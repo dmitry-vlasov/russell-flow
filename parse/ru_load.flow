@@ -1,126 +1,57 @@
 import fs/filesystem;
+import sys/concurrent;
 import lingo/compiler/syntaxtree_util;
-import ru_math;
-import ru_load_file;
-import ru_load_src;
+import ru_conf;
+import ru_fileinfo;
+import parse/ru_load_file;
+import parse/ru_load_ast;
 
 export {
-	ruLoad(file : string) -> RuMath;
+	RuLoadSource(imps : [string], src : string, info : RuFileInfo);
+	ruLoad(conf : RuConf, onError : (string) -> void) -> Tree<string, RuLoadSource>;
 }
 
-ruLoad(file : string) -> RuMath {
-	switch (lookupTree(math.sources, file)) {
-		Some(src): math;
-		None(): {
-			if (fileExists(file)) {
-				src_str = getFileContent(file);
-				pr1 = parse_source(src_str);
-				st = pr1.first;
-				err = pr1.second;
-				if (st.end != strlen(src_str)) {
-					math.onError("Syntax error: expected one of " + strGlue(err.expected, ", ") + " while met: " + err.met, [RuPlace(file, err.pos)]);
-					math
-				} else {
-					ruMakeSrc(file, src_str, st, math);
-				}
-			} else {
-				math.onError("file " + file + " is not found", []);
-				math
-			}
-		}
-	}
-}
-
-ruMakeSrc(file : string, src_str : string, st : SyntaxTree, math : RuMath) -> RuMath {
-	imports = ref [];
-	decls = ref [];
-	math1 = fold(get_source_decl_s(st), math,
-		\acc, decl -> {
-			if (decl.rule == st_import) {
-				maybeApply(ruMakeImport(file, src_str, decl, math), \imp -> refArrayPush(imports, imp));
-				acc
-			} else if (decl.rule == st_const) {
-				eitherMap(
-					ruMakeConst(file, src_str, decl, math), 
-					\c -> {
-						refArrayPush(decls, c);
-						RuMath(math with 
-							consts = setTree(math.consts, c.symb, c), 
-							symbs = ruAddSymb(c.symb, math.symbs)
-						)
-					},
-					acc
-				);
-			} else if (decl.rule == st_type) {
-				eitherMap(
-					ruMakeType(file, src_str, decl, math), 
-					\t -> {
-						refArrayPush(decls, t);
-						RuMath(math with 
-							types = setTree(math.types, t.name, t)
-						)
-					},
-					acc
-				);
-			} else {
-				acc
-			}
-		}
-	);
-	RuMath(math1 with sources = setTree(math1.sources, file, RuSource(^imports, ^decls)));
-}
-
-ruMakeImport(file : string, src_str : string, st : SyntaxTree, math : RuMath) -> Maybe<RuImport> { 
-	path = grabSTText(get_source_symb(st), src_str);
-	switch (lookupTree(math.sources, path)) {
-		Some(src): Some(RuImport(path, src));
-		None(): {
-			math.onError("import '" + path + "' is not found", [RuPlace(file, get_source_symb(st).start)]);
-			None();
-		}
-	}
-}
-
-ruMakeConst(file : string, src_str : string, st : SyntaxTree, math : RuMath) -> Maybe<RuConst> {
-	symbs = get_source_symb_s(st);
-	symb = grabSTText(get_source_symb(symbs[0]), src_str);
-	ascii = if (length(symbs) > 1) grabSTText(get_source_symb(symbs[1]), src_str) else "";
-	latex = if (length(symbs) > 2) grabSTText(get_source_symb(symbs[2]), src_str) else "";
-	if (containsKeyTree(math.consts, symb)) {
-		math.onError("constant '" + symb + "' is already declared", [RuPlace(file, get_source_symb(symbs[0]).start)]);
-		None();
+ruLoad(conf : RuConf, onError : (string) -> void) -> Tree<string, RuLoadSource> {
+	if (fileExists(conf.file)) {
+		ruLoadImports([conf.file], conf, onError, makeTree());
 	} else {
-		Some(RuConst(symb, ascii, latex));
+		onError("file " + conf.file + " is not found");
+		makeTree()
 	}
 }
 
-ruMakeType(file : string, src_str : string, st : SyntaxTree, math : RuMath) -> Maybe<RuType> {
-	all_ids = get_source_id_s(st);
-	name = grabSTText(ids[0], src_str);
-	if (containsKeyTree(math.types, name)) {
-		math.onError("type '" + name + "' is already defined", [RuPlace(file, ids[0].start)]);
+ruLoadImports(imports : [string], conf : RuConf, onError : (string) -> void, acc : Tree<string, RuLoadSource>) -> Tree<string, RuLoadSource> {
+	if (imports == []) acc else {
+		loaded = filtermap(
+			concurrent(true, 
+				map(imports, \imp -> \ -> ruLoadSource(imp, onError))
+			), idfn
+		);
+		new_imports = fold(loaded, [], \ac, l ->
+			concat(ac, filter(l.imps, \i -> !containsKeyTree(acc, i)))
+		);
+		ruLoadImports(new_imports, conf, onError, fold(loaded, acc, \ac, l -> setTree(ac, l.info.file, l)))
+	}
+}
+
+ruLoadSource(file : string, onError : (string) -> void) -> Maybe<RuLoadSource> {
+	if (fileExists(file)) {
+		src_str = getFileContent(file);
+		pr1 = parse_load(src_str);
+		st = pr1.first;
+		err = pr1.second;
+		if (st.end != strlen(src_str)) {
+			onError("Syntax error: expected one of " + strGlue(err.expected, ", ") + " while met: " + err.met);
+			None()
+		} else {
+			Some(RuLoadSource(
+				map(filter(get_load_block_s(st), \s -> s.rule == st_import), \i -> grabSTText(get_load_path(i), src_str)), 
+				src_str, 
+				makeRuFileInfo(file)
+			));
+		}
+	} else {
+		onError("file " + file + " is not found");
 		None()
-	} else {
-		super_ids = tail(all_ids);
-		supers = fold(super_ids, Some([]), \acc, sid -> {
-			maybeBind(acc, \ac -> {
-				id = grabSTText(sid, src_str);
-				switch(lookupTree(math.types, id)) {
-					Some(st): Some(concat(ac, [st]));
-					None(): math.onError("type '" + id + "' is not defined", )
-				}
-			})
-		});
-	
-	}
-	
-	ascii = if (length(symbs) > 1) grabSTText(get_source_symb(symbs[1]), src_str) else "";
-	latex = if (length(symbs) > 2) grabSTText(get_source_symb(symbs[2]), src_str) else "";
-	p = ruAddSymb(symb, math.symbs);
-	if (containsKeyTree(math.consts, symb)) {
-		math.onError("constant '" + symb + "' is already declared", [RuPlace(file, get_source_symb(symbs[0]).start)]);
-		None();
-	} else {
-		Some(RuConst(symb, ascii, latex));
 	}
 }
