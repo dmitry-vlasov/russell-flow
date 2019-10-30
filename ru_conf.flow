@@ -1,4 +1,5 @@
 import ds/tree;
+import fs/filesystem;
 import net/url_parameter;
 import sys/concurrent;
 
@@ -6,32 +7,121 @@ export {
 	RuPlace(file : string, pos : int);
 	RuConf(
 		file : string,
-		//findPaths : [string],
-        //storePaths : [string],
+		importRoots : [string],
+		workingDir : string,
         verbose : int,
 		opts : Tree<string, string>,
 		threadId : int,
 		onError : (string, [RuPlace]) -> void
 	);
 
-	ruMakeConf(onError : (string, [RuPlace]) -> void) -> Maybe<RuConf> {
-		opts = fold(getAllUrlParametersArray(), makeTree(), \acc, p -> setTree(acc, p[0], p[1]));
-		file = foldTree(opts, "", \name, val, acc -> 
-			if (name == "file" || val == "") {
-				if (acc == "") {
-					if (name == "file") val else name
-				} else if (acc != val) {
-					onError("target file is set up more then once: '" + val + "' and '" + acc + "'", []);
-					""
+	ruMakeConf(onError : (string, [RuPlace]) -> void) -> Maybe<RuConf>;
+	ruTrimPath(file : string, conf : RuConf) -> string;
+	ruFindPath(file : string, conf : RuConf) -> string;
+}
+
+ruMakeConf(onError : (string, [RuPlace]) -> void) -> Maybe<RuConf> {
+	conf_opts = ruReadConfFileFromDir(resolveRelativePath("."));
+	opts = fold(getAllUrlParametersArray(), conf_opts, \acc, p -> setTree(acc, p[0], p[1]));
+	file = foldTree(opts, "", \name, val, acc -> 
+		if (name == "file" || val == "") {
+			if (acc == "") {
+				if (name == "file") val else name
+			} else if (acc != val) {
+				onError("target file is set up more then once: '" + val + "' and '" + acc + "'", []);
+				""
+			} else acc;
+		} else acc
+	);
+	verbose = s2i(lookupTreeDef(opts, "verbose", "0"));
+	importRoots = map(strSplit(lookupTreeDef(opts, "import-roots", ""), ","), \imp -> strReplace(imp, "\\", "/"));
+	workingDir = lookupTreeDef(opts, "working-dir", "");
+	conf1 = RuConf(file, importRoots, workingDir, verbose, opts, s2i(getThreadId()), onError);
+	if (file == "") {
+		onError("target file is not set", []);
+		None() 
+	} else {
+		Some(RuConf(
+			ruTrimPath(file, conf1), 
+			importRoots, workingDir, verbose, opts, s2i(getThreadId()), onError
+		));
+	}
+}
+
+ruReadConfFileFromDir(dir : string) -> Tree<string, string> {
+	path = dir + "/russell.conf";
+	if (fileExists(path)) {
+		config = getFileContent(path);
+		lines = strSplit(config, "\n");
+		fold(lines, makeTree(), \acc, l -> {
+			// Skip comment lines in russell.conf
+			if (!startsWith(ltrim2(l, " \t"), "#") && !startsWith(ltrim2(l, " \t"), "//")) {
+				opts = strSplit(l, "=");
+				if (length(opts) == 1) {
+					opt = trim2(opts[0], " \t\r");
+					setTree(acc, opt, "");
+				} else if (length(opts) == 2) {
+					opt = trim2(opts[0], " \t\r");
+					val = trim2(opts[1], " \t\r");
+					setTree(acc, opt, val)
 				} else acc;
-			} else acc
-		);
-		verbose = s2i(lookupTreeDef(opts, "verbose", "0"));
-		if (file == "") {
-			onError("target file is not set", []);
-			None() 
+			} else acc;
+		});
+	} else if (dir == "/" || dir == "") {
+		makeTree();
+	} else {
+		ruReadConfFileFromDir(dirName(dir));
+	}
+}
+
+ruTrimPath(file : string, conf : RuConf) -> string {
+	norus = strReplace(if (endsWith(file, ".rus")) strsubsmart(file, 0, -4) else file, "\\", "/");
+	shift = if (conf.workingDir == "") "" else relatingPath(conf.workingDir, resolveRelativePath("."));
+	pathShift = if (shift == "") shift else shift + "/";
+
+	processImportRoot = \acc, impRoot -> {
+		resolved = strReplace(resolveRelativePath(impRoot), "\\", "/");
+		if (startsWith(toLowerCase(acc), toLowerCase(resolved))) {
+			strRight(acc, strlen(resolved))
+		} else if (startsWith(toLowerCase(acc), toLowerCase(impRoot))) {
+			strRight(acc, strlen(impRoot))
+		} else acc
+	};
+
+	// Find the path-less path
+	trim2(fold(conf.importRoots, norus, \acc, impRoot -> {
+		acc1 = if (pathShift != "") {
+			processImportRoot(acc, pathShift + impRoot)
+		} else acc;
+		processImportRoot(acc1, impRoot)
+	}), "/")
+}
+
+ruFindPath(file : string, conf : RuConf) -> string {
+	withRus = if (endsWith(file, ".rus")) file else file + ".rus";
+	shift = if (conf.workingDir == "") "" else relatingPath(conf.workingDir, resolveRelativePath("."));
+	if (fileExists(withRus)) {
+		resolveRelativePath(withRus);
+	} else {
+		ruDoFindPath(withRus, if (shift == "") shift else shift + "/", conf.importRoots);
+	}
+}
+
+ruDoFindPath(withRus : string, pathShift : string, importRoots : [string]) -> string {
+	if (importRoots == []) withRus
+	else {
+		head = importRoots[0];
+		directPath = head + (if (endsWith(head, "/")) "" else "/") + withRus;
+		if (fileExists(directPath)) {
+			resolveRelativePath(directPath);
 		} else {
-			Some(RuConf(file, verbose, opts, s2i(getThreadId()), onError));
+			shiftedPath = pathShift + directPath;
+			if (fileExists(shiftedPath)) {
+				resolveRelativePath(shiftedPath);
+			} else {
+				ruDoFindPath(withRus, pathShift, tail(importRoots));
+			}
 		}
 	}
 }
+
