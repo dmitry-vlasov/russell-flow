@@ -6,19 +6,20 @@ export {
 			conf.onError("empty expression met", []);
 			None()
 		} else {
-			switch (lookupTree(types, term.type)) {
+			ret = switch (lookupTree(types, term.type)) {
 				Some(tenv): {
-					ret = ruParseExpr(term.expr, 0, term.type, tenv.table, types, conf);
-					if (ret.pos < length(term.expr)) {
-						conf.onError("unparsed rest: " + ruTerm2s(term) + " ret.pos: " + i2s(ret.pos), []);
-						conf.onError("ret.expr: [" + ruExpRPN2s(ret.expr) + "]", []);
-						None();
-					} else {
-						if (ret.expr == []) {
+					println("going to parse: " + ruTerm2s(term));
+					switch (ruParseExpr(
+						RuParseEnv(term.expr, types, conf), 0, 
+						RuParseStack(None(), 0, tenv.table, [])
+					)) {
+						Some(expr): {
+							println("successfully parsed: " + ruExpRPN2s(expr));
+							Some(RuExp(expr));
+						}
+						None(): {
 							conf.onError("expr was not successfully parsed: " + ruTerm2s(term), []);
 							None();
-						} else {
-							Some(RuExp(ret.expr));
 						}
 					}
 				}
@@ -27,53 +28,169 @@ export {
 					None();
 				}
 			}
+			if (ret == None()) {
+				quit(0);
+			}
+			ret
 		}
 	}
 }
 
-RuParseExpRet(
-	pos : int,
+RuParseEnv(
+	nodes : [RuTermNode],
+	types : Tree<string, RuTypeEnv>, 
+	conf : RuConf,
+);
+
+RuParseStack(
+	parent : Maybe<RuParseStack>,
+	start : int,
+	table : RuTab,
 	expr : [RuExpNode]
 );
 
-ruParseExpr(nodes : [RuTermNode], pos : int, type : string, tab : RuTab, types : Tree<string, RuTypeEnv>, conf : RuConf) -> RuParseExpRet {
-	if (pos == length(nodes)) {
-		RuParseExpRet(pos + 1, []) 
-	} else {
-		switch (nodes[pos]) {
-			RuVarRef(v, t): {
-				switch (lookupTree(tab.vars, t)) {
-					Some(n): RuParseExpRet(pos + 1, [RuVarRef(v, t)]);
+
+printStack(stack : RuParseStack) {
+	println("stack start: " + i2s(stack.start) + ", nodes: " + ruExpRPN2s(stack.expr))
+}
+
+showNode(n : RuTermNode) -> string {
+	switch (n) {
+		RuVarRef(v, t): "var[" + v + " : " + t + "]";
+		RuConstRef(c): "const[" + c + "]";
+	}
+}
+
+ruParseExpr(env : RuParseEnv, pos : int, stack : RuParseStack) -> Maybe<[RuExpNode]> {
+	if (pos == length(env.nodes)) None() else {
+		println("pos: " + i2s(pos) + ", acc: " + ruExpRPN2s(stack.expr) + ", nodes[pos]: " + showNode(env.nodes[pos]) + ", vars: {" +
+			strGlue(getTreeKeys(stack.table.vars), ", ") + "}, consts: {" + strGlue(getTreeKeys(stack.table.consts), ", ") + "}"
+		);
+		/*
+		from_stack = \st, n -> {
+			switch (ruParseExpr(env, pos + 1, RuParseStack(st with table = n.table))) {
+			
+			}
+			if (n.data == "") {
+				ruParseExpr(env, pos + 1, RuParseStack(st with table = n.table));
+			} else {
+				println("table data: " + n.data);
+				switch (st.parent) {
+					Some(parent):
+						ruParseExpr(env, pos + 1, RuParseStack(parent with 
+							expr = concat3([RuRuleRef(n.data, pos - st.start)], st.expr, parent.expr)
+						));
 					None(): {
-						switch (lookupTree(lookupTreeDef(types, t, ruNoTypeEnv).supers, type)) {
-							Some(r): RuParseExpRet(pos + 1, [RuRuleRef(r.name, 1), RuVarRef(v, t)]);
-							None():  RuParseExpRet(pos + 1, []);
+						if (pos + 1 == length(env.nodes)) {
+							Some(concat([RuRuleRef(n.data, pos - st.start)], st.expr))
+						} else {
+							env.conf.onError("pop of an empty stack", []);
+							None() 
 						}
 					}
 				}
 			}
-			RuConstRef(c): {
-				switch (lookupTree(tab.consts, c)) {
+		}
+		*/
+		ret = switch (env.nodes[pos]) {
+			RuVarRef(v, t): {
+				switch (lookupTree(stack.table.vars, t)) {
 					Some(n): {
 						if (n.data == "") {
-							ruParseExpr(nodes, pos + 1, type, n.table, types, conf);
+							ruParseExpr(env, pos + 1,
+								RuParseStack(stack with 
+									expr = concat(stack.expr, [RuVarRef(v, t)]),
+									table = n.table
+								)
+							);
 						} else {
-							x = ruParseExpr(nodes, pos + 1, type, n.table, types, conf);
-							if (x.expr != []) x else {
-								RuParseExpRet(x.pos, concat([RuRuleRef(n.data, x.pos - pos)], x.expr));
+						
+							switch (stack.parent) {
+								Some(parent):
+									ruParseExpr(env, pos + 1,
+										RuParseStack(parent with 
+											expr = concat3([RuRuleRef(n.data, pos - stack.start)], stack.expr, parent.expr)
+										)
+									);
+								None(): {
+									if (pos + 1 == length(env.nodes)) {
+										Some(concat([RuRuleRef(n.data, pos - stack.start)], stack.expr))
+									} else {
+										env.conf.onError("pop of an empty stack", []);
+										None() 
+									}
+								}
+							}
+						
+							ruParseExpr(env, pos + 1,
+								RuParseStack(stack with 
+									expr = concat(stack.expr, [RuVarRef(v, t)]),
+									table = n.table
+								)
+							);
+						}
+					}
+					None(): {
+						supers = lookupTreeDef(env.types, t, ruNoTypeEnv).supers;
+						foldTree(stack.table.vars, None(), \tp, n, ac -> 
+							if (ac != None()) ac else {
+								switch (lookupTree(supers, tp)) {
+									Some(r): 
+										ruParseExpr(env, pos + 1,
+											RuParseStack(stack with 
+												expr = concat(stack.expr, [RuRuleRef(r.name, 1), RuVarRef(v, t)]),
+												table = n.table
+											)
+										);
+									None(): ac;
+								}
+							}
+						);
+					}
+				}
+			}
+			RuConstRef(c): {
+				switch (lookupTree(stack.table.consts, c)) {
+					Some(n): {
+						if (n.data == "") {
+							ruParseExpr(env, pos + 1, RuParseStack(stack with table = n.table));
+						} else {
+							println("table data: " + n.data);
+							switch (stack.parent) {
+								Some(parent):
+									ruParseExpr(env, pos + 1,
+										RuParseStack(parent with 
+											expr = concat3([RuRuleRef(n.data, pos - stack.start)], stack.expr, parent.expr)
+										)
+									);
+								None(): {
+									if (pos + 1 == length(env.nodes)) {
+										Some(concat([RuRuleRef(n.data, pos - stack.start)], stack.expr))
+									} else {
+										env.conf.onError("pop of an empty stack", []);
+										None() 
+									}
+								}
 							}
 						}
 					}
 					None(): {
-						foldTree(tab.vars, RuParseExpRet(pos + 1, []), \t, n, acc ->
-							if (acc.expr != []) acc else {
-								ruParseExpr(nodes, pos + 1, t, lookupTreeDef(types, t, ruNoTypeEnv).table, types, conf)
+						foldTree(stack.table.vars, None(), \t, n, ac ->
+							if (ac != None()) ac else {
+								ruParseExpr(env, pos, 
+									RuParseStack(
+										Some(RuParseStack(stack with table = n.table)), 
+										pos, lookupTreeDef(env.types, t, ruNoTypeEnv).table, []
+									), 
+								)
 							}
 						)
 					}
 				}
 			}
 		}
+		//printRet(ret);
+		ret
 	}
 }
 
