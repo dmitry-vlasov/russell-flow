@@ -68,6 +68,40 @@ export {
 			ret
 		}
 	}
+	
+	ruParseExp2(term : RuTerm, types : Tree<string, RuTypeEnv>, conf : RuConf) -> Maybe<RuExp> {
+		if (length(term.expr) == 0) {
+			conf.onError("empty expression met", []);
+			None()
+		} else {
+			ret = switch (lookupTree(types, term.type)) {
+				Some(tenv): {
+					println("going to parse: " + ruTerm2s(term));
+					switch (ruParseExpr2(
+						RuParseEnv(term.expr, types, conf), 0, 
+						RuParseStack2(None(), 0, tenv.trie1, [])
+					)) {
+						Some(expr): {
+							println("successfully parsed: " + ruExpRPN2s(expr));
+							Some(RuExp(expr));
+						}
+						None(): {
+							conf.onError("expr was not successfully parsed: " + ruTerm2s(term), []);
+							None();
+						}
+					}
+				}
+				None(): {
+					conf.onError("unknown type: " + term.type, []);
+					None();
+				}
+			}
+			if (ret == None()) {
+				quit(0);
+			}
+			ret
+		}
+	}
 }
 
 RuParseEnv(
@@ -90,8 +124,8 @@ printStack(stack : RuParseStack) {
 
 showNode(n : RuTermNode) -> string {
 	switch (n) {
-		RuVarRef(v, t): "var[" + v + " : " + t + "]";
-		RuConstRef(c): "const[" + c + "]";
+		RuVarRef(v, t): "\"" + v + "\"";
+		RuConstRef(c): "\"" + c + "\"";
 	}
 }
 
@@ -169,16 +203,37 @@ ruParseExpr(env : RuParseEnv, pos : int, stack : RuParseStack) -> Maybe<[RuExpNo
 RuParseStack1(
 	parent : Maybe<RuParseStack1>,
 	start : int,
-	trie : RuTrie<(RuTermNode, int) -> [RuExpNode]>,
+	trie : RuTrie<string, (RuTermNode, int) -> [RuExpNode]>,
 	expr : [RuExpNode]
 );
+
+printStack1(stack : RuParseStack1) {
+	prn_keys = \mp -> 
+	strGlue(
+		map(getTreeKeys(mp), 
+			\key -> 
+				if (isSome(lookupTreeDef(mp, key, ruTrieNodeEmpty).data)) "*" + key else key
+		),
+		", "
+	);
+	println(
+		strGlue([
+			"STACK start: " + i2s(stack.start),
+			//"expr: " + ruExpRPN2s(stack.expr),
+			"trie keys: {" + prn_keys(stack.trie.map) + "}",
+			switch (stack.parent) {
+				Some(parent): "parent keys: {" + prn_keys(parent.trie.map) + "}";
+				None(): "no parent";
+			}
+		], ", ")
+	)
+}
 
 
 ruParseExpr1(env : RuParseEnv, pos : int, stack : RuParseStack1) -> Maybe<[RuExpNode]> {
 	if (pos == length(env.nodes)) None() else {
-		println("pos: " + i2s(pos) + ", acc: " + ruExpRPN2s(stack.expr) + ", nodes[pos]: " + showNode(env.nodes[pos]) + ", keys: {" +
-			strGlue(getTreeKeys(stack.trie.map), ", ") + "}"
-		);
+		println("pos: " + i2s(pos) + /*", acc: " + ruExpRPN2s(stack.expr) +*/ ", nodes[pos]: " + showNode(env.nodes[pos]) + ",");
+		printStack1(stack);
 		do_step = \st, n -> {
 			switch (ruParseExpr1(env, pos + 1, RuParseStack1(st with trie = n.trie))) {
 				Some(expr): Some(expr);
@@ -186,10 +241,151 @@ ruParseExpr1(env : RuParseEnv, pos : int, stack : RuParseStack1) -> Maybe<[RuExp
 					switch (n.data) {
 						Some(callback): {
 							switch (st.parent) {
-								Some(parent):
-									ruParseExpr1(env, pos + 1, RuParseStack1(parent with 
+								Some(parent): {
+									poped = RuParseStack1(parent with 
 										expr = concat3(parent.expr, st.expr, callback(env.nodes[pos], pos - st.start))
-									));
+									);
+									println("poped:");
+									printStack1(poped);
+									ruParseExpr1(env, pos + 1, poped);
+								}
+								None(): {
+									if (pos + 1 == length(env.nodes)) {
+										Some(concat(st.expr, callback(env.nodes[pos], pos - st.start)))
+									} else {
+										env.conf.onError("pop of an empty stack", []);
+										None() 
+									}
+								}
+							}
+						}
+						None(): None();
+					}
+				}
+			}
+		}
+		switch (env.nodes[pos]) {
+			RuVarRef(v, t):
+				switch (lookupTree(stack.trie.map, t)) {
+					Some(n): do_step(stack, n);
+					None(): None();
+				}
+				/*switch (lookupTree(stack.trie.map, t)) {
+					Some(n): do_step(RuParseStack1(stack with expr = concat(stack.expr, [RuVarRef(v, t)])), n);
+					None(): {
+						supers = lookupTreeDef(env.types, t, ruNoTypeEnv).supers;
+						foldTree(stack.trie.map, None(), \tp, n, ac -> 
+							if (ac != None()) ac else {
+								switch (lookupTree(supers, tp)) {
+									Some(r): 
+										do_step(RuParseStack1(stack with expr = concat(stack.expr, [RuRuleRef(r.name, 1), RuVarRef(v, t)])), n);
+									None(): ac;
+								}
+							}
+						);
+					}
+				}*/
+			RuConstRef(c): {
+				switch (lookupTree(stack.trie.map, c)) {
+					Some(n): do_step(stack, n);
+					None(): {
+						foldTree(stack.trie.map, None(), \t, n, ac ->
+							if (ac != None()) ac else {
+								
+								ruParseExpr1(env, pos, 
+									RuParseStack1(
+										Some(RuParseStack1(stack with trie = n.trie)), 
+										pos, 
+										lookupTreeDef(env.types, t, ruNoTypeEnv).trie, 
+										[]
+									), 
+								)
+							}
+						)
+					}
+				}
+			}
+		}
+	}
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+RuParseStack2(
+	parent : Maybe<RuParseStack2>,
+	start : int,
+	trie : RuTrie1<string, (RuTermNode, int) -> [RuExpNode]>,
+	expr : [RuExpNode]
+);
+
+printStack2(stack : RuParseStack2) {
+	prn_keys = \mp -> 
+	strGlue(
+		map(getTreeKeys(mp), 
+			\key -> 
+				if (isSome(lookupTreeDef(mp, key, ruTrie1Empty).data)) "*" + key else key
+		),
+		", "
+	);
+	println(
+		strGlue([
+			"STACK start: " + i2s(stack.start),
+			//"expr: " + ruExpRPN2s(stack.expr),
+			"trie keys: {" + prn_keys(stack.trie.map) + "}",
+			switch (stack.parent) {
+				Some(parent): "parent keys: {" + prn_keys(parent.trie.map) + "}";
+				None(): "no parent";
+			}
+		], ", ")
+	)
+}
+
+
+ruUnrollStack(env : RuParseEnv, pos : int, stack : RuParseStack2) -> RuParseStack2 {
+	switch (stack.trie.data) {
+		Some(callback): {
+			switch (stack.parent) {
+				Some(parent): {
+					ruUnrollStack(env, pos, RuParseStack2(parent with
+						expr = concat3(parent.expr, stack.expr, callback(env.nodes[pos], pos - stack.start))
+					));
+				}
+				None(): stack;
+			}
+		}
+		None(): stack;
+	}
+}
+
+ruParseExpr2(env : RuParseEnv, pos : int, stack : RuParseStack2) -> Maybe<[RuExpNode]> {
+	if (pos == length(env.nodes)) None() else {
+		println("exr[" + i2s(pos) + "]= " + showNode(env.nodes[pos]) /*", acc: " + ruExpRPN2s(stack.expr) +*/);
+		printStack2(stack);
+
+		do_step = \st, n -> {
+			switch (ruParseExpr2(env, pos + 1, RuParseStack2(st with trie = n))) {
+				Some(expr): Some(expr);
+				None(): {
+					switch (n.data) {
+						Some(callback): {
+							switch (st.parent) {
+								Some(parent): {
+									poped = ruUnrollStack(env, pos, parent);
+									println("poped:");
+									printStack2(poped);
+									ruParseExpr2(env, pos + 1, poped);
+								}
 								None(): {
 									if (pos + 1 == length(env.nodes)) {
 										Some(concat(st.expr, callback(env.nodes[pos], pos - st.start)))
@@ -217,12 +413,16 @@ ruParseExpr1(env : RuParseEnv, pos : int, stack : RuParseStack1) -> Maybe<[RuExp
 					None(): {
 						foldTree(stack.trie.map, None(), \t, n, ac ->
 							if (ac != None()) ac else {
-								ruParseExpr1(env, pos, 
-									RuParseStack1(
-										Some(RuParseStack1(stack with trie = n.trie)), 
-										pos, lookupTreeDef(env.types, t, ruNoTypeEnv).trie, []
-									), 
-								)
+								switch (lookupTree(env.types, t)) {
+									Some(tenv):
+										ruParseExpr2(env, pos, 
+											RuParseStack2(
+												Some(RuParseStack2(stack with trie = n)), 
+												pos, tenv.trie1, []
+											)
+										);
+									None(): ac;
+								}
 							}
 						)
 					}
@@ -231,4 +431,5 @@ ruParseExpr1(env : RuParseEnv, pos : int, stack : RuParseStack1) -> Maybe<[RuExp
 		}
 	}
 }
+
 
