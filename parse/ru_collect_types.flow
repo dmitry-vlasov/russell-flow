@@ -14,7 +14,7 @@ export {
 		acc
 	}
 	ruSuperTypeName(super : string, infer : string) -> string {
-		super + "_sup_" + infer
+		infer + "-" + super
 	}
 }
 /*
@@ -64,10 +64,11 @@ ruDoCollectTypes(left : Tree<string, RuParseSource>, conf : RuConf, acc : RuColl
 ruCollectTypesInSource(src : RuParseSource, conf : RuConf, acc : RuCollectAcc) -> RuCollectAcc {
 	fold(src.decls, acc, \ac, decl ->
 		switch (decl) {
-			RuParseConst(symb, ascii, latex): ruCollectConst(decl, conf, ac);
-			RuParseType(name, sups): ruCollectType(decl, conf, ac);
-			RuParseRule(name, vs, term): ruCollectRule(decl, conf, ac);
-			RuParseAxiom(name, vars, disjs, hyps, prop): ruCollectAxiom(decl, conf, ac);
+			RuParseConst(__,__,__): ruCollectConst(decl, conf, ac);
+			RuParseType(__,__): ruCollectType(decl, conf, ac);
+			RuParseRule(__,__,__): ruCollectRule(decl, conf, ac);
+			RuParseAxiom(__,__,__,__,__): ruCollectAxiom(decl, conf, ac);
+			//RuParseTheorem(__,__,__,__,__,__): ruCollectTheorem(decl, conf, ac);
 			default: ac;
 		}
 	)
@@ -93,14 +94,19 @@ ruCollectType(type : RuParseType, conf : RuConf, acc : RuCollectAcc) -> RuCollec
 		}
 		None(): {
 			infer = type.name;
-			super_rule = \super ->
-				RuRule(ruSuperTypeName(super, infer), makeTree1("x", RuVar("x", infer)), RuTerm(super, [RuVarRef("x", infer)]));
+			super_rule = \super -> {
+				RuRule(
+					ruSuperTypeName(super, infer), 
+					makeTree1("x", RuVar("x", infer)), 
+					RuTerm(super, [RuVarRef("x", infer)])
+				);
+			}
 			supers = fold(type.supers, makeTree(), \ac, s ->
 				switch (lookupTree(acc.types, s)) {
 					Some(env): {
-						foldTree(env.supers, 
+						foldTree(env.supers,
 							setTree(ac, s, super_rule(s)), 
-							\super, __, a -> 
+							\super, __, a ->
 								setTree(a, super, super_rule(super))
 						)
 					}
@@ -128,7 +134,7 @@ ruCollectType(type : RuParseType, conf : RuConf, acc : RuCollectAcc) -> RuCollec
 						supers, makeTree()
 					)
 				),
-				rules = mergeTree(acc.rules, supers)
+				rules = foldTree(supers, acc.rules, \__, rule, ac -> setTree(ac, rule.name, rule))
 			);
 		}
 	}
@@ -219,27 +225,89 @@ ruCollectAxiom(ax : RuParseAxiom, conf : RuConf, acc : RuCollectAcc) -> RuCollec
 			acc
 		}
 		None(): {
-			vars = fold(ax.vars, makeTree(), \ac, v ->
-				switch (lookupTree(acc.types, v.type)) {
-					Some(tp): setTree(ac, v.name, RuVar(v.name, v.type));
-					None(): {
-						conf.onError("unknown var " + v.name + " type " + v.type, []);
-						ac
-					}
-				}
-			);
+			vars = ruCollectVars(ax.vars, conf, acc);
 			disjs = map(ax.disjs, \d -> RuDisj(d.vars));
-			parse_exp = \ex -> ruParseExp(ruMakeTerm(ex, vars, acc.consts, conf), acc.types, conf);
-			make_hyp = \h -> maybeMap(parse_exp(h.expr), \e -> RuHyp(h.ind, e));
-			maxiom = maybeMap2(\prop, hyps -> 
-				RuAxiom(ax.name, vars, disjs, hyps, prop)
-			)(parse_exp(ax.prop), arrMaybe2maybeArr(map(ax.hyps, make_hyp)));
+			maxiom = maybeMap2(\prop, hyps -> RuAxiom(ax.name, vars, disjs, hyps, prop))
+			(
+				ruCollectExp(ax.prop, vars, conf, acc),
+				arrMaybe2maybeArr(map(ax.hyps, \h -> ruCollectHyp(h, vars, conf, acc)))
+			);
 			switch (maxiom) {
 				Some(axiom): RuCollectAcc(acc with assertions = setTree(acc.assertions, ax.name, axiom));
-				None(): acc;
+				None(): {
+					conf.onError("error in assertion " + ax.name, []);
+					acc;
+				}
 			}
 		}
 	}
 }
 
+ruCollectExp(ex : RuParseExp, vars : Tree<string, RuVar>, conf : RuConf, acc : RuCollectAcc) -> Maybe<RuExp> {
+	ruParseExp(ruMakeTerm(ex, vars, acc.consts, conf), acc.types, conf)
+}
 
+ruCollectVars(vars : [RuParseVar], conf : RuConf, acc : RuCollectAcc) -> Tree<string, RuVar> {
+	fold(vars, makeTree(), \ac, v ->
+		switch (lookupTree(acc.types, v.type)) {
+			Some(tp): setTree(ac, v.name, RuVar(v.name, v.type));
+			None(): {
+				conf.onError("unknown var " + v.name + " type " + v.type, []);
+				ac
+			}
+		}
+	)
+}
+
+ruCollectHyp(hyp : RuParseHyp, vars : Tree<string, RuVar>, conf : RuConf, acc : RuCollectAcc) -> Maybe<RuHyp> {
+	maybeMap(ruCollectExp(hyp.expr, vars, conf, acc), \e -> RuHyp(hyp.ind, e))
+}
+
+ruCollectTheorem(th : RuParseTheorem, conf : RuConf, acc : RuCollectAcc) -> RuCollectAcc {
+	switch (lookupTree(acc.assertions, th.name)) {
+		Some(__): {
+			conf.onError("assertion with name " + th.name + " is already defined", []);
+			acc
+		}
+		None(): {
+			vars = ruCollectVars(th.vars, conf, acc);
+			disjs = map(th.disjs, \d -> RuDisj(d.vars));
+			mtheorem = maybeBind(
+				ruCollectProof(th.proof, vars, conf, acc),
+				\proof ->
+					maybeMap2(\prop, hyps -> RuTheorem(th.name, vars, disjs, hyps, prop, proof))
+					(
+						ruCollectExp(th.prop, vars, conf, acc),
+						arrMaybe2maybeArr(map(th.hyps, \h -> ruCollectHyp(h, vars, conf, acc)))
+					)
+			);
+			switch (mtheorem) {
+				Some(theorem): RuCollectAcc(acc with assertions = setTree(acc.assertions, th.name, theorem));
+				None(): {
+					conf.onError("error in theorem " + th.name, []);
+					acc;
+				}
+			}
+		}
+	}
+}
+
+ruCollectProof(proof : RuParseProof, vars : Tree<string, RuVar>, conf : RuConf, acc : RuCollectAcc) -> Maybe<RuProof> {
+	proof_vars = ruCollectVars(proof.vars, conf, acc);
+	proof_disjs = map(proof.disjs, \d -> RuDisj(d.vars));
+	all_vars = mergeTree(vars, proof_vars);
+	do_ref = \r -> switch (r) {
+		RuParseHypRef(i): RuHypRef(i);
+		RuParseStepRef(i): RuStepRef(i);
+	}
+	msteps = fold(proof.steps, [], 
+		\ac, s -> concat(ac, 
+			[maybeMap(ruCollectExp(s.expr, all_vars, conf, acc),
+			\e -> RuStep(s.ind, s.assertion, map(s.refs, do_ref), e))]
+		)
+	);
+	switch (arrMaybe2maybeArr(msteps)) {
+		Some(steps): Some(RuProof(proof_vars, proof_disjs, steps));
+		None(): None();
+	}
+}
