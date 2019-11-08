@@ -14,10 +14,9 @@ export {
 					}
 					//println("going to parse, max len: " + i2s(^max_len) + " len: " + i2s(length(term.expr)) + " = " + ruTerm2s(term.expr));
 					start = timestamp();
-					switch (ruParseExpr(
-						RuParseEnv(term.expr, types, conf), 0, 
-						RuParseStack(None(), 0, 0, tenv.type.name, tenv.trie, [])
-					)) {
+					count := true;
+					counter := 0;
+					switch (ruParseExpr0(RuParseEnv(term.expr, types, conf), term.type, types)) {
 						Some(expr): {
 							//println("successfully parsed: " + ruExpRPN2s(expr));
 							time = timestamp() - start;
@@ -25,6 +24,13 @@ export {
 								max_time := time;
 								println("max time: expr " + ruTerm2s(term.expr) + " parsed in " + d2st(^max_time/ 1000.0, 2));
 							}
+							count := false;
+							if (^counter > ^max_counter) {
+								max_counter := ^counter;
+								println("max counter: " + i2s(^max_counter));
+							}
+							
+							//testCache(term, RuExp(expr), types, conf);
 							
 							Some(RuExp(expr));
 						}
@@ -39,10 +45,7 @@ export {
 								}
 							);
 							
-							ruParseExpr(
-								RuParseEnv(term.expr, types, conf), 0, 
-								RuParseStack(None(), 0, 0, tenv.type.name, tenv.trie, [])
-							);
+							ruParseExpr0(RuParseEnv(term.expr, types, conf), term.type, types);
 							
 							quit(0);
 							None();
@@ -62,10 +65,64 @@ export {
 	}
 }
 
+ruParseExpr0(env : RuParseEnv, type : string, types : Tree<string, RuTypeEnv>) -> Maybe<[RuExpNode]> {
+	tenv = lookupTreeDef(types, type, ruNoTypeEnv);
+	ret = ruParseExpr(env, 0, RuParseStack(None(), 0, 0, type, tenv.cache, [], true));
+	switch (ret) {
+		Some(__): ret;
+		None(): ruParseExpr(env, 0, RuParseStack(None(), 0, 0, type, tenv.trie, [], false));
+	}
+}
+
 debug = ref false;
+count = ref false;
+counter = ref 0;
+use_cache = ref false;
 
 max_len = ref 0;
 max_time = ref 0.0;
+max_counter = ref 0;
+
+testCache(term : RuTerm, expr : RuExp, types : Tree<string, RuTypeEnv>, conf : RuConf) -> void {
+	tenv = lookupTreeDef(types, term.type, ruNoTypeEnv);
+	new_cache = ruAddExp2RuTrie(term, expr, tenv.cache);
+	new_types = setTree(types, term.type, RuTypeEnv(tenv with cache = new_cache));
+	new_tenv = lookupTreeDef(new_types, term.type, ruNoTypeEnv);
+	count := true;
+	use_cache_val = ^use_cache;
+	prev_counter = ^counter;
+	use_cache := true;
+	counter := 0;
+	ret = ruParseExpr0(RuParseEnv(term.expr, new_types, conf), term.type, types);
+	count := false;
+	use_cache := use_cache_val;
+	switch (ret) {
+		Some(ex): {
+			if (prev_counter < ^counter) {
+				//println("coutner balance: " + i2s(prev_counter) + " <  " + i2s(^counter) + ", term: " + ruTerm2s(term.expr));
+			} else if (prev_counter > ^counter) {
+				println("coutner balance: " + i2s(prev_counter) + " >  " + i2s(^counter) + ", term: " + ruTerm2s(term.expr));
+			}
+			/*if (length(term.expr) != ^counter) {
+				println("testing cache FAIL, len: " + i2s(length(term.expr)) + ", counter: " + i2s(^counter) + " = " + ruTerm2s(term.expr));
+				quit(0);
+			}*/
+			if (expr.nodes != ex) {
+				println("testing cache FAIL");
+				println("term: " + ruTerm2s(term.expr));
+				println("expr: " + ruExpRPN2s(expr.nodes));
+				println("ex:   " + ruExpRPN2s(ex));
+				quit(0);
+			}
+		}
+		None(): {
+			println("testing cache FAIL");
+			quit(0);
+		}
+	}
+}
+
+
 
 RuParseEnv(
 	nodes : [RuTermNode],
@@ -79,7 +136,8 @@ RuParseStack(
 	curr : int,
 	type : string,
 	trie : RuTrie<string, ([RuExpNode])->[RuExpNode]>,
-	expr : [RuExpNode]
+	expr : [RuExpNode],
+	fromCache : bool
 );
 
 stackDepth(stack : RuParseStack) -> int {
@@ -145,85 +203,76 @@ ruParseExpr(env : RuParseEnv, pos : int, stack0 : RuParseStack) -> Maybe<[RuExpN
 		if (^debug) {
 			println("exr[" + i2s(pos) + "]= " + showNode(env.nodes[pos]) + ", stack: " + printStack(stack));
 		}
+		if (^count) {
+			counter := ^counter + 1;
+		}
 
 		do_step = \st, n -> {
 			poped = ruPopExprStack(env, pos, RuParseStack(st with trie = n));
 			ruParseExpr(env, pos + 1, poped);
 		}
+		try_supers = \v, t -> {
+			supers = lookupTreeDef(env.types, t, ruNoTypeEnv).supers;
+			foldTree(stack.trie.map, None(), \tp, m, ac -> 
+				if (ac != None()) ac else {
+					switch (lookupTree(supers, tp)) {
+						Some(r): 
+							do_step(RuParseStack(stack with 
+								expr = concat(stack.expr, [RuVarRef(v, t), RuRuleRef(r.name, 1)])
+							), m);
+						None(): ac;
+					}
+				}
+			);
+		}
+		try_vars = \-> {
+			foldTree(stack.trie.map, None(), \t, n, ac ->
+				if (ac != None()) ac else {
+					switch (lookupTree(env.types, t)) {
+						Some(tenv):
+							if (tenv.type.name == stack.type && stack.curr == stack.start) ac else {
+								try_cache = ruParseExpr(env, pos, 
+									RuParseStack(
+										Some(RuParseStack(stack with trie = n)), 
+										pos, pos, tenv.type.name, tenv.cache, [], true
+									)
+								);
+								switch (try_cache) {
+									Some(r): Some(r);
+									None(): 
+										ruParseExpr(env, pos, 
+											RuParseStack(
+												Some(RuParseStack(stack with trie = n)), 
+												pos, pos, tenv.type.name, tenv.trie, [], false
+											)
+										);
+								}
+							}
+						None(): ac;
+					}
+				}
+			)
+		}
 		switch (env.nodes[pos]) {
 			RuVarRef(v, t):
 				switch (lookupTree(stack.trie.map, t)) {
 					Some(n): {
-						ret = do_step(RuParseStack(stack with expr = concat(stack.expr, [RuVarRef(v, t)])), n);
-						if (isSome(ret)) ret else {
-							supers = lookupTreeDef(env.types, t, ruNoTypeEnv).supers;
-							foldTree(stack.trie.map, None(), \tp, m, ac -> 
-								if (ac != None()) ac else {
-									switch (lookupTree(supers, tp)) {
-										Some(r): 
-											do_step(RuParseStack(stack with 
-												expr = concat(stack.expr, [RuVarRef(v, t), RuRuleRef(r.name, 1)])
-											), m);
-										None(): ac;
-									}
-								}
-							);
+						switch (do_step(RuParseStack(stack with expr = concat(stack.expr, [RuVarRef(v, t)])), n)) {
+							Some(ret): Some(ret);
+							None(): try_supers(v, t);
 						}
 					}
-					None(): {
-						supers = lookupTreeDef(env.types, t, ruNoTypeEnv).supers;
-						foldTree(stack.trie.map, None(), \tp, n, ac -> 
-							if (ac != None()) ac else {
-								switch (lookupTree(supers, tp)) {
-									Some(r): 
-										do_step(RuParseStack(stack with 
-											expr = concat(stack.expr, [RuVarRef(v, t), RuRuleRef(r.name, 1)])
-										), n);
-									None(): ac;
-								}
-							}
-						);
-					}
+					None(): try_supers(v, t);
 				}
 			RuConstRef(c): {
 				switch (lookupTree(stack.trie.map, c)) {
 					Some(n): {
-						ret = do_step(stack, n); 
-						if (isSome(ret)) ret else {
-							foldTree(stack.trie.map, None(), \t, m, ac ->
-								if (ac != None()) ac else {
-									switch (lookupTree(env.types, t)) {
-										Some(tenv):
-											if (tenv.type.name == stack.type && stack.curr == stack.start) ac else
-											ruParseExpr(env, pos, 
-												RuParseStack(
-													Some(RuParseStack(stack with trie = m)), 
-													pos, pos, tenv.type.name, tenv.trie, []
-												)
-											);
-										None(): ac;
-									}
-								}
-							)
+						switch (do_step(stack, n)) {
+							Some(ret): Some(ret);
+							None(): if (stack.fromCache) None() else try_vars();
 						}
 					}
-					None(): {
-						foldTree(stack.trie.map, None(), \t, n, ac ->
-							if (ac != None()) ac else {
-								switch (lookupTree(env.types, t)) {
-									Some(tenv):
-										if (tenv.type.name == stack.type && stack.curr == stack.start) ac else
-										ruParseExpr(env, pos, 
-											RuParseStack(
-												Some(RuParseStack(stack with trie = n)), 
-												pos, pos, tenv.type.name, tenv.trie, []
-											)
-										);
-									None(): ac;
-								}
-							}
-						)
-					}
+					None(): if (stack.fromCache) None() else try_vars();
 				}
 			}
 		}
