@@ -19,7 +19,7 @@ ruDoCollectMath(left : Tree<string, RuParseSource>, conf : RuConf, acc : RuMath)
 			\src -> forall(src.imports, \imp -> !containsKeyTree(left, imp.path))
 		);
 		//println("modules to process: " + strGlue(map(ready, \s -> s.info.file), ", "));
-		collected = concurrent(true, map(ready, \s -> \-> ruCollectSource(s, acc)));
+		collected = sequential(true, map(ready, \s -> \-> ruCollectSource(s, acc)));
 		new_acc = fold(collected, acc, \ac, coll -> ruMergeRuMath(coll, ac));
 		new_left = fold(ready, left, \ac, src -> removeFromTree(ac, src.info.file));
 		ruDoCollectMath(new_left, conf, new_acc);
@@ -142,7 +142,7 @@ ruCollectType(type : RuParseType, acc : RuCollectAcc) -> RuCollectAcc {
 					ruAddTerm2RuTrie(
 						RuTerm(type.name, [RuVarRef("x", type.name)]), 
 						None(), //Some(\n, len -> [RuVarRef(n.name, type.name)]), 
-						ruTrieEmpty
+						ruTrieEmpty, acc.conf
 					), 
 					supers, makeTree()
 				)
@@ -165,6 +165,7 @@ ComputeArgsAcc(
 );
 
 ruComputeExpArgs(nodes : [RuExpNode]) -> [[RuExpNode]] {
+	if (length(nodes) == 0) [] else
 	ruDoComputeExpArgs(ComputeArgsAcc(nodes, length(nodes) - 1, [])).args
 }
 
@@ -185,23 +186,6 @@ ruDoComputeExpArgs(acc : ComputeArgsAcc) -> ComputeArgsAcc {
 				));
 		}
 	}
-}
-
-ruAddExp2RuTrie(term : RuTerm, expr : RuExp, trie : RuTrie<string, ([RuExpNode])->[RuExpNode]>) -> RuTrie<string, ([RuExpNode])->[RuExpNode]> {
-	term_key = \x -> switch (x) {
-		RuConstRef(c):  c;
-		RuVarRef(v, t): t;
-	}
-	action = \nodes -> {
-		args = ruComputeExpArgs(nodes);
-		fold(expr.nodes, Pair([], 0), \acc, node -> 
-			switch (node) {
-				RuRuleRef(r, len): Pair(concat(acc.first, [node]), acc.second);
-				RuVarRef(v, t): Pair(concat(acc.first, args[acc.second]), acc.second + 1);
-			}
-		).first
-	}
-	ruAdd2Trie(map(term.expr, term_key), Some(action), trie)
 }
 
 ruCollectRule(rule : RuParseRule, acc : RuCollectAcc) -> RuCollectAcc {
@@ -229,10 +213,10 @@ ruCollectRule(rule : RuParseRule, acc : RuCollectAcc) -> RuCollectAcc {
 						RuTypeEnv(env with 
 							trie = ruAddTerm2RuTrie(new_rule.term, 
 								Some(\expr -> {
-									println("rule: " + rule.name + " -- " + i2s(length(expr)) + ", args: " + i2s(length(ruComputeExpArgs(expr))) + ", expr: " + ruExpRPN2s(expr));
+									//println("rule: " + rule.name + " -- " + i2s(length(expr)) + ", args: " + i2s(length(ruComputeExpArgs(expr))) + ", expr: " + ruExpRPN2s(expr));
 									concat(expr, [RuRuleRef(rule.name, length(expr))])
 								}),
-								env.trie
+								env.trie, acc.conf
 							)
 						)
 					);
@@ -271,12 +255,19 @@ ruMakeTerm(term : RuParseExp, vars : Tree<string, RuVar>, acc : RuCollectAcc, co
 	RuTerm(term.type, expr);
 }
 
-arrMaybe2maybeArr(arr : [Maybe<?>]) -> Maybe<[?]>  {
-	fold(arr, Some([]), \acc, x ->
-		switch (acc) {
-			None(): acc;
-			Some(a): maybeMap(x, \y -> concat(a, [y]));
-		}
+RuCollectRet(
+	data : ?,
+	acc : RuCollectAcc
+);
+
+
+
+ruFilterMapCollectRet(arr : [?], acc : RuCollectAcc, fun : (?, RuCollectAcc) -> Maybe<RuCollectRet<??>>) -> RuCollectRet<[??]>  {
+	fold(arr, RuCollectRet([], acc), \ac, x ->
+		eitherMap(fun(x, ac.acc), 
+			\y -> RuCollectRet(concat(ac.data, [y.data]), y.acc),
+			ac
+		)
 	)
 }
 
@@ -287,30 +278,64 @@ ruCollectAxiom(ax : RuParseAxiom, acc : RuCollectAcc) -> RuCollectAcc {
 			acc
 		}
 		None(): {
+			err = \-> { acc.conf.onError("error in axiom " + ax.name, []); acc; }
 			conf1 = ruAddErr2Conf(acc.conf, "\nat axiom " + ax.name);
 			vars = ruCollectVars(ax.vars, acc, conf1);
 			disjs = map(ax.disjs, \d -> RuDisj(d.vars));
-			maxiom = maybeMap2(\prop, hyps -> RuAxiom(ax.name, vars, disjs, hyps, prop))
-			(
-				ruCollectExp(ax.prop, vars, acc, conf1),
-				arrMaybe2maybeArr(map(ax.hyps, \h -> ruCollectHyp(h, vars, acc, conf1)))
-			);
-			switch (maxiom) {
-				Some(axiom): 
-					RuCollectAcc(acc with
-						local = RuMath(acc.local with assertions = setTree(acc.local.assertions, ax.name, axiom))
-					);
-				None(): {
-					acc.conf.onError("error in assertion " + ax.name, []);
-					acc;
+			hyps = ruFilterMapCollectRet(ax.hyps, acc, \h, ac -> ruCollectHyp(h, vars, ac, conf1));
+			if (length(hyps.data) != length(ax.hyps)) {
+				err();
+				acc;
+			} else {
+				switch (ruCollectExp(ax.prop, vars, hyps.acc, conf1)) {
+					Some(prop): {
+						axiom = RuAxiom(ax.name, vars, disjs, hyps.data, prop.data);
+						RuCollectAcc(prop.acc with
+							local = RuMath(acc.local with assertions = setTree(acc.local.assertions, ax.name, axiom))
+						);
+					}
+					None(): err();
 				}
 			}
 		}
 	}
 }
 
-ruCollectExp(ex : RuParseExp, vars : Tree<string, RuVar>, acc : RuCollectAcc, conf : RuConf) -> Maybe<RuExp> {
-	ruParseExp(ruMakeTerm(ex, vars, acc, conf), acc.types, conf)
+ruAddExp2RuTrie(term : RuTerm, expr : RuExp, trie : RuTrie<string, ([RuExpNode])->[RuExpNode]>) -> RuTrie<string, ([RuExpNode])->[RuExpNode]> {
+	term_key = \x -> switch (x) {
+		RuConstRef(c):  c;
+		RuVarRef(v, t): t;
+	}
+	action = \nodes -> {
+		if (length(nodes) == 0) [RuRuleRef("[term: " + ruTerm2s(term.expr) + ", exp: " + ruExpRPN2s(expr.nodes) + "]", 0)] else {
+			//println("worked: [term: " + ruTerm2s(term.expr) + ", exp: " + ruExpRPN2s(expr.nodes) + "]");
+			args = ruComputeExpArgs(nodes);
+			fold(expr.nodes, Pair([], 0), \acc, node -> 
+				switch (node) {
+					RuRuleRef(r, len): Pair(concat(acc.first, [node]), acc.second);
+					RuVarRef(v, t): Pair(concat(acc.first, args[acc.second]), acc.second + 1);
+				}
+			).first
+		}
+	}
+	ruAdd2Trie(map(term.expr, term_key), Some(action), trie, \a1, a2 -> a1);
+}
+
+ruCollectExp(ex : RuParseExp, vars : Tree<string, RuVar>, acc : RuCollectAcc, conf : RuConf) -> Maybe<RuCollectRet<RuExp>> {
+	term = ruMakeTerm(ex, vars, acc, conf);
+	switch (ruParseExp(term, acc.types, conf)) {
+		Some(e): {
+			tenv = lookupTreeDef(acc.types, term.type, ruNoTypeEnv);
+			new_trie = tenv.trie; 
+			//new_trie = ruAddExp2RuTrie(term, e, tenv.trie);
+			new_types = setTree(acc.types, term.type, RuTypeEnv(tenv with trie = new_trie));
+			Some(RuCollectRet(e, RuCollectAcc(acc with 
+				local = RuMath(acc.local with types = new_types),
+				types = new_types,
+			)));
+		}
+		None(): None();
+	}
 }
 
 ruCollectVars(vars : [RuParseVar], acc : RuCollectAcc, conf : RuConf) -> Tree<string, RuVar> {
@@ -325,8 +350,11 @@ ruCollectVars(vars : [RuParseVar], acc : RuCollectAcc, conf : RuConf) -> Tree<st
 	)
 }
 
-ruCollectHyp(hyp : RuParseHyp, vars : Tree<string, RuVar>, acc : RuCollectAcc, conf : RuConf) -> Maybe<RuHyp> {
-	maybeMap(ruCollectExp(hyp.expr, vars, acc, conf), \e -> RuHyp(hyp.ind, e))
+ruCollectHyp(hyp : RuParseHyp, vars : Tree<string, RuVar>, acc : RuCollectAcc, conf : RuConf) -> Maybe<RuCollectRet<RuHyp>> {
+	maybeMap(
+		ruCollectExp(hyp.expr, vars, acc, conf), 
+		\ret -> RuCollectRet(RuHyp(hyp.ind, ret.data), ret.acc)
+	)
 }
 
 ruCollectTheorem(th : RuParseTheorem, acc : RuCollectAcc) -> RuCollectAcc {
@@ -336,33 +364,35 @@ ruCollectTheorem(th : RuParseTheorem, acc : RuCollectAcc) -> RuCollectAcc {
 			acc
 		}
 		None(): {
+			err = \-> { acc.conf.onError("error in theorem " + th.name, []); acc; }
 			conf1 = ruAddErr2Conf(acc.conf, "\nat theorem " + th.name);
 			vars = ruCollectVars(th.vars, acc, conf1);
 			disjs = map(th.disjs, \d -> RuDisj(d.vars));
-			mtheorem = maybeBind(
-				ruCollectProof(th.proof, vars, acc, conf1),
-				\proof ->
-					maybeMap2(\prop, hyps -> RuTheorem(th.name, vars, disjs, hyps, prop, proof))
-					(
-						ruCollectExp(th.prop, vars, acc, conf1),
-						arrMaybe2maybeArr(map(th.hyps, \h -> ruCollectHyp(h, vars, acc, conf1)))
-					)
-			);
-			switch (mtheorem) {
-				Some(theorem): 
-					RuCollectAcc(acc with
-						local = RuMath(acc.local with assertions = setTree(acc.local.assertions, th.name, theorem))
-					);
-				None(): {
-					acc.conf.onError("error in theorem " + th.name, []);
-					acc;
+			hyps = ruFilterMapCollectRet(th.hyps, acc, \h, ac -> ruCollectHyp(h, vars, ac, conf1));
+			if (length(hyps.data) != length(th.hyps)) {
+				err();
+				acc;
+			} else {
+				switch (ruCollectExp(th.prop, vars, hyps.acc, conf1)) { 
+					Some(prop): {
+						switch (ruCollectProof(th.proof, vars, prop.acc, conf1)) {
+							Some(proof): {
+								theorem = RuTheorem(th.name, vars, disjs, hyps.data, prop.data, proof.data);
+								RuCollectAcc(proof.acc with
+									local = RuMath(acc.local with assertions = setTree(acc.local.assertions, th.name, theorem))
+								);
+							}
+							None(): err();
+						}
+					}
+					None(): err();
 				}
 			}
 		}
 	}
 }
 
-ruCollectProof(proof : RuParseProof, vars : Tree<string, RuVar>, acc : RuCollectAcc, conf : RuConf) -> Maybe<RuProof> {
+ruCollectProof(proof : RuParseProof, vars : Tree<string, RuVar>, acc : RuCollectAcc, conf : RuConf) -> Maybe<RuCollectRet<RuProof>> {
 	proof_vars = ruCollectVars(proof.vars, acc, conf);
 	proof_disjs = map(proof.disjs, \d -> RuDisj(d.vars));
 	all_vars = mergeTree(vars, proof_vars);
@@ -370,18 +400,17 @@ ruCollectProof(proof : RuParseProof, vars : Tree<string, RuVar>, acc : RuCollect
 		RuParseHypRef(i): RuHypRef(i);
 		RuParseStepRef(i): RuStepRef(i);
 	}
-	msteps = fold(proof.steps, [], 
-		\ac, s -> concat(ac, 
-			[maybeMap(ruCollectExp(s.expr, all_vars, acc, conf),
-			\e -> RuStep(s.ind, s.assertion, map(s.refs, do_ref), e))]
-		)
+	steps = ruFilterMapCollectRet(proof.steps, acc, 
+		\s, ac -> {
+			maybeMap(ruCollectExp(s.expr, all_vars, acc, conf), 
+				\r -> RuCollectRet(RuStep(s.ind, s.assertion, map(s.refs, do_ref), r.data), r.acc)
+			)
+		}
 	);
-	switch (arrMaybe2maybeArr(msteps)) {
-		Some(steps): Some(RuProof(proof_vars, proof_disjs, steps));
-		None(): None();
+	if (length(steps.data) != length(proof.steps)) None() else {
+		Some(RuCollectRet(RuProof(proof_vars, proof_disjs, steps.data), steps.acc));
 	}
 }
-
 
 ruCollectDef(df : RuParseDef, acc : RuCollectAcc) -> RuCollectAcc {
 	switch (ruLookupAssertion(acc, df.name)) {
@@ -390,6 +419,7 @@ ruCollectDef(df : RuParseDef, acc : RuCollectAcc) -> RuCollectAcc {
 			acc
 		}
 		None(): {
+			err = \-> { acc.conf.onError("error in definition " + df.name, []); acc; }
 			conf1 = ruAddErr2Conf(acc.conf, "\nat definitoin " + df.name);
 			vars = ruCollectVars(df.vars, acc, conf1);
 			disjs = map(df.disjs, \d -> RuDisj(d.vars));
@@ -398,24 +428,29 @@ ruCollectDef(df : RuParseDef, acc : RuCollectAcc) -> RuCollectAcc {
 				if (s == "definiens") concat(ac, df.defs.symbs) else
 				concat(ac, [s])
 			);
-			mdef = 
-			maybeBind(ruCollectExp(df.defm, vars, acc, conf1), \dfm ->
-				maybeBind(ruCollectExp(df.defs, vars, acc, conf1), \dfs ->
-					maybeMap2(\prop, hyps -> RuDef(df.name, vars, disjs, hyps, dfm, dfs, prop))
-					(
-						ruCollectExp(RuParseExp(df.def.type, prop_ex), vars, acc, conf1),
-						arrMaybe2maybeArr(map(df.hyps, \h -> ruCollectHyp(h, vars, acc, conf1)))
-					)
-				)
-			);
-			switch (mdef) {
-				Some(def): 
-					RuCollectAcc(acc with
-						local = RuMath(acc.local with assertions = setTree(acc.local.assertions, df.name, def))
-					);
-				None(): {
-					acc.conf.onError("error in assertion " + df.name, []);
-					acc;
+			hyps = ruFilterMapCollectRet(df.hyps, acc, \h, ac -> ruCollectHyp(h, vars, ac, conf1));
+			if (length(hyps.data) != length(df.hyps)) {
+				err();
+				acc;
+			} else {
+				switch (ruCollectExp(RuParseExp(df.def.type, prop_ex), vars, hyps.acc, conf1)) {
+					Some(prop): {
+						switch (ruCollectExp(df.defm, vars, prop.acc, conf1)) {
+							Some(defm): {
+								switch (ruCollectExp(df.defs, vars, defm.acc, conf1)) {
+									Some(defs): {
+										def = RuDef(df.name, vars, disjs, hyps.data, defm.data, defs.data, prop.data);
+										RuCollectAcc(defs.acc with
+											local = RuMath(acc.local with assertions = setTree(acc.local.assertions, df.name, def))
+										);
+									}
+									None(): err();
+								}
+							}
+							None(): err();
+						}
+					}
+					None(): err();
 				}
 			}
 		}
