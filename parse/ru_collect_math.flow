@@ -45,42 +45,60 @@ ruCollectSource(src : RuParseSource, acc : RuMath) -> RuMath {
 			acc0 = RuCollectAcc(acc, ruMakeRuMath(acc.conf), acc.types, acc.conf);
 			acc1 = fold(src.decls, acc0, \ac, block -> 
 				switch(block) {
-					RuParseDecl(): ruCollectDecl(block, ac);
+					RuParseDecl(): ruCollectSyntax(block, ac);
 					RuParseComment(__): ac;
 				}
 			);
+			parse_decls : [RuParseDecl] = filtermap(src.decls, \block -> 
+				switch(block) {
+					RuParseDecl(): Some(block);
+					RuParseComment(__): None();
+				}
+			);
+			created_decls = concurrent(true, map(parse_decls, \decl -> \-> ruCreateAssertion(decl, acc1)));
+			assertions = filtermap(created_decls, idfn);
+			acc2 = fold(assertions, acc1, \ac, ass -> 
+				RuCollectAcc(ac with
+					local = RuMath(ac.local with assertions = setTree(ac.local.assertions, ass.name, ass))
+				)
+			);
 			decls = fold(src.decls, [], \ac, block -> 
 				switch (block) {
-					RuParseConst(name,__,__):            concat(ac, [lookupTreeDef(acc1.local.consts, name, ruNoConst)]);
-					RuParseType(name,__):                concat(ac, [lookupTreeDef(acc1.local.types, name, ruNoTypeEnv).type]);
-					RuParseRule(name,__,__):             concat(ac, [lookupTreeDef(acc1.local.rules, name, ruNoRule)]);
-					RuParseAxiom(name,__,__,__,__):      concat(ac, [lookupTreeDef(acc1.local.assertions, name, ruNoAxiom)]);
-					RuParseTheorem(name,__,__,__,__,__): concat(ac, [lookupTreeDef(acc1.local.assertions, name, ruNoTheorem)]);
-					RuParseDef(name,__,__,__,__,__,__):  concat(ac, [lookupTreeDef(acc1.local.assertions, name, ruNoAxiom)]);
+					RuParseConst(name,__,__):            concat(ac, [lookupTreeDef(acc2.local.consts, name, ruNoConst)]);
+					RuParseType(name,__):                concat(ac, [lookupTreeDef(acc2.local.types, name, ruNoTypeEnv).type]);
+					RuParseRule(name,__,__):             concat(ac, [lookupTreeDef(acc2.local.rules, name, ruNoRule)]);
+					RuParseAxiom(name,__,__,__,__):      concat(ac, [lookupTreeDef(acc2.local.assertions, name, ruNoAxiom)]);
+					RuParseTheorem(name,__,__,__,__,__): concat(ac, [lookupTreeDef(acc2.local.assertions, name, ruNoTheorem)]);
+					RuParseDef(name,__,__,__,__,__,__):  concat(ac, [lookupTreeDef(acc2.local.assertions, name, ruNoAxiom)]);
 					RuParseComment(text):                concat(ac, [RuComment(text)]);
 					RuParseTheory(name, __):             ac; // TODO
 				}
 			);
-			if (acc.conf.verbose > 0) {
+			if (acc2.conf.verbose > 0) {
 				println("collected: " + src.info.file + " in " + d2st((timestamp() - start)/ 1000.0, 4) + " s");
 			}
-			RuMath(acc1.local with 
+			RuMath(acc2.local with 
 				sources = makeTree1(src.info.file, RuSource(imps, decls, src.info))
 			);
 		}
 	}
 }
 
-ruCollectDecl(decl : RuParseDecl, acc : RuCollectAcc) -> RuCollectAcc {
+ruCollectSyntax(decl : RuParseDecl, acc : RuCollectAcc) -> RuCollectAcc {
 	switch (decl) {
-		RuParseConst(__,__,__):            ruCollectConst(decl, acc);
-		RuParseType(__,__):                ruCollectType(decl, acc);
-		RuParseRule(__,__,__):             ruCollectRule(decl, acc);
-		RuParseAxiom(__,__,__,__,__):      ruCollectAxiom(decl, acc);
-		RuParseTheorem(__,__,__,__,__,__): ruCollectTheorem(decl, acc);
-		RuParseDef(__,__,__,__,__,__,__):  ruCollectDef(decl, acc);
-		RuParseComment(__):                acc;
-		RuParseTheory(name, decls):        acc; // TODO 
+		RuParseConst(__,__,__): ruCollectConst(decl, acc);
+		RuParseType(__,__):     ruCollectType(decl, acc);
+		RuParseRule(__,__,__):  ruCollectRule(decl, acc);
+		default: acc;
+	}
+}
+
+ruCreateAssertion(decl : RuParseDecl, acc : RuCollectAcc) -> Maybe<RuAssertion> {
+	switch (decl) {
+		RuParseAxiom(__,__,__,__,__):      ruCreateAxiom(decl, acc);
+		RuParseTheorem(__,__,__,__,__,__): ruCreateTheorem(decl, acc);
+		RuParseDef(__,__,__,__,__,__,__):  ruCreateDef(decl, acc);
+		default: None();
 	}
 }
 
@@ -222,28 +240,24 @@ ruMakeTerm(term : RuParseExp, vars : Tree<string, RuVar>, acc : RuCollectAcc, co
 	RuTerm(term.type, expr);
 }
 
-ruCollectAxiom(ax : RuParseAxiom, acc : RuCollectAcc) -> RuCollectAcc {
+ruCreateAxiom(ax : RuParseAxiom, acc : RuCollectAcc) -> Maybe<RuAxiom> {
 	switch (ruLookupAssertion(acc, ax.name)) {
 		Some(__): {
 			acc.conf.onError("assertion with name " + ax.name + " is already defined", []);
-			acc
+			None();
 		}
 		None(): {
-			err = \-> { acc.conf.onError("error in axiom " + ax.name, []); acc; }
+			err = \-> { acc.conf.onError("error in axiom " + ax.name, []); None(); }
 			conf1 = ruAddErr2Conf(acc.conf, "\nat axiom " + ax.name);
 			vars = ruCollectVars(ax.vars, acc, conf1);
 			disjs = map(ax.disjs, \d -> RuDisj(d.vars));
 			hyps = filtermap(ax.hyps, \h -> ruCollectHyp(h, vars, acc, conf1));
 			if (length(hyps) != length(ax.hyps)) {
 				err();
-				acc;
 			} else {
 				switch (ruCollectExp(ax.prop, vars, acc, conf1)) {
 					Some(prop): {
-						axiom = RuAxiom(ax.name, vars, disjs, hyps, prop);
-						RuCollectAcc(acc with
-							local = RuMath(acc.local with assertions = setTree(acc.local.assertions, ax.name, axiom))
-						);
+						Some(RuAxiom(ax.name, vars, disjs, hyps, prop));
 					}
 					None(): err();
 				}
@@ -275,31 +289,25 @@ ruCollectHyp(hyp : RuParseHyp, vars : Tree<string, RuVar>, acc : RuCollectAcc, c
 	)
 }
 
-ruCollectTheorem(th : RuParseTheorem, acc : RuCollectAcc) -> RuCollectAcc {
+ruCreateTheorem(th : RuParseTheorem, acc : RuCollectAcc) -> Maybe<RuTheorem> {
 	switch (ruLookupAssertion(acc, th.name)) {
 		Some(__): {
 			acc.conf.onError("assertion with name " + th.name + " is already defined", []);
-			acc
+			None()
 		}
 		None(): {
-			err = \-> { acc.conf.onError("error in theorem " + th.name, []); acc; }
+			err = \-> { acc.conf.onError("error in theorem " + th.name, []); None(); }
 			conf1 = ruAddErr2Conf(acc.conf, "\nat theorem " + th.name);
 			vars = ruCollectVars(th.vars, acc, conf1);
 			disjs = map(th.disjs, \d -> RuDisj(d.vars));
 			hyps = filtermap(th.hyps, \h -> ruCollectHyp(h, vars, acc, conf1));
 			if (length(hyps) != length(th.hyps)) {
 				err();
-				acc;
 			} else {
 				switch (ruCollectExp(th.prop, vars, acc, conf1)) { 
 					Some(prop): {
 						switch (ruCollectProof(th.proof, vars, acc, conf1)) {
-							Some(proof): {
-								theorem = RuTheorem(th.name, vars, disjs, hyps, prop, proof);
-								RuCollectAcc(acc with
-									local = RuMath(acc.local with assertions = setTree(acc.local.assertions, th.name, theorem))
-								);
-							}
+							Some(proof): Some(RuTheorem(th.name, vars, disjs, hyps, prop, proof));
 							None(): err();
 						}
 					}
@@ -329,14 +337,14 @@ ruCollectProof(proof : RuParseProof, vars : Tree<string, RuVar>, acc : RuCollect
 	}
 }
 
-ruCollectDef(df : RuParseDef, acc : RuCollectAcc) -> RuCollectAcc {
+ruCreateDef(df : RuParseDef, acc : RuCollectAcc) -> Maybe<RuDef> {
 	switch (ruLookupAssertion(acc, df.name)) {
 		Some(__): {
 			acc.conf.onError("assertion with name " + df.name + " is already defined", []);
-			acc
+			None()
 		}
 		None(): {
-			err = \-> { acc.conf.onError("error in definition " + df.name, []); acc; }
+			err = \-> { acc.conf.onError("error in definition " + df.name, []); None(); }
 			conf1 = ruAddErr2Conf(acc.conf, "\nat definitoin " + df.name);
 			vars = ruCollectVars(df.vars, acc, conf1);
 			disjs = map(df.disjs, \d -> RuDisj(d.vars));
@@ -348,19 +356,14 @@ ruCollectDef(df : RuParseDef, acc : RuCollectAcc) -> RuCollectAcc {
 			hyps = filtermap(df.hyps, \h -> ruCollectHyp(h, vars, acc, conf1));
 			if (length(hyps) != length(df.hyps)) {
 				err();
-				acc;
 			} else {
 				switch (ruCollectExp(RuParseExp(df.def.type, prop_ex), vars, acc, conf1)) {
 					Some(prop): {
 						switch (ruCollectExp(df.defm, vars, acc, conf1)) {
 							Some(defm): {
 								switch (ruCollectExp(df.defs, vars, acc, conf1)) {
-									Some(defs): {
-										def = RuDef(df.name, vars, disjs, hyps, defm, defs, prop);
-										RuCollectAcc(acc with
-											local = RuMath(acc.local with assertions = setTree(acc.local.assertions, df.name, def))
-										);
-									}
+									Some(defs): 
+										Some(RuDef(df.name, vars, disjs, hyps, defm, defs, prop));
 									None(): err();
 								}
 							}
