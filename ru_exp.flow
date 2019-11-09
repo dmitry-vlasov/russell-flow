@@ -1,0 +1,166 @@
+import ru_math;
+
+export {
+	ruApply(e : RuExp, s : Tree<RuVarRef, RuExp>, math : RuMath) -> RuExp;
+	ruMatch(e : RuExp, pattern : RuExp, math : RuMath) -> Maybe<Tree<RuVarRef, RuExp>>;
+	ruMergeSubst(s1 : Tree<RuVarRef, RuExp>, s2 : Tree<RuVarRef, RuExp>) -> Maybe<Tree<RuVarRef, RuExp>>;
+	ruSubst2s(s : Tree<RuVarRef, RuExp>, math : RuMath) -> string;
+}
+
+ruMergeSubst(s1 : Tree<RuVarRef, RuExp>, s2 : Tree<RuVarRef, RuExp>) -> Maybe<Tree<RuVarRef, RuExp>> {
+	conflict = ref false;
+	s0 = mergeTreeCustom(s1, s2, \__, e1, e2 -> if (e1.nodes == e2.nodes) e1 else { conflict := true; e1 });
+	if (^conflict) None() else Some(s0);
+}
+
+ruSubst2s(s : Tree<RuVarRef, RuExp>, math : RuMath) -> string {
+	strGlue(map(tree2pairs(s), \p -> p.first.name + " => " + ruExp2s(p.second, math.rules)) 
+	, "\n")
+}
+
+RuMatchAcc(
+	expInd : int,
+	pattInd : int
+);
+
+ruMatch(e : RuExp, pattern : RuExp, math : RuMath) -> Maybe<Tree<RuVarRef, RuExp>> {
+	e_nodes = reverseA(e.nodes);
+	fold(reverseA(pattern.nodes), Pair(Some(makeTree()), 0), \acc, n1 ->
+		switch (acc.first) {
+			None(): acc;
+			Some(s): {
+				switch (n1) {
+					RuRuleRef(r1,__,__,__): {
+						switch (e_nodes[acc.second]) {
+							RuRuleRef(r2,__,__,__): 
+								if (r1 == r2) {
+									Pair(acc.first, acc.second + 1);
+								} else {
+									Pair(None(), 0);
+								}
+							RuVarRef(__,__): 
+								Pair(None(), 0);
+						}
+					}
+					RuVarRef(v1, t1): {
+						n2 = e_nodes[acc.second];
+						switch (n2) {
+							RuRuleRef(r2, t2, __, len): {
+								sub_exp = reverseA(subrange(e_nodes, acc.second, len + 1));
+								if (t1 == t2) {
+									Pair(
+										Some(setTree(s, n1, RuExp(sub_exp, e.pos))), 
+										acc.second + len + 1
+									);
+								} else {
+									switch (ruSuperRule(t2, t1, math)) {
+										Some(super): 
+											Pair(
+												Some(setTree(s, n1,
+													RuExp(
+														concat(sub_exp, [RuRuleRef(super.name, t1, 1, 1)]), 
+														e.pos
+													)
+												)), 
+												acc.second + len + 1
+											);
+										None():
+											Pair(None(), 0);
+									}
+								}
+							}
+							RuVarRef(v2, t2): {
+								if (t1 == t2) {
+									Pair(
+										Some(setTree(s, n1, RuExp([n2], e.pos))), 
+										acc.second + 1
+									);
+								} else {
+									switch (ruSuperRule(t2, t1, math)) {
+										Some(super): 
+											Pair(
+												Some(setTree(s, n1, RuExp([n2, RuRuleRef(super.name, t1, 1, 1)], e.pos))), 
+												acc.second + 1
+											);
+										None(): 
+											Pair(None(), 0);
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	).first;
+}
+
+ruSuperRule(infer : string, super : string, math : RuMath) -> Maybe<RuRule> {
+	switch (lookupTree(math.types, infer)) {
+		Some(infEnv): lookupTree(infEnv.supers, super);
+		None(): {
+			math.conf.onError("unknown type: " + infer, []);
+			quit(0);
+			None();
+		}
+	}
+}
+
+RuApplyStack(
+	parent : Maybe<RuApplyStack>,
+	len : int
+);
+
+ruApplyComputeLen(arity : int, stack_len : Pair<RuApplyStack, int>, math : RuMath) -> Pair<RuApplyStack, int> {
+	if (arity == 0) stack_len else {
+		switch (stack_len.first.parent) {
+			Some(p): 
+				ruApplyComputeLen(
+					arity - 1, 
+					Pair(p, stack_len.first.len + stack_len.second),
+					math
+				);
+			None(): {
+				math.conf.onError("empty stack pop at ruApplyComputeLen", []);
+				quit(0);
+				stack_len;
+			}
+		}
+	}
+}
+
+RuApplyAcc(
+	nodes : [RuExpNode],
+	stack : RuApplyStack
+);
+
+ruApply(e : RuExp, s : Tree<RuVarRef, RuExp>, math : RuMath) -> RuExp {
+	RuExp(fold(e.nodes, RuApplyAcc([], RuApplyStack(None(), 0)), 
+		\acc, n -> {
+			switch (n) {
+				RuRuleRef(r, t, a, l): {
+					st_len = ruApplyComputeLen(a, Pair(acc.stack, 0), math);
+					RuApplyAcc(
+						concat(acc.nodes, [RuRuleRef(r, t, a, st_len.second)]),
+						RuApplyStack(Some(st_len.first), st_len.second + 1)
+					);
+				}
+				RuVarRef(v, t): {
+					switch (lookupTree(s, n)) {
+						Some(x): 
+							RuApplyAcc(
+								concat(acc.nodes, x.nodes),
+								RuApplyStack(Some(acc.stack), length(x.nodes))
+							);
+						None(): 
+							RuApplyAcc(
+								concat(acc.nodes, [n]),
+								RuApplyStack(Some(acc.stack), 1)
+							);
+					}
+				}
+			}
+		}).nodes
+		, e.pos
+	)
+}
