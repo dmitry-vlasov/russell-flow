@@ -1,0 +1,368 @@
+import lingo/pegcode/driver;
+import fs/filesystem;
+import net/url_parameter;
+import metamath_ast;
+
+metamath_grammar = 
+	"source = ws block:b { Source(:b) };
+	block   = element*:es { Block(:es) };
+	element = 
+		comment | disj | essential | provable | 
+		\"${\" ws block:b \"$}\" ws { :b } | 
+		axiomatic | const | var | floating | include;
+
+	const     = \"$c\" s string+:s \"$.\" ws { Const(:s) };
+	var       = \"$v\" s string+:v \"$.\" ws { Var(:v) };
+	disj      = \"$d\" s string+:d \"$.\" ws { Disj(:d) };
+
+	floating  = label:l \"$f\" s string:t string:v \"$.\" ws { Floating(:l, :t, :v) };
+	essential = label:l \"$e\" s expr:e \"$.\" ws { Essential(:l, :e) };
+	axiomatic = label:l \"$a\" s expr:e \"$.\" ws { Axiomatic(:l, :e) };
+	provable  = label:l \"$p\" s expr:e \"$=\" s proof:p { Provable(:l, :e, :p) };
+
+	proof     = label+:l \"$.\" ws { Proof(:l) };
+	expr      = symb+:s { Expr(:s) };
+
+	string    = (!s char_)+$s s { $s };
+	symb      = (!s char_)+$s s { createSymb($s) };
+	label     = (!s char_)+$l s { $l };
+	comment   = \"$(\" (!\"$\" char_ | \"$\" !\")\" char_)* $c \"$)\" ws { Comment($c) };
+	include   = \"$[\" (!\"$]\" char_)* $i \"$]\" ws { Include($i) };
+
+	s = ws_+;
+	ws = ws_*;
+	ws_ = ' ' | '\\t' | '\\n' | '\\r' | comment;
+	char_ = !'$' '\\u0000'-'\\uFFFF';"
+
+TheoryEnv(
+	vars : Set<string>,
+	disj : List<Disj>,
+	hyps : List<Hypothesis>,
+	labeled : Tree<string, Labeled>, 
+	consts : Set<string>,
+	statements : List<Statement>
+);
+
+produceTheoryEnv(block : Block, env : TheoryEnv) -> TheoryEnv {
+	fold(block.elements, env,
+		\e, element -> {
+			switch (element) {
+				Comment(__): e;
+				Include(__): e;
+				Var(vars):
+					TheoryEnv(fold(vars, e.vars, \acc, v-> insertSet(acc, v)), e.disj, e.hyps, e.labeled, e.consts, e.statements);
+				Disj(__): 
+					TheoryEnv(e.vars, Cons(element, e.disj), e.hyps, e.labeled, e.consts, e.statements);
+				Const(consts): 
+					TheoryEnv(e.vars, e.disj, e.hyps, e.labeled, fold(consts, e.consts, \acc, c-> insertSet(acc, c)), e.statements);
+				Essential(label, __):
+					TheoryEnv(e.vars, e.disj, Cons(element, e.hyps), setTree(e.labeled, label, markVarsInHypothesis(element, e.vars)), e.consts, e.statements);
+				Floating(label, __, __):
+					TheoryEnv(e.vars, e.disj, Cons(element, e.hyps), setTree(e.labeled, label, markVarsInHypothesis(element, e.vars)), e.consts, e.statements);
+				Axiomatic(label, __): {
+					assertion = makeAssertion(element, e);
+					TheoryEnv(e.vars, e.disj, e.hyps, setTree(e.labeled, label, assertion), e.consts, Cons(assertion.statement, e.statements));
+				}
+				Provable(label, __, __): {
+					assertion = makeAssertion(element, e);
+					TheoryEnv(e.vars, e.disj, e.hyps, setTree(e.labeled, label, assertion), e.consts, Cons(assertion.statement, e.statements));
+				}
+				Block(__): {
+					block_env = produceTheoryEnv(element, e);
+					TheoryEnv(e.vars, e.disj, e.hyps, block_env.labeled, block_env.consts, block_env.statements);
+				}
+			}
+		}
+	)
+}
+
+makeAssertion(statement : Statement, env : TheoryEnv) -> Assertion {
+	getVars = \expr -> {
+		fold(expr.symbs,
+			makeSet(),
+			\acc, symb -> {
+				isVar = containsSet(env.vars, symb.literal);
+				isConst = containsSet(env.consts, symb.literal);
+				if (isVar == isConst) {
+					if (isVar) {
+						handleError("symbol " + symb.literal + " is const and var at the same time");
+					} else {
+						handleError("symbol " + symb.literal + " is not const neither var");
+					}
+				}
+				if (isVar) insertSet(acc, symb.literal) else acc
+			}
+		)
+	};
+	vars = foldList(env.hyps, getVars(statement.expr), 
+		\acc, hyp -> {
+			switch (hyp) {
+				Essential(__, expr): mergeSets(acc, getVars(expr));
+				Floating(__,__,__): acc;
+			}
+		}
+	);
+	hyps = foldList(env.hyps, [],
+		\acc, hyp : Hypothesis -> switch (hyp) {
+			Essential(label, expr): 
+				concat(acc, [Essential(label, markVarsInExpr(expr, vars))]);
+			Floating(label, type, var): 
+				if (containsSet(vars, var)) concat(acc, [hyp]) else acc;
+		}
+	);
+	Assertion(list2array(env.disj), hyps, markVarsInStatement(statement, vars));
+}
+
+markVarsInHypothesis(hyp : Hypothesis, vars : Set<string>) -> Hypothesis {
+	switch (hyp) {
+		Essential(label, expr): Essential(label, markVarsInExpr(expr, vars));
+		default: hyp;
+	}
+}
+
+markVarsInStatement(stat : Statement, vars : Set<string>) -> Statement {
+	switch (stat) {
+		Axiomatic(label, expr): Axiomatic(label, markVarsInExpr(expr, vars));
+		Provable(label, expr, proof): Provable(label, markVarsInExpr(expr, vars), proof);
+	}
+}
+
+markVarsInExpr(expr : Expr, vars : Set<string>) -> Expr {
+	Expr(map(expr.symbs, \symb -> 
+		Symb(symb.literal, containsSet(vars, symb.literal))
+	))
+}
+
+ExecutionAcc(
+	stack : List<Expr>,
+	essentials : List<ExprPair>,
+	subst : Tree<string, Expr>
+);
+
+ExprPair(
+	fromStack : Expr,
+	fromHyp   : Expr
+);
+
+handleError(message : string) -> void {
+	println("Error: " + message);
+}
+
+pickFromStack(stack : List<Expr>, hyps : [Hypothesis]) -> Maybe<ExecutionAcc> {
+	fold(hyps, Some(ExecutionAcc(stack, makeList(), makeTree())),
+		\macc, hyp -> {
+			maybeBind(macc,
+				\acc -> {
+					if (isEmptyList(acc.stack)) {
+						handleError("empty stack in the middle of proof");
+						None();
+					} else {
+						e = headList(acc.stack, Expr([]));
+						switch (hyp) {
+							Essential(__, expr):
+								Some(ExecutionAcc(
+									tailList(acc.stack), 
+									Cons(ExprPair(e, expr), acc.essentials), 
+									acc.subst
+								));
+							Floating(__, type, var): {
+								if (length(e.symbs) == 0) {
+									handleError("empty expression on stack");
+									None();
+								} else {
+									e_type = e.symbs[0].literal;
+									if (e_type != type) {
+										handleError("wrong type of expression on stack: " + e_type + " != " + type);
+										None()
+									} else {
+										e_expr = Expr(tailFrom(e.symbs, 1));
+										Some(ExecutionAcc(
+											tailList(acc.stack),
+											acc.essentials,
+											setTree(acc.subst, var, e_expr)
+										));
+									}
+								}
+							}
+						}
+					}
+				}
+			)
+		}
+	)
+}
+
+checkSubstitution(subst : Tree<string, Expr>, disj : [Disj], theorem : Assertion) -> bool {
+	forall(disj, \dis -> {
+			mapped = fold(dis.vars, [], 
+				\acc, v -> switch(lookupTree(subst, v)) {
+					Some(e): concat(acc, [e]);
+					None(): acc;
+				}
+			);
+			getVars = \e -> fold(e.symbs, makeSet(), \acc, symb -> if (symb.isVar) insertSet(acc, symb.literal) else acc);
+			foldi(mapped, true, \i, acc1, e1 -> 
+				foldi(mapped, acc1, \j, acc2, e2 -> 
+					if (j <= i || !acc2) acc2 else {
+						vars1 = getVars(e1);
+						vars2 = getVars(e2);
+						if (!isEmptySet(intersectSets(vars1, vars2))) {
+							handleError("expressions " + expr2s(e1) + " and " + expr2s(e2) + " have common vars - disjointed restrictions violation");
+							false;
+						} else {
+							foldSet(vars1, true, \ac1, v1 ->
+								foldSet(vars2, ac1, \ac2, v2 -> {
+										ret = exists(theorem.disj,
+											\d -> exists(d.vars, \w -> w == v1) && exists(d.vars, \w -> w == v2)
+										);
+										if (!ret) {
+											handleError("variables " + v1 + " and " + v2 + " are not inherently disjointed in theorem " + theorem.statement.label);
+										}
+										ret
+									}
+								)
+							)
+						}
+					}
+				)
+			)
+		}
+	)
+}
+
+executeRPNstep(label : string, mstack : Maybe<List<Expr>>, entities : Tree<string, Labeled>, theorem : Assertion) -> Maybe<List<Expr>> {
+	maybeBind(mstack, 
+		\stack -> {
+			switch (lookupTree(entities, label)) {
+				Some(labeled): {
+					switch (labeled) {
+						Assertion(disj, hyps, statement): {
+							maybeBind(pickFromStack(stack, hyps),
+								\acc -> {
+									if (forall(list2array(acc.essentials), \pair -> {
+											applied = applySubstitution(pair.fromHyp, acc.subst);
+											if (applied != pair.fromStack) {
+												handleError("applied expression differs from stack value: " + expr2s(applied) + " != " + expr2s(pair.fromStack));
+												false;
+											} else {
+												true;
+											}
+										}
+									)) {
+										applied = applySubstitution(statement.expr, acc.subst);
+										if (checkSubstitution(acc.subst, disj, theorem)) {
+											Some(Cons(applied, acc.stack));
+										} else {
+											None();
+										}
+									} else {
+										None();
+									}
+								}
+							)
+						}
+						Essential(__, expr): Some(Cons(expr, stack));
+						Floating(__, type, var): Some(Cons(Expr([Symb(type, false), Symb(var, true)]), stack));
+					}
+				}
+				None(): {
+					handleError("unknown label: " + label);
+					None();
+				}
+			}
+		}
+	)
+}
+
+verifyAssertion(assertion : Assertion, theory : Theory) -> bool {
+	switch(assertion.statement) {
+		Axiomatic(__,__): true;
+		Provable(th_label, expr, proof): {
+			maybe_stack = fold(proof.labels, Some(makeList()),
+				\stack, label -> executeRPNstep(label, stack, theory.labeled, assertion)
+			);
+			eitherMap(maybe_stack,
+				\stack -> {
+					if (!isEmptyList(tailList(stack))) {
+						handleError("non-empty stack at the end of proof");
+						false;
+					} else if (expr != headList(stack, Expr([]))) {
+						head = headList(stack, Expr([]));
+						handleError("expression on the top of the stack differs from provable expression: " + expr2s(expr) + " != " + expr2s(head));
+						false;
+					} else {
+						true;
+					}
+				},
+				false
+			)
+		}
+	}
+}
+
+verifyTheory(theory : Theory) -> void {
+	iter(theory.assertions, 
+		\assertion -> {
+			if (!verifyAssertion(assertion, theory)) {
+				println("proof of " + assertion.statement.label + " is wrong");
+			} else {
+				//println("proof of " + assertion.statement.label + " is ok");
+			}
+		}
+	)
+}
+
+main() {
+	file = getUrlParameterDef("file", "");
+	if (file == "") {
+		println("provide file name with 'file=<path>' option");
+	} else {
+		if (fileExists(file)) {
+			total_start_time = timestamp();
+			println("Start verification of " + file);
+			parsing_start_time = timestamp();
+			parser = compilePegGrammar(metamath_grammar);
+			ast = parsic(
+				parser, 
+				getFileContent(file), 
+				SemanticActions(setTree(defaultPegActions.t, "createSymb", \s -> Symb(s[0], false)))
+			);
+			println("\tparsing time: " + d2st((timestamp() - parsing_start_time) / 1000.0, 2) + "s");
+			
+			theory_building_start_time = timestamp();
+			env = produceTheoryEnv(ast.top, TheoryEnv(makeSet(), makeList(), makeList(), makeTree(), makeSet(), makeList()));
+			theory = Theory(
+				reverseA(foldList(env.statements, [], \acc, statement -> {
+						switch (lookupTree(env.labeled, statement.label)) {
+							Some(labeled): {
+								switch (labeled) {
+									Assertion(__,__,__): concat(acc, [labeled]);
+									default: acc;
+								}
+							}
+							None(): acc;
+						}
+					}
+				)),
+				env.labeled
+			);
+			println("\ttheory building time: " + d2st((timestamp() - theory_building_start_time) / 1000.0, 2) + "s");
+			axiom_count = fold(theory.assertions, 0, 
+				\acc, a -> switch(a.statement) {
+					Axiomatic(__,__): acc + 1;
+					Provable(__,__,__): acc;
+				}
+			);
+			
+			verification_start_time = timestamp();
+			verifyTheory(theory);
+			println("\tverification time: " + d2st((timestamp() - verification_start_time) / 1000.0, 2) + "s");
+			
+			println("there are " + i2s(length(theory.assertions)) + " assertions, " + 
+				i2s(axiom_count) + " are axioms and " + i2s(length(theory.assertions) - axiom_count) + " are theorems");
+			println("Total processing time: " + d2st((timestamp() - total_start_time) / 1000.0, 2) + "s");
+		} else {
+			println("cannot open file " + file);
+		}
+	}
+}

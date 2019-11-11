@@ -1,0 +1,107 @@
+import fs/filesystem;
+import sys/concurrent;
+import math/stringmath;
+import lingo/compiler/syntaxtree_util;
+import ru_conf;
+import ru_fileinfo;
+
+export {
+	MmLoadSource(imps : [string], src : string, info : RuFileInfo);
+	mmLoad(conf : RuConf) -> Tree<string, RuLoadSource>;
+}
+
+ruLoad(conf : RuConf) -> Tree<string, RuLoadSource> {
+	ruLoadImports([conf.file], conf, makeTree())
+}
+
+ruLoadImports(imports : [string], conf : RuConf, acc : Tree<string, RuLoadSource>) -> Tree<string, RuLoadSource> {
+	if (imports == []) acc else {
+		loaded = filtermap(
+			concurrent(true, map(imports, \imp -> \ -> ruLoadSource(imp, conf))), 
+			idfn
+		);
+		acc1 = fold(loaded, acc, \ac, l -> setTree(ac, l.info.file, l));
+		new_imports = fold(loaded, makeSet(), \ac, l -> 
+			fold(l.imps, ac, \a, p ->
+				if (containsKeyTree(acc1, ruTrimPath(p, conf))) a else insertSet(a, p)
+			)
+		);
+		ruLoadImports(set2array(new_imports), conf, acc1)
+	}
+}
+
+ruLoadSource(file : string, conf : RuConf) -> Maybe<RuLoadSource> {
+	start = timestamp();
+	trimmed = ruTrimPath(file, conf);
+	resolved = ruFindPath(trimmed, conf);
+	if (fileExists(resolved)) {
+		src_str = getFileContent(resolved);
+		imports = filter(ruParseLoad(src_str), \path -> !strContains(path, "Appendix___"));
+		Some(RuLoadSource(imports, src_str, makeRuFileInfo(trimmed, resolved)));
+	} else {
+		conf.onError("file " + file + " is not found", []);
+		None()
+	}
+}
+
+RuParseLoadAcc(
+	src : string,
+	pos : int,
+	imports : [string],
+	state : RuParseLoadState
+);
+
+RuParseLoadState ::= RuParseLoadCommentML, RuParseLoadCommentSL, RuParseLoadSrc;
+	RuParseLoadCommentML(); 
+	RuParseLoadCommentSL();
+	RuParseLoadSrc();
+
+ruParseLoad(src : string) -> [string] {
+	ruDoParseLoad(RuParseLoadAcc(src, 0, [], RuParseLoadSrc())).imports
+}
+
+ruDoParseLoad(acc : RuParseLoadAcc) -> RuParseLoadAcc {
+	if (acc.pos >= strlen(acc.src)) acc else {
+		switch (acc.state) {
+			RuParseLoadCommentSL(): {
+				i = strRangeIndexOf(acc.src, "\n", acc.pos, strlen(acc.src));
+				if (i == -1) acc else 
+				ruDoParseLoad(RuParseLoadAcc(acc with 
+					pos = i + 1,
+					state = RuParseLoadSrc()
+				))
+			}
+			RuParseLoadCommentML(): {
+				i = strRangeIndexOf(acc.src, "*/", acc.pos, strlen(acc.src));
+				if (i == -1) acc else 
+				ruDoParseLoad(RuParseLoadAcc(acc with 
+					pos = i + 2,
+					state = RuParseLoadSrc()
+				))
+			}
+			RuParseLoadSrc(): {
+				if (substring(acc.src, acc.pos, 2) == "//") {
+					ruDoParseLoad(RuParseLoadAcc(acc with 
+						pos = acc.pos + 2,
+						state = RuParseLoadCommentSL()
+					))
+				} else if (substring(acc.src, acc.pos, 2) == "/*") {
+					ruDoParseLoad(RuParseLoadAcc(acc with 
+						pos = acc.pos + 2,
+						state = RuParseLoadCommentML()
+					))
+				} else if (substring(acc.src, acc.pos, 6) == "import") {
+					i = strRangeIndexOf(acc.src, ";;", acc.pos + 6, strlen(acc.src));
+					if (i == -1) acc else
+					ruDoParseLoad(RuParseLoadAcc(acc with 
+						pos = i + 2,
+						imports = concat(acc.imports, [trim(substring(acc.src, acc.pos + 6, i - (acc.pos + 6)))])
+					))
+				} else {
+					ruDoParseLoad(RuParseLoadAcc(acc with pos = acc.pos + 1))
+				}
+			}
+		}
+	}
+}
+
