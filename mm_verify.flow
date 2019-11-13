@@ -1,0 +1,188 @@
+import ru_conf;
+import mm_src;
+
+export {
+	mmVerifyMath(math : MmMath) -> bool;
+}
+
+MmExecutionAcc(
+	stack : List<MmExpr>,
+	essentials : List<MmExprPair>,
+	subst : Tree<string, MmExpr>
+);
+
+MmExprPair(
+	fromStack : MmExpr,
+	fromHyp   : MmExpr
+);
+
+mmPickFromStack(stack : List<MmExpr>, hyps : [MmHyp], conf : RuConf) -> Maybe<MmExecutionAcc> {
+	fold(hyps, Some(MmExecutionAcc(stack, makeList(), makeTree())),
+		\macc, hyp -> {
+			maybeBind(macc,
+				\acc -> {
+					if (isEmptyList(acc.stack)) {
+						conf.onError("empty stack in the middle of proof", []);
+						None();
+					} else {
+						e = headList(acc.stack, MmExpr([]));
+						switch (hyp) {
+							MmEssential(__, expr):
+								Some(MmExecutionAcc(
+									tailList(acc.stack), 
+									Cons(MmExprPair(e, expr), acc.essentials), 
+									acc.subst
+								));
+							MmFloating(__, type, var): {
+								if (length(e.symbs) == 0) {
+									conf.onError("empty expression on stack", []);
+									None();
+								} else {
+									e_type = e.symbs[0].literal;
+									if (e_type != type) {
+										conf.onError("wrong type of expression on stack: " + e_type + " != " + type, []);
+										None()
+									} else {
+										e_expr = MmExpr(tailFrom(e.symbs, 1));
+										Some(MmExecutionAcc(
+											tailList(acc.stack),
+											acc.essentials,
+											setTree(acc.subst, var, e_expr)
+										));
+									}
+								}
+							}
+						}
+					}
+				}
+			)
+		}
+	)
+}
+
+mmCheckSubstitution(subst : Tree<string, MmExpr>, disj : [MmDisj], theorem : MmAssertion, conf : RuConf) -> bool {
+	forall(disj, \dis -> {
+			mapped = fold(dis.vars, [], 
+				\acc, v -> switch(lookupTree(subst, v)) {
+					Some(e): concat(acc, [e]);
+					None(): acc;
+				}
+			);
+			getVars = \e : MmExpr -> fold(e.symbs, makeSet(), \acc, symb -> if (symb.isVar) insertSet(acc, symb.literal) else acc);
+			foldi(mapped, true, \i, acc1, e1 -> 
+				foldi(mapped, acc1, \j, acc2, e2 -> 
+					if (j <= i || !acc2) acc2 else {
+						vars1 = getVars(e1);
+						vars2 = getVars(e2);
+						if (!isEmptySet(intersectSets(vars1, vars2))) {
+							conf.onError("expressions " + mm2s(e1) + " and " + mm2s(e2) + " have common vars - disjointed restrictions violation", []);
+							false;
+						} else {
+							foldSet(vars1, true, \ac1, v1 ->
+								foldSet(vars2, ac1, \ac2, v2 -> {
+										ret = exists(theorem.disj,
+											\d -> exists(d.vars, \w -> w == v1) && exists(d.vars, \w -> w == v2)
+										);
+										if (!ret) {
+											conf.onError("variables " + v1 + " and " + v2 + " are not inherently disjointed in theorem " + theorem.stat.label, []);
+										}
+										ret
+									}
+								)
+							)
+						}
+					}
+				)
+			)
+		}
+	)
+}
+
+mmExecuteRPNstep(label : string, mstack : Maybe<List<MmExpr>>, entities : Tree<string, MmLabeled>, theorem : MmAssertion, conf : RuConf) -> Maybe<List<MmExpr>> {
+	maybeBind(mstack, 
+		\stack -> {
+			switch (lookupTree(entities, label)) {
+				Some(labeled): {
+					switch (labeled) {
+						MmAssertion(disj, hyps, statement): {
+							maybeBind(mmPickFromStack(stack, hyps, conf),
+								\acc -> {
+									if (forall(list2array(acc.essentials), \pair -> {
+											applied = mmApplySubst(pair.fromHyp, acc.subst);
+											if (applied != pair.fromStack) {
+												conf.onError("applied expression differs from stack value: " + mm2s(applied) + " != " + mm2s(pair.fromStack), []);
+												false;
+											} else {
+												true;
+											}
+										}
+									)) {
+										applied = mmApplySubst(statement.expr, acc.subst);
+										if (mmCheckSubstitution(acc.subst, disj, theorem, conf)) {
+											Some(Cons(applied, acc.stack));
+										} else {
+											None();
+										}
+									} else {
+										None();
+									}
+								}
+							)
+						}
+						MmEssential(__, expr): Some(Cons(expr, stack));
+						MmFloating(__, type, var): Some(Cons(MmExpr([MmSymb(type, false), MmSymb(var, true)]), stack));
+					}
+				}
+				None(): {
+					conf.onError("unknown label: " + label, []);
+					None();
+				}
+			}
+		}
+	)
+}
+
+mmVerifyAssertion(assertion : MmAssertion, math : MmMath) -> bool {
+	ret = switch(assertion.stat) {
+		MmAxiomatic(__,__): true;
+		MmProvable(th_label, expr, proof): {
+			maybe_stack = fold(proof.labels, Some(makeList()),
+				\stack, label -> mmExecuteRPNstep(label, stack, math.labeled, assertion, math.conf)
+			);
+			eitherMap(maybe_stack,
+				\stack -> {
+					if (!isEmptyList(tailList(stack))) {
+						math.conf.onError("non-empty stack at the end of proof", []);
+						false;
+					} else if (expr != headList(stack, MmExpr([]))) {
+						head = headList(stack, MmExpr([]));
+						math.conf.onError("expression on the top of the stack differs from provable expression: " + mm2s(expr) + " != " + mm2s(head), []);
+						false;
+					} else {
+						true;
+					}
+				},
+				false
+			)
+		}
+	};
+	if (!ret) {
+		math.conf.onError("proof of " + assertion.stat.label + " is wrong", []);
+	}
+	ret
+}
+
+mmVerifySource(src : MmSource, math : MmMath) -> bool {
+	forall(src.decls, 
+		\decl -> {
+			switch (decl) {
+				MmAssertion(__,__,__): mmVerifyAssertion(decl, math);
+				default: true;
+			}
+		}
+	)
+}
+
+mmVerifyMath(math : MmMath) -> bool {
+	all(concurrent(true, map(getTreeValues(math.sources), \s -> \-> mmVerifySource(s, math))))
+}
