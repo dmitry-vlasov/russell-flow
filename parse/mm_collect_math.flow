@@ -63,13 +63,14 @@ MmCollectAcc(
 	vars  : Set<string>,
 	disjs : List<MmDisj>,
 	hyps  : List<MmHyp>,
+	arities : Tree<string, int>,
 	src   : MmSource,
 );
 
 mmCollectSource(src : MmParseSource, conf : RuConf) -> MmSource {
 	start = timestamp();
 	acc = mmCollectElements(src.toplevel, 
-		MmCollectAcc(makeSet(), makeList(), makeList(), MmSource([], [], src.info))
+		MmCollectAcc(makeSet(), makeList(), makeList(), makeTree(), MmSource([], [], src.info))
 	);
 	if (conf.verbose > 0) {
 		println("collected: " + src.info.file + " in " + d2st((timestamp() - start)/ 1000.0, 4) + " s");
@@ -95,25 +96,34 @@ mmCollectElements(els : [MmElement], acc : MmCollectAcc) -> MmCollectAcc {
 					MmCollectAcc(ac with hyps = Cons(el, ac.hyps));
 				MmFloating(l, __, __):
 					MmCollectAcc(ac with hyps = Cons(el, ac.hyps));
-				MmAxiomatic(l, __):
-					MmCollectAcc(ac with src = MmSource(ac.src with decls = concat(ac.src.decls, [mmMakeAssertion(el, ac)])));
-				MmProvable(l, __, __):
-					MmCollectAcc(ac with src = MmSource(ac.src with decls = concat(ac.src.decls, [mmMakeAssertion(el, ac)])));
-				MmBlock(es):
-					MmCollectAcc(ac with src = mmCollectElements(es, ac).src);
+				MmAxiomatic(l, __): {
+					a = mmMakeAssertion(el, ac);
+					MmCollectAcc(ac with 
+						arities = setTree(ac.arities, a.stat.label, length(a.hyps)),
+						src = MmSource(ac.src with decls = concat(ac.src.decls, [a]))
+					);
+				}
+				MmProvable(l, __, __): {
+					a = mmMakeAssertion(el, ac);
+					MmCollectAcc(ac with 
+						arities = setTree(ac.arities, a.stat.label, length(a.hyps)),
+						src = MmSource(ac.src with decls = concat(ac.src.decls, [a]))
+					);
+				}
+				MmBlock(es): {
+					block = mmCollectElements(es, ac);
+					MmCollectAcc(ac with 
+						arities = block.arities, 
+						src = block.src
+					);
+				}
 			}
 		}
 	)
 }
 
 mmMakeAssertion(statement : MmStat, env : MmCollectAcc) -> MmAssertion {
-	getVars = \expr -> {
-		fold(expr.symbs,
-			makeSet(),
-			\acc, symb ->
-				if (containsSet(env.vars, symb.literal)) insertSet(acc, symb.literal) else acc
-		)
-	};
+	getVars = \expr -> fold(expr.symbs, makeSet(), \acc, symb -> insertSet(acc, symb.literal));
 	vars = foldList(env.hyps, getVars(statement.expr), 
 		\acc, hyp -> {
 			switch (hyp) {
@@ -122,22 +132,31 @@ mmMakeAssertion(statement : MmStat, env : MmCollectAcc) -> MmAssertion {
 			}
 		}
 	);
-	hyps = foldList(env.hyps, [],
+	hyps = reverseA(foldList(env.hyps, [],
 		\acc, hyp : MmHyp -> switch (hyp) {
 			MmEssential(label, expr): 
 				concat(acc, [MmEssential(label, mmMarkVarsInExpr(expr, vars))]);
 			MmFloating(label, type, var): 
 				if (containsSet(vars, var)) concat(acc, [hyp]) else acc;
 		}
-	);
+	));
+	labels = switch (statement) {
+		MmAxiomatic(__,__): makeSet();
+		MmProvable(__,__,proof): {
+			switch (proof) {
+				MmNormalProof(ls): buildSet(ls);
+				MmCompressedProof(ls, __): buildSet(ls);
+			}
+		}
+	}
 	inner = foldList(env.hyps, [],
 		\acc, hyp : MmHyp -> switch (hyp) {
 			MmEssential(label, expr): acc;
 			MmFloating(label, type, var): 
-				if (!containsSet(vars, var)) concat(acc, [hyp]) else acc;
+				if (!containsSet(vars, var) && containsSet(labels, label)) concat(acc, [hyp]) else acc;
 		}
 	);
-	MmAssertion(list2array(env.disjs), hyps, inner, mmMarkVarsInStatement(statement, vars, hyps));
+	MmAssertion(list2array(env.disjs), hyps, inner, mmMakeStatement(statement, vars, hyps, env.arities));
 }
 
 mmMarkVarsInHypothesis(hyp : MmHyp, vars : Set<string>) -> MmHyp {
@@ -147,12 +166,12 @@ mmMarkVarsInHypothesis(hyp : MmHyp, vars : Set<string>) -> MmHyp {
 	}
 }
 
-mmMarkVarsInStatement(stat : MmStat, vars : Set<string>, hyps : [MmHyp]) -> MmStat {
+mmMakeStatement(stat : MmStat, vars : Set<string>, hyps : [MmHyp], arities : Tree<string, int>) -> MmStat {
 	switch (stat) {
 		MmAxiomatic(label, expr): 
 			MmAxiomatic(label, mmMarkVarsInExpr(expr, vars));
 		MmProvable(label, expr, proof): 
-			MmProvable(label, mmMarkVarsInExpr(expr, vars), mmDecompressProof(hyps, proof));
+			MmProvable(label, mmMarkVarsInExpr(expr, vars), mmDecompressProof(proof, hyps, arities));
 	}
 }
 
@@ -162,7 +181,7 @@ mmMarkVarsInExpr(expr : MmExpr, vars : Set<string>) -> MmExpr {
 	))
 }
 
-mmDecompressProof(hyps : [MmHyp], proof : MmProof) -> MmNormalProof {
+mmDecompressProof(proof : MmProof, hyps : [MmHyp], arities : Tree<string, int>) -> MmNormalProof {
 	switch (proof) {
 		MmNormalProof(__): proof;
 		MmCompressedProof(labels, steps): {
@@ -182,10 +201,26 @@ mmDecompressProof(hyps : [MmHyp], proof : MmProof) -> MmNormalProof {
 						}
 					}
 					MmProofZ(): {
-						Pair(acc.first, concat(acc.second, [acc.first]))
+						len = mmSubexprLength(length(acc.first) - 1, acc.first, arities);
+						subexpr = subrange(acc.first, length(acc.first) - len, len);
+						Pair(acc.first, concat(acc.second, [subexpr]));
 					}
 				}
 			).first);
 		}
+	}
+}
+
+mmSubexprLength(i : int, labels : [string], arities : Tree<string, int>) -> int {
+	switch (lookupTree(arities, labels[i])) {
+		Some(arity): 1 + mmSubexprArgsLength(i - 1, 0, arity, labels, arities);
+		None(): 1;
+	}
+}
+
+mmSubexprArgsLength(i : int, acc : int, arg : int, labels : [string], arities : Tree<string, int>) -> int {
+	if (arg == 0) acc else {
+		arg_len = mmSubexprLength(i, labels, arities);
+		mmSubexprArgsLength(i - arg_len, acc + arg_len, arg - 1, labels, arities)
 	}
 }
