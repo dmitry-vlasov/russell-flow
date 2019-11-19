@@ -1,0 +1,368 @@
+import ru_verify;
+import mm_verify;
+
+export {
+	mmMath2ru(math : MmMath) -> Tree<string, RuParseSource>;
+	mmSource2ru(src : MmSource, math : MmMath) -> RuParseSource;
+}
+
+mmMath2ru(math : MmMath) -> Tree<string, RuParseSource> {
+	start = timestamp();
+	syntax = mmMath2Syntax(math); 
+	ret = mapTree(math.sources, \src -> mmSource2ru(src, math, syntax));
+	if (math.conf.verbose > 0) {
+		println("all translated to Russell in: " + d2st((timestamp() - start)/ 1000.0, 4) + " s");
+	}
+	ret
+}
+
+mmSource2ru(src : MmSource, math : MmMath, syntax : MmRuSyntax) -> RuParseSource {
+	start = timestamp();
+	ret = RuParseSource(
+		map(src.imports, \inc -> RuInclude(inc.file)),
+		fold(src.decls, [], \acc, decl ->
+			concat(acc, mmDecl2ru(decl, math, syntax))
+		),
+		RuFileInfo(
+			src.info.file,
+			mmMakeRuPath(src.info, math.conf),
+			0.0, 0.0
+		)
+	);
+	if (math.conf.verbose > 1) {
+		println("translated toRussell: " + src.info.file + " in " + d2st((timestamp() - start)/ 1000.0, 4) + " s");
+	}
+	ret
+}
+
+mmMakeRuPath(info : RuFileInfo, conf : RuConf) -> string {
+	ruRoot0 = lookupTreeDef(conf.opts, "ru-root", "");
+	if (ruRoot0 != "") {
+		ruRoot = if (endsWith(ruRoot0, "/")) ruRoot0 else ruRoot0 + "/";
+		ruRoot + info.file + ".ru"
+	} else {
+		info.file + ".ru"
+	}
+}
+
+mmDecl2ru(decl : MmDecl, math : MmMath, syntax : MmRuSyntax) -> [RuParseBlock] {
+	switch (decl) {
+		MmComment(text): [RuParseComment(text, -1)];
+		MmConst(symbs):
+			fold(symbs, [], \acc, s -> 
+				switch (lookupTree(syntax.types, s)) {
+					Some(t):
+						concat(
+							fold(t.supers, acc, \ac, sup -> 
+								concat(ac, [lookupTreeDef(syntax.types, sup, ruNoType)])
+							),
+							[t]
+						);
+					None(): concat(acc, [RuParseConst(s, math.conf)]);
+				}
+			);
+		MmAssertion(disjs, hyps, inner, stat): mmAssertion2ru(decl, math, syntax);
+	}
+}
+
+mmSymb2ru(s : string, conf : RuConf) -> string {
+	s
+}
+
+mmConst2ru(s : string, conf : RuConf) -> string {
+	RuParseConst(s, s, "")
+}
+
+mmAssertion2ru(ass : MmAssertion, math : MmMath, syntax : MmRuSyntax) -> [RuParseBlock] {
+	switch (lookupTree(syntax.rules, ass.label)) {
+		Some(r): [r];
+		None(): {
+			switch (ass.stat) {
+				MmProvable(__,__,__): 
+					mmTheorem2ru(ass, math, syntax);
+				MmAxiomatic(l,__): 
+					if (startsWith(l, "df-")) {
+						mmDef2ru(ass, math, syntax); 
+					} else {
+						mmAxiom2ru(ass, math, syntax);
+					}
+			}
+		}
+	}
+}
+
+mmAssertionHyps(hyps : [MmHyps]) -> [MmEssential] {
+	filtermap(hyps, \h -> 
+		switch (h) {
+			MmEssential(__,__): Some(h);
+			default: None();
+		}
+	)
+}
+
+mmAxiom2ru(ass : MmAssertion, math : MmMath, syntax : MmRuSyntax) -> [RuParseBlock] {
+	[RuParseAxiom(ass.stat.label, mmVars2ru(ass.hyps), mmDisjs2ru(ass.disjs), 
+		mapi(mmAssertionHyps(ass.hyps), \i, h -> RuParseHyp(i, mmExp2ru(h.expr))), 
+		mmExp2ru(ass.stat.expr)
+	)];
+}
+
+MmDefFactor(
+	defm : RuParseExp,
+	defs : RuParseExp,
+	def : RuParseExp,
+);
+
+mmDef2ru(ass : MmAssertion, math : MmMath, syntax : MmRuSyntax) -> [RuParseBlock] {
+	defFactor = mmFactorDef(ass.stat.expr);
+	[RuParseDef(ass.stat.label, mmVars2ru(ass.hyps), mmDisjs2ru(ass.disjs), 
+		mapi(mmAssertionHyps(ass.hyps), \i, h -> RuParseHyp(i, mmExp2ru(h.expr))),
+		defFactor.defm, defFactor.defs, defFactor.def
+	)];
+}
+
+mmFactorDef(ex : MmExp) -> MmDefFactor {
+	MmDefFactor(
+		RuParseExp("", [], -1),
+		RuParseExp("", [], -1),
+		RuParseExp("", [], -1),
+	);
+}
+
+mmExp2ru(e : MmExp) -> RuParseExp {
+	if (e.symbs[0].literal == "|-") {
+		RuParseExp("wff", map(tail(e.symbs), \s -> s.literal));
+	} else {
+		RuParseExp(e.symbs[0].literal, map(tail(e.symbs), \s -> s.literal));
+	}
+}
+
+mmAssertionIsRule(ass : MmAssertion) -> bool {
+	ass.stat.expr.symbs[0].literal != "|-";
+}
+
+ruRuleIsSuper(r : RuRule) -> bool {
+	length(r.term.expr) == 1;
+}
+
+ruRuleSuperType(r : RuRule) -> string {
+	r.term.type
+}
+
+ruRuleInferType(r : RuRule) -> string {
+	switch (r.vars) {
+		TreeNode(__, v,__,__,__): v.type;
+		TreeEmpty(): "";
+	}
+}
+
+mmRule2ru(ass : MmAssertion) -> RuParseRule {
+	RuParseRule(
+		ass.stat.label, 
+		mmVars2ru(ass), 
+		mmExpr2ru(ass.stat.expr), 
+		-1
+	);
+}
+
+mmVars2ru(hyps : [MmHyp]) -> [RuParseVar] {
+	filtermap(hyps, \h ->
+		switch (h) {
+			MmFloating(__, v, t): Some(RuParseVar(v, t, -1));
+			default: None();
+		}
+	)
+}
+
+mmDisjs2ru(disjs : [MmDisj]) -> [RuParseDisj] {
+	map(disjs, \d -> RuParseDisj(d.vars, -1))
+}
+
+mmExpr2RuTerm(ex : MmExp, vars : Tree<string, RuVar>) -> RuTerm {
+	RuTerm(ex.symbs[0].literal, map(tail(ex.symbs), \s -> 
+		if (s.isVar) {
+			RuVar(s.literal, lookupTreeDef(vars, s.literal, ruNoVar).type);
+		} else {
+			RuConstRef(s.literal);
+		}
+	), -1);
+}
+
+MmRuSyntax(
+	types : Tree<string, RuParseType>,
+	rules : Tree<string, RuParseRule>,
+	supers : Tree<string, RuParseRule>
+);
+
+mmMath2RulesTypes(math : MmMath) -> MmRuSyntax {
+	axioms = mmMathAxiomatic(math);
+	rules = filtermap(axioms, \ax -> 
+		if (mmAssertionIsRule(ax)) {
+			Some(mmRule2ru(ax));
+		} else {
+			None();
+		}
+	)
+	types = set2array(fold(rules, makeSet(), \acc, r -> 
+		foldTree(r.vars, insertSet(acc, r.term.type), \__, var, ac -> insertSet(ac, var.type))
+	));
+	superTypesMap = fold(filter(rules, ruRuleIsSuper), makeTree(), \acc, r ->
+		setTree(acc, ruRuleInferType(r), 
+			switch (lookupTree(acc, ruRuleInferType(r))) {
+				Some(supers): insertSet(supers, ruRuleSuperType(r));
+				None():       makeSet1(ruRuleSuperType(r));
+			}
+		)
+	);
+	typeMap = values2tree(map(types, \t ->
+			RuParseType(t, set2array(lookupTreeDef(superTypesMap, t, makeSet())), -1)
+		),
+		\t -> t.name
+	);
+	ruleMap = values2tree(filter(rules, \r -> !ruRuleIsSuper(r)), \r -> r.name);
+	supersMap = values2tree(filter(rules, ruRuleIsSuper), \r -> r.name);
+	MmRuSyntax(typeMap, ruleMap, supersMap);
+}
+
+RuMutAssertion(
+	name : string, 
+	vars : Tree<string, RuVar>, 
+	disjs : Set<RuDisj>, 
+	hyps : [RuMutHyp], 
+	mutable prop : Maybe<RuExp>
+);
+
+RuMutHyp(ind : int, mutable expr : Maybe<RuExp>);
+
+ruNoMutAssertion = RuMutAssertion("__no", makeTree(), makeSet(), [], None());
+
+Mm2RuExecAcc(
+	stack : List<MmRuStackEntry>,
+	essentials : List<MmRuStackEntry>,
+	mmSubst : Tree<string, MmExp>,
+	//ruSubst : Tree<RuVar, RuTerm>
+);
+
+RuProofTree(
+	name : string,
+	expr : RuTerm,
+	refs : [MmRuRef]
+);
+
+MmRuRef ::= RuProofTree, RuMutHyp;
+
+MmRuStackEntry(
+	mm : MmExp,
+	proof : MmRuRef,
+);
+
+mm2ruPickFromStack(stack : List<MmRuStackEntry>, mmHyps : [MmHyp], ruHyps : [RuMutHyp]) -> Mm2RuExecAcc {
+	foldi(mmHyps, Mm2RuExecAcc(stack, makeList(), makeTree(), makeTree()),
+		\i, acc, hyp -> {
+			e = headList(acc.stack, MmRuStackEntry(MmExp([]), RuExp([], -1)));
+			switch (hyp) {
+				MmEssential(__, expr):
+					Mm2RuExecAcc(
+						tailList(acc.stack), 
+						Cons(MmRuStackEntry(e, ruHyps[i]), acc.essentials), 
+						acc.mmSubst,
+						acc.ruSubst
+					);
+				MmFloating(__, type, var):
+					Mm2RuExecAcc(
+						tailList(acc.stack),
+						acc.essentials,
+						setTree(acc.mmSubst, var, MmExp(tail(e.mm.symbs))),
+						setTree(acc.ruSubst, RuVar(var, type), e.ru),
+					);
+			}
+		}
+	)
+}
+
+mm2ruExecRPNstep(lab : string, stack : List<MmRuStackEntry>, theorem : MmAssertion, labeled : Tree<string, MmLabeled>, translated : Tree<string, RuMutAssertion>) -> List<MmRuStackEntry> {
+	mmAss = lookupTreeDef(labeled, lab, mmNoAssertion);
+	ruAss = lookupTreeDef(translated, lab, ruNoMutAssertion);
+	switch (mmAss) {
+		MmAssertion(disj, hyps, inner, statement): {
+			acc = mm2ruPickFromStack(stack, reverseA(hyps), ruAss.hyps);
+			/*if (forall(list2array(acc.essentials), \pair -> {
+					applied = mmApplySubst(pair.fromHyp.mm, acc.mmSubst);
+				}
+			)) {
+				
+			}*/
+			appliedMm = mmApplySubst(statement.expr, acc.mmSubst);
+			appliedRu = ruApply(ruAss.prop, acc.ruSubst);
+			newRef = RuProofTree(lab, )
+			Cons(
+				MmRuExp(appliedMm, appliedRu),
+				acc.stack
+			);
+		}
+		MmEssential(l, expr): { 
+			i = find(theorem.hyps, \h -> l == h.label);
+			Cons(
+				MmRuExp(expr, RuExp([], -1)), // TODO: 
+				stack
+			);
+		}
+		MmFloating(__, type, var): 
+			Cons(
+				MmRuExp(
+					MmExp([MmSymb(type, false), MmSymb(var, true)]),
+					RuExp([RuVar(var, type)], -1)
+				), 
+				stack
+			);
+	}
+}
+
+mm2ruAssertion(ass : MmAssertion, math : MmMath, translated : Tree<string, RuMutAssertion>) -> RuMutAssertion {
+	vars = mmAssertion2RuVars(ass);
+	switch(ass.stat) {
+		MmAxiomatic(l, __): {
+			RuMutAssertion(ass.stat.label, vars, mmAssertion2RuDisjs(ass.disjs, vars), 
+				mapi(ass.hyps, \i, h -> RuMutHyp(i, None())), None()
+			);
+		};
+		MmProvable(th_label, expr, proof): {
+			stack = fold(proof.labels, makeList(),
+				\s, l -> mm2ruExecRPNstep(l, s, ass, math.labeled, translated)
+			);
+			head = headList(stack, emptyMmRuExp);
+			RuMutAssertion(ass.stat.label, vars, mmAssertion2RuDisjs(ass.disjs, vars), 
+				mapi(ass.hyps, \i, h -> RuMutHyp(i, None())), None()
+			);
+		}
+	}
+}
+mmTheorem2ru(ass : MmAssertion, math : MmMath, syntax : MmRuSyntax) -> [RuParseBlock] {
+	mm_proof = cast(ass.stat : MmStat -> MmProvable).proof;
+	stack = fold(proof.labels, makeList(),
+		\s, l -> mm2ruExecRPNstep(l, s, ass, math.labeled, translated)
+	);
+	
+	[RuParseTheorem(ass.stat.label, mmVars2ru(ass.hyps), mmDisjs2ru(ass.disjs), 
+		mapi(mmAssertionHyps(ass.hyps), \i, h -> RuParseHyp(i, mmExp2ru(h.expr))), 
+		mmExp2ru(ass.stat.expr), mmProofTree2Proof(stack.head.proof)
+	)];
+}
+
+
+
+/*
+
+MmRuAssertionKind ::= MmRuAssAxiom, MmRuAssDef, MmRuAssTheorem;
+	MmRuAssAxiom();
+	MmRuAssDef();
+	MmRuAssTheorem();
+
+mmAssertionKind(ass : MmAssertion) -> MmRuAssertionKind {
+	switch (ass.stat) {
+		MmProvable(__,__,__): MmRuAssTheorem();
+		MmAxiomatic(l,__): 
+			if (startsWith(l, "df-")) MmRuAssDef() else MmRuAssAxiom();
+	}
+}
+*/
