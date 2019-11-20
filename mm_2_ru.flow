@@ -112,7 +112,7 @@ mmAssertionFlos(hyps : [MmHyp]) -> [MmFloating] {
 
 
 mmAxiom2ru(ass : MmAssertion, math : MmMath, syntax : MmRuSyntax) -> [RuParseBlock] {
-	[RuParseAxiom(ass.stat.label, mmVars2ru(ass.hyps), mmDisjs2ru(ass.disjs), 
+	[RuParseAxiom(ass.stat.label, mmVars2ru(ass.hyps), mmDisjs2ru(ass.disjs, mmAssertionVars(ass)), 
 		mapi(mmAssertionHyps(ass.hyps), \i, h -> RuParseHyp(i, mmExp2ru(h.expr.symbs), -1)), 
 		mmExp2ru(ass.stat.expr.symbs), -1
 	)];
@@ -126,7 +126,7 @@ MmDefFactor(
 
 mmDef2ru(ass : MmAssertion, math : MmMath, syntax : MmRuSyntax) -> [RuParseBlock] {
 	defFactor = mmFactorDef(ass.stat.expr);
-	[RuParseDef(ass.stat.label, mmVars2ru(ass.hyps), mmDisjs2ru(ass.disjs), 
+	[RuParseDef(ass.stat.label, mmVars2ru(ass.hyps), mmDisjs2ru(ass.disjs, mmAssertionVars(ass)), 
 		mapi(mmAssertionHyps(ass.hyps), \i, h -> RuParseHyp(i, mmExp2ru(h.expr.symbs), -1)),
 		defFactor.defm, defFactor.defs, defFactor.def, -1
 	)];
@@ -139,23 +139,20 @@ MmFactorDefEqAcc(
 );
 
 mmFactorDefEqInd(ex : MmExp) -> int {
-	low_br = \ac -> (ac.braces <= 1 && ac.brackets == 0) || (ac.braces == 0 && ac.brackets <= 1);
+	is_eq = ex.symbs[1].literal != "(";
 	foldi(ex.symbs, MmFactorDefEqAcc(0, 0, -1), \i, ac, s ->
 		if (ac.eq != -1) ac else
 		if (s.literal == "(") MmFactorDefEqAcc(ac with brackets = ac.brackets + 1) else 
 		if (s.literal == "{") MmFactorDefEqAcc(ac with braces   = ac.braces + 1) else
 		if (s.literal == ")") MmFactorDefEqAcc(ac with brackets = ac.brackets - 1) else
 		if (s.literal == "}") MmFactorDefEqAcc(ac with braces   = ac.braces - 1) else
-		if ((s.literal == "=" || s.literal == "<->") && low_br(ac)) MmFactorDefEqAcc(ac with eq = i) else ac
+		if (s.literal == "="   && is_eq  && ac.braces == 0) MmFactorDefEqAcc(ac with eq = i) else
+		if (s.literal == "<->" && !is_eq && ac.brackets == 1) MmFactorDefEqAcc(ac with eq = i) else ac
 	).eq
 }
 
 mmFactorDef(ex : MmExp) -> MmDefFactor {
 	eq_ind = mmFactorDefEqInd(ex);
-	if (eq_ind == -1) {
-		println("eq_ind == -1");
-		println(mm2s(ex));
-	}
 	is_eq = ex.symbs[eq_ind].literal == "=";
 	dfm_beg = if (is_eq) 1 else 2;
 	dfm_len = if (is_eq) eq_ind - 1 else eq_ind - 2;
@@ -163,8 +160,8 @@ mmFactorDef(ex : MmExp) -> MmDefFactor {
 	dfs_len = if (is_eq) length(ex.symbs) - eq_ind - 1 else length(ex.symbs) - eq_ind - 2;
 	
 	MmDefFactor(
-		mmExp2ru(concat(if (is_eq) [MmSymb("setvar", false)] else [MmSymb("|-", false)], subrange(ex.symbs, dfm_beg, dfm_len))),
-		mmExp2ru(concat(if (is_eq) [MmSymb("setvar", false)] else [MmSymb("|-", false)], subrange(ex.symbs, dfs_beg, dfs_len))),
+		mmExp2ru(concat(if (is_eq) [MmSymb("class", false)] else [MmSymb("|-", false)], subrange(ex.symbs, dfm_beg, dfm_len))),
+		mmExp2ru(concat(if (is_eq) [MmSymb("class", false)] else [MmSymb("|-", false)], subrange(ex.symbs, dfs_beg, dfs_len))),
 		RuParseExp("wff", if (is_eq) ["defiendum", "=", "definiens"] else ["(", "defiendum", "<->", "definiens", ")"], -1),
 	);
 }
@@ -217,14 +214,13 @@ mmVars2ru(hyps : [MmHyp]) -> [RuParseVar] {
 	)
 }
 
-mmDisjs2ru(disjs : [MmDisj]) -> [RuParseDisj] {
-	map(disjs, \d -> RuParseDisj(d.vars, -1))
+mmDisjs2ru(disjs : [MmDisj], vars : Set<string>) -> [RuParseDisj] {
+	map(disjs, \d -> RuParseDisj(filter(d.vars, \v -> containsSet(vars, v)), -1))
 }
 
 MmRuSyntax(
 	types : Tree<string, RuParseType>,
-	rules : Tree<string, RuParseRule>,
-	supers : Tree<string, RuParseRule>
+	rules : Tree<string, RuParseRule>
 );
 
 mmMath2Syntax(math : MmMath) -> MmRuSyntax {
@@ -255,8 +251,8 @@ mmMath2Syntax(math : MmMath) -> MmRuSyntax {
 		\t -> t.name
 	);
 	ruleMap = values2tree(filter(rules, \r -> !ruRuleIsSuper(r)), \r -> r.name);
-	supersMap = values2tree(filter(rules, ruRuleIsSuper), \r -> r.name);
-	MmRuSyntax(typeMap, ruleMap, supersMap);
+	//supersMap = values2tree(filter(rules, ruRuleIsSuper), \r -> r.name);
+	MmRuSyntax(typeMap, ruleMap);
 }
 
 Mm2RuExecAcc(
@@ -282,20 +278,10 @@ mm2ruPickFromStack(s : Maybe<MmRuStack>, mmHyps : [MmHyp]) -> Mm2RuExecAcc {
 			eitherMap(acc.stack,
 				\stack -> {
 					switch (hyp) {
-						MmEssential(__, expr): {
-							Mm2RuExecAcc(
-								stack.parent, 
-								acc.subst,
-								concat([stack.proof], acc.refs), 
-							);
-						}
-						MmFloating(__, type, var): {
-							Mm2RuExecAcc(
-								stack.parent,
-								setTree(acc.subst, var, MmExp(tail(stack.expr.symbs))),
-								acc.refs,
-							);
-						}
+						MmEssential(__, expr):
+							Mm2RuExecAcc(stack.parent, acc.subst, concat([stack.proof], acc.refs));
+						MmFloating(__, type, var):
+							Mm2RuExecAcc(stack.parent, setTree(acc.subst, var, MmExp(tail(stack.expr.symbs))), acc.refs);
 					}
 				},
 				acc
@@ -333,7 +319,9 @@ mmTheorem2ru(ass : MmAssertion, stat : MmProvable, math : MmMath) -> [RuParseBlo
 			disj_set = fold(ass.disjs, makeSet(), \acc, disj -> 
 				foldi(disj.vars, acc, \i, ac, v1 ->
 					foldi(disj.vars, ac, \j, a, v2 ->
-						if (i < j) insertSet(a, RuDisj(make_var(v1), make_var(v2))) else a
+						if (i < j && containsKeyTree(vars_map, v1) && containsKeyTree(vars_map, v2)) {
+							insertSet(a, RuDisj(make_var(v1), make_var(v2))) 
+						} else a
 					)
 				)
 			);
