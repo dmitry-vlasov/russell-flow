@@ -4,7 +4,6 @@ import mm_src;
 
 export {
 	mmMath2ru(math : MmMath) -> Tree<string, RuParseSource>;
-	//mmSource2ru(src : MmSource, math : MmMath, syntax : MmRuSyntax) -> RuParseSource;
 }
 
 mmMath2ru(math : MmMath) -> Tree<string, RuParseSource> {
@@ -177,10 +176,6 @@ mmExp2ru(symbs : [MmSymb]) -> RuParseExp {
 	}
 }
 
-/*mmAssertionIsRule(ass : MmAssertion) -> bool {
-	ass.stat.expr.symbs[0].literal != "|-";
-}*/
-
 mmStatIsRule(stat : MmStat) -> bool {
 	stat.expr.symbs[0].literal != "|-";
 }
@@ -239,12 +234,10 @@ mmMath2Syntax(math : MmMath) -> MmRuSyntax {
 		} else {
 			None();
 		}
-	)
-	//println("rules: " + strGlue(map(rules, \r -> ruParse2s(r)), " "));
+	);
 	types = set2array(fold(rules, makeSet(), \acc, r -> 
 		fold(r.vars, insertSet(acc, r.term.type), \ac, var -> insertSet(ac, var.type))
 	));
-	//println("types: " + strGlue(types, " "));
 	superTypesMap = fold(filter(rules, ruRuleIsSuper), makeTree(), \acc, r ->
 		setTree(acc, ruRuleInferType(r), 
 			switch (lookupTree(acc, ruRuleInferType(r))) {
@@ -271,7 +264,7 @@ Mm2RuExecAcc(
 
 RuProofTree ::= RuProofTreeStep, RuProofTreeHyp, RuProofTreeNone;
 	RuProofTreeStep(name  : string, expr  : RuParseExp, refs : [RuProofTree]);
-	RuProofTreeHyp(ind : int);
+	RuProofTreeHyp(ind : int, expr  : RuParseExp);
 	RuProofTreeNone();
 
 MmRuStack(
@@ -307,8 +300,15 @@ mm2ruExecRPNstep(lab : string, stack : Maybe<MmRuStack>, th_hyps : [MmHyp], labe
 				if (mmStatIsRule(stat)) RuProofTreeNone() else RuProofTreeStep(lab, mmExp2ru(applied.symbs), acc.refs)
 			));
 		}
-		MmEssential(l, expr):
-			Some(MmRuStack(stack, expr, RuProofTreeHyp(findiDef(th_hyps, \h -> l == h.label, -1))));
+		MmEssential(l, expr): {
+			i = findiDef(th_hyps, \h -> l == h.label, -1);
+			switch (th_hyps[i]) {
+				MmEssential(__, ex):
+					Some(MmRuStack(stack, expr, RuProofTreeHyp(i, mmExp2ru(ex.symbs))));
+				default:
+					Some(MmRuStack(stack, expr, RuProofTreeNone()));
+			}
+		}
 		MmFloating(__, type, var):
 			Some(MmRuStack(stack, MmExp([MmSymb(type, false), MmSymb(var, true)]), RuProofTreeNone()));
 	}
@@ -319,9 +319,10 @@ mmTheorem2ru(ass : MmAssertion, stat : MmProvable, math : MmMath) -> [RuParseBlo
 	eitherMap(
 		fold(stat.proof.labels, None(), \s, lab -> mm2ruExecRPNstep(lab, s, th_hyps, math.labeled)), 
 		\stack -> {
-			steps = mmProofTree2ru(stack.proof);
 			th_vars = mmVars2ru(ass.hyps);
-			th_vars_set = fold(th_vars, makeSet(), \acc, v -> insertSet(acc, v.name));
+			
+			th_vars_map = fold(th_vars, makeTree(), \acc, v -> setTree(acc, v.name, v.type));
+			steps = mmProofTree2ru(stack.proof, th_vars_map);
 			vars_map = fold(mmAssertionFlos(concat(ass.hyps, ass.inner)), makeTree(), 
 				\acc, v -> setTree(acc, v.var, RuVar(v.var, v.type))
 			);
@@ -335,8 +336,8 @@ mmTheorem2ru(ass : MmAssertion, stat : MmProvable, math : MmMath) -> [RuParseBlo
 					)
 				)
 			);
-			th_ds = filterSet(disj_set, \d -> containsSet(th_vars_set, d.v1.name) && containsSet(th_vars_set, d.v2.name));
-			pr_ds = filterSet(disj_set, \d -> !(containsSet(th_vars_set, d.v1.name) && containsSet(th_vars_set, d.v2.name)));
+			th_ds = filterSet(disj_set, \d -> containsKeyTree(th_vars_map, d.v1.name) && containsKeyTree(th_vars_map, d.v2.name));
+			pr_ds = filterSet(disj_set, \d -> !(containsKeyTree(th_vars_map, d.v1.name) && containsKeyTree(th_vars_map, d.v2.name)));
 			
 			make_disj = \s -> map(ruDisjs2Array(s), \ds -> RuParseDisj(map(set2array(ds), \d -> d.name), -1));
 			if (steps == []) [] else {
@@ -364,17 +365,40 @@ MmRuProofAcc(
 	linear : [RuParseStep]
 );
 
-mmProofTree2ru(proof : RuProofTree) -> [RuParseStep] {
+mmRemoveTrivialSteps(proof : RuProofTree) -> RuProofTree {
 	switch (proof) {
-		RuProofTreeStep(__,__,__): mmDoProofTree2ru(proof, MmRuProofAcc(makeTree(), [])).linear;
+		RuProofTreeStep(name, expr, refs): {
+			new_proof = RuProofTreeStep(name, expr, map(refs, mmRemoveTrivialSteps));
+			if (length(refs) != 1) {
+				new_proof; 
+			} else {
+				switch (new_proof.refs[0]) {
+					RuProofTreeStep(__, ex, __): 
+						if (ex.symbs == expr.symbs) new_proof.refs[0] else new_proof;
+					RuProofTreeHyp(__, ex): {
+						if (ex.symbs == expr.symbs) new_proof.refs[0] else new_proof;
+					}
+					RuProofTreeNone(): new_proof;					
+				}
+			}
+		}
+		default: proof;
+	}
+}
+
+mmProofTree2ru(proof : RuProofTree, vars : Tree<string, string>) -> [RuParseStep] {
+	new_proof = mmRemoveTrivialSteps(proof);
+	switch (new_proof) {
+		RuProofTreeStep(__,__,__): 
+			mmDoProofTree2ru(new_proof, MmRuProofAcc(makeTree(), []), vars).linear;
 		default: [];
 	}
 }
 
-mmDoProofTree2ru(proof : RuProofTreeStep, acc0 : MmRuProofAcc) -> MmRuProofAcc {
+mmDoProofTree2ru(proof : RuProofTreeStep, acc0 : MmRuProofAcc, vars : Tree<string, string>) -> MmRuProofAcc {
 	acc1 = fold(proof.refs, acc0, \ac, ref -> 
 		switch (ref) {
-			RuProofTreeStep(__,__,__): mmDoProofTree2ru(ref, ac);
+			RuProofTreeStep(__,__,__): mmDoProofTree2ru(ref, ac, vars);
 			default: ac;
 		}
 	);
@@ -384,8 +408,10 @@ mmDoProofTree2ru(proof : RuProofTreeStep, acc0 : MmRuProofAcc) -> MmRuProofAcc {
 			ind = length(acc1.linear);
 			refs = fold(proof.refs, [], \ac, ref -> 
 				switch (ref) {
-					RuProofTreeStep(__, ex, __): concat(ac, [RuParseStepRef(lookupTreeDef(acc1.steps, ex, -1), -1)]);
-					RuProofTreeHyp(i): concat(ac, [RuParseHypRef(i, -1)]);
+					RuProofTreeStep(label, ex, refs):
+						concat(ac, [RuParseStepRef(lookupTreeDef(acc1.steps, ex, -1), -1)]);
+					RuProofTreeHyp(i,__): 
+						concat(ac, [RuParseHypRef(i, -1)]);
 					RuProofTreeNone(): ac;
 				}
 			);
@@ -398,3 +424,31 @@ mmDoProofTree2ru(proof : RuProofTreeStep, acc0 : MmRuProofAcc) -> MmRuProofAcc {
 }
 
 ruNoParseType = RuParseType("__no", [], -1);
+/*
+ruParseMatchExactly(e : RuParseExp, pattern : RuParseExp, vars : Tree<string, string>) -> Maybe<Tree<string, string>> {
+	if (length(e.symbs) != length(pattern.symbs)) None() else {
+		foldi(e.symbs, Some(makeTree()), \i, acc, s1 -> {
+			s2 = pattern.symbs[i];
+			maybeBind(acc, \sub ->
+				switch (lookupTree(vars, s1)) {
+					None():
+						switch (lookupTree(vars, s2)) {
+							None(): if (s1 == s2) Some(sub) else None();
+							Some(__): None();
+						}
+					Some(t1):
+						switch (lookupTree(vars, s2)) {
+							None(): None();
+							Some(t2): 
+								if (t1 != t2) None() else {
+									switch (lookupTree(sub, s2)) {
+										Some(w1): if (s1 == w1) Some(sub) else None();
+										None(): Some(setTree(sub, s2, s1));
+									}
+								}
+						}
+				}
+			)
+		})
+	}
+}*/
