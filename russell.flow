@@ -10,106 +10,82 @@ import ru_verify;
 import ru_2_mm;
 import mm_2_ru;
 import mm_verify;
-
-RuWriteSource(data : string, info : RuFileInfo);
-
-ruWriteSources(srcs : [RuWriteSource], conf : RuConf) -> void {
-	concurrent(true, map(srcs, \src -> 
-		\-> {
-			path = src.info.path;
-			ensureDirectoryExists(ruDirName(path));
-			if (conf.verbose > 0) {
-				println("writing : " + path);
-			}
-			ret = setFileContent(path, src.data); 
-			if (!ret) {
-				println("error while writing " + path);
-			}
-			ret;
-		}
-	));
-	{}
-}
+import ru_split;
 
 ruProcessMath(math : RuMath) -> void {
-	mmRoot0 = lookupTreeDef(math.conf.opts, "mm-root", "");
-	if (mmRoot0 != "") {
-		mmRoot = if (endsWith(mmRoot0, "/")) mmRoot0 else mmRoot0 + "/";
-		mmMath = ruMath2mm(math);
-		ruWriteSources(
-			map(getTreeValues(mmMath.sources), 
-				\src : MmSource ->
-					if (lookupTreeDef(math.conf.opts, "mm-strip", "") == "1") {
-						RuWriteSource(mm2s(mmStripComments(src)), src.info)
-					} else {
-						RuWriteSource(mm2s(src), src.info)
-					}
-			),
-			math.conf
-		)
+	if (ruOptIsTrue("ru-2-mm", math.conf)) {
+		mmProcessMath(ruMath2mm(RuMath(math with conf = ruRemoveOpt("ru-2-mm", math.conf))));
 	}
-	mmFile = lookupTreeDef(math.conf.opts, "mm", "");
-	if (mmFile != "") {
-		mmMath = ruMath2mm(math);
-		mmSrc = if (lookupTreeDef(math.conf.opts, "mm-strip", "") == "1") {
-			mmStripComments(mmMath2Source(mmMath, mmFile));
-		} else {
-			mmMath2Source(mmMath, mmFile);
-		}
-		ensureDirectoryExists(dirName(mmFile));
-		src_text = mm2s(mmSrc);
-		ret = setFileContent(mmFile, src_text); 
-		if (!ret) {
-			println("error at writing output file " + mmFile);
-		}
-	}
-	
-	rusRoot = lookupTreeDef(math.conf.opts, "ru-root", "");
-	if (rusRoot != "") {
-		ruWriteSources(
-			map(getTreeValues(math.sources), 
-				\src : RuSource -> RuWriteSource(
-					ruAny2s(src, math.rules), 
-					RuFileInfo(src.info with path = rusRoot + "/" + src.info.file + ".ru";)
+	prepare_srcs = \ -> {
+		ruRoot0 = rtrim2(lookupTreeDef(math.conf.opts, "ru-root", ""), "/");
+		ruRoot = if (ruRoot0 == "1") "." else ruRoot0 + "/";
+		map(getTreeValues(math.sources), 
+			\src : RuSource ->
+				RuWriteSource(
+					ruAny2s(src, math.rules),
+					RuFileInfo(src.info with path = ruRoot + src.info.file + ".ru")
 				)
-			),
-			math.conf
 		)
-	} 
-
-	if (lookupTreeDef(math.conf.opts, "ru-stats", "") == "1") {
-		println("stats:\n" + ruMathStats(math) + "\n");
+	}
+	if (ruOptIsTrue("ru-write-all", math.conf)) {
+		ruWriteSources(prepare_srcs(), math.conf);
+	}
+	write_src = \src -> if (!setFileContent(src.info.path, ruAny2s(src, math.rules))) {
+		println("failed to save file: " + src.info.path);
+	}
+	if (ruOptIsSet("ru", math.conf)) {
+		write_src(ruMath2SingleSource(math, ruRemoveExt(ruOpt("ru", math.conf), ".ru")));
+	}
+	if (ruOptIsSet("ru-write", math.conf)) {
+		file = ruTrimPath(ruOpt("ru-write", math.conf), math.conf, ".ru");
+		switch (lookupTree(math.sources, file)) {
+			Some(src): write_src(src);
+			None(): println("source: " + file + " is not found");
+		}
+	}
+	if (ruOptIsTrue("ru-stats", math.conf)) {
+		println("ru stats:\n" + ruMathStats(math) + "\n");
 	}
 }
 
 mmProcessMath(math : MmMath) -> void {
-	ruFile = lookupTreeDef(math.conf.opts, "ru", "");
-	if (ruFile != "") {
-		maybeApply(ruCollectMath(mmMath2ru(math), math.conf), \collected -> {
-			maybeApply(ruVerifyMath(collected), \verified -> {
-					fixed = ruFixLeftRecursiveRules(verified);
-					if (lookupTreeDef(fixed.conf.opts, "ru-stats", "") == "1") {
-						println("stats:\n" + ruMathStats(fixed) + "\n");
-					}
-					ruSrc = ruMath2Source(fixed, ruFile);
-					if (!setFileContent(ruFile, ruAny2s(ruSrc, fixed.rules))) {
-						println("failed to save file: " + ruFile);
-					}
-				}
+	if (ruOptIsSet("mm", math.conf)) {
+		src = mmMath2SingleSource(math, ruRemoveExt(ruOpt("mm", math.conf), ".mm"));
+		txt = mm2s(ruIf(ruOptIsTrue("strip-comments", math.conf), src, mmStripComments));
+		if (!setFileContent(src.info.path, txt)) {
+			println("failed to save file: " + src.info.path);
+		}
+	}
+	if (ruOptIsTrue("mm-2-ru", math.conf)) {
+		maybeApply(ruMakeMath1(mmMath2ru(math), math.conf), \verified ->
+			ruProcessMath(
+				ruIf(ruOptIsTrue("mm-split", math.conf), 
+					ruIf(ruOptIsSet("mm-fix", math.conf), 
+						RuMath(verified with conf = ruRemoveOpt("mm-2-ru", verified.conf)), 
+						ruFixLeftRecursiveRules
+					), 
+					ruSplitMath
+				)
 			)
-			}
 		);
+	}
+	if (ruOptIsTrue("mm-stats", math.conf)) {
+		println("mm stats:\n" + mmMathStats(math) + "\n");
 	}
 }
 
-ruMakeMath(conf : RuConf) -> Maybe<RuMath> {
+ruParseMath(conf : RuConf) -> Maybe<Tree<string, RuParseSource>> {
 	maybeBind(ruLoad(conf, ruLoadDescr), \loaded ->
-		maybeBind(ruParse(getTreeValues(loaded), conf), \parsed ->
-			maybeBind(ruCollectMath(parsed, conf), \collected ->
-				maybeMap(ruVerifyMath(collected), ruFixLeftRecursiveRules)
-			)
-		)
+		ruParse(getTreeValues(loaded), conf)
 	)
+}
+
+ruMakeMath1(parsed : Tree<string, RuParseSource>, conf : RuConf) -> Maybe<RuMath> {
+	maybeBind(ruCollectMath(parsed, conf), ruVerifyMath)
+}
+
+ruMakeMath(conf : RuConf) -> Maybe<RuMath> {
+	maybeBind(ruParseMath(conf), \parsed -> ruMakeMath1(parsed, conf))
 }
 
 mmMakeMath(conf : RuConf) -> Maybe<MmMath> {
@@ -137,7 +113,7 @@ main() -> void {
 				} else if (conf.ext == ".mm") {
 					maybeApply(mmMakeMath(conf), mmProcessMath);
 				} else {
-					println("file extension should be *.ru or *.mm");
+					println("file extension should be *.ru or *.mm, while given is: " + conf.ext);
 				}
 				println("processed in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
 				quit(0);
