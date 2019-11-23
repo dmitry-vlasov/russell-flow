@@ -1,0 +1,96 @@
+import ru_math;
+
+export {
+	ruOptimizeMathImports(math : RuMath) -> RuMath;
+}
+
+ruOptimizeMathImports(math : RuMath) -> RuMath {
+	start = timestamp();
+	optimized = ruDoOptimizeMathImports(math.sources, math, RuOptImportsAcc(makeTree(), makeTree()));
+	if (math.conf.verbose > 0) {
+		println("ru imports optimized: " +i2s(sizeTree(optimized.sources)) + " files in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
+	}
+	RuMath(math with sources = optimized.sources)
+}
+
+RuOptImportsAcc(
+	sources : Tree<string, RuSource>,
+	cumulativeImports : Tree<string, Set<string>>
+);
+
+ruDoOptimizeMathImports(left : Tree<string, RuSource>, math : RuMath, acc : RuOptImportsAcc) -> RuOptImportsAcc {
+	if (sizeTree(left) == 0) acc else {
+		ready = filter(
+			getTreeValues(left), 
+			\src -> forall(src.imports, \imp -> !containsKeyTree(left, imp.path))
+		);
+		//println("modules to process: " + strGlue(map(ready, \s -> s.info.file), ", "));
+		optimized = concurrent(true, map(ready, \s -> \-> ruOptimizeSourrceImports(s, acc, math))); 
+		new_acc = RuOptImportsAcc(
+			fold(optimized, acc.sources, \ac, src -> setTree(ac, src.info.file, src)),
+			fold(optimized, acc.cumulativeImports, \ac, src ->
+				setTree(ac, src.info.file, 
+					fold(src.imports, makeSet1(src.info.file), \a, imp -> insertSet(a, imp.path))
+				)
+			)
+		);
+		new_left = fold(ready, left, \ac, src -> removeFromTree(ac, src.info.file));
+		ruDoOptimizeMathImports(new_left, math, new_acc);
+	}
+}
+
+ruOptimizeSourrceImports(src : RuSource, acc : RuOptImportsAcc, math : RuMath) -> RuSource {
+	if (ruContainsOnlyComments(src)) src else {
+		deps = set2array(mapSet(ruCollectDependencies(src), \n -> 
+			switch (lookupTree(math.names, n)) {
+				Some(m): m;
+				None(): {
+					math.conf.onError("unknown name: " + n, []);
+					"";
+				}
+			}
+		));
+		optimized = filter(deps, \d1 -> 
+			(d1 != src.info.file) && forall(deps, \d2 -> {
+				switch (lookupTree(acc.cumulativeImports, d2)) {
+					Some(imps): (d1 == d2) || !containsSet(imps, d1);
+					None(): true;
+				}
+			})
+		);
+		RuSource(src with imports = map(optimized, \imp -> RuImport(imp, -1)))
+	}
+}
+
+ruCollectDependencies(src : RuSource) -> Set<string> {
+	exprDeps = \acc, expr -> fold(expr.nodes, acc, \ac, n ->
+		switch (n) {
+			RuRuleRef(rule, type, __,__): insertSet(insertSet(ac, rule), type);
+			RuVar(__, type): insertSet(ac, type);
+		}
+	);
+	termDeps = \acc, term -> fold(term.expr, insertSet(acc, term.type), \ac, n ->
+		switch (n) {
+			RuConstRef(c): insertSet(ac, c);
+			RuVar(__, type): insertSet(ac, type);
+		}
+	);
+	fold(src.decls, makeSet(), \acc, decl ->
+		switch (decl) {
+			RuComment(__,__): acc;
+			RuTheory(name, decls,__): acc; // TODO
+			RuConst(symb, __,__,__): insertSet(acc, symb);
+			RuType(name, supers,__): fold(supers, acc, \ac, super -> insertSet(ac, super));
+			RuRule(name, vars, term, __): termDeps(acc, term);
+			RuAxiom(name, vars, disjs, hyps, prop, __):
+				fold(hyps, exprDeps(acc, prop), \ac, hyp -> exprDeps(ac, hyp.expr));
+			RuTheorem(name, vars, disjs, hyps, prop, proof, __):
+				fold(proof.steps, 
+					fold(hyps, exprDeps(acc, prop), \ac, hyp -> exprDeps(ac, hyp.expr)), 
+					\ac, step -> insertSet(exprDeps(ac, step.expr), step.assertion)
+				);
+			RuDef(name, vars, disjs, hyps, defm, defs, prop, pos):
+				fold(hyps, exprDeps(acc, prop), \ac, hyp -> exprDeps(ac, hyp.expr));
+		}
+	)
+}
