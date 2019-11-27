@@ -4,8 +4,8 @@ export {
 
 	RuIndex(
 		data  : Maybe<?>,
-		rules : Tree<string, RuIndex<?>>,
-		vars  : Tree<RuVar, RuIndex<?>>,
+		rules : Tree<string, RuIndexNode<?>>,
+		vars  : Tree<string, RuIndexNode<?>>,
 		ends  : [RuIndex<?>],
 		mutable parent : Maybe<RuIndex<?>>,
 	);
@@ -15,7 +15,19 @@ export {
 	ruSetIndex(key : RuExp, data : Maybe<?>, index : RuIndex<?>, conflict : (?, ?) -> ?) -> RuIndex<?>;
 
 	ruIndexSize(ind : RuIndex<?>) -> int;
+
+	RuUnified(
+		sub1 : Tree<RuVar, RuExp>,
+		sub2 : Tree<RuVar, RuExp>,
+		data : Maybe<?>
+	);
+	ruUnifyIndex(e : RuExp, index : RuIndex<?>, math : RuMath) -> [RuUnified<?>];
 }
+
+RuIndexNode(
+	type : string,
+	index : RuIndex<?>
+);
 
 ruMakeIndex() -> RuIndex<?> {
 	ruIndexEmpty
@@ -24,13 +36,13 @@ ruMakeIndex() -> RuIndex<?> {
 ruIndexEmpty = RuIndex(None(), makeTree(), makeTree(), [], None());
 
 ruIndexSize(ind : RuIndex<?>) -> int {
-	s1 = foldTree(ind.rules, 0, \__, i, acc -> acc + ruIndexSize(i));
-	s2 = foldTree(ind.vars, 0, \__, i, acc -> acc + ruIndexSize(i));
+	s1 = foldTree(ind.rules, 0, \__, n, acc -> acc + ruIndexSize(n.index));
+	s2 = foldTree(ind.vars, 0, \__, n, acc -> acc + ruIndexSize(n.index));
 	s1 + s2 + 1;
 }
 
 ruSetIndex(key : RuExp, data : Maybe<?>, index : RuIndex<?>, conflict : (?, ?) -> ?) -> RuIndex<?> {
-	ruDoAdd2Index(0, index, RuIndexStacks(None(), None()), RuIndexAddEnv(key.nodes, data, conflict)).ind
+	ruDoAdd2Index(0, index, RuIndexStacks(None(), None()), RuIndexAddEnv(reverseA(key.nodes), data, conflict)).ind
 }
 
 RuIndexAddEnv(
@@ -92,7 +104,6 @@ ruProcIndexBeg(i : int, n : RuIndex<?>, ret : RuIndexAddRet) -> RuIndexAddRet {
 }
 
 ruDoAdd2Index(i : int, index : RuIndex<?>, stacks : RuIndexStacks<?>, env : RuIndexAddEnv<?>) -> RuIndexAddRet {
-	k = env.key[i];
 	insert_data = \md1, md2 ->
 		eitherMap(md1, \d1 -> eitherMap(md2, \d2 -> Some(env.conflict(d1, d2)), md1), md2);
 	update_node = \n, s -> 
@@ -102,20 +113,96 @@ ruDoAdd2Index(i : int, index : RuIndex<?>, stacks : RuIndexStacks<?>, env : RuIn
 			ruProcIndexBeg(i, n, ruDoAdd2Index(i + 1, n, ruProcIndexEnd(i, n, s), env));
 		}
 	make_ret = \ind, ret -> {
-		traverseInOrder(ind.rules, \__, n -> n.parent ::= Some(ind));
-		traverseInOrder(ind.vars, \__, n -> n.parent ::= Some(ind));
+		traverseInOrder(ind.rules, \__, n -> (n.index).parent ::= Some(ind));
+		traverseInOrder(ind.vars, \__, n -> (n.index).parent ::= Some(ind));
 		RuIndexAddRet(ind, ret.begs);
 	}
-	switch (k) {
+	switch (env.key[i]) {
 		RuRuleRef(rule, type, __, len): {
-			n = lookupTreeDef(index.rules, rule, ruIndexEmpty);
-			r = update_node(n, RuIndexStacks(stacks with ends = Some(RuIndexEndStack(stacks.ends, i + len, i))));
-			make_ret(RuIndex(index with rules = setTree(index.rules, rule, r.ind)), r);
+			n = lookupTreeDef(index.rules, rule, RuIndexNode("", ruIndexEmpty));
+			r = update_node(n.index, RuIndexStacks(stacks with ends = Some(RuIndexEndStack(stacks.ends, i + len, i))));
+			make_ret(RuIndex(index with rules = setTree(index.rules, rule, RuIndexNode(type, r.ind))), r);
 		}
 		RuVar(name, type): {
-			n = lookupTreeDef(index.vars, k, ruIndexEmpty);
-			r = update_node(n, stacks);
-			make_ret(RuIndex(index with vars = setTree(index.vars, k, r.ind)), r);
+			n = lookupTreeDef(index.vars, name, RuIndexNode("", ruIndexEmpty));
+			r = update_node(n.index, stacks);
+			make_ret(RuIndex(index with vars = setTree(index.vars, name, RuIndexNode(type, r.ind))), r);
+		}
+	}
+}
+
+ruUnifyIndex(e : RuExp, index : RuIndex<?>, math : RuMath) -> [RuUnified<?>] {
+	ruDoUnifyIndex(0, index, math, RuUnifyEnv(reverseA(e.nodes), makeTree(), makeTree()))
+}
+
+RuUnifyEnv(
+	nodes : [RuExpNode],
+	sub1 : Tree<RuVar, RuExp>,
+	sub2 : Tree<RuVar, RuExp>,
+);
+
+//ruSuperRule(infer : string, super : string, math : RuMath) -> Maybe<RuRule>;
+
+ruDoUnifyIndex(i : int, index : RuIndex<?>, math : RuMath, env : RuUnifyEnv) -> [RuUnified<?>] {
+	if (i == length(env.nodes)) [RuUnified(env.sub1, env.sub2, index.data)] else {
+		switch (env.nodes[i]) {
+			RuRuleRef(name, type, arity, len): {
+				r1 = switch (lookupTree(index.rules, name)) {
+					Some(ind): ruDoUnifyIndex(i + 1, ind, math, env);
+					None(): [];
+				}
+				r2 = foldTree(index.vars, [], \v, n, acc ->
+					if (type == n.type) {
+						ex = RuExp(reverseA(subrange(env.nodes, i, i + len + 1)), -1);
+						switch (ruAdd2Subst(env.sub1, RuVar(v, n.type), ex)) {
+							Some(s1): 
+								concat(acc, ruDoUnifyIndex(i + len + 1, n.index, math, RuUnifyEnv(env with sub1 = s1)));
+							None(): acc;
+						}
+					} else {
+						switch (ruSuperRule(type, n.type, math)) {
+							Some(sr): {
+								ex = RuExp(reverseA(concat([RuRuleRef(sr.name, n.type, 1, 1)], subrange(env.nodes, i, i + len + 1))), -1);
+								switch (ruAdd2Subst(env.sub1, RuVar(v, n.type), ex)) {
+									Some(s1): 
+										concat(acc, ruDoUnifyIndex(i + len + 1, n.index, math, RuUnifyEnv(env with sub1 = s1)));
+									None(): acc;
+								}
+							}
+							None(): acc;
+						}
+					}
+				);
+				concat(r1, r2);
+			}
+			RuVar(name, type): {
+				r1 = foldTree(index.rules, [], \r, n, acc ->
+					acc
+				);
+				r2 = foldTree(index.vars, [], \v, n, acc ->
+					if (type == n.type) {
+						ex = RuExp([RuVar(name, type)], -1);
+						switch (ruAdd2Subst(env.sub1, RuVar(v, n.type), ex)) {
+							Some(s1): 
+								concat(acc, ruDoUnifyIndex(i + 1, n.index, math, RuUnifyEnv(env with sub1 = s1)));
+							None(): acc;
+						}
+					} else {
+						switch (ruSuperRule(type, n.type, math)) {
+							Some(sr): {
+								ex = RuExp(reverseA(concat([RuRuleRef(sr.name, n.type, 1, 1)], [RuVar(name, type)])), -1);
+								switch (ruAdd2Subst(env.sub1, RuVar(v, n.type), ex)) {
+									Some(s1): 
+										concat(acc, ruDoUnifyIndex(i + 1, n.index, math, RuUnifyEnv(env with sub1 = s1)));
+									None(): acc;
+								}
+							}
+							None(): acc;
+						}
+					}
+				);
+				concat(r1, r2);
+			}
 		}
 	}
 }
