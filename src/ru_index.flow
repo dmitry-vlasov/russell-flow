@@ -31,6 +31,7 @@ RuIndexNode(
 	lens  : [int],            // distances to the beginnings of subterms, starting at this node
 
 	data  : Maybe<?>,
+	expr  : Maybe<RuExp>,
 
 	index : RuIndex<?>, // children nodes
 	mutable parent : Maybe<RuIndexNode<?>>,
@@ -49,11 +50,11 @@ ruIndexSize(ind : RuIndex<?>) -> int {
 }
 
 ruSetIndex(key : RuExp, data : Maybe<?>, index : RuIndex<?>, conflict : (?, ?) -> ?) -> RuIndex<?> {
-	ruDoAdd2Index(0, None(), index, RuIndexStacks(None(), None()), RuIndexAddEnv(key.nodes, data, conflict)).ind
+	ruDoAdd2Index(0, None(), index, RuIndexStacks(None(), None()), RuIndexAddEnv(key, data, conflict)).ind
 }
 
 RuIndexAddEnv(
-	key : [RuExpNode], 
+	key : RuExp, 
 	data : Maybe<?>,
 	conflict : (?, ?) -> ?,
 );
@@ -122,8 +123,15 @@ ruDoAdd2Index(i : int, parent : Maybe<RuIndexNode<?>>, index : RuIndex<?>, stack
 	insert_data = \md1, md2 ->
 		eitherMap(md1, \d1 -> eitherMap(md2, \d2 -> Some(env.conflict(d1, d2)), md1), md2);
 	update_node = \n, s -> {
-		r = if (i + 1 == length(env.key)) {
-			RuIndexAddRet(index, RuIndexNode(n with data = insert_data(n.data, env.data)), stacks.begs);
+		r = if (i + 1 == length(env.key.nodes)) {
+			//ruProcIndexBeg(i, n, 
+				RuIndexAddRet(
+					index, 
+					RuIndexNode(n with data = insert_data(n.data, env.data), expr = Some(env.key)), 
+					ruProcIndexEnd(i, n, s).begs
+					//stacks.begs
+				)
+			//);
 		} else {
 			ruProcIndexBeg(i, n, ruDoAdd2Index(i + 1, Some(n), n.index, ruProcIndexEnd(i, n, s), env));
 		}
@@ -131,14 +139,14 @@ ruDoAdd2Index(i : int, parent : Maybe<RuIndexNode<?>>, index : RuIndex<?>, stack
 		traverseInOrder(r.node.index.vars, \__, m -> m.parent ::= Some(r.node));
 		r
 	}
-	switch (env.key[i]) {
+	switch (env.key.nodes[i]) {
 		RuRuleRef(name, type, arity, len): {
-			n = lookupTreeDef(index.rules, name, RuIndexNode(name, type, arity, [], [], None(), ruIndexEmpty, parent));
+			n = lookupTreeDef(index.rules, name, RuIndexNode(name, type, arity, [], [], None(), None(), ruIndexEmpty, parent));
 			r = update_node(n, RuIndexStacks(stacks with ends = Some(RuIndexEndStack(stacks.ends, i, len))));
 			RuIndexAddRet(r with ind = RuIndex(index with rules = setTree(index.rules, name, r.node)));
 		}
 		RuVar(name, type): {
-			n = lookupTreeDef(index.vars, name, RuIndexNode(name, type, -1, [], [], None(), ruIndexEmpty, parent));
+			n = lookupTreeDef(index.vars, name, RuIndexNode(name, type, -1, [], [], None(), None(), ruIndexEmpty, parent));
 			r = update_node(n, stacks);
 			RuIndexAddRet(r with ind = RuIndex(index with vars = setTree(index.vars, name, r.node)));
 		}
@@ -146,11 +154,11 @@ ruDoAdd2Index(i : int, parent : Maybe<RuIndexNode<?>>, index : RuIndex<?>, stack
 }
 
 ruUnifyIndex(e : RuExp, index : RuIndex<?>, math : RuMath) -> [RuUnified<?>] {
-	ruDoUnifyIndex(0, index, math, RuUnifyEnv(e.nodes, makeTree()))
+	ruDoUnifyIndex(0, index, math, RuUnifyEnv(e, makeTree()))
 }
 
 RuUnifyEnv(
-	nodes : [RuExpNode],
+	expr : RuExp,
 	sub : Tree<RuVar, RuExp>
 );
 
@@ -195,8 +203,8 @@ ruDoUnifyIndex(i : int, index : RuIndex<?>, math : RuMath, env : RuUnifyEnv) -> 
 				None(): []
 			}
 		}
-	if (i == length(env.nodes)) [] else {
-		switch (env.nodes[i]) {
+	if (i == length(env.expr.nodes)) [] else {
+		switch (env.expr.nodes[i]) {
 			RuRuleRef(name, type, arity, len): {
 				r1 = switch (lookupTree(index.rules, name)) {
 					Some(n): ruDoUnifyIndexNode(i, n, math, env);
@@ -204,19 +212,24 @@ ruDoUnifyIndex(i : int, index : RuIndex<?>, math : RuMath, env : RuUnifyEnv) -> 
 				}
 				r2 = foldTree(index.vars, [], \v, n, acc -> 
 					unify_var(i + len, RuVar(n.name, n.type), type, n, 
-						\-> RuExp(subrange(env.nodes, i, i + len + 1), -1)
+						\-> RuExp(subrange(env.expr.nodes, i, len + 1), -1)
 					)
 				);
 				concat(r1, r2);
 			}
 			RuVar(name, type): {
-				r1 = foldTree(index.rules, [], \__, n, acc -> 
+				r1 = foldTree(index.rules, [], \nm, n, acc -> {
+					println("nm: " + nm + ", ends: " + i2s(length(n.ends)));
 					fold(n.ends, acc, \ac, end ->
 						unify_var(i, RuVar(name, type), n.type, n, 
-							\-> ruIndexSubexpr(n, end)
+							\-> {
+								ex = ruIndexSubexpr(n, end);
+								println("ex: " + ru2s(ex, math.rules));
+								ex
+							}
 						)
 					)
-				);
+				});
 				r2 = foldTree(index.vars, [], \v, n, acc -> 
 					unify_var(i, RuVar(n.name, n.type), type, n, 
 						\-> RuExp([RuVar(name, type)], -1)
@@ -229,12 +242,34 @@ ruDoUnifyIndex(i : int, index : RuIndex<?>, math : RuMath, env : RuUnifyEnv) -> 
 }
 
 ruDoUnifyIndexNode(i : int, node : RuIndexNode<?>, math : RuMath, env : RuUnifyEnv) -> [RuUnified<?>] {
-	if (i == length(env.nodes)) {
+	r = if (i + 1 == length(env.expr.nodes)) {
 		switch (node.data) {
-			Some(d): [RuUnified(env.sub, d)];
+			Some(d): {
+				switch (node.expr) {
+					Some(ex): {
+						e1 = ruApplySubst(ex, env.sub);
+						e2 = ruApplySubst(env.expr, env.sub);
+						if (e1.nodes != e2.nodes) {
+							println("wrong unification");
+							println("ex: " + ru2s(ex, math.rules));
+							println("ex(raw): " + ruExpRPN2s(ex.nodes));
+							println("env.expr: " + ru2s(env.expr, math.rules));
+							println("e1: " + ru2s(e1, math.rules));
+							println("e2: " + ru2s(e2, math.rules));
+							println("subst:\n" + ruSubst2s(env.sub, math));
+							println("e1(1): " + ru2s(ruApplySubst(ex, env.sub), math.rules));
+							println("e1(raw): " + ruExpRPN2s(ruApplySubst(ex, env.sub).nodes));
+							quit(-1);
+						}
+					}
+					None(): println("impossible");
+				};
+				[RuUnified(env.sub, d)];
+			}
 			None(): [];
 		}
-	} else ruDoUnifyIndex(i + 1, node.index, math, env)
+	} else [];
+	concat(r, ruDoUnifyIndex(i + 1, node.index, math, env))
 }
 
 ruIndex2s(index : RuIndex<?>, show_data : (?) -> string, math : RuMath) -> string {
@@ -277,7 +312,7 @@ ruDoIndexRaw2s(index : RuIndex<?>, show_data : (?) -> string, nodes : [RuIndexNo
 
 ruDoIndexNodeRaw2s(node : RuIndexNode<?>, show_data : (?) -> string, nodes : [RuIndexNode<?>], acc : string) -> string {
 	acc1 = switch (node.data) {
-		Some(d): acc + strGlue(map(nodes, \n -> n.name), " ") + " --> " + show_data(d) + "\n";
+		Some(d): acc + strGlue(map(nodes, \n -> n.name + ":" + n.type), " ") + " --> " + show_data(d) + "\n";
 		None(): acc;
 	}
 	ruDoIndexRaw2s(node.index, show_data, nodes, acc1);
