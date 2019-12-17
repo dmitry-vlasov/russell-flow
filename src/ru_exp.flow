@@ -248,13 +248,14 @@ ruMatchExpExactly(e : RuExp, pattern : RuExp) -> Maybe<Tree<RuVar, RuVar>> {
 
 ruUnifyExps(es : [RuExp], sub : Tree<RuVar, RuExp>, math : RuMath) -> Maybe<Tree<RuVar, RuExp>> {
 	if (length(es) <= 1) Some(sub) else {
-		ruDoUnifyExps(es, RuUnifyAcc(sub, map(es, \__ -> 0)), math)
+		ruDoUnifyExps(es, RuUnifyAcc(sub, map(es, \__ -> 0), math))
 	}
 }
 
 RuUnifyAcc(
 	sub : Tree<RuVar, RuExp>,
 	inds : [int],
+	math : RuMath
 );
 
 RuUnifyRule(
@@ -263,6 +264,7 @@ RuUnifyRule(
 );
 
 RuUnifyStepAcc(
+	shift : [int],
 	vars  : [RuVar],
 	exprs : [RuExp],
 	rule  : string,
@@ -273,47 +275,71 @@ RuUnifyStepAcc(
 ruUnifyStepVar(step : RuUnifyStepAcc, math : RuMath) -> Maybe<RuVar> {
 	fold(tail(step.vars), Some(step.vars[0]), \acc, v ->
 		maybeBind(acc, \t -> 
-			if (isSome(ruSuperRule(v.type, t.type, math))) Some(v) else
-			if (isSome(ruSuperRule(t.type, v.type, math))) Some(t) else None()
+			if (v.type == t.type || isSome(ruSuperRule(v.type, t.type, math))) Some(v) else
+			if (v.type == t.type || isSome(ruSuperRule(t.type, v.type, math))) Some(t) else None()
 		)
 	)
 }
 
-ruDoUnifyExps(es : [RuExp], acc : RuUnifyAcc, math : RuMath) -> Maybe<Tree<RuVar, RuExp>> {
+ruDoUnifyExps(es : [RuExp], acc : RuUnifyAcc) -> Maybe<Tree<RuVar, RuExp>> {
 	if (all(mapi(acc.inds, \i, n -> n == length(es[i].nodes)))) {
 		Some(acc.sub) 
 	} else {
-		step = foldi(mapi(es, \i, e -> e.nodes[acc.inds[i]]), RuUnifyStepAcc([], [], "", "", true), \i, ac, n ->
+		//println("ruDoUnifyExps: inds=" + strGlue(map(acc.inds, i2s), ", "));
+		step = foldi(mapi(es, \i, e -> e.nodes[acc.inds[i]]), RuUnifyStepAcc([], [], [], "", "", true), \i, ac, n ->
 			switch (n) {
-				RuVar(__,__): 
+				RuVar(__,__): {
+					//println("var[" + i2s(i) + "]=" + n.name);
 					RuUnifyStepAcc(ac with 
+						shift = concat(ac.shift, [1]),
 						vars = concat(ac.vars, [n])
 					);
-				RuRuleRef(rule, type,__, len):
-					RuUnifyStepAcc(ac.vars,
+				}
+				RuRuleRef(rule, type,__, len): {
+					//println("rule[" + i2s(i) + "]=" + rule);
+					RuUnifyStepAcc(
+						concat(ac.shift, [len + 1]),
+						ac.vars,
 						concat(ac.exprs, [RuExp(subrange(es[i].nodes, acc.inds[i], len + 1), es[i].pos)]),
 						rule, type, ac.ok && (ac.rule == "" || rule == ac.rule)
 					);
+				}
 			}
 		);
 		if (!step.ok) None() else {
 			if (step.rule != "") {
 				if (length(step.vars) > 0) {
-					maybeBind(ruUnifyExps(step.exprs, acc.sub, math), \s -> {
+					maybeBind(ruUnifyExps(step.exprs, acc.sub, acc.math), \s -> {
 						ex = ruApplySubst(step.exprs[0], s);
-						fold(step.vars, Some(s), \ac, v -> 
-							maybeBind(ac, \s1 -> ruAdd2Subst1(s1, v, ex, math))
-						)
+						maybeBind(
+							fold(step.vars, Some(s), \ac, v -> 
+								maybeBind(ac, \s1 -> ruAdd2Subst1(s1, v, ex, acc.math))
+							),
+							\s1 -> ruDoUnifyExps(es, 
+								RuUnifyAcc(acc with 
+									sub = s1,
+									inds = mapi(acc.inds, \j, i -> i + step.shift[j])
+								)
+							)
+						);
 					});
 				} else {
-					ruDoUnifyExps(es, RuUnifyAcc(acc with inds = map(acc.inds, \i -> i + 1)), math);
+					ruDoUnifyExps(es, RuUnifyAcc(acc with inds = map(acc.inds, \i -> i + 1)));
 				}
 			} else {
-				maybeBind(ruUnifyStepVar(step, math), \w -> {
+				maybeBind(ruUnifyStepVar(step, acc.math), \w -> {
 					ex = RuExp([w], -1);
-					fold(step.vars, Some(acc.sub), \ac, v -> 
-						maybeBind(ac, \s1 -> ruAdd2Subst1(s1, v, ex, math))
-					)
+					maybeBind(
+						fold(step.vars, Some(acc.sub), \ac, v -> 
+							maybeBind(ac, \s1 -> ruAdd2Subst1(s1, v, ex, acc.math))
+						),
+						\s1 -> ruDoUnifyExps(es, 
+							RuUnifyAcc(acc with
+								sub = s1,
+								inds = map(acc.inds, \i -> i + 1)
+							)
+						)
+					);
 				});
 			}
 		}
@@ -322,18 +348,26 @@ ruDoUnifyExps(es : [RuExp], acc : RuUnifyAcc, math : RuMath) -> Maybe<Tree<RuVar
 
 ruUnifySubstVect(subs : [Tree<RuVar, RuExp>], math : RuMath) -> Maybe<Tree<RuVar, RuExp>> {
 	//println("unifying subs:");
-	//iteri(subs, \i, s -> println(i2s(i) + ":\n" + ruSubst2s(s, math)));
+	//iteri(subs, \i, s -> println(i2s(i) + ":\n" + ruIndent(ruSubst2s(s, math))));
+	vars = fold(subs, makeSet(), \acc, s -> mergeSets(acc, buildSet(getTreeKeys(s))));
+	//println("vars: " + strGlue(map(set2array(vars), \v -> v.name), ", "));
 	ret = foldSet(
 		fold(subs, makeSet(), \acc, s -> mergeSets(acc, buildSet(getTreeKeys(s)))), 
 		Some(makeTree()), 
 		\acc, v ->
 			maybeBind(acc, \sub -> {
 				exprs = filtermap(subs, \s -> lookupTree(s, v));
-				maybeBind(ruUnifyExps(exprs, sub, math), \sub1 ->
-					ruAdd2Subst1(sub1, v, ruApplySubst(exprs[0], sub1), math)
-				)
+				
+				//println("\tvar: " + v.name);
+				//println("\texprs:\n"  + ruIndent2(strGlue(map(exprs, \ex -> ru2s(ex, math.rules)), "\n")));
+				
+				
+				maybeBind(ruUnifyExps(exprs, sub, math), \sub1 -> {
+					//println("\tunifier:\n" + ruIndent2(ruSubst2s(sub1, math)));
+					ruAdd2Subst1(sub1, v, ruApplySubst(exprs[0], sub1), math);
+				});
 			})
 	);
-	//maybeApply(ret, \s -> println("result:\n" + ruSubst2s(s, math)));
+	//maybeApply(ret, \s -> println("result:\n" + ruIndent(ruSubst2s(s, math))));
 	ret
 }
