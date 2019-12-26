@@ -7,8 +7,8 @@ export {
 	RuProverEnv(
 		theorem : RuTheorem,
 		tree : RuProverTree,
-		assertions : RuIndex<RuAssertion>,
-		premises : RuIndex<RuHyp>,
+		unifyAssertion : (hyp : RuProverHyp) -> [RuUnified<RuAssertion>],
+		unifyPremise   : (hyp : RuProverHyp) -> [RuUnified<RuHyp>],
 		math : RuMath,
 		fresher : (RuVar) -> RuVar,
 		unconst : (RuExp) -> RuExp,
@@ -37,10 +37,10 @@ ruInitProver(th : RuTheorem, math0 : RuMath) -> RuProverEnv {
 	uncv_map = foldTree(cv_map, makeTree(), \v, cv, acc -> setTree(acc, cv, v));
 	uncv_exp = \e -> RuExp(map(e.nodes, \n -> lookupTreeDef(uncv_map, n, n)), e.pos);
 	
-	th_src = lookupTreeDef(math.names, th.name, ruNoSource);
+	th_src = ruNameSource(th.name, math);
 	all_imported = removeSet(ruCollectAllImported(th.name, math), th_src);
 	assertions = foldTree(math.assertions, ruMakeIndex(), \name, ass, acc -> {
-			ass_src = lookupTreeDef(math.names, name, ruNoSource);
+			ass_src = ruNameSource(name, math);
 			if (containsSet(all_imported, ass_src)) {
 				ruSetIndex(ass.prop, ass, acc);
 			} else if (ass_src == th_src) {
@@ -59,8 +59,8 @@ ruInitProver(th : RuTheorem, math0 : RuMath) -> RuProverEnv {
 	env = RuProverEnv(
 		th,
 		RuProverTree([], root),
-		assertions,
-		premises,
+		\hyp -> ruUnifyIndex(hyp.expr, assertions, math),
+		\hyp -> ruUnifyIndex(hyp.expr, premises, math),
 		math,
 		\v -> {
 			vars := setTree(^vars, v, lookupTreeDef(^vars, v, 0) + 1);
@@ -74,7 +74,7 @@ ruInitProver(th : RuTheorem, math0 : RuMath) -> RuProverEnv {
 
 ruExpandHyp(hyp : RuProverHyp, env : RuProverEnv) -> RuProverEnv {
 	make_fresh = \vars, fresher -> foldSet(vars, makeTree(), \acc, v -> setTree(acc, v, RuExp([fresher(v)], -1)));
-	iter(ruUnifyIndex(hyp.expr, env.assertions, env.math), \unif -> {
+	iter(env.unifyAssertion(hyp), \unif -> {
 			a_vars  = ruAssertion2Vars(unif.data);
 			fresher = make_fresh(differenceSets(a_vars, buildSet(getTreeKeys(unif.sub))), env.fresher);
 			maybeApply(ruCompose(unif.sub, fresher), \s_all -> {
@@ -110,7 +110,7 @@ ruExpandProp(prop : RuProverProp, env : RuProverEnv) -> RuProverEnv {
 			ex = ruApplySubst(ruApplySubst(h.expr, prop.sub), prop.outer);
 			hyp = RuProverExp(ref [], ex, ref [], prop);
 			refArrayPush(prop.children, hyp);
-			iter(ruUnifyIndex(ex, acc.premises, acc.math), \unif -> {
+			iter(env.unifyPremise(hyp), \unif -> {
 				hex = ruApplySubst(unif.data.expr, unif.sub);
 				hypProof = RuProverProofTop(hyp, hex, unif.data, unif.sub);
 				refArrayPush(hyp.proofs, hypProof);
@@ -123,37 +123,17 @@ ruExpandProp(prop : RuProverProp, env : RuProverEnv) -> RuProverEnv {
 	}
 }
 
-ruNextCart(v : [int], prod : [[?]]) -> Maybe<[int]> {
-	keep = ref false;
-	next = mapi(v, \i, n -> {
-		if (^keep) n else 
-		if (n + 1 < length(prod[i])) {
-			keep := true;
-			n + 1;
-		} else 0
-	});
-	if (^keep) Some(next) else None();
-}
-
-ruCardCart(prod : [[?]]) -> int {
-	fold (prod, 1, \acc, p -> acc * length(p));
-}
-
-ruProd2s(prod : [[?]]) -> string {
-	"dims=[" + strGlue(map(prod, \p -> i2s(length(p))), ", ") + "]"
-}
-
 ruAddProof(prop : RuProverProp, hypProof : RuProverProofHyp, env : RuProverEnv) -> void {
 	if (length(^(prop.children)) == ruArity(prop.assertion)) {
 		prod = map(^(prop.children), \hyp ->
 			if (hyp == hypProof.node) [hypProof] else ^(hyp.proofs)
 		);
-		if (ruCardCart(prod) > 0) {
+		if (ruSizeCart(prod) > 0) {
 			/*if (ruCardCart(prod) > 1000) {
-				println("ruCardCart(prod)=" + i2s(ruCardCart(prod)));
+				println("ruSizeCart(prod)=" + i2s(ruSizeCart(prod)));
 			}*/
-			if (ruCardCart(prod) > 100000) {
-				println("ruCardCart(prod)=" + i2s(ruCardCart(prod)));
+			if (ruSizeCart(prod) > 100000) {
+				println("ruSizeCart(prod)=" + i2s(ruSizeCart(prod)));
 			} else {
 				ruAddProofVariant(prop, map(prod, \__ -> 0), prod, env);
 			}
@@ -313,7 +293,7 @@ ruReproveTask(math : RuMath, target : string) -> bool {
 			default: true;
 		}
 	reprove_decls = \decls ->
-		all(ruConcurrent2(map(decls, \d -> \-> reprove_decl(d))));
+		all(ruConcurrent(map(decls, \d -> \-> reprove_decl(d))));
 	start = timestamp();
 	ret = if (target == "1" || target == "all") {
 		reprove_decls(concatA(map(ruOrderSources(math), \src -> src.decls)));
@@ -342,3 +322,71 @@ ruReproveTask(math : RuMath, target : string) -> bool {
 	}
 	ret
 }
+
+ruInitGeneralizer(th : RuTheorem, math : RuMath) -> RuProverEnv {
+	dag = ruProofToDAG(th.proof);
+	ass = lookupTreeDef(math.assertions, dag.data, ruNoAxiom);
+	mapping = ref makeTree();
+	vars = ref makeTree();
+	root = RuProverRoot(ref [], ass.prop, ref []);
+	mapping := setTree(^mapping, root, dag);
+	hyps = ref [];
+	env = RuProverEnv(
+		th,
+		RuProverTree([], root),
+		\hyp -> {
+			switch (lookupTree(^mapping, hyp)) {
+				Some(node): {
+					a = lookupTreeDef(math.assertions, node.data, ruNoAxiom);
+					switch (ruUnifyExps([hyp.expr, a.prop], makeTree(), math)) {
+						Some(theta): [RuUnified(theta, a)];
+						None(): [];
+					}
+				}
+				None(): {
+					println("must not happen");
+					quit(-1);
+					[];
+				}
+			}
+		},
+		\hyp -> {
+			switch (hyp) {
+				RuProverExp(__,__,__,parent):
+					switch (lookupTree(^mapping, parent.parent)) {
+						Some(node): {
+							if (node.data != "") [] else {
+								switch (find(^hyps, \h -> h.expr == hyp.expr)) {
+									Some(h): [RuUnified(makeTree(), h)];
+									None(): {
+										h = RuHyp(length(^hyps), hyp.expr, -1);
+										refArrayPush(hyps, h);
+										[RuUnified(makeTree(), h)];
+									}
+								}
+							}
+						}
+						None(): {
+							println("must not happen");
+							quit(-1);
+							[];
+						}
+					}
+				default: {
+					println("must not happen");
+					quit(-1);
+					[];
+				}
+			}
+		},
+		math,
+		\v -> {
+			vars := setTree(^vars, v, lookupTreeDef(^vars, v, 0) + 1);
+			RuVar(v.name + "_" + i2s(lookupTreeDef(^vars, v, 0)), v.type);
+		},
+		idfn,
+		ref []
+	);
+	ruExpandHyp(root, env);
+}
+
