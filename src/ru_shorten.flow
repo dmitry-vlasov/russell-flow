@@ -1,13 +1,19 @@
 import ru_refactor;
 import prover/ru_prover_util;
+import ru_verify;
 
 export {
 	ruShortenTheorem(theorem : RuTheorem, math : RuMath) -> Maybe<RuTheorem>;
+	ruShortenMath(math : RuMath) -> RuMath;
+	ruShorten(math : RuMath, target : string) -> RuMath;
 }
 
 RuShortenAcc(
-	variants : Tree<int,[RuStep]>,
-	premises : RuIndex<RuRef>
+	optimized : [RuStep],
+	assertions : RuIndex<RuAssertion>,
+	premises : RuIndex<RuRef>,
+	steps : [RuStep],
+	math : RuMath,
 );
 
 ruSubProofVolume(i : int, steps : [RuStep]) -> int {
@@ -20,40 +26,165 @@ ruSubProofVolume(i : int, steps : [RuStep]) -> int {
 }
 
 RuShortenStepAcc(
-	acc : RuShortenAcc,
+	up : RuShortenAcc,
+	step : RuStep,
 	sub : Tree<RuVar, RuExp>,
 	refs : [RuRef]
 );
 
-ruShortenTheorem(th : RuTheorem, math : RuMath) -> Maybe<RuTheorem> {
-	cth = ruConstTheorem(th, math);
+ruRefsEq(r1 : RuRef, r2 : RuRef) -> bool {
+	switch (r1) {
+		RuHypRef(i, __): 
+			switch (r2) {
+				RuHypRef(j, __): i == j;
+				RuStepRef(__, __): false;
+			}
+		RuStepRef(i, __):
+			switch (r2) {
+				RuHypRef(__, __): false;
+				RuStepRef(j, __): i == j;
+			}
+	}
+}
+
+ruStepsEq(s1 : RuStep, s2 : RuStep) -> bool {
+	s1.ind == s2.ind &&
+	s1.assertion == s2.assertion && 
+	s1.expr.nodes == s2.expr.nodes &&
+	length(s1.refs) == length(s2.refs) &&
+	forall(zipWith(s1.refs, s2.refs, \r1, r2 -> Pair(r1, r2)),
+		\p -> ruRefsEq(p.first, p.second)
+	);
+}
+
+ruShortenTheorem(th : RuTheorem, math0 : RuMath) -> Maybe<RuTheorem> {
+	cth = ruConstTheorem(th, math0);
+	math = cth.math;
 	assertions = ruInitAssertionsIndex(th.name, math);
 	initPremises = fold(cth.const.hyps, ruMakeIndex(), \acc, hyp -> ruSetIndex(hyp.expr, RuHypRef(hyp.ind, -1), acc));
-	variants = fold(cth.const.proof.steps, RuShortenAcc(makeTree(), initPremises), \acc, step -> {
+	optimized = foldi(cth.const.proof.steps, RuShortenAcc([], assertions, initPremises, cth.const.proof.steps, math), \i, acc, step -> {
 		vol = ruSubProofVolume(step.ind, th.proof.steps);
-		fold(ruUnifyIndex(step.expr, assertions, makeTree(), cth.math), acc, \ac, unif -> {
-			if (!ruCheckDisjs(unif.sub, unif.data.disjs) || !ruCheckDisjs(unif.sub, cth.const.disjs)) ac else {
-				foldi(unif.data.hyps, RuShortenStepAcc(ac, unif.sub, []), \i, a, hyp -> {
-						fold(ruUnifyIndex(ruApplySubst(hyp.expr, a.sub), ac.premises, a.sub, cth.math), a, \b, un -> {
-							if (i + 1 < length(unif.data.hyps)) RuShortenStepAcc(b.acc, un.sub, concat(a.refs, [un.data])) else {
-								new_step = RuStep(step with refs = b.refs);
-								new_steps = ruReplaceArray(cth.const.proof.steps, step.ind, new_step);
-								if (ruSubProofVolume(step.ind, new_steps) >= vol) b else {
-									RuShortenStepAcc(
-										RuShortenAcc(b.acc with 
-											variants = setTree(b.acc.variants, step.ind,
-												concat(lookupTreeDef(b.acc.variants, step.ind, []), [new_step])
-											)
-										),
-										un.sub, []
-									);
-								}
-							}
-						})
-					}
-				).acc;
+		variants = ruStepVariants(step.ind, cth.const.proof.steps, th.disjs, acc);
+		if (!exists(variants, \st -> ruStepsEq(st, step))) {
+			println("step " + ru2s(step, math.rules) + "  in theorem " + th.name + " is not found");
+			println("variants:\n" + strGlue(map(variants, \v -> "\t" + ru2s(v, math.rules)), "\n"));
+			quit(-1);
+		}
+		least = fold(variants, Pair(step, vol), \ac, new_step -> {
+			v = ruSubProofVolume(i, ruReplaceArray(acc.steps, i, new_step));
+			if (v < ac.second) Pair(new_step, v) else ac;
+		}).first;
+		RuShortenAcc(acc with
+			optimized = concat(acc.optimized, [least]),
+			premises = ruSetIndex(step.expr, RuStepRef(step.ind, -1), acc.premises)
+		);
+	}).optimized;
+	ret = ruRemoveTheoremUnusedSteps(RuTheorem(th with 
+		proof = ruTransformProof(RuProof(th.proof with steps = optimized), cth.unconst)
+	), math.conf);
+	switch (ret) {
+		Some(th_opt): {
+			if (math.conf.verbose > 0) {
+				println("theorem " + th.name + " shortened by " + i2s(length(th.proof.steps) - length(th_opt.proof.steps)) + " steps");
 			}
-		})
-	}).variants;
-	None();
+			if (isNone(ruVerifyTheorem(th_opt, math))) {
+				println("ERROR IN SHORTENING");
+				println("optimized:");
+				println(ru2s(th_opt, math.rules));
+				println("original:");
+				println(ru2s(th, math.rules));
+				quit(-1);
+			}
+		}
+		None(): 
+			if (math.conf.verbose > 1) {
+				println("therem " + th.name + " was not shortened");
+			}
+	}
+	ret
+}
+
+ruStepVariants(i : int, steps : [RuStep], disjs : Set<RuDisj>, acc : RuShortenAcc) -> [RuStep] {
+	step = acc.steps[i];
+	vol = ruSubProofVolume(i, acc.steps);
+	ass_unified = ruUnifyIndex(step.expr, acc.assertions, makeTree(), acc.math);
+	fold(ruUnifyIndex(step.expr, acc.assertions, makeTree(), acc.math), [], \ac, unif -> {
+		if (!ruCheckDisjs(unif.sub, unif.data.disjs) || !ruCheckDisjs(unif.sub, disjs)) ac else {
+			concat(ac, ruRefsVariants(0, unif.data.hyps, RuShortenStepAcc(acc, RuStep(step with assertion = unif.data.name), unif.sub, [])));
+		}
+	})
+}
+
+ruRefsVariants(j : int, hyps : [RuHyp], acc : RuShortenStepAcc) -> [RuStep] {
+	if (j == length(hyps)) {
+		[RuStep(acc.step with refs = acc.refs)];
+	} else {
+		concatA(map(ruUnifyIndex(ruApplySubst(hyps[j].expr, acc.sub), acc.up.premises, acc.sub, acc.up.math), \un -> {
+			ruRefsVariants(j + 1, hyps, RuShortenStepAcc(acc with 
+				refs = concat(acc.refs, [un.data]),
+				sub = un.sub
+			))
+		}))
+	}
+}
+
+ruShortenMath(math : RuMath) -> RuMath {
+	start = timestamp();
+	shortened = filtermap(ruConcurrent(
+		map(getTreeValues(ruMathTheorems(math)), 
+			\th -> \ -> ruShortenTheorem(th, math)
+		)
+	), idfn);
+	ret = fold(shortened, math, \acc, th -> ruReplaceTheorem(th, acc));
+	if (math.conf.verbose > 0) {
+		println("shortened " + i2s(length(shortened)) + " theorems in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
+	}
+	ret;
+}
+
+ruShorten(math : RuMath, target : string) -> RuMath {
+	if (target == "1" || target == "all") {
+		ruShortenMath(math);
+	} else {
+		switch (lookupTree(math.assertions, target)) {
+			Some(th): {
+				switch (th) {
+					RuTheorem(__,__,__,__,__,__,__,__): {
+						start = timestamp();
+						shortened = ruShortenTheorem(th, math);
+						ret = eitherMap(shortened, \t -> ruReplaceTheorem(t, math), math);
+						if (math.conf.verbose > 0 && isSome(shortened)) {
+							println("theorem " + target + " shortened in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
+						}
+						ret;
+					}
+					default: {
+						println("assertion " + target + " is not a theorem");
+						math;
+					}
+				}
+			}
+			None(): {
+				switch (lookupTree(math.sources, target)) {
+					Some(src): {
+						start = timestamp();
+						shortened = filtermap(ruConcurrent(
+							map(ruSourceTheorems(src), 
+								\th -> \ -> ruShortenTheorem(th, math)
+							)
+						), idfn);
+						ret = fold(shortened, math, \acc, th -> ruReplaceTheorem(th, acc));
+						if (math.conf.verbose > 0) {
+							println("shortened " + i2s(length(shortened)) + " theorems in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
+						}
+						ret;
+					}
+					None(): {
+						println("shortening target " + target + " is not found");
+						math;
+					}
+				}
+			}
+		}
+	}
 }
