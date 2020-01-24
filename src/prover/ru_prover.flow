@@ -15,17 +15,17 @@ export {
 		proofs : ref [RuProof]
 	);
 
-	ruInitProver(theorem : RuTheorem, math : RuMath) -> RuProverEnv;
+	ruInitProver(theorem : RuTheorem, math : RuMath, asses : Maybe<RuIndex<RuAssertion>>) -> RuProverEnv;
 	ruExpandProp(prop : RuProverProp, env : RuProverEnv) -> RuProverEnv;
 	ruProve(env : RuProverEnv, tactic : (RuProverTree) -> Maybe<RuProverProp>) -> RuProverEnv;
 
 	ruCommandReproveTask(math : RuMath) -> RuMath;
 }
 
-ruInitProver(th : RuTheorem, math0 : RuMath) -> RuProverEnv {
+ruInitProver(th : RuTheorem, math0 : RuMath, asses : Maybe<RuIndex<RuAssertion>>) -> RuProverEnv {
 	cth = ruConstTheorem(th, math0);
 	math = cth.math;
-	assertions = ruInitAssertionsIndex(th.name, math);
+	assertions = eitherFn(asses, idfn, \ -> ruInitAssertionsIndex(th.name, math));
 	premises = ruInitPremisesIndex(cth.const);
 	vars = ref makeTree();
 	root = RuProverRoot(ref [], cth.const.prop, ref []);
@@ -352,15 +352,32 @@ ruCommandReproveTask(math : RuMath) -> RuMath {
 	failed_th_names = ref [];
 	max_time = ref 0.0;
 	max_th_name = ref "";
-	reprove_th = \th -> {
+	reprove_th = \th, index -> {
 		start = timestamp();
-		env = ruInitProver(th, math);
+		env = ruInitProver(th, math, index);
+		init_stats = RuStatsRow("reprove init " + th.name, 
+			pairs2tree([Pair("size", length(th.proof.steps)), Pair("time", cast(timestamp() - start : double -> int))])
+		);
+		ruAddStats("reprove_init", init_stats);
+		
+		t = timestamp();
 		ruProve(env, ruReproveTactic(th, math));
+		tm = cast(timestamp() - start : double -> int);
 		time = (timestamp() - start)/ 1000.0;
 		if (time > ^max_time) {
 			max_time := time;
 			max_th_name := th.name;
 		}
+		reprove_stats = RuStatsRow("reprove do " + th.name, 
+			pairs2tree([Pair("size", length(th.proof.steps)), Pair("time", cast(timestamp() - t : double -> int))])
+		);
+		ruAddStats("reprove_do", reprove_stats);
+		
+		stats = RuStatsRow("reproved all " + th.name, 
+			pairs2tree([Pair("size", length(th.proof.steps)), Pair("time", tm)])
+		);
+		ruAddStats("reprove_all", stats);
+		
 		if (^(env.proofs) == []) {
 			atomicRefIntAddition(failed_count, 1);
 			println("theorem " + th.name + " was NOT reproved in " + d2st(time, 2) + "s");
@@ -379,21 +396,32 @@ ruCommandReproveTask(math : RuMath) -> RuMath {
 			true;
 		}
 	}
-	reprove_ass = \ass -> 
+	reprove_ass = \ass : RuAssertion -> 
 		switch (ass) {
-			RuTheorem(__,__,__,__,__,__,__,__): reprove_th(ass);
+			RuTheorem(__,__,__,__,__,__,__,__): reprove_th(ass, None());
 			default: true;
 		}
-	reprove_decl = \decl ->
+	reprove_decl = \decl : RuBlock ->
 		switch (decl) {
-			RuTheorem(__,__,__,__,__,__,__,__): reprove_th(decl);
+			RuTheorem(__,__,__,__,__,__,__,__): reprove_th(decl, None());
 			default: true;
 		}
 	reprove_decls = \decls ->
 		all(ruConcurrent(map(decls, \d -> \-> reprove_decl(d))));
-		//all(map(decls, \d -> reprove_decl(d)));
 	start = timestamp();
-	ret = if (target == "1" || target == "all") {
+	ret = if (target == "all" || target == "1") {
+		decls = filtermap(concatA(map(ruOrderSources(math), \src -> src.decls)), ruBlock2Assertion);
+		chunks = splitByNumber(decls, s2i(ruOptDef("reprove-split-num", "256", math.conf)));
+		fold(chunks, Pair(ruMakeIndex(), true), \acc, chunk -> {
+			indexes = foldi(chunk, Pair(acc.first, []), \i, ac, ass ->
+				Pair(ruSetIndex(ass.prop, ass, ac.first), concat(ac.second, [ac.first]))
+			);
+			ret = all(ruConcurrent(mapi(chunk, \i, ass -> 
+					\-> eitherMap(ruAssertion2Theorem(ass), \th -> reprove_th(th, Some(indexes.second[i])), true)
+			)));
+			Pair(indexes.first, ret && acc.second)
+		}).second;
+	} else if (target == "1-seq" || target == "all-seq") {
 		reprove_decls(concatA(map(ruOrderSources(math), \src -> src.decls)));
 	} else {
 		switch (lookupTree(math.sources, target)) {
@@ -419,17 +447,48 @@ ruCommandReproveTask(math : RuMath) -> RuMath {
 		iter(^failed_th_names, \th -> println("\t" + th));
 	}
 	if (math.conf.verbose > 0) {
+		println("<< reprove all >>");
+		println("complete reprove distrib: ");
+		println(ruIndent(ruProcStats("reprove_all", ruDistribSumStats("size", "time", 2))));
+		println("sum reprove all time: " + ruProcStats("reprove_all", ruSumStats("time")));
+		println("max size: " + ruProcStats("reprove_all", ruMaxStats("size")));
+		println("max time: " + ruProcStats("reprove_all", ruMaxStats("time")));
+		println("");
+	
+		println("<< reprove init >>");
+		println("reprove init distrib: ");
+		println(ruIndent(ruProcStats("reprove_init", ruDistribSumStats("size", "time", 2))));
+		println("sum init time: " + ruProcStats("reprove_init", ruSumStats("time")));
+		println("max size: " + ruProcStats("reprove_init", ruMaxStats("size")));
+		println("max time: " + ruProcStats("reprove_init", ruMaxStats("time")));
+		println("");
+	
+		println("<< reprove do >>");
+		println("do reprove distrib sum: ");
+		println(ruIndent(ruProcStats("reprove_do", ruDistribSumStats("size", "time", 2))));
+		println("do reprove distrib avg: ");
+		println(ruIndent(ruProcStats("reprove_do", ruDistribAvgStats("size", "time", 2))));
+		println("sum do reprove: " + ruProcStats("reprove_do", ruSumStats("time")));
+		println("max size: " + ruProcStats("reprove_do", ruMaxStats("size")));
+		println("max time: " + ruProcStats("reprove_do", ruMaxStats("time")));
+		println("avg time: " + ruProcStats("reprove_do", ruAvgStats("time")));
+		println("");
+	
+		/*println("<< init_assertion_index >>");
+		println("init_assertion_index times: ");
+		println(ruIndent(ruProcStats("init_assertion_index", ruDistribSumStats("size", "time", 2))));
+		println("sum init_assertion_index time: " + ruProcStats("init_assertion_index", ruSumStats("time")));
+		println("max size: " + ruProcStats("init_assertion_index", ruMaxStats("size")));
+		println("max time: " + ruProcStats("init_assertion_index", ruMaxStats("time")));
+		println("");*/
+	
 		println("<< add_proof >>");
 		println("prod times: ");
 		println(ruIndent(ruProcStats("add_proof_prod", ruDistribSumStats("size", "time", 10))));
 		println("sum prod time: " + ruProcStats("add_proof_prod", ruSumStats("time")));
-		println("");
-
 		println("tree times: ");
 		println(ruIndent(ruProcStats("add_proof_tree", ruDistribSumStats("size", "time", 10))));
 		println("sum tree time: " + ruProcStats("add_proof_tree", ruSumStats("time")));
-		println("");
-
 		println("max size: " + ruProcStats("add_proof", ruMaxStats("size")));
 		println("max time: " + ruProcStats("add_proof", ruMaxStats("time")));
 		println("max rets: " + ruProcStats("add_proof", ruMaxStats("rets")));
