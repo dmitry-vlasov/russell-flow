@@ -1,12 +1,13 @@
 import ru_index;
 import ru_stats;
+import prover/ru_prover_util;
 
 export {
 	RuSubData(
 		sub : Tree<RuVar, RuExp>,
 		data: ?
 	);
-	ruUnifySubsProd(prod : [[RuSubData<?>]], math : RuMath) -> [RuSubData<[?]>];
+	ruUnifySubsProd(prod : [[RuSubData<?>]], maxExLen : int, timer : () -> bool, math : RuMath) -> [RuSubData<[?]>];
 	
 	RuSubsColumn(
 		var : RuVar,
@@ -90,9 +91,10 @@ ruIntersectCols1(col1 : [RuSubArrData<[Set<int>]>], col2 : [RuUnified<[Set<int>]
 	);
 }
 
-ruUnifySubsProd(subs : [[RuSubData<?>]], math : RuMath) -> [RuSubData<[?]>] {
+ruUnifySubsProd(subs : [[RuSubData<?>]], maxExLen : int, timeLimit : () -> bool, math : RuMath) -> [RuSubData<[?]>] {
 	if (subs == [] || exists(subs, \s -> s == [])) [] else 
 	if (length(subs) == 1) map(subs[0], \d -> RuSubData(d.sub, [d.data])) else {
+		started = timestamp();
 		matrix = ruMakeSubsMatrix(subs);
 		if (matrix.cols == []) {
 			ruMapCart(subs, \vect -> RuSubData(makeTree(), map(vect, \sd -> sd.data)));
@@ -103,7 +105,7 @@ ruUnifySubsProd(subs : [[RuSubData<?>]], math : RuMath) -> [RuSubData<[?]>] {
 						println("unifying COLUMN " + i2s(i) + ":");
 						debugUnifyIndexes := true;
 					}
-					if (!^empty) {
+					if (!^empty && !timeLimit()) {
 						size = fold(col.rows, 1, \acc, ind -> acc * ruIndexDataCount(ind));
 						descr = strGlue(map(col.rows, \ind -> i2s(ruIndexDataCount(ind))), "x");
 						t = timestamp();
@@ -125,13 +127,21 @@ ruUnifySubsProd(subs : [[RuSubData<?>]], math : RuMath) -> [RuSubData<[?]>] {
 								}
 								switch (lookupTree(unif.sub, col.var)) {
 									None(): 
-										maybeMap(ruAdd2Subst1(unif.sub, col.var, unif.expr, math), \s ->
-											RuUnified(s, unif.data, ruApplySubst(unif.expr, s))
+										maybeBind(ruAdd2Subst1(unif.sub, col.var, unif.expr, math), \s ->
+											if (ruSubIsLess(s, maxExLen)) {
+												Some(RuUnified(s, unif.data, ruApplySubst(unif.expr, s)));
+											} else {
+												None();
+											}
 										);
 									Some(ex):
 										maybeBind(ruUnifyExps([unif.expr, ex], unif.sub, math), \un -> 
-											maybeMap(ruCompose(unif.sub, un), \s ->
-												RuUnified(s, unif.data, ruApplySubst(ex, s))
+											maybeBind(ruCompose(unif.sub, un), \s ->
+												if (ruSubIsLess(s, maxExLen)) {
+													Some(RuUnified(s, unif.data, ruApplySubst(ex, s)));
+												} else {
+													None();
+												}
 											)
 										);
 								}
@@ -177,8 +187,10 @@ ruUnifySubsProd(subs : [[RuSubData<?>]], math : RuMath) -> [RuSubData<[?]>] {
 					tail(unified), 
 					Pair(map(unified[0], \unif -> RuSubArrData([unif.sub], unif.data)), []), 
 					\acc, col -> {
-						ret = ruIntersectCols1(acc.first, col, math);
-						Pair(ret, concat(acc.second, [length(acc.first) * length(col)]));
+						if (timeLimit()) acc else {
+							ret = ruIntersectCols1(acc.first, col, math);
+							Pair(ret, concat(acc.second, [length(acc.first) * length(col)]));
+						}
 					}
 				);
 				intersected_1 = inter_pair.first;
@@ -198,7 +210,15 @@ ruUnifySubsProd(subs : [[RuSubData<?>]], math : RuMath) -> [RuSubData<[?]>] {
 				intersected = filtermap(intersected_1, \ss -> 
 					maybeMap(
 						fold(ss.subs, Some(makeTree()), \acc, s2 -> 
-							maybeBind(acc, \s1 ->ruUnifySubs([s1, s2], math))
+							maybeBind(acc, \s1 ->
+								maybeBind(ruUnifySubs([s1, s2], math), \s3 ->
+									if (ruSubIsLess(s3, maxExLen) && !timeLimit()) {
+										Some(s3);
+									} else {
+										None();
+									}
+								)
+							)
 						),
 						\s -> RuSubData(s, ss.data)
 					)
