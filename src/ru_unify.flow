@@ -1,0 +1,517 @@
+import ru_subst;
+import ru_index;
+
+export {
+	ruUnifyExps(es : [RuExp], sub : Tree<RuVar, RuExp>, math : RuMath) -> Maybe<Tree<RuVar, RuExp>>;
+	ruUnifySubs(subs : [Tree<RuVar, RuExp>], math : RuMath) -> Maybe<Tree<RuVar, RuExp>>;
+
+	RuUnified(
+		sub : Tree<RuVar, RuExp>,
+		data : ?,
+		expr : RuExp
+	);
+	ruUnifyIndex(e : RuExp, index : RuIndex<?>, sub : Tree<RuVar, RuExp>, math : RuMath) -> [RuUnified<?>];
+	ruUnifyIndexes(inds : [RuIndex<?>], sub : Tree<RuVar, RuExp>, math : RuMath) -> [RuUnified<[Set<?>]>];
+
+	debugUnifyIndexes = ref false;
+}
+
+ruUnifyExps(es : [RuExp], sub : Tree<RuVar, RuExp>, math : RuMath) -> Maybe<Tree<RuVar, RuExp>> {
+	if (length(es) <= 1) Some(sub) else {
+		ruDoUnifyExps(es, RuUnifyAcc(sub, map(es, \__ -> 0), math))
+	}
+}
+
+RuUnifyAcc(
+	sub : Tree<RuVar, RuExp>,
+	inds : [int],
+	math : RuMath
+);
+
+RuUnifyStepAcc(
+	shift : [int],
+	vars  : [RuVar],
+	exprs : [RuExp],
+	rule  : string,
+	type  : string,
+	ok    : bool,
+	all_rules : bool
+);
+
+ruUnifyStepVar(step : RuUnifyStepAcc, math : RuMath) -> Maybe<RuVar> {
+	maybeBind(
+		fold(tail(step.vars), Some(step.vars[0]), \acc, v ->
+			maybeBind(acc, \t -> 
+				if (v.type == t.type || isSome(ruSuperRule(v.type, t.type, math))) Some(v) else
+				if (v.type == t.type || isSome(ruSuperRule(t.type, v.type, math))) Some(t) else None()
+			)
+		),
+		\v -> if (step.type == "" || v.type == step.type || isSome(ruSuperRule(v.type, step.type, math))) Some(v) else None()
+	)
+}
+
+ruDoUnifyStep(es : [RuExp], acc : RuUnifyAcc) -> RuUnifyStepAcc {
+	foldi(
+		mapi(es, \i, e -> e.nodes[acc.inds[i]]), 
+		RuUnifyStepAcc([], [], [], "", "", true, true), 
+		\i, ac, n ->
+		switch (n) {
+			RuVar(__,__): {
+				switch (lookupTree(acc.sub, n)) {
+					None():
+						RuUnifyStepAcc(ac with
+							shift = concat(ac.shift, [1]),
+							vars = concat(ac.vars, [n]),
+							all_rules = false
+						);
+					Some(ex): {
+						m = ex.nodes[0];
+						switch (m) {
+							RuRuleRef(rule, type, __,len):
+								RuUnifyStepAcc(
+									concat(ac.shift, [1]),
+									ac.vars,
+									concat(ac.exprs, [ex]),
+									rule, 
+									type, 
+									ac.ok && (ac.rule == "" || rule == ac.rule),
+									false
+								);
+							RuVar(v, t):
+								RuUnifyStepAcc(ac with 
+									shift = concat(ac.shift, [1]),
+									vars = concat(ac.vars, [m]),
+									all_rules = false
+								);
+						}
+					}
+				}
+			}
+			RuRuleRef(rule, type,__, len): {
+				RuUnifyStepAcc(
+					concat(ac.shift, [len + 1]),
+					ac.vars,
+					concat(ac.exprs, [RuExp(subrange(es[i].nodes, acc.inds[i], len + 1), es[i].pos)]),
+					rule, type, ac.ok && (ac.rule == "" || rule == ac.rule), ac.all_rules
+				);
+			}
+		}
+	);
+}
+
+ruDoUnifyExps(es : [RuExp], acc : RuUnifyAcc) -> Maybe<Tree<RuVar, RuExp>> {
+	if (all(mapi(acc.inds, \i, n -> n == length(es[i].nodes)))) {
+		Some(acc.sub) 
+	} else {
+		step = ruDoUnifyStep(es, acc);
+		if (!step.ok) None() else {
+			new_inds = \-> mapi(acc.inds, \j, i -> i + step.shift[j]);
+			if (step.rule != "") {
+				if (!step.all_rules) {
+					maybeBind(ruUnifyExps(step.exprs, acc.sub, acc.math), \s -> {
+						ex = ruApplySubst(step.exprs[0], s);
+						maybeBind(
+							fold(step.vars, Some(s), \ac, v -> 
+								maybeBind(ac, \s1 -> ruAdd2Subst1(s1, v, ex, acc.math))
+							),
+							\s1 -> ruDoUnifyExps(es, 
+								RuUnifyAcc(acc with 
+									sub = s1,
+									inds = new_inds()
+								)
+							)
+						);
+					});
+				} else {
+					ruDoUnifyExps(es, RuUnifyAcc(acc with inds = map(acc.inds, \i -> i + 1)));
+				}
+			} else {
+				maybeBind(ruUnifyStepVar(step, acc.math), \w -> {
+					ex = RuExp([w], -1);
+					maybeBind(
+						fold(step.vars, Some(acc.sub), \ac, v -> 
+							maybeBind(ac, \s1 -> ruAdd2Subst1(s1, v, ex, acc.math))
+						),
+						\s1 -> ruDoUnifyExps(es, 
+							RuUnifyAcc(acc with
+								sub = s1,
+								inds = new_inds()
+							)
+						)
+					);
+				});
+			}
+		}
+	}
+}
+
+ruUnifySubs(subs : [Tree<RuVar, RuExp>], math : RuMath) -> Maybe<Tree<RuVar, RuExp>> {
+	foldSet(
+		fold(subs, makeSet(), \acc, s -> mergeSets(acc, buildSet(getTreeKeys(s)))),
+		Some(makeTree()), 
+		\acc, v ->
+			maybeBind(acc, \sub -> {
+				exprs = filtermap(subs, \s -> maybeMap(lookupTree(s, v), \e -> ruApplySubst(e, sub)));
+				maybeBind(ruUnifyExps(exprs, sub, math), \sub1 -> {
+					e1 = ruApplySubst(exprs[0], sub1);
+					switch (lookupTree(sub1, v)) {
+						None(): ruAdd2Subst1(sub1, v, e1, math);
+						Some(e2):
+							maybeBind(ruUnifyExps([e1, e2], sub1, math), \unif -> 
+								ruCompose(sub1, unif)
+							);
+					}
+				});
+			})
+	);
+}
+
+ruUnifyIndex(e : RuExp, index : RuIndex<?>, sub : Tree<RuVar, RuExp>, math : RuMath) -> [RuUnified<?>] {
+	unified = ref [];
+	ruDoUnifyIndex(0, index, math, RuUnifyEnv(e, sub, unified));
+	^unified
+}
+
+RuUnifyEnv(
+	expr : RuExp,
+	sub : Tree<RuVar, RuExp>,
+	unified : ref [RuUnified<?>]
+);
+
+ruDoUnifyIndex(i : int, index : RuIndex<?>, math : RuMath, env : RuUnifyEnv) -> void {
+	unify_step = \j, var, end, ex -> {
+		switch (lookupTree(env.sub, var)) {
+			Some(ex1): {
+				switch (ruUnifyExps([ex1, ex], env.sub, math)) {
+					Some(s): ruDoUnifyIndexNode(j, end, math, RuUnifyEnv(env with sub = s));
+					None(): {};
+				}
+			}
+			None():
+				switch (ruAdd2Subst(env.sub, var, ex)) {
+					Some(s): ruDoUnifyIndexNode(j, end, math, RuUnifyEnv(env with sub = s));
+					None(): {};
+				}
+		}
+	}
+	unify_var = \j, var, ex_type, end, e ->
+		if (ex_type == var.type) unify_step(j, var, end, e())
+		else {
+			switch (ruSuperRule(var.type, ex_type, math)) {
+				Some(sr): {
+					ex = RuExp(concat([RuRuleRef(sr.name, var.type, 1, 1)], e().nodes), -1);
+					unify_step(j, var, end, ex);
+				}
+				None(): {}
+			}
+		}
+	if (i < length(env.expr.nodes)) {
+		switch (env.expr.nodes[i]) {
+			RuRuleRef(name, type, arity, len): {
+				switch (lookupTree(index.rules, name)) {
+					Some(n): ruDoUnifyIndexNode(i, n, math, env);
+					None(): {};
+				}
+				traverseInOrder(index.vars, \v, n -> 
+					unify_var(i + len, RuVar(n.name, n.type), type, n, 
+						\-> RuExp(subrange(env.expr.nodes, i, len + 1), -1)
+					)
+				);
+			}
+			RuVar(name, type): {
+				traverseInOrder(index.rules, \nm, n -> {
+					iterSet(n.ends, \e -> {
+						end = ^(index.nodes)[e];
+						unify_var(i, RuVar(name, type), n.type, end, 
+							\-> ruIndexSubexpr(n, end)
+						)
+					})
+				});
+				traverseInOrder(index.vars, \v, n -> 
+					unify_var(i, RuVar(n.name, n.type), type, n, 
+						\-> RuExp([RuVar(name, type)], -1)
+					)
+				);
+			}
+		}
+	}
+}
+
+ruDoUnifyIndexNode(i : int, node : RuIndexNode<?>, math : RuMath, env : RuUnifyEnv) -> void {
+	if (i + 1 == length(env.expr.nodes)) {
+		iter(node.data, \d -> refArrayPush(env.unified, RuUnified(env.sub, d, ruApplySubst(env.expr, env.sub))));
+	}
+	ruDoUnifyIndex(i + 1, node.index, math, env);
+}
+
+RuSubIndex(
+	start : RuIndexNode<?>, 
+	curr  : RuIndexNode<?>,
+	ends  : Set<int>
+);
+
+RuUnifyIndexesAcc(
+	sub  : Tree<RuVar, RuExp>,
+	inds : [RuSubIndex<?>],
+	math : RuMath
+);
+
+RuUnifyIndexesStepAcc(
+	is_var: [bool],
+	vars  : [RuVar],
+	exprs : [RuExp],
+	inds  : [RuSubIndex<?>],
+	rule  : string,
+	type  : string,
+	arity : int,
+	ok    : bool
+);
+
+ruUnifyIndexesStepAcc2s(step : RuUnifyIndexesStepAcc<?>, math : RuMath) -> string {
+	"rule: " + step.rule + ", type: " + step.type + ", ok: " + b2s(step.ok) + "\n"
+	"is_var: " + strGlue(map(step.is_var, b2s), ", ")  + "\n" +
+	"vars: " + strGlue(map(step.vars, \v -> ru2s(v, math.rules)), ", ")  + "\n" +
+	"exprs:\n" + ruIndent(strGlue(map(step.exprs, \e -> ru2s(e, math.rules)), "\n"))  + "\n"
+}
+
+ruUnifyIndexesStepVar(step : RuUnifyIndexesStepAcc<?>, math : RuMath) -> Maybe<RuVar> {
+	maybeBind(
+		fold(tail(step.vars), Some(step.vars[0]), \acc, v ->
+			maybeBind(acc, \t -> 
+				if (v.type == t.type || isSome(ruSuperRule(v.type, t.type, math))) Some(v) else
+				if (v.type == t.type || isSome(ruSuperRule(t.type, v.type, math))) Some(t) else None()
+			)
+		),
+		\v -> if (step.type == "" || v.type == step.type || isSome(ruSuperRule(v.type, step.type, math))) Some(v) else None()
+	)
+}
+
+ruDoUnifyIndexesStep(ns : [RuIndexNode<?>], acc : RuUnifyIndexesAcc<?>) -> RuUnifyIndexesStepAcc<?> {
+	foldi(
+		ns,
+		RuUnifyIndexesStepAcc([], [], [], [], "", "", -1, true), 
+		\i, ac, n ->
+			if (n.arity == -1) {
+				switch (lookupTree(acc.sub, RuVar(n.name, n.type))) {
+					None():
+						RuUnifyIndexesStepAcc(ac with
+							is_var = concat(ac.is_var, [true]),
+							vars = concat(ac.vars, [RuVar(n.name, n.type)])
+						);
+					Some(ex): {
+						m = ex.nodes[0];
+						switch (m) {
+							RuRuleRef(rule, type, arity, __):
+								RuUnifyIndexesStepAcc(ac with
+									is_var = concat(ac.is_var, [true]),
+									exprs = concat(ac.exprs, [ex])
+								);
+							RuVar(v, t):
+								RuUnifyIndexesStepAcc(ac with 
+									is_var = concat(ac.is_var, [true]),
+									vars = concat(ac.vars, [m])
+								);
+						}
+					}
+				}
+			} else {
+				RuUnifyIndexesStepAcc(ac with
+					is_var = concat(ac.is_var, [false]),
+					inds = concat(ac.inds, [RuSubIndex(n, n, n.ends)]),
+					rule = n.name, 
+					type = n.type, 
+					arity = n.arity,
+					ok = ac.ok && (ac.rule == "" || n.name == ac.rule)
+				);
+			}
+	);
+}
+
+RuUnifiyIndexesRet(
+	vect : [int],
+	sub  : Tree<RuVar, RuExp>,
+	expr : RuExp
+);
+
+counter = ref 0;
+
+ruDoUnifyIndexNodesNext(s : Tree<RuVar, RuExp>, new_inds : [RuSubIndex<?>], acc : RuUnifyIndexesAcc) -> [RuUnifiyIndexesRet] {
+	vect = map(new_inds, \n -> n.curr.id);
+	if (^debugUnifyIndexes) {
+		println("unify_next, vect: <" + strGlue(map(vect, i2s), ",") + ">");
+		println("unify_next, nodes: {" + strGlue(mapi(vect, \i, n -> ^(new_inds[i].curr.index.nodes)[n].name), ",") + "}");
+		println("unify_next, ends: {" + strGlue(mapi(vect, \i, __ -> "[" + strGlue(map(set2array(acc.inds[i].ends), i2s), ",") + "]"), ",") + "}");
+	}
+	ends = mapi(new_inds, \i, ind -> containsSet(ind.ends, vect[i]) || isEmptySet(ind.ends));
+	if (^debugUnifyIndexes) {
+		println("ends: [" + strGlue(map(ends, b2s), ",") + "]");
+	}
+	if (!all(ends)) {
+		if (^debugUnifyIndexes) {
+			println("YYY");
+		};
+		ruDoUnifyIndexes(
+			RuUnifyIndexesAcc(acc with sub = s, inds = new_inds)
+		);
+	} else {
+		if (^debugUnifyIndexes) {
+			println("XXX: ");
+			println("unify_next, nodes ids: {" + strGlue(mapi(vect, \i, __ -> i2s(new_inds[i].curr.id)), ",") + "}");
+			println(ru2s(ruApplySubst(ruIndexSubexpr(new_inds[0].start, new_inds[0].curr), s), acc.math.rules));
+		};
+		[RuUnifiyIndexesRet(vect, s, ruApplySubst(ruIndexSubexpr(new_inds[0].start, new_inds[0].curr), s))];
+	}
+}
+
+ruDoUnifyIndexNextInds(vect : [int], step : RuUnifyIndexesStepAcc<?>, nodes : [RuIndexNode<?>], acc : RuUnifyIndexesAcc) -> [RuSubIndex<?>] {
+	foldi(nodes, Pair([], 0), \i, ac, n -> 
+		if (step.is_var[i]) {
+			Pair(
+				concat(ac.first, [RuSubIndex(acc.inds[i].start, n, acc.inds[i].ends)]), 
+				ac.second
+			);
+		} else {
+			end_node : RuIndexNode<?> = ^(acc.inds[i].start.index.nodes)[vect[ac.second]];
+			Pair(
+				concat(ac.first, [RuSubIndex(acc.inds[i].start, end_node, acc.inds[i].ends)]), 
+				ac.second + 1
+			);
+		}
+	).first;
+}
+
+ruDoUnifyTrivial(node : RuIndexNode<?>, acc : RuUnifyIndexesAcc<?>) -> [RuUnifiyIndexesRet] {
+	foldSet(node.ends, [], \ac, end -> 
+		concat(ac, [RuUnifiyIndexesRet([end], acc.sub, ruIndexSubexpr(node, ^(node.index.nodes)[end]))])
+	);
+}
+
+ruDoUnifyIndexNodes(nodes : [RuIndexNode<?>], acc : RuUnifyIndexesAcc<?>) -> [RuUnifiyIndexesRet] {
+	counter := ^counter + 1;
+	if (^debugUnifyIndexes /*&& ^counter == 32*/) {
+		println("counter: " + i2s(^counter));
+	}
+	if (length(nodes) == 0) [] else 
+	if (length(nodes) == 1) {
+		ruDoUnifyTrivial(nodes[0], acc);
+	} else {
+		step = ruDoUnifyIndexesStep(nodes, acc);
+		if (^debugUnifyIndexes) {
+			println("step:\n" + ruUnifyIndexesStepAcc2s(step, acc.math));
+			println("sub:\n" + ruIndent(ruSubst2s(acc.sub, acc.math)))
+		}
+		if (!step.ok) [] else {
+			if (step.rule != "") {
+				if (any(step.is_var)) {
+					if (step.arity > 0) {
+						sub_unified = 
+							if (length(step.inds) > 1) {
+								ruDoUnifyIndexes(RuUnifyIndexesAcc(acc.sub, step.inds, acc.math));
+							} else if (length(step.inds) == 1) {
+								ruDoUnifyTrivial(nodes[findiDef(step.is_var, \v -> !v, -1)], acc);
+							} else [];
+						concatA(filtermap(sub_unified, \ret -> {
+							maybeBind(ruUnifyExps(concat(step.exprs, [ret.expr]), ret.sub, acc.math), \s -> {
+								ex = ruApplySubst(ret.expr, s);
+								maybeBind(
+									fold(step.vars, Some(s), \ac, var -> 
+										maybeBind(ac, \s1 -> ruAdd2Subst1(s1, var, ex, acc.math))
+									),
+									\s1 -> {
+										ni = ruDoUnifyIndexNextInds(ret.vect, step, nodes, acc);
+										Some(ruDoUnifyIndexNodesNext(s1, ni, acc));
+									}
+								);
+							});
+						}));
+					} else {
+						const = RuExp([RuRuleRef(step.rule, step.type, 0, 0)], -1);
+						eitherMap(ruUnifyExps(concat(step.exprs, [const]), acc.sub, acc.math), 
+							\s -> {
+								eitherMap(
+									fold(step.vars, Some(s), \ac, var -> 
+										maybeBind(ac, \s1 -> ruAdd2Subst1(s1, var, const, acc.math))
+									),
+									\s1 -> {
+										ni = mapi(nodes, \i, n -> RuSubIndex(acc.inds[i].start, n, acc.inds[i].ends));
+										ruDoUnifyIndexNodesNext(s1, ni, acc)
+									},
+									[]
+								);
+							},
+							[]
+						);
+					}
+				} else {
+					eitherMap(ruUnifyExps(step.exprs, acc.sub, acc.math), 
+						\s -> {
+							ni = mapi(nodes, \i, n -> RuSubIndex(acc.inds[i].start, n, acc.inds[i].ends));
+							ruDoUnifyIndexNodesNext(s, ni, acc)
+						},
+						[]
+					);
+				}
+			} else {
+				if (step.exprs == []) {
+					eitherMap(ruUnifyIndexesStepVar(step, acc.math), \w ->
+						eitherMap(
+							fold(step.vars, Some(acc.sub), \ac, var -> 
+								maybeBind(ac, \s1 -> ruAdd2Subst1(s1, var, RuExp([w], -1), acc.math))
+							),
+							\s1 -> {
+								ni = mapi(nodes, \i, n -> RuSubIndex(acc.inds[i].start, n, acc.inds[i].ends));
+								ruDoUnifyIndexNodesNext(s1, ni, acc);
+							},
+							[]
+						), []
+					);
+				} else {
+					eitherMap(ruUnifyExps(step.exprs, acc.sub, acc.math), 
+						\s -> {
+							ex = ruApplySubst(step.exprs[0], s);
+							eitherMap(
+								fold(step.vars, Some(s), \ac, var -> 
+									maybeBind(ac, \s1 -> ruAdd2Subst1(s1, var, ex, acc.math))
+								),
+								\s1 -> {
+									ni = mapi(nodes, \i, n -> RuSubIndex(acc.inds[i].start, n, acc.inds[i].ends));
+									ruDoUnifyIndexNodesNext(s1, ni, acc);
+								},
+								[]
+							);
+						},
+						[]
+					);
+				}
+			}
+		}
+	}
+}
+
+ruDoUnifyIndexes(acc : RuUnifyIndexesAcc<?>) -> [RuUnifiyIndexesRet] {
+	prod = map(acc.inds, \subind -> concat(getTreeValues(subind.curr.index.rules), getTreeValues(subind.curr.index.vars)));
+	if (^debugUnifyIndexes) {
+		println("prod size: " + i2s(ruSizeCart(prod)));
+	}
+	ruFoldCart(prod, [], \ac, nodes -> concat(ac, ruDoUnifyIndexNodes(nodes, acc)));
+}
+
+ruUnifyIndexes(inds : [RuIndex<?>], sub : Tree<RuVar, RuExp>, math : RuMath) -> [RuUnified<[Set<?>]>] {
+	if (inds == []) [] else {
+		prod = map(inds, \ind -> concat(getTreeValues(ind.rules), getTreeValues(ind.vars)));
+		rets = ruFoldCart(prod, [], \acc, nodes -> 
+			concat(acc, ruDoUnifyIndexNodes(nodes,
+				RuUnifyIndexesAcc(sub, 
+					mapi(nodes, \i, n -> RuSubIndex(n, n, n.ends)),
+					math, //map(inds, \ind -> ^(ind.nodes))
+				)
+			))
+		);
+		if (^debugUnifyIndexes) {
+			println("RETS: " + strGlue(map(rets, \ret -> "\t<" + strGlue(map(ret.vect, i2s), ", ")  + ">"), ", "));
+		}
+		map(rets, \ret -> 
+			RuUnified(ret.sub, mapi(ret.vect, \i, n -> buildSet(^(inds[i].nodes)[n].data)), ret.expr)
+	);
+	}
+}
