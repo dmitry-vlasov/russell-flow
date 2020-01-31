@@ -1,0 +1,156 @@
+import prover/ru_prover_util;
+import unify/ru_unify_indexes;
+
+export {
+
+	RuProverEnv(
+		timeLimit : () -> bool,
+		maxExLen : int,
+		theorem : RuTheorem,
+		tree : RuProverTree,
+		unifyAssertion : (hyp : RuProverHyp) -> [RuUnified<RuAssertion>],
+		unifyPremise   : (hyp : RuProverHyp) -> [RuUnified<RuHyp>],
+		math : RuMath,
+		fresher : (RuVar) -> RuVar,
+		unconst : (RuExp) -> RuExp,
+		proofs : ref [RuProof],
+		idxer : () -> int,
+		reproveMap : ref Tree<RuProverProp, RuProofStep>
+	);
+	ruInitProverEnv(theorem : RuTheorem, math : RuMath, asses : Maybe<RuIndex<RuAssertion>>) -> RuProverEnv;
+	ruInitGeneralizerEnv(theorem : RuTheorem, math : RuMath) -> RuProverEnv;
+}
+
+ruEstimateMaxExp(index : RuIndex<RuAssertion>) -> int {
+	len_num_max = ruFoldIndex(index, Triple(0.0, 0, 0), \acc, ass ->
+		eitherMap(ruAssertion2Theorem(ass), \th ->
+			fold(th.proof.steps, acc, \ac, step -> {
+				len = length(step.expr.nodes);
+				Triple(ac.first + cast(len : int -> double), ac.second + 1, max(acc.third, len))
+			}),
+			acc
+		)
+	);
+	if (len_num_max.second < 4096) 256 else {
+		avg_len = len_num_max.first / cast(len_num_max.second : int -> double);
+		sigma_sum = ruFoldIndex(index, 0.0, \acc, ass ->
+			eitherMap(ruAssertion2Theorem(ass), \th ->
+				fold(th.proof.steps, acc, \ac, step -> {
+					delta = cast(length(step.expr.nodes) : int -> double) - avg_len;
+					ac + delta * delta;
+				}),
+				acc
+			)
+		);
+		sigma = sqrt(sigma_sum / cast(len_num_max.second : int -> double));
+		cast(avg_len + 3.0 * sigma : double -> int);
+	}
+	len_num_max.third + 64;
+}
+
+ruInitProverEnv(th : RuTheorem, math0 : RuMath, asses : Maybe<RuIndex<RuAssertion>>) -> RuProverEnv {
+	cth = ruConstTheorem(th, math0);
+	math = cth.math;
+	assertions = eitherFn(asses, idfn, \ -> ruInitAssertionsIndex(th.name, math));	
+	premises = ruInitPremisesIndex(cth.const);
+	vars = ref makeTree();
+	root = RuProverRoot(ref [], cth.const.prop, ref []);
+	id = ref 0;
+	RuProverEnv(
+		{
+			started = timestamp();
+			limit = cast(s2i(ruOptDef("prove-time-limit", "5", math.conf)) * 1000 : int -> double);
+			\-> timestamp() - started > limit
+		},
+		ruEstimateMaxExp(assertions),
+		th, //cth.const,
+		RuProverTree(makeTree(), root),
+		\hyp -> ruUnifyIndex(hyp.expr, assertions, makeTree(), math),
+		\hyp -> ruUnifyIndex(hyp.expr, premises, makeTree(), math),
+		math,
+		\v -> {
+			vars := setTree(^vars, v, lookupTreeDef(^vars, v, 0) + 1);
+			RuVar(v.name + "_" + i2s(lookupTreeDef(^vars, v, 0)), v.type);
+		},
+		cth.unconst,
+		ref [],
+		\-> { ret = ^id; id := ^id + 1; ret; },
+		ref makeTree()
+	);
+}
+
+ruInitGeneralizerEnv(th : RuTheorem, math : RuMath) -> RuProverEnv {
+	dag = ruProofToDAG(th.proof);
+	ass = lookupTreeDef(math.assertions, dag.data, ruNoAxiom);
+	mapping = ref makeTree();
+	vars = ref makeTree();
+	root = RuProverRoot(ref [], ass.prop, ref []);
+	mapping := setTree(^mapping, root, dag);
+	hyps = ref [];
+	id = ref 0;
+	RuProverEnv(
+		{
+			started = timestamp();
+			limit = cast(s2i(ruOptDef("prove-time-limit", "5", math.conf)) * 1000 : int -> double);
+			\-> timestamp() - started > limit
+		},
+		-1,
+		th,
+		RuProverTree(makeTree(), root),
+		\hyp -> {
+			switch (lookupTree(^mapping, hyp)) {
+				Some(node): {
+					a = lookupTreeDef(math.assertions, node.data, ruNoAxiom);
+					switch (ruUnifyExps([hyp.expr, a.prop], makeTree(), math)) {
+						Some(theta): [RuUnified(theta, a, ruApplySubst(a.prop, theta))];
+						None(): [];
+					}
+				}
+				None(): {
+					println("must not happen");
+					quit(-1);
+					[];
+				}
+			}
+		},
+		\hyp -> {
+			switch (hyp) {
+				RuProverExp(__,__,__,__,parent):
+					switch (lookupTree(^mapping, parent.parent)) {
+						Some(node): {
+							if (node.data != "") [] else {
+								switch (find(^hyps, \h -> h.expr == hyp.expr)) {
+									Some(h): [RuUnified(makeTree(), h, h.expr)];
+									None(): {
+										h = RuHyp(length(^hyps), hyp.expr, -1);
+										refArrayPush(hyps, h);
+										[RuUnified(makeTree(), h, h.expr)];
+									}
+								}
+							}
+						}
+						None(): {
+							println("must not happen");
+							quit(-1);
+							[];
+						}
+					}
+				default: {
+					println("must not happen");
+					quit(-1);
+					[];
+				}
+			}
+		},
+		math,
+		\v -> {
+			vars := setTree(^vars, v, lookupTreeDef(^vars, v, 0) + 1);
+			RuVar(v.name + "_" + i2s(lookupTreeDef(^vars, v, 0)), v.type);
+		},
+		idfn,
+		ref [],
+		\ -> { ret = ^id; id := ^id + 1; ret; },
+		ref makeTree()
+	);
+}
+
