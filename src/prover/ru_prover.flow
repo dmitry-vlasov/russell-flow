@@ -16,7 +16,8 @@ export {
 		fresher : (RuVar) -> RuVar,
 		unconst : (RuExp) -> RuExp,
 		proofs : ref [RuProof],
-		idxer : () -> int
+		idxer : () -> int,
+		reproveMap : ref Tree<RuProverProp, RuProofStep>
 	);
 
 	ruInitProver(theorem : RuTheorem, math : RuMath, asses : Maybe<RuIndex<RuAssertion>>) -> RuProverEnv;
@@ -80,32 +81,99 @@ ruInitProver(th : RuTheorem, math0 : RuMath, asses : Maybe<RuIndex<RuAssertion>>
 		},
 		cth.unconst,
 		ref [],
-		\-> { ret = ^id; id := ^id + 1; ret; }
+		\-> { ret = ^id; id := ^id + 1; ret; },
+		ref makeTree()
 	);
 	ruExpandHyp(root, env);
 }
 
+ruMakeFresh(vars : Set<RuVar>, env : RuProverEnv) -> Tree<RuVar, RuExp> {
+	foldSet(vars, makeTree(), \acc, v -> setTree(acc, v, RuExp([env.fresher(v)], -1)));
+}
+
 ruExpandHyp(hyp : RuProverHyp, env : RuProverEnv) -> RuProverEnv {
-	make_fresh = \vars, fresher -> foldSet(vars, makeTree(), \acc, v -> setTree(acc, v, RuExp([fresher(v)], -1)));
 	t1 = timestamp();
 	unified = env.unifyAssertion(hyp);
-	ruAddStats("unify_assertion", RuStatsRow("unifying " + ru2s(hyp.expr, env.math.rules), 
-		pairs2tree([
-			Pair("size", length(hyp.expr.nodes)), 
-			Pair("time", cast(timestamp() - t1 : double -> int)), 
-			Pair("rets", length(unified))
-		])
-	));
-	leafs = fold(unified, 
-		switch (hyp) {
-			RuProverExp(__,__,__, parent): removeFromTree(env.tree.leafs, parent.id);
-			RuProverRoot(__,__,__): env.tree.leafs;
-		},
-		\acc, unif -> {
-			a_vars  = ruAssertion2Vars(unif.data);
-			fresher = make_fresh(differenceSets(a_vars, buildSet(getTreeKeys(unif.sub))), env.fresher);
-			eitherMap(ruCompose(unif.sub, fresher), \s_all -> {
-				sub = filterTree(s_all, \v, __ -> !containsSet(a_vars, v));
+	if (ruOptIsTrue("reprove-stats", env.math.conf)) {
+		ruAddStats("unify_assertion", RuStatsRow("unifying " + ru2s(hyp.expr, env.math.rules), 
+			pairs2tree([
+				Pair("size", length(hyp.expr.nodes)), 
+				Pair("time", cast(timestamp() - t1 : double -> int)), 
+				Pair("rets", length(unified))
+			])
+		));
+	}
+	leafs_removed = switch (hyp) {
+		RuProverExp(__,__,__,__, parent): removeFromTree(env.tree.leafs, parent.id);
+		RuProverRoot(__,__,__): env.tree.leafs;
+	};
+	proc_unified = \unif -> {
+		t2 = timestamp();
+		a_vars  = ruAssertion2Vars(unif.data);
+		t2_ = cast(timestamp() - t2 : double -> int);
+		
+		t3 = timestamp();
+		fresher = ruMakeFresh(differenceSets(a_vars, buildSet(getTreeKeys(unif.sub))), env);
+		t3_ = cast(timestamp() - t3 : double -> int);
+		
+		
+		t4 = timestamp();
+		s_all = ruUnsafeCompose(unif.sub, fresher);
+		t4_ = cast(timestamp() - t4 : double -> int);
+		
+		t = cast(timestamp() - t2 : double -> int);
+		
+		if (ruOptIsTrue("reprove-stats", env.math.conf)) {
+			ruAddStats("add_unified", RuStatsRow("adding " + ru2s(hyp.expr, env.math.rules) + " for " + unif.data.name, 
+				pairs2tree([
+					//Pair("size", length(hyp.expr.nodes)), 
+					Pair("time",  t), 
+					Pair("time2", t2_), 
+					Pair("time3", t3_),
+					Pair("time4", t4_),
+					Pair("count", 1)
+				])
+			));
+		}
+		RuProverProp(
+			env.idxer(),
+			unif.data, ref [], 
+			filterTree(s_all, \v, __ -> !containsSet(a_vars, v)),
+			filterTree(s_all, \v, __ -> containsSet(a_vars, v)),
+			ref [],
+			hyp
+		);
+	}
+	regular_expand = \-> {
+		fold(unified, leafs_removed,
+			\acc, unif -> {
+				t2 = timestamp();
+				a_vars  = ruAssertion2Vars(unif.data);
+				t2_ = cast(timestamp() - t2 : double -> int);
+				
+				t3 = timestamp();
+				fresher = ruMakeFresh(differenceSets(a_vars, buildSet(getTreeKeys(unif.sub))), env);
+				t3_ = cast(timestamp() - t3 : double -> int);
+				
+				
+				t4 = timestamp();
+				s_all = ruUnsafeCompose(unif.sub, fresher);
+				t4_ = cast(timestamp() - t4 : double -> int);
+				
+				t = cast(timestamp() - t2 : double -> int);
+				
+				if (ruOptIsTrue("reprove-stats", env.math.conf)) {
+					ruAddStats("add_unified", RuStatsRow("adding " + ru2s(hyp.expr, env.math.rules) + " for " + unif.data.name, 
+						pairs2tree([
+							//Pair("size", length(hyp.expr.nodes)), 
+							Pair("time",  t), 
+							Pair("time2", t2_), 
+							Pair("time3", t3_),
+							Pair("time4", t4_),
+							Pair("count", 1)
+						])
+					));
+				}
 				prop = RuProverProp(
 					env.idxer(),
 					unif.data, ref [], 
@@ -115,47 +183,44 @@ ruExpandHyp(hyp : RuProverHyp, env : RuProverEnv) -> RuProverEnv {
 					hyp
 				);
 				refArrayPush(hyp.children, prop);
-				setTree(acc, prop.id, prop);
-			}, acc);
+				t5 = timestamp();
+				ret = setTree(acc, prop.id, prop);
+				if (ruOptIsTrue("reprove-stats", env.math.conf)) {
+					ruAddStats("add_unified_set_tree", RuStatsRow("adding " + ru2s(hyp.expr, env.math.rules) + " for " + unif.data.name, 
+						pairs2tree([
+							Pair("time",  cast(timestamp() - t5 : double -> int)),
+							Pair("count", 1)
+						])
+					));
+				}
+				ret
+			}
+		);
+	}
+	leafs = if (!ruOptIsSet("reprove", env.math.conf) || !ruOptIsTrue("reprove-singletons", env.math.conf)) regular_expand() else {
+		switch (hyp) {
+			RuProverExp(i,__,__,__, parent): {
+				p = lookupTreeDef(^(env.reproveMap), parent, RuProofStep(ruNoAxiom, [], ruNoExp));
+				switch (p.children[i]) {
+					RuProofStep(ass,__,__): {
+						switch (find(unified, \unif -> unif.data.name == ass.name)) {
+							Some(unif): {
+								prop = proc_unified(unif);
+								refArrayPush(hyp.children, prop);
+								setTree(leafs_removed, prop.id, prop);
+							}
+							None(): leafs_removed;
+						}
+					}
+					RuProofHyp(__,__): leafs_removed;
+				}
+			}
+			RuProverRoot(__,__,__): regular_expand();
 		}
-	);
+	}
 	RuProverEnv(env with 
 		tree = RuProverTree(leafs, env.tree.root)
 	);
-	/*
-	leafs = removeTree(env.tree.leafs, parent.ind);
-	iter(unified, \unif -> {
-			a_vars  = ruAssertion2Vars(unif.data);
-			fresher = make_fresh(differenceSets(a_vars, buildSet(getTreeKeys(unif.sub))), env.fresher);
-			maybeApply(ruCompose(unif.sub, fresher), \s_all -> {
-				sub = filterTree(s_all, \v, __ -> !containsSet(a_vars, v));
-				refArrayPush(
-					hyp.children,
-					RuProverProp(unif.data, ref [], 
-						filterTree(s_all, \v, __ -> !containsSet(a_vars, v)),
-						filterTree(s_all, \v, __ -> containsSet(a_vars, v)),
-						ref [],
-						hyp
-					)
-				);
-			})
-		}
-	);
-	t2 = timestamp();
-	leafs = switch (hyp) {
-		RuProverExp(__,__,__, parent): removeFirst(env.tree.leafs, parent);
-		RuProverRoot(__,__,__): [];
-	}
-	ruAddStats("removeFirst", RuStatsRow("removing", 
-		pairs2tree([
-			Pair("time", cast(timestamp() - t2 : double -> int)), 
-			Pair("count", 1)
-		])
-	));
-	RuProverEnv(env with tree = RuProverTree(
-		concat(leafs, ^(hyp.children)),
-		env.tree.root
-	));*/
 }
 
 ruExpandProp(prop : RuProverProp, env : RuProverEnv) -> RuProverEnv {
@@ -163,20 +228,22 @@ ruExpandProp(prop : RuProverProp, env : RuProverEnv) -> RuProverEnv {
 		refArrayPush(prop.proofs, RuProverProofProp(prop, prop.sub, []));
 		RuProverEnv(env with tree = RuProverTree(env.tree with leafs = removeFromTree(env.tree.leafs, prop.id)));
 	} else {
-		env1 = fold(prop.assertion.hyps, env, \acc, h -> {
+		env1 = foldi(prop.assertion.hyps, env, \i, acc, h -> {
 			ex = ruApplySubst(ruApplySubst(h.expr, prop.sub), prop.outer);
 			if (!ruExpIsLess(ex, env.maxExLen)) acc else {
-				hyp = RuProverExp(ref [], ex, ref [], prop);
+				hyp = RuProverExp(i, ref [], ex, ref [], prop);
 				refArrayPush(prop.children, hyp);
 				t1 = timestamp();
 				unified = env.unifyPremise(hyp);
-				ruAddStats("unify_premise", RuStatsRow("unifying " + ru2s(hyp.expr, env.math.rules), 
-					pairs2tree([
-						Pair("size", length(hyp.expr.nodes)), 
-						Pair("time", cast(timestamp() - t1 : double -> int)), 
-						Pair("rets", length(unified))
-					])
-				));
+				if (ruOptIsTrue("reprove-stats", env.math.conf)) {
+					ruAddStats("unify_premise", RuStatsRow("unifying " + ru2s(hyp.expr, env.math.rules), 
+						pairs2tree([
+							Pair("size", length(hyp.expr.nodes)), 
+							Pair("time", cast(timestamp() - t1 : double -> int)), 
+							Pair("rets", length(unified))
+						])
+					));
+				}
 				iter(unified, \unif -> {
 					hypProof = RuProverProofTop(hyp, unif.expr, unif.data, unif.sub);
 					refArrayPush(hyp.proofs, hypProof);
@@ -184,12 +251,14 @@ ruExpandProp(prop : RuProverProp, env : RuProverEnv) -> RuProverEnv {
 				});
 				t2 = timestamp();
 				ret = ruExpandHyp(hyp, acc);
-				ruAddStats("ruExpandHyp", RuStatsRow("expanding " + ru2s(hyp.expr, env.math.rules), 
-					pairs2tree([
-						Pair("time", cast(timestamp() - t2 : double -> int)), 
-						Pair("count", 1)
-					])
-				));
+				if (ruOptIsTrue("reprove-stats", env.math.conf)) {
+					ruAddStats("ruExpandHyp", RuStatsRow("expanding " + ru2s(hyp.expr, env.math.rules), 
+						pairs2tree([
+							Pair("time", cast(timestamp() - t2 : double -> int)), 
+							Pair("count", 1)
+						])
+					));
+				}
 				ret
 			}
 		});
@@ -223,23 +292,26 @@ ruAddProof(prop : RuProverProp, hypProof : RuProverProofHyp, env : RuProverEnv) 
 		new_proofs = if (size < 1024) {
 			t = timestamp();
 			new_proofs = ruAddProof1(prop, hypProof, env);
-			time = cast(timestamp() - t : double -> int);
-			stats = RuStatsRow("prod " + ruProd2s(prod), 
-				pairs2tree([Pair("size", size), Pair("time", time), Pair("rets", length(new_proofs))])
-			);
-			ruAddStats("add_proof", stats);
-			ruAddStats("add_proof_prod", stats);
+			if (ruOptIsTrue("reprove-stats", env.math.conf)) {
+				time = cast(timestamp() - t : double -> int);
+				stats = RuStatsRow("prod " + ruProd2s(prod), 
+					pairs2tree([Pair("size", size), Pair("time", time), Pair("rets", length(new_proofs))])
+				);
+				ruAddStats("add_proof", stats);
+				ruAddStats("add_proof_prod", stats);
+			}
 			new_proofs;
 		} else {
 			t = timestamp();
 			new_proofs = ruAddProof2(prop, hypProof, env);
-			iter(new_proofs, \p -> refArrayPush(prop.proofs, p));
-			time = cast(timestamp() - t : double -> int);
-			stats = RuStatsRow("tree " + ruProd2s(prod), 
-				pairs2tree([Pair("size", size), Pair("time", time), Pair("rets", length(new_proofs))])
-			);
-			ruAddStats("add_proof", stats);
-			ruAddStats("add_proof_tree", stats);
+			if (ruOptIsTrue("reprove-stats", env.math.conf)) {
+				time = cast(timestamp() - t : double -> int);
+				stats = RuStatsRow("tree " + ruProd2s(prod), 
+					pairs2tree([Pair("size", size), Pair("time", time), Pair("rets", length(new_proofs))])
+				);
+				ruAddStats("add_proof", stats);
+				ruAddStats("add_proof_tree", stats);
+			}
 			new_proofs;
 		}
 		iter(new_proofs, \p -> 
@@ -337,7 +409,7 @@ ruBuildPropProofs(parent : RuProverHyp, proofs : [RuProverProofProp], env : RuPr
 		)
 	);
 	switch (parent) {
-		RuProverExp(__,__,__,grand): 
+		RuProverExp(__,__,__,__,grand): 
 			ruBuildHypProofs(grand, tailFrom(^(parent.proofs), n), env);
 		RuProverRoot(__,__,__):
 			iter(tailFrom(^(parent.proofs), n), \root -> {
@@ -371,32 +443,38 @@ ruBuildHypProofs(parent : RuProverProp, proofs : [RuProverProofHyp], env : RuPro
 
 ruProve(env : RuProverEnv, tactic : (RuProverTree) -> Maybe<RuProverProp>) -> RuProverEnv {
 	t0 = timestamp();
-	choice = tactic(env.tree); 
-	ruAddStats("choice", RuStatsRow("choice ", 
-		pairs2tree([
-			Pair("size", sizeTree(env.tree.leafs)), 
-			Pair("time", cast(timestamp() - t0 : double -> int)), 
-			Pair("count", 1)
-		])
-	));
+	choice = tactic(env.tree);
+	if (ruOptIsTrue("reprove-stats", env.math.conf)) {
+		ruAddStats("choice", RuStatsRow("choice ", 
+			pairs2tree([
+				Pair("size", sizeTree(env.tree.leafs)), 
+				Pair("time", cast(timestamp() - t0 : double -> int)), 
+				Pair("count", 1)
+			])
+		));
+	}
 	switch (choice) {
 		Some(prop): {
 			t1 = timestamp();
 			env1 = ruExpandProp(prop, env);
-			ruAddStats("ruExpandProp", RuStatsRow("expanding " + prop.assertion.name, 
-				pairs2tree([
-					Pair("time", cast(timestamp() - t1 : double -> int)), 
-					Pair("count", 1)
-				])
-			));
+			if (ruOptIsTrue("reprove-stats", env.math.conf)) {
+				ruAddStats("ruExpandProp", RuStatsRow("expanding " + prop.assertion.name, 
+					pairs2tree([
+						Pair("time", cast(timestamp() - t1 : double -> int)), 
+						Pair("count", 1)
+					])
+				));
+			}
 			t2 = timestamp();
 			ruBuildPropProofs(prop.parent, ^(prop.proofs), env1);
-			ruAddStats("ruBuildPropProofs", RuStatsRow("building proofs for " + prop.assertion.name, 
-				pairs2tree([
-					Pair("time", cast(timestamp() - t2 : double -> int)), 
-					Pair("count", 1)
-				])
-			));
+			if (ruOptIsTrue("reprove-stats", env.math.conf)) {
+				ruAddStats("ruBuildPropProofs", RuStatsRow("building proofs for " + prop.assertion.name, 
+					pairs2tree([
+						Pair("time", cast(timestamp() - t2 : double -> int)), 
+						Pair("count", 1)
+					])
+				));
+			}
 			ruProve(env1, tactic);
 		}
 		None(): env;
@@ -485,12 +563,12 @@ ruCommandReproveTask(math : RuMath) -> RuMath {
 		mapping = ref makeTree();
 		env0 = ruInitProver(th, math, index);
 		env = RuProverEnv(env0 with
-			unifyPremise = if (!ruOptIsTrue("reprove-wide", math.conf)) {
+			reproveMap = mapping,
+			unifyPremise = if (ruOptIsTrue("reprove-singletons", math.conf)) {
 				\hyp : RuProverHyp ->  {
 					unif = env0.unifyPremise(hyp);
 					switch (hyp) {
-						RuProverExp(__,__,__, parent): {
-							i = findiDef(^(parent.children), \x -> x == hyp, -1);
+						RuProverExp(i, __,__,__, parent): {
 							switch (lookupTree(^mapping, parent)) {
 								Some(step): {
 									switch (step.children[i]) {
@@ -510,10 +588,12 @@ ruCommandReproveTask(math : RuMath) -> RuMath {
 				}
 			} else env0.unifyPremise
 		);
-		init_stats = RuStatsRow("reprove init " + th.name, 
-			pairs2tree([Pair("size", length(th.proof.steps)), Pair("time", cast(timestamp() - start : double -> int))])
-		);
-		ruAddStats("reprove_init", init_stats);
+		if (ruOptIsTrue("reprove-stats", env.math.conf)) {
+			init_stats = RuStatsRow("reprove init " + th.name, 
+				pairs2tree([Pair("size", length(th.proof.steps)), Pair("time", cast(timestamp() - start : double -> int))])
+			);
+			ruAddStats("reprove_init", init_stats);
+		}
 		t = timestamp();
 		ruProve(env, ruReproveTactic(th, math, mapping));
 		tm = cast(timestamp() - start : double -> int);
@@ -522,16 +602,16 @@ ruCommandReproveTask(math : RuMath) -> RuMath {
 			max_time := time;
 			max_th_name := th.name;
 		}
-		reprove_stats = RuStatsRow("reprove do " + th.name, 
-			pairs2tree([Pair("size", length(th.proof.steps)), Pair("time", cast(timestamp() - t : double -> int))])
-		);
-		ruAddStats("reprove_do", reprove_stats);
-		
-		stats = RuStatsRow("reproved all " + th.name, 
-			pairs2tree([Pair("size", length(th.proof.steps)), Pair("time", tm)])
-		);
-		ruAddStats("reprove_all", stats);
-		
+		if (ruOptIsTrue("reprove-stats", env.math.conf)) {
+			reprove_stats = RuStatsRow("reprove do " + th.name, 
+				pairs2tree([Pair("size", ruSizeProverTree(env.tree.root)), Pair("time", cast(timestamp() - t : double -> int))])
+			);
+			ruAddStats("reprove_do", reprove_stats);
+			stats = RuStatsRow("reproved all " + th.name, 
+				pairs2tree([Pair("size", ruSizeProverTree(env.tree.root)), Pair("time", tm)])
+			);
+			ruAddStats("reprove_all", stats);
+		}
 		if (^(env.proofs) == []) {
 			atomicRefIntAddition(failed_count, 1);
 			println("theorem " + th.name + " was NOT reproved in " + d2st(time, 2) + "s");
@@ -597,7 +677,7 @@ ruCommandReproveTask(math : RuMath) -> RuMath {
 		println("Failed to reprove: " + i2s(^failed_count) + " theorems:");
 		iter(^failed_th_names, \th -> println("\t" + th));
 	}
-	if (math.conf.verbose > 0) {
+	if (math.conf.verbose > 0 && ruOptIsTrue("reprove-stats", math.conf)) {
 		println("<< reprove all >>");
 		println("complete reprove distrib: ");
 		println(ruIndent(ruProcStats("reprove_all", ruDistribLogSumStats("size", "time", 2))));
@@ -653,6 +733,22 @@ ruCommandReproveTask(math : RuMath) -> RuMath {
 		println(ruIndent(ruProcStats("removeFirst", ruDistribLogSumStats("time", "count", 2))));
 		println("sum removeFirst time: " + ruProcStats("removeFirst", ruSumStats("time")));
 		println("max time: " + ruProcStats("removeFirst", ruMaxStats("time")));
+		println("");
+		
+		println("<< add_unified >>");
+		println(ruIndent(ruProcStats("add_unified", ruDistribLogSumStats("time", "count", 2))));
+		println("sum add_unified count: " + ruProcStats("add_unified", ruSumStats("count")));
+		println("sum add_unified time: " + ruProcStats("add_unified", ruSumStats("time")));
+		println("sum add_unified time2: " + ruProcStats("add_unified", ruSumStats("time2")));
+		println("sum add_unified time3: " + ruProcStats("add_unified", ruSumStats("time3")));
+		println("sum add_unified time4: " + ruProcStats("add_unified", ruSumStats("time4")));
+		println("max time: " + ruProcStats("add_unified", ruMaxStats("time")));
+		println("max time2: " + ruProcStats("add_unified", ruMaxStats("time2")));
+		println("max time3: " + ruProcStats("add_unified", ruMaxStats("time3")));
+		println("max time4: " + ruProcStats("add_unified", ruMaxStats("time4")));
+		println("max time (add_unified_set_tree): " + ruProcStats("add_unified_set_tree", ruMaxStats("time")));
+		println("sum time (add_unified_set_tree): " + ruProcStats("add_unified_set_tree", ruSumStats("time")));
+		println(ruIndent(ruProcStats("add_unified_set_tree", ruDistribLogSumStats("time", "count", 2))));
 		println("");
 
 		println("<< ruBuildPropProofs >>");
@@ -753,7 +849,7 @@ ruInitGeneralizer(th : RuTheorem, math : RuMath) -> RuProverEnv {
 		},
 		\hyp -> {
 			switch (hyp) {
-				RuProverExp(__,__,__,parent):
+				RuProverExp(__,__,__,__,parent):
 					switch (lookupTree(^mapping, parent.parent)) {
 						Some(node): {
 							if (node.data != "") [] else {
@@ -787,7 +883,8 @@ ruInitGeneralizer(th : RuTheorem, math : RuMath) -> RuProverEnv {
 		},
 		idfn,
 		ref [],
-		\ -> { ret = ^id; id := ^id + 1; ret; }
+		\ -> { ret = ^id; id := ^id + 1; ret; },
+		ref makeTree()
 	);
 	ruExpandHyp(root, env);
 }
