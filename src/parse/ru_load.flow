@@ -2,20 +2,21 @@ import ru_load;
 import ru_src;
 
 export {
-	//RuLoaded ::= RuRawSource, RuSource;
+	RuCachedSource(source : RuSource, dependencyChannged : () -> bool);
+	RuLoaded ::= RuRawSource, RuCachedSource;
 
-	ruLoad(conf : RuConf, file : string) -> Maybe<Tree<string, RuRawSource>>;
+	ruLoad(conf : RuConf, file : string, cache : (string) -> Maybe<RuSource>) -> Maybe<Tree<string, RuLoaded>>;
 }
 
 ruLoadDescr = RuLoadDescr("/*", "*/", "//", "\n", "import", ";;", ".ru");
 
-ruLoad(conf : RuConf, file : string) -> Maybe<Tree<string, RuRawSource>> {
+ruLoad(conf : RuConf, file : string, cache : (string) -> Maybe<RuSource>) -> Maybe<Tree<string, RuLoaded>> {
 	err_count = ref 0;
 	start = timestamp();
 	if (conf.verbose > 1) {
 		println("loading: " + file);
 	}
-	loaded = ruLoadImports([file], ruAddErrCounter(conf, err_count), makeTree());
+	loaded = ruLoadImports([file], ruAddErrCounter(conf, err_count), cache, makeTree());
 	if (conf.verbose > 1) {
 		println(strRight(ruLoadDescr.ext, 1) + " loaded " +i2s(sizeTree(loaded)) + " files in: " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
 	}
@@ -26,15 +27,32 @@ ruLoad(conf : RuConf, file : string) -> Maybe<Tree<string, RuRawSource>> {
 	}
 }
 
-ruLoadImports(imports : [string], conf : RuConf, acc : Tree<string, RuRawSource>) -> Tree<string, RuRawSource> {
+ruLoadImports(imports : [string], conf : RuConf, cache : (string) -> Maybe<RuSource>, acc : Tree<string, RuLoaded>) -> Tree<string, RuLoaded> {
+	loaded_file = \loaded -> {
+		switch (loaded) {
+			RuCachedSource(source, __): source.info.file;
+			RuRawSource(__,__, info):   info.file;
+		}
+	}
+	loaded_imports = \loaded -> {
+		switch (loaded) {
+			RuCachedSource(source, __): map(source.imports, \imp -> imp.path);
+			RuRawSource(imps,__, info): imps;
+		}
+	}
 	if (imports == []) acc else {
-		loaded = filtermap(ruConcurrent(map(imports, \imp -> \ -> ruLoadRawSource(imp, conf, ruLoadDescr))), idfn);
-		acc1 = fold(loaded, acc, \ac, l -> setTree(ac, l.info.file, l));
+		loaded : [RuLoaded]  = filtermap(ruConcurrent(map(imports, \imp -> 
+			\ -> switch (cache(imp)) {
+				Some(source): Some(RuCachedSource(source, \-> false));
+				None():       ruLoadRawSource(imp, conf, ruLoadDescr);
+			}
+		)), idfn);
+		acc1 = fold(loaded, acc, \ac, l -> setTree(ac, loaded_file(l), l));
 		new_imports = fold(loaded, makeSet(), \ac, l -> 
-			fold(l.imps, ac, \a, p ->
+			fold(loaded_imports(l), ac, \a, p ->
 				if (containsKeyTree(acc1, ruTrimPath(p, conf, ruLoadDescr.ext))) a else insertSet(a, p)
 			)
 		);
-		ruLoadImports(set2array(new_imports), conf, acc1)
+		ruLoadImports(set2array(new_imports), conf, cache, acc1)
 	}
 }
