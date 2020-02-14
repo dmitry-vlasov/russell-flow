@@ -1,36 +1,23 @@
-import fs/filesystem;
-import sys/concurrent;
-import math/stringmath;
-import lingo/compiler/syntaxtree_util;
-import ru_conf;
-import ru_fileinfo;
+import ru_load;
+import ru_src;
 
 export {
-	RuLoadDescr(
-		mlCommentBeg : string,
-		mlCommentEnd : string,
-		slCommentBeg : string,
-		slCommentEnd : string,
-		importBeg : string,
-		importEnd : string,
-		ext : string
-	);
-	ruLoadDescr = RuLoadDescr("/*", "*/", "//", "\n", "import", ";;", ".ru");
-	mmLoadDescr = RuLoadDescr("$(", "$)", "", "", "$[", "$]", ".mm");
+	//RuLoaded ::= RuRawSource, RuSource;
 
-	RuRawSource(imps : [string], src : string, info : RuFileInfo);
-	ruLoad(conf : RuConf, descr : RuLoadDescr) -> Maybe<Tree<string, RuRawSource>>;
+	ruLoad(conf : RuConf, file : string) -> Maybe<Tree<string, RuRawSource>>;
 }
 
-ruLoad(conf : RuConf, descr : RuLoadDescr) -> Maybe<Tree<string, RuRawSource>> {
+ruLoadDescr = RuLoadDescr("/*", "*/", "//", "\n", "import", ";;", ".ru");
+
+ruLoad(conf : RuConf, file : string) -> Maybe<Tree<string, RuRawSource>> {
 	err_count = ref 0;
 	start = timestamp();
 	if (conf.verbose > 1) {
-		println("loading: " + conf.file);
+		println("loading: " + file);
 	}
-	loaded = ruLoadImports([conf.file], ruAddErrCounter(conf, err_count), descr, makeTree());
+	loaded = ruLoadImports([file], ruAddErrCounter(conf, err_count), makeTree());
 	if (conf.verbose > 1) {
-		println(strRight(descr.ext, 1) + " loaded " +i2s(sizeTree(loaded)) + " files in: " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
+		println(strRight(ruLoadDescr.ext, 1) + " loaded " +i2s(sizeTree(loaded)) + " files in: " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
 	}
 	if (^err_count == 0) {
 		Some(loaded);
@@ -39,92 +26,15 @@ ruLoad(conf : RuConf, descr : RuLoadDescr) -> Maybe<Tree<string, RuRawSource>> {
 	}
 }
 
-ruLoadImports(imports : [string], conf : RuConf, descr : RuLoadDescr, acc : Tree<string, RuRawSource>) -> Tree<string, RuRawSource> {
+ruLoadImports(imports : [string], conf : RuConf, acc : Tree<string, RuRawSource>) -> Tree<string, RuRawSource> {
 	if (imports == []) acc else {
-		loaded = filtermap(ruConcurrent(map(imports, \imp -> \ -> ruLoadSource(imp, conf, descr))), idfn);
+		loaded = filtermap(ruConcurrent(map(imports, \imp -> \ -> ruLoadRawSource(imp, conf, ruLoadDescr))), idfn);
 		acc1 = fold(loaded, acc, \ac, l -> setTree(ac, l.info.file, l));
 		new_imports = fold(loaded, makeSet(), \ac, l -> 
 			fold(l.imps, ac, \a, p ->
-				if (containsKeyTree(acc1, ruTrimPath(p, conf, descr.ext))) a else insertSet(a, p)
+				if (containsKeyTree(acc1, ruTrimPath(p, conf, ruLoadDescr.ext))) a else insertSet(a, p)
 			)
 		);
-		ruLoadImports(set2array(new_imports), conf, descr, acc1)
+		ruLoadImports(set2array(new_imports), conf, acc1)
 	}
 }
-
-ruLoadSource(file : string, conf : RuConf, descr : RuLoadDescr) -> Maybe<RuRawSource> {
-	start = timestamp();
-	trimmed = ruTrimPath(file, conf, descr.ext);
-	resolved = ruFindPath(trimmed, conf, descr.ext);
-	if (fileExists(resolved)) {
-		src_str = getFileContent(resolved);
-		//imports = filter(ruParseLoad(src_str, descr), \path -> !strContains(path, "Appendix___"));
-		imports = ruParseLoad(src_str, descr);
-		Some(RuRawSource(imports, src_str, ruMakeFileInfo(trimmed, resolved)));
-	} else {
-		conf.onError("file " + resolved + " is not found", []);
-		None()
-	}
-}
-
-RuParseLoadAcc(
-	src : string,
-	pos : int,
-	imports : [string],
-	state : RuParseLoadState
-);
-
-RuParseLoadState ::= RuParseLoadCommentML, RuParseLoadCommentSL, RuParseLoadSrc;
-	RuParseLoadCommentML(); 
-	RuParseLoadCommentSL();
-	RuParseLoadSrc();
-	
-ruParseLoad(src : string, descr : RuLoadDescr) -> [string] {
-	ruDoParseLoad(RuParseLoadAcc(src, 0, [], RuParseLoadSrc()), descr).imports
-}
-
-ruDoParseLoad(acc : RuParseLoadAcc, descr : RuLoadDescr) -> RuParseLoadAcc {
-	if (acc.pos >= strlen(acc.src)) acc else {
-		switch (acc.state) {
-			RuParseLoadCommentSL(): {
-				i = strRangeIndexOf(acc.src, descr.slCommentEnd, acc.pos, strlen(acc.src));
-				if (i == -1) acc else 
-				ruDoParseLoad(RuParseLoadAcc(acc with 
-					pos = i + strlen(descr.slCommentEnd),
-					state = RuParseLoadSrc()
-				), descr)
-			}
-			RuParseLoadCommentML(): {
-				i = strRangeIndexOf(acc.src, descr.mlCommentEnd, acc.pos, strlen(acc.src));
-				if (i == -1) acc else 
-				ruDoParseLoad(RuParseLoadAcc(acc with 
-					pos = i + strlen(descr.mlCommentEnd),
-					state = RuParseLoadSrc()
-				), descr)
-			}
-			RuParseLoadSrc(): {
-				if (descr.slCommentBeg != "" && substring(acc.src, acc.pos, strlen(descr.slCommentBeg)) == descr.slCommentBeg) {
-					ruDoParseLoad(RuParseLoadAcc(acc with 
-						pos = acc.pos + strlen(descr.slCommentBeg),
-						state = RuParseLoadCommentSL()
-					), descr)
-				} else if (descr.mlCommentBeg != "" && substring(acc.src, acc.pos, strlen(descr.mlCommentBeg)) == descr.mlCommentBeg) {
-					ruDoParseLoad(RuParseLoadAcc(acc with 
-						pos = acc.pos + strlen(descr.mlCommentBeg),
-						state = RuParseLoadCommentML()
-					), descr)
-				} else if (substring(acc.src, acc.pos, strlen(descr.importBeg)) == descr.importBeg) {
-					i = strRangeIndexOf(acc.src, descr.importEnd, acc.pos + strlen(descr.importBeg), strlen(acc.src));
-					if (i == -1) acc else
-					ruDoParseLoad(RuParseLoadAcc(acc with 
-						pos = i + strlen(descr.importEnd),
-						imports = concat(acc.imports, [trim(substring(acc.src, acc.pos + strlen(descr.importBeg), i - (acc.pos + strlen(descr.importBeg))))])
-					), descr)
-				} else {
-					ruDoParseLoad(RuParseLoadAcc(acc with pos = acc.pos + 1), descr)
-				}
-			}
-		}
-	}
-}
-
