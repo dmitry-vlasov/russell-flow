@@ -5,14 +5,14 @@ import ru_verify;
 import ru_math;
 
 export {
-	ruCollectMath(parsed : Tree<string, RuParsed>, conf : RuConf) -> Maybe<RuMath>;
+	ruCollectMath(parsed : Tree<string, RuParsed>, conf : RuConf, to_cache : (RuSource, RuConf) -> void) -> Maybe<RuMath>;
 }
 
-ruCollectMath(parsed : Tree<string, RuParsed>, conf0 : RuConf) -> Maybe<RuMath> {
+ruCollectMath(parsed : Tree<string, RuParsed>, conf0 : RuConf, to_cache : (RuSource, RuConf) -> void) -> Maybe<RuMath> {
 	err_count = ref 0;
 	conf = ruAddErrCounter(conf0, err_count);
 	start = timestamp();
-	collected = ruDoCollectMath(parsed, conf, ruMakeRuMath(conf));
+	collected = ruDoCollectMath(parsed, conf, ruMakeMath(conf), to_cache);
 	if (conf.verbose > 0) {
 		println("ru collected: " +i2s(sizeTree(collected.sources)) + " files in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
 	}
@@ -23,7 +23,7 @@ ruCollectMath(parsed : Tree<string, RuParsed>, conf0 : RuConf) -> Maybe<RuMath> 
 	}
 }
 
-ruDoCollectMath(left : Tree<string, RuParsed>, conf : RuConf, acc : RuMath) -> RuMath {
+ruDoCollectMath(left : Tree<string, RuParsed>, conf : RuConf, acc : RuMath, to_cache : (RuSource, RuConf) -> void) -> RuMath {
 	parsed_imports = \parsed -> {
 		switch (parsed) {
 			RuCachedSource(source, __): map(source.imports, \imp -> imp.path);
@@ -47,25 +47,32 @@ ruDoCollectMath(left : Tree<string, RuParsed>, conf : RuConf, acc : RuMath) -> R
 		} else {
 			collected = filtermap(ready, \parsed ->
 				switch (parsed) {
-					RuParseSource(__,__,__): Some(ruCollectParsed(parsed, acc));
+					RuParseSource(__,__,__): {
+						Some(ruCollectParsed(parsed, acc, to_cache));
+					}
 					RuCachedSource(src, depChanged): {
-						if (!depChanged()) Some(ruCollectSourceNames(src, acc)) else
-						switch (ruVerifySource(src, acc)) {
-							Some(verified): Some(ruCollectSourceNames(verified, acc));
-							None(): {
-								maybeBind(ruLoadOne(conf, src.info.file, \__ -> None()), \l ->
-									maybeMap(ruParseOne(l, conf), \s ->
-										ruCollectOne(s, acc)
-									)
-								)
+						if (!depChanged()) {
+							Some(ruCollectSourceNames(src, RuMath(acc with sources = setTree(acc.sources, src.info.file, src)))); 
+						} else { 
+							switch (ruVerifySource(src, acc)) {
+								Some(verified): {
+									Some(ruCollectSourceNames(verified, RuMath(acc with sources = setTree(acc.sources, verified.info.file, verified))));
+								}
+								None(): {
+									maybeBind(ruLoadOne(conf, src.info.file, \__,__ -> None()), \l ->
+										maybeMap(ruParseOne(l, conf), \s ->
+											ruCollectOne(s, acc, to_cache)
+										)
+									);
+								}
 							}
 						}
 					}
 				}
 			); 
-			new_acc = fold(collected, acc, \ac, coll -> ruMergeRuMath(coll, ac));
+			new_acc = fold(collected, acc, \ac, coll -> ruMergeMath(coll, ac));
 			new_left = fold(ready, left, \ac, parsed -> removeFromTree(ac, parsed_file(parsed)));
-			ruDoCollectMath(new_left, conf, new_acc);
+			ruDoCollectMath(new_left, conf, new_acc, to_cache);
 		}
 	}
 }
@@ -78,14 +85,14 @@ RuCollectAcc(
 	conf : RuConf
 );
 
-ruCollectOne(parsed : RuParsed, acc : RuMath) -> RuMath {
+ruCollectOne(parsed : RuParsed, acc : RuMath, to_cache : (RuSource, RuConf) -> void) -> RuMath {
 	switch (parsed) {
-		RuParseSource(__,__,__): ruCollectParsed(parsed, acc);
+		RuParseSource(__,__,__): ruCollectParsed(parsed, acc, to_cache);
 		RuCachedSource(src, __): ruCollectSourceNames(src, acc);
 	}
 }
 
-ruCollectParsed(src : RuParseSource, acc : RuMath) -> RuMath {
+ruCollectParsed(src : RuParseSource, acc : RuMath, to_cache : (RuSource, RuConf) -> void) -> RuMath {
 	start = timestamp();
 	switch (lookupTree(acc.sources, src.info.file)) {
 		Some(__): {
@@ -94,7 +101,7 @@ ruCollectParsed(src : RuParseSource, acc : RuMath) -> RuMath {
 		}
 		None(): {
 			imps = map(src.imports, \imp -> RuImport(imp.path, imp.pos));
-			acc0 = RuCollectAcc(src.info.file, acc, ruMakeRuMath(acc.conf), acc.types, acc.conf);
+			acc0 = RuCollectAcc(src.info.file, acc, ruMakeMath(acc.conf), acc.types, acc.conf);
 			acc1 = fold(src.decls, acc0, \ac, block -> 
 				switch(block) {
 					RuParseDecl(): ruCollectSyntax(block, ac);
@@ -135,6 +142,7 @@ ruCollectParsed(src : RuParseSource, acc : RuMath) -> RuMath {
 				println("\tru collected: " + src.info.file + " in " + d2st((timestamp() - start)/ 1000.0, 4) + " s");
 			}
 			ru_src = RuSource(imps, decls, src.info);
+			to_cache(ru_src, acc.conf);
 			ruCollectSourceNames(
 				ru_src, 
 				RuMath(acc2.local with 
@@ -146,31 +154,34 @@ ruCollectParsed(src : RuParseSource, acc : RuMath) -> RuMath {
 }
 
 /*
-RuCollectDeclsAcc(
-	left : Tree<string, RuParseDecl>,
-	done : [Maybe<RuAssertion>]
-);
-
-ruCollectDecls(parse_decls : [RuParseDecl], acc : RuCollectAcc) -> [Maybe<RuAssertion>] {
-	ruConcurrentTasks(
-		RuTaskFactory(
-			\ac -> {
-				to_proc = take(getTreeValues(ac.left), availableProcessors());
-				map(to_proc, \decl -> 
-					RuTask(
-						decl.name,
-						\-> ruCreateAssertion(decl, acc),
-						\a -> RuCollectDeclsAcc(a with left = removeFromTree(ac.left, decl.name)),
-						\a, m -> RuCollectDeclsAcc(a with done = concat(a.done, [m]))
-					)
-				)
-			},
-			\ac -> isEmptyTree(ac.left)
-		),
-		ref RuCollectDeclsAcc(values2tree(parse_decls, \d -> d.name), [])
-	).done;
-}
+	RuMath(
+		sources : Tree<string, RuSource>,
+		consts  : Tree<string, RuConst>,
+		types   : Tree<string, RuTypeEnv>,
+		rules   : Tree<string, RuRule>,
+		names   : Tree<string, string>,
+		assertions : Tree<string, RuAssertion>,
+		conf : RuConf
+	);
 */
+/*
+ruCollectSource(src : RuSource, acc : RuMath, to_cache : (RuSource, RuConf) -> void) -> RuMath {
+	start = timestamp();
+	acc1 = fold(src.decls, acc, \ac, block -> 
+		switch (block) {
+			RuConst(name,__,__,__):               RuMath(ac with consts = setTree(ac.consts, name, block));
+			RuType(name,__,__):                   RuMath(ac with types = setTree(ac.consts, name, block));
+			RuRule(name,__,__,__):                RuMath(ac with rules = setTree(ac.consts, name, block));
+			RuAxiom(name,__,__,__,__,__):         RuMath(ac with assertions = setTree(ac.assertions, name, block));
+			RuTheorem(name,__,__,__,__,__,__,__): RuMath(ac with assertions = setTree(ac.assertions, name, block));
+			RuDef(name,__,__,__,__,__,__,__):     RuMath(ac with assertions = setTree(ac.assertions, name, block));
+			RuComment(text, pos):                 ac;
+			RuTheory(name, __,__):                ac; // TODO
+		}
+	);
+	ruCollectSourceNames(src, RuMath(acc1 with sources = makeTree1(src.info.file, src)));
+}*/
+
 ruCollectSyntax(decl : RuParseDecl, acc : RuCollectAcc) -> RuCollectAcc {
 	switch (decl) {
 		RuParseConst(__,__,__,__): ruCollectConst(decl, acc);
@@ -201,6 +212,66 @@ ruCollectConst(const : RuParseConst, acc : RuCollectAcc) -> RuCollectAcc {
 					consts = setTree(acc.local.consts, const.name, RuConst(const.name, const.ascii, const.latex, const.pos)),
 				)
 			);
+		}
+	}
+}
+
+ruAddType(type : RuParseType, acc : RuCollectAcc) -> RuCollectAcc {
+	switch (ruLookupType(acc, type.name)) {
+		Some(__): {
+			acc.conf.onError("type " + type.name + " is already defined", [RuPlace(acc.file, type.pos)]);
+			acc
+		}
+		None(): {
+			infer = type.name;
+			super_rule = \super -> {
+				RuRule(
+					ruSuperTypeName(super, infer), 
+					makeTree1("x", RuVar("x", infer)), 
+					RuTerm(super, [RuVar("x", infer)], type.pos),
+					type.pos
+				);
+			}
+			supers = fold(type.supers, makeTree(), \ac, s ->
+				switch (ruLookupType(acc, s)) {
+					Some(env): {
+						foldTree(env.supers,
+							setTree(ac, s, super_rule(s)), 
+							\super, __, a ->
+								setTree(a, super, super_rule(super))
+						)
+					}
+					None(): {
+						acc.conf.onError("unknown super type " + s + " for a type" + infer, [RuPlace(acc.file, type.pos)]);
+						ac
+					}
+				}
+			);
+			super_types = foldTree(supers, acc.types, 
+				\sup_name, sup_rule, ac -> {
+					env = lookupTreeDef(ac, sup_name, ruNoTypeEnv);
+					setTree(ac, sup_name, RuTypeEnv(env with infers = setTree(env.infers, infer, super_rule(sup_name))))
+				}
+			);
+			new_types = setTree(super_types, type.name, 
+				RuTypeEnv(
+					RuType(type.name, type.supers, type.pos), 
+					ruAddTerm2RuTrie(
+						RuTerm(type.name, [RuVar("x", type.name)], type.pos), 
+						None(),
+						ruTrieEmpty, acc.conf
+					), 
+					supers, makeTree()
+				)
+			);
+			RuCollectAcc(acc with
+				local = RuMath(acc.local with 
+					types = new_types,
+					rules = foldTree(supers, acc.local.rules, \__, rule, ac -> setTree(ac, rule.name, rule)),
+					//names = foldTree(supers, setTree(acc.local.names, type.name, acc.file), \__, rule, ac -> setTree(ac, rule.name, acc.file))
+				),
+				types = new_types
+			)
 		}
 	}
 }
