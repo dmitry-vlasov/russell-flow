@@ -1,208 +1,24 @@
-import lingo/linecolumn;
-import math/stringmath;
-import parse/mm_load;
-import parse/ru_load;
-import parse/ru_parse;
-import parse/ru_collect_math;
-import parse/mm_parse;
-import parse/mm_collect_math;
-import ru_usage;
-import ru_verify;
-import ru_2_mm;
-import mm_2_ru;
-import mm_verify;
-import ru_split;
-import ru_imports;
-import ru_refactor;
-import ru_shorten;
-import ru_cache;
-import prover/ru_prover;
-
-ruOperateMath(comm : RuCommand, math : RuMath) -> RuMath {
-	if (comm.name == "verify") {
-		ruCommandVerify(math);
-	} else if (comm.name == "remove-duplicate-steps") {
-		ruCommandRemoveMathDuplicateSteps(math);
-	} else if (comm.name == "remove-unused-steps") {
-		ruCommandRemoveMathUnusedSteps(math);
-	} else if (comm.name == "remove-unused-hyps") {
-		ruCommandRemoveMathUnusedHyps(math);
-	} else if (comm.name == "shorten-proofs") {
-		ruCommandShortenProofs(math);
-	} else if (comm.name == "reprove") {
-		ruCommandReproveTask(math);
-	} else if (comm.name == "stats") {
-		println("stats:\n" + ruMathStats(math) + "\n");
-		math;
-	} else if (comm.name == "expr-len-stats") {
-		ruCommandExpressionLenStats(math);
-		math;
-	} else if (comm.name == "write") {
-		target = lookupTreeDef(math.conf.opts, "default", "");
-		if (target == "all" || target == "1" || target == "") {
-			ruWriteSources(ruPrepareSources(math), math.conf);
-		} else {
-			file = ruTrimPath(target, math.conf, ".ru");
-			switch (lookupTree(math.sources, file)) {
-				Some(src): ruWriteSource(src, math.rules);
-				None():    println("source: " + file + " is not found");
-			}
-		}
-		math;
-	} else if (comm.name == "write-single") {
-		target = lookupTreeDef(math.conf.opts, "default", "");
-		if (target != "") {
-			file = ruRemoveExt(target, ".ru");
-			ruWriteSource(ruMath2SingleSource(math, file), math.rules);
-		}
-		math;
-	} else {
-		println("unknown command: " + comm.name);
-		math
-	}
-}
-
-ruPrepareSources(math : RuMath) -> [RuWriteSource] {
-	ruRoot0 = rtrim2(lookupTreeDef(math.conf.opts, "ru-root", ""), "/");
-	ruRoot = if (ruRoot0 == "1") "." else ruRoot0 + "/";
-	map(getTreeValues(math.sources), 
-		\src : RuSource ->
-			RuWriteSource(
-				ru2s(src, math.rules),
-				ruUpdateFileInfo(RuFileInfo(src.info with path = ruRoot + src.info.file + ".ru"))
-			)
-	)
-}
-
-ruProcessMath(math0 : RuMath) -> void {
-	math1 = ruIf(ruOptIsTrue("ru-imports", math0.conf), math0, ruOptimizeMathImports);
-	math = fold(ruConf2Commands(math1.conf), math1, \acc, comm -> 
-		ruOperateMath(comm, RuMath(acc with conf = comm.conf))
-	);
-	if (ruOptIsTrue("ru-2-mm", math.conf)) {
-		mmProcessMath(ruMath2mm(RuMath(math with conf = ruRemoveOpt("ru-2-mm", math.conf))));
-	}
-	
-	if (ruOptIsTrue("ru-write-all", math.conf)) {
-		ruWriteSources(ruPrepareSources(math), math.conf);
-	}
-	if (ruOptIsSet("ru", math.conf)) {
-		ruWriteSource(ruMath2SingleSource(math, ruRemoveExt(ruOpt("ru", math.conf), ".ru")), math.rules);
-	}
-	if (ruOptIsSet("ru-write", math.conf)) {
-		file = ruTrimPath(ruOpt("ru-write", math.conf), math.conf, ".ru");
-		switch (lookupTree(math.sources, file)) {
-			Some(src): ruWriteSource(src, math.rules);
-			None(): println("source: " + file + " is not found");
-		}
-	}
-	if (ruOptIsSet("reprove", math.conf)) {
-		ruCommandReproveTask(RuMath(math with 
-			conf = RuConf(math.conf with 
-				opts = setTree(math.conf.opts, "default", ruOpt("reprove", math.conf))
-			)
-		)); {}
-	}
-	if (ruOptIsSet("shorten-proofs", math.conf)) {
-		ruCommandShortenProofs(RuMath(math with
-			conf = RuConf(math.conf with 
-				opts = setTree(math.conf.opts, "default", ruOpt("shorten-proofs", math.conf))
-			)
-		)); {}
-	}
-	if (ruOptIsSet("ru-assertion", math.conf)) {
-		name = ruOpt("ru-assertion", math.conf);
-		switch (lookupTree(math.assertions, name)) {
-			Some(ass): println(ru2s(ass, math.rules));
-			None(): println("assertion: " + name + " is not found");
-		}
-	}
-	if (ruOptIsTrue("ru-stats", math.conf)) {
-		println("ru stats:\n" + ruMathStats(math) + "\n");
-	}
-}
-
-mmProcessMath(math : MmMath) -> void {
-	if (ruOptIsSet("mm", math.conf)) {
-		src = mmMath2SingleSource(math, ruRemoveExt(ruOpt("mm", math.conf), ".mm"));
-		txt = mm2s(ruIf(ruOptIsTrue("strip-comments", math.conf), src, mmStripComments));
-		if (!setFileContent(src.info.path, txt)) {
-			println("failed to save file: " + src.info.path);
-		}
-	}
-	if (ruOptIsTrue("mm-2-ru", math.conf)) {
-		maybeApply(ruLoadMath1(mmMath2ru(math), math.conf), \verified ->
-			ruProcessMath(
-				ruIf(ruOptIsTrue("mm-split", math.conf), 
-					ruIf(ruOptIsSet("mm-fix", math.conf), 
-						RuMath(verified with conf = ruRemoveOpt("mm-2-ru", verified.conf)), 
-						ruFixLeftRecursiveRules
-					), 
-					ruSplitMath
-				)
-			)
-		);
-	}
-	if (ruOptIsSet("mm-assertion", math.conf)) {
-		name = ruOpt("mm-assertion", math.conf);
-		switch (lookupTree(math.labeled, name)) {
-			Some(ass): println(mm2s(ass));
-			None(): println("assertion: " + name + " is not found");
-		}
-	}
-	if (ruOptIsTrue("mm-stats", math.conf)) {
-		println("mm stats:\n" + mmMathStats(math) + "\n");
-	}
-}
-
-ruParseMath(conf : RuConf) -> Maybe<Tree<string, RuParsed>> {
-	maybeBind(ruLoadAll(conf, conf.file, ruFromCache), \loaded ->
-		ruParseAll(getTreeValues(loaded), conf)
-	)
-}
-
-ruLoadMath1(parsed : Tree<string, RuParsed>, conf : RuConf) -> Maybe<RuMath> {
-	maybeMap(maybeBind(ruCollectMath(parsed, conf, ruToCache), ruVerifyMath), 
-		\math -> ruIf(ruOptIsTrue("ru-imports", conf), math, ruOptimizeMathImports)
-	)
-}
-
-ruLoadMath(conf : RuConf) -> Maybe<RuMath> {
-	maybeBind(ruParseMath(conf), \parsed -> ruLoadMath1(parsed, conf))
-}
-
-mmLoadMath(conf : RuConf) -> Maybe<MmMath> {
-	maybeBind(mmLoad(conf, conf.file), \loaded ->
-		maybeBind(mmParse(getTreeValues(loaded), conf), \parsed ->
-			maybeBind(mmCollectMath(parsed, conf), \collected ->
-				mmVerifyMath(collected)
-			)
-		)
-	)
-}
+import ru_server;
 
 main() -> void {
 	println("Russell prover (4th generation)");
 	println("");
-	onError = \err, places -> println(err + (if (places == []) "" else "\n" + strGlue(map(places, ruPlace2s), "\n")));
-	switch (ruMakeConf(onError)) {
+	switch (ruMakeConf()) {
 		Some(conf): {
-			if (lookupTreeDef(conf.opts, "help", "0") != "0") {
+			if (ruOptIsTrue("help", conf)) {
 				ruUsage(conf);
+				quit(0);
+			} else if (ruOptIsTrue("http-server", conf)) {
+				ruHttpServer(conf);
+			} else if (ruOptIsTrue("console-server", conf)) {
+				ruConsoleServer(conf);
 			} else {
 				ensureDirectoryExists(ruOpt("cache-dir", conf));
 				start = timestamp();
-				if (conf.ext == ".ru") {
-					maybeApply(ruLoadMath(conf), ruProcessMath);
-				} else if (conf.ext == ".mm") {
-					maybeApply(mmLoadMath(conf), mmProcessMath);
-				} else {
-					println("file extension should be *.ru or *.mm, while given is: '" + conf.ext + "'");
-				}
-				println("processed in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
+				ruRun(conf, \code -> ruPrintln("processed in " + d2st((timestamp() - start)/ 1000.0, 2) + "s", conf));
+				quit(0);
 			}
 		}
-		None(): { }
+		None(): quit(0);
 	}
-	quit(0);
 }

@@ -1,0 +1,106 @@
+import server/http;
+import ru_lsp;
+import ru_run;
+
+export {
+	// A language server working over http.
+	ruHttpServer(conf : RuConf) -> void;
+
+	// A language server using stdin/stdout to communicate. Usually is invoked as a child process of an IDE.
+	ruConsoleServer(conf : RuConf) -> void;
+}
+
+ruDecodeConfigRequest(s : string) -> Maybe<RuConf> {
+	conf = deserialize(s, IllegalStruct());
+	if (conf == IllegalStruct()) None() else {
+		switch (conf) {
+			RuConf(__,__,__,__,__,__,__,__): {
+				Some(RuConf(conf with threadId = s2i(getThreadId())));
+			}
+			default: None();
+		}
+	}
+}
+
+ruProcessRequest(serverConf : RuConf, req : string, out_cb : (int, string) ->  void, loop_cb : () -> void, exit_cb : () -> void) -> void {
+	switch (ruJson2Conf(parseJsonSafe(req))) {
+		Some(conf): {
+			start_time = timestamp();
+			if (ruOptIsTrue("shutdown-server", conf)) {
+				exit_cb();
+			} else {
+				ruServerLog("Request: " + json2string(ruConf2Json(conf)), conf);
+				ruPrintln("Processing '" + conf.file + "' on http server.", conf);
+				ruRunLocal(conf, \code -> {
+					ruServerLog("Request processing finished in " + d2st((timestamp() - start_time) / 1000.0, 2) + " s.", conf);
+					out = ruOutput(conf);
+					ruServerLog("Response: " + out, conf);
+					out_cb(code, out);
+					ruClearOutput(conf);
+					loop_cb();
+				});
+			}
+		}
+		None(): {
+			json = ruDecodeJsonRequest(req);
+			if (json == JsonNull()) {
+				out_cb(200, "WARNING: Illegal request.");
+				loop_cb();
+			} else {
+				ruLspProcessRequest(serverConf, json, \msg -> out_cb(0, msg), loop_cb, exit_cb);
+			}
+		}
+	}
+}
+
+ruConsoleServer(conf : RuConf) -> void { 
+	ruServerLog("Proc server started.", conf);
+	ruSetSkipPrinting(conf, true);
+	ruRunConsoleServer(conf);
+}
+
+ruRunConsoleServer(conf : RuConf) -> void {
+	switch (ruLspReadRequest()) {
+		Some(req): {
+			ruServerLog("Request: " + strReplaces(req, ["\n", "\\n", "\r", "\\r", "\t", "\\t"]), conf);
+			ruProcessRequest(conf, req, 
+				\__, resp -> {
+					ruServerLog("Response: " + strReplaces(resp, ["\n", "\\n", "\r", "\\r", "\t", "\\t"]), conf);
+					println(resp);
+				},
+				\-> ruRunConsoleServer(conf),
+				\-> {
+					ruServerLog("Proc server stopped.", conf);
+					quit(0);
+				}
+			);
+		}
+		None(): {
+			ruServerLog("Failed to read a request.", conf);
+			ruRunConsoleServer(conf);
+		}
+	}
+}
+
+ruHttpServer(conf : RuConf) -> void {
+	port = s2i(ruOptDef("server-port", "20001", conf));
+	server = ref nop;
+	server := createHttpServer(port,
+		\-> {
+			ruServerLog("Http server started.", conf);
+			ruPrintln("Http server started.", conf)
+		},
+		\request, response -> {
+			ruProcessRequest(conf, request.body,
+				\code, output -> HttpResponse(200 + code, output, []) |> response,
+				nop,
+				\-> {
+					^server();
+					ruPrintln("Http server stopped.", conf);
+					ruServerLog("Http server stopped.", conf);
+					quit(0);
+				}
+			)
+		}
+	);
+}
