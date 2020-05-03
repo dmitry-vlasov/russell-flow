@@ -5,8 +5,12 @@ import ru_prod;
 
 export {
 	ruAddProof(prop : RuProverProp, hypProof : RuProverProofHyp, env : RuProverEnv) -> void;
-	ruBuildHypProofs(parent : RuProverProp, proofs : [RuProverProofHyp], env : RuProverEnv) -> void;
+	//ruBuildHypProofs(parent : RuProverProp, proofs : [RuProverProofHyp], env : RuProverEnv) -> void;
 	ruBuildPropProofs(parent : RuProverHyp, proofs : [RuProverProofProp], env : RuProverEnv) -> void;
+
+max_cplx = ref 0;
+max_cplx_subs : ref [Tree<RuVar, RuExp>] = ref [];
+max_cplx_expr : ref RuExp = ref ruNoExp;
 }
 
 ruCheckTests(test1 : Tree<[RuProverProofHyp], RuProverProofProp>, test2 : Tree<[RuProverProofHyp], RuProverProofProp>) -> bool {
@@ -120,12 +124,43 @@ ruAddProof1(prop : RuProverProp, hypProof : RuProverProofHyp, env : RuProverEnv)
 	prod = CartProd(map(^(prop.children), \hyp ->
 		if (hyp == hypProof.node) [hypProof] else ^(hyp.proofs)
 	));
-	if (sizeCartProd(prod) == 0) [] else {
+	if (sizeCartProd(prod) == 0) [] else
+	if (sizeCartProd(prod) == 1) { 
+		hypProofs = map(prod.sets, \s -> s[0]);
+		subs = map(hypProofs, \p -> p.sub);
+		cplx = fold(subs, 0, \acc, sub -> acc + ruSubComplexity(sub));
+		t = timestamp();
+		rets = eitherMap(ruUnifySubs(subs, env.math),
+			\s -> eitherMap(ruCompose(prop.sub, s), 
+				\theta -> if (!ruCheckDisjs(theta, prop.assertion.disjs)) [] else [RuProverProofProp(prop, theta, hypProofs)],
+				[]
+			), []
+		);
+		if (cplx > ^max_cplx && length(rets) > 0) {
+			max_cplx := cplx;
+			max_cplx_subs := subs;
+			max_cplx_expr := ruApplySubst(prop.parent.expr, rets[0].sub);
+		}
+		if (ruOptIsTrue("reprove-stats", env.math.conf)) {
+				time = cast(timestamp() - t : double -> int);
+				stats = RuStatsRow("prop " + prop.assertion.name, 
+					pairs2tree([
+						Pair("size", sizeCartProd(prod)), 
+						Pair("time", time), 
+						Pair("rets", length(rets)),
+						Pair("cplx", cplx)
+					])
+				);
+				ruAddStats("ruAddProof0", stats);
+			}
+		rets;
+	} else {
 		if (sizeCartProd(prod) > 100000) {
 			println("ruSizeCart(prod)=" + i2s(sizeCartProd(prod)));
 			[]
 		} else {
-			filtermapCartProd(prod, \hypProofs -> 
+			t = timestamp();
+			rets = filtermapCartProd(prod, \hypProofs -> 
 				maybeBind(ruUnifySubs(map(hypProofs, \hp -> hp.sub), env.math),
 					\s ->
 						maybeBind(ruCompose(prop.sub, s), \theta ->
@@ -134,7 +169,19 @@ ruAddProof1(prop : RuProverProp, hypProof : RuProverProofHyp, env : RuProverEnv)
 							} 
 						)
 				)
-			)
+			);
+			if (ruOptIsTrue("reprove-stats", env.math.conf)) {
+				time = cast(timestamp() - t : double -> int);
+				stats = RuStatsRow("prop " + prop.assertion.name, 
+					pairs2tree([
+						Pair("size", sizeCartProd(prod)), 
+						Pair("time", time), 
+						Pair("rets", length(rets))
+					])
+				);
+				ruAddStats("ruAddProof1", stats);
+			}
+			rets
 		}
 	}
 }
@@ -152,8 +199,8 @@ ruBuildPropProofs(parent : RuProverHyp, proofs : [RuProverProofProp], env : RuPr
 		)
 	);
 	switch (parent) {
-		RuProverExp(__,__,__,__,grand): 
-			ruBuildHypProofs(grand, tailFrom(^(parent.proofs), n), env);
+		RuProverExp(__,__,ex,__,grand): 
+			ruBuildHypProofs(grand, tailFrom(^(parent.proofs), n), env, ex);
 		RuProverRoot(__,__,__):
 			iter(tailFrom(^(parent.proofs), n), \root -> {
 				steps = map(ruMakeLinearProof(ruMakeProofNode(root)), \step -> RuStep(step with expr = env.unconst(step.expr)));
@@ -178,8 +225,16 @@ ruBuildPropProofs(parent : RuProverHyp, proofs : [RuProverProofProp], env : RuPr
 	}
 }
 
-ruBuildHypProofs(parent : RuProverProp, proofs : [RuProverProofHyp], env : RuProverEnv) -> void {
+ruBuildHypProofs(parent : RuProverProp, proofs : [RuProverProofHyp], env : RuProverEnv, ex : RuExp) -> void {
 	n = length(^(parent.proofs));
+	t = timestamp();
 	iter(proofs, \proof -> ruAddProof(parent, proof, env));
+	if (ruOptIsTrue("reprove-stats", env.math.conf)) {
+		time = cast(timestamp() - t : double -> int);
+		stats = RuStatsRow("hyp " + ru2s(ex, env.math.rules), 
+			pairs2tree([Pair("size", length(proofs)), Pair("time", time), Pair("rets", length(tailFrom(^(parent.proofs), n)))])
+		);
+		ruAddStats("ruBuildHypProofs", stats);
+	}
 	ruBuildPropProofs(parent.parent, tailFrom(^(parent.proofs), n), env);
 }
