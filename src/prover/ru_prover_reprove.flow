@@ -143,13 +143,17 @@ ruCommandReproveTask(math : RuMath) -> RuMath {
 	failed_th_names = ref [];
 	max_time = ref 0.0;
 	max_th_name = ref "";
-	reprove_th = \th, index -> {
+	ms_time_limit = i2d(s2i(ruOptDef("reprove-time-limit", "600", math.conf)) * 1000);
+	if (math.conf.verbose > 0) {
+		println("reprove time limit: " + d2s(ms_time_limit / 1000.0) + ".s");
+	}
+	reprove_th = \th, index, time_limit -> {
 		//if (math.conf.verbose > 0) {
 		//	println("going to reprove theorem " + th.name);
 		//}
 		start = timestamp();
 		mapping = ref makeTree();
-		env0 = ruInitProver(th, math, index);
+		env0 = ruInitProver(th, math, index, time_limit);
 		env = RuProverEnv(env0 with
 			reproveMap = mapping,
 			unifyAssertion = ruReproveUnifyAssertion(env0.unifyAssertion, mapping, math),
@@ -206,40 +210,57 @@ ruCommandReproveTask(math : RuMath) -> RuMath {
 			true;
 		}
 	}
-	reprove_ass = \ass : RuAssertion -> 
+	reprove_ass = \ass : RuAssertion, time_limit -> 
 		switch (ass) {
-			RuTheorem(__,__,__,__,__,__,__,__): reprove_th(ass, None());
+			RuTheorem(__,__,__,__,__,__,__,__): reprove_th(ass, None(), time_limit);
 			default: true;
 		}
-	reprove_decl = \decl : RuBlock ->
+	reprove_decl = \decl : RuBlock, time_limit ->
 		switch (decl) {
-			RuTheorem(__,__,__,__,__,__,__,__): reprove_th(decl, None());
+			RuTheorem(__,__,__,__,__,__,__,__): reprove_th(decl, None(), time_limit);
 			default: true;
 		}
-	reprove_decls = \decls ->
-		all(ruConcurrent(map(decls, \d -> \-> reprove_decl(d))));
+	reprove_decls = \decls, time_limit -> {
+		limit_on_one = time_limit / i2d(length(decls));
+		all(ruConcurrent(map(decls, \d -> \-> reprove_decl(d, limit_on_one))));
+	}
 	start = timestamp();
 	ret = if (target == "all" || target == "1") {
 		decls = filtermap(concatA(map(ruOrderSources(math), \src -> src.decls)), ruBlock2Assertion);
 		chunks = splitByNumber(decls, s2i(ruOptDef("reprove-split-num", "256", math.conf)));
-		fold(chunks, Pair(ruMakeIndex(), true), \acc, chunk -> {
+		foldi(chunks, Pair(ruMakeIndex(), true), \n, acc, chunk -> {
 			indexes = foldi(chunk, Pair(acc.first, []), \i, ac, ass ->
 				Pair(ruSetIndex(ass.prop, ass, ac.first), concat(ac.second, [ac.first]))
 			);
-			ret = all(ruConcurrent(mapi(chunk, \i, ass -> 
-					\-> eitherMap(ruAssertion2Theorem(ass), \th -> reprove_th(th, Some(indexes.second[i])), true)
-			)));
-			Pair(indexes.first, ret && acc.second)
+			left_time = ms_time_limit - (timestamp() - start);
+			if (left_time <= 0.0) Pair(indexes.first, false) else {
+				time_left_on_chunk = left_time / i2d((length(chunks) - n));
+				limit_on_one = time_left_on_chunk / i2d(length(chunk));
+				ret = all(ruConcurrent(mapi(chunk, \i, ass -> 
+						\-> eitherMap(ruAssertion2Theorem(ass), \th -> reprove_th(th, Some(indexes.second[i]), limit_on_one), true)
+				)));
+				Pair(indexes.first, ret && acc.second);
+			}
 		}).second;
 	} else if (target == "1-seq" || target == "all-seq") {
-		//reprove_decls(concatA(map(ruOrderSources(math), \src -> src.decls)));
-		all(map(concatA(map(ruOrderSources(math), \src -> src.decls)), \d -> reprove_decl(d)));
+		decls = concatA(map(ruOrderSources(math), \src -> src.decls));
+		all(mapi(decls, \i, d -> {
+			passed = (timestamp() - start);
+			left_time = ms_time_limit - passed;
+			if (left_time <= 0.0) false else { 
+				limit_on_one = left_time / i2d(length(decls) - i);
+				//println("limit_on_one: " + d2s(limit_on_one / 1000.0) + ".s");
+				reprove_decl(d, limit_on_one);
+			}
+		}));
 	} else {
 		switch (lookupTree(math.sources, target)) {
-			Some(src): reprove_decls(src.decls);
+			Some(src): {
+				reprove_decls(src.decls, ms_time_limit);
+			}
 			None(): {
 				switch (lookupTree(math.assertions, target)) {
-					Some(ass): reprove_ass(ass);
+					Some(ass): reprove_ass(ass, ms_time_limit);
 					None(): {
 						println("no target for reproving");
 						false
