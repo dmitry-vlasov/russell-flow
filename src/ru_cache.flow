@@ -4,8 +4,9 @@ import ru_src;
 export {
 	ruToCache(src : RuSource, conf : RuConf) -> void;
 	ruFromCache(file : string, conf : RuConf) -> Maybe<RuSource>;
+	ruLoadToCache(file : string, conf : RuConf) -> void;
 	ruClearCache() -> void;
-	ruSourceCache() -> [RuSource];
+	ruSourcesCache() -> [RuSource];
 	ruMakeCacheDir(conf : RuConf) -> void;
 
 	RuCachedDecl(
@@ -14,12 +15,22 @@ export {
 	);
 
 	ruCachedDecl(name : string) -> Maybe<RuCachedDecl>;
+
+	// Lookups a cached file source, if not found - loads and stores.
+	ruFileSource(path : string) -> string;
+	// Stores a certain string as a source for some path.
+	ruSetFileSource(path : string, src : string) -> void;
+	// Loads file source from filesystem. May be used to undo fcSetFileSource function.
+	ruLoadFileSource(path : string) -> void;
+
+	ruRange2s(info : RuFileInfo, range : RuRange, msg : string) -> string;
 }
 
 ruCacheVersion = 1;
 RuCached(source : RuSource, version : int);
 ruMemoryCache = initConcurrentHashMap();
 ruNameCache = initConcurrentHashMap();
+ruSourceCache = initConcurrentHashMap(); // Sources of files as strings
 
 ruClearCache() -> void {
 	clearConcurrentHashMap(ruMemoryCache);
@@ -27,7 +38,7 @@ ruClearCache() -> void {
 	// TODO: clear serialized sources?..
 }
 
-ruSourceCache() -> [RuSource] {
+ruSourcesCache() -> [RuSource] {
 	filtermap(valuesConcurrentHashMap(ruMemoryCache), idfn);
 }
 
@@ -85,7 +96,8 @@ ruToCache(src : RuSource, conf : RuConf) -> void {
 	}
 }
 
-ruFromCache(file : string, conf : RuConf) -> Maybe<RuSource> {
+ruFromCache(file0 : string, conf : RuConf) -> Maybe<RuSource> {
+	file = ruTrimPath(file0, conf, ".ru");
 	if (ruOptIsFalse("caching", conf)) None() else {
 		if (containsConcurrentHashMap(ruMemoryCache, file)) {
 			getConcurrentHashMap(ruMemoryCache, file, None());
@@ -121,6 +133,15 @@ ruFromCache(file : string, conf : RuConf) -> Maybe<RuSource> {
 	}
 }
 
+ruLoadToCache(file0 : string,  conf : RuConf) -> void {
+	file = ruTrimPath(file0, conf, ".ru");
+	if (!containsConcurrentHashMap(ruMemoryCache, file)) {
+		maybeApply(ruFromCache(file, conf), \src ->
+			iter(src.imports, \imp -> ruLoadToCache(imp.path, conf))
+		);
+	}
+}
+
 ruDeleteFromCache(file : string, path : string, conf : RuConf) -> void {
 	if (conf.verbose > 1) {
 		println("Deleting outdated cached " + file);
@@ -136,4 +157,52 @@ ruDeleteFromCache(file : string, path : string, conf : RuConf) -> void {
 
 ruCachedDecl(name : string) -> Maybe<RuCachedDecl> {
 	getConcurrentHashMap(ruNameCache, name, None());
+}
+
+RuCachedSourceCode(
+	text : string,
+	modified : double
+);
+
+ruFileSource(path : string) -> string {
+	if (!containsConcurrentHashMap(ruSourceCache, path)) {
+		setConcurrentHashMap(ruSourceCache, path, RuCachedSourceCode(getFileContent(path), fileModified(path)));
+	}
+	cached = getConcurrentHashMap(ruSourceCache, path, RuCachedSourceCode("", 0.0));
+	modified = fileModified(path);
+	if (cached.modified != modified) {
+		// Reload outdated source.
+		text = getFileContent(path);
+		setConcurrentHashMap(ruSourceCache, path, RuCachedSourceCode(text, modified));
+		text;
+	} else {
+		cached.text;
+	}
+}
+
+ruSetFileSource(path : string, text : string) -> void {
+	if (!containsConcurrentHashMap(ruSourceCache, path)) {
+		setConcurrentHashMap(ruSourceCache, path, RuCachedSourceCode(text, fileModified(path)));
+	} else {
+		cached = getConcurrentHashMap(ruSourceCache, path, RuCachedSourceCode("", 0.0));
+		setConcurrentHashMap(ruSourceCache, path, RuCachedSourceCode(text, cached.modified));
+	}
+}
+
+ruLoadFileSource(path : string) -> void {
+	setConcurrentHashMap(ruSourceCache, path, RuCachedSourceCode(getFileContent(path), fileModified(path)));
+}
+
+ruRange2s(info : RuFileInfo, range : RuRange, msg : string) -> string {
+	if (info.path == "") "" else {
+		code = ruFileSource(info.path);
+		resolver = makeLineResolver(code);
+		s = findLine(resolver, range.start);
+		if (range.end < 0) {
+			info.path + ":" + i2s(s.lineno) + ":" + i2s(s.lineIndex + 1) + ":" + (if (msg == "") "" else " " + msg);
+		} else {
+			e = findLine(resolver, range.end);
+			info.path + ":" + i2s(s.lineno) + ":" + i2s(s.lineIndex + 1) + ":" + i2s(e.lineno) + ":" + i2s(e.lineIndex + 1) + ":" + (if (msg == "") "" else " " + msg);
+		}
+	}
 }
