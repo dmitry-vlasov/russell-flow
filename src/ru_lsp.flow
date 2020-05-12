@@ -190,7 +190,11 @@ ruLspInitialize(call: RuLspMethodCall) -> void {
 					Pair("hoverProvider", JsonBool(true)),
 					Pair("renameProvider", JsonBool(true)),
 					Pair("executeCommandProvider", 
-						JsonObject([Pair("commands", JsonArray([JsonString("verify"), JsonString("metamath")]))])
+						JsonObject([Pair("commands", JsonArray([
+							JsonString("verify"), 
+							JsonString("metamath"),
+							JsonString("cache-info"),
+						]))])
 					),
 					Pair("textDocumentSync",
 						JsonObject([
@@ -213,8 +217,12 @@ ruLspTextDocumentDidOpen(call: RuLspMethodCall) -> void {
 			call.run(
 				RuConf(conf with opts = setTree(conf.opts, "update-cache", "1")),
 				\code -> {
+					out = ruOutput(call.conf);
 					ruClearOutput(call.conf);
-					if (code != 0) call.loop_cb() else {
+					if (code != 0) {
+						call.out_cb(ruLspErrorResponse(call.id, 1, "error at opening: " + path + "\n" + out));
+						call.loop_cb() 
+					} else {
 						call.run(
 							RuConf(conf with 
 								opts = mergeTree(conf.opts, 
@@ -331,23 +339,23 @@ ruLspParseSymbols(s : string) -> [Json] {
 				Some(lspTextDocumentSymbol2Json(LspTextDocumentSymbol(p.second, "", 0, false, loc.range, loc.range, [])))
 			} else if (length(descr_parts) > 1) {
 				name = descr_parts[1];
-				kind = if (descr_parts[0] == "import") {
-					lookupTreeDef(lspSymbolKindName2id, "Module", 0);
-				} else if (descr_parts[0] == "forbid") {
+				kind = if (descr_parts[0] == "const") {
+					lookupTreeDef(lspSymbolKindName2id, "Object", 0);
+				} else if (descr_parts[0] == "import") {
 					lookupTreeDef(lspSymbolKindName2id, "Package", 0);
-				} else if (descr_parts[0] == "struct") {
+				} else if (descr_parts[0] == "type") {
 					lookupTreeDef(lspSymbolKindName2id, "Struct", 0);
 				} else if (descr_parts[0] == "union") {
 					lookupTreeDef(lspSymbolKindName2id, "Enum", 0);
-				} else if (descr_parts[0] == "fundef") {
+				} else if (descr_parts[0] == "theorem") {
 					lookupTreeDef(lspSymbolKindName2id, "Function", 0);
-				} else if (descr_parts[0] == "fundecl") {
+				} else if (descr_parts[0] == "axiom") {
 					lookupTreeDef(lspSymbolKindName2id, "Interface", 0);
 				} else if (descr_parts[0] == "vardef") {
 					lookupTreeDef(lspSymbolKindName2id, "Object", 0);
-				} else if (descr_parts[0] == "vardecl") {
+				} else if (descr_parts[0] == "rule") {
 					lookupTreeDef(lspSymbolKindName2id, "Variable", 0);
-				} else if (descr_parts[0] == "natdef") {
+				} else if (descr_parts[0] == "def") {
 					lookupTreeDef(lspSymbolKindName2id, "Method", 0);
 				} else if (descr_parts[0] == "natdecl") {
 					lookupTreeDef(lspSymbolKindName2id, "Method", 0);
@@ -569,60 +577,78 @@ ruLspTextDocumentRename(call: RuLspMethodCall) -> void {
 	}
 }
 
+ruLspWorkspaceExecuteVerify(call : RuLspMethodCall, commandParams: LspExecuteCommandParams) -> void {
+	if (length(commandParams.arguments) == 0) {
+		call.out_cb(ruLspErrorResponse(call.id, 1, "no file for verification is provided"));
+	} else {
+		file = ref "";
+		params = filtermap(commandParams.arguments, \arg -> 
+			switch (arg) {
+				JsonString(str): {
+					opt_val = strSplit(str, "=");
+					if (length(opt_val) == 0) None() else
+					if (length(opt_val) == 1) { file := opt_val[0]; None(); } else {
+						opt = opt_val[0];
+						val = opt_val[1];
+						if (opt == "file") {
+							file := val;
+							None();
+						} else {
+							Some(Pair(opt, val));
+						}
+					}
+				}
+				default: None();
+			}
+		);
+		if (^file == "") {
+			call.out_cb(ruLspErrorResponse(call.id, 1, "no file for verification"));
+		} else {
+			conf = ruLspFileConfig(call.conf, ruCorrectUriPath(^file));
+			call.run(
+				RuConf(conf with opts = mergeTree(conf.opts, pairs2tree(params))),
+				\code -> {
+					out = ruOutput(call.conf);
+					ruClearOutput(call.conf);
+					call.out_cb(ruLspNormalResponse(call.id, JsonString(out)));
+				}
+			);
+		}
+	}
+}
+
+ruLspWorkspaceExecuteMetamath(call : RuLspMethodCall, commandParams: LspExecuteCommandParams) -> void {
+	// TODO
+}
+
+ruLspWorkspaceExecuteCacheInfo(call : RuLspMethodCall, commandParams: LspExecuteCommandParams) -> void {
+	full = commandParams.arguments != [] && commandParams.arguments[0] == JsonString("full");
+	info = ruCacheInfo(full);
+	ruDebugLog("cache info: \n" + info, call.conf);
+	ruPrintln(info, call.conf);
+	out = ruOutput(call.conf);
+	ruClearOutput(call.conf);
+	call.out_cb(ruLspNormalResponse(call.id, JsonString(out)));
+}
+
 ruLspWorkspaceExecuteCommand(call: RuLspMethodCall) -> void {
 	switch (json2LspExecuteCommandParams(call.params)) {
 		Some(commandParams): {
-			if (commandParams.command == "compile") {
-				if (length(commandParams.arguments) == 0) {
-					call.out_cb(ruLspErrorResponse(call.id, 1, "no file for compilation is provided"));
-					call.loop_cb();
-				} else {
-					file = ref "";
-					params = filtermap(commandParams.arguments, \arg -> 
-						switch (arg) {
-							JsonString(str): {
-								opt_val = strSplit(str, "=");
-								if (length(opt_val) == 0) None() else
-								if (length(opt_val) == 1) { file := opt_val[0]; None(); } else {
-									opt = opt_val[0];
-									val = opt_val[1];
-									if (opt == "file") {
-										file := val;
-										None();
-									} else {
-										Some(Pair(opt, val));
-									}
-								}
-							}
-							default: None();
-						}
-					);
-					if (^file == "") {
-						call.out_cb(ruLspErrorResponse(call.id, 1, "no file for compilation"));
-						call.loop_cb();
-					} else {
-						conf = ruLspFileConfig(call.conf, ruCorrectUriPath(^file));
-						call.run(
-							RuConf(conf with opts = mergeTree(conf.opts, pairs2tree(params))),
-							\code -> {
-								out = ruOutput(call.conf);
-								ruClearOutput(call.conf);
-								call.out_cb(ruLspNormalResponse(call.id, JsonString(out)));
-								call.loop_cb();
-							}
-						);
-					}
-				}
+			if (commandParams.command == "verify") {
+				ruLspWorkspaceExecuteVerify(call, commandParams);
+			} else if (commandParams.command == "metamath") {
+				ruLspWorkspaceExecuteMetamath(call, commandParams);
+			} else if (commandParams.command == "cache-info") {
+				ruLspWorkspaceExecuteCacheInfo(call, commandParams);
 			} else {
 				call.out_cb(ruLspErrorResponse(call.id, 1, "command " + commandParams.command + " is unknown"));
-				call.loop_cb();
 			}
 		}
 		None(): {
 			call.out_cb(ruLspErrorResponse(call.id, 1, "ExecuteCommand request is illegal"));
-			call.loop_cb();
 		}
 	}
+	call.loop_cb();
 }
 
 ruDetectLspError(out : string, conf : RuConf) -> bool {
