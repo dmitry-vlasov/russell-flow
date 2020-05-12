@@ -29,6 +29,7 @@ export function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(vscode.commands.registerCommand('russell.stopHttpServer', stopHttpServer));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.restartLspServer', restartLspServer));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.toggleHttpServer', toggleHttpServer));
+	context.subscriptions.push(vscode.commands.registerCommand('russell.cacheInfo', cacheInfo));
 
     russellChannel = vscode.window.createOutputChannel("Russell");
 	russellChannel.show();
@@ -36,19 +37,25 @@ export function activate(context: vscode.ExtensionContext) {
 	checkHttpServerStatus(true);
 	setInterval(checkHttpServerStatus, 3000, false);
 	serverStatusBarItem.show();
-
-    // Create a client
 	startLspServer();
+}
+
+function cacheInfo() {
+	let options: vscode.InputBoxOptions = { prompt: "Full: ", placeHolder: "" };
+	vscode.window.showInputBox(options).then(value => {
+		client.sendRequest("workspace/executeCommand", 
+			value ? { command : "cache-info", arguments: [value] } : { command : "cache-info" }
+		).then((out : any) => russellChannel.appendLine(out));
+	});
 }
 
 function startLspServer() {
 	// If the extension is launched in debug mode then the debug server options are used
 	// Otherwise the run options are used
-	const root_dir : string = vscode.workspace.getConfiguration("russell").get("lspRoot");
 	let serverOptions: ServerOptions = {
 		command: process.platform == "win32" ? 'russell.bat' : 'russell',
 		args: ['server=lsp'],
-		options:  (root_dir == "") ? { detached: false } : { detached: false, cwd:  root_dir }
+		options:  { detached: false }
 	}
 	// Options to control the language client
 	let clientOptions: LanguageClientOptions = {
@@ -69,8 +76,6 @@ function startLspServer() {
 	client = new LanguageClient('russell', 'Russell Language Server', serverOptions, clientOptions);
 	// Start the client. This will also launch the server
 	client.start();
-	russellChannel.appendLine('Russell LSP server stared');
-	client.onReady().then(() => russellChannel.appendLine('Russell LSP server is ready'));
 }
 
 function restartLspServer() {
@@ -116,8 +121,7 @@ function toggleHttpServer() {
 function startHttpServer() {
     if (!httpServerOnline) {
 		const port : number = vscode.workspace.getConfiguration("russell").get("portOfHttpServer");
-		const root_dir : string = vscode.workspace.getConfiguration("russell").get("serverRoot");
-		httpServer = tools.launchHttpServer(root_dir, port, showHttpServerOnline, showHttpServerOffline);
+		httpServer = tools.launchHttpServer(port, showHttpServerOnline, showHttpServerOffline);
 		httpServerOnline = true;
     }
 }
@@ -169,7 +173,7 @@ function getPath(uri : string | vscode.Uri) : string {
 function resolveProjectRoot(uri : string | vscode.Uri) : string {
 	const config = vscode.workspace.getConfiguration("russell");
 	if (uri != null) {
-		let dir = uri != null ? getPath(uri) : path.resolve(getPath(config.get("projectRoot")), "russell.conf");
+		let dir = getPath(uri);
 		while (dir != path.resolve(dir, "..")) {
 			dir = path.resolve(dir, "..");
 			if (fs.existsSync(path.resolve(dir, "russell.conf"))) {
@@ -191,14 +195,4 @@ function verifyRussell() {
 
 function verifyMetamath() {
     verifyRussell();
-}
-
-// reads configuration, defaults to global plugin configuration
-function readConfiguration(): PropertiesReader.Reader {
-    let configFile = path.join(vscode.workspace.rootPath, "russell.config");
-	var reader = PropertiesReader(undefined);
-	if (fs.existsSync(configFile)) {
-		reader.append(configFile);
-	}
-    return reader;
 }

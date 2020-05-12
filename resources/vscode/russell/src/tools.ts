@@ -21,9 +21,9 @@ export function shutdownHttpServer(port : number) {
     return run_cmd("russell", "", ["shutdown-server=1", "server-port=" + port], (s) => { console.log(s); } );
 }
 
-export function launchHttpServer(projectRoot: string, port : number, on_start : () => void, on_stop : () => void) {
+export function launchHttpServer(port : number, on_start : () => void, on_stop : () => void) {
     on_start();
-    let httpServer = run_cmd("russell", projectRoot, ["server=http", "server-port=" + port], (s) => { console.log(s); });
+    let httpServer = run_cmd("russell", "", ["server=http", "server-port=" + port], (s) => { console.log(s); });
     httpServer.addListener("close", (code: number, signal: string) => { on_stop() });
     httpServer.addListener("disconnect", () => { on_stop() });
     httpServer.addListener("exit", (code: number, signal: string) => { on_stop() });
