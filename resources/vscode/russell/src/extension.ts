@@ -7,7 +7,7 @@ import { ChildProcess } from 'child_process';
 import * as fs from "fs";
 import * as PropertiesReader from 'properties-reader';
 import {
-    LanguageClient, LanguageClientOptions, ServerOptions, RevealOutputChannelOn,
+    LanguageClient, LanguageClientOptions, ServerOptions, RevealOutputChannelOn, Location,
 } from 'vscode-languageclient';
 import * as tools from "./tools";
 
@@ -30,6 +30,7 @@ export function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(vscode.commands.registerCommand('russell.restartLspServer', restartLspServer));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.toggleHttpServer', toggleHttpServer));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.cacheInfo', cacheInfo));
+	context.subscriptions.push(vscode.commands.registerCommand('russell.findSymbol', findSymbol));
 
     russellChannel = vscode.window.createOutputChannel("Russell");
 	russellChannel.show();
@@ -46,6 +47,23 @@ function cacheInfo() {
 		client.sendRequest("workspace/executeCommand", 
 			value ? { command : "cache-info", arguments: [value] } : { command : "cache-info" }
 		).then((out : any) => russellChannel.appendLine(out));
+	});
+}
+
+function findSymbol() {
+	let options: vscode.InputBoxOptions = { prompt: "Symbol: ", placeHolder: "" };
+	vscode.window.showInputBox(options).then(value => {
+		if (value) {
+			client.sendRequest("workspace/executeCommand", { command : "find-symbol", arguments: [value] }).
+			then((location : vscode.Location) => {
+					let uri = vscode.Uri.parse(location.uri.toString());
+					vscode.workspace.openTextDocument(uri).then((document) =>
+						vscode.window.showTextDocument(document).then((edit) =>
+							edit.revealRange(location.range)
+						)
+					);
+			});
+		}
 	});
 }
 
