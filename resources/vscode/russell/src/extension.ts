@@ -46,7 +46,7 @@ function cacheInfo() {
 	vscode.window.showInputBox(options).then(value => {
 		client.sendRequest("workspace/executeCommand", 
 			value ? { command : "cache-info", arguments: [value] } : { command : "cache-info" }
-		).then((out : any) => russellChannel.appendLine(out));
+		).then((out : string) => russellChannel.appendLine(out));
 	});
 }
 
@@ -204,11 +204,11 @@ function resolveProjectRoot(uri : string | vscode.Uri) : string {
 
 function verifyRussell() {
 	let document = vscode.window.activeTextEditor.document;
-	let rootPath = resolveProjectRoot(document.uri);
 	russellChannel.clear();
 	russellChannel.show(true);
-	russellChannel.appendLine("Verifying directory '" + document.uri + "'");
-	tools.run_cmd("russell", rootPath, ["verify=1"], (s : string) => russellChannel.append(s.toString()));
+	//russellChannel.appendLine("Verifying file '" + document.uri + "'");
+	client.sendRequest("workspace/executeCommand", { command : "verify", arguments: [document.uri.fsPath] }).
+	then((out : string) => russellChannel.append(out));
 }
 
 function verifyMetamath() {
