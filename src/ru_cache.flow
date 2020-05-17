@@ -3,17 +3,29 @@ import ru_src;
 import ru_log;
 
 export {
-	ruToCache(src : RuSource, conf : RuConf) -> void;
-	ruFromCache(file : string, conf : RuConf) -> Maybe<RuSource>;
-	ruLoadToCache(file : string, conf : RuConf) -> void;
-	ruClearCache() -> void;
-	ruSourcesCache() -> [RuSource];
-	ruMakeCacheDir(conf : RuConf) -> void;
+	RuCachedSource(
+		source : RuSource, 
+		dependencyChanged : () -> bool, 
+		version : int
+	);
 
 	RuCachedDecl(
 		decl : RuDecl,
 		src : string, // name of a source of origin
 	);
+
+	// Cached source code.
+	RuCachedSourceText(
+		text : string,
+		modified : double
+	);
+
+	ruToCache(src : RuSource, conf : RuConf) -> void;
+	ruFromCache(file : string, conf : RuConf) -> Maybe<RuCachedSource>;
+	ruLoadToCache(file : string, conf : RuConf) -> void;
+	ruClearCache() -> void;
+	ruSourcesCache() -> [RuSource];
+	ruMakeCacheDir(conf : RuConf) -> void;
 
 	ruCachedDecl(name : string) -> Maybe<RuCachedDecl>;
 
@@ -33,19 +45,19 @@ export {
 }
 
 ruCacheVersion = 1;
-RuCached(source : RuSource, version : int);
-ruMemoryCache = initConcurrentHashMap();
+
+ruSourceCache = initConcurrentHashMap();
 ruNameCache = initConcurrentHashMap();
-ruSourceCache = initConcurrentHashMap(); // Sources of files as strings
+ruTextCache = initConcurrentHashMap(); // Sources of files as strings
 
 ruClearCache() -> void {
-	clearConcurrentHashMap(ruMemoryCache);
+	clearConcurrentHashMap(ruSourceCache);
 	clearConcurrentHashMap(ruNameCache);
-	// TODO: clear serialized sources?..
+	clearConcurrentHashMap(ruTextCache);
 }
 
 ruSourcesCache() -> [RuSource] {
-	filtermap(valuesConcurrentHashMap(ruMemoryCache), idfn);
+	filtermap(valuesConcurrentHashMap(ruSourceCache), idfn);
 }
 
 ruMakeCacheDir(conf : RuConf) -> void {
@@ -63,30 +75,32 @@ ruCachedPath(file : string, conf : RuConf) -> string {
 	ruCacheDir(conf) + "/" + strReplace(strReplace(file, "/", "_"), ":", "_")  + ".cache"
 }
 
-/*
-ruDependencyChangedCallback(conf : RuConf, src : RuSource) -> () -> bool {
-	changed = \ -> {
+RuCachedFileSource(
+	source : RuSource,
+	version : int
+);
+
+ruDepChangedCallback(src : RuSource, conf : RuConf) -> () -> bool {
+	\ -> {
 		check = exists(src.imports, \imp ->
 			switch (ruFromCache(imp.path, conf)) {
 				Some(cached): {
-					src.info.lastupdate < cached.src.info.lastupdate || cached.dependencyChanged();
+					src.info.lastupdate < cached.source.info.lastupdate || cached.dependencyChanged();
 				}
 				None(): {
 					conf.onError("a module " + imp.path + " must be already in cache, but is not there", []); true; 
 				}
 			}
 		);
-		fcAddToCache(globEnv, module.fileinfo.flowfile, FcLoaded(module, \ -> ret));
+		setConcurrentHashMap(ruSourceCache, src.info.file, Some(RuCachedSource(src, \ -> check, ruCacheVersion)));
 		check
 	}
-	fcAddToCache(globEnv, module.fileinfo.flowfile, FcLoaded(module, changed));
-	changed
-}*/
+}
 
 ruToCache(src : RuSource, conf : RuConf) -> void {
 	if (!ruOptIsFalse("caching", conf)) {
-		//ruDebugLog("adding to cache: " + src.info.file, conf);
-		setConcurrentHashMap(ruMemoryCache, src.info.file, Some(src));
+		cached = RuCachedSource(src, ruDepChangedCallback(src, conf), ruCacheVersion);
+		setConcurrentHashMap(ruSourceCache, src.info.file, Some(cached));
 		path = ruCachedPath(src.info.file, conf);
 		iter(src.decls, \decl ->
 			switch (decl) {
@@ -94,7 +108,7 @@ ruToCache(src : RuSource, conf : RuConf) -> void {
 				default: { }
 			}
 		);
-		if (!setFileContent(ruCachedPath(src.info.file, conf), toBinary(RuCached(src, ruCacheVersion)))) {
+		if (!setFileContent(ruCachedPath(src.info.file, conf), toBinary(RuCachedFileSource(cached.source, cached.version)))) {
 			conf.onError("cannot save cached source " + src.info.file, []);
 		}
 		if (conf.verbose > 1) {
@@ -103,11 +117,11 @@ ruToCache(src : RuSource, conf : RuConf) -> void {
 	}
 }
 
-ruFromCache(file0 : string, conf : RuConf) -> Maybe<RuSource> {
+ruFromCache(file0 : string, conf : RuConf) -> Maybe<RuCachedSource> {
 	file = ruTrimPath(file0, conf, ".ru");
 	if (ruOptIsFalse("caching", conf)) None() else {
-		if (containsConcurrentHashMap(ruMemoryCache, file)) {
-			getConcurrentHashMap(ruMemoryCache, file, None());
+		if (containsConcurrentHashMap(ruSourceCache, file)) {
+			getConcurrentHashMap(ruSourceCache, file, None());
 		} else {
 			path = ruCachedPath(file, conf);
 			if (!fileExists(path)) None() else {
@@ -117,9 +131,9 @@ ruFromCache(file0 : string, conf : RuConf) -> Maybe<RuSource> {
 					ruDeleteFromCache(file, path, conf);
 					None();
 				} else {
-					cached = cast(deserialized : flow -> RuCached);
-					if (cached.version == ruCacheVersion) {
-						changed = ruFileChanged(cached.source.info);
+					cached_file = cast(deserialized : flow -> RuCachedFileSource);
+					if (cached_file.version == ruCacheVersion) {
+						changed = ruFileChanged(cached_file.source.info);
 						if (changed != "") {
 							if (conf.verbose >= 1) {
 								println(changed);
@@ -130,8 +144,9 @@ ruFromCache(file0 : string, conf : RuConf) -> Maybe<RuSource> {
 							if (conf.verbose > 1) {
 								ruPrintln("loaded from cache: " + file, conf);
 							}
-							setConcurrentHashMap(ruMemoryCache, file, Some(cached.source));
-							Some(cached.source);
+							cached = RuCachedSource(cached_file.source, ruDepChangedCallback(cached_file.source, conf), cached_file.version);
+							setConcurrentHashMap(ruSourceCache, file, Some(cached));
+							Some(cached);
 						}
 					} else None();
 				}
@@ -142,9 +157,9 @@ ruFromCache(file0 : string, conf : RuConf) -> Maybe<RuSource> {
 
 ruLoadToCache(file0 : string,  conf : RuConf) -> void {
 	file = ruTrimPath(file0, conf, ".ru");
-	if (!containsConcurrentHashMap(ruMemoryCache, file)) {
-		maybeApply(ruFromCache(file, conf), \src ->
-			iter(src.imports, \imp -> ruLoadToCache(imp.path, conf))
+	if (!containsConcurrentHashMap(ruSourceCache, file)) {
+		maybeApply(ruFromCache(file, conf), \cached ->
+			iter(cached.source.imports, \imp -> ruLoadToCache(imp.path, conf))
 		);
 	}
 }
@@ -153,7 +168,7 @@ ruDeleteFromCache(file : string, path : string, conf : RuConf) -> void {
 	if (conf.verbose > 1) {
 		ruPrintln("Deleting outdated cached " + file, conf);
 	}
-	removeConcurrentHashMap(ruMemoryCache, file);
+	removeConcurrentHashMap(ruSourceCache, file);
 	err = deleteFile(path);
 	if (err != "") {
 		if (fileExists(path)) {
@@ -166,21 +181,16 @@ ruCachedDecl(name : string) -> Maybe<RuCachedDecl> {
 	getConcurrentHashMap(ruNameCache, name, None());
 }
 
-RuCachedSourceCode(
-	text : string,
-	modified : double
-);
-
 ruFileSource(path : string) -> string {
-	if (!containsConcurrentHashMap(ruSourceCache, path)) {
-		setConcurrentHashMap(ruSourceCache, path, RuCachedSourceCode(getFileContent(path), fileModified(path)));
+	if (!containsConcurrentHashMap(ruTextCache, path)) {
+		setConcurrentHashMap(ruTextCache, path, RuCachedSourceText(getFileContent(path), fileModified(path)));
 	}
-	cached = getConcurrentHashMap(ruSourceCache, path, RuCachedSourceCode("", 0.0));
+	cached = getConcurrentHashMap(ruTextCache, path, RuCachedSourceText("", 0.0));
 	modified = fileModified(path);
 	if (cached.modified != modified) {
 		// Reload outdated source.
 		text = getFileContent(path);
-		setConcurrentHashMap(ruSourceCache, path, RuCachedSourceCode(text, modified));
+		setConcurrentHashMap(ruTextCache, path, RuCachedSourceText(text, modified));
 		text;
 	} else {
 		cached.text;
@@ -188,16 +198,16 @@ ruFileSource(path : string) -> string {
 }
 
 ruSetFileSource(path : string, text : string) -> void {
-	if (!containsConcurrentHashMap(ruSourceCache, path)) {
-		setConcurrentHashMap(ruSourceCache, path, RuCachedSourceCode(text, fileModified(path)));
+	if (!containsConcurrentHashMap(ruTextCache, path)) {
+		setConcurrentHashMap(ruTextCache, path, RuCachedSourceText(text, fileModified(path)));
 	} else {
-		cached = getConcurrentHashMap(ruSourceCache, path, RuCachedSourceCode("", 0.0));
-		setConcurrentHashMap(ruSourceCache, path, RuCachedSourceCode(text, cached.modified));
+		cached = getConcurrentHashMap(ruTextCache, path, RuCachedSourceText("", 0.0));
+		setConcurrentHashMap(ruTextCache, path, RuCachedSourceText(text, cached.modified));
 	}
 }
 
 ruLoadFileSource(path : string) -> void {
-	setConcurrentHashMap(ruSourceCache, path, RuCachedSourceCode(getFileContent(path), fileModified(path)));
+	setConcurrentHashMap(ruTextCache, path, RuCachedSourceText(getFileContent(path), fileModified(path)));
 }
 
 ruRange2s(info : RuFileInfo, range : RuRange, msg : string) -> string {
@@ -215,20 +225,20 @@ ruRange2s(info : RuFileInfo, range : RuRange, msg : string) -> string {
 }
 
 ruCacheInfo(full : bool) -> string {
-	"cached sources: " + i2s(sizeConcurrentHashMap(ruMemoryCache)) + "\n" +
+	"cached sources: " + i2s(sizeConcurrentHashMap(ruSourceCache)) + "\n" +
 	"cached names: " + i2s(sizeConcurrentHashMap(ruNameCache)) + "\n" +
-	"cached source texts: " + i2s(sizeConcurrentHashMap(ruSourceCache)) + "\n" +
+	"cached source texts: " + i2s(sizeConcurrentHashMap(ruTextCache)) + "\n" +
 	if (!full) "" else {
-		"cached sources:\n" + strGlue(map(keysConcurrentHashMap(ruMemoryCache), \n -> "\t" + n), "\n") + "\n"
-		"cached source texts:\n" + strGlue(map(keysConcurrentHashMap(ruSourceCache), \n -> "\t" + n),"\n")
+		"cached sources:\n" + strGlue(map(keysConcurrentHashMap(ruSourceCache), \n -> "\t" + n), "\n") + "\n"
+		"cached source texts:\n" + strGlue(map(keysConcurrentHashMap(ruTextCache), \n -> "\t" + n),"\n")
 	}
 }
 
 ruDeclRange(d : RuDecl, src : RuSource) -> RuRange {
 	ind = ruIndexOfDecl(ruDeclName(d), src);
 	text = ruFileSource(src.info.path);
-	//start = src.decls[ruIndexWithComments(ind, src)].pos;
-	start = src.decls[ind].pos;
+	start = src.decls[ruIndexWithComments(ind, src)].pos;
+	//start = src.decls[ind].pos;
 	end = if (ind + 1 < length(src.decls)) {
 		src.decls[ind + 1].pos;
 	} else {
