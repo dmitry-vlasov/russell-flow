@@ -49,6 +49,7 @@ ruCacheVersion = 1;
 ruSourceCache = initConcurrentHashMap();
 ruNameCache = initConcurrentHashMap();
 ruTextCache = initConcurrentHashMap(); // Sources of files as strings
+ruDefCache = initConcurrentHashMap();  // Definitions
 
 ruClearCache() -> void {
 	clearConcurrentHashMap(ruSourceCache);
@@ -97,17 +98,54 @@ ruDepChangedCallback(src : RuSource, conf : RuConf) -> () -> bool {
 	}
 }
 
+ruUpdateNameCache(src : RuSource, conf : RuConf) -> void {
+	iter(src.decls, \decl ->
+		switch (decl) {
+			RuDecl(): setConcurrentHashMap(ruNameCache, ruDeclName(decl), Some(RuCachedDecl(decl, src.info.file)));
+			default: { }
+		}
+	);
+}
+
+ruUpdateDefCache(src : RuSource, conf : RuConf) -> void {
+	iter(src.decls, \decl -> 
+		switch (decl) {
+			RuDef(__,__,__,__, defm, __,__,__): {
+				switch (defm.nodes[0]) {
+					RuRuleRef(rule_name,__,__,__): {
+						switch (getConcurrentHashMap(ruNameCache, rule_name, None())) {
+							Some(cached_rule): {
+								rule = cast(cached_rule.decl : RuDecl -> RuRule);
+								non_bracket_consts = filtermap(rule.term.expr, \n ->
+									switch (n) {
+										RuConstRef(name): 
+											if (name != "(" && name != ")" && name != ",") Some(name) 
+											else None();
+										RuVar(__,__): None(); 
+									}
+								);
+								if (length(non_bracket_consts) == 1) {
+									defiendum = non_bracket_consts[0];
+									setConcurrentHashMap(ruDefCache, defiendum, Some(RuCachedDecl(decl, src.info.file)));
+								}
+							}
+							None(): conf.onError("Rule " + rule_name + " is not found in cache", []);
+						}
+					}
+					default: { }
+				}
+			}
+			default: { }
+		}
+	);
+}
+
 ruToCache(src : RuSource, conf : RuConf) -> void {
 	if (!ruOptIsFalse("caching", conf)) {
 		cached = RuCachedSource(src, ruDepChangedCallback(src, conf), ruCacheVersion);
 		setConcurrentHashMap(ruSourceCache, src.info.file, Some(cached));
-		path = ruCachedPath(src.info.file, conf);
-		iter(src.decls, \decl ->
-			switch (decl) {
-				RuDecl(): setConcurrentHashMap(ruNameCache, ruDeclName(decl), Some(RuCachedDecl(decl, src.info.file)));
-				default: { }
-			}
-		);
+		ruUpdateNameCache(src, conf);
+		ruUpdateDefCache(src, conf);
 		if (!setFileContent(ruCachedPath(src.info.file, conf), toBinary(RuCachedFileSource(cached.source, cached.version)))) {
 			conf.onError("cannot save cached source " + src.info.file, []);
 		}
@@ -146,9 +184,16 @@ ruFromCache(file0 : string, conf : RuConf) -> Maybe<RuCachedSource> {
 							}
 							cached = RuCachedSource(cached_file.source, ruDepChangedCallback(cached_file.source, conf), cached_file.version);
 							setConcurrentHashMap(ruSourceCache, file, Some(cached));
+							ruUpdateNameCache(cached.source, conf);
 							Some(cached);
 						}
-					} else None();
+					} else {
+						if (conf.verbose > 1) {
+							ruPrintln("cached file " + file + " is has version " + i2s(cached_file.version) + " while current version is " + i2s(ruCacheVersion), conf);
+							ruDeleteFromCache(file, path, conf);
+						}
+						None();
+					}
 				}
 			}
 		}
@@ -157,10 +202,22 @@ ruFromCache(file0 : string, conf : RuConf) -> Maybe<RuCachedSource> {
 
 ruLoadToCache(file0 : string,  conf : RuConf) -> void {
 	file = ruTrimPath(file0, conf, ".ru");
-	if (!containsConcurrentHashMap(ruSourceCache, file)) {
-		maybeApply(ruFromCache(file, conf), \cached ->
-			iter(cached.source.imports, \imp -> ruLoadToCache(imp.path, conf))
-		);
+	sources = ruDoLoadToCache(file, conf, [], makeSet()).first;
+	iter(sources, \src -> ruUpdateDefCache(src, conf));
+}
+
+ruDoLoadToCache(file : string,  conf : RuConf, acc : [RuSource], visited : Set<string>) -> Pair<[RuSource], Set<string>> {
+	if (containsSet(visited, file)) Pair(acc, visited) else {
+		new_visited = insertSet(visited, file);
+		switch (ruFromCache(file, conf)) {
+			Some(cached):
+				fold(
+					cached.source.imports,
+					Pair(concat(acc, [cached.source]), new_visited), 
+					\ac, imp -> ruDoLoadToCache(imp.path, conf, ac.first, ac.second)
+				);
+			None(): Pair(acc, new_visited);
+		}
 	}
 }
 
@@ -178,7 +235,10 @@ ruDeleteFromCache(file : string, path : string, conf : RuConf) -> void {
 }
 
 ruCachedDecl(name : string) -> Maybe<RuCachedDecl> {
-	getConcurrentHashMap(ruNameCache, name, None());
+	switch (getConcurrentHashMap(ruDefCache, name, None())) {
+		Some(decl): Some(decl);
+		None(): getConcurrentHashMap(ruNameCache, name, None());
+	}
 }
 
 ruFileSource(path : string) -> string {
