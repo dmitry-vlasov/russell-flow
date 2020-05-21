@@ -30,6 +30,7 @@ export function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(vscode.commands.registerCommand('russell.restartLspServer', restartLspServer));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.toggleHttpServer', toggleHttpServer));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.cacheInfo', cacheInfo));
+	context.subscriptions.push(vscode.commands.registerCommand('russell.declInfo', declInfo));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.findSymbol', findSymbol));
 
     russellChannel = vscode.window.createOutputChannel("Russell");
@@ -41,12 +42,36 @@ export function activate(context: vscode.ExtensionContext) {
 	startLspServer();
 }
 
+function toUTF8(text : string): string {
+    /*var utf8Text = text;
+    try {
+        // Try to convert to utf-8
+        utf8Text = decodeURIComponent(escape(text));
+        // If the conversion succeeds, text is not utf-8
+    } catch(e) {
+        // console.log(e.message); // URI malformed
+        // This exception means text is utf-8
+    }   
+	return utf8Text; // returned text is always utf-8*/
+	
+	return escape(text);
+}
+
 function cacheInfo() {
 	let options: vscode.InputBoxOptions = { prompt: "Full: ", placeHolder: "" };
 	vscode.window.showInputBox(options).then(value => {
 		client.sendRequest("workspace/executeCommand", 
 			value ? { command : "cache-info", arguments: [value] } : { command : "cache-info" }
-		).then((out : string) => russellChannel.appendLine(out));
+		).then((out : string) => russellChannel.append(out));
+	});
+}
+
+function declInfo() {
+	let options: vscode.InputBoxOptions = { prompt: "Args: (consts, types, rules, axioms, defs, all) ", placeHolder: "" };
+	vscode.window.showInputBox(options).then(value => {
+		client.sendRequest("workspace/executeCommand", 
+			value ? { command : "decl-info", arguments: [value] } : { command : "decl-info" }
+		).then((out : string) => russellChannel.append(toUTF8(out)));
 	});
 }
 
