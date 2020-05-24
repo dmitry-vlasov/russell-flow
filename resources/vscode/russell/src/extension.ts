@@ -10,6 +10,8 @@ import {
     LanguageClient, LanguageClientOptions, ServerOptions, RevealOutputChannelOn, Location,
 } from 'vscode-languageclient';
 import * as tools from "./tools";
+import { MathProvider, MathEntity } from "./mathProvider";
+import { isNullOrUndefined } from 'util';
 
 const isPortReachable = require('is-port-reachable');
 
@@ -32,6 +34,27 @@ export function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(vscode.commands.registerCommand('russell.cacheInfo', cacheInfo));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.declInfo', declInfo));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.findSymbol', findSymbol));
+	context.subscriptions.push(vscode.commands.registerCommand('russell.gotoLocation', gotoLocation));
+
+	const axiomsProvider = new MathProvider(context, () => mathInfo('axioms-info'));
+	vscode.window.registerTreeDataProvider('math-axioms', axiomsProvider);
+	vscode.commands.registerCommand('russell.refreshAxioms', () => axiomsProvider.update());
+
+	const defsProvider = new MathProvider(context, () => mathInfo('defs-info'));
+	vscode.window.registerTreeDataProvider('math-defs', defsProvider);
+	vscode.commands.registerCommand('russell.refreshDefs', () => defsProvider.update());
+
+	const typesProvider = new MathProvider(context, () => mathInfo('types-info'));
+	vscode.window.registerTreeDataProvider('math-types', typesProvider);
+	vscode.commands.registerCommand('russell.refreshTypes', () => typesProvider.update());
+
+	const rulesProvider = new MathProvider(context, () => mathInfo('rules-info'));
+	vscode.window.registerTreeDataProvider('math-rules', rulesProvider);
+	vscode.commands.registerCommand('russell.refreshRules', () => rulesProvider.update());
+
+	const constsProvider = new MathProvider(context, () => mathInfo('consts-info'));
+	vscode.window.registerTreeDataProvider('math-consts', constsProvider);
+	vscode.commands.registerCommand('russell.refreshConsts', () => constsProvider.update());
 
     russellChannel = vscode.window.createOutputChannel("Russell");
 	russellChannel.show();
@@ -42,19 +65,8 @@ export function activate(context: vscode.ExtensionContext) {
 	startLspServer();
 }
 
-function toUTF8(text : string): string {
-    /*var utf8Text = text;
-    try {
-        // Try to convert to utf-8
-        utf8Text = decodeURIComponent(escape(text));
-        // If the conversion succeeds, text is not utf-8
-    } catch(e) {
-        // console.log(e.message); // URI malformed
-        // This exception means text is utf-8
-    }   
-	return utf8Text; // returned text is always utf-8*/
-	
-	return escape(text);
+function mathInfo(type : string): Thenable<MathEntity[]> {
+	return client.sendRequest("workspace/executeCommand", { command : type, arguments: [] });
 }
 
 function cacheInfo() {
@@ -71,8 +83,17 @@ function declInfo() {
 	vscode.window.showInputBox(options).then(value => {
 		client.sendRequest("workspace/executeCommand", 
 			value ? { command : "decl-info", arguments: [value] } : { command : "decl-info" }
-		).then((out : string) => russellChannel.append(toUTF8(out)));
+		).then((out : string) => russellChannel.append(out));
 	});
+}
+
+function gotoLocation(location : vscode.Location) : void {
+	let uri = vscode.Uri.parse(location.uri.toString());
+	vscode.workspace.openTextDocument(uri).then((document) =>
+		vscode.window.showTextDocument(document).then((edit) =>
+			edit.revealRange(location.range)
+		)
+	);
 }
 
 function findSymbol() {
@@ -80,14 +101,7 @@ function findSymbol() {
 	vscode.window.showInputBox(options).then(value => {
 		if (value) {
 			client.sendRequest("workspace/executeCommand", { command : "find-symbol", arguments: [value] }).
-			then((location : vscode.Location) => {
-					let uri = vscode.Uri.parse(location.uri.toString());
-					vscode.workspace.openTextDocument(uri).then((document) =>
-						vscode.window.showTextDocument(document).then((edit) =>
-							edit.revealRange(location.range)
-						)
-					);
-			});
+			then(gotoLocation);
 		}
 	});
 }
