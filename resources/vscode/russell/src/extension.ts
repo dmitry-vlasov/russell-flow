@@ -36,23 +36,23 @@ export function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(vscode.commands.registerCommand('russell.findSymbol', findSymbol));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.gotoLocation', gotoLocation));
 
-	const axiomsProvider = new MathProvider(context, () => mathInfo('axioms-info'));
+	const axiomsProvider = new MathProvider(context, () => mathInfo('axioms'));
 	vscode.window.registerTreeDataProvider('math-axioms', axiomsProvider);
 	vscode.commands.registerCommand('russell.refreshAxioms', () => axiomsProvider.update());
 
-	const defsProvider = new MathProvider(context, () => mathInfo('defs-info'));
+	const defsProvider = new MathProvider(context, () => mathInfo('defs'));
 	vscode.window.registerTreeDataProvider('math-defs', defsProvider);
 	vscode.commands.registerCommand('russell.refreshDefs', () => defsProvider.update());
 
-	const typesProvider = new MathProvider(context, () => mathInfo('types-info'));
+	const typesProvider = new MathProvider(context, () => mathInfo('types'));
 	vscode.window.registerTreeDataProvider('math-types', typesProvider);
 	vscode.commands.registerCommand('russell.refreshTypes', () => typesProvider.update());
 
-	const rulesProvider = new MathProvider(context, () => mathInfo('rules-info'));
+	const rulesProvider = new MathProvider(context, () => mathInfo('rules'));
 	vscode.window.registerTreeDataProvider('math-rules', rulesProvider);
 	vscode.commands.registerCommand('russell.refreshRules', () => rulesProvider.update());
 
-	const constsProvider = new MathProvider(context, () => mathInfo('consts-info'));
+	const constsProvider = new MathProvider(context, () => mathInfo('consts'));
 	vscode.window.registerTreeDataProvider('math-consts', constsProvider);
 	vscode.commands.registerCommand('russell.refreshConsts', () => constsProvider.update());
 
@@ -66,7 +66,7 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 function mathInfo(type : string): Thenable<MathEntity[]> {
-	return client.sendRequest("workspace/executeCommand", { command : type, arguments: [] });
+	return client.sendRequest("workspace/executeCommand", { command: "math-info", arguments: [type] });
 }
 
 function cacheInfo() {
