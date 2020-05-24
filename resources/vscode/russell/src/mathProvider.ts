@@ -25,9 +25,9 @@ export class MathProvider implements vscode.TreeDataProvider<string> {
 				if (entitites) {
 					this.entities = entitites.reduce((acc, c) => acc.set(c.name, c), new Map())
 				}
+				this._onDidChangeTreeData.fire();
 			});
 		}
-		this._onDidChangeTreeData.fire();
 	}
 
 	getChildren(name?: string): Thenable<string[]> {
