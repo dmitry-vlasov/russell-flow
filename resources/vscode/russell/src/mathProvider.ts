@@ -4,7 +4,7 @@ import * as path from 'path';
 export interface MathEntity {
 	location : vscode.Location;
 	name : string;
-	tooptip : string;
+	tooltip : string;
 }
 
 export class MathProvider implements vscode.TreeDataProvider<string> {
@@ -26,8 +26,8 @@ export class MathProvider implements vscode.TreeDataProvider<string> {
 					this.entities = entitites.reduce((acc, c) => acc.set(c.name, c), new Map())
 				}
 			});
-			this._onDidChangeTreeData.fire();
 		}
+		this._onDidChangeTreeData.fire();
 	}
 
 	getChildren(name?: string): Thenable<string[]> {
@@ -50,7 +50,7 @@ export class MathProvider implements vscode.TreeDataProvider<string> {
 				title: 'open location',
 				arguments: [c.location]
 			};
-			treeItem.tooltip = c.tooptip;
+			treeItem.tooltip = c.tooltip;
 			return treeItem;
 		} else {
 			return null;
