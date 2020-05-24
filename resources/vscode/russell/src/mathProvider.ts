@@ -22,9 +22,11 @@ export class MathProvider implements vscode.TreeDataProvider<string> {
 		let updated = this.updater();
 		if (updated) {
 			updated.then((entitites : MathEntity[]) => {
+				vscode.window.showInformationMessage("update size: " + entitites.length);
 				if (entitites) {
 					this.entities = entitites.reduce((acc, c) => acc.set(c.name, c), new Map())
 				}
+				vscode.window.showInformationMessage("updates size: " + this.entities.size);
 				this._onDidChangeTreeData.fire();
 			});
 		}

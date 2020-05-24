@@ -137,8 +137,11 @@ function startLspServer() {
 
 function restartLspServer() {
 	if (client) {
-		client.sendNotification("exit");
-        client.stop().then(startLspServer);
+        client.stop().then(
+			startLspServer,
+			(reason) => { vscode.window.showInformationMessage(`Restart of LSP server failed: ${reason}.`) }
+		);
+		client = null;
 	} else {
 		startLspServer();
 	}
@@ -209,7 +212,6 @@ export function deactivate() {
     if (!client) {
         return undefined;
     } else {
-        client.sendNotification("exit");
         return client.stop()
     }
 }
