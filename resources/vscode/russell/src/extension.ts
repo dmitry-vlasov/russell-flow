@@ -34,6 +34,7 @@ export function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(vscode.commands.registerCommand('russell.cacheInfo', cacheInfo));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.declInfo', declInfo));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.findSymbol', findSymbol));
+	context.subscriptions.push(vscode.commands.registerCommand('russell.execCommand', execCommand));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.gotoLocation', gotoLocation));
 
 	const axiomsProvider = new MathProvider(context, () => mathInfo('axioms'));
@@ -75,6 +76,18 @@ function cacheInfo() {
 		client.sendRequest("workspace/executeCommand", 
 			value ? { command : "cache-info", arguments: [value] } : { command : "cache-info" }
 		).then((out : string) => russellChannel.append(out));
+	});
+}
+
+function execCommand() {
+	let options: vscode.InputBoxOptions = { prompt: "Command and args: ", placeHolder: "" };
+	vscode.window.showInputBox(options).then(value => {
+		let val_arr = value.split(" ");
+		if (val_arr.length > 0) {
+			client.sendRequest("workspace/executeCommand", { command : "command", arguments: val_arr }).then(
+				(out : string) => russellChannel.append(out)
+			);
+		}
 	});
 }
 
@@ -212,7 +225,8 @@ export function deactivate() {
     if (!client) {
         return undefined;
     } else {
-        return client.stop()
+		client.sendNotification("exit");
+        return client.stop();
     }
 }
 
