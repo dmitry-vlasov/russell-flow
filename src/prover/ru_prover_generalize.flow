@@ -1,0 +1,399 @@
+import prover/ru_prover_prove;
+import prover/ru_prover_stats;
+
+export {
+	ruCommandGeneralizeTask(math : RuMath) -> RuMath;
+}
+
+ruInitGeneralizer(th : RuTheorem, math : RuMath, ms_time_limit : double) -> RuProverEnv {
+	env = ruInitGeneralizerEnv(th, math, ms_time_limit);
+	ruExpandHyp(env.tree.root, env);
+}
+
+ruCommandGeneralizeTask(math : RuMath) -> RuMath {
+	target = lookupTreeDef(math.conf.opts, "default", "1");
+	if (math.conf.verbose > 0) {
+		println("generalizing target: " + target);
+	}
+	generalized_count = ref 0;
+	failed_count = ref 0;
+	failed_th_names = ref [];
+	max_time = ref 0.0;
+	max_th_name = ref "";
+	depths = ruTheoremDepth(math);
+	if (ruOptIsTrue("generalize-stats", math.conf)) {
+		ruCommandTheoremDepthStats(math);
+	}
+	generalize_th = \th, time_limit -> {
+		//if (math.conf.verbose > 0) {
+		//	println("going to generalize theorem " + th.name);
+		//}
+		start = timestamp();
+		mapping = ref makeTree();
+		env0 = ruInitGeneralizer(th, math, time_limit);
+		env = RuProverEnv(env0 with
+			reproveMap = mapping,
+			unifyAssertion = ruGeneralizeUnifyAssertion(env0.unifyAssertion, mapping, math),
+			unifyPremise = ruGeneralizeUnifyPremise(env0.unifyPremise, mapping, math),
+		);
+		if (ruOptIsTrue("generalize-stats", env.math.conf)) {
+			init_stats = RuStatsRow("generalize init " + th.name, 
+				pairs2tree([Pair("size", i2d(length(th.proof.steps))), Pair("time", timestamp() - start)])
+			);
+			ruAddStats("generalize_init", init_stats);
+		}
+		t = timestamp();
+		ruProve(env, ruGeneralizeTactic(th, math, mapping));
+		tm = timestamp() - start;
+		time = (timestamp() - start)/ 1000.0;
+		if (time > ^max_time) {
+			max_time := time;
+			max_th_name := th.name;
+		}
+		if (ruOptIsTrue("generalize-stats", env.math.conf)) {
+			prove_time = timestamp() - t;
+			generalize_stats = RuStatsRow("generalize do " + th.name, 
+				pairs2tree([
+					Pair("depth", i2d(lookupTreeDef(depths, th.name, -1))),
+					Pair("size", i2d(ruSizeProverTree(env.tree.root))),
+					Pair("proof-size", i2d(length(th.proof.steps))), 
+					Pair("proof-vol", i2d(fold(th.proof.steps, 0, \acc, step -> acc + length(step.expr.nodes)))), 
+					Pair("time", prove_time),
+					Pair("time-per-step", prove_time / i2d(length(th.proof.steps)))
+				])
+			);
+			ruAddStats("generalize_time", generalize_stats);
+			stats = RuStatsRow("generalized all " + th.name, 
+				pairs2tree([Pair("size", i2d(ruSizeProverTree(env.tree.root))), Pair("time", tm)])
+			);
+			ruAddStats("generalize_all", stats);
+			/*println("max_cplx = " + i2s(^max_cplx));
+			println("length(max_cplx_subs) = " + i2s(length(^max_cplx_subs)));
+			println("max_cplx_subs:");
+			iteri(^max_cplx_subs, \i, sub -> {
+				println("sub: " + i2s(i));
+				println("dom: " + i2s(sizeTree(sub)));
+				println("cplx: " + i2s(ruSubComplexity(sub)));
+				println(ruSubst2s(sub, env.math));
+				println("");
+			});
+			println("max_cplx_expr:");
+			println(ru2s(^max_cplx_expr, env.math.rules));*/
+		}
+		if (^(env.proofs) == []) {
+			atomicRefIntAddition(failed_count, 1);
+			println("theorem " + th.name + " was NOT generalized in " + d2st(time, 2) + "s");
+			println(ru2s(th, math.rules));
+			refArrayPush(failed_th_names, th.name);
+			//quit(-1);
+			false;
+		} else {
+			if (math.conf.verbose > 0) {
+				atomicRefIntAddition(generalized_count, 1);
+				println(i2s(^generalized_count) + " theorem " + th.name + " was REPROVED in " + d2st(time, 2) + "s");
+			}
+			true;
+		}
+	}
+	generalize_ass = \ass : RuAssertion, time_limit -> 
+		switch (ass) {
+			RuTheorem(__,__,__,__,__,__,__,__): generalize_th(ass, time_limit);
+			default: true;
+		}
+	generalize_decl = \decl : RuBlock, time_limit ->
+		switch (decl) {
+			RuTheorem(__,__,__,__,__,__,__,__): generalize_th(decl, time_limit);
+			default: true;
+		}
+	generalize_decls = \decls, time_limit -> {
+		proof_lens = map(decls, \d -> {
+			switch (d) {
+				RuTheorem(__,__,__,__,__,__,proof,__): length(proof.steps);
+				default: 0;
+			}
+		});
+		sum_proof_lens = i2d(fold(proof_lens, 0, \acc, len -> acc + len));
+		all(ruConcurrent(mapi(decls, \i, d -> {
+			limit = time_limit * i2d(availableProcessors()) * i2d(proof_lens[i]) / sum_proof_lens;
+			\-> generalize_decl(d, limit)
+		})));
+	}
+	start = timestamp();
+	calc_total_steps = \decls -> fold(decls, 0, \acc, d ->
+		switch (d) {
+			RuTheorem(__,__,__,__,__,__,proof,__): acc + length(proof.steps);
+			default: acc;
+		}
+	);
+	calc_time_limit = \decls -> {
+		opt = ruOptDef("time-limit", "600", math.conf);
+		limit = if (opt == "auto") {
+			i2d(calc_total_steps(decls)) * 3.0;
+		} else {
+			i2d(s2i(opt) * 1000);
+		}
+		if (math.conf.verbose > 0) {
+			println("time limit: " + d2s(limit / 1000.0) + ".s");
+		}
+		limit
+	}
+	ret = if (target == "all" || target == "1") {
+		decls = filtermap(concatA(map(ruOrderSources(math), \src -> src.decls)), ruBlock2Assertion);
+		ms_time_limit = calc_time_limit(decls);
+		chunks = splitByNumber(decls, s2i(ruOptDef("decls-split-num", "256", math.conf)));
+		//time_limit = ms_time_limit * i2d(availableProcessors());
+		//println("generalize concurrent time limit: " + d2s(time_limit / 1000.0) + ".s");
+		proof_lens = map(chunks, \chunk ->
+			map(chunk, \d ->
+				switch (d) {
+					RuTheorem(__,__,__,__,__,__,proof,__): length(proof.steps);
+					default: 0;
+				}
+			)
+		);
+		sum_proof_lens = map(proof_lens, \lens -> i2d(fold(lens, 0, \ac, len -> ac + len)));
+		total_steps = fold(sum_proof_lens, 0.0, \acc, len -> acc + len);
+		r = foldi(chunks, true, \n, acc, chunk -> {
+			left_time = ms_time_limit - (timestamp() - start);
+			if (left_time <= 0.0) false else {
+				time_left_on_chunk = left_time * i2d(availableProcessors()) * sum_proof_lens[n] / total_steps * 2.0;
+				acc && all(ruConcurrent(mapi(chunk, \i, ass -> 
+						\-> eitherMap(ruAssertion2Theorem(ass), 
+							\th -> {
+								limit = time_left_on_chunk * i2d(proof_lens[n][i]) / sum_proof_lens[n];
+								generalize_th(th, limit);
+							}, 
+							true
+						)
+				)));
+			}
+		});
+		println("average time per step: " + d2s((timestamp() - start) / total_steps));
+		r;
+	} else if (target == "1-seq" || target == "all-seq") {
+		decls = concatA(map(ruOrderSources(math), \src -> src.decls));
+		ms_time_limit = calc_time_limit(decls);
+		all(mapi(decls, \i, d -> {
+			passed = (timestamp() - start);
+			left_time = ms_time_limit - passed;
+			if (left_time <= 0.0) false else { 
+				limit_on_one = left_time / i2d(length(decls) - i);
+				//println("limit_on_one: " + d2s(limit_on_one / 1000.0) + ".s");
+				generalize_decl(d, limit_on_one);
+			}
+		}));
+	} else {
+		switch (lookupTree(math.sources, target)) {
+			Some(src): {
+				ms_time_limit = calc_time_limit(src.decls);
+				generalize_decls(src.decls, ms_time_limit);
+			}
+			None(): {
+				switch (lookupTree(math.assertions, target)) {
+					Some(ass): {
+						ms_time_limit = calc_time_limit([ass]);
+						generalize_ass(ass, ms_time_limit);
+					}
+					None(): {
+						println("no target for reproving");
+						false
+					}
+				}
+			}
+		}
+	}
+	if (math.conf.verbose > 0) {
+		println("ru generalized in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
+		println("Max time: " + d2st(^max_time, 2) + "s for a theorem: " + ^max_th_name);
+	}
+	if (/*math.conf.verbose > 0 ||*/ ^failed_count > 0) {
+		println("Reproved: " + i2s(^generalized_count) + " theorems,");
+		println("Failed to generalize: " + i2s(^failed_count) + " theorems:");
+		iter(^failed_th_names, \th -> println("\t" + th));
+	}
+	if (ruOptIsTrue("generalize-stats", math.conf)) {
+		ruCommandReproveTimeStats(math);
+		//ruCommandReproveAllStats(math);
+	}
+	math
+}
+
+ruGeneralizeUnifyPremise(unify : (RuProverHyp) -> [RuUnified<RuHyp>], mapping : ref Tree<RuProverProp, RuProofStep>, math : RuMath) -> (RuProverHyp) -> [RuUnified<RuHyp>] {
+	if (ruOptIsTrue("generalize-singletons", math.conf)) {
+		\hyp : RuProverHyp ->  {
+			unif = unify(hyp);
+			switch (hyp) {
+				RuProverExp(i, __,__,__, parent): {
+					switch (lookupTree(^mapping, parent)) {
+						Some(step): {
+							switch (step.children[i]) {
+								RuProofStep(__,__,__): [];
+								RuProofHyp(h,__): filter(unif, \un -> un.data.ind == h.ind);
+							}
+						}
+						None(): {
+							println("must not happen");
+							quit(-1);
+							[]; // must not be
+						}
+					}
+				}
+				RuProverRoot(__,__,__): unif;
+			}
+		}
+	} else unify;
+}
+
+ruGeneralizeUnifyAssertion(mapping : ref Tree<RuProverProp, RuProofStep>, math : RuMath) -> (RuProverHyp) -> [RuUnified<RuAssertion>] {
+	\hyp : RuProverHyp ->  {
+		switch (hyp) {
+			RuProverExp(i, __,__,__, parent): {
+				switch (lookupTree(^mapping, parent)) {
+					Some(step): {
+						switch (step.children[i]) {
+							RuProofStep(assertion, children, expr): {
+								e1 = hyp.expr;
+								e2 = assertion.prop;
+								eitherMap(
+									ruUnifyExps([e1, e2],makeTree(), math),
+									\sub -> [RuUnified(sub, assertion, ruApplySubst(e1, sub))], []
+								);
+							}
+							RuProofHyp(h,__): [];
+						}
+					}
+					None(): {
+						println("must not happen");
+						quit(-1);
+						[]; // must not be
+					}
+				}
+			}
+			RuProverRoot(__,__,__): unify(hyp);
+		}
+	}
+}
+
+
+ruGeneralizeTactic(theorem : RuTheorem, math : RuMath, mapping : ref Tree<RuProverProp, RuProofStep>) -> (RuProverTree) -> Maybe<RuProverProp> {
+	proof = ruMakeTreeProof(theorem, math);
+	leafs = ref [];
+	queue = ref [];
+	\tree -> {
+		if (length(^queue) == 0) {
+			if (sizeTree(^mapping) == 0) {
+				traverseInOrder(tree.leafs, \__, n -> 
+					if (length(^queue) == 0) {
+						switch (n.parent) {
+							RuProverRoot(__,__,__):
+								if (n.assertion == proof.assertion) {
+									queue := [Pair(n, proof)];
+								}
+							default: {}
+						}
+					}
+				);
+			} else if (length(^leafs) > 0) {
+				n = ^leafs[0].first;
+				s = ^leafs[0].second;
+				leafs := tail(^leafs);
+				iteri(^(n.children), \i, child -> {
+					step_child = s.children[i];
+					switch (step_child) {
+						RuProofStep(assertion,__,__) : {
+							iter(^(child.children), \grand ->
+								if (grand.assertion == assertion) {
+									refArrayPush(queue, Pair(grand, step_child));
+								}
+							);
+						}
+						default: { }
+					}
+				});
+			}
+		}
+		if (length(^queue) > 0) {
+			n = ^queue[0].first;
+			s = ^queue[0].second;
+			queue := tail(^queue);
+			if (exists(s.children, \ch -> switch (ch) { RuProofStep(__,__,__): true; default: false; })) {
+				refArrayPush(leafs, Pair(n, s));
+			}
+			mapping := setTree(^mapping, n, s);
+			Some(n);
+		} else {
+			None();
+		}
+	}
+}
+
+ruInitGeneralizerEnv(th : RuTheorem, math : RuMath, ms_time_limit : double) -> RuProverEnv {
+	dag = ruProofToDAG(th.proof);
+	ass = lookupTreeDef(math.assertions, dag.data, ruNoAxiom);
+	mapping = ref makeTree();
+	vars = ref makeTree();
+	root = RuProverRoot(ref [], ass.prop, ref []);
+	mapping := setTree(^mapping, root, dag);
+	hyps = ref [];
+	id = ref 0;
+	RuProverEnv(
+		{ started = timestamp(); \-> timestamp() - started > ms_time_limit },
+		-1,
+		th,
+		RuProverTree(makeTree(), root),
+		\hyp -> {
+			switch (lookupTree(^mapping, hyp)) {
+				Some(node): {
+					a = lookupTreeDef(math.assertions, node.data, ruNoAxiom);
+					switch (ruUnifyExps([hyp.expr, a.prop], makeTree(), math)) {
+						Some(theta): [RuUnified(theta, a, ruApplySubst(a.prop, theta))];
+						None(): [];
+					}
+				}
+				None(): {
+					println("must not happen");
+					quit(-1);
+					[];
+				}
+			}
+		},
+		\hyp -> {
+			switch (hyp) {
+				RuProverExp(__,__,__,__,parent):
+					switch (lookupTree(^mapping, parent.parent)) {
+						Some(node): {
+							if (node.data != "") [] else {
+								switch (find(^hyps, \h -> h.expr == hyp.expr)) {
+									Some(h): [RuUnified(makeTree(), h, h.expr)];
+									None(): {
+										h = RuHyp(length(^hyps), hyp.expr, -1);
+										refArrayPush(hyps, h);
+										[RuUnified(makeTree(), h, h.expr)];
+									}
+								}
+							}
+						}
+						None(): {
+							println("must not happen");
+							quit(-1);
+							[];
+						}
+					}
+				default: {
+					println("must not happen");
+					quit(-1);
+					[];
+				}
+			}
+		},
+		math,
+		\v -> {
+			vars := setTree(^vars, v, lookupTreeDef(^vars, v, 0) + 1);
+			RuVar(v.name + "_" + i2s(lookupTreeDef(^vars, v, 0)), v.type);
+		},
+		idfn,
+		ref [],
+		\ -> { ret = ^id; id := ^id + 1; ret; },
+		ref makeTree()
+	);
+}
