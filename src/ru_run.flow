@@ -21,51 +21,50 @@ import ru_refactor;
 import ru_shorten;
 import ru_info;
 import ru_command;
+import ru_conf_utils;
 import prover/ru_prover_prove;
 import prover/ru_prover_reprove;
 
 export {
-	ruRun(conf : RuConf, onRunComplete : (int) -> void) -> void;
-	ruRunLocal(conf : RuConf, onRunComplete : (int) -> void) -> void;
+	ruRun(job : RuJob, onRunComplete : (int) -> void) -> void;
+	ruRunLocal(job : RuJob, onRunComplete : (int) -> void) -> void;
 }
 
-ruRun(conf : RuConf, onRunComplete : (int) -> void) -> void {
-	if (ruOptIsTrue("local", conf)) {
-		ruRunLocal(conf, onRunComplete);
+ruRun(job : RuJob, onRunComplete : (int) -> void) -> void {
+	if (lookupTreeDef(job.conf.opts, "local", "") == "1") {
+		ruRunLocal(job, onRunComplete);
 	} else {
 		ruRunRemote(
-			conf, 
-			\msg -> ruPrintln(msg, conf), 
-			\msg -> ruPrintln(msg, conf), 
+			job, 
+			\msg -> ruPrintln(msg, job.conf), 
+			\msg -> ruPrintln(msg, job.conf), 
 			onRunComplete, 
 			\code -> {
 				//ruPrintln("DEBUG trying local run: " + i2s(code), conf);
-				ruRunLocal(conf, onRunComplete)
+				ruRunLocal(job, onRunComplete)
 			}
 		)
 	}
 }
 
-ruRunRemote(conf : RuConf, onData: (flow) -> void, onError : (string) -> void, onRunComplete : (int) -> void, onServerError : (int) -> void) -> void {
-	serverUrl = "http://" + ruOptDef("server-url", "localhost", conf) + ":" + ruOptDef("server-port", "20001", conf);
+ruRunRemote(job : RuJob, onData: (flow) -> void, onError : (string) -> void, onRunComplete : (int) -> void, onServerError : (int) -> void) -> void {
+	serverUrl = 
+		"http://" + lookupTreeDef(job.conf.opts, "server-url", "localhost") + 
+		":" + lookupTreeDef(job.conf.opts, "server-port", "20001");
 	cwd = strReplace(resolveRelativePath("."), "\\", "/");
-	remoteConf = RuConf(conf with opts =
+	remoteConf = RuConf(job.conf with opts =
 		setTree(
-			setTree(
-				switch (lookupTree(conf.opts, "output-dir")) {
-					Some(__): conf.opts;
-					None():   setTree(conf.opts, "output-dir", cwd);
-				},
-				"file",
-				conf.file
-			),
+			switch (lookupTree(job.conf.opts, "output-dir")) {
+				Some(__): job.conf.opts;
+				None():   setTree(job.conf.opts, "output-dir", cwd);
+			},
 			"working-dir",
-			lookupTreeDef(conf.opts, "working-dir", cwd)
+			lookupTreeDef(job.conf.opts, "working-dir", cwd)
 		)
 	);
 	httpCustomRequest(
 		serverUrl,
-		GET(), [], RequestPayload(json2string(ruConf2Json(remoteConf))),
+		GET(), [], RequestPayload(json2string(ruJob2Json(RuJob(job with conf = remoteConf)))),
 		\status, data, headers -> {
 			code = status - 200;
 			if (code == 0) {
@@ -83,105 +82,68 @@ ruRunRemote(conf : RuConf, onData: (flow) -> void, onError : (string) -> void, o
 	)
 }
 
-ruRunLocal(conf : RuConf, onRunComplete : (int) -> void) -> void {
-	ruMakeCacheDir(conf);
-	if (conf.ext == ".ru") {
-		if (ruSomeOptsAreSet([
-				"decl", "uses", "hover", "rename", "outline", "find", "consts-info", "math-info"], conf)) {
-			ruProcessInfo(conf);
-			onRunComplete(0);
-		} if (ruOptIsSet("command", conf)) {
-			ruProcessCommand(conf);
-			onRunComplete(0);
-		} else if (ruSomeOptsAreSet(["update-cache", "did-open", "did-change", "did-save"], conf)) {
-			ruProcessConf(conf);
-			onRunComplete(0);
-		} else if (conf.file == "") {
-			// No tasks
-			onRunComplete(0); 
-		} else {
-			switch (ruLoadMath(conf)) {
-				Some(math): {
-					ruProcessMath(math);
-					onRunComplete(0);
-				}
-				None(): {
-					ruPrintln("could not load config for: '" + conf.ext + "', file: " + conf.file + ", path: " + conf.path, conf);
-					onRunComplete(1);
-				}
-			}
-		}
-	} else if (conf.ext == ".mm") {
-		if (conf.file == "") {
-			// No tasks
-			onRunComplete(0); 
-		} else {
-			switch (mmLoadMath(conf)) {
-				Some(math): {
-					mmProcessMath(math);
-					onRunComplete(0);
-				}
-				None(): {
-					ruPrintln("could not load config for: '" + conf.ext + "', file: " + conf.file + ", path: " + conf.path, conf);
-					onRunComplete(1);
-				}
-			}
-		}
-	} else {
-		ruPrintln("file extension should be *.ru or *.mm, while given is: '" + conf.ext + "', file: " + conf.file + ", path: " + conf.path, conf);
-		onRunComplete(1);
-	}
+ru_commands : ref Maybe<Tree<string, RuComm>> = ref None();
+
+ruCommands() -> Tree<string, RuComm> {
+	init_commands = \-> {
+		commands_list = [
+			[
+				RuComm(
+					"verify", "", "verify entity",
+					[RuCommArg("target", false, "the target: a theorem name, file name or 'all' for verification of all math", "")],
+					ruCommVerify
+				),
+				RuComm("math-stats", "", "show math statistics", [],
+					\conf, task, env -> { ruPrintln("stats:\n" + ruMathStats(env.ruMath) + "\n", conf);	env; }
+				),
+			],
+			ruIoCommands(),
+			ruRefactorCommands(),
+			ruProverCommands(),
+			ruTranslateCommands(),
+			ruInfoCommands(),
+			ruFileSyncCommands()
+		];
+		fold(concatA(commands_list), makeTree(), \acc, comm -> setTree(acc, comm.name, comm));
+    }
+    onlyOnce(ru_commands, init_commands);
 }
 
-ruOperateMath(comm : RuCommand, math : RuMath) -> RuMath {
-	if (comm.name == "verify") {
-		ruCommandVerify(math);
-	} else if (comm.name == "remove-duplicate-steps") {
-		ruCommandRemoveMathDuplicateSteps(math);
-	} else if (comm.name == "remove-unused-steps") {
-		ruCommandRemoveMathUnusedSteps(math);
-	} else if (comm.name == "remove-unused-hyps") {
-		ruCommandRemoveMathUnusedHyps(math);
-	} else if (comm.name == "shorten-proofs") {
-		ruCommandShortenProofs(math);
-	} else if (comm.name == "reprove") {
-		ruCommandReproveTask(math);
-	} else if (comm.name == "stats") {
-		ruPrintln("stats:\n" + ruMathStats(math) + "\n", math.conf);
-		math;
-	} else if (comm.name == "expr-len-stats") {
-		ruCommandExpressionLenStats(math);
-		math;
-	} else if (comm.name == "proof-stats") {
-		ruCommandProofsStats(math);
-		math;
-	}else if (comm.name == "write") {
-		target = lookupTreeDef(math.conf.opts, "default", "");
-		if (target == "all" || target == "1" || target == "") {
-			ruWriteSources(ruPrepareSources(math), math.conf);
-		} else {
-			file = ruTrimPath(target, math.conf, ".ru");
-			switch (lookupTree(math.sources, file)) {
-				Some(src): ruWriteSource(src, math.rules);
-				None():    ruPrintln("source: " + file + " is not found", math.conf);
+ru_env = ref RuEnv(
+	RuMath(makeTree(), makeTree(), makeTree(), makeTree(), makeTree(), makeTree()),
+	MmMath(makeTree(), makeTree(), makeSet())
+);
+
+ruRunLocal(job : RuJob, onRunComplete : (int) -> void) -> void {
+	ru_env := fold(job.tasks, ^ru_env, \acc, task -> 
+		switch (lookupTree(ruCommands(), task.command)) {
+			Some(command): {
+				if (ruCheckTaskArgs(task, command, job.conf)) {
+					command.run(job.conf, task, acc);
+				} else {
+					acc;
+				}
+			}
+			None(): {
+				ruPrintln("Unknown command: " + task.command, job.conf);
+				acc;
 			}
 		}
-		math;
-	} else if (comm.name == "write-single") {
-		target = lookupTreeDef(math.conf.opts, "default", "");
-		if (target != "") {
-			file = ruRemoveExt(target, ".ru");
-			ruWriteSource(ruMath2SingleSource(math, file), math.rules);
-		}
-		math;
-	} else {
-		ruPrintln("unknown command: " + comm.name, math.conf);
-		math
-	}
+	);
+	onRunComplete(0);
 }
 
-ruPrepareSources(math : RuMath) -> [RuWriteSource] {
-	ruRoot0 = rtrim2(lookupTreeDef(math.conf.opts, "ru-root", ""), "/");
+ruCheckTaskArgs(task : RuTask, command : RuComm, conf : RuConf) -> bool {
+	forall(command.args, \arg ->
+		if (arg.optional || containsKeyTree(task.args, arg.name)) true else {
+			ruPrintln("Obligatory argument " + arg.name + " of the command " + task.command + " is missing", conf);
+			false;
+		}
+	)
+}
+
+ruPrepareSources(math : RuMath, conf : RuConf) -> [RuWriteSource] {
+	ruRoot0 = rtrim2(lookupTreeDef(conf.opts, "ru-root", ""), "/");
 	ruRoot = if (ruRoot0 == "1") "." else ruRoot0 + "/";
 	map(getTreeValues(math.sources), 
 		\src : RuSource -> {
@@ -193,152 +155,200 @@ ruPrepareSources(math : RuMath) -> [RuWriteSource] {
 	)
 }
 
-ruProcessConf(conf : RuConf) -> void {
-	//ruDebugLog("processing conf: " + ruOptsDescr(conf.opts), conf);
-	if (ruOptIsSet("update-cache", conf)) {
-		ruLoadToCache(conf.path, conf);
-	}
-	if (ruOptIsSet("did-open", conf)) {
-		source_path = ruOpt("did-open", conf);
-		source_text = ruOpt("did-open-text", conf);
-		if (source_text != "" && source_path != "") {
-			ruSetFileSource(source_path, source_text);
-		} else {
-			ruPrintln("did-open: Options 'did-open-text' must be provided", conf);
-		}
-	}
-	if (ruOptIsSet("did-change", conf)) {
-		json = ruOpt("did-change-json", conf);
-		switch (json2LspDidChangeTextDocumentParams(parseJson(json))) {
-			Some(params): {
-				path = ruCorrectUriPath(params.textDocument.uri.path);
-				contents = ruFileSource(path);
-				changed = fold(params.contentChanges, contents, \acc, changes -> lspApplyContentChangeEvent(changes, acc));
-				ruSetFileSource(path, changed);
+ruFileSyncCommands() -> [RuComm] {[
+	RuComm(
+		"update-cache", "file-sync", "read cached sources",
+		[RuCommArg("file", false, "input file", "")],
+		\conf, task, env -> { ruLoadToCache(lookupTreeDef(task.args, "file", ""), conf); env; }
+	),
+	RuComm(
+		"file-source", "file-sync", "load an updated file source",
+		[RuCommArg("file", false, "input file", ""),  RuCommArg("text", false, "updated source", "")],
+		\conf, task, env -> { ruSetFileSource(lookupTreeDef(task.args, "file", ""), lookupTreeDef(task.args, "text", "")); env; }
+	),
+	RuComm(
+		"file-change", "file-sync", "apply changes to a file source",
+		[RuCommArg("change-json", false, "change in JSON format", "")],
+		\conf, task, env -> {
+			json = lookupTreeDef(task.args, "change-json", "");
+			switch (json2LspDidChangeTextDocumentParams(parseJson(json))) {
+				Some(params): {
+					path = ruCorrectUriPath(params.textDocument.uri.path);
+					contents = ruFileSource(path);
+					changed = fold(params.contentChanges, contents, \acc, changes -> lspApplyContentChangeEvent(changes, acc));
+					ruSetFileSource(path, changed);
+				}
+				None(): {
+					ruPrintln("file-change: An option 'change-json' must be a vaid Json-encoded LSP DidChangeTextDocimentParams", conf);
+				}
 			}
-			None(): {
-				ruPrintln("did-change: An option 'did-change-json' must be a vaid Json-encoded LSP DidChangeTextDocimentParams", conf);
+			env;
+		}
+	),
+	RuComm(
+		"file-saved", "file-sync", "file was saved",
+		[RuCommArg("file", false, "input file", "")],
+		\conf, task, env -> { ruLoadFileSource(lookupTreeDef(task.args, "file", "")); env; }
+	)
+]}
+
+ruRefactorCommands() -> [RuComm] {[
+	RuComm(
+		"shorten-proofs", "refactor", "try to make proofs shorter",
+		[RuCommArg("target", false, "the target: a theorem, file or all", "")],
+		ruCommShortenProofs
+	),
+	RuComm(
+		"remove-duplicate-steps", "refactor", "self evident",
+		[RuCommArg("target", false, "the target: a theorem, file or all", "")],
+		ruCommRemoveMathDuplicateSteps
+	),
+	RuComm(
+		"remove-unused-steps", "refactor", "self evident",
+		[RuCommArg("target", false, "the target: a theorem, file or all", "")],
+		ruCommRemoveMathUnusedSteps
+	),
+]}
+
+ruProverCommands() -> [RuComm] {[
+	RuComm(
+		"reprove", "prover", "reprove entities",
+		[RuCommArg("target", false, "the target: a theorem, file or all", "")],
+		ruCommReprove
+	),
+]}
+
+ruIoCommands() -> [RuComm] {[
+	RuComm(
+		"read-ru", "io", "read a Russell file",
+		[RuCommArg("file", false, "input file", "")],
+		ruCommRead
+	),
+	RuComm(
+		"read-mm", "io", "read a Metamath file",
+		[RuCommArg("file", false, "input file", "")],
+		mmCommRead
+	),
+	RuComm(
+		"write-mm", "io", "write a Metamath file to a filesystem",
+		[RuCommArg("file", false, "input file", ""), RuCommArg("strip-comments", true, "self evident", "")],
+		\conf, task, env -> {
+			file = lookupTreeDef(task.args, "file", "");
+			if (!endsWith(file, ".mm")) {
+				conf.onError("Wrong file extension " + file + ", mus be *.mm", []);
+			} else {
+				src0 = mmMath2SingleSource(env.mmMath, ruRemoveExt(file, ".mm"));
+				src1 = if (lookupTreeDef(task.args, "strip-comments", "") == "") src0 else mmStripComments(src0);
+				if (!setFileContent(src1.info.path, mm2s(src1))) {
+					ruPrintln("failed to save file: " + src1.info.path, conf);
+				}
 			}
+			env;
 		}
-	}
-	if (ruOptIsSet("did-save", conf)) {
-		path = ruOpt("did-save", conf);
-		ruLoadFileSource(path);
-	}
-}
+	),
+	RuComm(
+		"write-ru", "io", "write a Russell file to a filesystem",
+		[
+			RuCommArg("file", true, "input file", ""), 
+			RuCommArg("all", true, "write all files", ""), 
+			RuCommArg("all-to-one", true, "write all files to a one", "")
+		],
+		\conf, task, env -> {
+			math = env.ruMath;
+			if (lookupTreeDef(task.args, "file", "") != "") {
+				file0 = lookupTreeDef(task.args, "file", "");
+				if (!endsWith(file0, ".ru")) {
+					conf.onError("Wrong file extension " + file0 + ", mus be *.ru", []);
+				} else {
+					file = ruTrimPath(file0, conf, ".ru");
+					switch (lookupTree(math.sources, file)) {
+						Some(src): ruWriteSource(src, math.rules);
+						None(): ruPrintln("source: " + file + " is not found", conf);
+					}
+				}
+			} else if (lookupTreeDef(task.args, "all", "") == "1") {
+				ruWriteSources(ruPrepareSources(env.ruMath, conf), conf);
+			} else if (lookupTreeDef(task.args, "all-to-one", "") != "") {
+				file = lookupTreeDef(task.args, "all-to-one", "");
+				if (!endsWith(file, ".ru")) {
+					conf.onError("Wrong file extension " + file + ", mus be *.ru", []);
+				} else {
+					ruWriteSource(ruMath2SingleSource(math, ruRemoveExt(file, ".ru")), math.rules);
+				}
+			}
+			env;
+		}
+	),
+	RuComm(
+		"split-math", "misc", "split a single file into a filesystem",
+		[RuCommArg("file", false, "input file", "")],
+		\conf, task, env -> RuEnv(env with ruMath = ruSplitMath(env.ruMath, conf, lookupTreeDef(task.args, "file", "")))
+	),
+	RuComm(
+		"fix-left-recursion", "misc", "make all grammar rules non-left-recursive",
+		[RuCommArg("file", false, "input file", "")],
+		\conf, task, env -> RuEnv(env with ruMath = ruFixLeftRecursiveRules(env.ruMath, conf))
+	),
+	RuComm(
+		"optimize-imports", "misc", "optimize imports",
+		[RuCommArg("file", false, "input file", "")],
+		\conf, task, env -> RuEnv(env with ruMath = ruOptimizeImports(env.ruMath, conf))
+	),
+]}
 
-ruProcessMath(math0 : RuMath) -> void {
-	math1 = ruIf(ruOptIsTrue("ru-imports", math0.conf), math0, ruOptimizeMathImports);
-	math = fold(ruConf2Commands(math1.conf), math1, \acc, comm -> 
-		ruOperateMath(comm, RuMath(acc with conf = comm.conf))
-	);
-	if (ruOptIsTrue("ru-2-mm", math.conf)) {
-		mmProcessMath(ruMath2mm(RuMath(math with conf = ruRemoveOpt("ru-2-mm", math.conf))));
-	}
-	
-	if (ruOptIsTrue("ru-write-all", math.conf)) {
-		ruWriteSources(ruPrepareSources(math), math.conf);
-	}
-	if (ruOptIsSet("ru", math.conf)) {
-		ruWriteSource(ruMath2SingleSource(math, ruRemoveExt(ruOpt("ru", math.conf), ".ru")), math.rules);
-	}
-	if (ruOptIsSet("ru-write", math.conf)) {
-		file = ruTrimPath(ruOpt("ru-write", math.conf), math.conf, ".ru");
-		switch (lookupTree(math.sources, file)) {
-			Some(src): ruWriteSource(src, math.rules);
-			None(): ruPrintln("source: " + file + " is not found", math.conf);
-		}
-	}
-	if (ruOptIsSet("verify", math.conf)) {
-		ruCommandVerify(math);
-		{}
-	}
-	if (ruOptIsSet("shorten-proofs", math.conf)) {
-		ruCommandShortenProofs(RuMath(math with
-			conf = RuConf(math.conf with 
-				opts = setTree(math.conf.opts, "default", ruOpt("shorten-proofs", math.conf))
-			)
-		)); {}
-	}
-	if (ruOptIsSet("ru-assertion", math.conf)) {
-		name = ruOpt("ru-assertion", math.conf);
-		switch (lookupTree(math.assertions, name)) {
-			Some(ass): ruPrintln(ru2s(ass, math.rules), math.conf);
-			None(): ruPrintln("assertion: " + name + " is not found", math.conf);
-		}
-	}
-	if (ruOptIsTrue("ru-stats", math.conf)) {
-		ruPrintln("ru stats:\n" + ruMathStats(math) + "\n", math.conf);
-	}
-}
-
-mmProcessMath(math : MmMath) -> void {
-	if (ruOptIsSet("mm", math.conf)) {
-		src = mmMath2SingleSource(math, ruRemoveExt(ruOpt("mm", math.conf), ".mm"));
-		txt = mm2s(ruIf(ruOptIsTrue("strip-comments", math.conf), src, mmStripComments));
-		if (!setFileContent(src.info.path, txt)) {
-			ruPrintln("failed to save file: " + src.info.path, math.conf);
-		}
-	}
-	if (ruOptIsTrue("mm-2-ru", math.conf)) {
-		maybeApply(ruLoadMath1(mmMath2ru(math), math.conf), \verified ->
-			ruProcessMath(
-				ruIf(ruOptIsTrue("mm-split", math.conf), 
-					ruIf(ruOptIsSet("mm-fix", math.conf), 
-						RuMath(verified with conf = ruRemoveOpt("mm-2-ru", verified.conf)), 
-						ruFixLeftRecursiveRules
-					), 
-					ruSplitMath
-				)
-			)
-		);
-	}
-	if (ruOptIsSet("mm-assertion", math.conf)) {
-		name = ruOpt("mm-assertion", math.conf);
-		switch (lookupTree(math.labeled, name)) {
-			Some(ass): ruPrintln(mm2s(ass), math.conf);
-			None(): ruPrintln("assertion: " + name + " is not found", math.conf);
-		}
-	}
-	if (ruOptIsTrue("mm-stats", math.conf)) {
-		ruPrintln("mm stats:\n" + mmMathStats(math) + "\n", math.conf);
-	}
-}
-
-ruParseMath(conf : RuConf) -> Maybe<Tree<string, RuParsed>> {
-	maybeBind(ruLoadAll(conf, conf.file, ruFromCache), \loaded ->
+ruParseMath(conf : RuConf, file : string) -> Maybe<Tree<string, RuParsed>> {
+	maybeBind(ruLoadAll(conf, file, ruFromCache), \loaded ->
 		ruParseAll(getTreeValues(loaded), conf)
 	)
 }
 
 ruLoadMath1(parsed : Tree<string, RuParsed>, conf : RuConf) -> Maybe<RuMath> {
-	maybeMap(maybeBind(ruCollectMath(parsed, conf, ruToCache), ruVerifyMath), 
-		\math -> ruIf(ruOptIsTrue("ru-imports", conf), math, ruOptimizeMathImports)
-	)
+	maybeBind(ruCollectMath(parsed, conf, ruToCache), \math -> ruVerifyMath(math, conf));
 }
 
-ruLoadMath(conf : RuConf) -> Maybe<RuMath> {
-	maybeBind(ruParseMath(conf), \parsed -> ruLoadMath1(parsed, conf))
+ruLoadMath(conf : RuConf, file : string) -> Maybe<RuMath> {
+	maybeBind(ruParseMath(conf, file), \parsed -> ruLoadMath1(parsed, conf))
 }
 
-mmLoadMath(conf : RuConf) -> Maybe<MmMath> {
-	maybeBind(mmLoad(conf, conf.file), \loaded ->
+ruCommRead(conf : RuConf, task : RuTask, env : RuEnv) -> RuEnv {
+	file = lookupTreeDef(task.args, "file", "");
+	if (!endsWith(file, ".ru")) {
+		conf.onError("Wrong file extension: " + file + ", must be *.ru", []);
+		env;
+	} else {
+		eitherMap(ruLoadMath(conf, changeFileExt(file, "")), \math -> RuEnv(env with ruMath = math), env);
+	}
+}
+
+mmLoadMath(conf : RuConf, file : string) -> Maybe<MmMath> {
+	maybeBind(mmLoad(conf, file), \loaded ->
 		maybeBind(mmParse(getTreeValues(loaded), conf), \parsed ->
 			maybeBind(mmCollectMath(parsed, conf), \collected ->
-				mmVerifyMath(collected)
+				mmVerifyMath(collected, conf)
 			)
 		)
 	)
 }
 
-// ruInfoTheoremAxioms() -> void
-
-ruProcessCommand(conf : RuConf) -> void {
-	comm = ruOpt("command", conf);
-	args = ruOpt("args", conf);
-	if (comm == "theorem-axioms") {
-		ruInfoTheoremAxioms(conf);
-	} else if (comm == "reprove") {
-		//ruCommandReproveTask(math);
-	} 
+mmCommRead(conf : RuConf, task : RuTask, env : RuEnv) -> RuEnv {
+	file = lookupTreeDef(task.args, "file", "");
+	if (!endsWith(file, ".mm")) {
+		conf.onError("Wrong file extension " + file + ", mus be *.mm", []);
+		env;
+	} else {
+		eitherMap(mmLoadMath(conf, changeFileExt(file, "")), \math -> RuEnv(env with mmMath = math), env);
+	}
 }
+
+ruTranslateCommands() -> [RuComm] {[
+	RuComm(
+		"ru-to-mm", "translate", "translate Russell to Metamath", [],
+		\conf, task, env -> RuEnv(env with mmMath = ru2mm(env.ruMath, conf))
+	),
+	RuComm(
+		"mm-to-ru", "translate", "translate Metamath to Russell",
+		[RuCommArg("file", false, "input file", "")],
+		\conf, task, env -> eitherMap(ruLoadMath1(mm2ru(env.mmMath, conf), conf), \math -> RuEnv(env with ruMath = math), env)
+	),
+]}
+
