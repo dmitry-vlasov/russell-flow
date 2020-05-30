@@ -21,7 +21,6 @@ import ru_refactor;
 import ru_shorten;
 import ru_info;
 import ru_command;
-import ru_conf_utils;
 import prover/ru_prover_prove;
 import prover/ru_prover_reprove;
 
@@ -31,13 +30,13 @@ export {
 }
 
 ruRun(job : RuJob, onRunComplete : (int) -> void) -> void {
-	if (lookupTreeDef(job.conf.opts, "local", "") == "1") {
+	if (getUrlParameterBoolDef("local", false)) {
 		ruRunLocal(job, onRunComplete);
 	} else {
 		ruRunRemote(
-			job, 
-			\msg -> ruPrintln(msg, job.conf), 
-			\msg -> ruPrintln(msg, job.conf), 
+			job,
+			\msg -> ruPrintln(msg), 
+			\msg -> ruPrintln(msg), 
 			onRunComplete, 
 			\code -> {
 				//ruPrintln("DEBUG trying local run: " + i2s(code), conf);
@@ -49,9 +48,9 @@ ruRun(job : RuJob, onRunComplete : (int) -> void) -> void {
 
 ruRunRemote(job : RuJob, onData: (flow) -> void, onError : (string) -> void, onRunComplete : (int) -> void, onServerError : (int) -> void) -> void {
 	serverUrl = 
-		"http://" + lookupTreeDef(job.conf.opts, "server-url", "localhost") + 
-		":" + lookupTreeDef(job.conf.opts, "server-port", "20001");
-	cwd = strReplace(resolveRelativePath("."), "\\", "/");
+		"http://" + getUrlParameterDef("server-url", "localhost") + 
+		":" + getUrlParameterDef("server-port", "20001");
+	/*cwd = strReplace(resolveRelativePath("."), "\\", "/");
 	remoteConf = RuConf(job.conf with opts =
 		setTree(
 			switch (lookupTree(job.conf.opts, "output-dir")) {
@@ -61,10 +60,10 @@ ruRunRemote(job : RuJob, onData: (flow) -> void, onError : (string) -> void, onR
 			"working-dir",
 			lookupTreeDef(job.conf.opts, "working-dir", cwd)
 		)
-	);
+	);*/
 	httpCustomRequest(
 		serverUrl,
-		GET(), [], RequestPayload(json2string(ruJob2Json(RuJob(job with conf = remoteConf)))),
+		GET(), [], RequestPayload(json2string(ruJob2Json(job))),
 		\status, data, headers -> {
 			code = status - 200;
 			if (code == 0) {
@@ -89,13 +88,18 @@ ruCommands() -> Tree<string, RuComm> {
 		commands_list = [
 			[
 				RuComm(
+					"help", "", "help on some topics", [RuCommArg("category", true, "category of help", "")],
+					ruCommHelp
+				),
+				RuComm(
 					"verify", "", "verify entity",
 					[RuCommArg("target", false, "the target: a theorem name, file name or 'all' for verification of all math", "")],
 					ruCommVerify
 				),
 				RuComm("math-stats", "", "show math statistics", [],
-					\conf, task, env -> { ruPrintln("stats:\n" + ruMathStats(env.ruMath) + "\n", conf);	env; }
+					\task, env -> { ruPrintln("stats:\n" + ruMathStats(env.ruMath) + "\n");	env; }
 				),
+				RuComm("update-conf", "", "update configuration", [], ruCommUpdateConf),
 			],
 			ruIoCommands(),
 			ruRefactorCommands(),
@@ -109,34 +113,75 @@ ruCommands() -> Tree<string, RuComm> {
     onlyOnce(ru_commands, init_commands);
 }
 
+ruCommHelp(task : RuTask, env : RuEnv) -> RuEnv {
+	category = lookupTreeDef(task.args, "category", "");
+	filtered = if (category == "") getTreeValues(ruCommands()) else 
+		filter(getTreeValues(ruCommands()), \comm -> comm.category == category);
+	// Syntax of a command line task:
+	//   do=<command> <arg_1>=<val_1> ... <arg_n>=<val_n>
+	//
+	// Syntax of a command line:
+	//   <opt_1>=<val_1> ... <opt_k>=<val_k> ; <task_1> ; ... ; <task_m>
+	ruPrintln("usage: '<task_1> ... <task_m>' where");
+	ruPrintln("task is: 'do=<command> <arg_1>=<val_1> ... <arg_n>=<val_n>'");
+	iter(filtered, \comm -> ruPrintln(ruComm2s(comm)));
+	env;
+}
+
+ruCommUpdateConf(task : RuTask, env : RuEnv) -> RuEnv {
+	RuEnv(env with conf = ruMergeConfs(env.conf, ruTree2Conf(task.args)));
+}
+
 ru_env = ref RuEnv(
 	RuMath(makeTree(), makeTree(), makeTree(), makeTree(), makeTree(), makeTree()),
-	MmMath(makeTree(), makeTree(), makeSet())
+	MmMath(makeTree(), makeTree(), makeSet()),
+	ruMakeConf(".", getAllUrlParametersArray())
 );
 
 ruRunLocal(job : RuJob, onRunComplete : (int) -> void) -> void {
-	ru_env := fold(job.tasks, ^ru_env, \acc, task -> 
+	ru_env := fold(job.tasks, ^ru_env, \acc, t -> {
+		task = ruPrepareTask(t, acc.conf);
 		switch (lookupTree(ruCommands(), task.command)) {
 			Some(command): {
-				if (ruCheckTaskArgs(task, command, job.conf)) {
-					command.run(job.conf, task, acc);
+				if (ruCheckTaskArgs(task, command, acc.conf)) {
+					command.run(task, acc);
 				} else {
 					acc;
 				}
 			}
 			None(): {
-				ruPrintln("Unknown command: " + task.command, job.conf);
+				ruPrintln("Unknown command: " + task.command);
 				acc;
 			}
 		}
-	);
+	});
 	onRunComplete(0);
+}
+
+ruPrepareTask(task : RuTask, conf : RuConf) -> RuTask {
+	switch (lookupTree(task.args, "file")) {
+		Some(file): {
+			module = ruTrimPath(file, conf, getFileExt(file));
+			RuTask(task with args = setTree(task.args, "module", module));
+		}
+		None(): {
+			switch (lookupTree(conf.opts, "root-file")) {
+				Some(file): {
+					module = ruTrimPath(file, conf, getFileExt(file));
+					RuTask(task with 
+						args = setTree(setTree(task.args, "file", file), "module", module)
+					);
+				}
+				None(): task;
+			}
+		}
+	}
 }
 
 ruCheckTaskArgs(task : RuTask, command : RuComm, conf : RuConf) -> bool {
 	forall(command.args, \arg ->
 		if (arg.optional || containsKeyTree(task.args, arg.name)) true else {
-			ruPrintln("Obligatory argument " + arg.name + " of the command " + task.command + " is missing", conf);
+			ruPrintln("Obligatory argument " + arg.name + " of the command " + task.command + " is missing");
 			false;
 		}
 	)
@@ -159,17 +204,17 @@ ruFileSyncCommands() -> [RuComm] {[
 	RuComm(
 		"update-cache", "file-sync", "read cached sources",
 		[RuCommArg("file", false, "input file", "")],
-		\conf, task, env -> { ruLoadToCache(lookupTreeDef(task.args, "file", ""), conf); env; }
+		\task, env -> { ruLoadToCache(lookupTreeDef(task.args, "file", ""), env.conf); env; }
 	),
 	RuComm(
 		"file-source", "file-sync", "load an updated file source",
 		[RuCommArg("file", false, "input file", ""),  RuCommArg("text", false, "updated source", "")],
-		\conf, task, env -> { ruSetFileSource(lookupTreeDef(task.args, "file", ""), lookupTreeDef(task.args, "text", "")); env; }
+		\task, env -> { ruSetFileSource(lookupTreeDef(task.args, "file", ""), lookupTreeDef(task.args, "text", "")); env; }
 	),
 	RuComm(
-		"file-change", "file-sync", "apply changes to a file source",
-		[RuCommArg("change-json", false, "change in JSON format", "")],
-		\conf, task, env -> {
+		"file-changed", "file-sync", "apply changes to a file source",
+		[RuCommArg("file", false, "input file", ""),  RuCommArg("change", false, "change in JSON format", "")],
+		\task, env -> {
 			json = lookupTreeDef(task.args, "change-json", "");
 			switch (json2LspDidChangeTextDocumentParams(parseJson(json))) {
 				Some(params): {
@@ -179,7 +224,7 @@ ruFileSyncCommands() -> [RuComm] {[
 					ruSetFileSource(path, changed);
 				}
 				None(): {
-					ruPrintln("file-change: An option 'change-json' must be a vaid Json-encoded LSP DidChangeTextDocimentParams", conf);
+					ruPrintln("file-change: An option 'change-json' must be a vaid Json-encoded LSP DidChangeTextDocimentParams");
 				}
 			}
 			env;
@@ -188,7 +233,7 @@ ruFileSyncCommands() -> [RuComm] {[
 	RuComm(
 		"file-saved", "file-sync", "file was saved",
 		[RuCommArg("file", false, "input file", "")],
-		\conf, task, env -> { ruLoadFileSource(lookupTreeDef(task.args, "file", "")); env; }
+		\task, env -> { ruLoadFileSource(lookupTreeDef(task.args, "file", "")); env; }
 	)
 ]}
 
@@ -232,15 +277,15 @@ ruIoCommands() -> [RuComm] {[
 	RuComm(
 		"write-mm", "io", "write a Metamath file to a filesystem",
 		[RuCommArg("file", false, "input file", ""), RuCommArg("strip-comments", true, "self evident", "")],
-		\conf, task, env -> {
+		\task, env -> {
 			file = lookupTreeDef(task.args, "file", "");
 			if (!endsWith(file, ".mm")) {
-				conf.onError("Wrong file extension " + file + ", mus be *.mm", []);
+				env.conf.onError("Wrong file extension " + file + ", mus be *.mm", []);
 			} else {
 				src0 = mmMath2SingleSource(env.mmMath, ruRemoveExt(file, ".mm"));
 				src1 = if (lookupTreeDef(task.args, "strip-comments", "") == "") src0 else mmStripComments(src0);
 				if (!setFileContent(src1.info.path, mm2s(src1))) {
-					ruPrintln("failed to save file: " + src1.info.path, conf);
+					ruPrintln("failed to save file: " + src1.info.path);
 				}
 			}
 			env;
@@ -253,25 +298,25 @@ ruIoCommands() -> [RuComm] {[
 			RuCommArg("all", true, "write all files", ""), 
 			RuCommArg("all-to-one", true, "write all files to a one", "")
 		],
-		\conf, task, env -> {
+		\task, env -> {
 			math = env.ruMath;
 			if (lookupTreeDef(task.args, "file", "") != "") {
 				file0 = lookupTreeDef(task.args, "file", "");
 				if (!endsWith(file0, ".ru")) {
-					conf.onError("Wrong file extension " + file0 + ", mus be *.ru", []);
+					env.conf.onError("Wrong file extension " + file0 + ", mus be *.ru", []);
 				} else {
-					file = ruTrimPath(file0, conf, ".ru");
+					file = ruTrimPath(file0, env.conf, ".ru");
 					switch (lookupTree(math.sources, file)) {
 						Some(src): ruWriteSource(src, math.rules);
-						None(): ruPrintln("source: " + file + " is not found", conf);
+						None(): ruPrintln("source: " + file + " is not found");
 					}
 				}
 			} else if (lookupTreeDef(task.args, "all", "") == "1") {
-				ruWriteSources(ruPrepareSources(env.ruMath, conf), conf);
+				ruWriteSources(ruPrepareSources(env.ruMath, env.conf), env.conf);
 			} else if (lookupTreeDef(task.args, "all-to-one", "") != "") {
 				file = lookupTreeDef(task.args, "all-to-one", "");
 				if (!endsWith(file, ".ru")) {
-					conf.onError("Wrong file extension " + file + ", mus be *.ru", []);
+					env.conf.onError("Wrong file extension " + file + ", mus be *.ru", []);
 				} else {
 					ruWriteSource(ruMath2SingleSource(math, ruRemoveExt(file, ".ru")), math.rules);
 				}
@@ -282,17 +327,17 @@ ruIoCommands() -> [RuComm] {[
 	RuComm(
 		"split-math", "misc", "split a single file into a filesystem",
 		[RuCommArg("file", false, "input file", "")],
-		\conf, task, env -> RuEnv(env with ruMath = ruSplitMath(env.ruMath, conf, lookupTreeDef(task.args, "file", "")))
+		\task, env -> RuEnv(env with ruMath = ruSplitMath(env.ruMath, env.conf, lookupTreeDef(task.args, "file", "")))
 	),
 	RuComm(
 		"fix-left-recursion", "misc", "make all grammar rules non-left-recursive",
 		[RuCommArg("file", false, "input file", "")],
-		\conf, task, env -> RuEnv(env with ruMath = ruFixLeftRecursiveRules(env.ruMath, conf))
+		\task, env -> RuEnv(env with ruMath = ruFixLeftRecursiveRules(env.ruMath, env.conf))
 	),
 	RuComm(
 		"optimize-imports", "misc", "optimize imports",
 		[RuCommArg("file", false, "input file", "")],
-		\conf, task, env -> RuEnv(env with ruMath = ruOptimizeImports(env.ruMath, conf))
+		\task, env -> RuEnv(env with ruMath = ruOptimizeImports(env.ruMath, env.conf))
 	),
 ]}
 
@@ -310,13 +355,13 @@ ruLoadMath(conf : RuConf, file : string) -> Maybe<RuMath> {
 	maybeBind(ruParseMath(conf, file), \parsed -> ruLoadMath1(parsed, conf))
 }
 
-ruCommRead(conf : RuConf, task : RuTask, env : RuEnv) -> RuEnv {
+ruCommRead(task : RuTask, env : RuEnv) -> RuEnv {
 	file = lookupTreeDef(task.args, "file", "");
 	if (!endsWith(file, ".ru")) {
-		conf.onError("Wrong file extension: " + file + ", must be *.ru", []);
+		env.conf.onError("Wrong file extension: " + file + ", must be *.ru", []);
 		env;
 	} else {
-		eitherMap(ruLoadMath(conf, changeFileExt(file, "")), \math -> RuEnv(env with ruMath = math), env);
+		eitherMap(ruLoadMath(env.conf, changeFileExt(file, "")), \math -> RuEnv(env with ruMath = math), env);
 	}
 }
 
@@ -330,25 +375,25 @@ mmLoadMath(conf : RuConf, file : string) -> Maybe<MmMath> {
 	)
 }
 
-mmCommRead(conf : RuConf, task : RuTask, env : RuEnv) -> RuEnv {
+mmCommRead(task : RuTask, env : RuEnv) -> RuEnv {
 	file = lookupTreeDef(task.args, "file", "");
 	if (!endsWith(file, ".mm")) {
-		conf.onError("Wrong file extension " + file + ", mus be *.mm", []);
+		env.conf.onError("Wrong file extension " + file + ", mus be *.mm", []);
 		env;
 	} else {
-		eitherMap(mmLoadMath(conf, changeFileExt(file, "")), \math -> RuEnv(env with mmMath = math), env);
+		eitherMap(mmLoadMath(env.conf, changeFileExt(file, "")), \math -> RuEnv(env with mmMath = math), env);
 	}
 }
 
 ruTranslateCommands() -> [RuComm] {[
 	RuComm(
 		"ru-to-mm", "translate", "translate Russell to Metamath", [],
-		\conf, task, env -> RuEnv(env with mmMath = ru2mm(env.ruMath, conf))
+		\task, env -> RuEnv(env with mmMath = ru2mm(env.ruMath, env.conf))
 	),
 	RuComm(
 		"mm-to-ru", "translate", "translate Metamath to Russell",
 		[RuCommArg("file", false, "input file", "")],
-		\conf, task, env -> eitherMap(ruLoadMath1(mm2ru(env.mmMath, conf), conf), \math -> RuEnv(env with ruMath = math), env)
+		\task, env -> eitherMap(ruLoadMath1(mm2ru(env.mmMath, env.conf), env.conf), \math -> RuEnv(env with ruMath = math), env)
 	),
 ]}
 
