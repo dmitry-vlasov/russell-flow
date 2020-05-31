@@ -75,7 +75,7 @@ function cacheInfo() {
 	vscode.window.showInputBox(options).then(value => {
 		client.sendRequest("workspace/executeCommand", 
 			value ? { command : "cache-info", arguments: [value] } : { command : "cache-info" }
-		).then((out : string) => russellChannel.append(out));
+		).then((out : string) => russellChannel.appendLine(out));
 	});
 }
 
@@ -85,7 +85,7 @@ function execCommand() {
 		let val_arr = value.split(" ");
 		if (val_arr.length > 0) {
 			client.sendRequest("workspace/executeCommand", { command : "command", arguments: val_arr }).then(
-				(out : string) => russellChannel.append(out)
+				(out : string) => russellChannel.appendLine(out)
 			);
 		}
 	});
@@ -96,7 +96,7 @@ function declInfo() {
 	vscode.window.showInputBox(options).then(value => {
 		client.sendRequest("workspace/executeCommand", 
 			value ? { command : "decl-info", arguments: [value] } : { command : "decl-info" }
-		).then((out : string) => russellChannel.append(out));
+		).then((out : string) => russellChannel.appendLine(out));
 	});
 }
 
@@ -263,7 +263,7 @@ function verifyRussell() {
 	russellChannel.show(true);
 	//russellChannel.appendLine("Verifying file '" + document.uri + "'");
 	client.sendRequest("workspace/executeCommand", { command : "verify", arguments: [document.uri.fsPath] }).
-	then((out : string) => russellChannel.append(out));
+	then((out : string) => russellChannel.appendLine(out));
 }
 
 function verifyMetamath() {
