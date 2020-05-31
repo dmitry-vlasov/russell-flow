@@ -12,7 +12,7 @@ ruCollectMath(parsed : Tree<string, RuParsed>, conf0 : RuConf, to_cache : (RuSou
 	err_count = ref 0;
 	conf = ruAddErrCounter(conf0, err_count);
 	start = timestamp();
-	collected = ruDoCollectMath(parsed, makeSet(), conf, RuMath(makeTree(), makeTree(), makeTree(), makeTree(), makeTree(), makeTree()), to_cache);
+	collected = ruDoCollectMath(parsed, makeSet(), conf, ruEmptyMath, to_cache);
 	if (conf.verbose > 0) {
 		ruPrintln("ru collected: " + i2s(sizeTree(collected.sources)) + " files in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
 	}
@@ -86,7 +86,7 @@ ruDoCollectMath(left : Tree<string, RuParsed>, done : Set<string>, conf : RuConf
 					}
 				)), idfn
 			);
-			new_acc = fold(collected, acc, \ac, coll -> ruMergeMath(coll, ac, conf));
+			new_acc = ruMergeMath(acc, fold(collected, ruEmptyMath, \ac, coll -> ruMergeMath(coll, ac, conf)), conf);
 			new_left = fold(ready, left, \ac, parsed -> removeFromTree(ac, parsed_file(parsed)));
 			new_done = fold(ready, done, \ac, parsed -> insertSet(ac, parsed_file(parsed)));
 			ruDoCollectMath(new_left, new_done, conf, new_acc, to_cache);
@@ -98,14 +98,14 @@ RuCollectAcc(
 	file : string,
 	global : RuMath,
 	local : RuMath,
-	types : Tree<string, RuTypeEnv>,
+	types : Tree<string, RuWithSource<RuTypeEnv>>,
 	conf : RuConf
 );
 
 ruCollectOne(parsed : RuParsed, acc : RuMath, to_cache : (RuSource, RuConf) -> void, conf : RuConf) -> RuMath {
 	switch (parsed) {
 		RuParseSource(__,__,__): ruCollectParsed(parsed, acc, to_cache, conf);
-		RuCachedSource(src, __,__): ruCollectSourceNames(src, acc);
+		RuCachedSource(src, __,__): ruMakeMathFromSource(src, acc.types, conf);
 	}
 }
 
@@ -118,11 +118,7 @@ ruCollectParsed(src : RuParseSource, acc : RuMath, to_cache : (RuSource, RuConf)
 		}
 		None(): {
 			imps = map(src.imports, \imp -> RuImport(imp.path, imp.pos));
-			acc0 = RuCollectAcc(
-				src.info.file, acc,
-				RuMath(makeTree(), makeTree(), makeTree(), makeTree(), makeTree(), makeTree()),
-				acc.types, conf
-			);
+			acc0 = RuCollectAcc(src.info.file, acc, ruEmptyMath, acc.types, conf);
 			acc1 = fold(src.decls, acc0, \ac, block -> 
 				switch(block) {
 					RuParseDecl(): ruCollectSyntax(block, ac);
@@ -141,20 +137,26 @@ ruCollectParsed(src : RuParseSource, acc : RuMath, to_cache : (RuSource, RuConf)
 			acc2 = fold(assertions, acc1, \ac, ass -> 
 				RuCollectAcc(ac with
 					local = RuMath(ac.local with 
-						assertions = setTree(ac.local.assertions, ass.name, ass),
-						//names = setTree(ac.local.names, ass.name, src.info.file)
-					),
+						assertions = setTree(ac.local.assertions, ass.name, RuWithSource(ass, src.info.file))
+					)
 				)
 			);
 			decls = fold(src.decls, [], \ac, block -> 
 				switch (block) {
-					RuParseConst(name,__,__,__):               concat(ac, [lookupTreeDef(acc2.local.consts, name, ruNoConst)]);
-					RuParseType(name,__,__):                   concat(ac, [lookupTreeDef(acc2.local.types, name, ruNoTypeEnv).type]);
-					RuParseRule(name,__,__,__):                concat(ac, [lookupTreeDef(acc2.local.rules, name, ruNoRule)]);
-					RuParseAxiom(name,__,__,__,__,__):         concat(ac, [lookupTreeDef(acc2.local.assertions, name, ruNoAxiom)]);
-					RuParseTheorem(name,__,__,__,__,__,__,__): concat(ac, [lookupTreeDef(acc2.local.assertions, name, ruNoTheorem)]);
-					RuParseDef(name,__,__,__,__,__,__,__):     concat(ac, [lookupTreeDef(acc2.local.assertions, name, ruNoAxiom)]);
-					RuParseComment(text, pos):                 concat(ac, [RuComment(text, pos)]);
+					RuParseConst(name,__,__,__):
+						eitherMap(lookupTree(acc2.local.consts, name), \c -> concat(ac, [c.item]), ac);
+					RuParseType(name,__,__): 
+						eitherMap(lookupTree(acc2.local.types, name), \t -> concat(ac, [t.item.type]), ac);
+					RuParseRule(name,__,__,__):
+						eitherMap(lookupTree(acc2.local.rules, name), \r -> concat(ac, [r.item]), ac);
+					RuParseAxiom(name,__,__,__,__,__):
+						eitherMap(lookupTree(acc2.local.assertions, name), \a -> concat(ac, [a.item]), ac);
+					RuParseTheorem(name,__,__,__,__,__,__,__):
+						eitherMap(lookupTree(acc2.local.assertions, name), \t -> concat(ac, [t.item]), ac);
+					RuParseDef(name,__,__,__,__,__,__,__):
+						eitherMap(lookupTree(acc2.local.assertions, name), \d -> concat(ac, [d.item]), ac);
+					RuParseComment(text, pos):
+						concat(ac, [RuComment(text, pos)]);
 					RuParseTheory(name, __,__):                ac; // TODO
 				}
 			);
@@ -163,12 +165,7 @@ ruCollectParsed(src : RuParseSource, acc : RuMath, to_cache : (RuSource, RuConf)
 			}
 			ru_src = RuSource(imps, decls, src.info);
 			to_cache(ru_src, conf);
-			ruCollectSourceNames(
-				ru_src, 
-				RuMath(acc2.local with 
-					sources = makeTree1(src.info.file, ru_src)
-				)
-			);
+			RuMath(acc2.local with sources = makeTree1(src.info.file, ru_src));
 		}
 	}
 }
@@ -200,7 +197,9 @@ ruCollectConst(const : RuParseConst, acc : RuCollectAcc) -> RuCollectAcc {
 		None(): {
 			RuCollectAcc(acc with
 				local = RuMath(acc.local with 
-					consts = setTree(acc.local.consts, const.name, RuConst(const.name, const.ascii, const.latex, const.pos)),
+					consts = setTree(acc.local.consts, const.name, 
+						RuWithSource(RuConst(const.name, const.ascii, const.latex, const.pos), acc.file)
+					),
 				)
 			);
 		}
@@ -219,9 +218,9 @@ ruCollectType(type : RuParseType, acc : RuCollectAcc) -> RuCollectAcc {
 				switch (ruLookupType(acc, s)) {
 					Some(env): {
 						foldTree(env.supers,
-							setTree(ac, s, ruMakeSuperRule(s, infer, type.pos)), 
+							setTree(ac, s, RuWithSource(ruMakeSuperRule(s, infer, type.pos), acc.file)), 
 							\super, __, a ->
-								setTree(a, super, ruMakeSuperRule(super, infer, type.pos))
+								setTree(a, super, RuWithSource(ruMakeSuperRule(super, infer, type.pos), acc.file))
 						)
 					}
 					None(): {
@@ -232,26 +231,25 @@ ruCollectType(type : RuParseType, acc : RuCollectAcc) -> RuCollectAcc {
 			);
 			super_types = foldTree(supers, acc.types, 
 				\sup_name, sup_rule, ac -> {
-					env = lookupTreeDef(ac, sup_name, ruNoTypeEnv);
+					env = lookupTreeDef(ac, sup_name, RuWithSource(ruNoTypeEnv, ""));
 					setTree(ac, sup_name, env)
 				}
 			);
 			new_types = setTree(super_types, type.name, 
-				RuTypeEnv(
+				RuWithSource(RuTypeEnv(
 					RuType(type.name, type.supers, type.pos), 
 					ruAddTerm2RuTrie(
 						RuTerm(type.name, [RuVar("x", type.name)], type.pos), 
 						None(),
 						ruTrieEmpty, acc.conf
 					), 
-					supers
-				)
+					mapTree(supers, \super -> super.item)
+				), acc.file)
 			);
 			RuCollectAcc(acc with
 				local = RuMath(acc.local with 
 					types = new_types,
-					rules = foldTree(supers, acc.local.rules, \__, rule, ac -> setTree(ac, rule.name, rule)),
-					//names = foldTree(supers, setTree(acc.local.names, type.name, acc.file), \__, rule, ac -> setTree(ac, rule.name, acc.file))
+					rules = foldTree(supers, acc.local.rules, \__, rule, ac -> setTree(ac, rule.item.name, rule))
 				),
 				types = new_types
 			)
@@ -281,18 +279,17 @@ ruCollectRule(rule : RuParseRule, acc : RuCollectAcc) -> RuCollectAcc {
 			switch (ruLookupType(acc, rule.term.type)) {
 				Some(env): {
 					new_types = setTree(acc.types, env.type.name,
-						RuTypeEnv(env with 
+						RuWithSource(RuTypeEnv(env with 
 							trie = ruAddTerm2RuTrie(new_rule.term, 
 								Some(RuRuleRef(rule.name, rule.term.type, sizeTree(vars), 0)),
 								env.trie, acc.conf
 							)
-						)
+						), acc.file)
 					);
 					RuCollectAcc(acc with
 						local = RuMath(acc.local with 
-							rules = setTree(acc.local.rules, rule.name, new_rule),
-							types = new_types,
-							//names = setTree(acc.local.names, rule.name, acc.file)
+							rules = setTree(acc.local.rules, rule.name, RuWithSource(new_rule, acc.file)),
+							types = new_types
 						),
 						types = new_types
 					);
@@ -510,25 +507,25 @@ ruCreateDef(df : RuParseDef, acc : RuCollectAcc) -> Maybe<RuDef> {
 
 ruLookupConst(acc : RuCollectAcc, n : string) -> Maybe<RuConst> {
 	switch(lookupTree(acc.global.consts, n)) {
-		Some(c): Some(c);
-		None(): lookupTree(acc.local.consts, n);
+		Some(c): Some(c.item);
+		None(): maybeMap(lookupTree(acc.local.consts, n), \c -> c.item);
 	}
 }
 
 ruLookupType(acc : RuCollectAcc, n : string) -> Maybe<RuTypeEnv> {
-	lookupTree(acc.types, n)
+	maybeMap(lookupTree(acc.types, n), \t -> t.item);
 }
 
 ruLookupRule(acc : RuCollectAcc, n : string) -> Maybe<RuRule> {
 	switch(lookupTree(acc.global.rules, n)) {
-		Some(r): Some(r);
-		None(): lookupTree(acc.local.rules, n);
+		Some(r): Some(r.item);
+		None(): maybeMap(lookupTree(acc.local.rules, n), \r -> r.item);
 	}
 }
 
 ruLookupAssertion(acc : RuCollectAcc, n : string) -> Maybe<RuAssertion> {
 	switch(lookupTree(acc.global.assertions, n)) {
-		Some(a): Some(a);
-		None(): lookupTree(acc.local.assertions, n);
+		Some(a): Some(a.item);
+		None(): maybeMap(lookupTree(acc.local.assertions, n), \a -> a.item);
 	}
 }
