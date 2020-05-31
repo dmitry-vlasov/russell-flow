@@ -25,6 +25,8 @@ export {
 	ruFromCache(file : string, conf : RuConf) -> Maybe<RuCachedSource>;
 	ruLoadToCache(file : string, conf : RuConf) -> void;
 	ruClearCache() -> void;
+	ruSaveCache(conf : RuConf) -> void;
+	ruSaveCacheFile(file : string, conf : RuConf) -> void;
 	ruSourcesCache() -> [RuSource];
 	ruMakeCacheDir(conf : RuConf) -> void;
 
@@ -53,7 +55,7 @@ export {
 	ruDeclRange(d : RuDecl, src : RuSource) -> RuRange;
 }
 
-ruCacheVersion = 1;
+ruCacheVersion = 2;
 
 ruSourceCache = initConcurrentHashMap();
 ruNameCache = initConcurrentHashMap();
@@ -96,7 +98,8 @@ ruDepChangedCallback(src : RuSource, conf : RuConf) -> () -> bool {
 		check = exists(src.imports, \imp ->
 			switch (ruFromCache(imp.path, conf)) {
 				Some(cached): {
-					src.info.lastupdate < cached.source.info.lastupdate || cached.dependencyChanged();
+					ruFileChanged(src.info) || cached.dependencyChanged();
+					//src.info.lastupdate < cached.source.info.lastupdate || cached.dependencyChanged();
 				}
 				None(): {
 					conf.onError("a module " + imp.path + " must be already in cache, but is not there", []); true; 
@@ -166,19 +169,35 @@ ruUpdateDefCache(src : RuSource, conf : RuConf) -> void {
 	//ruDebugLog1("ruUpdateDefCache: finished " + src.info.file);
 }
 
-ruToCache(src : RuSource, conf : RuConf) -> void {
-	if (lookupTreeDef(conf.opts, "caching", "") != "0") {
-		cached = RuCachedSource(src, ruDepChangedCallback(src, conf), ruCacheVersion);
-		setConcurrentHashMap(ruSourceCache, src.info.file, Some(cached));
-		ruUpdateNameCache(src, conf);
-		ruUpdateDefCache(src, conf);
-		if (!setFileContent(ruCachedPath(src.info.file, conf), toBinary(RuCachedFileSource(cached.source, cached.version)))) {
-			conf.onError("cannot save cached source " + src.info.file, []);
-		}
-		if (conf.verbose > 1) {
-			ruPrintln("saved to cached: " + src.info.file);
-		}
+ruSaveCache(conf : RuConf) -> void {
+	iter(filtermap(valuesConcurrentHashMap(ruSourceCache), idfn), 
+		\cached : RuCachedSource -> ruSaveCacheSource(cached.source, conf)
+	);
+}
+
+ruSaveCacheFile(file : string, conf : RuConf) -> void {
+	switch (getConcurrentHashMap(ruSourceCache, file, None())) {
+		Some(cached): ruSaveCacheSource(cached.source, conf);
+		None(): { }
 	}
+}
+
+ruSaveCacheSource(src : RuSource, conf : RuConf) -> void {
+	binary = toBinary(RuCachedFileSource(src, ruCacheVersion));
+	if (!setFileContent(ruCachedPath(src.info.file, conf), binary)) {
+		conf.onError("cannot save cached source " + src.info.file, []);
+	}
+	if (conf.verbose > 1) {
+		ruPrintln("\tsaved to cache: '" + src.info.file + "'");
+	}
+}
+
+ruToCache(src : RuSource, conf : RuConf) -> void {
+	cached = RuCachedSource(src, ruDepChangedCallback(src, conf), ruCacheVersion);
+	setConcurrentHashMap(ruSourceCache, src.info.file, Some(cached));
+	ruUpdateNameCache(src, conf);
+	ruUpdateDefCache(src, conf);
+	ruSaveCacheSource(src, conf);
 }
 
 ruFromCache(file0 : string, conf : RuConf) -> Maybe<RuCachedSource> {
@@ -191,13 +210,13 @@ ruFromCache(file0 : string, conf : RuConf) -> Maybe<RuCachedSource> {
 			if (!fileExists(path)) None() else {
 				deserialized = deserializeBinary(getFileContent(path), IllegalStruct());
 				if (deserialized == IllegalStruct()) {
-					conf.onError("WARNING: Illegal structure of cache file for " + file + ". Incremental file deleted.", []);
+					conf.onError("WARNING: Illegal structure of cache file for '" + file + "'. Incremental file deleted.", []);
 					ruDeleteFromCache(file, path, conf);
 					None();
 				} else {
 					cached_file = cast(deserialized : flow -> RuCachedFileSource);
 					if (cached_file.version == ruCacheVersion) {
-						changed = ruFileChanged(cached_file.source.info);
+						changed = ruFileChangedMessage(cached_file.source.info);
 						if (changed != "") {
 							if (conf.verbose >= 1) {
 								println(changed);

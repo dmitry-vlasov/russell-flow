@@ -145,7 +145,7 @@ ruCommLoadConf(task : RuTask, env : RuEnv) -> RuEnv {
 	RuEnv(env with 
 		conf = ruMergeConfs(
 			env.conf, 
-			ruTree2Conf(ruReadConfFileFromDir(lookupTreeDef(task.args, "dir", "")))
+			ruMakeConf(lookupTreeDef(task.args, "dir", ""), [])
 		)
 	);
 }
@@ -224,9 +224,22 @@ ruPrepareSources(math : RuMath, conf : RuConf) -> [RuWriteSource] {
 
 ruFileSyncCommands() -> [RuComm] {[
 	RuComm(
-		"update-cache", "file-sync", "read cached sources",
+		"load-cache", "file-sync", "read cached sources",
 		[RuCommArg("file", false, "input file", "")],
 		\task, env -> { ruLoadToCache(lookupTreeDef(task.args, "file", ""), env.conf); env; }
+	),
+	RuComm(
+		"save-cache", "file-sync", "save cached sources",
+		[RuCommArg("file", true, "input file", "")],
+		\task, env -> { 
+			file = lookupTreeDef(task.args, "file", "");
+			if (file == "") {
+				ruSaveCache(env.conf); 
+			} else {
+				ruSaveCacheFile(file, env.conf); 
+			}
+			env; 
+		}
 	),
 	RuComm(
 		"file-source", "file-sync", "load an updated file source",
@@ -287,14 +300,19 @@ ruProverCommands() -> [RuComm] {[
 
 ruIoCommands() -> [RuComm] {[
 	RuComm(
-		"read-ru", "io", "read a Russell file",
+		"read", "io", "read a Russell file",
 		[RuCommArg("file", false, "input file", "")],
 		ruCommRead
 	),
 	RuComm(
+		"read-ru", "io", "read a Russell file",
+		[RuCommArg("file", false, "input file", "")],
+		ruCommReadRu
+	),
+	RuComm(
 		"read-mm", "io", "read a Metamath file",
 		[RuCommArg("file", false, "input file", "")],
-		mmCommRead
+		ruCommReadMm
 	),
 	RuComm(
 		"write-mm", "io", "write a Metamath file to a filesystem",
@@ -363,47 +381,48 @@ ruIoCommands() -> [RuComm] {[
 	),
 ]}
 
-ruParseMath(conf : RuConf, file : string) -> Maybe<Tree<string, RuParsed>> {
-	maybeBind(ruLoadAll(conf, file, ruFromCache), \loaded ->
-		ruParseAll(getTreeValues(loaded), conf)
-	)
-}
-
-ruLoadMath1(parsed : Tree<string, RuParsed>, conf : RuConf) -> Maybe<RuMath> {
-	maybeBind(ruCollectMath(parsed, conf, ruToCache), \math -> ruVerifyMath(math, conf));
-}
-
-ruLoadMath(conf : RuConf, file : string) -> Maybe<RuMath> {
-	maybeBind(ruParseMath(conf, file), \parsed -> ruLoadMath1(parsed, conf))
-}
-
-ruCommRead(task : RuTask, env : RuEnv) -> RuEnv {
+ruCommReadRu(task : RuTask, env : RuEnv) -> RuEnv {
 	file = lookupTreeDef(task.args, "file", "");
 	if (!endsWith(file, ".ru")) {
 		env.conf.onError("Wrong file extension: " + file + ", must be *.ru", []);
 		env;
 	} else {
-		eitherMap(ruLoadMath(env.conf, changeFileExt(file, "")), \math -> RuEnv(env with ruMath = math), env);
+		ru = maybeBind(
+			maybeBind(ruLoadAll(env.conf, file, ruFromCache), \loaded ->
+				ruParseAll(getTreeValues(loaded), env.conf)
+			), 
+			\parsed -> ruCollectMath(parsed, env.conf, ruToCache)
+		);
+		eitherMap(ru, \math -> RuEnv(env with ruMath = math), env);
 	}
 }
 
-mmLoadMath(conf : RuConf, file : string) -> Maybe<MmMath> {
-	maybeBind(mmLoad(conf, file), \loaded ->
-		maybeBind(mmParse(getTreeValues(loaded), conf), \parsed ->
-			maybeBind(mmCollectMath(parsed, conf), \collected ->
-				mmVerifyMath(collected, conf)
-			)
-		)
-	)
-}
-
-mmCommRead(task : RuTask, env : RuEnv) -> RuEnv {
+ruCommReadMm(task : RuTask, env : RuEnv) -> RuEnv {
 	file = lookupTreeDef(task.args, "file", "");
 	if (!endsWith(file, ".mm")) {
 		env.conf.onError("Wrong file extension " + file + ", mus be *.mm", []);
 		env;
 	} else {
-		eitherMap(mmLoadMath(env.conf, changeFileExt(file, "")), \math -> RuEnv(env with mmMath = math), env);
+		mm = maybeBind(mmLoad(env.conf, file), \loaded ->
+			maybeBind(mmParse(getTreeValues(loaded), env.conf), \parsed ->
+				maybeBind(mmCollectMath(parsed, env.conf), \collected ->
+					mmVerifyMath(collected, env.conf)
+				)
+			)
+		);
+		eitherMap(mm, \math -> RuEnv(env with mmMath = math), env);
+	}
+}
+
+ruCommRead(task : RuTask, env : RuEnv) -> RuEnv {
+	file = lookupTreeDef(task.args, "file", "");
+	if (endsWith(file, ".ru")) {
+		ruCommReadRu(task, env);
+	} else if (endsWith(file, ".mm")) {
+		ruCommReadMm(task, env);
+	} else {
+		env.conf.onError("Unknown file extension: " + file + ", must be *.ru or *.mm", []);
+		env;
 	}
 }
 
@@ -415,7 +434,6 @@ ruTranslateCommands() -> [RuComm] {[
 	RuComm(
 		"mm-to-ru", "translate", "translate Metamath to Russell",
 		[RuCommArg("file", false, "input file", "")],
-		\task, env -> eitherMap(ruLoadMath1(mm2ru(env.mmMath, env.conf), env.conf), \math -> RuEnv(env with ruMath = math), env)
+		\task, env -> eitherMap(ruCollectMath(mm2ru(env.mmMath, env.conf), env.conf, ruToCache), \math -> RuEnv(env with ruMath = math), env)
 	),
 ]}
-

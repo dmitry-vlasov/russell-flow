@@ -12,9 +12,9 @@ ruCollectMath(parsed : Tree<string, RuParsed>, conf0 : RuConf, to_cache : (RuSou
 	err_count = ref 0;
 	conf = ruAddErrCounter(conf0, err_count);
 	start = timestamp();
-	collected = ruDoCollectMath(parsed, conf, RuMath(makeTree(), makeTree(), makeTree(), makeTree(), makeTree(), makeTree()), to_cache);
+	collected = ruDoCollectMath(parsed, makeSet(), conf, RuMath(makeTree(), makeTree(), makeTree(), makeTree(), makeTree(), makeTree()), to_cache);
 	if (conf.verbose > 0) {
-		ruPrintln("ru collected: " +i2s(sizeTree(collected.sources)) + " files in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
+		ruPrintln("ru collected: " + i2s(sizeTree(collected.sources)) + " files in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
 	}
 	if (^err_count == 0) {
 		Some(collected);
@@ -23,7 +23,7 @@ ruCollectMath(parsed : Tree<string, RuParsed>, conf0 : RuConf, to_cache : (RuSou
 	}
 }
 
-ruDoCollectMath(left : Tree<string, RuParsed>, conf : RuConf, acc : RuMath, to_cache : (RuSource, RuConf) -> void) -> RuMath {
+ruDoCollectMath(left : Tree<string, RuParsed>, done : Set<string>, conf : RuConf, acc : RuMath, to_cache : (RuSource, RuConf) -> void) -> RuMath {
 	parsed_imports = \parsed -> {
 		switch (parsed) {
 			RuCachedSource(source, __,__): map(source.imports, \imp -> imp.path);
@@ -39,7 +39,7 @@ ruDoCollectMath(left : Tree<string, RuParsed>, conf : RuConf, acc : RuMath, to_c
 	if (sizeTree(left) == 0) acc else {
 		ready = filter(
 			getTreeValues(left), 
-			\src -> forall(parsed_imports(src), \imp -> !containsKeyTree(left, imp))
+			\src -> forall(parsed_imports(src), \imp -> containsSet(done, imp))
 		);
 		if (ready == []) {
 			conf.onError("cyclic import detected", []);
@@ -47,6 +47,7 @@ ruDoCollectMath(left : Tree<string, RuParsed>, conf : RuConf, acc : RuMath, to_c
 		} else {
 			collected = filtermap(
 				ruConcurrent(map(ready, 
+				//sequential(true, map(ready, 
 					\parsed -> \->
 					switch (parsed) {
 						RuParseSource(__,__,info): {
@@ -54,11 +55,23 @@ ruDoCollectMath(left : Tree<string, RuParsed>, conf : RuConf, acc : RuMath, to_c
 						}
 						RuCachedSource(src, depChanged,__): {
 							if (!depChanged()) {
-								Some(ruMakeMathFromSource(src, acc.types, conf)); 
-							} else { 
-								switch (ruVerifySource(src, ruAddSourceAssertions(src, acc), conf)) {
+								start = timestamp();
+								ret = Some(ruMakeMathFromSource(src, acc.types, conf)); 
+								if (conf.verbose > 1) {
+									ruPrintln("\tru collected cached: " + src.info.file + " in " + d2st((timestamp() - start)/ 1000.0, 4) + " s");
+								}
+								ret;
+							} else {
+								start = timestamp();
+								switch (ruVerifySource(src, ruAddSource(src, acc, conf), conf)) {
 									Some(verified): {
-										Some(ruMakeMathFromSource(src, acc.types, conf));
+										updated_src = RuSource(src with info = ruUpdateFileInfo(src.info));
+										ruToCache(updated_src, conf);
+										ret = Some(ruMakeMathFromSource(src, acc.types, conf));
+										if (conf.verbose > 1) {
+											ruPrintln("\tru collected verified: " + src.info.file + " in " + d2st((timestamp() - start)/ 1000.0, 4) + " s");
+										}
+										ret;
 									}
 									None(): {
 										maybeBind(ruLoadOne(conf, src.info.file, \__,__ -> None()), \l ->
@@ -75,7 +88,8 @@ ruDoCollectMath(left : Tree<string, RuParsed>, conf : RuConf, acc : RuMath, to_c
 			);
 			new_acc = fold(collected, acc, \ac, coll -> ruMergeMath(coll, ac, conf));
 			new_left = fold(ready, left, \ac, parsed -> removeFromTree(ac, parsed_file(parsed)));
-			ruDoCollectMath(new_left, conf, new_acc, to_cache);
+			new_done = fold(ready, done, \ac, parsed -> insertSet(ac, parsed_file(parsed)));
+			ruDoCollectMath(new_left, new_done, conf, new_acc, to_cache);
 		}
 	}
 }
@@ -145,7 +159,7 @@ ruCollectParsed(src : RuParseSource, acc : RuMath, to_cache : (RuSource, RuConf)
 				}
 			);
 			if (conf.verbose > 1) {
-				ruPrintln("\tru collected: " + src.info.file + " in " + d2st((timestamp() - start)/ 1000.0, 4) + " s");
+				ruPrintln("\tru collected parsed: " + src.info.file + " in " + d2st((timestamp() - start)/ 1000.0, 4) + " s");
 			}
 			ru_src = RuSource(imps, decls, src.info);
 			to_cache(ru_src, conf);
