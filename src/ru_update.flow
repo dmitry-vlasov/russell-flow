@@ -1,0 +1,174 @@
+import parse/ru_type_env;
+import parse/ru_parse_src;
+import parse/ru_load;
+import parse/ru_parse;
+import ru_math;
+
+export {
+	ruUpdateSourceNames(math : RuMath) -> RuMath;
+	ruUpdateMathPositions(math : RuMath, conf : RuConf) -> RuMath;
+	ruUpdateSourcePositions(src : RuSource, conf : RuConf) -> RuSource;
+}
+
+ruUpdateSourceNames(math : RuMath) -> RuMath {
+	foldTree(math.sources, math, \name, src, acc -> {
+		module = src.info.module;
+		fold(src.decls, acc, \ac, decl -> 
+			switch (decl) {
+				RuConst(n,__,__,__): 
+					RuMath(ac with consts = setTree(ac.consts, n, RuWithSource(decl, module)));
+				RuType(n,__,__): {
+					switch (lookupTree(ac.types, n)) {
+						Some(ws): {
+							env = ws.item;
+							foldTree(
+								env.supers,
+								RuMath(ac with types = setTree(ac.types, n, RuWithSource(ws.item, module))),
+								\__, super, a -> 
+									RuMath(a with rules = setTree(a.rules, super.name, RuWithSource(super, module)))
+							);
+						}
+						None(): ac;
+					}
+				}
+				RuRule(n,__,__,__):
+					RuMath(ac with rules = setTree(ac.rules, n, RuWithSource(decl, module)));
+				RuAxiom(n,__,__,__,__,__):
+					RuMath(ac with assertions = setTree(ac.assertions, n, RuWithSource(decl, module)));
+				RuTheorem(n,__,__,__,__,__,__,__):
+					RuMath(ac with assertions = setTree(ac.assertions, n, RuWithSource(decl, module)));
+				RuDef(n,__,__,__,__,__,__,__):
+					RuMath(ac with assertions = setTree(ac.assertions, n, RuWithSource(decl, module)));
+				default: ac;
+			}
+		)
+	});
+}
+
+ruUpdateDeclPositions(decl1 : RuBlock, decl2 : RuParseBlock) -> RuBlock {
+	switch (decl1) {
+		RuConst(__,__,__,__):
+			RuConst(decl1 with pos = decl2.pos);
+		RuType(__,__,__):
+			RuType(decl1 with pos = decl2.pos);
+		RuRule(__,__,term,__): {
+			rule = cast(decl2 : RuParseBlock -> RuParseRule);
+			RuRule(decl1 with
+				pos = rule.pos,
+				term = RuTerm(term with pos = rule.term.pos)
+			);
+		}
+		RuAxiom(__,__,__,hyps, prop,__): {
+			axiom = cast(decl2 : RuParseBlock -> RuParseAxiom);
+			RuAxiom(decl1 with 
+				pos = axiom.pos,
+				hyps = mapi(hyps, \i, hyp -> 
+					RuHyp(hyp with 
+						expr = RuExp(hyp.expr with pos = axiom.hyps[i].expr.pos),
+						pos = axiom.hyps[i].pos
+					)
+				),
+				prop = RuExp(prop with pos = axiom.prop.pos)
+			);
+		}
+		RuTheorem(__,__,__,__,hyps, prop, proof,__): {
+			theorem = cast(decl2 : RuParseBlock -> RuParseTheorem);
+			RuTheorem(decl1 with 
+				pos = theorem.pos,
+				hyps = mapi(hyps, \i, hyp -> 
+					RuHyp(hyp with 
+						expr = RuExp(hyp.expr with pos = theorem.hyps[i].expr.pos),
+						pos = theorem.hyps[i].pos
+					)
+				),
+				prop = RuExp(prop with pos = theorem.prop.pos),
+				proof = RuProof(proof with 
+					steps = mapi(proof.steps, \i, step -> 
+						RuStep(step with
+							expr = RuExp(step.expr with pos = theorem.proof.steps[i].expr.pos),
+							refs = mapi(step.refs, \j, ref -> 
+								switch (ref) {
+									RuHypRef(ind,__): RuHypRef(ind, theorem.proof.steps[i].refs[j].pos);
+									RuStepRef(ind,__): RuStepRef(ind, theorem.proof.steps[i].refs[j].pos);
+								}
+							),
+							pos = theorem.proof.steps[i].pos
+						)
+					)
+				)
+			);
+		}
+		RuDef(__,__,__, hyps, defm, defs, prop,__): {
+			def = cast(decl2 : RuParseBlock -> RuParseDef);
+			RuDef(decl1 with 
+				pos = def.pos,
+				hyps = mapi(hyps, \i, hyp -> 
+					RuHyp(hyp with 
+						expr = RuExp(hyp.expr with pos = def.hyps[i].expr.pos),
+						pos = def.hyps[i].pos
+					)
+				),
+				defm = RuExp(defm with pos = def.defm.pos),
+				defs = RuExp(defs with pos = def.defs.pos),
+				prop = RuExp(prop with pos = def.prop.pos)
+			);
+		}
+		RuComment(__,__): RuComment(decl1 with pos = decl2.pos);
+	}
+}
+
+ruUpdateSourcePositions(src : RuSource, conf : RuConf) -> RuSource {
+	switch (ruLoadRawSource(src.info.path, conf, ruLoadDescr)) {
+		Some(loaded): {
+			switch (ruParseSource(loaded, conf)) {
+				Some(parsed): {
+					RuSource(src with 
+						imports = mapi(src.imports, \i, imp -> RuImport(imp with pos = parsed.imports[i].pos)),
+						decls = mapi(src.decls, \i, d -> ruUpdateDeclPositions(d, parsed.decls[i]))
+					);
+				}
+				None(): src;
+			}
+		}
+		None(): src;
+	}
+}
+
+ruUpdateMathPositions(math : RuMath, conf : RuConf) -> RuMath {
+	foldTree(math.sources, math, \n, src, acc -> {
+		module = src.info.module;
+		updated = ruUpdateSourcePositions(src, conf);
+		fold(updated.decls, 
+			RuMath(acc with sources = setTree(acc.sources, n, updated)),
+			\ac, decl -> {
+				switch (decl) {
+					RuConst(name,__,__,__):
+						RuMath(ac with consts = setTree(ac.consts, name, RuWithSource(decl, module)));
+					RuType(name,__,__): {
+						switch (lookupTree(ac.types, name)) {
+							Some(ws): 
+								foldTree(
+									ws.item.supers,
+									RuMath(ac with 
+										types = setTree(ac.types, name, RuWithSource(RuTypeEnv(ws.item with type = decl), module))
+									),
+									\__, super, a -> 
+										RuMath(a with rules = setTree(a.rules, super.name, RuWithSource(super, module)))
+								);
+							None(): ac;
+						}
+					}
+					RuRule(name,__,__,__):
+						RuMath(ac with rules = setTree(ac.rules, name, RuWithSource(decl, module)));
+					RuAxiom(name,__,__,__,__,__):
+						RuMath(ac with assertions = setTree(ac.assertions, name, RuWithSource(decl, module)));
+					RuTheorem(name,__,__,__,__,__,__,__):
+						RuMath(ac with assertions = setTree(ac.assertions, name, RuWithSource(decl, module)));
+					RuDef(name,__,__,__,__,__,__,__):
+						RuMath(ac with assertions = setTree(ac.assertions, name, RuWithSource(decl, module)));
+					RuComment(__,__): ac;
+				}
+			}
+		);
+	});
+}
