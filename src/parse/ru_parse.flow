@@ -10,8 +10,24 @@ import parse/ru_parse_ast;
 export {
 	RuParsed ::= RuParseSource, RuCachedSource;
 
+	ruParsedImports(parsed : RuParsed) -> [string];
+	ruParsedModule(parsed : RuParsed) -> string;
 	ruParseAll(loaded : [RuLoaded], conf : RuConf) -> Maybe<Tree<string, RuParsed>>;
 	ruParseOne(loaded : RuLoaded, conf : RuConf) -> Maybe<RuParsed>;
+}
+
+ruParsedImports(parsed : RuParsed) -> [string] {
+	switch (parsed) {
+		RuCachedSource(source, __,__): map(source.imports, \imp -> imp.module);
+		RuParseSource(imports,__,__): map(imports, \imp -> imp.module);
+	}
+}
+
+ruParsedModule(parsed : RuParsed) -> string {
+	switch (parsed) {
+		RuCachedSource(source, __,__): source.info.module;
+		RuParseSource(__,__, info): info.module;
+	}
 }
 
 ruParseAll(loaded : [RuLoaded], conf0 : RuConf) -> Maybe<Tree<string, RuParsed>> {
@@ -32,7 +48,9 @@ ruParseAll(loaded : [RuLoaded], conf0 : RuConf) -> Maybe<Tree<string, RuParsed>>
 		ruPrintln("ru parsed: " +i2s(sizeTree(ret)) + " files in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
 	}
 	if (^err_count == 0) {
-		Some(ret);
+		if (ruDetectCyclicImports(ret, conf)) None() else {
+			Some(ret);
+		}
 	} else {
 		None();
 	}
@@ -260,4 +278,47 @@ ruMakeRefs(loaded : RuRawSource, st : SyntaxTree, conf : RuConf) -> [RuParseRef]
 
 ruMakeInd(loaded : RuRawSource, st : SyntaxTree, conf : RuConf) -> int {
 	s2i(grabSTText(get_source_ind(st), loaded.src)) - 1
+}
+
+ruDetectCyclicImports(parsed : Tree<string, RuParsed>, conf : RuConf) -> bool {
+	if (isEmptyTree(parsed)) false else {
+		ready = filter(
+			getTreeValues(parsed), 
+			\src -> forall(ruParsedImports(src), \imp -> !containsKeyTree(parsed, imp))
+		);
+		if (ready == []) {
+			conf.onError("cyclic import detected:\n" + ruRevealCyclicImport(parsed), []);
+			true
+		} else {
+			less_parsed = fold(ready, parsed, \acc, src -> removeFromTree(acc, ruParsedModule(src)));
+			ruDetectCyclicImports(less_parsed, conf);
+		}
+	}
+}
+
+ruRevealCyclicImport(parsed : Tree<string, RuParsed>) -> string {
+	cycles = map(getTreeValues(parsed), \src -> 
+		ruMakeImportsCycle(src, parsed, makeSet1(ruParsedModule(src)))
+	);
+	if (cycles == []) "" else {
+		min_cycle = fold(tail(cycles), cycles[0], \acc, cycle -> if (length(cycle) < length(acc)) cycle else acc);
+		strGlue(map(min_cycle, \s -> "\t" + s), "\n");
+	}
+}
+
+ruMakeImportsCycle(src : RuParsed, parsed : Tree<string, RuParsed>, acc : Set<string>) -> [string] {
+	imports = ruParsedImports(src);
+	switch (find(imports, \imp -> containsSet(acc, imp))) {
+		Some(imp): set2array(acc);
+		None(): {
+			cycles = filtermap(imports, \imp ->
+				maybeMap(lookupTree(parsed, imp), \new_src -> 
+					ruMakeImportsCycle(new_src, parsed, insertSet(acc, imp))
+				)
+			);
+			if (cycles == []) [] else {
+				fold(tail(cycles), cycles[0], \ac, cycle -> if (length(cycle) < length(ac)) cycle else ac);
+			}
+		}
+	} 
 }
