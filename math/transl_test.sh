@@ -2,35 +2,55 @@
 
 file=$1
 
-rm $file-1.mm
+if [ -f "${file}-1.mm" ]; then
+	rm ${file}-1.mm
+fi
+
+if [ -d "./${file}" ]; then
+	rm -fr ./${file}
+fi
+
+echo "Translation: Metamath --> Russell"
+echo "---------------------------------"
+echo
 
 ../bin/russell \
-	update-conf verbose=1 ru-root=./${file} ';' \
-	mem-stats ';' \
-	read file=${file}.mm ';' \
-	mm-to-ru file=${file}.mm ';' \
-	mem-stats ';' \
-	fix-left-recursion file=${file}.ru ';' \
-	split-math file=${file}.ru ';' \
-	mem-stats ';' \
-	math-stats ';' \
-	write-ru all=1 ';' \
-	mem-stats
+	update-conf verbose=1 ru-root=./${file} ";" \
+	mem-stats ";" \
+	read file=${file}.mm ";" \
+	mm-to-ru file=${file}.mm ";" \
+	mem-stats ";" \
+	fix-left-recursion file=${file}.ru ";" \
+	split-math file=${file}.ru ";" \
+	optimize-imports ";" \
+	verify target=all ";" \
+	mem-stats ";" \
+	math-stats
 
 dir=$(pwd)
 
 echo import-roots=${dir}/${file} > ./${file}/russell.conf
 
-#verbose=1 caching=1 $file.ru mm=$file-1.mm ru-2-mm=1 ru-stats=1
-../bin/russell \
-	load-conf dir=./${file} \
-	update-conf verbose=1 ru-root=./${file} ';' \
-	mem-stats ';' \
-	read file=./${file}/${file}.ru ';' \
-	math-stats ';' \
-	ru-to-mm file=${file}.ru ';' \
-	mem-stats ';' \
-	write-mm file=${file}-1.mm \
-	mem-stats ';'
+echo
+echo "Translation: Russell --> Metamath"
+echo "---------------------------------"
+echo
 
-../bin/metamath "read $file-1.mm" 'verify proof *' 'exit'
+../bin/russell \
+	load-conf dir=./${file} ";" \
+	update-conf verbose=1 ru-root=./${file} mm-root=. ";" \
+	mem-stats ";" \
+	read file=./${file}/${file}.ru ";" \
+	math-stats ";" \
+	ru-to-mm file=${file}.ru ";" \
+	mem-stats ";" \
+	write-mm all-to-one=${file}-1.mm ";" \
+	mem-stats
+
+echo
+echo "Verification of Metamath"
+echo "------------------------"
+echo
+
+../bin/metamath "read $file-1.mm" "verify proof *" "exit"
+
