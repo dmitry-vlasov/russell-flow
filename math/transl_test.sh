@@ -49,7 +49,7 @@ echo
 	math-stats ";" \
 	ru-to-mm file=${file}.ru ";" \
 	mem-stats ";" \
-	write-mm all-to-one=${file}-1.mm ";" \
+	write-mm all-to-one=${file}-1.mm strip-comments=1 ";" \
 	mem-stats
 
 echo
