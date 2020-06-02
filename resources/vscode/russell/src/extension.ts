@@ -84,7 +84,9 @@ function execCommand() {
 	vscode.window.showInputBox(options).then(value => {
 		let val_arr = value.split(" ");
 		if (val_arr.length > 0) {
-			client.sendRequest("workspace/executeCommand", { command : "command", arguments: val_arr }).then(
+			let file_arg = Array("file=" + vscode.window.activeTextEditor.document.uri.fsPath);
+			let args = file_arg.concat(val_arr);
+			client.sendRequest("workspace/executeCommand", { command : "command", arguments: args }).then(
 				(out : string) => russellChannel.appendLine(out)
 			);
 		}
