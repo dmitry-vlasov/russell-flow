@@ -1,17 +1,13 @@
 'use strict';
 // The module 'vscode' contains the VS Code extensibility API
 // Import the module and reference it with the alias vscode in your code below
-import * as vscode from 'vscode';
-import * as path from 'path';
 import { ChildProcess } from 'child_process';
 import * as fs from "fs";
-import * as PropertiesReader from 'properties-reader';
-import {
-    LanguageClient, LanguageClientOptions, ServerOptions, RevealOutputChannelOn, Location,
-} from 'vscode-languageclient';
+import * as path from 'path';
+import * as vscode from 'vscode';
+import { LanguageClient, LanguageClientOptions, RevealOutputChannelOn, ServerOptions } from 'vscode-languageclient';
+import { MathEntity, MathProvider } from "./mathProvider";
 import * as tools from "./tools";
-import { MathProvider, MathEntity } from "./mathProvider";
-import { isNullOrUndefined } from 'util';
 
 const isPortReachable = require('is-port-reachable');
 
