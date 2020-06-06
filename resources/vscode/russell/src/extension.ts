@@ -5,7 +5,7 @@ import { ChildProcess } from 'child_process';
 import * as fs from "fs";
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { LanguageClient, LanguageClientOptions, RevealOutputChannelOn, ServerOptions } from 'vscode-languageclient';
+import { LanguageClient, LanguageClientOptions, RevealOutputChannelOn, ServerOptions, CancellationToken, Event } from 'vscode-languageclient';
 import { MathEntity, MathProvider } from "./mathProvider";
 import * as tools from "./tools";
 
@@ -27,8 +27,6 @@ export function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(vscode.commands.registerCommand('russell.stopHttpServer', stopHttpServer));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.restartLspServer', restartLspServer));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.toggleHttpServer', toggleHttpServer));
-	context.subscriptions.push(vscode.commands.registerCommand('russell.cacheInfo', cacheInfo));
-	context.subscriptions.push(vscode.commands.registerCommand('russell.declInfo', declInfo));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.findSymbol', findSymbol));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.execCommand', execCommand));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.gotoLocation', gotoLocation));
@@ -54,7 +52,7 @@ export function activate(context: vscode.ExtensionContext) {
 	vscode.commands.registerCommand('russell.refreshConsts', () => constsProvider.update());
 
     russellChannel = vscode.window.createOutputChannel("Russell");
-	russellChannel.show();
+	russellChannel.show(true);
 
 	checkHttpServerStatus(true);
 	setInterval(checkHttpServerStatus, 3000, false);
@@ -66,16 +64,8 @@ function mathInfo(type : string): Thenable<MathEntity[]> {
 	return client.sendRequest("workspace/executeCommand", { command: "math-info", arguments: [type] });
 }
 
-function cacheInfo() {
-	let options: vscode.InputBoxOptions = { prompt: "Full: ", placeHolder: "" };
-	vscode.window.showInputBox(options).then(value => {
-		client.sendRequest("workspace/executeCommand", 
-			value ? { command : "cache-info", arguments: [value] } : { command : "cache-info" }
-		).then((out : string) => russellChannel.appendLine(out));
-	});
-}
-
 function execCommand() {
+	russellChannel.show(true);
 	let options: vscode.InputBoxOptions = { prompt: "Command and args: ", placeHolder: "" };
 	vscode.window.showInputBox(options).then(value => {
 		let val_arr = value.split(" ");
@@ -83,18 +73,14 @@ function execCommand() {
 			let file_arg = Array("file=" + vscode.window.activeTextEditor.document.uri.fsPath);
 			let args = file_arg.concat(val_arr);
 			client.sendRequest("workspace/executeCommand", { command : "command", arguments: args }).then(
-				(out : string) => russellChannel.appendLine(out)
+				(out : string) => {
+					russellChannel.appendLine(out);
+				},
+				(err : any) => {
+					vscode.window.showErrorMessage(`command ${value} failed: ${err}`);
+				}
 			);
 		}
-	});
-}
-
-function declInfo() {
-	let options: vscode.InputBoxOptions = { prompt: "Args: (consts, types, rules, axioms, defs, all) ", placeHolder: "" };
-	vscode.window.showInputBox(options).then(value => {
-		client.sendRequest("workspace/executeCommand", 
-			value ? { command : "decl-info", arguments: [value] } : { command : "decl-info" }
-		).then((out : string) => russellChannel.appendLine(out));
 	});
 }
 
@@ -152,7 +138,6 @@ function restartLspServer() {
 			startLspServer,
 			(reason) => { vscode.window.showInformationMessage(`Restart of LSP server failed: ${reason}.`) }
 		);
-		client = null;
 	} else {
 		startLspServer();
 	}
@@ -256,12 +241,12 @@ function resolveProjectRoot(uri : string | vscode.Uri) : string {
 }
 
 function verifyRussell() {
-	let document = vscode.window.activeTextEditor.document;
-	russellChannel.clear();
+	//russellChannel.clear();
 	russellChannel.show(true);
-	//russellChannel.appendLine("Verifying file '" + document.uri + "'");
-	client.sendRequest("workspace/executeCommand", { command : "verify", arguments: [document.uri.fsPath] }).
-	then((out : string) => russellChannel.appendLine(out));
+	client.sendRequest(
+		"workspace/executeCommand", 
+		{ command : "verify", arguments: [vscode.window.activeTextEditor.document.uri.fsPath] }
+	).then((out : string) => russellChannel.appendLine(out));
 }
 
 function verifyMetamath() {
