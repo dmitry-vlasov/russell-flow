@@ -5,7 +5,7 @@ import { ChildProcess } from 'child_process';
 import * as fs from "fs";
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { LanguageClient, LanguageClientOptions, RevealOutputChannelOn, ServerOptions, CancellationToken, Event } from 'vscode-languageclient';
+import { LanguageClient, LanguageClientOptions, RevealOutputChannelOn, ServerOptions, CancellationToken, Event, CancellationTokenSource } from 'vscode-languageclient';
 import { MathEntity, MathProvider } from "./mathProvider";
 import * as tools from "./tools";
 
@@ -72,7 +72,8 @@ function execCommand() {
 		if (val_arr.length > 0) {
 			let file_arg = Array("file=" + vscode.window.activeTextEditor.document.uri.fsPath);
 			let args = file_arg.concat(val_arr);
-			client.sendRequest("workspace/executeCommand", { command : "command", arguments: args }).then(
+			let cts = new CancellationTokenSource();
+			client.sendRequest("workspace/executeCommand", { command : "command", arguments: args , "workDoneToken": cts.token}).then(
 				(out : string) => {
 					russellChannel.appendLine(out);
 				},
