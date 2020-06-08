@@ -13,7 +13,13 @@ export {
 		type : string, // Content-Type
 		json : string  // the Json description of request
 	);
-	ruLspProcessRequest(conf : RuConf, json : Json,  out_cb : (string) ->  void, loop_cb : () -> void, exit_cb : () -> void, run : (RuJob, (int) -> void) -> void) -> void;
+	ruLspProcessRequest(
+		conf : RuConf, json : Json,  
+		out_cb : (string) ->  void, 
+		loop_cb : () -> void, 
+		exit_cb : () -> void, 
+		run : (RuJob, (string) -> void, (int) -> void) -> void
+	) -> void;
 }
 
 ruDecodeJsonRequest(s : string) -> Json {
@@ -59,7 +65,7 @@ RuLspMethodCall(
 	out_cb : (Json) ->  void, 
 	loop_cb : () -> void, 
 	exit_cb : () -> void,
-	run : (RuJob, (int) -> void) -> void
+	run : (RuJob, (string) -> void, (int) -> void) -> void
 );
 
 ruLspMethods = pairs2tree([
@@ -80,10 +86,15 @@ ruLspMethods = pairs2tree([
 	Pair("workspace/executeCommand", ruLspWorkspaceExecuteCommand),
 ]);
 
+RuServerRequest(
+	request : LspRequestMessage,
+	callback : (LspResponseMessage) -> void
+);
+
 RuLspServerState(
 	mutable clientConf : Json,
 	mutable currId : int,
-	mutable requests : Tree<Json, LspRequestMessage>
+	mutable requests : Tree<Json, RuServerRequest>
 );
 
 ruLspServerState = RuLspServerState(JsonNull(), 1, makeTree());
@@ -98,7 +109,17 @@ ruLspNormalResponse(id : Json, result : Json) -> Json {
 	lspResponseMessage2Json(LspResponseMessage("2.0", id, result, None()));
 }
 
-ruLspProcessRequest(conf : RuConf, json : Json, str_out_cb : (string) ->  void, loop_cb : () -> void, exit_cb : () -> void, run : (RuJob, (int) -> void) -> void) -> void {
+ruLspNotification(method : string, params : Json) -> Json {
+	lspNotificationMessage2Json(LspNotificationMessage("2.0", method, params));
+}
+
+ruLspProcessRequest(
+	conf : RuConf, json : Json, 
+	str_out_cb : (string) ->  void, 
+	loop_cb : () -> void, 
+	exit_cb : () -> void, 
+	run : (RuJob, (string) -> void, (int) -> void) -> void
+) -> void {
 	out_cb = \msg -> {
 		js_out = json2string(msg);
 		js_len = strlen(expandUtf8(js_out));
@@ -122,17 +143,10 @@ ruLspProcessRequest(conf : RuConf, json : Json, str_out_cb : (string) ->  void, 
 		None(): {
 			switch (json2LspResponseMessage(json)) {
 				Some(response): {
-					// TODO: handle properly
 					switch (lookupTree(ruLspServerState.requests, response.id)) {
-						Some(request): {
-							ruDebugLog("response to the request: " + 
-								json2string(lspRequestMessage2Json(request)) + ":\n" + 
-								json2string(lspResponseMessage2Json(response))
-								, conf
-							);
-						}
+						Some(req): req.callback(response);
 						None(): {
-							ruDebugLog("unknown request: " + json2string(response.id), conf);
+							ruServerLog("Server: unknown request: " + json2string(response.id), conf);
 						}
 					}
 					loop_cb();
@@ -159,22 +173,26 @@ ruLspExit(call : RuLspMethodCall) -> void {
 	call.exit_cb();
 }
 
+ruMakeServerRequest(method : string, params : Json, out_cb : (Json) -> void, callback : (LspResponseMessage) -> void) -> void {
+	request = LspRequestMessage("2.0", JsonDouble(i2d(ruLspServerState.currId)), method, params);
+	ruLspServerState.requests ::= setTree(ruLspServerState.requests, request.id, 
+		RuServerRequest(request, callback)
+	);
+	ruLspServerState.currId ::= ruLspServerState.currId + 1;
+	out_cb(lspRequestMessage2Json(request));
+}
+
 ruLspInitialized(call: RuLspMethodCall) -> void {
 	if (getJsonBoolField(getJsonNestedField(ruLspServerState.clientConf, ["capabilities", "workspace", "didChangeConfiguration"]), "dynamicRegistration", false)) {
-		request = LspRequestMessage("2.0", JsonDouble(i2d(ruLspServerState.currId)), "client/registerCapability", 
-			lspRegistrationParams2Json(LspRegistrationParams([
-				LspRegistration(makeUuid(), "textDocument/didChange", 
-					lspTextDocumentChangeRegistrationOptions2Json(
-						LspTextDocumentChangeRegistrationOptions([LspDocumentFilter("flow", "file", "*.{flow}")], 1)
-					)
-				),
-				//LspRegistration(makeUuid(), "workspace/executeCommand", ruExecuteCommandOptions)
-			]))
-		);
-		//ruDebugLog("didChangeConfiguration dynamic config: \n" + json2string(lspRequestMessage2Json(request)), call.conf);
-		ruLspServerState.requests ::= setTree(ruLspServerState.requests, request.id, request);
-		ruLspServerState.currId ::= ruLspServerState.currId + 1;
-		call.out_cb(lspRequestMessage2Json(request));
+		params = lspRegistrationParams2Json(LspRegistrationParams([
+			LspRegistration(makeUuid(), "textDocument/didChange", 
+				lspTextDocumentChangeRegistrationOptions2Json(
+					LspTextDocumentChangeRegistrationOptions([LspDocumentFilter("flow", "file", "*.{flow}")], 1)
+				)
+			),
+			//LspRegistration(makeUuid(), "workspace/executeCommand", ruExecuteCommandOptions)
+		]));
+		ruMakeServerRequest("client/registerCapability", params, call.out_cb, nop1);
 	}
 	call.loop_cb(); // It's a notification, no response.
 }
@@ -222,33 +240,19 @@ ruLspInitialize(call: RuLspMethodCall) -> void {
 ruLspTextDocumentDidOpen(call: RuLspMethodCall) -> void {
 	switch (json2LspTextDocumentItem(getJsonObjectField(call.params, "textDocument"))) {
 		Some(textitem): {
-			//ruDebugLog("call.conf.file: " + call.conf.file, call.conf);
-			//ruDebugLog("call.conf.path: " + call.conf.path, call.conf);
-			//ruDebugLog("call.conf.ext: " + call.conf.ext, call.conf);
-			//ruDebugLog("call.conf.importRoots: " + strGlue(call.conf.importRoots, ", "), call.conf);
-		
 			file = ruCorrectUriPath(textitem.uri.path);
 			conf = ruLspFileConfig(call.conf, file);
-			
-			//ruDebugLog("conf1.file: " + conf.file, conf);
-			//ruDebugLog("conf1.path: " + conf.path, conf);
-			//ruDebugLog("conf1.ext: " + conf.ext, conf);
-			//ruDebugLog("conf1.importRoots: " + strGlue(conf.importRoots, ", "), conf);
-			
-			//ruDebugLog1("ruLspTextDocumentDidOpen start file: " + conf.file);
-			
+			out_lines = ref [];
 			call.run(
 				RuJob([
 					RuTask("update-conf", ruConf2Tree(conf)), 
 					RuTask("load-cache", makeTree1("file", file)), 
 					RuTask("file-source", setTree(makeTree1("file", file), "text", textitem.text))
 				]),
+				\msg -> refArrayPush(out_lines, msg),
 				\code -> {
-					//ruDebugLog1("ruLspTextDocumentDidOpen finish");
-					out = ruOutput();
-					ruClearOutput();
 					if (code != 0) {
-						call.out_cb(ruLspErrorResponse(call.id, 1, "error at opening: " + file + "\n" + out));
+						call.out_cb(ruLspErrorResponse(call.id, 1, "error at opening: " + file + "\n" + strGlue(^out_lines, "\n")));
 					}
 					call.loop_cb();
 				}
@@ -266,13 +270,17 @@ ruLspTextDocumentDidChange(call: RuLspMethodCall) -> void {
 		Some(textitem): {
 			file = ruCorrectUriPath(textitem.uri.path);
 			conf = ruLspFileConfig(call.conf, file);
+			out_lines = ref [];
 			call.run(
 				RuJob([
 					RuTask("update-conf", ruConf2Tree(conf)),
 					RuTask("file-changed", setTree(makeTree1("file", file), "change", json2string(call.params)))
 				]),
+				\msg -> refArrayPush(out_lines, msg),
 				\code -> {
-					ruClearOutput();
+					if (code != 0) {
+						call.out_cb(ruLspErrorResponse(call.id, 1, "error at applying changes to: " + file + "\n" + strGlue(^out_lines, "\n")));
+					}
 					call.loop_cb();
 				}
 			);
@@ -289,13 +297,17 @@ ruLspTextDocumentDidSave(call: RuLspMethodCall) -> void {
 		Some(params): {
 			file = ruCorrectUriPath(params.textDocument.uri.path);
 			conf = ruLspFileConfig(call.conf, file);
+			out_lines = ref [];
 			call.run(
 				RuJob([
 					RuTask("update-conf", ruConf2Tree(conf)),
 					RuTask("file-saved", makeTree1("file", file))
 				]),
-				\code_ -> {
-					ruClearOutput();
+				\msg -> refArrayPush(out_lines, msg), 
+				\code -> {
+					if (code != 0) {
+						call.out_cb(ruLspErrorResponse(call.id, 1, "error at saving: " + file + "\n" + strGlue(^out_lines, "\n")));
+					}
 					call.loop_cb();
 				}
 			);
@@ -312,18 +324,18 @@ ruLspTextDocumentDocumentSymbol(call: RuLspMethodCall) -> void {
 		Some(textid): {
 			file = ruCorrectUriPath(textid.uri.path);
 			conf = ruLspFileConfig(call.conf, file);
+			out_lines = ref [];
 			call.run(
 				RuJob([
 					RuTask("update-conf", ruConf2Tree(conf)),
 					RuTask("info-outline", makeTree1("file", file))
 				]),
+				\msg -> refArrayPush(out_lines, msg),
 				\code -> {
-					out = ruOutput();
-					ruClearOutput();
-					if (ruDetectLspError(out, call.conf)) {
+					if (ruDetectLspError(^out_lines, call.conf)) {
 						call.out_cb(ruLspNormalResponse(call.id, JsonNull()));
 					} else {
-						symbols = ruLspParseSymbols(out);
+						symbols = ruLspParseSymbols(^out_lines);
 						call.out_cb(ruLspNormalResponse(call.id, JsonArray(symbols)));
 					}
 					call.loop_cb();
@@ -342,6 +354,7 @@ ruLspTextDocumentDeclaration(call: RuLspMethodCall) -> void {
 		Some(textpos): {
 			file = ruCorrectUriPath(textpos.textDocument.uri.path);
 			conf = ruLspFileConfig(call.conf, file);
+			out_lines = ref [];
 			call.run(
 				RuJob([
 					RuTask("update-conf", ruConf2Tree(conf)),
@@ -351,13 +364,12 @@ ruLspTextDocumentDeclaration(call: RuLspMethodCall) -> void {
 						Pair("col", i2s(textpos.position.character))
 					]))
 				]),
+				\msg -> refArrayPush(out_lines, msg),
 				\code -> {
-					out = ruOutput();
-					ruClearOutput();
-					if (ruDetectLspError(out, call.conf)) {
+					if (ruDetectLspError(^out_lines, call.conf)) {
 						call.out_cb(ruLspNormalResponse(call.id, JsonNull()));
 					} else {
-						locations = ruLspParseLocations(out);
+						locations = ruLspParseLocations(^out_lines);
 						call.out_cb(ruLspNormalResponse(call.id, JsonArray(locations)));
 					}
 					call.loop_cb();
@@ -376,6 +388,7 @@ ruLspTextDocumentDefinition(call: RuLspMethodCall) -> void {
 		Some(textpos): {
 			file = ruCorrectUriPath(textpos.textDocument.uri.path);
 			conf = ruLspFileConfig(call.conf, file);
+			out_lines = ref [];
 			call.run(
 				RuJob([
 					RuTask("update-conf", ruConf2Tree(conf)),
@@ -385,13 +398,12 @@ ruLspTextDocumentDefinition(call: RuLspMethodCall) -> void {
 						Pair("col", i2s(textpos.position.character))
 					]))
 				]),
+				\msg -> refArrayPush(out_lines, msg),
 				\code -> {
-					out = ruOutput();
-					ruClearOutput();
-					if (ruDetectLspError(out, call.conf)) {
+					if (ruDetectLspError(^out_lines, call.conf)) {
 						call.out_cb(ruLspNormalResponse(call.id, JsonNull()));
 					} else {
-						locations = ruLspParseLocations(out);
+						locations = ruLspParseLocations(^out_lines);
 						call.out_cb(ruLspNormalResponse(call.id, JsonArray(locations)));
 					}
 					call.loop_cb();
@@ -410,6 +422,7 @@ ruLspTextDocumentReferences(call: RuLspMethodCall) -> void {
 		Some(textpos): {
 			file = ruCorrectUriPath(textpos.textDocument.uri.path);
 			conf = ruLspFileConfig(call.conf, file);
+			out_lines = ref [];
 			call.run(
 				RuJob([
 					RuTask("update-conf", ruConf2Tree(conf)),
@@ -419,13 +432,12 @@ ruLspTextDocumentReferences(call: RuLspMethodCall) -> void {
 						Pair("col", i2s(textpos.position.character))
 					]))
 				]),
+				\msg -> refArrayPush(out_lines, msg),
 				\code -> {
-					out = ruOutput();
-					ruClearOutput();
-					if (ruDetectLspError(out, call.conf)) {
+					if (ruDetectLspError(^out_lines, call.conf)) {
 						call.out_cb(ruLspNormalResponse(call.id, JsonNull()));
 					} else {
-						locations = ruLspParseLocations(out);
+						locations = ruLspParseLocations(^out_lines);
 						call.out_cb(ruLspNormalResponse(call.id, JsonArray(locations)));
 					}
 					call.loop_cb();
@@ -444,6 +456,7 @@ ruLspTextDocumentHover(call: RuLspMethodCall) -> void {
 		Some(textpos): {
 			file = ruCorrectUriPath(textpos.textDocument.uri.path);
 			conf = ruLspFileConfig(call.conf, file);
+			out_lines = ref [];
 			call.run(
 				RuJob([
 					RuTask("update-conf", ruConf2Tree(conf)),
@@ -453,12 +466,12 @@ ruLspTextDocumentHover(call: RuLspMethodCall) -> void {
 						Pair("col", i2s(textpos.position.character))
 					]))
 				]),
+				\msg -> refArrayPush(out_lines, msg),
 				\code -> {
-					out = ruOutput();
-					ruClearOutput();
-					if (ruDetectLspError(out, call.conf)) {
+					if (ruDetectLspError(^out_lines, call.conf)) {
 						call.out_cb(ruLspNormalResponse(call.id, JsonNull()));
 					} else {
+						out = strGlue(^out_lines, "\n");
 						if (isNotSpace(out)) {
 							hover = LspHover([LspMarkedString("russell", out)], None());
 							call.out_cb(ruLspNormalResponse(call.id, lspHover2Json(hover)));
@@ -482,6 +495,7 @@ ruLspTextDocumentRename(call: RuLspMethodCall) -> void {
 		Some(rename): {
 			file = ruCorrectUriPath(rename.textDocument.uri.path);
 			conf = ruLspFileConfig(call.conf, file);
+			out_lines = ref [];
 			call.run(
 				RuJob([
 					RuTask("update-conf", ruConf2Tree(conf)),
@@ -492,10 +506,9 @@ ruLspTextDocumentRename(call: RuLspMethodCall) -> void {
 						Pair("to", rename.newName)
 					]))
 				]),
+				\msg -> refArrayPush(out_lines, msg),
 				\code -> {
-					out = ruOutput();
-					ruClearOutput();
-					if (ruDetectLspError(out, call.conf)) {
+					if (ruDetectLspError(^out_lines, call.conf)) {
 						call.out_cb(ruLspNormalResponse(call.id, JsonNull()));
 					} else {
 						call.out_cb(ruLspNormalResponse(call.id, JsonNull()));
@@ -515,16 +528,17 @@ ruLspTextDocumentRename(call: RuLspMethodCall) -> void {
 ruLspWorkspaceSymbol(call: RuLspMethodCall) -> void {
 	switch (json2LspWorkspaceSymbolParams(call.params)) {
 		Some(symbol): {
+			out_lines = ref [];
 			call.run(
 				RuJob([
 					RuTask("info-symbol", makeTree1("name", symbol.query))
 				]),
+				\msg -> refArrayPush(out_lines, msg),
 				\code -> {
-					out = ruOutput();
-					ruClearOutput();
-					if (ruDetectLspError(out, call.conf)) {
+					if (ruDetectLspError(^out_lines, call.conf)) {
 						call.out_cb(ruLspNormalResponse(call.id, JsonNull()));
 					} else {
+						out = strGlue(^out_lines, "\n");
 						call.out_cb(ruLspNormalResponse(call.id, parseJson(out)));
 					}
 					call.loop_cb();
@@ -544,22 +558,21 @@ ruLspWorkspaceExecuteVerify(call : RuLspMethodCall, commandParams: LspExecuteCom
 		call.loop_cb();
 	} else {
 		file = ruCorrectUriPath(getJsonStringValue(commandParams.arguments[0], ""));
+		out_lines = ref [];
 		if (file == "") {
 			call.out_cb(ruLspErrorResponse(call.id, 1, "no file for verification"));
 			call.loop_cb();
 		} else {
 			conf = ruLspFileConfig(call.conf, file);
-			//ruDebugLog("verifying: " + conf.file, conf);
 			call.run(
 				RuJob([
 					RuTask("update-conf", ruConf2Tree(RuConf(conf with verbose=1))),
 					RuTask("read", makeTree1("file", file)),
 					RuTask("verify", makeTree1("target", file))
 				]),
+				\msg -> refArrayPush(out_lines, msg),
 				\code -> {
-					//ruDebugLog("code: " + i2s(code), conf);
-					out = ruOutput();
-					ruClearOutput();
+					out = strGlue(^out_lines, "\n");
 					call.out_cb(ruLspNormalResponse(call.id, JsonString(out)));
 					call.loop_cb();
 				}
@@ -576,16 +589,15 @@ ruLspWorkspaceExecuteFindSymbol(call : RuLspMethodCall, commandParams: LspExecut
 	if (length(commandParams.arguments) == 1) {
 		name = getJsonStringValue(commandParams.arguments[0], "");
 		if (name != "") {
+			out_lines = ref [];
 			call.run(
 				RuJob([RuTask("info-find", makeTree1("name", name))]),
+				\msg -> refArrayPush(out_lines, msg),
 				\code -> {
-					out = ruOutput();
-					ruClearOutput();
-					if (ruDetectLspError(out, call.conf)) {
+					if (ruDetectLspError(^out_lines, call.conf)) {
 						call.out_cb(ruLspNormalResponse(call.id, JsonNull()));
 					} else {
-						locations = ruLspParseLocations(out);
-						
+						locations = ruLspParseLocations(^out_lines);
 						if (length(locations) != 1) {
 							call.out_cb(ruLspNormalResponse(call.id, JsonNull()));
 						} else {
@@ -608,12 +620,13 @@ ruLspWorkspaceExecuteFindSymbol(call : RuLspMethodCall, commandParams: LspExecut
 ruLspWorkspaceExecuteMathInfo(call: RuLspMethodCall, commandParams: LspExecuteCommandParams) -> void {
 	if (length(commandParams.arguments) == 1) {
 		kind = getJsonStringValue(commandParams.arguments[0], "");
+		out_lines = ref [];
 		call.run(
 			RuJob([RuTask("info-math", makeTree1("kind", kind))]),
+			\msg -> refArrayPush(out_lines, msg),
 			\code -> {
-				out = ruOutput();
-				ruClearOutput();
-				if (ruDetectLspError(out, call.conf)) {
+				out = strGlue(^out_lines, "\n");
+				if (ruDetectLspError(^out_lines, call.conf)) {
 					call.out_cb(ruLspNormalResponse(call.id, JsonNull()));
 				} else {
 					call.out_cb(ruLspNormalResponse(call.id, parseJson(out)));
@@ -628,7 +641,7 @@ ruLspWorkspaceExecuteMathInfo(call: RuLspMethodCall, commandParams: LspExecuteCo
 }
 
 ruLspWorkspaceExecuteACommand(call: RuLspMethodCall, commandParams: LspExecuteCommandParams) -> void {
-	if (length(commandParams.arguments) > 0) {
+	if (length(commandParams.arguments) > 1) {
 		params = map(commandParams.arguments, \param -> getJsonStringValue(param, ""));
 		if (!startsWith(params[0], "file=")) {
 			call.out_cb(ruLspErrorResponse(call.id, 1, "command args must start with file=<path> option"));
@@ -646,19 +659,49 @@ ruLspWorkspaceExecuteACommand(call: RuLspMethodCall, commandParams: LspExecuteCo
 					if (containsKeyTree(task.args, "file")) task else RuTask(task with args = setTree(task.args, "file", file))
 				]
 			)));
-			call.run(
-				job,
-				\code -> {
-					out = ruOutput();
-					ruClearOutput();
-					if (ruDetectLspError(out, call.conf)) {
-						call.out_cb(ruLspNormalResponse(call.id, JsonNull()));
-					} else {
-						call.out_cb(ruLspNormalResponse(call.id, JsonString(out)));
-					}
-					call.loop_cb();
+			token = makeUuid();
+			ruMakeServerRequest("window/workDoneProgress/create",
+				lspWorkDoneProgressCreateParams2Json(LspWorkDoneProgressCreateParams(token)),
+				call.out_cb,
+				\response -> {
+					out_lines = ref [];
+					call.out_cb(ruLspNotification("$/progress", 
+						lspProgressParams2Json(LspProgressParams(token, 
+							lspWorkDoneProgressBegin2Json(LspWorkDoneProgressBegin(
+								"begin", "command " + params[1] + " started", false, "", 0.0
+							))
+						))
+					));
+					call.run(
+						job,
+						\msg -> {
+							call.out_cb(ruLspNotification("$/progress", 
+								lspProgressParams2Json(LspProgressParams(token, 
+									lspWorkDoneProgressReport2Json(LspWorkDoneProgressReport(
+										"report", false, "command " + params[1] + " in progress: " + msg, 0.0
+									))
+								))
+							));
+							refArrayPush(out_lines, msg)
+						},
+						\code -> {
+							call.out_cb(ruLspNotification("$/progress", 
+								lspProgressParams2Json(LspProgressParams(token, 
+									lspWorkDoneProgressEnd2Json(LspWorkDoneProgressEnd("end", "command " + params[1] + " ended"))
+								))
+							));
+							if (ruDetectLspError(^out_lines, call.conf)) {
+								call.out_cb(ruLspNormalResponse(call.id, JsonNull()));
+							} else {
+								out = strGlue(^out_lines, "\n");
+								call.out_cb(ruLspNormalResponse(call.id, JsonString(out)));
+							}
+							call.loop_cb();
+						}
+					);
 				}
-		);
+			);
+			call.loop_cb();
 		}
 	} else {
 		call.out_cb(ruLspErrorResponse(call.id, 1, "command takes at least one parameter: the command itself. Passed " + i2s(length(commandParams.arguments)) + " args."));
@@ -691,15 +734,14 @@ ruLspWorkspaceExecuteCommand(call: RuLspMethodCall) -> void {
 	}
 }
 
-ruDetectLspError(out : string, conf : RuConf) -> bool {
-	if (strContains(out, "Error: ") || strContains(out, "Fail: ")) {
-		ruServerLog("ERROR: " + out, conf);
+ruDetectLspError(lines : [string], conf : RuConf) -> bool {
+	if (exists(lines, \l -> strContains(l, "Error: ") || strContains(l, "Fail: "))) {
+		ruServerLog("Server error: " + strGlue(lines, "\\n"), conf);
 		true
 	} else false;
 }
 
 ruLspFileConfig(def : RuConf, path : string) -> RuConf {
-	//path = ruCorrectUriPath(path0);
 	cwd_dir = strReplace(resolveRelativePath("."), "\\", "/");
 	ext = getFileExt(path);
 	file_dir = dirName(path);
@@ -722,9 +764,8 @@ ruLspFileConfig(def : RuConf, path : string) -> RuConf {
 	}
 }
 
-ruLspParseLocations(s : string) -> [Json] {
-	//isNum = \st -> st != "" && isDigits(st);
-	filtermap(strSplit(s, "\n"), \l -> maybeMap(ruLspParseLocation(l), \p -> lspLocation2Json(p.first)));
+ruLspParseLocations(lines : [string]) -> [Json] {
+	filtermap(lines, \l -> maybeMap(ruLspParseLocation(l), \p -> lspLocation2Json(p.first)));
 }
 
 ruString2SymbolKind(str : string) -> int {
@@ -747,9 +788,8 @@ ruString2SymbolKind(str : string) -> int {
 	}
 }
 
-ruLspParseSymbols(s : string) -> [Json] {
-	//isNum = \st -> st != "" && isDigits(st);
-	filtermap(strSplit(s, "\n"), \l -> 
+ruLspParseSymbols(lines : [string]) -> [Json] {
+	filtermap(lines, \l -> 
 		maybeBind(ruLspParseLocation(l), \p -> {
 			loc = p.first;
 			descr_parts = strSplit(trim(p.second), " ");

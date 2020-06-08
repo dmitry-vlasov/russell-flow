@@ -72,8 +72,7 @@ function execCommand() {
 		if (val_arr.length > 0) {
 			let file_arg = Array("file=" + vscode.window.activeTextEditor.document.uri.fsPath);
 			let args = file_arg.concat(val_arr);
-			let cts = new CancellationTokenSource();
-			client.sendRequest("workspace/executeCommand", { command : "command", arguments: args , "workDoneToken": cts.token}).then(
+			client.sendRequest("workspace/executeCommand", { command : "command", arguments: args }).then(
 				(out : string) => {
 					russellChannel.appendLine(out);
 				},
@@ -131,6 +130,7 @@ function startLspServer() {
 	client = new LanguageClient('russell', 'Russell Language Server', serverOptions, clientOptions);
 	// Start the client. This will also launch the server
 	client.start();
+	client.onNotification("workspace/executeCommand", (msg : string) => russellChannel.appendLine(msg));
 }
 
 function restartLspServer() {
