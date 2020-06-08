@@ -130,7 +130,9 @@ function startLspServer() {
 	client = new LanguageClient('russell', 'Russell Language Server', serverOptions, clientOptions);
 	// Start the client. This will also launch the server
 	client.start();
-	client.onNotification("workspace/executeCommand", (msg : string) => russellChannel.appendLine(msg));
+	client.onReady().then(
+		() => client.onNotification("console/message", (msg : string) => russellChannel.appendLine(msg))
+	);
 }
 
 function restartLspServer() {
