@@ -82,6 +82,7 @@ ruLspMethods = pairs2tree([
 	Pair("textDocument/references", ruLspTextDocumentReferences),
 	Pair("textDocument/hover", ruLspTextDocumentHover),
 	Pair("textDocument/rename", ruLspTextDocumentRename),
+	Pair("textDocument/codeAction", ruLspTextDocumentCodeAction),
 	Pair("workspace/symbol", ruLspWorkspaceSymbol),
 	Pair("workspace/executeCommand", ruLspWorkspaceExecuteCommand),
 ]);
@@ -224,6 +225,14 @@ ruLspInitialize(call: RuLspMethodCall) -> void {
 					Pair("renameProvider", JsonBool(true)),
 					Pair("workspaceSymbolProvider", JsonBool(true)),
 					Pair("executeCommandProvider", ruExecuteCommandOptions),
+					/*Pair("codeActionProvider", 
+						JsonObject([
+							Pair("codeActionKinds", JsonArray([
+								JsonString("verify"), JsonString("prove"), JsonString("reprove"), JsonString("generalize")
+							])),
+						])
+					),*/
+					Pair("codeActionProvider", JsonBool(true)),
 					Pair("textDocumentSync",
 						JsonObject([
 							Pair("openClose", JsonBool(true)),
@@ -524,6 +533,39 @@ ruLspTextDocumentRename(call: RuLspMethodCall) -> void {
 	}
 }
 
+ruLspTextDocumentCodeAction(call: RuLspMethodCall) -> void {
+	switch (json2LspCodeActionParams(call.params)) {
+		Some(params): {
+			file = ruCorrectUriPath(params.textDocument.uri.path);
+			conf = ruLspFileConfig(call.conf, file);
+			out_lines = ref [];
+			call.run(
+				RuJob([
+					RuTask("update-conf", ruConf2Tree(conf)),
+					RuTask("actions", pairs2tree([
+						Pair("file", file),
+						Pair("line", i2s(params.range.start.line)), 
+						Pair("col", i2s(params.range.start.character)),
+					]))
+				]),
+				\msg -> refArrayPush(out_lines, msg),
+				\code -> {
+					if (ruDetectLspError(^out_lines, call.conf)) {
+						call.out_cb(ruLspNormalResponse(call.id, JsonNull()));
+					} else {
+						out = strGlue(^out_lines, "\n");
+						call.out_cb(ruLspNormalResponse(call.id, parseJson(out)));
+					}
+					call.loop_cb();
+				}
+			);
+		}
+		None(): {
+			call.out_cb(ruLspErrorResponse(call.id, 1, "code action params are invalid: " + json2string(call.params)));
+			call.loop_cb();
+		}
+	}
+}
 
 ruLspWorkspaceSymbol(call: RuLspMethodCall) -> void {
 	switch (json2LspWorkspaceSymbolParams(call.params)) {
@@ -557,25 +599,22 @@ ruLspWorkspaceExecuteVerify(call : RuLspMethodCall, commandParams: LspExecuteCom
 		call.out_cb(ruLspErrorResponse(call.id, 1, "no file for verification is provided"));
 		call.loop_cb();
 	} else {
-		file = ruCorrectUriPath(getJsonStringValue(commandParams.arguments[0], ""));
-		out_lines = ref [];
+		params = map(commandParams.arguments, \param -> getJsonStringValue(param, ""));
+		file = ruCorrectUriPath(params[0]);
 		if (file == "") {
 			call.out_cb(ruLspErrorResponse(call.id, 1, "no file for verification"));
 			call.loop_cb();
 		} else {
 			conf = ruLspFileConfig(call.conf, file);
+			target = if (length(params) < 2) file else params[1];
 			call.run(
 				RuJob([
 					RuTask("update-conf", ruConf2Tree(RuConf(conf with verbose=1))),
 					RuTask("read", makeTree1("file", file)),
-					RuTask("verify", makeTree1("target", file))
+					RuTask("verify", makeTree1("target", target))
 				]),
-				\msg -> refArrayPush(out_lines, msg),
-				\code -> {
-					out = strGlue(^out_lines, "\n");
-					call.out_cb(ruLspNormalResponse(call.id, JsonString(out)));
-					call.loop_cb();
-				}
+				\msg -> call.out_cb(ruLspNotification("console/message", JsonString(msg))),
+				\code -> call.loop_cb()
 			);
 		}
 	}

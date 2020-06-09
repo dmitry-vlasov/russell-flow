@@ -50,6 +50,58 @@ ruRunRemote(job : RuJob, onData: (string) -> void, onError : (string) -> void, o
 	)
 }
 
+ru_env = ref RuEnv(ruEmptyMath, mmEmptyMath, ruMakeConf(".", []));
+
+ruRunLocal(job : RuJob, onMessage : (string) -> void, onRunComplete : (int) -> void) -> void {
+	ru_env := fold(job.tasks, ^ru_env, \acc, t -> {
+		task = ruPrepareTask(t, acc.conf);
+		switch (lookupTree(ruCommands(), task.command)) {
+			Some(command): {
+				conf = RuConf(acc.conf with onMessage = onMessage);
+				if (ruCheckTaskArgs(task, command, conf)) {
+					command.run(task, RuEnv(acc with conf = conf));
+				} else {
+					acc;
+				}
+			}
+			None(): {
+				onMessage("Unknown command: '" + task.command + "'");
+				acc;
+			}
+		}
+	});
+	onRunComplete(0);
+}
+
+ruPrepareTask(task : RuTask, conf : RuConf) -> RuTask {
+	switch (lookupTree(task.args, "file")) {
+		Some(file): {
+			module = ruTrimPath(file, conf, getFileExt(file));
+			RuTask(task with args = setTree(task.args, "module", module));
+		}
+		None(): {
+			switch (lookupTree(conf.opts, "root-file")) {
+				Some(file): {
+					module = ruTrimPath(file, conf, getFileExt(file));
+					RuTask(task with 
+						args = setTree(setTree(task.args, "file", file), "module", module)
+					);
+				}
+				None(): task;
+			}
+		}
+	}
+}
+
+ruCheckTaskArgs(task : RuTask, command : RuComm, conf : RuConf) -> bool {
+	forall(command.args, \arg ->
+		if (arg.optional || containsKeyTree(task.args, arg.name)) true else {
+			conf.onMessage("Obligatory argument '" + arg.name + "' of the command '" + task.command + "' is missing");
+			false;
+		}
+	)
+}
+
 ru_commands : ref Maybe<Tree<string, RuComm>> = ref None();
 
 ruCommands() -> Tree<string, RuComm> {
@@ -101,6 +153,15 @@ ruCommands() -> Tree<string, RuComm> {
 				RuComm("show-conf", "conf", "show current configuration key-value pairs", [], ruCommShowConf),
 				RuComm("load-conf", "conf", "load configuration from given directory", [RuCommArg("dir", false, "directory with config file", "")], ruCommLoadConf),
 				RuComm("clear-conf", "conf", "clear configuration", [], ruCommClearConf),
+				RuComm(
+					"actions", "", "available actions at the given position",
+					[
+						RuCommArg("file", false, "input file", ""), 
+						RuCommArg("line", false, "clear", ""), 
+						RuCommArg("col", false, "clear", "")
+					], 
+					ruCommActions
+				),
 			],
 			ruIoCommands(),
 			ruRefactorCommands(),
@@ -112,6 +173,30 @@ ruCommands() -> Tree<string, RuComm> {
 		fold(concatA(commands_list), makeTree(), \acc, comm -> setTree(acc, comm.name, comm));
     }
     onlyOnce(ru_commands, init_commands);
+}
+
+ruCommActions(task : RuTask, env : RuEnv) -> RuEnv {
+	actions = ["verify", "prove", "reprove", "generalize"];
+	file = lookupTreeDef(task.args, "file", "");
+	line = s2i(lookupTreeDef(task.args, "line", "-1"));
+	col = s2i(lookupTreeDef(task.args, "col", "-1"));
+	name = ruNameByLineCol(line, col, getFileContent(file));
+	json = if (name == "") JsonArray([]) else {
+		JsonArray(map(actions, \action -> 
+			lspCodeAction2Json(LspCodeAction(
+				action + " " + name, action, [], false, None(),
+				Some(LspCommand(
+					action + " " + name,
+					"command",
+					map(["file=" + file, "read", ";", action, "target=" + name], 
+						\arg -> JsonString(arg)
+					)
+				))
+			))
+		));
+	}
+	env.conf.onMessage(json2string(json));
+	env;
 }
 
 ruCommHelp(task : RuTask, env : RuEnv) -> RuEnv {
@@ -145,58 +230,6 @@ ruCommLoadConf(task : RuTask, env : RuEnv) -> RuEnv {
 
 ruCommClearConf(task : RuTask, env : RuEnv) -> RuEnv {
 	RuEnv(env with conf = ruTree2Conf(makeTree()));
-}
-
-ru_env = ref RuEnv(ruEmptyMath, mmEmptyMath, ruMakeConf(".", []));
-
-ruRunLocal(job : RuJob, onMessage : (string) -> void, onRunComplete : (int) -> void) -> void {
-	ru_env := fold(job.tasks, ^ru_env, \acc, t -> {
-		task = ruPrepareTask(t, acc.conf);
-		switch (lookupTree(ruCommands(), task.command)) {
-			Some(command): {
-				conf = RuConf(acc.conf with onMessage = onMessage);
-				if (ruCheckTaskArgs(task, command, conf)) {
-					command.run(task, RuEnv(acc with conf = conf));
-				} else {
-					acc;
-				}
-			}
-			None(): {
-				onMessage("Unknown command: '" + task.command + "'");
-				acc;
-			}
-		}
-	});
-	onRunComplete(0);
-}
-
-ruPrepareTask(task : RuTask, conf : RuConf) -> RuTask {
-	switch (lookupTree(task.args, "file")) {
-		Some(file): {
-			module = ruTrimPath(file, conf, getFileExt(file));
-			RuTask(task with args = setTree(task.args, "module", module));
-		}
-		None(): {
-			switch (lookupTree(conf.opts, "root-file")) {
-				Some(file): {
-					module = ruTrimPath(file, conf, getFileExt(file));
-					RuTask(task with 
-						args = setTree(setTree(task.args, "file", file), "module", module)
-					);
-				}
-				None(): task;
-			}
-		}
-	}
-}
-
-ruCheckTaskArgs(task : RuTask, command : RuComm, conf : RuConf) -> bool {
-	forall(command.args, \arg ->
-		if (arg.optional || containsKeyTree(task.args, arg.name)) true else {
-			conf.onMessage("Obligatory argument '" + arg.name + "' of the command '" + task.command + "' is missing");
-			false;
-		}
-	)
 }
 
 ruFileSyncCommands() -> [RuComm] {[
