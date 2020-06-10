@@ -16,6 +16,7 @@ let russellChannel : vscode.OutputChannel = null;
 let serverStatusBarItem: vscode.StatusBarItem;
 let httpServer : ChildProcess;
 let httpServerOnline : boolean = false;
+let mathProvider = new MathProvider();
 
 export function activate(context: vscode.ExtensionContext) {	
 	serverStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
@@ -30,29 +31,12 @@ export function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(vscode.commands.registerCommand('russell.findSymbol', findSymbol));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.execCommand', execCommand));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.gotoLocation', gotoLocation));
-
-	const axiomsProvider = new MathProvider(context, () => mathInfo('axioms'));
-	vscode.window.registerTreeDataProvider('math-axioms', axiomsProvider);
-	vscode.commands.registerCommand('russell.refreshAxioms', () => axiomsProvider.update());
-
-	const defsProvider = new MathProvider(context, () => mathInfo('defs'));
-	vscode.window.registerTreeDataProvider('math-defs', defsProvider);
-	vscode.commands.registerCommand('russell.refreshDefs', () => defsProvider.update());
-
-	const typesProvider = new MathProvider(context, () => mathInfo('types'));
-	vscode.window.registerTreeDataProvider('math-types', typesProvider);
-	vscode.commands.registerCommand('russell.refreshTypes', () => typesProvider.update());
-
-	const rulesProvider = new MathProvider(context, () => mathInfo('rules'));
-	vscode.window.registerTreeDataProvider('math-rules', rulesProvider);
-	vscode.commands.registerCommand('russell.refreshRules', () => rulesProvider.update());
-
-	const constsProvider = new MathProvider(context, () => mathInfo('consts'));
-	vscode.window.registerTreeDataProvider('math-consts', constsProvider);
-	vscode.commands.registerCommand('russell.refreshConsts', () => constsProvider.update());
+	context.subscriptions.push(vscode.commands.registerCommand('russell.refreshMath', mathInfo));
 
     russellChannel = vscode.window.createOutputChannel("Russell");
 	russellChannel.show(true);
+
+	vscode.workspace.onDidOpenTextDocument(mathInfo);
 
 	checkHttpServerStatus(true);
 	setInterval(checkHttpServerStatus, 3000, false);
@@ -60,8 +44,10 @@ export function activate(context: vscode.ExtensionContext) {
 	startLspServer();
 }
 
-function mathInfo(type : string): Thenable<MathEntity[]> {
-	return client.sendRequest("workspace/executeCommand", { command: "math-info", arguments: [type] });
+function mathInfo(): void {
+	client.sendRequest("workspace/executeCommand", { command: "math-info", arguments: [] }).then(
+		(data : MathEntity[]) => mathProvider.update(data)
+	);
 }
 
 function execCommand() {
