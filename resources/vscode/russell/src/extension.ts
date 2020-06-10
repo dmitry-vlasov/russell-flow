@@ -26,6 +26,8 @@ export function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(vscode.commands.registerCommand('russell.verifyTheorem', () => processRussellTheorem("verify")));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.reproveFile', (uri) => processRussellFile(uri, "reprove")));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.reproveTheorem', () => processRussellTheorem("reprove")));
+	context.subscriptions.push(vscode.commands.registerCommand('russell.generalizeFile', (uri) => processRussellFile(uri, "generalize")));
+	context.subscriptions.push(vscode.commands.registerCommand('russell.generalizeTheorem', () => processRussellTheorem("generalize")));
     context.subscriptions.push(vscode.commands.registerCommand('russell.metamath', verifyMetamath));
     context.subscriptions.push(vscode.commands.registerCommand('russell.startHttpServer', startHttpServer));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.stopHttpServer', stopHttpServer));
