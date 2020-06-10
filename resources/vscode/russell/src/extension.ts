@@ -22,7 +22,10 @@ export function activate(context: vscode.ExtensionContext) {
 	serverStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
 	serverStatusBarItem.command = 'russell.toggleHttpServer';
     context.subscriptions.push(serverStatusBarItem);
-    context.subscriptions.push(vscode.commands.registerCommand('russell.verify', verifyRussell));
+	context.subscriptions.push(vscode.commands.registerCommand('russell.verifyFile', verifyRussellFile));
+	context.subscriptions.push(vscode.commands.registerCommand('russell.verifyTheorem', verifyRussellTheorem));
+	context.subscriptions.push(vscode.commands.registerCommand('russell.reproveFile', reproveRussellFile));
+	context.subscriptions.push(vscode.commands.registerCommand('russell.reproveTheorem', reproveRussellTheorem));
     context.subscriptions.push(vscode.commands.registerCommand('russell.metamath', verifyMetamath));
     context.subscriptions.push(vscode.commands.registerCommand('russell.startHttpServer', startHttpServer));
 	context.subscriptions.push(vscode.commands.registerCommand('russell.stopHttpServer', stopHttpServer));
@@ -229,15 +232,67 @@ function resolveProjectRoot(uri : string | vscode.Uri) : string {
 	return getPath(config.get("root"));
 }
 
-function verifyRussell() {
-	//russellChannel.clear();
+function verifyRussellFile(uri : vscode.Uri): void {
+	/*russellChannel.show(true);
+	let file = vscode.window.activeTextEditor.document.uri.fsPath;
+	if (uri) {
+		file = uri.fsPath;
+	}
+	client.sendRequest("workspace/executeCommand", { command : "verify", arguments: [file] }).then(
+		(out : string) => russellChannel.appendLine(out)
+	);*/
+	processRussellFile(uri, "verify");
+}
+
+function verifyRussellTheorem(): void {
+	/*russellChannel.show(true);
+	let file = vscode.window.activeTextEditor.document.uri.fsPath;
+	let pos = vscode.window.activeTextEditor.selection.active;
+	if (pos instanceof vscode.Position) {
+		let range = vscode.window.activeTextEditor.document.getWordRangeAtPosition(pos);
+		let target = vscode.window.activeTextEditor.document.getText(range);
+		client.sendRequest("workspace/executeCommand", { command : "verify", arguments: [file, target] }).then(
+			(out : string) => russellChannel.appendLine(out)
+		);
+	}*/
+	processRussellTheorem("verify");
+}
+
+function reproveRussellFile(uri : vscode.Uri): void {
+	processRussellFile(uri, "reprove");
+}
+
+function reproveRussellTheorem(): void {
+	processRussellTheorem("reprove");
+}
+
+function processRussellFile(uri : vscode.Uri, action : string): void {
+	processRussell(uri, uri.fsPath, action);
+}
+
+function processRussellTheorem(action : string): void {
+	let uri = vscode.window.activeTextEditor.document.uri;
+	let pos = vscode.window.activeTextEditor.selection.active;
+	if (pos instanceof vscode.Position) {
+		let range = vscode.window.activeTextEditor.document.getWordRangeAtPosition(pos);
+		let target = vscode.window.activeTextEditor.document.getText(range);
+		processRussell(uri, target, action);
+	}
+}
+
+function processRussell(uri : vscode.Uri, target : string, action : string): void {
 	russellChannel.show(true);
-	client.sendRequest(
-		"workspace/executeCommand", 
-		{ command : "verify", arguments: [vscode.window.activeTextEditor.document.uri.fsPath] }
-	).then((out : string) => russellChannel.appendLine(out));
+	client.sendRequest("workspace/executeCommand", { 
+		command : "command", 
+		arguments: [
+			"file=" + uri.fsPath, "read",  ";",
+			action, "target=" + target
+		] 
+	}); //.then(
+	//	(out : string) => russellChannel.appendLine(out)
+	//);
 }
 
 function verifyMetamath() {
-    verifyRussell();
+    //verifyRussellFile(null);
 }
