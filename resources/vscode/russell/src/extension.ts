@@ -235,6 +235,9 @@ function resolveProjectRoot(uri : string | vscode.Uri) : string {
 }
 
 function processRussellFile(uri : vscode.Uri, action : string): void {
+	if (!uri) {
+		uri = vscode.window.activeTextEditor.document.uri;
+	}
 	processRussell(uri, uri.fsPath, action);
 }
 
