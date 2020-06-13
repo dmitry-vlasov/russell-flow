@@ -1,5 +1,6 @@
 import prover/ru_prover_prove;
 import prover/ru_prover_stats;
+import ru_reindex_theorem_vars;
 
 export {
 	ruProof2Theorem(name : string, proof : RuDAG<string>, math : RuMath, conf : RuConf, time_limit : double) -> Maybe<RuTheorem>;
@@ -9,7 +10,6 @@ ruProof2Theorem(name : string, proof : RuDAG<string>, math : RuMath, conf : RuCo
 	steps = ref [];
 	premises = ref ruMakeIndex();
 	ruProve(ruInitBuildProofEnv(proof, math, conf, time_limit, steps, premises));
-	^steps;
 	hyps = sortCustom(ruIndexValues(^premises), \hyp -> hyp.ind, true);
 	prop = (^steps)[length(^steps) - 1].expr;
 	vars = foldSet(
@@ -17,7 +17,13 @@ ruProof2Theorem(name : string, proof : RuDAG<string>, math : RuMath, conf : RuCo
 		makeTree(),	\acc, v -> setTree(acc, v.name, v)
 	);
 	th = RuTheorem(name, vars, makeSet(), makeSet(), hyps, prop, ruNoProof, -1);
-	ruUpdateTheoremWithSteps(th, ^steps, math, conf);
+	maybeBind(
+		ruUpdateTheoremWithSteps(th, ^steps, math, conf),
+		\updated -> {
+			reindexed = ruReindexTheoremVars(updated, conf);
+			ruVerifyTheorem(reindexed, math, conf);
+		}
+	);
 }
 
 ruInitBuildProofEnv(
@@ -29,7 +35,15 @@ ruInitBuildProofEnv(
 	root_ass = find_ass(proof.data);
 	mapping : ref Tree<RuProverProp, RuDAG<string>> = ref makeTree();
 	vars = ref makeTree();
-	root = RuProverRoot(ref [], root_ass.prop, ref []);
+	fresher = \v -> {
+		vars := setTree(^vars, v, lookupTreeDef(^vars, v, 0) + 1);
+		RuVar(v.name + "_" + i2s(lookupTreeDef(^vars, v, 0)), v.type);
+	}
+	root_exp = ruApplySubst(
+		root_ass.prop,
+		ruMakeFresh(set2array(ruExp2Vars(root_ass.prop.nodes)), fresher)
+	);
+	root = RuProverRoot(ref [], root_exp, ref []);
 	id = ref 0;
 	env = RuProverEnv(
 		{ started = timestamp(); \-> timestamp() - started > ms_time_limit },
@@ -40,10 +54,7 @@ ruInitBuildProofEnv(
 		ruBuildTactic(),
 		math,
 		conf,
-		\v -> {
-			vars := setTree(^vars, v, lookupTreeDef(^vars, v, 0) + 1);
-			RuVar(v.name + "_" + i2s(lookupTreeDef(^vars, v, 0)), v.type);
-		},
+		fresher,
 		idfn,
 		\s -> steps := s,
 		ruBuildOnProp(conf, mapping, proof),
@@ -60,13 +71,13 @@ ruBuildUnifyAssertion(
 ) -> (RuProverHyp) -> [RuUnified<RuAssertion>] {
 	\hyp -> {
 		switch (hyp) {
-			RuProverExp(ind,__,__,__,parent): {
+			RuProverExp(ind,__,expr,__,parent): {
 				switch (lookupTree(^mapping, parent)) {
 					Some(node): {
 						switch (lookupTree(math.assertions, node.children[ind].data)) {
 							Some(ws): {
 								a = ws.item;
-								switch (ruUnifyExps([hyp.expr, a.prop], makeTree(), math, conf)) {
+								switch (ruUnifyExps([expr, a.prop], makeTree(), math, conf)) {
 									Some(theta): [RuUnified(theta, a, ruApplySubst(a.prop, theta))];
 									None(): [];
 								}
@@ -81,8 +92,11 @@ ruBuildUnifyAssertion(
 					}
 				}
 			}
-			RuProverRoot(__,e,__): {
-				[RuUnified(makeTree(), root_ass, e)];
+			RuProverRoot(__,expr,__): {
+				switch (ruUnifyExps([expr, root_ass.prop], makeTree(), math, conf)) {
+					Some(theta): [RuUnified(theta, root_ass, ruApplySubst(root_ass.prop, theta))];
+					None(): [];
+				}
 			}
 		}
 	}
