@@ -7,29 +7,55 @@ export {
 }
 
 ruProof2Theorem(name : string, proof : RuDAG<string>, math : RuMath, conf : RuConf, time_limit : double) -> Maybe<RuTheorem> {
-	steps = ref [];
+	proof_root = ref None();
 	premises = ref ruMakeIndex();
-	ruProve(ruInitBuildProofEnv(proof, math, conf, time_limit, steps, premises));
-	hyps = sortCustom(ruIndexValues(^premises), \hyp -> hyp.ind, true);
-	prop = (^steps)[length(^steps) - 1].expr;
-	vars = foldSet(
-		fold(hyps, ruExp2Vars(prop.nodes), \acc, hyp -> mergeSets(acc, ruExp2Vars(hyp.expr.nodes))), 
-		makeTree(),	\acc, v -> setTree(acc, v.name, v)
-	);
-	th = RuTheorem(name, vars, makeSet(), makeSet(), hyps, prop, ruNoProof, -1);
-	maybeBind(
-		ruUpdateTheoremWithSteps(th, ^steps, math, conf),
-		\updated -> {
-			reindexed = ruReindexTheoremVars(updated, conf);
-			ruVerifyTheorem(reindexed, math, conf);
+	env = ruProve(ruInitBuildProofEnv(proof, math, conf, time_limit, proof_root, premises));
+	
+	switch (^proof_root) {
+		Some(root): {
+			leafs = ruProofNodeHyps(root);
+			pair = foldSet(leafs, Pair(ruMakeIndex(), makeTree()), \acc, leaf -> {
+					index = acc.first;
+					mapping = acc.second;
+					hs = ruFindIndex(leaf.expr, index, math);
+					if (hs == []) {
+						new_hyp = RuHyp(ruIndexDataCount(index), leaf.expr, -1);
+						Pair(ruSetIndex(leaf.expr, new_hyp, index), setTree(mapping, leaf.hyp, new_hyp));
+					} else {
+						Pair(index, setTree(mapping, leaf.hyp, hs[0]));
+					}
+				}
+			);
+			hyps_index = pair.first;
+			hyps = sortCustom(ruIndexValues(hyps_index), \hyp -> hyp.ind, true);
+			updated_root = ruUpdateProofNodeHyps(root, pair.second);
+			steps = map(ruMakeLinearProof(updated_root), \step -> RuStep(step with expr = env.unconst(step.expr)));
+			prop = (steps)[length(steps) - 1].expr;
+			vars = foldSet(
+				fold(hyps, ruExp2Vars(prop.nodes), \acc, hyp -> mergeSets(acc, ruExp2Vars(hyp.expr.nodes))), 
+				makeTree(),	\acc, v -> setTree(acc, v.name, v)
+			);
+			th = RuTheorem(name, vars, makeSet(), makeSet(), hyps, prop, ruNoProof, -1);
+			maybeBind(
+				ruUpdateTheoremWithSteps(th, steps, math, conf),
+				\updated -> {
+					reindexed = ruReindexTheoremVars(updated, conf);
+					ruVerifyTheorem(reindexed, math, conf);
+				}
+			);
 		}
-	);
+		None(): {
+			conf.onMessage("NO STEPS");
+			conf.onMessage(ruProverTree2s(env.tree.root, math));
+			None();
+		}
+	}
 }
 
 ruInitBuildProofEnv(
 	proof : RuDAG<string>, 
 	math : RuMath, conf : RuConf, ms_time_limit : double, 
-	steps : ref [RuStep], premises : ref RuIndex<RuHyp>
+	root_proof : ref Maybe<RuProofNode>, premises : ref RuIndex<RuHyp>
 ) -> RuProverEnv {
 	find_ass = \name -> lookupTreeDef(math.assertions, name, RuWithSource(ruNoAxiom, "")).item;
 	root_ass = find_ass(proof.data);
@@ -56,7 +82,7 @@ ruInitBuildProofEnv(
 		conf,
 		fresher,
 		idfn,
-		\s -> steps := s,
+		\n -> root_proof := Some(n),
 		ruBuildOnProp(conf, mapping, proof),
 		\ -> { ret = ^id; id := ^id + 1; ret; },
 	);
@@ -108,31 +134,30 @@ ruBuildUnifyPremise(
 	mapping : ref Tree<RuProverProp, RuDAG<string>>,
 	premises : ref RuIndex<RuHyp>
 ) -> (RuProverHyp) -> [RuUnified<RuHyp>] {
-	hyp_parent = \hyp -> {
-		switch (hyp) {
-			RuProverExp(__,__,__,__,parent): parent;
-			default: ruNoProverProp;
-		}
-	}
 	\hyp -> {
-		switch (lookupTree(^mapping, hyp_parent(hyp))) {
-			Some(node): {
-				if (node.children != []) [] else {
-					hyps = ruFindIndex(hyp.expr, ^premises, math);
-					if (hyps == []) {
-						h = RuHyp(ruIndexDataCount(^premises), hyp.expr, -1);
-						premises := ruSetIndex(hyp.expr, h, ^premises);
-						[RuUnified(makeTree(), h, hyp.expr)];
-					} else {
-						[RuUnified(makeTree(), hyps[0], hyp.expr)];
+		switch (hyp) {
+			RuProverExp(ind,__,expr,__,parent): {
+				switch (lookupTree(^mapping, parent)) {
+					Some(node): {
+						if (node.children[ind].data != "") [] else {
+							hyps = ruFindIndex(expr, ^premises, math);
+							if (hyps == []) {
+								h = RuHyp(ruIndexDataCount(^premises), expr, -1);
+								premises := ruSetIndex(expr, h, ^premises);
+								[RuUnified(makeTree(), h, expr)];
+							} else {
+								[RuUnified(makeTree(), hyps[0], expr)];
+							}
+						}
+					}
+					None(): {
+						conf.onMessage("must not happen");
+						quit(-1);
+						[];
 					}
 				}
 			}
-			None(): {
-				conf.onMessage("must not happen");
-				quit(-1);
-				[];
-			}
+			RuProverRoot(__,__,__): [];
 		}
 	}
 }
