@@ -23,7 +23,18 @@ export {
 
 	ruCommArg2s(arg : RuCommArg) -> string;
 	ruComm2s(comm : RuComm) -> string;
-	ruComms2s(comms : [RuComm]) -> string ;
+	ruComms2s(comms : [RuComm]) -> string;
+
+	// Apply 'fn' to the decls from 'target' task option. 
+	// Selects decls to process with 'pred' parameter.
+	// Balances the time limit between all admitted decls
+	// proportionally to the 'measure'.
+	ruApplyFnComm(
+		fn_name : string, 
+		pred : (RuDecl) -> bool, 
+		measure : (RuDecl) -> double, 
+		fn : (RuDecl, double, RuEnv) -> bool
+	) -> (task : RuTask, env : RuEnv) -> void;
 }
 
 ruCommArg2s(arg : RuCommArg) -> string {
@@ -59,8 +70,13 @@ ruComms2s(comms : [RuComm]) -> string {
 		"\n"
 	);
 }
-/*
-ruApplyTheoremComm(fn_name : string, fn : (RuTheorem, double, RuEnv) -> RuEnv) -> (task : RuTask, env : RuEnv) -> RuEnv {
+
+ruApplyFnComm(
+	fn_name : string, 
+	pred : (RuDecl) -> bool, 
+	measure : (RuDecl) -> double,
+	fn : (RuDecl, double, RuEnv) -> bool
+) -> (task : RuTask, env : RuEnv) -> void {
 	\task : RuTask, env : RuEnv -> {
 		file = lookupTreeDef(task.args, "file", "");
 		math = env.ruMath;
@@ -70,38 +86,43 @@ ruApplyTheoremComm(fn_name : string, fn : (RuTheorem, double, RuEnv) -> RuEnv) -
 		if (conf.verbose > 0) {
 			conf.onMessage(fn_name + " target: " + target);
 		}
-		gen_level = s2i(lookupTreeDef(task.args, "level", "2"));
-		generalized_count = ref 0;
-		gen_array : ref [Pair<RuTheorem, RuTheorem>] = ref [];
-		failed_count = ref 0;
-		failed_th_names = ref [];
+		failure = ref 0;
+		success = ref 0;
+		failed_names = ref [];
 		max_time = ref 0.0;
-		max_th_name = ref "";
-		apply_th = \th, time_limit -> fn(th, time_limit, evalActionExp);
-		generalize_ass = \ass : RuAssertion, time_limit -> 
-			switch (ass) {
-				RuTheorem(__,__,__,__,__,__,__,__): apply_th(ass, time_limit);
-				default: true;
+		max_name = ref "";
+		apply_decl = \decl, time_limit -> {
+			start = timestamp();
+			ret = if (fn(decl, time_limit, env)) {
+				atomicRefIntAddition(success, 1);
+				true 
+			} else {
+				atomicRefIntAddition(failure, 1);
+				refArrayPush(failed_names, ruDeclName(decl));
+				false;
+			} 
+			time = timestamp() - start;
+			if (time > ^max_time) {
+				max_time := time;
+				max_name := ruDeclName(decl);
 			}
-		generalize_decl = \decl : RuBlock, time_limit ->
-			switch (decl) {
-				RuTheorem(__,__,__,__,__,__,__,__): apply_th(decl, time_limit);
-				default: true;
-			}
-		generalize_decls = \decls, time_limit -> {
-			proof_lens = map(decls, \d -> {
-				switch (d) {
-					RuTheorem(__,__,__,__,__,__,proof,__): length(proof.steps);
-					default: 0;
+			ret;
+		}
+
+		decls2measures = \decls -> filtermap(decls, \d -> if (pred(d)) Some(measure(d)) else None());
+
+		process_decls = \decls, time_limit -> {
+			measures = decls2measures(decls);
+			sum_measure = ruSumDoublesFromArray(measures);
+			all(ruConcurrent(filtermapi(decls, \i, d ->
+				if (!pred(d)) None() else {
+					limit = time_limit * i2d(availableProcessors()) * measures[i] / sum_measure;
+					Some(\-> apply_decl(d, limit))
 				}
-			});
-			sum_proof_lens = i2d(fold(proof_lens, 0, \acc, len -> acc + len));
-			all(ruConcurrent(mapi(decls, \i, d -> {
-				limit = time_limit * i2d(availableProcessors()) * i2d(proof_lens[i]) / sum_proof_lens;
-				\-> generalize_decl(d, limit)
-			})));
+			)));
 		}
 		start = timestamp();
+
 		calc_total_steps = \decls -> fold(decls, 0, \acc, d ->
 			switch (d) {
 				RuTheorem(__,__,__,__,__,__,proof,__): acc + length(proof.steps);
@@ -109,9 +130,11 @@ ruApplyTheoremComm(fn_name : string, fn : (RuTheorem, double, RuEnv) -> RuEnv) -
 			}
 		);
 		calc_time_limit = \decls -> {
-			opt = lookupTreeDef(conf.opts, "time-limit", "600");
+			opt = lookupTreeDef(conf.opts, "time-limit", "300");
 			limit = if (opt == "auto") {
-				i2d(calc_total_steps(decls)) * 3.0;
+				// By default we set 3 ms per one measure unit
+				measures = decls2measures(decls);
+				ruSumDoublesFromArray(measures) * 3.0;
 			} else {
 				i2d(s2i(opt) * 1000);
 			}
@@ -121,40 +144,30 @@ ruApplyTheoremComm(fn_name : string, fn : (RuTheorem, double, RuEnv) -> RuEnv) -
 			limit
 		}
 		ret = if (target == "all" || target == "1") {
-			decls = filtermap(concatA(map(ruOrderSources(math), \src -> src.decls)), ruBlock2Assertion);
+			decls = filtermap(concatA(map(ruOrderSources(math), \src -> src.decls)), ruBlock2Decl);
 			ms_time_limit = calc_time_limit(decls);
 			chunks = splitByNumber(decls, s2i(lookupTreeDef(conf.opts, "decls-split-num", "256")));
 			//time_limit = ms_time_limit * i2d(availableProcessors());
 			//conf.onMessage("generalize concurrent time limit: " + d2s(time_limit / 1000.0) + ".s");
-			proof_lens = map(chunks, \chunk ->
-				map(chunk, \d ->
-					switch (d) {
-						RuTheorem(__,__,__,__,__,__,proof,__): length(proof.steps);
-						default: 0;
-					}
-				)
-			);
-			sum_proof_lens = map(proof_lens, \lens -> i2d(fold(lens, 0, \ac, len -> ac + len)));
-			total_steps = fold(sum_proof_lens, 0.0, \acc, len -> acc + len);
+			chunk_measures = map(chunks, decls2measures);
+			sum_chunk_measures = map(chunk_measures, ruSumDoublesFromArray);
+			total_measure = ruSumDoublesFromArray(sum_chunk_measures);
 			r = foldi(chunks, true, \n, acc, chunk -> {
 				left_time = ms_time_limit - (timestamp() - start);
 				if (left_time <= 0.0) false else {
-					time_left_on_chunk = left_time * i2d(availableProcessors()) * sum_proof_lens[n] / total_steps * 2.0;
-					acc && all(ruConcurrent(mapi(chunk, \i, ass -> 
-							\-> eitherMap(ruAssertion2Theorem(ass), 
-								\th -> {
-									limit = time_left_on_chunk * i2d(proof_lens[n][i]) / sum_proof_lens[n];
-									apply_th(th, limit);
-								}, 
-								true
-							)
+					time_left_on_chunk = left_time * i2d(availableProcessors()) * sum_chunk_measures[n] / total_measure * 2.0;
+					acc && all(ruConcurrent(mapi(chunk, \i, decl -> 
+							\-> if (!pred(decl)) true else {
+									limit = time_left_on_chunk * chunk_measures[n][i] / sum_chunk_measures[n];
+									apply_decl(decl, limit);
+								}
 					)));
 				}
 			});
-			conf.onMessage("average time per step: " + d2s((timestamp() - start) / total_steps));
+			conf.onMessage("average time per unit: " + d2s((timestamp() - start) / total_measure) + " ms");
 			r;
 		} else if (target == "1-seq" || target == "all-seq") {
-			decls = concatA(map(ruOrderSources(math), \src -> src.decls));
+			decls = filtermap(concatA(map(ruOrderSources(math), \src -> src.decls)), ruBlock2Decl);
 			ms_time_limit = calc_time_limit(decls);
 			all(mapi(decls, \i, d -> {
 				passed = (timestamp() - start);
@@ -162,45 +175,38 @@ ruApplyTheoremComm(fn_name : string, fn : (RuTheorem, double, RuEnv) -> RuEnv) -
 				if (left_time <= 0.0) false else { 
 					limit_on_one = left_time / i2d(length(decls) - i);
 					//conf.onMessage("limit_on_one: " + d2s(limit_on_one / 1000.0) + ".s");
-					generalize_decl(d, limit_on_one);
+					apply_decl(d, limit_on_one);
 				}
 			}));
 		} else {
 			switch (lookupTree(math.sources, target)) {
 				Some(src): {
 					ms_time_limit = calc_time_limit(src.decls);
-					generalize_decls(src.decls, ms_time_limit);
+					process_decls(filtermap(src.decls, ruBlock2Decl), ms_time_limit);
 				}
 				None(): {
 					switch (lookupTree(math.assertions, target)) {
 						Some(ass): {
 							ms_time_limit = calc_time_limit([ass.item]);
-							generalize_ass(ass.item, ms_time_limit);
+							apply_decl(ass.item, ms_time_limit);
 						}
 						None(): {
-							conf.onMessage("no target for generalizing");
+							conf.onMessage("no target for " + fn_name);
 							false
 						}
 					}
 				}
 			}
 		}
-		if (conf.verbose > 0 && ^failed_count == 0) {
-			conf.onMessage("ru generalized in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
-			conf.onMessage("Max time: " + d2st(^max_time, 2) + "s for a theorem: " + ^max_th_name);
-			iter(^gen_array, \p -> {
-				conf.onMessage("Generalization IS MORE GENERAL:");
-				conf.onMessage(ru2s(p.second, math.rules));
-				conf.onMessage("ORIGINAL:");
-				conf.onMessage(ru2s(p.first, math.rules));
-			});
+		time = timestamp() - start;
+		if (^failure > 0) {
+			conf.onMessage(fn_name + " failures: " + i2s(^failure));
+			conf.onMessage(fn_name + " success: " + i2s(^success));
+			conf.onMessage("Failed:\n" + strGlue(map(^failed_names, \n -> "\t" + n), "\n"));
 		}
-		if (^failed_count > 0) {
-			conf.onMessage("Generalized: " + i2s(^generalized_count) + " theorems,");
-			conf.onMessage("Failed to generalize: " + i2s(^failed_count) + " theorems:");
-			iter(^failed_th_names, \th -> conf.onMessage("\t" + th));
+		if (conf.verbose > 0) {
+			conf.onMessage("ru applied " + fn_name + " to " + i2s(^success) + " decls in " + d2st(time / 1000.0, 2) + "s");
+			conf.onMessage("Max time: " + d2st(^max_time / 1000.0, 2) + "s for: " + ^max_name);
 		}
-		RuEnv(env with ruMath = math);
 	}
 }
-*/
