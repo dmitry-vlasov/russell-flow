@@ -25,16 +25,22 @@ export {
 	ruComm2s(comm : RuComm) -> string;
 	ruComms2s(comms : [RuComm]) -> string;
 
-	// Apply 'fn' to the decls from 'target' task option. 
-	// Selects decls to process with 'pred' parameter.
-	// Balances the time limit between all admitted decls
-	// proportionally to the 'measure'.
-	ruApplyFnComm(
-		fn_name : string, 
+	// A struct describing a general function, which operates on decls.
+	// pred - the predicate, which selects decls to process.
+	// measure - the function, which return the relative 'size' of the decl. Used to balance time limits.
+	// func - the function to be applied. Second argument is a lime limit.
+	RuApplyFn(
+		name : string, 
 		pred : (RuDecl) -> bool, 
 		measure : (RuDecl) -> double, 
-		fn : (RuDecl, double, RuEnv) -> bool
-	) -> (task : RuTask, env : RuEnv) -> void;
+		func : (RuDecl, double) -> bool
+	);
+
+	// Apply 'f.func' to the decls from 'target' task option. 
+	// Selects decls to process with 'fn.pred' parameter.
+	// Balances the time limit between all admitted decls
+	// proportionally to the 'fn.measure'.
+	ruApplyFnComm(task : RuTask, env : RuEnv, f : RuApplyFn) -> void;
 }
 
 ruCommArg2s(arg : RuCommArg) -> string {
@@ -71,142 +77,122 @@ ruComms2s(comms : [RuComm]) -> string {
 	);
 }
 
-ruApplyFnComm(
-	fn_name : string, 
-	pred : (RuDecl) -> bool, 
-	measure : (RuDecl) -> double,
-	fn : (RuDecl, double, RuEnv) -> bool
-) -> (task : RuTask, env : RuEnv) -> void {
-	\task : RuTask, env : RuEnv -> {
-		file = lookupTreeDef(task.args, "file", "");
-		math = env.ruMath;
-		conf = env.conf;
-		target0 = lookupTreeDef(task.args, "target", file);
-		target = ruTrimPath(target0, env.conf, ".ru");
-		if (conf.verbose > 0) {
-			conf.onMessage(fn_name + " target: " + target);
-		}
-		failure = ref 0;
-		success = ref 0;
-		failed_names = ref [];
-		max_time = ref 0.0;
-		max_name = ref "";
-		apply_decl = \decl, time_limit -> {
-			start = timestamp();
-			ret = if (fn(decl, time_limit, env)) {
-				atomicRefIntAddition(success, 1);
-				true 
-			} else {
-				atomicRefIntAddition(failure, 1);
-				refArrayPush(failed_names, ruDeclName(decl));
-				false;
-			} 
-			time = timestamp() - start;
-			if (time > ^max_time) {
-				max_time := time;
-				max_name := ruDeclName(decl);
-			}
-			ret;
-		}
-
-		decls2measures = \decls -> filtermap(decls, \d -> if (pred(d)) Some(measure(d)) else None());
-
-		process_decls = \decls, time_limit -> {
-			measures = decls2measures(decls);
-			sum_measure = ruSumDoublesFromArray(measures);
-			all(ruConcurrent(filtermapi(decls, \i, d ->
-				if (!pred(d)) None() else {
-					limit = time_limit * i2d(availableProcessors()) * measures[i] / sum_measure;
-					Some(\-> apply_decl(d, limit))
-				}
-			)));
-		}
+ruApplyFnComm(task : RuTask, env : RuEnv, f : RuApplyFn) -> void {
+	file = lookupTreeDef(task.args, "file", "");
+	math = env.ruMath;
+	conf = env.conf;
+	target0 = lookupTreeDef(task.args, "target", file);
+	target = ruTrimPath(target0, env.conf, ".ru");
+	if (conf.verbose > 0) {
+		conf.onMessage(f.name + " target: " + target);
+	}
+	failure = ref 0;
+	success = ref 0;
+	failed_names = ref [];
+	max_time = ref 0.0;
+	max_name = ref "";
+	apply_decl = \decl, time_limit -> {
 		start = timestamp();
-
-		calc_total_steps = \decls -> fold(decls, 0, \acc, d ->
-			switch (d) {
-				RuTheorem(__,__,__,__,__,__,proof,__): acc + length(proof.steps);
-				default: acc;
-			}
-		);
-		calc_time_limit = \decls -> {
-			opt = lookupTreeDef(conf.opts, "time-limit", "300");
-			limit = if (opt == "auto") {
-				// By default we set 3 ms per one measure unit
-				measures = decls2measures(decls);
-				ruSumDoublesFromArray(measures) * 3.0;
-			} else {
-				i2d(s2i(opt) * 1000);
-			}
-			if (conf.verbose > 0) {
-				conf.onMessage("time limit: " + d2s(limit / 1000.0) + ".s");
-			}
-			limit
-		}
-		ret = if (target == "all" || target == "1") {
-			decls = filtermap(concatA(map(ruOrderSources(math), \src -> src.decls)), ruBlock2Decl);
-			ms_time_limit = calc_time_limit(decls);
-			chunks = splitByNumber(decls, s2i(lookupTreeDef(conf.opts, "decls-split-num", "256")));
-			//time_limit = ms_time_limit * i2d(availableProcessors());
-			//conf.onMessage("generalize concurrent time limit: " + d2s(time_limit / 1000.0) + ".s");
-			chunk_measures = map(chunks, decls2measures);
-			sum_chunk_measures = map(chunk_measures, ruSumDoublesFromArray);
-			total_measure = ruSumDoublesFromArray(sum_chunk_measures);
-			r = foldi(chunks, true, \n, acc, chunk -> {
-				left_time = ms_time_limit - (timestamp() - start);
-				if (left_time <= 0.0) false else {
-					time_left_on_chunk = left_time * i2d(availableProcessors()) * sum_chunk_measures[n] / total_measure * 2.0;
-					acc && all(ruConcurrent(mapi(chunk, \i, decl -> 
-							\-> if (!pred(decl)) true else {
-									limit = time_left_on_chunk * chunk_measures[n][i] / sum_chunk_measures[n];
-									apply_decl(decl, limit);
-								}
-					)));
-				}
-			});
-			conf.onMessage("average time per unit: " + d2s((timestamp() - start) / total_measure) + " ms");
-			r;
-		} else if (target == "1-seq" || target == "all-seq") {
-			decls = filtermap(concatA(map(ruOrderSources(math), \src -> src.decls)), ruBlock2Decl);
-			ms_time_limit = calc_time_limit(decls);
-			all(mapi(decls, \i, d -> {
-				passed = (timestamp() - start);
-				left_time = ms_time_limit - passed;
-				if (left_time <= 0.0) false else { 
-					limit_on_one = left_time / i2d(length(decls) - i);
-					//conf.onMessage("limit_on_one: " + d2s(limit_on_one / 1000.0) + ".s");
-					apply_decl(d, limit_on_one);
-				}
-			}));
+		ret = if (f.func(decl, time_limit)) {
+			atomicRefIntAddition(success, 1);
+			true 
 		} else {
-			switch (lookupTree(math.sources, target)) {
-				Some(src): {
-					ms_time_limit = calc_time_limit(src.decls);
-					process_decls(filtermap(src.decls, ruBlock2Decl), ms_time_limit);
-				}
-				None(): {
-					switch (lookupTree(math.assertions, target)) {
-						Some(ass): {
-							ms_time_limit = calc_time_limit([ass.item]);
-							apply_decl(ass.item, ms_time_limit);
-						}
-						None(): {
-							conf.onMessage("no target for " + fn_name);
-							false
-						}
+			atomicRefIntAddition(failure, 1);
+			refArrayPush(failed_names, ruDeclName(decl));
+			false;
+		} 
+		time = timestamp() - start;
+		if (time > ^max_time) {
+			max_time := time;
+			max_name := ruDeclName(decl);
+		}
+		ret;
+	}
+	decls2measures = \decls : [RuDecl] -> {
+		map(decls, \d -> f.measure(d));
+	}
+	process_decls = \decls : [RuDecl], time_limit -> {
+		measures = decls2measures(decls);
+		sum_measure = ruSumDoublesFromArray(measures);
+		all(ruConcurrent(mapi(decls, \i, d ->
+			\-> apply_decl(d, time_limit * i2d(availableProcessors()) * measures[i] / sum_measure)
+		)));
+	}
+	start = timestamp();
+	calc_time_limit = \decls -> {
+		opt = lookupTreeDef(conf.opts, "time-limit", "300");
+		limit = if (opt == "auto") {
+			// By default we set 3 ms per one measure unit
+			measures = decls2measures(decls);
+			ruSumDoublesFromArray(measures) * 3.0;
+		} else {
+			i2d(s2i(opt) * 1000);
+		}
+		if (conf.verbose > 0) {
+			conf.onMessage("time limit: " + d2s(limit / 1000.0) + ".s");
+		}
+		limit
+	}
+	ret = if (target == "all" || target == "1") {
+		decls = filter(filtermap(concatA(map(ruOrderSources(math), \src -> src.decls)), ruBlock2Decl), f.pred);
+		ms_time_limit = calc_time_limit(decls);
+		chunks = splitByNumber(decls, s2i(lookupTreeDef(conf.opts, "decls-split-num", "256")));
+		//time_limit = ms_time_limit * i2d(availableProcessors());
+		//conf.onMessage("generalize concurrent time limit: " + d2s(time_limit / 1000.0) + ".s");
+		chunk_measures = map(chunks, decls2measures);
+		sum_chunk_measures = map(chunk_measures, ruSumDoublesFromArray);
+		total_measure = ruSumDoublesFromArray(sum_chunk_measures);
+		r = foldi(chunks, true, \n, acc, chunk -> {
+			left_time = ms_time_limit - (timestamp() - start);
+			if (left_time <= 0.0) false else {
+				time_left_on_chunk = left_time * i2d(availableProcessors()) * sum_chunk_measures[n] / total_measure * 2.0;
+				acc && all(ruConcurrent(mapi(chunk, \i, decl -> 
+						\-> apply_decl(decl, time_left_on_chunk * chunk_measures[n][i] / sum_chunk_measures[n])
+				)));
+			}
+		});
+		conf.onMessage("average time per unit: " + d2s((timestamp() - start) / total_measure) + " ms");
+		r;
+	} else if (target == "1-seq" || target == "all-seq") {
+		decls = filter(filtermap(concatA(map(ruOrderSources(math), \src -> src.decls)), ruBlock2Decl), f.pred);
+		ms_time_limit = calc_time_limit(decls);
+		all(mapi(decls, \i, d -> {
+			passed = (timestamp() - start);
+			left_time = ms_time_limit - passed;
+			if (left_time <= 0.0) false else { 
+				limit_on_one = left_time / i2d(length(decls) - i);
+				//conf.onMessage("limit_on_one: " + d2s(limit_on_one / 1000.0) + ".s");
+				apply_decl(d, limit_on_one);
+			}
+		}));
+	} else {
+		switch (lookupTree(math.sources, target)) {
+			Some(src): {
+				ms_time_limit = calc_time_limit(src.decls);
+				process_decls(filter(filtermap(src.decls, ruBlock2Decl), f.pred), ms_time_limit);
+			}
+			None(): {
+				switch (lookupTree(math.assertions, target)) {
+					Some(ass): {
+						ms_time_limit = calc_time_limit([ass.item]);
+						apply_decl(ass.item, ms_time_limit);
+					}
+					None(): {
+						conf.onMessage("no target for " + f.name);
+						false
 					}
 				}
 			}
 		}
-		time = timestamp() - start;
-		if (^failure > 0) {
-			conf.onMessage(fn_name + " failures: " + i2s(^failure));
-			conf.onMessage(fn_name + " success: " + i2s(^success));
-			conf.onMessage("Failed:\n" + strGlue(map(^failed_names, \n -> "\t" + n), "\n"));
-		}
-		if (conf.verbose > 0) {
-			conf.onMessage("ru applied " + fn_name + " to " + i2s(^success) + " decls in " + d2st(time / 1000.0, 2) + "s");
-			conf.onMessage("Max time: " + d2st(^max_time / 1000.0, 2) + "s for: " + ^max_name);
-		}
+	}
+	time = timestamp() - start;
+	if (^failure > 0) {
+		conf.onMessage(f.name + " failures: " + i2s(^failure));
+		conf.onMessage(f.name + " success: " + i2s(^success));
+		conf.onMessage("Failed:\n" + strGlue(map(^failed_names, \n -> "\t" + n), "\n"));
+	}
+	if (conf.verbose > 0) {
+		conf.onMessage("ru applied " + f.name + " to " + i2s(^success) + " decls in " + d2st(time / 1000.0, 2) + "s");
+		conf.onMessage("Max time: " + d2st(^max_time / 1000.0, 2) + "s for: " + ^max_name);
 	}
 }

@@ -8,188 +8,65 @@ export {
 }
 
 ruCommGeneralize(task : RuTask, env : RuEnv) -> RuEnv {
-	file = lookupTreeDef(task.args, "file", "");
 	math = env.ruMath;
 	conf = env.conf;
-	target0 = lookupTreeDef(task.args, "target", file);
-	target = ruTrimPath(target0, env.conf, ".ru");
-	if (conf.verbose > 0) {
-		conf.onMessage("generalizing target: " + target);
-	}
+	generalized = initConcurrentHashMap();
 	gen_level = s2i(lookupTreeDef(task.args, "level", "2"));
-	//generalized_count = ref 0;
-	generalized = initConcurrentHashMap(); //: ref [Pair<RuTheorem, RuTheorem>] = ref [];
-	failed_count = ref 0;
-	failed_th_names = ref [];
-	max_time = ref 0.0;
-	max_th_name = ref "";
-	generalize_th = \th, time_limit -> {
-		start = timestamp();
-		proof = ruProofToDAG(th.proof);
-		//if (math.conf.verbose > 0) {
-		//	conf.onMessage("going to generalize theorem " + th.name);
-		//}
-		gen_name = th.name + "_gen";
-		if (containsKeyTree(math.assertions, gen_name)) {
-			if (conf.verbose >= 2) {
-				conf.onMessage("Seems that '" + th.name + "' is already generalized");
-			}
-			true;
-		} else {
-			switch (ruProof2Theorem(gen_name, proof, math, conf, time_limit)) {
-				Some(gen): {
-					if (isNone(ruMatchAssertions(gen, th, math, conf))) {
-						conf.onError("Generalizatio doesn't match!!!", []);
-						quit(-1);
-					}
-					if (isNone(ruMatchAssertions(th, gen, math, conf))) {
-						maybeApply(ruMatchAssertions(gen, th, math, conf), \match ->
-							if (ruSubstLevel(match.sub) >= gen_level) {
-								time = (timestamp() - start) / 1000.0;
-								setConcurrentHashMap(generalized, th.name, Pair(th, gen));
-								if (conf.verbose > 0) {
-									conf.onMessage(i2s(sizeConcurrentHashMap(generalized)) + " theorem " + th.name + " was GENERALIZED in " + d2st(time, 2) + "s");
-									//conf.onMessage(ru2s(generalized, math.rules));
+	fn = RuApplyFn(
+		"generalize", 
+		\decl -> switch (decl) {
+			RuTheorem(__,__,__,__,__,__,__,__): true;
+			default: false; 
+		},
+		\decl -> i2d(length(cast(decl : RuDecl -> RuTheorem).proof.steps)),
+		\decl, time_limit -> {
+			th = cast(decl : RuDecl -> RuTheorem);
+			gen_name = th.name + "_gen";
+			if (containsKeyTree(math.assertions, gen_name)) {
+				if (conf.verbose >= 2) {
+					conf.onMessage("Seems that '" + th.name + "' is already generalized");
+				}
+				true;
+			} else {
+				start = timestamp();
+				switch (ruProof2Theorem(gen_name, ruProofToDAG(th.proof), math, conf, time_limit)) {
+					Some(gen): {
+						if (isNone(ruMatchAssertions(gen, th, math, conf))) {
+							conf.onError("Generalizatio doesn't match!!!", []);
+							quit(-1);
+						}
+						if (isNone(ruMatchAssertions(th, gen, math, conf))) {
+							maybeApply(ruMatchAssertions(gen, th, math, conf), \match ->
+								if (ruSubstLevel(match.sub) >= gen_level) {
+									time = (timestamp() - start) / 1000.0;
+									setConcurrentHashMap(generalized, th.name, Pair(th, gen));
+									if (conf.verbose > 0) {
+										conf.onMessage(i2s(sizeConcurrentHashMap(generalized)) + " theorem " + th.name + " was GENERALIZED in " + d2st(time, 2) + "s");
+										//conf.onMessage(ru2s(generalized, math.rules));
+									}
 								}
-							}
-						);
-					}
-					true;
-				}
-				None(): {
-					atomicRefIntAddition(failed_count, 1);
-					time = (timestamp() - start) / 1000.0;
-					conf.onMessage("theorem " + th.name + " was NOT generalized in " + d2st(time, 2) + "s");
-					conf.onMessage(ru2s(th, math.rules));
-					refArrayPush(failed_th_names, th.name);
-					//quit(-1);
-					false;
-				}
-			}
-		}
-	}
-	generalize_ass = \ass : RuAssertion, time_limit -> 
-		switch (ass) {
-			RuTheorem(__,__,__,__,__,__,__,__): generalize_th(ass, time_limit);
-			default: true;
-		}
-	generalize_decl = \decl : RuBlock, time_limit ->
-		switch (decl) {
-			RuTheorem(__,__,__,__,__,__,__,__): generalize_th(decl, time_limit);
-			default: true;
-		}
-	generalize_decls = \decls, time_limit -> {
-		proof_lens = map(decls, \d -> {
-			switch (d) {
-				RuTheorem(__,__,__,__,__,__,proof,__): length(proof.steps);
-				default: 0;
-			}
-		});
-		sum_proof_lens = i2d(fold(proof_lens, 0, \acc, len -> acc + len));
-		all(ruConcurrent(mapi(decls, \i, d -> {
-			limit = time_limit * i2d(availableProcessors()) * i2d(proof_lens[i]) / sum_proof_lens;
-			\-> generalize_decl(d, limit)
-		})));
-	}
-	start = timestamp();
-	calc_total_steps = \decls -> fold(decls, 0, \acc, d ->
-		switch (d) {
-			RuTheorem(__,__,__,__,__,__,proof,__): acc + length(proof.steps);
-			default: acc;
-		}
-	);
-	calc_time_limit = \decls -> {
-		opt = lookupTreeDef(conf.opts, "time-limit", "600");
-		limit = if (opt == "auto") {
-			i2d(calc_total_steps(decls)) * 3.0;
-		} else {
-			i2d(s2i(opt) * 1000);
-		}
-		if (conf.verbose > 0) {
-			conf.onMessage("time limit: " + d2s(limit / 1000.0) + ".s");
-		}
-		limit
-	}
-	ret = if (target == "all" || target == "1") {
-		decls = filtermap(concatA(map(ruOrderSources(math), \src -> src.decls)), ruBlock2Assertion);
-		ms_time_limit = calc_time_limit(decls);
-		chunks = splitByNumber(decls, s2i(lookupTreeDef(conf.opts, "decls-split-num", "256")));
-		//time_limit = ms_time_limit * i2d(availableProcessors());
-		//conf.onMessage("generalize concurrent time limit: " + d2s(time_limit / 1000.0) + ".s");
-		proof_lens = map(chunks, \chunk ->
-			map(chunk, \d ->
-				switch (d) {
-					RuTheorem(__,__,__,__,__,__,proof,__): length(proof.steps);
-					default: 0;
-				}
-			)
-		);
-		sum_proof_lens = map(proof_lens, \lens -> i2d(fold(lens, 0, \ac, len -> ac + len)));
-		total_steps = fold(sum_proof_lens, 0.0, \acc, len -> acc + len);
-		r = foldi(chunks, true, \n, acc, chunk -> {
-			left_time = ms_time_limit - (timestamp() - start);
-			if (left_time <= 0.0) false else {
-				time_left_on_chunk = left_time * i2d(availableProcessors()) * sum_proof_lens[n] / total_steps * 2.0;
-				acc && all(ruConcurrent(mapi(chunk, \i, ass -> 
-						\-> eitherMap(ruAssertion2Theorem(ass), 
-							\th -> {
-								limit = time_left_on_chunk * i2d(proof_lens[n][i]) / sum_proof_lens[n];
-								generalize_th(th, limit);
-							}, 
-							true
-						)
-				)));
-			}
-		});
-		conf.onMessage("average time per step: " + d2s((timestamp() - start) / total_steps));
-		r;
-	} else if (target == "1-seq" || target == "all-seq") {
-		decls = concatA(map(ruOrderSources(math), \src -> src.decls));
-		ms_time_limit = calc_time_limit(decls);
-		all(mapi(decls, \i, d -> {
-			passed = (timestamp() - start);
-			left_time = ms_time_limit - passed;
-			if (left_time <= 0.0) false else { 
-				limit_on_one = left_time / i2d(length(decls) - i);
-				//conf.onMessage("limit_on_one: " + d2s(limit_on_one / 1000.0) + ".s");
-				generalize_decl(d, limit_on_one);
-			}
-		}));
-	} else {
-		switch (lookupTree(math.sources, target)) {
-			Some(src): {
-				ms_time_limit = calc_time_limit(src.decls);
-				generalize_decls(src.decls, ms_time_limit);
-			}
-			None(): {
-				switch (lookupTree(math.assertions, target)) {
-					Some(ass): {
-						ms_time_limit = calc_time_limit([ass.item]);
-						generalize_ass(ass.item, ms_time_limit);
+							);
+						}
+						true;
 					}
 					None(): {
-						conf.onMessage("no target for generalizing");
-						false
+						time = (timestamp() - start) / 1000.0;
+						conf.onMessage("theorem " + th.name + " was NOT generalized in " + d2st(time, 2) + "s");
+						conf.onMessage(ru2s(th, math.rules));
+						//quit(-1);
+						false;
 					}
 				}
 			}
 		}
-	}
-	if (conf.verbose > 0 && ^failed_count == 0) {
-		conf.onMessage("ru generalized in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
-		conf.onMessage("Max time: " + d2st(^max_time, 2) + "s for a theorem: " + ^max_th_name);
-		iter(valuesConcurrentHashMap(generalized), \p : Pair<RuTheorem, RuTheorem> -> {
-			conf.onMessage("Generalization IS MORE GENERAL: " + p.second.name + " > " + p.first.name);
-			//conf.onMessage(ru2s(p.second, math.rules));
-			//conf.onMessage("ORIGINAL:");
-			//conf.onMessage(ru2s(p.first, math.rules));
-		});
-	}
-	if (/*conf.verbose > 0 ||*/ ^failed_count > 0) {
-		conf.onMessage("Generalized: " + i2s(sizeConcurrentHashMap(generalized)) + " theorems,");
-		conf.onMessage("Failed to generalize: " + i2s(^failed_count) + " theorems:");
-		iter(^failed_th_names, \th -> conf.onMessage("\t" + th));
-	}
+	);
+	ruApplyFnComm(task, env, fn);
+	ruInsertGeneralized(generalized, env);
+}
+
+ruInsertGeneralized(generalized : native, env : RuEnv) -> RuEnv {
+	math = env.ruMath;
+	conf = env.conf;
 	gen_math = fold(valuesConcurrentHashMap(generalized), math, \acc, pair : Pair<RuTheorem, RuTheorem> -> {
 		th = pair.first;
 		gen = pair.second;
