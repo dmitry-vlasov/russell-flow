@@ -1,3 +1,4 @@
+import ru/parse/write;
 import ru/prover/stats;
 import ru/prover/proof2theorem;
 import ru/util/match_assertions;
@@ -16,8 +17,8 @@ ruCommGeneralize(task : RuTask, env : RuEnv) -> RuEnv {
 		conf.onMessage("generalizing target: " + target);
 	}
 	gen_level = s2i(lookupTreeDef(task.args, "level", "2"));
-	generalized_count = ref 0;
-	gen_array : ref [Pair<RuTheorem, RuTheorem>] = ref [];
+	//generalized_count = ref 0;
+	generalized = initConcurrentHashMap(); //: ref [Pair<RuTheorem, RuTheorem>] = ref [];
 	failed_count = ref 0;
 	failed_th_names = ref [];
 	max_time = ref 0.0;
@@ -28,35 +29,42 @@ ruCommGeneralize(task : RuTask, env : RuEnv) -> RuEnv {
 		//if (math.conf.verbose > 0) {
 		//	conf.onMessage("going to generalize theorem " + th.name);
 		//}
-		switch (ruProof2Theorem(th.name + "_gen", proof, math, conf, time_limit)) {
-			Some(generalized): {
-				if (isNone(ruMatchAssertions(generalized, th, math, conf))) {
-					conf.onError("Generalization doesn't match!!!", []);
-					quit(-1);
-				}
-				if (isNone(ruMatchAssertions(th, generalized, math, conf))) {
-					maybeApply(ruMatchAssertions(generalized, th, math, conf), \match ->
-						if (ruSubstLevel(match.sub) >= gen_level) {
-							time = (timestamp() - start) / 1000.0;
-							if (conf.verbose > 0) {
-								atomicRefIntAddition(generalized_count, 1);
-								conf.onMessage(i2s(^generalized_count) + " theorem " + th.name + " was GENERALIZED in " + d2st(time, 2) + "s");
-								//conf.onMessage(ru2s(generalized, math.rules));
-							}
-							refArrayPush(gen_array, Pair(th, generalized));
-						}
-					);
-				}
-				true;
+		gen_name = th.name + "_gen";
+		if (containsKeyTree(math.assertions, gen_name)) {
+			if (conf.verbose >= 2) {
+				conf.onMessage("Seems that '" + th.name + "' is already generalized");
 			}
-			None(): {
-				atomicRefIntAddition(failed_count, 1);
-				time = (timestamp() - start) / 1000.0;
-				conf.onMessage("theorem " + th.name + " was NOT generalized in " + d2st(time, 2) + "s");
-				conf.onMessage(ru2s(th, math.rules));
-				refArrayPush(failed_th_names, th.name);
-				//quit(-1);
-				false;
+			true;
+		} else {
+			switch (ruProof2Theorem(gen_name, proof, math, conf, time_limit)) {
+				Some(gen): {
+					if (isNone(ruMatchAssertions(gen, th, math, conf))) {
+						conf.onError("Generalizatio doesn't match!!!", []);
+						quit(-1);
+					}
+					if (isNone(ruMatchAssertions(th, gen, math, conf))) {
+						maybeApply(ruMatchAssertions(gen, th, math, conf), \match ->
+							if (ruSubstLevel(match.sub) >= gen_level) {
+								time = (timestamp() - start) / 1000.0;
+								setConcurrentHashMap(generalized, th.name, Pair(th, gen));
+								if (conf.verbose > 0) {
+									conf.onMessage(i2s(sizeConcurrentHashMap(generalized)) + " theorem " + th.name + " was GENERALIZED in " + d2st(time, 2) + "s");
+									//conf.onMessage(ru2s(generalized, math.rules));
+								}
+							}
+						);
+					}
+					true;
+				}
+				None(): {
+					atomicRefIntAddition(failed_count, 1);
+					time = (timestamp() - start) / 1000.0;
+					conf.onMessage("theorem " + th.name + " was NOT generalized in " + d2st(time, 2) + "s");
+					conf.onMessage(ru2s(th, math.rules));
+					refArrayPush(failed_th_names, th.name);
+					//quit(-1);
+					false;
+				}
 			}
 		}
 	}
@@ -170,17 +178,65 @@ ruCommGeneralize(task : RuTask, env : RuEnv) -> RuEnv {
 	if (conf.verbose > 0 && ^failed_count == 0) {
 		conf.onMessage("ru generalized in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
 		conf.onMessage("Max time: " + d2st(^max_time, 2) + "s for a theorem: " + ^max_th_name);
-		iter(^gen_array, \p -> {
-			conf.onMessage("Generalization IS MORE GENERAL:");
-			conf.onMessage(ru2s(p.second, math.rules));
-			conf.onMessage("ORIGINAL:");
-			conf.onMessage(ru2s(p.first, math.rules));
+		iter(valuesConcurrentHashMap(generalized), \p : Pair<RuTheorem, RuTheorem> -> {
+			conf.onMessage("Generalization IS MORE GENERAL: " + p.second.name + " > " + p.first.name);
+			//conf.onMessage(ru2s(p.second, math.rules));
+			//conf.onMessage("ORIGINAL:");
+			//conf.onMessage(ru2s(p.first, math.rules));
 		});
 	}
 	if (/*conf.verbose > 0 ||*/ ^failed_count > 0) {
-		conf.onMessage("Generalized: " + i2s(^generalized_count) + " theorems,");
+		conf.onMessage("Generalized: " + i2s(sizeConcurrentHashMap(generalized)) + " theorems,");
 		conf.onMessage("Failed to generalize: " + i2s(^failed_count) + " theorems:");
 		iter(^failed_th_names, \th -> conf.onMessage("\t" + th));
 	}
-	RuEnv(env with ruMath = math);
+	gen_math = fold(valuesConcurrentHashMap(generalized), math, \acc, pair : Pair<RuTheorem, RuTheorem> -> {
+		th = pair.first;
+		gen = pair.second;
+		eitherMap(lookupTree(acc.assertions, th.name), \item -> 
+			eitherMap(lookupTree(acc.sources, item.source), \src -> {
+					conf.onMessage("Adding generalized sources: " + gen.name);
+					ind = ruIndexOfDecl(th.name, src);
+					acc1 = ruAddAssertion(gen, ind, src, acc, conf);
+					/*ruAddComment(
+						RuComment(
+							"", // ru2s(th, acc.rules), 
+							JsonObject([
+							Pair("refactor",
+								JsonObject([
+									Pair("generalize",
+										JsonObject([
+											Pair("less_general", JsonString(th.name)),
+											Pair("more_general", JsonString(gen.name)),
+										])
+									)
+								])
+							)
+						]), -1), 
+						ind, src, acc1, conf
+					);*/
+					acc1
+				}, acc
+			), acc
+		);
+	});
+	modified_sources = fold(valuesConcurrentHashMap(generalized), makeSet(), \acc, pair : Pair<RuTheorem, RuTheorem> ->
+		eitherMap(lookupTree(gen_math.assertions, pair.first.name), \item -> insertSet(acc, item.source), acc)
+	);
+	gen_names = fold(valuesConcurrentHashMap(generalized), makeSet(), \acc, pair : Pair<RuTheorem, RuTheorem> ->
+		insertSet(acc, pair.second.name)
+	);
+	if (conf.verbose > 0) {
+		conf.onMessage("Saving generalized sources:\n" + 
+			strGlue(map(set2array(modified_sources), \src -> "\t" + src), "\n")
+		);
+	}
+	//conf.onMessage("GEN NAMES: " + strGlue(set2array(gen_names), ", "));
+	iterSet(modified_sources, \s -> 
+		maybeApply(lookupTree(gen_math.sources, s), \src ->
+			ruWriteSource(src, gen_math, conf)
+		)
+	);
+	//conf.onMessage("CONF VEBOSE: " + i2s(conf.verbose));
+	RuEnv(env with ruMath = gen_math);
 }
