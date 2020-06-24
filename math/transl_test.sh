@@ -19,17 +19,17 @@ echo
 dir=$(pwd)
 
 echo import-roots=${dir}/${file} > ./${file}/russell.conf
+echo project-roots=${dir}/${file}/${file}.ru >> ./${file}/russell.conf
 
 ../bin/russell \
-	update-conf verbose=1 ru-root=./${file} import-roots=${dir} ";" \
+	conf ru-root=./${file} project-roots=${dir}/${file}/${file}.ru ";" \
 	mem-stats ";" \
 	read file=${file}.mm ";" \
 	mm-to-ru file=${file}.mm ";" \
+	conf import-roots=${dir}/${file} ";" \
 	mem-stats ";" \
-	clear-conf ";" \
-	update-conf verbose=1 ru-root=./${file} import-roots=${dir}/${file} ";" \
-	fix-left-recursion file=${file}.ru ";" \
-	split-math file=${file}.ru ";" \
+	fix-left-recursion ";" \
+	split-math ";" \
 	optimize-imports ";" \
 	verify target=all ";" \
 	mem-stats ";" \
@@ -43,11 +43,11 @@ echo
 
 ../bin/russell \
 	load-conf dir=./${file} ";" \
-	update-conf verbose=1 ru-root=./${file} mm-root=. ";" \
+	conf mm-root=. ";" \
 	mem-stats ";" \
-	read file=./${file}/${file}.ru ";" \
+	read ";" \
 	math-stats ";" \
-	ru-to-mm file=${file}.ru ";" \
+	ru-to-mm ";" \
 	mem-stats ";" \
 	write-mm all-to-one=${file}-1.mm strip-comments=1 ";" \
 	mem-stats
