@@ -2,29 +2,36 @@ import ru/subst;
 import command;
 
 export {
+	RuVerifyAcc(
+		math : RuMath,
+		approved  : Set<string>,
+		disproved : Set<string>
+	);
 	ruVerifyTheorem(th : RuTheorem, math : RuMath, conf : RuConf) -> Maybe<RuTheorem>;
-	ruVerifySource(src : RuSource, math : RuMath, conf : RuConf) -> Maybe<RuSource>;
-	ruVerifyMath(math : RuMath, conf : RuConf) -> Maybe<RuMath>;
+	ruVerifySource(src : RuSource, acc : RuVerifyAcc, conf : RuConf) -> Pair<RuSource, RuVerifyAcc>;
+	ruVerifySource1(src : RuSource, math : RuMath, conf : RuConf) -> Maybe<RuSource>;
+	ruVerifyMath(math : RuMath, conf : RuConf) -> RuMath;
 	ruMatchStep(step : RuStep, th : RuTheorem, math : RuMath, conf : RuConf) -> Maybe<Pair<RuAssertion, Tree<RuVar, RuExp>>>;
 	ruCommVerify(task : RuTask, env : RuEnv) -> RuEnv;
 }
 
-ruVerifyMath(math : RuMath, conf0 : RuConf) -> Maybe<RuMath> {
+ruVerifyMath(math : RuMath, conf : RuConf) -> RuMath {
 	err_count = ref 0;
-	conf = ruAddErrCounter(conf0, err_count);
 	start = timestamp();
-	verified = ruDoVerifyMath(math.sources, math, conf);
+	acc = ruDoVerifyMath(math.sources, RuVerifyAcc(math, makeSet(), makeSet()), conf);
 	if (conf.verbose > 0) {
-		conf.onMessage("ru verified: " +i2s(sizeTree(verified.sources)) + " files in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
+		conf.onMessage("ru verified: " +i2s(sizeTree(math.sources)) + " files in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
+		if (conf.verbose > 2) {
+			conf.onMessage("approved theorems:\n" + strGlue(map(set2array(acc.approved), \th -> "\t" + th), "\n"));
+		}
 	}
-	if (^err_count == 0) {
-		Some(verified);
-	} else {
-		None();
+	if (sizeSet(acc.disproved) > 0) {
+		conf.onMessage("disproved theorems:\n" + strGlue(map(set2array(acc.disproved), \th -> "\t" + th), "\n"));
 	}
+	acc.math;
 }
 
-ruDoVerifyMath(left : Tree<string, RuSource>, acc : RuMath, conf : RuConf) -> RuMath {
+ruDoVerifyMath(left : Tree<string, RuSource>, acc : RuVerifyAcc, conf : RuConf) -> RuVerifyAcc {
 	if (sizeTree(left) == 0) acc else {
 		ready = filter(
 			getTreeValues(left), 
@@ -34,17 +41,21 @@ ruDoVerifyMath(left : Tree<string, RuSource>, acc : RuMath, conf : RuConf) -> Ru
 			conf.onError("cannot verify: " +i2s(sizeTree(left)) + " files - cyclic import", []);
 			acc;
 		} else {
-			verified = filtermap(ruConcurrent(map(ready, \s -> \-> ruVerifySource(s, acc, conf))), idfn);
-			new_acc = fold(verified, acc, \ac, v_src -> {
-				new_assertions = fold(v_src.decls, ac.assertions, \a, decl ->
-					switch (decl) {
-						RuTheorem(name,__,__,__,__,__,__,__,__): setTree(a, name, decl);
-						default: a;
-					}
-				);
-				RuMath(ac with 
-					assertions = new_assertions, 
-					sources = setTree(ac.sources, v_src.info.module, v_src)
+			verified = ruConcurrent(map(ready, \s -> \-> ruVerifySource(s, acc, conf)));
+			new_acc = fold(verified, acc, \ac, p -> {
+				src = p.first;
+				RuVerifyAcc(
+					RuMath(ac.math with 
+						assertions = fold(src.decls, ac.math.assertions, \a, decl ->
+							switch (decl) {
+								RuTheorem(name,__,__,__,__,__,__,__,__): setTree(a, name, decl);
+								default: a;
+							}
+						), 
+						sources = setTree(ac.math.sources, src.info.module, src)
+					),
+					mergeSets(ac.approved, p.second.approved),
+					mergeSets(ac.disproved, p.second.disproved)
 				);
 			});
 			new_left = fold(ready, left, \ac, src -> removeFromTree(ac, src.info.module));
@@ -53,21 +64,61 @@ ruDoVerifyMath(left : Tree<string, RuSource>, acc : RuMath, conf : RuConf) -> Ru
 	}
 }
 
-ruVerifySource(src : RuSource, acc : RuMath, conf : RuConf) -> Maybe<RuSource> {
+ruVerifySource(src : RuSource, acc : RuVerifyAcc, conf : RuConf) -> Pair<RuSource, RuVerifyAcc> {
 	start = timestamp();
-	correct = ref true;
-	decls_acc = fold(src.decls, Pair([], acc), \ac, decl -> 
+	approve_th = \ac, decl -> Pair(concat(ac.first, [decl]), 
+		RuVerifyAcc(ac.second with
+			math = RuMath(ac.second.math with
+				assertions = setTree(ac.second.math.assertions, ruDeclName(decl), decl)
+			),
+			approved = insertSet(ac.second.approved, ruDeclName(decl))
+		)
+	);
+	approve = \ac, decl -> Pair(concat(ac.first, [decl]), 
+		RuVerifyAcc(ac.second with
+			approved = insertSet(ac.second.approved, ruDeclName(decl))
+		)
+	);
+	disprove = \ac, decl -> Pair(ac.first,
+		RuVerifyAcc(ac.second with 
+			disproved = insertSet(ac.second.disproved, ruDeclName(decl))
+		)
+	);
+
+	p = fold(src.decls, Pair([], acc), \ac, decl -> 
 		switch (decl) {
 			RuTheorem(__,__,__,__,__,__,__,__,__): {
-				switch (ruVerifyTheorem(decl, ac.second, conf)) {
-					Some(th):
-						Pair(
-							concat(ac.first, [th]),
-							RuMath(ac.second with 
-								assertions = setTree(ac.second.assertions, th.name, th)
-							)
-						);
-					None(): { correct := false; ac }
+				switch (ruDoVerifyTheorem(decl, ac.second, conf)) {
+					Some(th): approve_th(ac, th);
+					None(): disprove(ac, decl);
+				}
+			}
+			RuAxiom(__,__,__,__,__,__,__): approve(ac, decl);
+			RuDef(__,__,__,__,__,__,__,__,__): approve(ac, decl);
+			default: Pair(concat(ac.first, [decl]), ac.second);
+		}
+	);
+	if (conf.verbose > 1) {
+		conf.onMessage("\tru verified: '" + src.info.module + "' in " + d2st((timestamp() - start)/ 1000.0, 4) + " s");
+	}
+	Pair(RuSource(src with decls = p.first), p.second);
+}
+
+ruVerifySource1(src : RuSource, math : RuMath, conf : RuConf) -> Maybe<RuSource> {
+	start = timestamp();
+	approve = \ac, decl -> Pair(
+		concat(ac.first, [decl]), 
+		RuMath(ac.second with
+			assertions = setTree(ac.second.assertions, ruDeclName(decl), decl)
+		)
+	);
+	err = ref false;
+	p = fold(src.decls, Pair([], math), \ac, decl -> 
+		switch (decl) {
+			RuTheorem(__,__,__,__,__,__,__,__,__): {
+				switch (ruDoVerifyTheorem1(decl, ac.second, conf)) {
+					Some(th): approve(ac, th);
+					None(): { err := true; ac; };
 				}
 			}
 			default: Pair(concat(ac.first, [decl]), ac.second);
@@ -76,11 +127,7 @@ ruVerifySource(src : RuSource, acc : RuMath, conf : RuConf) -> Maybe<RuSource> {
 	if (conf.verbose > 1) {
 		conf.onMessage("\tru verified: '" + src.info.module + "' in " + d2st((timestamp() - start)/ 1000.0, 4) + " s");
 	}
-	if (^correct) {
-		Some(RuSource(src with decls = decls_acc.first));
-	} else {
-		None();
-	}
+	if (^err) None() else Some(RuSource(src with decls = p.first));
 }
 
 ruStepRefExp(ref : RuRef, th : RuTheorem) -> RuExp {
@@ -161,22 +208,31 @@ ruMatchStep(step : RuStep, th : RuTheorem, math : RuMath, conf0 : RuConf) -> May
 	}
 }
 
-ruVerifyTheorem(th : RuTheorem, math : RuMath, conf : RuConf) -> Maybe<RuTheorem> {
+ruDoVerifyTheorem(th : RuTheorem, acc0 : RuVerifyAcc, conf : RuConf) -> Maybe<RuTheorem> {
+	math = acc0.math;
 	ret = maybeBind(
 		fold(th.proof.steps, Some(makeSet()), \acc, step ->
 			switch (acc) {
 				None(): acc;
 				Some(disjs): {
-					switch (ruMatchStep(step, th, math, conf)) {
-						Some(p): 
-							ruComputeDisjs(p.second, disjs, p.first.disjs, 
-								\disj, common_vars -> conf.onError(
-									"disjointed variables violation, variables: " + disj.v1.name + " and " + disj.v2.name +
-									" are mappped onto expressions, with common vars: " + strGlue(map(set2array(common_vars), \v -> v.name), ", "), 
-									[RuPlace(eitherMap(ruNameSource(th.name, math), \src -> src.info.module, ""), th.pos)]
-								)
-							);
-						None(): None();
+					if (!containsSet(acc0.approved, step.assertion)) {
+						conf.onError(
+							"Step '" + ru2s(step, math.rules) + "' depends on a non-verified assertion " + step.assertion,
+							[RuPlace(eitherMap(ruNameSource(th.name, math), \src -> src.info.module, ""), th.pos)]
+						);
+						None();
+					} else {
+						switch (ruMatchStep(step, th, math, conf)) {
+							Some(p): 
+								ruComputeDisjs(p.second, disjs, p.first.disjs, 
+									\disj, common_vars -> conf.onError(
+										"disjointed variables violation, variables: " + disj.v1.name + " and " + disj.v2.name +
+										" are mappped onto expressions, with common vars: " + strGlue(map(set2array(common_vars), \v -> v.name), ", "), 
+										[RuPlace(eitherMap(ruNameSource(th.name, math), \src -> src.info.module, ""), th.pos)]
+									)
+								);
+							None(): None();
+						}
 					}
 				}
 			}
@@ -211,6 +267,74 @@ ruVerifyTheorem(th : RuTheorem, math : RuMath, conf : RuConf) -> Maybe<RuTheorem
 	ret;
 }
 
+ruDoVerifyTheorem1(th : RuTheorem, math : RuMath, conf : RuConf) -> Maybe<RuTheorem> {
+	ret = maybeBind(
+		fold(th.proof.steps, Some(makeSet()), \acc, step ->
+			switch (acc) {
+				None(): acc;
+				Some(disjs): {
+					switch (ruMatchStep(step, th, math, conf)) {
+							Some(p): 
+								ruComputeDisjs(p.second, disjs, p.first.disjs, 
+									\disj, common_vars -> conf.onError(
+										"disjointed variables violation, variables: " + disj.v1.name + " and " + disj.v2.name +
+										" are mappped onto expressions, with common vars: " + strGlue(map(set2array(common_vars), \v -> v.name), ", "), 
+										[RuPlace(eitherMap(ruNameSource(th.name, math), \src -> src.info.module, ""), th.pos)]
+									)
+								);
+							None(): None();
+						}
+					}
+			}
+		), 
+		\ds -> {
+			th_vars = ruAssertion2Vars(th);
+			th_ds = filterSet(ds, \d -> containsSet(th_vars, d.v1) && containsSet(th_vars, d.v2));
+			pr_ds = filterSet(ds, \d -> !(containsSet(th_vars, d.v1) && containsSet(th_vars, d.v2)));
+			if (th.prop.nodes != lastElement(th.proof.steps, ruNoStep).expr.nodes) {
+				conf.onError(
+					"assertion statement does not coincide with the proved statement", 
+					[RuPlace(eitherMap(ruNameSource(th.name, math), \src -> src.info.module, ""), th.pos)]
+				);
+				None();
+			} else {
+				Some(RuTheorem(th with 
+					disjs = th_ds,
+					proof = RuProof(th.proof with disjs = pr_ds)
+				));
+			}
+		}
+	)
+	if (isNone(ret)) {
+		conf.onError(
+			"verification of theorem '" + th.name + "' failed\n" + ru2s(th, math.rules),
+			[RuPlace(eitherMap(ruNameSource(th.name, math), \src -> src.info.module, ""), th.pos)]
+		);
+		//quit(0);
+	} else if (conf.verbose > 2) {
+		conf.onMessage("ru theorem verified: " + th.name);
+	}
+	ret;
+}
+
+ruVerifyTheorem(th : RuTheorem, math : RuMath, conf : RuConf) -> Maybe<RuTheorem> {
+	maybeBind(lookupTree(math.sources, th.src), \src -> {
+		deps = fold(src.imports, 
+			fold(src.decls, Pair(makeSet(), false), \acc, decl ->
+				switch (decl) {
+					RuDecl():
+						if (acc.second) acc else
+						if (ruDeclName(decl) == th.name) Pair(acc.first, true) else	
+						Pair(insertSet(acc.first, ruDeclName(decl)), false);
+					default: acc;
+				}
+			).first, 
+			\acc, imp -> ruSourceDeclNames(imp.module, acc, math, conf)
+		);
+		ruDoVerifyTheorem(th, RuVerifyAcc(math, deps, makeSet()), conf);
+	});
+}
+
 ruCommVerify(task : RuTask, env : RuEnv) -> RuEnv {
 	target0 = lookupTreeDef(task.args, "target", "");
 	target = if (!endsWith(target0, ".ru")) target0 else ruTrimPath(target0, env.conf, ".ru");
@@ -218,12 +342,12 @@ ruCommVerify(task : RuTask, env : RuEnv) -> RuEnv {
 	conf = env.conf;
 	m = if (target == "" || target == "all" || target == "1") {
 		//ruDebugLog("target: " + target, math.conf);
-		either(ruVerifyMath(math, conf), math);
+		ruVerifyMath(math, conf);
 	} else {
 		switch (lookupTree(math.assertions, target)) {
 			Some(th): {
 				switch (th) {
-					RuTheorem(__,__,__,__,__,__,__,__,__): {
+					RuTheorem(__,__, __,__,__,__,__,__,__): {
 						start = timestamp();
 						verified = ruVerifyTheorem(th, math, conf);
 						ret = eitherMap(verified, \t -> ruReplaceAssertion(t, math, conf), math);
@@ -246,21 +370,29 @@ ruCommVerify(task : RuTask, env : RuEnv) -> RuEnv {
 				switch (lookupTree(math.sources, target)) {
 					Some(src): {
 						start = timestamp();
-						switch (ruVerifySource(src, math, conf)) {
-							Some(verified): {
-								ret = fold(ruSourceTheorems(verified), math, \acc, th -> ruReplaceAssertion(th, acc, conf));
-								if (conf.verbose > 0) {
-									conf.onMessage("source '" + target + "' is verified in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
-								}
-								ret;
-							}
-							None(): {
-								if (conf.verbose > 0) {
-									conf.onMessage("verification of source '" + target + "' failed in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
-								}
-								math
+						// ruSourceDeclNames(src : string, acc : Set<string>, math : RuMath, conf : RuConf) -> Set<string>;
+						deps = fold(src.imports, makeSet(), \acc, imp -> ruSourceDeclNames(imp.module, acc, math, conf));
+						p = ruVerifySource(src, RuVerifyAcc(math, deps, makeSet()), conf);
+						src_verified = p.first;
+						acc = p.second;
+						if (conf.verbose > 0) {
+							conf.onMessage("source " + target + " is verified: " +i2s(sizeTree(math.sources)) + " in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
+							if (conf.verbose > 2) {
+								conf.onMessage("approved theorems:\n" + strGlue(map(set2array(acc.approved), \th -> "\t" + th), "\n"));
 							}
 						}
+						if (sizeSet(acc.disproved) > 0) {
+							conf.onMessage("disproved theorems:\n" + strGlue(map(set2array(acc.disproved), \th -> "\t" + th), "\n"));
+						}
+						RuMath(acc.math with 
+							assertions = fold(src_verified.decls, acc.math.assertions, \a, decl ->
+								switch (decl) {
+									RuTheorem(name,__,__,__,__,__,__,__,__): setTree(a, name, decl);
+									default: a;
+								}
+							), 
+							sources = setTree(acc.math.sources, src_verified.info.module, src_verified)
+						);
 					}
 					None(): {
 						conf.onMessage("verification target '" + target + "' is not found");
