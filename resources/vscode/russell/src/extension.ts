@@ -206,34 +206,7 @@ export function deactivate() {
         return client.stop();
     }
 }
-/*
-const homedir = process.env[(process.platform == "win32") ? "USERPROFILE" : "HOME"];
 
-function expandHomeDir(p : string) : string {
-	if (!p) return p;
-	if (p == "~") return homedir;
-	if (p.slice(0, 2) != "~/") return p;
-	return path.join(homedir, p.slice(2));
-}
-
-function getPath(uri : string | vscode.Uri) : string {
-	return expandHomeDir(uri instanceof vscode.Uri ? uri.fsPath : uri.startsWith("file://") ? vscode.Uri.parse(uri).fsPath : uri);
-}
-
-function resolveProjectRoot(uri : string | vscode.Uri) : string {
-	const config = vscode.workspace.getConfiguration("russell");
-	if (uri != null) {
-		let dir = getPath(uri);
-		while (dir != path.resolve(dir, "..")) {
-			dir = path.resolve(dir, "..");
-			if (fs.existsSync(path.resolve(dir, "russell.conf"))) {
-				return dir;
-			}
-		}
-	}
-	return getPath(config.get("root"));
-}
-*/
 function processRussellFile(uri : vscode.Uri, action : string): void {
 	if (!uri) {
 		uri = vscode.window.activeTextEditor.document.uri;
@@ -274,8 +247,7 @@ function verifyMetamath(uri : vscode.Uri): void {
 			"write-mm", "file=" + mm_file, "monolithic=1", "strip-comments=1"
 		] 
 	}).then(
-		(out : string) => {
-			russellChannel.appendLine(out);
+		(__) => {
 			let mm_path = path.parse(mm_file);
 			tools.run_cmd("metamath", mm_path.dir, 
 				["'read " + mm_path.base + "'",	"'verify proof *'", "exit"],
