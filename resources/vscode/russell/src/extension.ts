@@ -63,7 +63,9 @@ function execCommand() {
 			let args = file_arg.concat(val_arr);
 			client.sendRequest("workspace/executeCommand", { command : "command", arguments: args }).then(
 				(out : string) => {
-					russellChannel.appendLine(out);
+					if (out != "null") {
+						russellChannel.appendLine(out);
+					}
 				},
 				(err : any) => {
 					vscode.window.showErrorMessage(`command ${value} failed: ${err}`);
