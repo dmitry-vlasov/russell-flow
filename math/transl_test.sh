@@ -24,7 +24,7 @@ echo project-roots=${dir}/${file}/${file}.ru >> ./${file}/russell.conf
 ../bin/russell \
 	conf ru-root=./${file} project-roots=${dir}/${file}/${file}.ru ";" \
 	mem-stats ";" \
-	read file=${file}.mm ";" \
+	read-mm file=${file}.mm ";" \
 	mm-to-ru file=${file}.mm ";" \
 	conf import-roots=${dir}/${file} ";" \
 	mem-stats ";" \
@@ -49,7 +49,7 @@ echo
 	math-stats ";" \
 	ru-to-mm ";" \
 	mem-stats ";" \
-	write-mm all-to-one=${file}-1.mm strip-comments=1 ";" \
+	write-mm module=${file} monolithic=${file}-1.mm strip-comments=1 ";" \
 	mem-stats
 
 echo
