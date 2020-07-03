@@ -44,19 +44,18 @@ ruRunRemote(job : RuJob, onData: (string) -> void, onError : (string) -> void, o
 ru_env = ref RuEnv(ruEmptyMath, mmEmptyMath, ruMakeConf(".", []));
 
 ruRunLocal(job : RuJob, onMessage : (string) -> void, onRunComplete : (int) -> void) -> void {
-	ru_env := fold(job.tasks, ^ru_env, \acc, t -> {
-		task = ruPrepareTask(t, acc.conf);
+	ru_env := fold(job.tasks, ^ru_env, \acc, task -> {
 		switch (lookupTree(ruCommandsTree(), task.command)) {
 			Some(command): {
 				conf = RuConf(acc.conf with 
 					onMessage = onMessage,
 					onError = \err, places -> onMessage("Error: " + err + (if (places == []) "" else "\n" + strGlue(map(places, ruPlace2s), "\n")))
 				);
-				if (ruCheckTaskArgs(task, command, conf)) {
-					command.run(task, RuEnv(acc with conf = conf));
-				} else {
-					acc;
-				}
+				fold(
+					ruPrepareTasks(task, command, conf), 
+					RuEnv(acc with conf = conf), 
+					\env, t -> command.run(t, env)
+				);
 			}
 			None(): {
 				onMessage("Unknown command: '" + task.command + "'");
@@ -67,31 +66,27 @@ ruRunLocal(job : RuJob, onMessage : (string) -> void, onRunComplete : (int) -> v
 	onRunComplete(0);
 }
 
-ruPrepareTask(task : RuTask, conf : RuConf) -> RuTask {
-	switch (lookupTree(task.args, "file")) {
-		Some(file): {
-			module = ruTrimPath(file, conf, getFileExt(file));
-			RuTask(task with args = setTree(task.args, "module", module));
-		}
-		None(): {
-			switch (lookupTree(conf.opts, "root-file")) {
-				Some(file): {
-					module = ruTrimPath(file, conf, getFileExt(file));
-					RuTask(task with 
-						args = setTree(setTree(task.args, "file", file), "module", module)
-					);
+ruPrepareTasks(task : RuTask, command : RuComm, conf : RuConf) -> [RuTask] {
+	induced_tasks = if (containsKeyTree(task.args, "file")) [task] else 
+		map(conf.projectRoots, \root -> RuTask(task with args = setTree(task.args, "file", root)));
+	filtermap(induced_tasks, 
+		\t -> {
+			args_w_module = eitherMap(
+				lookupTree(t.args, "file"), 
+				\file -> setTree(t.args, "module", ruTrimPath(file, conf, getFileExt(file))), 
+				t.args
+			);
+			updated_args = foldTree(args_w_module, makeTree(), \k, v, acc -> 
+				if (v != "") setTree(acc, k, v) else setTree(acc, command.defarg, k)
+			);
+			updated_task = RuTask(t with args = updated_args);
+			check = forall(command.args, \arg ->
+				if (arg.optional || containsKeyTree(updated_task.args, arg.name)) true else {
+					conf.onMessage("Obligatory argument '" + arg.name + "' of the command '" + updated_task.command + "' is missing");
+					false;
 				}
-				None(): task;
-			}
+			);
+			if (!check) None() else Some(updated_task);
 		}
-	}
-}
-
-ruCheckTaskArgs(task : RuTask, command : RuComm, conf : RuConf) -> bool {
-	forall(command.args, \arg ->
-		if (arg.optional || containsKeyTree(task.args, arg.name)) true else {
-			conf.onMessage("Obligatory argument '" + arg.name + "' of the command '" + task.command + "' is missing");
-			false;
-		}
-	)
+	);
 }
