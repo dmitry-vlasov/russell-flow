@@ -2,8 +2,6 @@
 // The module 'vscode' contains the VS Code extensibility API
 // Import the module and reference it with the alias vscode in your code below
 import { ChildProcess } from 'child_process';
-import * as fs from "fs";
-import * as path from 'path';
 import * as vscode from 'vscode';
 import { LanguageClient, LanguageClientOptions, RevealOutputChannelOn, ServerOptions, CancellationToken, Event, CancellationTokenSource } from 'vscode-languageclient';
 import { MathEntity, MathProvider } from "./mathProvider";
@@ -244,18 +242,8 @@ function verifyMetamath(uri : vscode.Uri): void {
 		arguments: [
 			"file=" + ru_file, "read-ru",  ";",
 			"ru-to-mm", "file=" + ru_file, ";",
-			"write-mm", "file=" + mm_file, "monolithic=1", "strip-comments=1"
+			"write-mm", "file=" + mm_file, "monolithic=1", "strip-comments=1", ";",
+			"verify-mm", "file=" + mm_file
 		] 
-	}).then(
-		(__) => {
-			let mm_path = path.parse(mm_file);
-			tools.run_cmd("metamath", mm_path.dir, 
-				["'read " + mm_path.base + "'",	"'verify proof *'", "exit"],
-				(mm_out : string) => russellChannel.append(mm_out)
-			);
-		},
-		(err : any) => { 
-			vscode.window.showErrorMessage(`translation of ${uri.fsPath} failed: ${err}`);
-		}
-	);
+	});
 }
