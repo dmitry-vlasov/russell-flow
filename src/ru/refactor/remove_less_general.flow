@@ -8,7 +8,15 @@ export {
 }
 
 ruCommRemoveLessGeneral = RuComm(
-	"remove-less-general", "refactor", "removes those assertions, which are less general then some others", "target", [],
+	"remove-less-general", "refactor", "removes those assertions, which are less general then some others", "target", 
+	[
+		RuCommArg("remove-axioms", true, "remove redundant axioms. Default is 1", "1"),
+		RuCommArg("remove-generalized", true, "remove those theorems, which were generalized with 'generalize' command. Default is 1", "1"),
+		RuCommArg("remove-all", true, "remove all assertions, which are less generall to some other. May cause problem with cyclic imports", ""),
+		RuCommArg("only-preceeding", true, "remove a less general assertion to only those, which preceeds it.", "1"),
+		RuCommArg("update-imports", true, "include a more general module, in case it is not imported.", ""),
+		RuCommArg("save", true, "save the result. Default is 1", "1"),
+	],
 	ruRunRemoveLessGeneral
 );
 
@@ -17,17 +25,43 @@ ruRunRemoveLessGeneral(task : RuTask, env : RuEnv) -> RuEnv {
 	conf = env.conf;
 	hash_relation = initConcurrentHashMap();
 	t0 = timestamp();
+	if (conf.verbose > 0) {
+		conf.onMessage("starting removing less general ... ");
+	}
 	assertionsIndex = ruInitGlobalAssertionsIndex(math);
 	if (conf.verbose >= 3) {
-		conf.onMessage("\t\tbuilding an assertion index: " + " in " + d2st((timestamp() - t0) / 1000.0, 3) + " s")
+		conf.onMessage("\t\tbuilding an assertion index: " + " in " + d2st((timestamp() - t0) / 1000.0, 3) + " s");
+	}
+	remove_axioms = lookupTreeDef(task.args, "remove-axioms", "") == "1";
+	remove_generalized = lookupTreeDef(task.args, "remove-generalized", "") == "1";
+	remove_all = lookupTreeDef(task.args, "remove-all", "") == "1";
+	only_preceeding = lookupTreeDef(task.args, "only-preceeding", "") == "1";
+	update_imports = lookupTreeDef(task.args, "update-imports", "") == "1";
+	if (conf.verbose >= 3) {
+		conf.onMessage(
+			"\targuments:\n" +
+			"\t\tremove-axioms: " + b2s(remove_axioms) + "\n" +
+			"\t\tremove-generalized: " + b2s(remove_generalized) + "\n" +
+			"\t\tremove-all: " + b2s(remove_all) + "\n"
+			"\t\tonly-preceeding: " + b2s(only_preceeding)
+		);
+	}
+
+	remove_predicate = \decl -> {
+		switch (decl) {
+			RuAxiom(__,__,__,__,__,__,__): 
+				remove_all || remove_axioms;
+			RuDef(__,__,__,__,__,__,__,__,__): 
+				remove_all;
+			RuTheorem(name,__,__,__,__,__,__,__,__):
+				remove_all || (remove_generalized && containsKeyTree(math.assertions, name + "_gen"));
+			default: false; 
+		}
 	}
 
 	fn = RuApplyFn(
 		"generality relation", 
-		\decl -> switch (decl) {
-			RuAssertion(): true;
-			default: false; 
-		},
+		remove_predicate,
 		\decl -> i2d(length(cast(decl : RuDecl -> RuAssertion).hyps)),
 		\decl, time_limit -> {
 			ass = cast(decl : RuDecl -> RuAssertion);
@@ -58,7 +92,7 @@ ruRunRemoveLessGeneral(task : RuTask, env : RuEnv) -> RuEnv {
 	
 	t1 = timestamp();
 	ruApplyFnComm(task, env, fn);
-	if (conf.verbose >= 2) {
+	if (conf.verbose >= 3) {
 		conf.onMessage("\tRAW GEN REL: " + i2s(sizeConcurrentHashMap(hash_relation)) + " in " + d2st((timestamp() - t1) / 1000.0, 3) + " s");
 		if (conf.verbose >= 3) {
 			conf.onMessage(strGlue(map(keysConcurrentHashMap(hash_relation), 
@@ -90,7 +124,7 @@ ruRunRemoveLessGeneral(task : RuTask, env : RuEnv) -> RuEnv {
 			});
 		}
 	);
-	imports_map = ruMathAllImported(math);
+	imports_map = ruMathAllImported(math, conf);
 	preceeds = \a1, a2 -> {
 		ret = if (a1.src == a2.src) {
 			lookupTreeDef(affected_inds, a1.name, 0) < lookupTreeDef(affected_inds, a2.name, 0);
@@ -105,9 +139,17 @@ ruRunRemoveLessGeneral(task : RuTask, env : RuEnv) -> RuEnv {
 	compare_gen = \a1, a2 -> {
 		ret = maybeBind(ruMatchAssertions(a2, a1, math, conf), \match ->
 			if (isNone(ruMatchAssertions(a1, a2, math, conf))) {
-				if (!preceeds(a1, a2)) Some(match) else None();
+				if (only_preceeding) {
+					if (preceeds(a2, a1)) Some(match) else None();
+				} else {
+					if (!preceeds(a1, a2)) Some(match) else None();
+				}
 			} else if (strlen(a1.name) > strlen(a2.name)) {
-				if (!preceeds(a1, a2)) Some(match) else None();
+				if (only_preceeding) {
+					if (preceeds(a2, a1)) Some(match) else None();
+				} else {
+					if (!preceeds(a1, a2)) Some(match) else None();
+				}
 			} else None()
 		);
 		if (conf.verbose >= 4) {
@@ -151,8 +193,8 @@ ruRunRemoveLessGeneral(task : RuTask, env : RuEnv) -> RuEnv {
 		\m, less -> length(less) > 0
 	);
 	to_remove = foldTree(greater2less, 0, \__, less, acc -> acc + length(less));
-	if (conf.verbose >= 2) {
-		conf.onMessage("\tGEN REL (1): " + i2s(sizeTree(greater2less)) + ", TO REMOVE: " + i2s(to_remove) + " in " + d2st((timestamp() - t2) / 1000.0, 3) + " s");
+	if (conf.verbose >= 3) {
+		conf.onMessage("\t\tgeneralization relation: " + i2s(sizeTree(greater2less)) + ", to remove: " + i2s(to_remove) + " in " + d2st((timestamp() - t2) / 1000.0, 3) + " s");
 		if (conf.verbose >= 3) {
 			conf.onMessage(strGlue(map(tree2pairs(greater2less), \p -> 
 				"\t\t" + p.first.name + " >= " + strGlue(map(p.second, \a -> a.first.name), ", ")
@@ -167,30 +209,37 @@ ruRunRemoveLessGeneral(task : RuTask, env : RuEnv) -> RuEnv {
 	less2greater = mapTree(less2greater_arr, \greater_arr -> 
 		fold(tail(greater_arr), greater_arr[0], \acc, greater -> if (strlen(greater.first.name) < strlen(acc.first.name)) greater else acc)
 	);
-	to_leave = foldTree(less2greater, makeSet(), \__, greater, acc -> insertSet(acc, greater.first.name));
+	to_keep = set2array(foldTree(less2greater, makeSet(), \__, greater, acc -> insertSet(acc, greater.first.name)));
+	to_keep_non_gen = filter(to_keep, \ass -> !endsWith(ass, "_gen"));
 	if (conf.verbose >= 2) {
-		conf.onMessage("\tGEN REL (2): " + i2s(sizeTree(less2greater)) + ", TO LEAVE: " + i2s(sizeSet(to_leave)) + " in " + d2st((timestamp() - t2) / 1000.0, 3) + " s");
+		conf.onMessage("\tto remove: " + i2s(sizeTree(less2greater)) + ", to keep: " + i2s(length(to_keep)) + " in " + d2st((timestamp() - t2) / 1000.0, 3) + " s");
+		conf.onMessage("\tkept non-generalized: " + i2s(length(to_keep_non_gen)) + ": \n" + 
+			strGlue(map(to_keep_non_gen, \ass -> "\t\t" + ass), "\n")
+		);
 		if (conf.verbose >= 3) {
 			conf.onMessage(strGlue(map(tree2pairs(less2greater), \p -> 
 				"\t\t" + p.first.name + " <= " + p.second.first.name
 			), "\n"));
 		}
-		conf.onMessage("\tgeneralization relation: all done");
+		//conf.onMessage("\tgeneralization relation: all done");
 	}
 	ass2step = ruAssertionsProofSteps(buildSet(map(getTreeKeys(less2greater), \less -> less.name)), math);
 	new_math = foldTree(less2greater, env.ruMath, \less, greater, acc ->
-		ruReplaceLessWithGreater(less, greater.first, greater.second, acc, conf, ass2step)
+		if (!remove_predicate(less)) acc else 
+		ruReplaceLessWithGreater(less, greater.first, greater.second, acc, conf, ass2step, update_imports)
 	);
-	modified_sources = fold(getTreeKeys(less2greater), makeSet(), \acc, less -> 
-		fold(getTreeKeys(lookupTreeDef(ass2step, less.name, makeTree())), insertSet(acc, less.src), \ac, thm -> 
-			eitherMap(lookupTree(math.assertions, thm), \th -> insertSet(ac, th.src), ac)
-		)
-	);
-	ruWriteRefactoredSources(modified_sources, new_math, conf);
+	if (lookupTreeDef(task.args, "save", "") == "1") {
+		modified_sources = fold(getTreeKeys(less2greater), makeSet(), \acc, less -> 
+			fold(getTreeKeys(lookupTreeDef(ass2step, less.name, makeTree())), insertSet(acc, less.src), \ac, thm -> 
+				eitherMap(lookupTree(math.assertions, thm), \th -> insertSet(ac, th.src), ac)
+			)
+		);
+		ruWriteRefactoredSources(modified_sources, new_math, ruDecVerbose(conf));
+	}
 	RuEnv(env with ruMath = new_math);
 }
 
-ruReplaceLessWithGreater(less : RuAssertion, greater : RuAssertion, match : RuAssertionMatch, math : RuMath, conf : RuConf, ass2step : Tree<string, Tree<string, [int]>>) -> RuMath {
+ruReplaceLessWithGreater(less : RuAssertion, greater : RuAssertion, match : RuAssertionMatch, math : RuMath, conf : RuConf, ass2step : Tree<string, Tree<string, [int]>>, update_imports : bool) -> RuMath {
 	match_inds = enumFromTo(0, sizeTree(match.hypsMap) - 1);
 	if (conf.verbose >= 2) {
 		conf.onMessage("\tReplacing: " + less.name + " with " + greater.name);
@@ -216,7 +265,7 @@ ruReplaceLessWithGreater(less : RuAssertion, greater : RuAssertion, match : RuAs
 							}
 						)
 					);
-					with_greater = eitherMap(lookupTree(acc.sources, th.src),
+					with_greater = if (!update_imports) acc else eitherMap(lookupTree(acc.sources, th.src),
 						\s -> ruAddImportToSource(s, greater.src, acc, conf),
 						acc
 					);
