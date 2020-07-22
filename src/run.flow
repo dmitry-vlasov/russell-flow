@@ -52,25 +52,45 @@ ruRunLocal(job : RuJob, onMessage : (string) -> void, onRunComplete : (int) -> v
 }
 
 ruExecJob(job : RuJob, onMessage : (string) -> void, env : RuEnv) -> RuEnv {
-	fold(job.tasks, env, \acc, task -> {
+	upd_conf = \e -> {
+		RuEnv(e with 
+			conf = RuConf(e.conf with 
+				onMessage = onMessage,
+				onError = \err, places -> onMessage("Error: " + err + (if (places == []) "" else "\n" + strGlue(map(places, ruPlace2s), "\n")))
+			)
+		);
+	}
+	job_start = timestamp();
+	ruJobLog("Started job:\n" + strIndent(ruJob2s(job)) + "\n", env.conf);
+	ret = fold(job.tasks, Some(upd_conf(env)), \acc, task -> {
 		switch (lookupTree(ruCommandsTree(), task.command)) {
 			Some(command): {
-				conf = RuConf(acc.conf with 
-					onMessage = onMessage,
-					onError = \err, places -> onMessage("Error: " + err + (if (places == []) "" else "\n" + strGlue(map(places, ruPlace2s), "\n")))
-				);
-				fold(
-					ruPrepareTasks(task, command, conf), 
-					RuEnv(acc with conf = conf), 
-					\e, t -> command.run(t, e)
+				fold(ruPrepareTasks(task, command, env.conf), acc,  
+					\ac, t -> maybeBind(ac, \e -> {
+						task_start = timestamp();
+						ruJobLog("Started task: " + ruTask2s(t) + " ... ", env.conf);
+						ret = command.run(t, upd_conf(e));
+						ruJobLog(
+							"Task finished: " +
+							(if (isSome(ret)) "Ok " else "Fail ") +
+							"in " + d2st((timestamp() - task_start) / 1000.0, 2) + "s", env.conf
+						);
+						ret;
+					})
 				);
 			}
 			None(): {
 				onMessage("Unknown command: '" + task.command + "'");
-				acc;
+				None();
 			}
 		}
-	})
+	});
+	ruJobLog(
+		"Job finished: " +
+		(if (isSome(ret)) "Ok " else "Fail ") + 
+		"in " + d2st((timestamp() - job_start) / 1000.0, 2) + "s", env.conf
+	);
+	either(ret, env);
 }
 
 ruPrepareTasks(task : RuTask, command : RuComm, conf : RuConf) -> [RuTask] {
@@ -141,7 +161,7 @@ ruCommReadAny = RuComm(
 	ruRunReadAny
 );
 
-ruRunReadAny(task : RuTask, env : RuEnv) -> RuEnv {
+ruRunReadAny(task : RuTask, env : RuEnv) -> Maybe<RuEnv> {
 	file = lookupTreeDef(task.args, "file", "");
 	if (endsWith(file, ".ru")) {
 		ruRunRead(task, env);
@@ -149,7 +169,7 @@ ruRunReadAny(task : RuTask, env : RuEnv) -> RuEnv {
 		mmRunRead(task, env);
 	} else {
 		env.conf.onError("Unknown file extension: " + file + ", must be *.ru or *.mm", []);
-		env;
+		None();
 	}
 }
 
@@ -161,20 +181,20 @@ ruCommHelp = RuComm(
 
 ruCommUsage = RuComm(
 	"help-usage", "help", "usage message", "", [],
-	\task, env -> { env.conf.onMessage(ruUsageMessage()); env;	}
+	\task, env -> { env.conf.onMessage(ruUsageMessage()); Some(env); }
 );
 
 ruCommCategory = RuComm(
 	"help-category", "help", "show all help categories", "", [],
-	\task, env -> { env.conf.onMessage(ruCategoryMessage()); env;	}
+	\task, env -> { env.conf.onMessage(ruCategoryMessage()); Some(env); }
 );
 
 ruCommServer = RuComm(
 	"help-server", "help", "show all server modes", "", [],
-	\task, env -> { env.conf.onMessage(ruServerMessage()); env;	}
+	\task, env -> { env.conf.onMessage(ruServerMessage()); Some(env); }
 );
 
-ruRunHelp(task : RuTask, env : RuEnv) -> RuEnv {
+ruRunHelp(task : RuTask, env : RuEnv) -> Maybe<RuEnv> {
 	commands = getTreeValues(ruCommandsTree());
 	cats = toLowerCase(lookupTreeDef(task.args, "category", ""));
 	categories = 
@@ -191,7 +211,7 @@ ruRunHelp(task : RuTask, env : RuEnv) -> RuEnv {
 	} else {
 		env.conf.onMessage(ruHelpOn(""));
 	}
-	env;
+	Some(env);
 }
 
 ruHelpMessage(detailed : bool) -> string {
@@ -271,18 +291,18 @@ ruCommRunScript = RuComm(
 	ruRunScript
 );
 
-ruRunScript(task : RuTask, env : RuEnv) -> RuEnv {
+ruRunScript(task : RuTask, env : RuEnv) -> Maybe<RuEnv> {
 	file = lookupTreeDef(task.args, "script", "");
 	script = fileNameOnly(file);
 	if (containsSet(^ru_running_scripts, script)) {
 		env.conf.onError("Recursive scripts are not allowed.", []);
-		env;
+		None();
 	} else {
 		job = ruComposeJobFromScript(file, env.conf);
 		ru_running_scripts := insertSet(^ru_running_scripts, script);
 		new_env = ruExecJob(job, env.conf.onMessage, env);
 		ru_running_scripts := removeSet(^ru_running_scripts, script);
-		new_env
+		Some(new_env)
 	}
 }
 
@@ -312,7 +332,7 @@ ruCommVerifyMetamath = RuComm(
 	ruRunVerifyMetamath
 );
 
-ruRunVerifyMetamath(task : RuTask, env : RuEnv) -> RuEnv {
+ruRunVerifyMetamath(task : RuTask, env : RuEnv) -> Maybe<RuEnv> {
 	file = changeFileExt(lookupTreeDef(task.args, "file", ""), ".mm");
 	if (env.conf.verbose > 1) {
 		env.conf.onMessage("Going to verify " + file + " with Metamath");
@@ -327,5 +347,5 @@ ruRunVerifyMetamath(task : RuTask, env : RuEnv) -> RuEnv {
 	if (code != 0) {
 		env.conf.onError("Verification of " + file + " with Metamath eneded up with return code: " + i2s(code), []);
 	}
-	env;
+	Some(env);
 }
