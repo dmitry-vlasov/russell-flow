@@ -53,6 +53,10 @@ function mathInfo(): void {
 	);
 }
 
+function removeAllSpaces(str : string) : string { 
+    return str.replace(/[\r\n\t ]+/gm, ''); 
+} 
+
 function execCommand() {
 	russellChannel.show(true);
 	let options: vscode.InputBoxOptions = { prompt: "Command and args: ", placeHolder: "" };
@@ -63,7 +67,8 @@ function execCommand() {
 			let args = file_arg.concat(val_arr);
 			client.sendRequest("workspace/executeCommand", { command : "command", arguments: args }).then(
 				(out : string) => {
-					if (out != "null") {
+					let spaces_removed = removeAllSpaces(out);
+					if (!(spaces_removed == "null" || spaces_removed == "")) {
 						russellChannel.appendLine(out);
 					}
 				},
