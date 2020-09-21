@@ -97,9 +97,9 @@ RuCachedFileSource(
 
 ruDepChangedCallback(src : RuSource, conf : RuConf) -> () -> bool {
 	\ -> {
-		check = exists(src.imports, \imp ->
+		check = ruFileChanged(src.info) || exists(src.imports, \imp ->
 			switch (ruFromCache(imp.module, conf)) {
-				Some(cached): ruFileChanged(src.info) || cached.dependencyChanged();
+				Some(cached): cached.dependencyChanged();
 				None(): {
 					conf.onError("a module '" + imp.module + "' must be already in cache, but is not there", []); true; 
 				}
@@ -198,47 +198,77 @@ ruToCache(s : RuSource, conf : RuConf) -> void {
 }
 
 ruFromCache(file0 : string, conf : RuConf) -> Maybe<RuCachedSource> {
-	file = ruTrimPath(file0, conf, ".ru");
 	if (lookupTreeDef(conf.opts, "caching", "") == "0") None() else {
+		file = ruTrimPath(file0, conf, ".ru");
+		cached = switch (ruFromMemoryCache(file, conf)) {
+			Some(cached): Some(cached);
+			None(): ruFromDiskCache(file, conf);
+		}
+		ruCheckCachedIntegrity(file, cached, conf);
+	}
+}
+
+ruCheckCachedIntegrity(file : string, mcached : Maybe<RuCachedSource>, conf : RuConf) -> Maybe<RuCachedSource> {
+	del_from_cache = \cached -> {
+		//ruServerLog("ABOUT TO DELETE: " + cached.source.info.path, conf);
+		//ruServerLog(ruFileChangedMessage(cached.source.info), conf);
+		ruDeleteFromCache(file, ruCachedPath(file, conf), conf);
+		None();
+	}
+	maybeBind(mcached, \cached -> {
+		if (ruFileChanged(cached.source.info)) {
+			if (conf.verbose > 1) {
+				conf.onMessage("\t" + ruFileChangedMessage(cached.source.info));
+			}
+			del_from_cache(cached);
+		} else if (cached.dependencyChanged()) {
+			if (conf.verbose > 1) {
+				conf.onMessage("\tdependency of file: '" + file + "' has changed");
+			}
+			del_from_cache(cached);
+		} else {
+			if (conf.verbose > 1) {
+				conf.onMessage("\tloaded from cache: '" + file + "'");
+			}
+			setConcurrentHashMap(ruSourceCache, file, Some(cached));
+			ruUpdateNameCache(cached.source, conf);
+			if (!fileExists(ruCachedPath(file, conf))) {
+				ruSaveCacheSource(cached.source, conf);
+			}
+			Some(cached);
+		}
+	});
+}
+
+ruFromDiskCache(file : string, conf : RuConf) -> Maybe<RuCachedSource> {
+	path = ruCachedPath(file, conf);
+	if (lookupTreeDef(conf.opts, "disk-caching", "") == "0" || !fileExists(path)) None() else {
+		deserialized = deserializeBinary(getFileContent(path), IllegalStruct());
+		if (deserialized == IllegalStruct()) {
+			conf.onError("WARNING: Illegal structure of cache file for '" + file + "'. Incremental file deleted.", []);
+			ruDeleteFromCache(file, path, conf);
+			None();
+		} else {
+			cached_file = cast(deserialized : flow -> RuCachedFileSource);
+			if (cached_file.version == ruCacheVersion) {
+				Some(RuCachedSource(cached_file.source, ruDepChangedCallback(cached_file.source, conf), cached_file.version));
+			} else {
+				if (conf.verbose > 1) {
+					conf.onMessage("\tcached file " + file + " has outdated version " + i2s(cached_file.version) + " while current version is " + i2s(ruCacheVersion));
+					ruDeleteFromCache(file, path, conf);
+				}
+				None();
+			}
+		}
+	}
+}
+
+ruFromMemoryCache(file : string, conf : RuConf) -> Maybe<RuCachedSource> {
+	if (lookupTreeDef(conf.opts, "mem-caching", "") == "0") None() else {
 		if (containsConcurrentHashMap(ruSourceCache, file)) {
 			getConcurrentHashMap(ruSourceCache, file, None());
 		} else {
-			path = ruCachedPath(file, conf);
-			if (!fileExists(path)) None() else {
-				deserialized = deserializeBinary(getFileContent(path), IllegalStruct());
-				if (deserialized == IllegalStruct()) {
-					conf.onError("WARNING: Illegal structure of cache file for '" + file + "'. Incremental file deleted.", []);
-					ruDeleteFromCache(file, path, conf);
-					None();
-				} else {
-					cached_file = cast(deserialized : flow -> RuCachedFileSource);
-					if (cached_file.version == ruCacheVersion) {
-						if (ruFileChanged(cached_file.source.info)) {
-							if (conf.verbose > 1) {
-								conf.onMessage("\t" + ruFileChangedMessage(cached_file.source.info));
-							}
-							ruServerLog("ABOUT TO DELETE: " + cached_file.source.info.path, conf);
-							ruServerLog(ruFileChangedMessage(cached_file.source.info), conf);
-							ruDeleteFromCache(file, path, conf);
-							None();
-						} else {
-							if (conf.verbose > 1) {
-								conf.onMessage("\tloaded from cache: '" + file + "'");
-							}
-							cached = RuCachedSource(cached_file.source, ruDepChangedCallback(cached_file.source, conf), cached_file.version);
-							setConcurrentHashMap(ruSourceCache, file, Some(cached));
-							ruUpdateNameCache(cached.source, conf);
-							Some(cached);
-						}
-					} else {
-						if (conf.verbose > 1) {
-							conf.onMessage("\tcached file " + file + " is has version " + i2s(cached_file.version) + " while current version is " + i2s(ruCacheVersion));
-							ruDeleteFromCache(file, path, conf);
-						}
-						None();
-					}
-				}
-			}
+			None();
 		}
 	}
 }
@@ -264,7 +294,7 @@ ruDoLoadToCache(module : string,  conf : RuConf, acc : [RuSource], visited : Set
 				);
 			}
 			None(): {
-				ruServerLog("MODULE: " + module + " is not cached", conf);
+				//ruServerLog("MODULE: " + module + " is not cached", conf);
 				Pair(acc, new_visited);
 			}
 		}
