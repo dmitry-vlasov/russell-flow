@@ -18,7 +18,7 @@ export function run_cmd_sync(cmd: string, wd: string, args: string[]) {
 }
 
 export function shutdownHttpServer(port : number) {
-    return run_cmd("russell", "", ["shutdown-server=1", "server-port=" + port], (s) => { console.log(s); } );
+    return run_cmd("russell", "", ["server-shutdown", "server-port=" + port], (s) => { console.log(s); } );
 }
 
 export function launchHttpServer(port : number, on_start : () => void, on_stop : () => void) {
