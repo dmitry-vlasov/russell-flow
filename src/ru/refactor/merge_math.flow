@@ -13,7 +13,8 @@ ruCommMergeMath(exec : (RuJob, (string) -> void, RuEnv) -> RuEnv) -> RuComm {
 			RuCommArg("file", false, "input math file. Make sense to use a root file.", ""),
             RuCommArg("importRoots", false, "input math import roots", ""),
 			RuCommArg("exportRoot", false, "where to put new files", ""),
-			RuCommArg("verify", false, "set to 'no' to force skipping of verification", "yes"),
+			RuCommArg("merge", false, "set to 0 not to perform actual merging", ""),
+			RuCommArg("verify", false, "set to 'no' to force skipping of verification or set to 'smart' to automatically remove failed theorems", "yes"),
             RuCommArg("info-verbose", true, "verbosity at show info about merged theorems, value: 0, 1, 2, 3", ""),
         ],
         ruRunMergeMath(exec)
@@ -44,7 +45,7 @@ ruRunMergeMath(exec : (RuJob, (string) -> void, RuEnv) -> RuEnv) -> (RuTask, RuE
 					Pair("file", file), 
 					Pair("import-roots", importRoots), 
 					Pair("caching", "0"), 
-					Pair("verbose", i2s(conf.verbose)), 
+					Pair("verbose", i2s(if (conf.verbose > 0) conf.verbose - 1 else 0)), 
 					Pair("strict-file-names", "1"),
 				])),
 				//RuTask("show-conf", makeTree()),
@@ -58,28 +59,51 @@ ruRunMergeMath(exec : (RuJob, (string) -> void, RuEnv) -> RuEnv) -> (RuTask, RuE
 			if (info_level > 0) {
 				ruMergeMathsInfo(env.ruMath, env1.ruMath, conf, info_level);
 			}
-			merged_math = ruMergeMaths(env.ruMath, env1.ruMath, exportRoot, conf);
-			// Some imports may become obsolete, some other may become necessary.
-			imports_optimized = ruRunOptimizeImports(merged_math, conf);
-			env2 = RuEnv(env with ruMath = imports_optimized);
-			if (lookupTreeDef(task.args, "verify", "yes") == "no") {
-				if (conf.verbose > 0) {
-					conf.onMessage("merging succeeded (NOT verified yet!), done in: " + d2st((timestamp() - start) / 1000.0, 3) + " s.");
-				}
-				Some(env2);
-			} else {
-				switch (ruVerifyMath(env2.ruMath, conf)) {
-					Some(verified_math): {
-						if (conf.verbose > 0) {
-							conf.onMessage("merging succeeded, done in: " + d2st((timestamp() - start) / 1000.0, 3) + " s.");
-						}
-						Some(RuEnv(env2 with ruMath = verified_math));
+			if (lookupTreeDef(task.args, "merge", "1") == "0") Some(env) else {
+				merged_math = ruMergeMaths(env.ruMath, env1.ruMath, exportRoot, conf);
+				// Some imports may become obsolete, some other may become necessary.
+				imports_optimized = ruRunOptimizeImports(merged_math, ruDecVerbose(conf));
+				env2 = RuEnv(env with ruMath = imports_optimized);
+				verify_mode = lookupTreeDef(task.args, "verify", "smart");
+				if (verify_mode == "no") {
+					if (conf.verbose > 0) {
+						conf.onMessage("merging succeeded (NOT verified yet!), done in: " + d2st((timestamp() - start) / 1000.0, 3) + " s.");
 					}
-					None(): {
-						if (conf.verbose > 0) {
-							conf.onMessage("merging failed, took : " + d2st((timestamp() - start) / 1000.0, 3) + " s.");
+					Some(env2);
+				} else if (verify_mode == "smart") {
+					math = env2.ruMath;
+					verify_acc = ruDoVerifyMath(
+						math.sources, 
+						RuVerifyAcc(math, makeSet(), makeSet()), 
+						ruDecVerbose(conf)
+					);
+					disproved = filtermap(set2array(verify_acc.disproved), \disp -> 
+						lookupTree(math.assertions, disp)
+					);
+					if (conf.verbose > 0) {
+						if (sizeSet(verify_acc.disproved) > 0) {
+							conf.onMessage("removing disproved " + i2s(sizeSet(verify_acc.disproved)) + " theorems: " + strGlue(map(disproved, ruDeclName), ", "));
 						}
-						None();
+					}
+					filtered_math = fold(disproved, verify_acc.math, \acc, thm -> ruRemoveDecl(thm, acc, conf));
+					if (conf.verbose > 0) {
+						conf.onMessage("merging succeeded, done in: " + d2st((timestamp() - start) / 1000.0, 3) + " s.");
+					}
+					Some(RuEnv(env2 with ruMath = filtered_math));
+				} else {
+					switch (ruVerifyMath(env2.ruMath, ruDecVerbose(conf))) {
+						Some(verified_math): {
+							if (conf.verbose > 0) {
+								conf.onMessage("merging succeeded, done in: " + d2st((timestamp() - start) / 1000.0, 3) + " s.");
+							}
+							Some(RuEnv(env2 with ruMath = verified_math));
+						}
+						None(): {
+							if (conf.verbose > 0) {
+								conf.onMessage("merging failed, took : " + d2st((timestamp() - start) / 1000.0, 3) + " s.");
+							}
+							None();
+						}
 					}
 				}
 			}
@@ -121,6 +145,13 @@ ruMergeMaths(m1 : RuMath, m2 : RuMath, exportRoot : string, conf : RuConf) -> Ru
 			setTree(acc, name, tenv), acc
 		)
 	);
+	if (conf.verbose > 1) {
+		if (sizeTree(new_types) > 0) {
+			conf.onMessage("\tnew types: " + strIndent(strIndent(strGlue(getTreeKeys(new_types), ", "))));
+		} else {
+			conf.onMessage("\tnew types: -- ");
+		}
+	}
 	// We equip types with the super-infer rules, and these rules must be added initiall, with types.
 	new_types_supers = foldTree(new_types, makeTree(), \__, tenv, acc -> 
 		foldTree(tenv.supers, acc, \__, super, ac ->
@@ -128,68 +159,115 @@ ruMergeMaths(m1 : RuMath, m2 : RuMath, exportRoot : string, conf : RuConf) -> Ru
 		)
 	);
 
-	m1_0 = RuMath(m1 with 
-		types = mergeTree(m1.types, new_types),
-		rules = mergeTree(m1.rules, new_types_supers)
-	);
+	m1_sources = buildSet(getTreeKeys(m1.sources));
+	m2_sources = buildSet(getTreeKeys(m2.sources));
 
-	new_decl_names = differenceSets(
-		buildSet(getTreeKeys(ruMathAllDecls(m2))), 
-		buildSet(getTreeKeys(ruMathAllDecls(m1)))
-	);
+	// Find a set of all common sources
+	common_srcs = intersectSets(m1_sources, m2_sources);
 
-	// At second step, add all new sources as a whole
-	new_srcs = set2array(differenceSets(buildSet(getTreeKeys(m2.sources)), buildSet(getTreeKeys(m1.sources))));
-	m1_1 = fold(new_srcs, m1_0, \acc, name -> 
+	// Filter out only modified sources
+	mod_srcs = filterSet(common_srcs, \name -> {
+		src_1 = lookupTreeDef(m1.sources, name, ruNoSource);
+		src_2 = lookupTreeDef(m2.sources, name, ruNoSource);
+		src_1.decls != src_2.decls;
+	});
+	if (conf.verbose > 1) {
+		if (sizeSet(mod_srcs) > 0) {
+			conf.onMessage("\tmodified sources:\n" + strIndent(strIndent(strGlue(set2array(mod_srcs), "\n"))));
+		} else {
+			conf.onMessage("\tmodified sources: --");
+		}
+	}
+
+	m1_names = buildSet(getTreeKeys(ruMathAllDecls(m1)));
+	new_srcs = differenceSets(m2_sources, m1_sources);
+	if (conf.verbose > 1) {
+		if (sizeSet(new_srcs) > 0) {
+			conf.onMessage("\tnew sources:\n" + strIndent(strIndent(strGlue(set2array(new_srcs), "\n"))));
+		} else {
+			conf.onMessage("\tnew sources: --");
+		}
+	}
+	new_or_mod_srcs = mergeSets(new_srcs, mod_srcs);
+
+	m1_decls = ruMathAllDecls(m1);
+
+	// Find moved names: those, which occur in new sources and in old math as well
+	moved_decls = foldSet(new_or_mod_srcs, makeSet(), \acc, name ->
 		eitherMap(lookupTree(m2.sources, name), 
-			\src -> {
-				// Add only those decls, which doesn't occcur already in code
-				new_decls = filter(src.decls, \decl -> containsSet(new_decl_names, ruDeclName(decl)));
-				if (length(new_decls) == 0) {
-					// No new decls - skip this source
-					acc 
-				} else {
-					ruAddSource(RuSource(src with 
-						info = ruChangeImportRoot(src.info, exportRoot),
-						decls = new_decls
-					), acc, conf);
-				}
-			},
+			\src -> mergeSets(acc, 
+				fold(src.decls, acc, \ac, m2_decl ->
+					if (!containsSet(m1_names, ruDeclName(m2_decl))) ac else {
+						switch (lookupTree(m1_decls, ruDeclName(m2_decl))) {
+							Some(m1_decl): insertSet(ac, m1_decl);
+							None(): ac;
+						}
+					}
+				)
+			),
+			acc
+		)
+	);
+	if (conf.verbose > 2) {
+		if (sizeSet(moved_decls) > 0) {
+			conf.onMessage("\tmoved decls:\n" + strIndent(strIndent(strGlue(map(set2array(moved_decls), ruDeclName), "\n"))));
+		} else {
+			conf.onMessage("\tmoved decls: --");
+		}
+	}
+
+	// Remove moved names from the former location
+	m1_0 = foldSet(moved_decls, m1, \acc, decl -> ruRemoveDecl(decl, acc, conf));
+
+	// Update math with types and rules
+	m1_1 = RuMath(m1_0 with 
+		types = mergeTree(m1.types, new_types),
+		rules = mergeTree(m1.rules, new_types_supers),
+	);
+
+	// Add all new sources as a whole
+	m1_2 = foldSet(new_srcs, m1_1, \acc, name -> 
+		eitherMap(lookupTree(m2.sources, name), 
+			\src -> ruAddSource(
+				RuSource(src with 
+					info = ruChangeImportRoot(src.info, exportRoot)
+				), acc, conf
+			),
 			acc
 		)
 	);
 
-	// Find a set of modified sources
-	common_srcs = set2array(intersectSets(buildSet(getTreeKeys(m2.sources)), buildSet(getTreeKeys(m1.sources))));
-	mod_srcs = filter(common_srcs, \name -> {
-		src_1 = lookupTreeDef(m1_1.sources, name, ruNoSource);
+	// Merge decl arrays for modified sources
+	m1_3 = foldSet(mod_srcs, m1_2, \acc, name -> {
+		src_1 = lookupTreeDef(acc.sources, name, ruNoSource);
 		src_2 = lookupTreeDef(m2.sources, name, ruNoSource);
-		if (length(src_1.decls) != length(src_2.decls)) true else {
-			exists(zipWith(src_1.decls, src_2.decls, \d1, d2 -> Pair(d1, d2)), \p -> 
-				ruDeclName(p.first) != ruDeclName(p.second)
-			);
-		}
-	});
-	
-	// Finally merge modified sources
-	fold(mod_srcs, m1_1, \acc, name -> {
-		src_1 = lookupTreeDef(m1_1.sources, name, ruNoSource);
-		src_2 = lookupTreeDef(m2.sources, name, ruNoSource);
-		merged = ruMergeDecls(src_1.decls, src_2.decls, 0, 0, []);
+		merged = concat(src_2.decls, src_1.decls);
 		ruAddSource(RuSource(src_1 with decls = merged), acc, conf);
 	});
-}
 
-ruMergeDecls(ds1 : [RuDecl], ds2 : [RuDecl], i1 : int, i2 : int, acc : [RuDecl]) -> [RuDecl] {
-	if (i1 == length(ds1) && i2 == length(ds2)) acc else
-	if (i1 == length(ds1)) ruMergeDecls(ds1, ds2, i1, i2 + 1, concat(acc, [ds2[i2]])) else 
-	if (i2 == length(ds2)) ruMergeDecls(ds1, ds2, i1 + 1, i2, concat(acc, [ds1[i1]])) else {
-		d1 = ds1[i1];
-		d2 = ds2[i2];
-		if (d1.descr.name == d2.descr.name) {
-			ruMergeDecls(ds1, ds2, i1 + 1, i2 + 1, concat(acc, [d1]));
-		} else {
-			ruMergeDecls(ds1, ds2, i1, i2 + 1, concat(acc, [d2]));
+	switch (ruProjectRootSource(m1)) {
+		Some(root_1): {
+			switch (ruProjectRootSource(m2)) {
+				Some(root_2): {
+					root_1_3 = lookupTreeDef(m1_3.sources, root_1.info.module, ruNoSource);
+					root_1_srcs = buildSet(map(root_1_3.imports, \imp -> imp.module));
+					new_imports = filter(root_2.imports, \imp -> !containsSet(root_1_srcs, imp.module));
+					new_root_1 = RuSource(root_1_3 with imports = concat(root_1_3.imports, new_imports));
+					RuMath(m1_3 with sources = setTree(m1_3.sources, root_1.info.module, new_root_1));
+				}
+				None(): {
+					if (conf.verbose > 2) {
+						conf.onMessage("\tno root file in math which is merging");
+					}
+					m1_3;
+				}
+			}
+		}
+		None(): {
+			if (conf.verbose > 2) {
+				conf.onMessage("\tno root file in math which is merged");
+			}
+			m1_3;
 		}
 	}
 }
