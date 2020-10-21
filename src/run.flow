@@ -6,7 +6,8 @@ import mm/comms;
 export {
 	ruRun(job : RuJob, onMessage : (string) -> void, onRunComplete : (int) -> void) -> void;
 	ruRunLocal(job : RuJob, onMessage : (string) -> void, onRunComplete : (int) -> void) -> void;
-	ruComposeJobFromScript(file : string, conf : RuConf) -> RuJob;
+	ruFindScript(name : string, conf : RuConf) -> string;
+	ruComposeJobFromScript(file : string, args : Tree<string, string>, conf : RuConf) -> RuJob;
 }
 
 ruRun(job : RuJob, onMessage : (string) -> void, onRunComplete : (int) -> void) -> void {
@@ -336,13 +337,14 @@ ruCommRunScript = RuComm(
 );
 
 ruRunScript(task : RuTask, env : RuEnv) -> Maybe<RuEnv> {
-	file = lookupTreeDef(task.args, "script", "");
+	name = lookupTreeDef(task.args, "script", "");
+	file = ruFindScript(name, env.conf);
 	script = fileNameOnly(file);
 	if (containsSet(^ru_running_scripts, script)) {
 		env.conf.onError("Recursive scripts are not allowed.", []);
 		None();
 	} else {
-		job = ruComposeJobFromScript(file, env.conf);
+		job = ruComposeJobFromScript(file, task.args, env.conf);
 		ru_running_scripts := insertSet(^ru_running_scripts, script);
 		new_env = ruExecJob(job, env.conf.onMessage, env);
 		ru_running_scripts := removeSet(^ru_running_scripts, script);
@@ -350,28 +352,63 @@ ruRunScript(task : RuTask, env : RuEnv) -> Maybe<RuEnv> {
 	}
 }
 
-ruComposeJobFromScript(file : string, conf : RuConf) -> RuJob {
+ruFindScript(name : string, conf : RuConf) -> string {
+	if (fileExists(name)) name else 
+	if (fileExists(name + ".rus")) name + ".rus" else {
+		scripts_dir = pathCombine(getRussellDir(), "scripts");
+		if (fileExists(pathCombine(scripts_dir, name))) pathCombine(scripts_dir, name) else 
+		if (fileExists(pathCombine(scripts_dir, name + ".rus"))) pathCombine(scripts_dir, name + ".rus") else {
+			conf.onError("Script '" + name + "' is not found", []);
+			""
+		}
+	}
+}
+
+ruComposeJobFromScript(file : string, args : Tree<string, string>, conf : RuConf) -> RuJob {
 	if (!fileExists(file)) {
 		conf.onMessage("Script " + file + " is not found");
 		RuJob([]);
 	} else {
-		contents = strGlue(
-			filtermap(strSplit(getFileContent(file), "\n"), \line -> 
-				if (startsWith(line, "#")) None() else Some(line)
-			), " "
-		);
-		params = filtermap(
-			strSplit2(contents, [" ", "\r", "\t"]),
-			\p -> {
-				param = trim2(p, " \n\r\t");
-				if (param == "" || startsWith(param, "#")) None() else Some(strSplit(param, "="));
+		src0 = getFileContent(file);
+		vars = ruScriptVars(src0);
+		vars_without_vals = filter(vars, \var -> !containsKeyTree(args, var));
+		if (length(vars_without_vals) > 0) {
+			conf.onMessage("Script " + file + " has variables: " + strGlue(map(vars_without_vals, \v -> "$" + v), ", ") + " with no values provided");
+			RuJob([]);
+		} else {
+			replacing = fold(vars, [], \acc, var -> 
+				concat(acc, ["$" + var, lookupTreeDef(args, var, "")])
+			);
+			src = strReplaces(src0, replacing);
+			contents = strGlue(
+				filtermap(strSplit(src, "\n"), \line -> 
+					if (startsWith(line, "#")) None() else Some(line)
+				), " "
+			);
+			params = filtermap(
+				strSplit2(contents, [" ", "\r", "\t"]),
+				\p -> {
+					param = trim2(p, " \n\r\t");
+					if (param == "" || startsWith(param, "#")) None() else Some(strSplit(param, "="));
+				}
+			);
+			job = ruMakeJob(params);
+			if (conf.verbose >= 2) {
+				conf.onMessage("\tAbout to execute script: " + ruJob2s(job));
 			}
-		);
-		job = ruMakeJob(params);
-		if (conf.verbose >= 2) {
-			conf.onMessage("\tAbout to execute script: " + ruJob2s(job));
+			job;
 		}
-		job;
+	}
+}
+
+ruScriptVars(src : string) -> [string] {
+	map(multipleStrIndexOf(src, "$"), \i -> ruScriptVar(src, i + 1, ""));
+}
+
+ruScriptVar(src : string, i : int, acc : string) -> string {
+	c = getCharAt(src, i);
+	if (!(isLetter(c) || isDigit(c))) acc else {
+		ruScriptVar(src, i + 1, acc + c);
 	}
 }
 
