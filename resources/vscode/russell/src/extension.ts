@@ -147,7 +147,8 @@ function checkHttpServerStatus(initial : boolean) {
 	isPortReachable(port, {host: 'localhost'}).then(
 		(reacheable : boolean) => {
 			if (reacheable) {
-				showHttpServerOnline();
+				//showHttpServerOnline();
+				outputHttpServerMemStats();
 				httpServerOnline = true;
 			} else {
 				httpServer = null;
@@ -161,6 +162,24 @@ function checkHttpServerStatus(initial : boolean) {
 					}
 				}
 			}
+		}
+	);
+}
+
+function outputHttpServerMemStats() {
+	client.sendRequest("workspace/executeCommand", { 
+		command : "command", 
+		arguments : ["mem-stats", "do_not_log_this"]
+	}).then(
+		(out : string) => {
+			let msg_start = out.indexOf("Used:");
+			let msg_end = out.indexOf("\n", msg_start);
+			let mem_stats = out.substr(msg_start, msg_end - msg_start);
+			showHttpServerOnline(mem_stats);
+		},
+		(err : any) => {
+			russellChannel.appendLine(err);
+			showHttpServerOffline();
 		}
 	);
 }
@@ -189,8 +208,12 @@ function stopHttpServer() {
 	}
 }
 
-function showHttpServerOnline() {
-	serverStatusBarItem.text = `$(vm-active) russell http server: online`;
+function showHttpServerOnline(mem_stats? : string) {
+	if (mem_stats) {
+		serverStatusBarItem.text = `$(vm-active) russell http server: online (` + mem_stats + ")";
+	} else {
+		serverStatusBarItem.text = `$(vm-active) russell http server: online`;
+	}
 }
 
 function showHttpServerOffline() {
@@ -199,7 +222,7 @@ function showHttpServerOffline() {
 
 // this method is called when your extension is deactivated
 export function deactivate() {
-	// First, shutdown Russellc server, if it is owned by current vscode instance
+	// First, shutdown Russell server, if it is owned by current vscode instance
 	if (httpServer) {
 		const port : number = vscode.workspace.getConfiguration("russell").get("portOfHttpServer");
 		tools.shutdownHttpServer(port).on("exit", (code, msg) => httpServer = null);
@@ -234,7 +257,8 @@ function processRussell(uri : vscode.Uri, target : string, action : string): voi
 	client.sendRequest("workspace/executeCommand", { 
 		command : "command", 
 		arguments: [
-			"file=" + uri.fsPath, "read",  ";",
+			"file=" + uri.fsPath, 
+			"read",  ";",
 			action, "target=" + target
 		] 
 	});
@@ -247,7 +271,8 @@ function verifyMetamath(uri : vscode.Uri): void {
 	client.sendRequest("workspace/executeCommand", { 
 		command : "command", 
 		arguments: [
-			"file=" + ru_file, "read-ru",  ";",
+			"file=" + ru_file, 
+			"read-ru",  ";",
 			"ru-to-mm", "file=" + ru_file, ";",
 			"write-mm", "file=" + mm_file, "monolithic=1", "strip-comments=1", ";",
 			"verify-mm", "file=" + mm_file
