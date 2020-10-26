@@ -1,0 +1,100 @@
+import base/job;
+import command;
+
+export {
+	ruExec(job : RuJob, commands : Tree<string, RuComm>, onMessage : (string) -> void, env : RuEnv) -> RuEnv;
+}
+
+ruExec(job : RuJob, commands : Tree<string, RuComm>, onMessage : (string) -> void, env : RuEnv) -> RuEnv {
+	upd_conf = \e -> {
+		RuEnv(e with 
+			conf = RuConf(e.conf with 
+				onMessage = onMessage,
+				onError = ruMakeOnError(e.conf.opts, onMessage)
+			)
+		);
+	}
+	job_start = timestamp();
+	log_job = exists(job.tasks, \task -> !existsTree(task.args, \arg, __ -> arg == "do_not_log_this"));
+	if (log_job) {
+		ruJobLog("Started job:\n" + strIndent(ruJob2s(job)) + "\n", env.conf);
+	}
+	ret = fold(job.tasks, Some(upd_conf(env)), \acc, task -> {
+		switch (lookupTree(commands, task.command)) {
+			Some(command): {
+				fold(ruPrepareTasks(task, command, env.conf), acc,  
+					\ac, t -> maybeBind(ac, \e -> {
+						task_start = timestamp();
+						log_task = !existsTree(t.args, \arg,__ -> arg == "do_not_log_this");
+						if (log_task) {
+							ruJobLog("Started task: " + ruTask2s(t) + " ... ", env.conf);
+						}
+						ret = command.run(t, upd_conf(e));
+						if (log_task) {
+							ruJobLog(
+								"Task finished: " +
+								(if (isSome(ret)) "Ok " else "Fail ") +
+								"in " + d2st((timestamp() - task_start) / 1000.0, 2) + "s", env.conf
+							);
+						}
+						ret;
+					})
+				);
+			}
+			None(): {
+				onMessage("Unknown command: '" + task.command + "'");
+				None();
+			}
+		}
+	});
+	if (log_job) {
+		ruJobLog(
+			"Job finished: " +
+			(if (isSome(ret)) "Ok " else "Fail ") + 
+			"in " + d2st((timestamp() - job_start) / 1000.0, 2) + "s", env.conf
+		);
+	}
+	either(ret, env);
+}
+
+ruPrepareTasks(task : RuTask, command : RuComm, conf : RuConf) -> [RuTask] {
+	induced_tasks = 
+		if (containsKeyTree(task.args, "file") || conf.projectRoots == []) {
+			[task];
+		 } else {
+			map(conf.projectRoots, \root -> RuTask(task with args = setTree(task.args, "file", root)));
+		 }
+	filtermap(induced_tasks, 
+		\t -> {
+			args_w_module = eitherMap(
+				lookupTree(t.args, "file"), 
+				\file -> {
+					absolute = resolveRelativePath(file);
+					w_file = setTree(t.args, "file", absolute);
+					if (containsKeyTree(w_file, "module")) {
+						w_file;
+					} else {
+						setTree(w_file, "module", ruTrimPath(absolute, conf, getFileExt(file)));
+					}
+				}, 
+				t.args
+			);
+			args_w_defvals = fold(command.args, args_w_module, \acc, arg ->
+				if (arg.defval == "") acc else {
+					if (containsKeyTree(acc, arg.name)) acc else setTree(acc, arg.name, arg.defval)
+				}
+			);
+			updated_args = foldTree(args_w_defvals, makeTree(), \k, v, acc -> 
+				if (v != "" || k == command.defarg || command.defarg == "") setTree(acc, k, v) else setTree(acc, command.defarg, k)
+			);
+			updated_task = RuTask(t with args = updated_args);
+			check = forall(command.args, \arg ->
+				if (arg.optional || containsKeyTree(updated_task.args, arg.name)) true else {
+					conf.onMessage("Obligatory argument '" + arg.name + "' of the command '" + updated_task.command + "' is missing");
+					false;
+				}
+			);
+			if (!check) None() else Some(updated_task);
+		}
+	);
+}
