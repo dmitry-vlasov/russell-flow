@@ -2,34 +2,34 @@ import net/http;
 import base/comms;
 import ru/comms;
 import mm/comms;
-import exec;
+import script/exec;
+import help;
 
 export {
-	ruRun(job : RuJob, onMessage : (string) -> void, onRunComplete : (int) -> void) -> void;
-	ruRunLocal(job : RuJob, onMessage : (string) -> void, onRunComplete : (int) -> void) -> void;
-	ruFindScript(name : string, conf : RuConf) -> string;
-	ruComposeJobFromScript(file : string, args : Tree<string, string>, conf : RuConf) -> RuJob;
+	ruRun(s : ScScript, onMessage : (string) -> void, onRunComplete : (int) -> void) -> void;
+	ruRunLocal(s : ScScript, onMessage : (string) -> void, onRunComplete : (int) -> void) -> void;
+	ruCommandsTree() -> Tree<string, RuComm>;
 }
 
-ruRun(job : RuJob, onMessage : (string) -> void, onRunComplete : (int) -> void) -> void {
+ruRun(s : ScScript, onMessage : (string) -> void, onRunComplete : (int) -> void) -> void {
 	if (getUrlParameterBoolDef("local", false)) {
-		ruRunLocal(job, onMessage, onRunComplete);
+		ruRunLocal(s, onMessage, onRunComplete);
 	} else {
-		ruRunRemote(job, onMessage, onMessage, onRunComplete, 
-			\code -> ruRunLocal(job, onMessage, onRunComplete)
+		ruRunRemote(s, onMessage, onMessage, onRunComplete, 
+			\code -> ruRunLocal(s, onMessage, onRunComplete)
 		);
 	}
 }
 
-ruRunRemote(job : RuJob, onMessage: (string) -> void, onError : (string) -> void, onRunComplete : (int) -> void, onServerError : (int) -> void) -> void {
+ruRunRemote(s : ScScript, onMessage: (string) -> void, onError : (string) -> void, onRunComplete : (int) -> void, onServerError : (int) -> void) -> void {
 	serverUrl = 
 		"http://" + getUrlParameterDef("server-url", "localhost") + 
 		":" + getUrlParameterDef("server-port", "20001");
 	cwd = strReplace(resolveRelativePath("."), "\\", "/");
-	remote_job = RuJob(concat([ruSetNoLogging(RuTask("update-conf", makeTree1("working-dir", cwd)))], job.tasks));
+	remote_s = ScSeq([ruSetNoLogging(RuTask("update-conf", makeTree1("working-dir", cwd))), s]);
 	httpCustomRequest(
 		serverUrl,
-		GET(), [], RequestPayload(json2string(ruJob2Json(remote_job))),
+		GET(), [], RequestPayload(json2string(ruScScript2Json(remote_s))),
 		\status, msg, headers -> {
 			code = status - 200;
 			if (code == 0) {
@@ -48,13 +48,13 @@ ruRunRemote(job : RuJob, onMessage: (string) -> void, onError : (string) -> void
 
 ru_env = ref ruEmptyState;
 
-ruRunLocal(job : RuJob, onMessage : (string) -> void, onRunComplete : (int) -> void) -> void {
-	ru_env := ruExecJob(job, onMessage, ^ru_env);
+ruRunLocal(s : ScScript, onMessage : (string) -> void, onRunComplete : (int) -> void) -> void {
+	ru_env := ruExecJob(s, onMessage, ^ru_env);
 	onRunComplete(0);
 }
 
-ruExecJob(job : RuJob, onMessage : (string) -> void, env : RuState) -> RuState {
-	ruExec(job, ruCommandsTree(), onMessage, env);
+ruExecJob(s : ScScript, onMessage : (string) -> void, env : RuState) -> RuState {
+	ruExec(s, ruCommandsTree(), onMessage, env);
 }
 
 ru_commands_tree : ref Maybe<Tree<string, RuComm>> = ref None();
@@ -63,7 +63,6 @@ ruCommandsTree() -> Tree<string, RuComm> {
 	init_commands_tree = \-> {
 		commands_list = [
 			[
-				ruCommHelp, ruCommUsage, ruCommCategory, ruCommServer, ruCommConfig,
 				ruCommServerShutdown,
 				ruCommRunScript,
 				ruCommClearMath,
@@ -71,6 +70,7 @@ ruCommandsTree() -> Tree<string, RuComm> {
 				ruApplyToProjectRoots(ruCommReadAny),
 				ruCommMergeMath(ruExecJob),
 			],
+			ruHelpCommands(ruCommandsTree),
 			ruBaseCommands,
 			ruCommands,
 			mmCommands
@@ -104,150 +104,11 @@ ruRunReadAny(task : RuTask, env : RuState) -> Maybe<RuState> {
 	}
 }
 
-ruCommHelp = RuComm(
-	"help", "help", "Usage: 'help <command>' or 'help <category>'", "category",
-	[RuCommArg("category", true, "category of help. Run 'help-category' to see all categories", "")],
-	ruRunHelp
-);
-
-ruCommUsage = RuComm(
-	"help-usage", "help", "usage message", "", [],
-	\task, env -> { env.conf.onMessage(ruUsageMessage()); Some(env); }
-);
-
-ruCommCategory = RuComm(
-	"help-category", "help", "show all help categories", "", [],
-	\task, env -> { env.conf.onMessage(ruCategoryMessage()); Some(env); }
-);
-
-ruCommServer = RuComm(
-	"help-server", "help", "show all server modes", "", [],
-	\task, env -> { env.conf.onMessage(ruServerMessage()); Some(env); }
-);
-
-ruCommConfig = RuComm(
-	"help-config", "help", "show config options", "", [],
-	\task, env -> { env.conf.onMessage(ruConfigMessage()); Some(env); }
-);
-
 ruCommServerShutdown = RuComm(
 	"server-shutdown", "server", "send the command to exit to a server", "", 
 	[RuCommArg("server-port", true, "port using by a server", "20001")],
 	\task, env -> { Some(env); }
 );
-
-ruRunHelp(task : RuTask, env : RuState) -> Maybe<RuState> {
-	cats = toLowerCase(lookupTreeDef(task.args, "category", ""));
-	categories = 
-		if (cats == "") {
-			if (containsKeyTree(task.args, "category")) ["category"] else []
-		} else {
-			filtermap(
-				strSplit(cats, ","),
-				\cat -> if (cat == "") None() else Some(cat)
-			);
-		}
-	if (categories != []) {
-		env.conf.onMessage(strGlue(map(categories, ruHelpOn), ""));
-	} else {
-		env.conf.onMessage(ruHelpOn(""));
-	}
-	Some(env);
-}
-
-ruHelpMessage(detailed : bool) -> string {
-	commands = getTreeValues(ruCommandsTree());
-	categories = set2array(fold(commands, makeSet(), \acc, comm -> 
-		if (comm.category == "") acc else insertSet(acc, comm.category)
-	));
-	"Help invocation:\n" +
-		"\t'russell help <category>,...,<category>'\n" +
-		"\t'russell help <command>'\n" +
-	(if (!detailed) "" else 
-		"Special help commands:\n" +
-		"\t'russell help usage'    -- usage message (command format)\n" +
-		"\t'russell help category' -- the list of all command categories\n" +
-		"\t'russell help server'   -- the list of all server modes\n"
-		"\t'russell help config'   -- the list of russell config parameters\n"
-	) +
-	"List of all commands may be seen with:\n" +
-		"\t'russell help all'\n";
-}
-
-ruUsageMessage() -> string {
-	"Usage:\n" + 
-		"\t'russell <task_1> ; ... ; <task_m>'\n" +
-	"where task is:\n" + 
-		"\t'<command> <arg_1>=<val_1> ... <arg_n>=<val_n>'\n";
-}
-
-ruConfigMessage() -> string {
-	"Config options:\n" + 
-		"\tfile=<name>                         input file\n" +
-		"\timport-roots=<dir_1>,...,<dir_n>    relative paths, against which sources are searched\n" +
-		"\tproject-roots=<file_1>,...,<file_n> a set of sources, which contain all project data\n" +
-		"\tbin-dir=<dir>                       directory, where the binary for russell is stored\n" + 
-		"\tworking-dir=<dir>                   a working directory, relative to which all paths are resolved\n" + 
-		"\tverbose={0,1,2,3,...}               output verbosity level. Larger means more verbose\n" + 
-		"\thalt-on-errors=1                    abort execution of a programm at first error\n" + 
-		"\tdisk-caching=0                      disable an external disk cache\n" + 
-		"\tmem-caching=0                       disable memory cache\n" + 
-		"\tcaching=0                           disable all kinds of caching\n" +
-		"\tstrict-file-names=1                 resolve modules paths only against import-roots\n" +
-		"\tdie-at-verify-failure=1             when a verification error is met program terminates\n" +
-		"\tshow-disproved-theorems=1           show theorem declarations when a verification error is reported\n" +
-		"\treport-depend-on-non-verified=1     report errors of kind: depends on non-verified theorem" +
-		"\tconcurrent=0                        switch off concurrent execution: only sequential" +
-		"\tmaxlen-expr=<int>                   maximum length of a plain expression used for output. Default is 32";
-}
-
-ruCategoryMessage() -> string {
-	commands = getTreeValues(ruCommandsTree());
-	categories = sort(set2array(fold(commands, makeSet(), \acc, comm -> 
-		if (comm.category == "") acc else insertSet(acc, comm.category)
-	)));
-	cat2commands : Tree<string, [string]> = foldTree(ruCommandsTree(), makeTree(), \name, comm, acc ->
-		setTree(acc, comm.category, 
-			concat(lookupTreeDef(acc, comm.category, []), [name])
-		)
-	);
-	cat_matr = [
-		categories,
-		map(categories, \cat -> strGlue(lookupTreeDef(cat2commands, cat, []), ", ")),
-	];
-	"The list of all categories:\n" + 
-	ruStringTable2s(cat_matr, Some(["Category", "Commands"])) + "\n";
-}
-
-ruServerMessage() -> string {
-	"Starting a Russell server:\n" + 
-		"\t'russell server=<mode>'\n" + 
-	"where mode is one of:\n" + 
-		"\thttp, lsp, console, repl\n" +
-	"here repl is alias to console (i.e. it is the same).\n";
-}
-
-ruHelpOn(category : string) -> string {
-	commands = getTreeValues(ruCommandsTree());
-	if (category == "") {
-		ruHelpMessage(true);
-	} else if (category == "usage") {
-		ruUsageMessage();
-	} else if (category == "category") {
-		ruCategoryMessage();
-	} else if (category == "server") {
-		ruServerMessage();
-	} else if (category == "config") {
-		ruConfigMessage();
-	} else {
-		filtered = filter(commands, \comm -> comm.category == category || category == "all");
-		if (filtered != []) {
-			ruComms2s(filtered, false);
-		} else {
-			eitherMap(lookupTree(ruCommandsTree(), category), \comm -> ruComm2s(comm, true), "");
-		}
-	}
-}
 
 ru_running_scripts : ref Set<string> = ref makeSet();
 
@@ -265,9 +126,9 @@ ruRunScript(task : RuTask, env : RuState) -> Maybe<RuState> {
 		env.conf.onError("Recursive scripts are not allowed.", []);
 		None();
 	} else {
-		job = ruComposeJobFromScript(file, task.args, env.conf);
+		s = ruComposeJobFromScript(file, task.args, env.conf);
 		ru_running_scripts := insertSet(^ru_running_scripts, script);
-		new_env = ruExecJob(job, env.conf.onMessage, env);
+		new_env = ruExecJob(s, env.conf.onMessage, env);
 		ru_running_scripts := removeSet(^ru_running_scripts, script);
 		Some(new_env)
 	}
@@ -285,39 +146,27 @@ ruFindScript(name : string, conf : RuConf) -> string {
 	}
 }
 
-ruComposeJobFromScript(file : string, args : Tree<string, string>, conf : RuConf) -> RuJob {
+ruComposeJobFromScript(file : string, args : Tree<string, string>, conf : RuConf) -> ScScript {
 	if (!fileExists(file)) {
 		conf.onMessage("Script " + file + " is not found");
-		RuJob([]);
+		ScSeq([]);
 	} else {
 		src0 = getFileContent(file);
 		vars = ruScriptVars(src0);
 		vars_without_vals = filter(vars, \var -> !containsKeyTree(args, var));
 		if (length(vars_without_vals) > 0) {
 			conf.onMessage("Script " + file + " has variables: " + strGlue(map(vars_without_vals, \v -> "$" + v), ", ") + " with no values provided");
-			RuJob([]);
+			ScSeq([]);
 		} else {
 			replacing = fold(vars, [], \acc, var -> 
 				concat(acc, ["$" + var, lookupTreeDef(args, var, "")])
 			);
 			src = strReplaces(src0, replacing);
-			contents = strGlue(
-				filtermap(strSplit(src, "\n"), \line -> 
-					if (startsWith(line, "#")) None() else Some(line)
-				), " "
-			);
-			params = filtermap(
-				strSplit2(contents, [" ", "\r", "\t"]),
-				\p -> {
-					param = trim2(p, " \n\r\t");
-					if (param == "" || startsWith(param, "#")) None() else Some(strSplit(param, "="));
-				}
-			);
-			job = ruMakeJob(params);
+			s = ruParseScScript(src);
 			if (conf.verbose >= 2) {
-				conf.onMessage("\tAbout to execute script: " + ruJob2s(job));
+				conf.onMessage("\tAbout to execute script: " + ruScScript2s(s));
 			}
-			job;
+			s;
 		}
 	}
 }
