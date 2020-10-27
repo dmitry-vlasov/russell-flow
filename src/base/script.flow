@@ -1,0 +1,269 @@
+import lingo/pegcode/driver;
+import base/task;
+import base/conf;
+
+export {
+	RuScript ::= RuSeq, RuAssign, RuIf, RuWhile, RuTask;
+		RuSeq(seq : [RuScript]);
+		RuAssign(key : string, exp : RuEval);
+		RuIf(cond : RuCond, script : RuScript);
+		RuWhile(cond : RuCond, script : RuScript);
+
+	RuCond(op : string, lhs : RuEval, rhs : RuEval);
+
+	RuEval ::= RuBinOp, RuUnOp, RuIntConst, RuKey;
+		RuBinOp(op : string, lhs : RuEval, rhs : RuEval);
+		RuUnOp(op : string, ex : RuEval);
+		RuIntConst(val : int);
+		RuKey(key : string);
+
+	ruParseScript(str : string) -> RuScript;
+	ruScript2Json(script : RuScript) -> Json;
+	ruJson2Script(json : Json) -> Maybe<RuScript>;
+
+	ruScript2s(script : RuScript) -> string;
+}
+
+ruMakeTaskAction(as : [flow]) -> RuTask {
+	RuTask(as[0], 
+		pairs2tree(map(
+			filtermap(strSplit(flow2s(as[1]), " "), \s0 -> {
+				s = trim2(s0, " \n\t\r");
+				if (s == "") None() else Some(s);
+			}),
+			\s -> {
+				sp = strSplit(s, "=");
+				if (length(sp) == 1) Pair(s, "") else Pair(sp[0], sp[1]);
+			}
+		))
+	);
+}
+
+ruMakeScriptAction(as : [flow]) -> RuScript {
+	j = cast(as[0] : flow -> RuScript);
+	s = cast(as[1] : flow -> RuSeq);
+	RuSeq(concat([j], s.seq));
+}
+
+ru_script_parser = compilePegGrammar("#include base/script.lingo");
+ru_script_actions = SemanticActions(mergeTree(defaultPegActions.t, 
+	pairs2tree([
+		Pair("makeTask", ruMakeTaskAction),
+		Pair("makeScript", ruMakeScriptAction),
+		Pair("makeEmptySeq", \__ -> RuSeq([]))
+	])
+));
+
+ruParseScript(str : string) -> RuScript {
+	parsic(ru_script_parser, str, ru_script_actions);
+}
+
+ruScript2Json(j : RuScript) -> Json {
+	cond2json = \cond -> {
+		JsonObject([
+			Pair("op", JsonString(cond.op)),
+			Pair("lhs", ruEval12Json(cond.lhs)),
+			Pair("rhs", ruEval12Json(cond.rhs))
+		]);
+	}
+	switch (j) {
+		RuSeq(seq): {
+			JsonObject([
+				Pair("struct", JsonString("RuSeq")),
+				Pair("seq", JsonArray(map(seq, ruScript2Json)))
+			]);
+		}
+		RuAssign(key, val): {
+			JsonObject([
+				Pair("struct", JsonString("RuAssign")),
+				Pair("key", JsonString(key)),
+				Pair("val", ruEval12Json(val))
+			]);
+		}
+		RuIf(cond, script): {
+			JsonObject([
+				Pair("struct", JsonString("RuIf")),
+				Pair("cond", cond2json(cond)),
+				Pair("script", ruScript2Json(script)),
+			]);
+		}
+		RuWhile(cond, script): {
+			JsonObject([
+				Pair("struct", JsonString("RuWhile")),
+				Pair("cond", cond2json(cond)),
+				Pair("script", ruScript2Json(script)),
+			]);
+		}
+		RuTask(comm, args): {
+			JsonObject([
+				Pair("struct", JsonString("RuTask")),
+				Pair("command", JsonString(comm)),
+				Pair("args", JsonArray(map(tree2pairs(args), 
+					\arg -> JsonObject([
+						Pair("key", JsonString(arg.first)),
+						Pair("value", JsonString(arg.second))
+					])
+				)))
+			]);
+		}
+	}
+}
+
+ruEval12Json(e : RuEval) -> Json {
+	switch (e) {
+		RuBinOp(op, lhs, rhs): {
+			JsonObject([
+				Pair("struct", JsonString("RuBinOp")),
+				Pair("op", JsonString(op)),
+				Pair("lhs", ruEval12Json(lhs)),
+				Pair("rhs", ruEval12Json(rhs))
+			]);
+		}
+		RuUnOp(op, ex): {
+			JsonObject([
+				Pair("struct", JsonString("RuUnOp")),
+				Pair("op", JsonString(op)),
+				Pair("ex", ruEval12Json(ex))
+			]);
+		}
+		RuIntConst(val): {
+			JsonObject([
+				Pair("struct", JsonString("RuIntConst")),
+				Pair("val", JsonDouble(i2d(val)))
+			]);
+		}
+		RuKey(key): {
+			JsonObject([
+				Pair("struct", JsonString("RuKey")),
+				Pair("key", JsonString(key))
+			]);
+		}
+	}
+}
+
+jsonObjectHasAllFields(json : JsonArray, fields : [string]) -> bool {
+	forall(fields, \field -> jsonObjectHasField(json, field));
+}
+
+ruJson2Script(json : Json) -> Maybe<RuScript> {
+	json2cond = \j -> {
+		op = getJsonStringField(j, "op", "");
+		if (op == "") None() else {
+			maybeMap2(\lhs, rhs -> RuCond(op, lhs, rhs))
+			(
+				ruJson2Eval(getJsonFieldValue(j, "lhs", JsonNull())),
+				ruJson2Eval(getJsonFieldValue(j, "rhs", JsonNull()))
+			);
+		}
+	}
+	struct = getJsonStringField(json, "struct", "");
+	if (struct == "") None() else
+	if (struct == "RuSeq") {
+		json_seq = getJsonArrayField(json, "seq");
+		seq = filtermap(getJsonArrayField(json, "seq"), ruJson2Script);
+		if (length(json_seq) == length(seq)) {
+			Some(RuSeq(seq));
+		} else {
+			None();
+		}
+	} else 
+	if (struct == "RuAssign") {
+		key = getJsonStringField(json, "key", "");
+		if (key == "") None() else {
+			json_val = getJsonFieldValue(json, "val", JsonNull());
+			maybeMap(
+				ruJson2Eval(json_val),
+				\val -> RuAssign(key, val)
+			);
+		}
+	} else 
+	if (struct == "RuIf") {
+		maybeMap2(\cond, script -> RuIf(cond, script))(
+			json2cond(getJsonFieldValue(json, "cond", JsonNull())),
+			ruJson2Script(getJsonFieldValue(json, "script", JsonNull()))
+		);
+	} else 
+	if (struct == "RuWhile") {
+		maybeMap2(\cond, script -> RuWhile(cond, script))(
+			json2cond(getJsonFieldValue(json, "cond", JsonNull())),
+			ruJson2Script(getJsonFieldValue(json, "script", JsonNull()))
+		);
+	} else 
+	if (struct == "RuTask") {
+		comm = getJsonStringField(json, "command", "");
+		if (comm == "") None() else {
+			json_args = getJsonArrayField(json, "args");
+			args = filtermap(getJsonArrayField(json, "args"), \opt -> {
+				key = getJsonStringField(opt, "key", "");
+				if (key == "") None() else {
+					Some(Pair(key, getJsonStringField(opt, "value", "")))
+				}
+			});
+			if (length(json_args) != length(args)) None() else {
+				Some(RuTask(comm, pairs2tree(args)));
+			}
+		}
+	} else {
+		None();
+	}
+}
+
+ruJson2Eval(json : Json) -> Maybe<RuEval> {
+	struct = getJsonStringField(json, "struct", "");
+	if (struct == "") None() else
+	if (struct == "RuBinOp") {
+		op = getJsonStringField(json, "op", "");
+		if (op == "") None() else {
+			maybeMap2(\lhs, rhs -> RuBinOp(op, lhs, rhs))
+			(
+				ruJson2Eval(getJsonFieldValue(json, "lhs", JsonNull())),
+				ruJson2Eval(getJsonFieldValue(json, "rhs", JsonNull())),
+			);
+		}
+	} else 
+	if (struct == "RuUnOp") {
+		op = getJsonStringField(json, "op", "");
+		if (op == "") None() else {
+			maybeMap(
+				ruJson2Eval(getJsonFieldValue(json, "ex", JsonNull())), 
+				\ex -> RuUnOp(op, ex)
+			);
+		} 
+	} else 
+	if (struct == "RuIntConst") {
+		if (!jsonObjectHasField(json, "val")) None() else {
+			val = getJsonDoubleField(json, "op", 0.0);
+			Some(RuIntConst(round(val)));
+		} 
+	} else 
+	if (struct == "RuKey") {
+		if (!jsonObjectHasField(json, "key")) None() else {
+			key = getJsonStringField(json, "key", "");
+			Some(RuKey(key));
+		} 
+	} else {
+		None();
+	}
+}
+
+ruScript2s(j : RuScript) -> string {
+	cond2s = \cond -> {
+		"(" + ruEval2s(cond.lhs) + " " + cond.op + " " + ruEval2s(cond.rhs) + ")";
+	}
+	switch (j) {
+		RuSeq(seq):         strGlue(map(seq, ruScript2s), "\n");
+		RuAssign(key, val): key + " = " + ruEval2s(val) + ";";
+		RuIf(cond, script):    "if " + cond2s(cond) + " {\n" + strIndent(ruScript2s(script)) + "\n}";
+		RuWhile(cond, script): "while " + cond2s(cond) + " {\n" + strIndent(ruScript2s(script)) + "\n}";
+		RuTask(comm, args): ruTask2s(j);
+	}
+}
+
+ruEval2s(e : RuEval) -> string {
+	switch (e) {
+		RuBinOp(op, lhs, rhs): "(" + ruEval2s(lhs) + " " + op + " " + ruEval2s(rhs) + ")";
+		RuUnOp(op, ex): op + ruEval2s(ex);
+		RuIntConst(val): i2s(val);
+		RuKey(key): key;
+	}
+}
