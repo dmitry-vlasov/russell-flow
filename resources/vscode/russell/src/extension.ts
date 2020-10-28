@@ -61,17 +61,10 @@ function execCommand() {
 	russellChannel.show(true);
 	let options: vscode.InputBoxOptions = { prompt: "Command and args: ", placeHolder: "" };
 	vscode.window.showInputBox(options).then(value => {
-		let val_arr = value.split(" ");
-		if (val_arr.length > 0) {
-			let file_arg = Array("file=" + vscode.window.activeTextEditor.document.uri.fsPath);
-			let args = file_arg.concat(val_arr);
-			client.sendRequest("workspace/executeCommand", { command : "command", arguments: args }).then(
-				(out : string) => {
-					let spaces_removed = removeAllSpaces(out);
-					if (!(spaces_removed == "null" || spaces_removed == "")) {
-						russellChannel.appendLine(out);
-					}
-				},
+		if (removeAllSpaces(value).length > 0) {
+			let file = vscode.window.activeTextEditor.document.uri.fsPath;
+			client.sendRequest("workspace/executeCommand", { command : "command", arguments: [value, file] }).then(
+				(out : string) => { },
 				(err : any) => {
 					vscode.window.showErrorMessage(`command ${value} failed: ${err}`);
 				}
@@ -169,7 +162,7 @@ function checkHttpServerStatus(initial : boolean) {
 function outputHttpServerMemStats() {
 	client.sendRequest("workspace/executeCommand", { 
 		command : "command", 
-		arguments : ["mem-stats", "do_not_log_this"]
+		arguments : ["mem-stats do_not_log_this"]
 	}).then(
 		(out : string) => {
 			let msg_start = out.indexOf("Used:");
@@ -257,9 +250,8 @@ function processRussell(uri : vscode.Uri, target : string, action : string): voi
 	client.sendRequest("workspace/executeCommand", { 
 		command : "command", 
 		arguments: [
-			"file=" + uri.fsPath, 
-			"read",  ";",
-			action, "target=" + target
+			"read file=" + uri.fsPath + ";\n" +
+			action + " target=" + target + ";"
 		] 
 	});
 }
@@ -271,11 +263,10 @@ function verifyMetamath(uri : vscode.Uri): void {
 	client.sendRequest("workspace/executeCommand", { 
 		command : "command", 
 		arguments: [
-			"file=" + ru_file, 
-			"read-ru",  ";",
-			"ru-to-mm", "file=" + ru_file, ";",
-			"write-mm", "file=" + mm_file, "monolithic=1", "strip-comments=1", ";",
-			"verify-mm", "file=" + mm_file
+			"read-ru   file=" + ru_file + ";\n" +
+			"ru-to-mm  file=" + ru_file + ";\n" +
+			"write-mm  file=" + mm_file + " monolithic=1 strip-comments=1;\n" +
+			"verify-mm file=" + mm_file + ";"
 		] 
 	});
 }
