@@ -1,7 +1,7 @@
 import ru/refactor/remove_unused_steps;
 import ru/verify;
 import ru/prover/util;
-import ru/unify/indexes;
+import ru/unify/prod;
 
 export {
 	//ruShortenTheorem(theorem : RuTheorem, math : RuMath, conf : RuConf) -> Maybe<RuTheorem>;
@@ -50,34 +50,42 @@ ruStepsEq(s1 : RuStep, s2 : RuStep) -> bool {
 	);
 }
 
+RuShortenEnv(
+	assertions : RuIndex<RuAssertion>,
+	imports : Tree<string, Set<string>>,
+	math : RuMath,
+	conf : RuConf
+);
+
 RuShortenAcc(
+	env : RuShortenEnv,
 	theorem : RuTheorem,
 	optimized : [RuStep],
-	assertions : RuIndex<RuAssertion>,
 	premises : RuIndex<RuRef>,
 	steps : [RuStep],
-	math : RuMath,
-	conf : RuConf,
 	cenv : RuConstEnv,
 	timer : RuTimer
 );
 
-ruShortenTheorem(th : RuTheorem, math0 : RuMath, conf : RuConf, time_limit : double) -> Maybe<RuTheorem> {
+ccc = ref 0;
+
+ruShortenTheorem(th : RuTheorem, time_limit : double, env : RuShortenEnv) -> Maybe<RuTheorem> {
 	started = ruTime();
+	math0 = env.math;
+	conf = env.conf;
 	cth = ruConstTheorem(th, math0);
 	math = cth.env.math;
 	
 	if (conf.verbose > 1) {
 		conf.onMessage("started shortening theorem " + th.descr.name + " with time limit: " + ruTime2s(time_limit) + " ...");
 	}
-	
-	assertions = ruInitAssertionsIndex(th.descr.name, math, conf);
+
 	initPremises = fold(cth.const.hyps, ruMakeIndex(), \acc, hyp -> ruSetIndex(hyp.expr, RuHypRef(hyp.ind, -1), acc));
 	optimized = foldi(cth.const.proof.steps, 
-		RuShortenAcc(th, [], assertions, initPremises, cth.const.proof.steps, math, conf, cth.env, ruMakeTimer(time_limit)), 
+		RuShortenAcc(env, th, [], initPremises, cth.const.proof.steps, cth.env, ruMakeTimer(time_limit)), 
 		\i, acc, step -> {
 			step_time_limit = ruTimeLeft(acc.timer) / i2d(length(cth.const.proof.steps) - i);
-			least = ruStepVariants(step.ind, cth.const.proof.steps, th, acc, step_time_limit);
+			least = ruStepMinVariant(step.ind, cth.const.proof.steps, th, acc, step_time_limit);
 			RuShortenAcc(acc with
 				optimized = concat(acc.optimized, [least]),
 				premises = ruSetIndex(step.expr, RuStepRef(step.ind, -1), acc.premises)
@@ -94,6 +102,9 @@ ruShortenTheorem(th : RuTheorem, math0 : RuMath, conf : RuConf, time_limit : dou
 	late_for = 100.0 * (time_taken - time_limit) / time_limit;
 	if (late_for > 10.0) {
 		println("*** " + th.descr.name + " was late for: " + d2st(late_for, 2) + "% (" + ruTime2s(time_taken - time_limit) + ")");
+	}
+	if (late_for < 0.5) {
+		//println("*** " + th.descr.name + " was UNDER late for: " + d2st(late_for, 2) + "% (limit: " + ruTime2s(time_limit) + ", taken: " + ruTime2s(time_taken) + ")");
 	}
 	switch (ret) {
 		Some(th_opt): {
@@ -133,69 +144,114 @@ RuShortenStepAcc(
 	timer : RuTimer
 );
 
-ruStepVariants(i : int, steps : [RuStep], th : RuTheorem, acc : RuShortenAcc, time_limit : double) -> RuStep {
+ruStepMinVariant(i : int, steps : [RuStep], th : RuTheorem, acc : RuShortenAcc, time_limit : double) -> RuStep {
+	step = acc.steps[i];
+	if (ruTimeIsOver(acc.timer)) step else {
+		step_timer = ruMakeTimer(time_limit);
+		unify_limit = ruTimeLeft(step_timer) / 10.0;
+		unified = filter(
+			ruUnifyIndex(
+				step.expr, acc.env.assertions, makeTree(), 
+				acc.env.math, acc.env.conf, unify_limit
+			),
+			\unif -> ruDeclPreceeds(unif.data, th, acc.env.imports)
+		);
+		ruFold(unified, 
+			RuShortenLeast(step, ruSubProofVolume(i, acc.steps)), 
+			\least, unif -> {
+				sub = ruTransformSubst(unif.sub, acc.cenv.unconst);
+				ass : RuAssertion = unif.data;
+				check_disj = \s -> ruCheckDisjs(s, ass.disjs);
+				check_disj_inherent = \s-> ruChechDisjsInherent(s, ass.disjs, th.disjs);
+				if (ass.hyps != [] && check_disj(sub) && check_disj_inherent(sub)) {
+					hyps_prod = map(ass.hyps, \h -> {
+						hyp_unified = ruUnifyIndex(
+							ruApplySubst(h.expr, unif.sub), acc.premises, unif.sub, 
+							acc.env.math, acc.env.conf, unify_limit / i2d(length(ass.hyps))
+						);
+						sorted = mergeSort(hyp_unified, \u1, u2 -> 
+							ruRefVolume(u1.data, acc.steps) - ruRefVolume(u2.data, acc.steps)
+						);
+						map(sorted, \un -> RuSubData(un.sub, un.data));
+					});
+					sub_unified = ruUnifySubsProd(hyps_prod, \__-> true, \ -> ruTimeIsOver(step_timer), acc.env.math, acc.env.conf);
+					ruFold(sub_unified, least, 
+						\le, sd -> {
+							st = RuStep(le.step with refs = sd.data, assertion = ass.descr.name);
+							vol = ruSubProofVolume(st.ind, replace(acc.steps, st.ind, st));
+							if (vol < le.vol && check_disj(sd.sub) && check_disj_inherent(sd.sub)) {
+								RuShortenLeast(st, vol) 
+							} else {
+								le;
+							}
+						},
+						step_timer
+					);
+				} else {
+					least;
+				}
+			}, 
+			step_timer
+		).step;
+	}
+}
+
+/*
+ruStepVariants1(i : int, steps : [RuStep], th : RuTheorem, acc : RuShortenAcc, time_limit : double) -> RuStep {
 	step = acc.steps[i];
 	if (!ruTimeIsOver(acc.timer)) {
-		least = ref RuShortenLeast(acc.steps[i], ruSubProofVolume(i, acc.steps));
-		unified = ruUnifyIndex(step.expr, acc.assertions, makeTree(), acc.math, acc.conf, acc.timer.limit / 10.0);
-		ruStepVariantsIter(th, acc, time_limit / i2d(length(unified)), least, unified, 0);
-		^least.step
+		step_timer = ruMakeTimer(time_limit);
+		unify_limit = ruTimeLeft(step_timer) / 10.0;
+		unified = filter(
+			ruUnifyIndex(
+				step.expr, acc.env.assertions, makeTree(), 
+				acc.env.math, acc.env.conf, unify_limit
+			),
+			\unif -> ruDeclPreceeds(unif.data, th, acc.env.imports)
+		);
+		ruFold(unified, 
+			RuShortenLeast(step, ruSubProofVolume(i, acc.steps)),
+			\least, unif -> {
+				sub = ruTransformSubst(unif.sub, acc.cenv.unconst);
+				ass : RuAssertion = unif.data;
+				check_disj = \s -> ruCheckDisjs(s, ass.disjs);
+				check_disj_inherent = \s -> ruChechDisjsInherent(s, ass.disjs, th.disjs);
+				if (ass.hyps == [] || !check_disj(sub) || !check_disj_inherent(sub)) least else {
+					hyps_prod = CartProd(map(ass.hyps, \h -> {
+						hyp_unified = ruUnifyIndex(
+							ruApplySubst(h.expr, unif.sub), acc.premises, unif.sub, 
+							acc.env.math, acc.env.conf, unify_limit / i2d(length(ass.hyps))
+						);
+						mergeSort(hyp_unified, \u1, u2 -> ruRefVolume(u1.data, acc.steps) - ruRefVolume(u2.data, acc.steps));
+					}));
+					ruFoldCartProd(hyps_prod, least,
+						\le, hyps_unif  -> {
+							refs = map(hyps_unif, \un -> un.data);
+							st = RuStep(le.step with refs = refs, assertion = ass.descr.name);
+							vol = ruSubProofVolume(st.ind, replace(acc.steps, st.ind, st));
+							if (vol >= le.vol) le else {
+								eitherMap(
+									fold(map(hyps_unif, \un -> un.sub), Some(unif.sub), \ac, su ->
+										maybeBind(ac, \s -> ruMergeSubst(s, su))
+									),
+									\s -> if (!check_disj(s) || !check_disj_inherent(s)) le else {
+										RuShortenLeast(st, vol);
+									},
+									le
+								);
+							}
+						},
+						ruMakeTimer(acc.timer.limit)
+					);
+				}
+			},
+			step_timer
+		).step;
 	} else {
-		step
+		step;
 	}
 }
-
-ruStepVariantsIter(
-	th : RuTheorem, acc : RuShortenAcc, time_limit : double, 
-	least : ref RuShortenLeast, unified : [RuUnified], j : int
-) -> void {
-	if (j < length(unified) && !ruTimeIsOver(acc.timer)) {
-		unif = unified[j];
-		sub = ruTransformSubst(unif.sub, acc.cenv.unconst);
-		ass : RuAssertion = unif.data;
-		check_disj = \-> ruCheckDisjs(sub, ass.disjs);
-		check_disj_inherent = \-> ruChechDisjsInherent(sub, ass.disjs, th.disjs);
-		if (ass.hyps != [] && check_disj() && check_disj_inherent()) {
-			stepAcc = RuShortenStepAcc(acc, ass.descr.name, unif.sub, [], least, 1, ruMakeTimer(time_limit));
-			ruRefsVariants(0, ass.hyps, stepAcc);
-		}
-		if (!ruTimeIsOver(acc.timer)) {
-			ruStepVariantsIter(th, acc, time_limit, least, unified, j + 1);
-		}
-	}
-}
-
-ruRefsVariants(j : int, hyps : [RuHyp], acc : RuShortenStepAcc) -> void {
-	if (j == length(hyps)) {
-		new_step = RuStep(^(acc.least).step with refs = acc.refs, assertion = acc.assertion);
-		acc.least := RuShortenLeast(new_step, acc.vol);
-	} else {
-		if (!ruTimeIsOver(acc.timer)) {
-			unified = ruUnifyIndex(ruApplySubst(hyps[j].expr, acc.sub), acc.up.premises, acc.sub, acc.up.math, acc.up.conf, acc.timer.limit / 10.0);
-			sorted = mergeSort(unified, \u1, u2 -> ruRefVolume(u1.data, acc.up.steps) - ruRefVolume(u2.data, acc.up.steps));
-			if (!ruTimeIsOver(acc.timer)) {
-				ruRefsVariantsIter(j, hyps, acc, sorted, 0);
-			}
-		}
-	}
-}
-
-ruRefsVariantsIter(j : int, hyps : [RuHyp], acc : RuShortenStepAcc, sorted : [RuUnified], i : int) -> void {
-	if (i < length(sorted) && !ruTimeIsOver(acc.timer)) {
-		un = sorted[i];
-		vol = acc.vol + ruRefVolume(un.data, acc.up.steps);
-		if (vol < ^(acc.least).vol) {
-			ruRefsVariants(j + 1, hyps, RuShortenStepAcc(acc with 
-				refs = concat(acc.refs, [un.data]),
-				sub = un.sub,
-				vol = vol
-			))
-		}
-		if (!ruTimeIsOver(acc.timer)) {
-			ruRefsVariantsIter(j, hyps, acc, sorted, i + 1);
-		}
-	}
-}
+*/
 
 ruRunShortenProofs(task : ScTask, env : RuState) -> Maybe<RuState> {	
 	math = env.ruMath;
@@ -215,6 +271,7 @@ ruRunShortenProofs(task : ScTask, env : RuState) -> Maybe<RuState> {
 		}
 	}
 	shortened = ref 0;
+	shorten_env = RuShortenEnv(ruInitGlobalAssertionsIndex(math), ruMathAllImported(math, conf), math, conf);
 	new_env = ruMapFnComm(task, env,
 		RuMapFn(
 			RuFnDescr("shorten proofs", ruDeclIsTheorem, measure),
@@ -235,7 +292,7 @@ ruRunShortenProofs(task : ScTask, env : RuState) -> Maybe<RuState> {
 								)
 						);
 						atomicRefIntAddition(counter, 1);
-						ret = ruShortenTheorem(th, math, upd_conf, time_limit);
+						ret = ruShortenTheorem(th, time_limit, RuShortenEnv(shorten_env with conf = upd_conf));
 						if (isSome(ret)) {
 							atomicRefIntAddition(shortened, 1);
 						} else {
