@@ -65,7 +65,7 @@ ruDoCollectMath(left : Tree<string, RuParsed>, done : Set<string>, conf : RuConf
 								start = timestamp();
 								switch (ruVerifySource1(src, ruAddSource(src, acc, conf), conf)) {
 									Some(verified): {
-										ruToCache(src, conf);
+										ruToMemCache(src, conf);
 										ret = Some(ruMakeMathFromSource(src, acc.types, conf));
 										if (conf.verbose > 1) {
 											conf.onMessage("\tru collected verified: '" + src.info.module + "' in " + d2st((timestamp() - start)/ 1000.0, 4) + " s");
@@ -101,6 +101,7 @@ ruDoCollectMath(left : Tree<string, RuParsed>, done : Set<string>, conf : RuConf
 
 RuCollectAcc(
 	file : string,
+	module : string,
 	global : RuMath,
 	local : RuMath,
 	types : Tree<string, RuTypeEnv>,
@@ -123,7 +124,7 @@ ruCollectParsed(src : RuParseSource, acc : RuMath, conf : RuConf) -> RuMath {
 		}
 		None(): {
 			imps = map(src.imports, \imp -> RuImport(imp.module, imp.pos));
-			acc0 = RuCollectAcc(src.info.module, acc, ruEmptyMath, acc.types, conf);
+			acc0 = RuCollectAcc(src.info.path, src.info.module, acc, ruEmptyMath, acc.types, conf);
 			acc1 = fold(src.decls, acc0, \ac, block -> 
 				switch(block) {
 					RuParseDecl(): ruCollectSyntax(block, ac);
@@ -169,7 +170,8 @@ ruCollectParsed(src : RuParseSource, acc : RuMath, conf : RuConf) -> RuMath {
 				conf.onMessage("\tru collected: '" + src.info.path + "' in " + d2st((timestamp() - start)/ 1000.0, 4) + " s");
 			}
 			ru_src = ruBclocks2Src(RuSource(imps, [], [], src.info), blocks);
-			ruToCache(ru_src, conf);
+			ruToMemCache(ru_src, conf);
+			ruToDiskCache(ru_src, conf);
 			RuMath(acc2.local with sources = makeTree1(src.info.module, ru_src));
 		}
 	}
@@ -216,7 +218,7 @@ ruCollectConst(const : RuParseConst, acc : RuCollectAcc) -> RuCollectAcc {
 			RuCollectAcc(acc with
 				local = RuMath(acc.local with 
 					consts = setTree(acc.local.consts, const.name, 
-						RuConst(RuDescr(const.name, acc.file, []), const.ascii, const.latex, const.pos)
+						RuConst(RuDescr(const.name, acc.module, []), const.ascii, const.latex, const.pos)
 					),
 				)
 			);
@@ -236,9 +238,9 @@ ruCollectType(type : RuParseType, acc : RuCollectAcc) -> RuCollectAcc {
 				switch (ruLookupType(acc, s)) {
 					Some(env): {
 						foldTree(env.supers,
-							setTree(ac, s, ruMakeSuperRule(s, infer, acc.file, type.pos)), 
+							setTree(ac, s, ruMakeSuperRule(s, infer, acc.module, type.pos)), 
 							\super, __, a ->
-								setTree(a, super, ruMakeSuperRule(super, infer, acc.file, type.pos))
+								setTree(a, super, ruMakeSuperRule(super, infer, acc.module, type.pos))
 						);
 					}
 					None(): {
@@ -255,7 +257,7 @@ ruCollectType(type : RuParseType, acc : RuCollectAcc) -> RuCollectAcc {
 			);
 			new_types = setTree(super_types, type.name, 
 				RuTypeEnv(
-					RuType(RuDescr(type.name, acc.file, []), type.supers, type.pos), 
+					RuType(RuDescr(type.name, acc.module, []), type.supers, type.pos), 
 					ruAddTerm2RuTrie(
 						RuTerm(type.name, [RuVar("x", type.name)], type.pos), 
 						None(),
@@ -293,7 +295,7 @@ ruCollectRule(rule : RuParseRule, acc : RuCollectAcc) -> RuCollectAcc {
 				}
 			);
 			term = ruMakeTerm(rule.term, vars, acc, ruAddErr2Conf(acc.conf, "\nat rule: " + rule.name));
-			new_rule = RuRule(RuDescr(rule.name, acc.file, []), vars, term, rule.pos);
+			new_rule = RuRule(RuDescr(rule.name, acc.module, []), vars, term, rule.pos);
 			switch (ruLookupType(acc, rule.term.type)) {
 				Some(env): {
 					new_types = setTree(acc.types, env.type.descr.name,
@@ -330,7 +332,10 @@ ruMakeTerm(term : RuParseExp, vars : Tree<string, RuVar>, acc : RuCollectAcc, co
 				switch (lookupTree(vars, symb)) {
 					Some(v): concat(ac, [RuVar(symb, v.type)]);
 					None(): {
-						conf.onError("unknown symbol " + symb, [RuPlace(acc.file, term.pos)]);
+						conf.onError("unknown symbol '" + symb + "' in term '" + ruParse2s(term) + "'", [RuPlace(acc.file, term.pos)]);
+						//println("glob consts:\n" + strGlue(map(getTreeKeys(acc.global.consts), \c -> "\t'" + c + "'"), "\n") + "\n");
+						//println("local consts:\n" + strGlue(map(getTreeKeys(acc.local.consts), \c -> "\t'" + c + "'"), "\n") + "\n");
+						quit(0);
 						ac
 					}
 				}
@@ -343,7 +348,7 @@ ruMakeTerm(term : RuParseExp, vars : Tree<string, RuVar>, acc : RuCollectAcc, co
 ruCreateAxiom(ax : RuParseAxiom, acc : RuCollectAcc) -> Maybe<RuAxiom> {
 	switch (ruLookupAssertion(acc, ax.name)) {
 		Some(__): {
-			acc.conf.onError("assertion with name " + ax.name + " is already defined", [RuPlace(acc.file, ax.pos)]);
+			acc.conf.onError("assertion with name '" + ax.name + "' is already defined", [RuPlace(acc.file, ax.pos)]);
 			None();
 		}
 		None(): {
@@ -357,7 +362,7 @@ ruCreateAxiom(ax : RuParseAxiom, acc : RuCollectAcc) -> Maybe<RuAxiom> {
 			} else {
 				switch (ruCollectExp(ax.prop, vars, acc, conf1)) {
 					Some(prop): {
-						Some(RuAxiom(RuDescr(ax.name, acc.file, []), vars, disjs, hyps, prop, ax.pos));
+						Some(RuAxiom(RuDescr(ax.name, acc.module, []), vars, disjs, hyps, prop, ax.pos));
 					}
 					None(): err();
 				}
@@ -450,7 +455,7 @@ ruCreateTheorem(th : RuParseTheorem, acc : RuCollectAcc) -> Maybe<RuTheorem> {
 				switch (ruCollectExp(th.prop, vars, acc, conf1)) { 
 					Some(prop): {
 						switch (ruCollectProof(th.proof, vars, acc, conf1)) {
-							Some(proof): Some(RuTheorem(RuDescr(th.name, acc.file, []), vars, disjs, meta, hyps, prop, proof, th.pos));
+							Some(proof): Some(RuTheorem(RuDescr(th.name, acc.module, []), vars, disjs, meta, hyps, prop, proof, th.pos));
 							None(): err();
 						}
 					}
@@ -509,7 +514,7 @@ ruCreateDef(df : RuParseDef, acc : RuCollectAcc) -> Maybe<RuDef> {
 							Some(defm): {
 								switch (ruCollectExp(df.defs, vars, acc, conf1)) {
 									Some(defs): 
-										Some(RuDef(RuDescr(df.name, acc.file, []), vars, disjs, hyps, defm, defs, prop, df.pos));
+										Some(RuDef(RuDescr(df.name, acc.module, []), vars, disjs, hyps, defm, defs, prop, df.pos));
 									None(): err();
 								}
 							}
