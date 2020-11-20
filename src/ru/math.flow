@@ -1,12 +1,12 @@
 import base/stats;
-import ru/parse/type_env;
+import ru/src;
 import ru/cache;
 
 export {
 	RuMath(
 		sources    : Tree<string, RuSource>,
 		consts     : Tree<string, RuConst>,
-		types      : Tree<string, RuTypeEnv>,
+		types      : Tree<string, RuType>,
 		rules      : Tree<string, RuRule>,
 		assertions : Tree<string, RuAssertion>
 	);
@@ -37,7 +37,7 @@ export {
 	ruRemoveDecl(decl : RuDecl, m : RuMath, conf : RuConf) -> RuMath;
 	ruAddImportToSource(src : RuSource, module : string, math : RuMath, conf : RuConf) -> RuMath;
 	ruReplaceSource(src : RuSource, m : RuMath, conf : RuConf) -> RuMath;
-	ruMakeMathFromSource(src : RuSource, types : Tree<string, RuTypeEnv>, conf : RuConf) -> RuMath;
+	ruMakeMathFromSource(src : RuSource, conf : RuConf) -> RuMath;
 	ruAddSourceAssertions(src : RuSource, m : RuMath) -> RuMath;
 	ruMath2SingleSource(math : RuMath, file : string, conf : RuConf) -> RuSource;
 
@@ -77,6 +77,8 @@ export {
 	ruDeclPreceeds(less : RuDecl, greater : RuDecl, imported_map : Tree<string, Set<string>>) -> bool;
 
 	ruTheoremName2ReferringTheorems(math : RuMath) -> Tree<string, Set<string>>;
+
+	ruAddType(type : RuType, m : RuMath, conf : RuConf) -> RuMath;
 }
 
 ruMakePlace(name : string, pos : int, math : RuMath) -> RuPlace {
@@ -93,7 +95,7 @@ ruFindSource(name : string, math : RuMath) -> string {
 				Some(c): c.descr.source;
 				None(): {
 					switch (lookupTree(math.types, name)) {
-						Some(e): e.type.descr.source;
+						Some(t): t.descr.source;
 						None(): {
 							switch (lookupTree(math.rules, name)) {
 								Some(r): r.descr.source;
@@ -176,7 +178,7 @@ ruMathAllDecls(math : RuMath) ->Tree<string, RuDecl> {
 	foldTree(math.assertions, 
 		foldTree(math.rules, 
 			foldTree(math.types, math.consts,
-				\name, tenv, acc -> setTree(acc, name, tenv.type)
+				\name, type, acc -> setTree(acc, name, type)
 			),
 			\name, rule, acc -> setTree(acc, name, rule)
 		),
@@ -194,19 +196,18 @@ ruMathSrcDecls(math : RuMath) ->Tree<string, RuDecl> {
 
 ruMathSupers(math : RuMath) -> Tree<string, RuRule> {
 	foldTree(math.types, makeTree(),
-		\name, tenv, acc -> mergeTree(acc, tenv.supers)
+		\name, type, acc -> 
+			fold(type.supers, makeTree(), \ac, super ->
+				switch (lookupTree(math.rules, ruSuperTypeName(type.descr.name, super))) {
+					Some(rule): setTree(ac, rule.descr.name, rule);
+					None(): ac;
+				}
+			)
 	);
 }
 
 ruSuperRule(infer : string, super : string, math : RuMath, conf : RuConf) -> Maybe<RuRule> {
-	switch (lookupTree(math.types, infer)) {
-		Some(infEnv): lookupTree(infEnv.supers, super);
-		None(): {
-			conf.onError("unknown type: " + infer, []);
-			quit(-1);
-			None();
-		}
-	}
+	lookupTree(math.rules, ruSuperTypeName(super, infer));
 }
 
 ruMathStats(math : RuMath) -> string {
@@ -237,9 +238,9 @@ ruMergeMath(m1 : RuMath, m2 : RuMath, conf : RuConf) -> RuMath {
 	RuMath(
 		mergeTreeCustom(m1.sources, m2.sources, \name, s1, s2 -> { conf.onError("duplicate source: " + name, []); s1 }),
 		mergeTreeCustom(m1.consts, m2.consts, \name, c1, c2 -> { conf.onError("duplicate constant: " + name, []); c1 }),
-		mergeTreeCustom(m1.types, m2.types, \type, e1, e2 -> ruMergeRuTypeEnv(e1, e2)),
+		mergeTreeCustom(m1.types, m2.types, \name, t1, t2 -> { conf.onError("duplicate type: " + name, []); t1 }),
 		mergeTreeCustom(m1.rules, m2.rules, \name, r1, r2 -> { conf.onError("duplicate rule: " + name, []); r1 }),
-		mergeTreeCustom(m1.assertions, m2.assertions, \name, a1, a2 -> { conf.onError("duplicate assertion: " + name, []); a1 })
+		mergeTreeCustom(m1.assertions, m2.assertions, \name, a1, a2 -> { conf.onError("duplicate assertion: " + name, []); quit(0); a1 })
 	);
 }
 
@@ -254,24 +255,8 @@ ruRemoveSource(src : RuSource, m : RuMath, conf : RuConf) -> RuMath {
 						RuMath(acc with consts = removeFromTree(acc.consts, descr.name));
 					RuType(descr,__,__):
 						RuMath(acc with types = removeFromTree(acc.types, descr.name));
-					RuRule(descr, vars, term, pos): {
-						switch (lookupTree(acc.types, term.type)) {
-							Some(env): {
-								RuMath(acc with 
-									rules = removeFromTree(acc.rules, descr.name),
-									types = setTree(acc.types, env.type.descr.name,
-										RuTypeEnv(env with 
-											trie = ruRemoveTermFromTrie(term, env.trie)
-										)
-									)
-								);
-							}
-							None(): {
-								conf.onError("!!! type " + term.type + " is not found", [RuPlace(module, pos)]);
-								acc
-							}
-						}
-					}
+					RuRule(descr, vars, term, pos):
+						RuMath(acc with rules = removeFromTree(acc.rules, descr.name));
 					RuAxiom(descr,__,__,__,__,__):
 						RuMath(acc with assertions = removeFromTree(acc.assertions, descr.name));
 					RuTheorem(descr,__,__,__,__,__,__,__):
@@ -293,27 +278,9 @@ ruAddSource(src : RuSource, m : RuMath, conf : RuConf) -> RuMath {
 				RuConst(descr,__,__,__):
 					RuMath(acc with consts = setTree(acc.consts, descr.name, decl));
 				RuType(descr,__,__):
-					RuMath(acc with types = setTree(acc.types, descr.name, ruMakeTypeEnv(decl, acc.types, module, conf)));
+					RuMath(acc with types = setTree(acc.types, descr.name, decl));
 				RuRule(descr, vars, term, pos):
-					switch (lookupTree(acc.types, term.type)) {
-						Some(env): {
-							RuMath(acc with 
-								rules = setTree(acc.rules, descr.name, decl),
-								types = setTree(acc.types, env.type.descr.name,
-									RuTypeEnv(env with 
-										trie = ruAddTerm2RuTrie(term, 
-											Some(RuRuleRef(descr.name, term.type, sizeTree(vars), 0)),
-											env.trie, conf
-										)
-									)
-								)
-							);
-						}
-						None(): {
-							conf.onError("!!! type " + term.type + " is not found", [RuPlace(module, pos)]);
-							acc
-						}
-					}
+					RuMath(acc with rules = setTree(acc.rules, descr.name, decl));
 				RuAxiom(descr,__,__,__,__,__):
 					RuMath(acc with assertions = setTree(acc.assertions, descr.name, decl));
 				RuTheorem(descr,__,__,__,__,__,__,__):
@@ -363,43 +330,17 @@ ruAddImportToSource(src : RuSource, module : string, math : RuMath, conf : RuCon
 	}
 }
 
-ruMakeMathFromSource(src : RuSource, types : Tree<string, RuTypeEnv>, conf : RuConf) -> RuMath {
+ruMakeMathFromSource(src : RuSource, conf : RuConf) -> RuMath {
 	module = src.info.module;
-	fold(src.decls, 
-		RuMath(ruEmptyMath with sources = makeTree1(module, src), types = types), 
+	fold(src.decls, ruEmptyMath, 
 		\acc, decl -> {
 			switch (decl) {
 				RuConst(descr,__,__,__):
 					RuMath(acc with consts = setTree(acc.consts, descr.name, decl));
-				RuType(descr,__,__): {
-					type = ruMakeTypeEnv(decl, acc.types, module, conf);
-					RuMath(acc with 
-						types = setTree(acc.types, descr.name, type),
-						rules = fold(getTreeValues(type.supers), acc.rules, 
-							\ac, super -> setTree(ac, super.descr.name, super)
-						)
-					);
-				}
+				RuType(descr,__,__): 
+					ruAddType(decl, acc, conf);
 				RuRule(descr, vars, term, pos):
-					switch (lookupTree(acc.types, term.type)) {
-						Some(env): {
-							RuMath(acc with 
-								rules = setTree(acc.rules, descr.name, decl),
-								types = setTree(acc.types, env.type.descr.name,
-									RuTypeEnv(env with 
-										trie = ruAddTerm2RuTrie(term, 
-											Some(RuRuleRef(descr.name, term.type, sizeTree(vars), 0)),
-											env.trie, conf
-										)
-									)
-								)
-							);
-						}
-						None(): {
-							conf.onError("type " + term.type + " is not found", [RuPlace(module, pos)]);
-							acc
-						}
-					}
+					RuMath(acc with rules = setTree(acc.rules, descr.name, decl));
 				RuAxiom(descr,__,__,__,__,__):
 					RuMath(acc with assertions = setTree(acc.assertions, descr.name, decl));
 				RuTheorem(descr,__,__,__,__,__,__,__):
@@ -481,25 +422,32 @@ ruDoSourceAllImported(src : RuSource, math : RuMath, acc : Set<RuSource>) -> Set
 ruMathAllImported(math : RuMath, conf : RuConf) -> Tree<string, Set<string>> {
 	fold(ruOrderSources(math), makeTree(), \acc, src ->
 		setTree(acc, src.info.module, 
-			fold(src.imports, makeSet(), \ac, imp -> 
+			fold(src.imports, makeSet(), \ac, imp -> {
+				if (!containsKeyTree(acc, imp.module)) {
+					println("MISSING IMPORT!!! " + imp.module + " in module " + src.info.module);
+					quit(0);
+				}
 				mergeSets(ac, insertSet(lookupTreeDef(acc, imp.module, makeSet()), imp.module))
-			)
+			})
 		)
 	);
 }
 
 ruOrderSources(math : RuMath) -> [RuSource] {
-	foldTree(math.sources, Pair([], makeSet()), \__, src, acc ->
-		ruDoOrderSources(src, math, acc)
-	).first
+	ruDoOrderSources(getTreeValues(math.sources), [], makeSet());
 }
 
-ruDoOrderSources(src : RuSource, math : RuMath, acc : Pair<[RuSource], Set<string>>) -> Pair<[RuSource], Set<string>> {
-	if (containsSet(acc.second, src.info.module)) acc else {
-		acc1 = fold(src.imports, Pair(acc.first, insertSet(acc.second, src.info.module)), \ac, imp ->
-			ruDoOrderSources(lookupTreeDef(math.sources, imp.module, ruNoSource), math, ac)
-		);
-		Pair(concat(acc1.first, [src]), acc1.second);
+ruDoOrderSources(srcs : [RuSource], acc : [RuSource], visited: Set<string>) -> [RuSource] {
+	new_level = filter(srcs, \src -> forall(src.imports, \imp -> containsSet(visited, imp.module)));
+	level_names = buildSet(map(new_level, \src -> src.info.module));
+	if (new_level == []) {
+		if (length(srcs) == 0) acc else {
+			println("Cycilc imports detected:\n" + strIndent(strGlue(map(srcs, \src -> src.info.module), "\n")));
+			[]
+		};
+	} else {
+		new_srcs = filter(srcs, \src -> !containsSet(level_names, src.info.module));
+		ruDoOrderSources(new_srcs, concat(acc, new_level), mergeSets(visited, level_names));
 	}
 }
 
@@ -557,12 +505,8 @@ ruReplaceDecl(d : RuDecl, math : RuMath, conf : RuConf) -> RuMath {
 			math1 = switch (d) {
 				RuConst(__,__,__,__): 
 					RuMath(math with consts = setTree(math.consts, name, d));
-				RuType(__,__,__): {
-					tenv = lookupTreeDef(math.types, name, ruMakeTypeEnv(d, math.types, src.info.module, conf));
-					RuMath(math with types = setTree(math.types, name,
-						RuTypeEnv(tenv with type = d)
-					));
-				}
+				RuType(__,__,__):
+					RuMath(math with types = setTree(math.types, name, d));
 				RuRule(__,__,__,__):
 					RuMath(math with rules = setTree(math.rules, name, d));
 				RuAssertion(): 
@@ -825,5 +769,17 @@ ruTheoremName2ReferringTheorems(math : RuMath) -> Tree<string, Set<string>> {
 				);
 			default: acc;
 		}
+	);
+}
+
+ruAddType(type : RuType, m : RuMath, conf : RuConf) -> RuMath {
+	RuMath(m with 
+		types = setTree(m.types, type.descr.name, type),
+		rules = fold(type.supers, m.rules, \a, super ->
+			setTree(a,
+				ruSuperTypeName(super, type.descr.name), 
+				ruMakeSuperRule(super, type.descr.name, type.descr.source, type.pos)
+			)
+		)
 	);
 }

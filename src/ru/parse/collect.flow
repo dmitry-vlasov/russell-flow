@@ -11,7 +11,7 @@ ruCollectMath(parsed : Tree<string, RuParsed>, conf0 : RuConf) -> Maybe<RuMath> 
 	err_count = ref 0;
 	conf = ruAddErrCounter(conf0, err_count);
 	start = timestamp();
-	collected = ruDoCollectMath(parsed, makeSet(), conf, ruEmptyMath);
+	collected = ruDoCollectMath(parsed, makeSet(), conf, ruMakeEmptyCollectEnv()).math;
 	if (conf.verbose > 0) {
 		conf.onMessage("ru collected: " + i2s(sizeTree(collected.sources)) + " files in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
 	}
@@ -22,7 +22,23 @@ ruCollectMath(parsed : Tree<string, RuParsed>, conf0 : RuConf) -> Maybe<RuMath> 
 	}
 }
 
-ruDoCollectMath(left : Tree<string, RuParsed>, done : Set<string>, conf : RuConf, acc : RuMath) -> RuMath {
+RuCollectEnv(
+	math : RuMath,
+	tenv : Tree<string, RuTypeEnv>
+);
+
+ruMakeEmptyCollectEnv() -> RuCollectEnv {
+	RuCollectEnv(ruEmptyMath, makeTree());
+}
+
+ruMergeCollectEnv(e1 : RuCollectEnv, e2 : RuCollectEnv, conf : RuConf) -> RuCollectEnv {
+	RuCollectEnv(
+		ruMergeMath(e1.math, e2.math, conf),
+		ruMergeTypeEnvTree(e1.tenv, e2.tenv)
+	);
+}
+
+ruDoCollectMath(left : Tree<string, RuParsed>, done : Set<string>, conf : RuConf, acc : RuCollectEnv) -> RuCollectEnv {
 	if (sizeTree(left) == 0) acc else {
 		ready = filter(
 			getTreeValues(left), 
@@ -35,60 +51,60 @@ ruDoCollectMath(left : Tree<string, RuParsed>, done : Set<string>, conf : RuConf
 			if (conf.verbose > 2) {
 				conf.onMessage("\t\tgoing to collect: \n" + strGlue(map(ready, \p -> "\t\t\t" + ruParsedModule(p)), "\n"));
 			}
-			collected = filtermap(
-				//ruConcurrent(map(ready, 
-				sequential(true, map(ready, 
-					\parsed -> \-> {
-					switch (parsed) {
-						RuParseSource(__,__,info): {
-							if (conf.verbose > 2) {
-								conf.onMessage("\t\t\tstarted collecting parsed: '" + ruParsedModule(parsed) + "'");
-							}
-							r = ruCollectParsed(parsed, acc, conf);
-							if (conf.verbose > 2) {
-								conf.onMessage("\t\t\tfinished collecting parsed: '" + ruParsedModule(parsed) + "'");
-							}
-							Some(r);
+			collected = filtermap(ready, \parsed ->
+				switch (parsed) {
+					RuParseSource(__,__,info): {
+						if (conf.verbose > 2) {
+							conf.onMessage("\t\t\tstarted collecting parsed: '" + ruParsedModule(parsed) + "'");
 						}
-						RuCachedSource(src, depChanged,__): {
-							if (conf.verbose > 2) {
-								conf.onMessage("\t\t\tstarted collecting cached: '" + ruParsedModule(parsed) + "'");
+						r = ruCollectParsed(parsed, acc, conf);
+						if (conf.verbose > 2) {
+							conf.onMessage("\t\t\tfinished collecting parsed: '" + ruParsedModule(parsed) + "'");
+						}
+						Some(r);
+					}
+					RuCachedSource(src, depChanged,__): {
+						if (conf.verbose > 2) {
+							conf.onMessage("\t\t\tstarted collecting cached: '" + ruParsedModule(parsed) + "'");
+						}
+						if (!depChanged()) {
+							start = timestamp();
+							ret = Some(ruCollectCached(src, acc, conf)); 
+							if (conf.verbose > 1) {
+								conf.onMessage("\tru collected cached: '" + src.info.module + "' in " + d2st((timestamp() - start)/ 1000.0, 4) + " s");
 							}
-							if (!depChanged()) {
-								start = timestamp();
-								ret = Some(ruMakeMathFromSource(src, acc.types, conf)); 
-								if (conf.verbose > 1) {
-									conf.onMessage("\tru collected cached: '" + src.info.module + "' in " + d2st((timestamp() - start)/ 1000.0, 4) + " s");
+							ret;
+						} else {
+							start = timestamp();
+							switch (ruVerifySource1(src, ruAddSource(src, acc.math, conf), conf)) {
+								Some(verified): {
+									ret = Some(ruCollectCached(src, acc, conf));
+									if (conf.verbose > 1) {
+										conf.onMessage("\tru collected verified: '" + src.info.module + "' in " + d2st((timestamp() - start)/ 1000.0, 4) + " s");
+									}
+									ret;
 								}
-								ret;
-							} else {
-								start = timestamp();
-								switch (ruVerifySource1(src, ruAddSource(src, acc, conf), conf)) {
-									Some(verified): {
-										ruToMemCache(src, conf);
-										ret = Some(ruMakeMathFromSource(src, acc.types, conf));
-										if (conf.verbose > 1) {
-											conf.onMessage("\tru collected verified: '" + src.info.module + "' in " + d2st((timestamp() - start)/ 1000.0, 4) + " s");
-										}
-										ret;
-									}
-									None(): {
-										maybeBind(ruLoadOne(conf, src.info.module, \__,__ -> None()), \l ->
-											maybeMap(ruParseOne(l, conf), \s ->
-												ruCollectOne(s, ruRemoveSource(src, acc, conf), conf)
-											)
-										);
-									}
+								None(): {
+									maybeBind(ruLoadOne(conf, src.info.module, \__,__ -> None()), \l ->
+										maybeMap(ruParseOne(l, conf), \s ->
+											ruCollectOne(s, acc, conf)
+										)
+									);
 								}
 							}
 						}
 					}
-				})), idfn
+				}
 			);
 			if (conf.verbose > 2) {
 				conf.onMessage("\t\tcollected: \n" + strGlue(map(ready, \p -> "\t\t\t" + ruParsedModule(p)), "\n"));
 			}
-			new_acc = ruMergeMath(acc, fold(collected, ruEmptyMath, \ac, coll -> ruMergeMath(coll, ac, conf)), conf);
+			new_acc = ruMergeCollectEnv(acc, 
+				fold(collected, 
+					ruMakeEmptyCollectEnv(), 
+					\ac, coll -> ruMergeCollectEnv(coll, ac, conf)), 
+				conf
+			);
 			new_left = fold(ready, left, \ac, parsed -> removeFromTree(ac, ruParsedModule(parsed)));
 			new_done = fold(ready, done, \ac, parsed -> insertSet(ac, ruParsedModule(parsed)));
 			if (conf.verbose > 2) {
@@ -104,27 +120,38 @@ RuCollectAcc(
 	module : string,
 	global : RuMath,
 	local : RuMath,
-	types : Tree<string, RuTypeEnv>,
+	tenv : Tree<string, RuTypeEnv>,
 	conf : RuConf
 );
 
-ruCollectOne(parsed : RuParsed, acc : RuMath, conf : RuConf) -> RuMath {
+ruCollectCached(src : RuSource, acc : RuCollectEnv, conf : RuConf) -> RuCollectEnv {
+	m = ruMakeMathFromSource(src, conf);
+	RuCollectEnv(
+		RuMath(m with sources = setTree(m.sources, src.info.module, src)),
+		mergeTree(
+			acc.tenv,
+			mapTree(m.types, \t -> ruMakeTypeEnv(t, conf))
+		)
+	);
+}
+
+ruCollectOne(parsed : RuParsed, acc : RuCollectEnv, conf : RuConf) -> RuCollectEnv {
 	switch (parsed) {
 		RuParseSource(__,__,__): ruCollectParsed(parsed, acc, conf);
-		RuCachedSource(src, __,__): ruMakeMathFromSource(src, acc.types, conf);
+		RuCachedSource(src, __,__): ruCollectCached(src, acc, conf);
 	}
 }
 
-ruCollectParsed(src : RuParseSource, acc : RuMath, conf : RuConf) -> RuMath {
+ruCollectParsed(src : RuParseSource, acc : RuCollectEnv, conf : RuConf) -> RuCollectEnv {
 	start = timestamp();
-	switch (lookupTree(acc.sources, src.info.module)) {
+	switch (lookupTree(acc.math.sources, src.info.module)) {
 		Some(__): {
 			conf.onError("source '" + src.info.module + "' is already defined", []);
 			acc
 		}
 		None(): {
 			imps = map(src.imports, \imp -> RuImport(imp.module, imp.pos));
-			acc0 = RuCollectAcc(src.info.path, src.info.module, acc, ruEmptyMath, acc.types, conf);
+			acc0 = RuCollectAcc(src.info.path, src.info.module, acc.math, ruEmptyMath, acc.tenv, conf);
 			acc1 = fold(src.decls, acc0, \ac, block -> 
 				switch(block) {
 					RuParseDecl(): ruCollectSyntax(block, ac);
@@ -152,7 +179,7 @@ ruCollectParsed(src : RuParseSource, acc : RuMath, conf : RuConf) -> RuMath {
 					RuParseConst(name,__,__,__):
 						eitherMap(lookupTree(acc2.local.consts, name), \c -> concat(ac, [c]), ac);
 					RuParseType(name,__,__): 
-						eitherMap(lookupTree(acc2.local.types, name), \t -> concat(ac, [t.type]), ac);
+						eitherMap(lookupTree(acc2.local.types, name), \t -> concat(ac, [t]), ac);
 					RuParseRule(name,__,__,__):
 						eitherMap(lookupTree(acc2.local.rules, name), \r -> concat(ac, [r]), ac);
 					RuParseAxiom(name,__,__,__,__,__):
@@ -172,7 +199,10 @@ ruCollectParsed(src : RuParseSource, acc : RuMath, conf : RuConf) -> RuMath {
 			ru_src = ruBclocks2Src(RuSource(imps, [], [], src.info), blocks);
 			ruToMemCache(ru_src, conf);
 			ruToDiskCache(ru_src, conf);
-			RuMath(acc2.local with sources = makeTree1(src.info.module, ru_src));
+			RuCollectEnv(
+				RuMath(acc2.local with sources = makeTree1(src.info.module, ru_src)),
+				acc2.tenv
+			);
 		}
 	}
 }
@@ -227,51 +257,19 @@ ruCollectConst(const : RuParseConst, acc : RuCollectAcc) -> RuCollectAcc {
 }
 
 ruCollectType(type : RuParseType, acc : RuCollectAcc) -> RuCollectAcc {
-	switch (ruLookupType(acc, type.name)) {
+	switch (lookupTree(acc.tenv, type.name)) {
 		Some(__): {
-			acc.conf.onError("type " + type.name + " is already defined", [RuPlace(acc.file, type.pos)]);
+			acc.conf.onError("type '" + type.name + "' is already defined", [RuPlace(acc.file, type.pos)]);
 			acc
 		}
 		None(): {
-			infer = type.name;
-			supers = fold(type.supers, makeTree(), \ac, s ->
-				switch (ruLookupType(acc, s)) {
-					Some(env): {
-						foldTree(env.supers,
-							setTree(ac, s, ruMakeSuperRule(s, infer, acc.module, type.pos)), 
-							\super, __, a ->
-								setTree(a, super, ruMakeSuperRule(super, infer, acc.module, type.pos))
-						);
-					}
-					None(): {
-						acc.conf.onError("unknown super type " + s + " for a type" + infer, [RuPlace(acc.file, type.pos)]);
-						ac
-					}
-				}
-			);
-			super_types = foldTree(supers, acc.types, 
-				\sup_name, sup_rule, ac -> {
-					env = lookupTreeDef(ac, sup_name, ruNoTypeEnv);
-					setTree(ac, sup_name, env)
-				}
-			);
-			new_types = setTree(super_types, type.name, 
-				RuTypeEnv(
-					RuType(RuDescr(type.name, acc.module, []), type.supers, type.pos), 
-					ruAddTerm2RuTrie(
-						RuTerm(type.name, [RuVar("x", type.name)], type.pos), 
-						None(),
-						ruTrieEmpty, acc.conf
-					), 
-					supers,
-				)
-			);
+			conf1 = ruAddErr2Conf(acc.conf, "\nat type '" + type.name + "'");
+			new_type = RuType(RuDescr(type.name, acc.module, []), type.supers, type.pos);
 			RuCollectAcc(acc with
-				local = RuMath(acc.local with 
-					types = new_types,
-					rules = foldTree(supers, acc.local.rules, \__, rule, ac -> setTree(ac, rule.descr.name, rule))
-				),
-				types = new_types
+				local = ruAddType(new_type, acc.local, conf1),
+				tenv = setTree(acc.tenv, type.name, 
+					ruMakeTypeEnv(new_type, conf1)
+				)
 			)
 		}
 	}
@@ -280,43 +278,33 @@ ruCollectType(type : RuParseType, acc : RuCollectAcc) -> RuCollectAcc {
 ruCollectRule(rule : RuParseRule, acc : RuCollectAcc) -> RuCollectAcc {
 	switch (ruLookupRule(acc, rule.name)) {
 		Some(__): {
-			acc.conf.onError("rule " + rule.name + " is already defined", [RuPlace(acc.file, rule.pos)]);
+			acc.conf.onError("rule '" + rule.name + "' is already defined", [RuPlace(acc.file, rule.pos)]);
 			acc
 		}
 		None(): {
+			conf1 = ruAddErr2Conf(acc.conf, "\nat rule " + rule.name);
 			type = rule.term.type;
-			vars = fold(rule.vars, makeTree(), \ac, v ->
-				switch (ruLookupType(acc, v.type)) {
-					Some(tp): setTree(ac, v.name, RuVar(v.name, v.type));
-					None(): {
-						acc.conf.onError("unknown var " + v.name + " type " + v.type, [RuPlace(acc.file, v.pos)]);
-						ac
-					}
-				}
-			);
+			vars = ruCollectVars(rule.vars, acc, conf1);
 			term = ruMakeTerm(rule.term, vars, acc, ruAddErr2Conf(acc.conf, "\nat rule: " + rule.name));
 			new_rule = RuRule(RuDescr(rule.name, acc.module, []), vars, term, rule.pos);
-			switch (ruLookupType(acc, rule.term.type)) {
-				Some(env): {
-					new_types = setTree(acc.types, env.type.descr.name,
-						RuTypeEnv(env with 
-							trie = ruAddTerm2RuTrie(new_rule.term, 
-								Some(RuRuleRef(rule.name, rule.term.type, sizeTree(vars), 0)),
-								env.trie, acc.conf
-							)
-						)
-					);
+			switch (lookupTree(acc.tenv, rule.term.type)) {
+				Some(tenv): {
 					RuCollectAcc(acc with
 						local = RuMath(acc.local with 
 							rules = setTree(acc.local.rules, rule.name, new_rule),
-							types = new_types
 						),
-						types = new_types
+						tenv = setTree(acc.tenv, type,
+							RuTypeEnv(tenv with 
+								trie = ruAddTerm2RuTrie(new_rule.term, 
+									Some(RuRuleRef(rule.name, type, sizeTree(vars), 0)),
+									tenv.trie, conf1
+								)
+							)
+						)
 					);
 				}
 				None(): {
-					acc.conf.onError("unknown type " + rule.term.type, [RuPlace(acc.file, rule.term.pos)]);
-					quit(0);
+					acc.conf.onError("unknown type '" + rule.term.type + "'", [RuPlace(acc.file, rule.term.pos)]);
 					acc;
 				}
 			}
@@ -372,12 +360,12 @@ ruCreateAxiom(ax : RuParseAxiom, acc : RuCollectAcc) -> Maybe<RuAxiom> {
 }
 
 ruCollectExp(ex : RuParseExp, vars : Tree<string, RuVar>, acc : RuCollectAcc, conf : RuConf) -> Maybe<RuExp> {
-	ruParseExp(ruMakeTerm(ex, vars, acc, conf), acc.types, conf)
+	ruParseExp(ruMakeTerm(ex, vars, acc, conf), acc.tenv, conf)
 }
 
 ruCollectVars(vars : [RuParseVar], acc : RuCollectAcc, conf : RuConf) -> Tree<string, RuVar> {
 	fold(vars, makeTree(), \ac, v ->
-		switch (ruLookupType(acc, v.type)) {
+		switch (lookupTree(acc.tenv, v.type)) {
 			Some(tp): setTree(ac, v.name, RuVar(v.name, v.type));
 			None(): {
 				conf.onError("unknown var " + v.name + " type " + v.type, [RuPlace(acc.file, v.pos)]);
@@ -533,10 +521,6 @@ ruLookupConst(acc : RuCollectAcc, n : string) -> Maybe<RuConst> {
 		Some(c): Some(c);
 		None(): lookupTree(acc.local.consts, n);
 	}
-}
-
-ruLookupType(acc : RuCollectAcc, n : string) -> Maybe<RuTypeEnv> {
-	lookupTree(acc.types, n);
 }
 
 ruLookupRule(acc : RuCollectAcc, n : string) -> Maybe<RuRule> {

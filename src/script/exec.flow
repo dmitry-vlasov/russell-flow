@@ -14,10 +14,8 @@ ruExec(script : ScScript, commands : Tree<string, RuComm>, onMessage : (string) 
 	if (log_script) {
 		ruScriptLog("<" + uuid + "> Script started:  " + ruServerEscapeString(script_src), env.conf);
 	}
-	ret = ruDoExec(script, commands, onMessage, env);
-	if (isNone(ret)) {
-		onMessage("error at evaluation of \n" + script_src + "\n");
-	}
+	err = ref false;
+	ret = ruDoExec(script, RuExecEnv(commands, onMessage, env, err));
 	if (log_script) {
 		ruScriptLog(
 			"<" + uuid + "> Script finished: " +
@@ -28,127 +26,144 @@ ruExec(script : ScScript, commands : Tree<string, RuComm>, onMessage : (string) 
 	ret
 }
 
-ruDoExec(script : ScScript, commands : Tree<string, RuComm>, onMessage : (string) -> void, env : RuState) -> Maybe<RuState> {
-	switch (script) {
+RuExecEnv(
+	commands : Tree<string, RuComm>, 
+	onMessage : (string) -> void, 
+	state : RuState, 
+	err : ref bool
+);
+
+ruDoExec(script : ScScript, env : RuExecEnv) -> Maybe<RuState> {
+	ret = switch (script) {
 		ScSeq(seq):
-			ruExecSeq(seq, commands, onMessage, env);
+			ruExecSeq(seq, env);
 		ScAssign(var, ex): 
-			ruExecAssign(var, ex, onMessage, env);
+			ruExecAssign(var, ex, env);
 		ScIf(cond, s): 
-			ruExecIf(cond, s, commands, onMessage, env);
+			ruExecIf(cond, s, env);
 		ScIfElse(cond, pos, neg): 
-			ruExecIfElse(cond, pos, neg, commands, onMessage, env);
+			ruExecIfElse(cond, pos, neg, env);
 		ScWhile(cond, s): 
-			ruExecWhile(cond, s, commands, onMessage, env);
+			ruExecWhile(cond, s, env);
 		ScPrint(ex): 
-			ruExecPrint(ex, onMessage, env);
+			ruExecPrint(ex, env);
 		ScTask(comm, args): 
-			ruExecTask(script, commands, onMessage, env);
+			ruExecTask(script, env);
+		ScExit(): 
+			None();
 	}
+	if (isNone(ret) && !^(env.err)) {
+		if (script != ScExit()) {
+			env.onMessage("error at evaluation of <<<\n" + ruScript2s(script) + "\n>>>");
+		}
+		env.err := true;
+	}
+	ret;
 }
 
-ruExecSeq(seq : [ScScript], commands : Tree<string, RuComm>, onMessage : (string) -> void, env : RuState) -> Maybe<RuState> {
-	fold(seq, Some(env), \acc, s -> 
-		maybeBind(acc, \ac -> ruDoExec(s, commands, onMessage, ac))
+ruExecSeq(seq : [ScScript], env : RuExecEnv) -> Maybe<RuState> {
+	fold(seq, Some(env.state), \acc, s -> 
+		maybeBind(acc, \state -> ruDoExec(s, RuExecEnv(env with state = state)))
 	);
 }
 
-ruExecAssign(var : string, ex : ScExp, onMessage : (string) -> void, env : RuState) -> Maybe<RuState> {
-	maybeMap(ruEval(ex, env.vars), \val -> 
-		RuState(env with vars = setTree(env.vars, var, val))
+ruExecAssign(var : string, ex : ScExp, env : RuExecEnv) -> Maybe<RuState> {
+	maybeMap(ruEval(ex, env.state.vars), \val -> 
+		RuState(env.state with vars = setTree(env.state.vars, var, val))
 	);
 }
 
-ruExecIf(cond : ScExp, script : ScScript, commands : Tree<string, RuComm>, onMessage : (string) -> void, env : RuState) -> Maybe<RuState> {
-	maybeBind(ruEval(cond, env.vars), \val -> 
+ruExecIf(cond : ScExp, script : ScScript, env : RuExecEnv) -> Maybe<RuState> {
+	maybeBind(ruEval(cond, env.state.vars), \val -> 
 		switch (val) {
 			ValBool(c): {
 				if (c) {
-					ruDoExec(script, commands, onMessage, env);
+					ruDoExec(script, env);
 				} else {
 					Some(env);
 				}
 			}
 			default: {
-				onMessage("'if' condition must return boolean value " + ruScExp2s(cond));
+				env.onMessage("'if' condition must return boolean value " + ruScExp2s(cond));
 				None();
 			}
 		}
 	);
 }
 
-ruExecIfElse(cond : ScExp, pos : ScScript, neg : ScScript, commands : Tree<string, RuComm>, onMessage : (string) -> void, env : RuState) -> Maybe<RuState> {
-	maybeBind(ruEval(cond, env.vars), \val -> 
+ruExecIfElse(cond : ScExp, pos : ScScript, neg : ScScript, env : RuExecEnv) -> Maybe<RuState> {
+	maybeBind(ruEval(cond, env.state.vars), \val -> 
 		switch (val) {
 			ValBool(c): {
 				if (c) {
-					ruDoExec(pos, commands, onMessage, env);
+					ruDoExec(pos, env);
 				} else {
-					ruDoExec(neg, commands, onMessage, env);
+					ruDoExec(neg, env);
 				}
 			}
 			default: {
-				onMessage("'if' condition must return boolean value " + ruScExp2s(cond));
+				env.onMessage("'if' condition must return boolean value " + ruScExp2s(cond));
 				None();
 			}
 		}
 	);
 }
 
-ruExecWhile(cond : ScExp, script : ScScript, commands : Tree<string, RuComm>, onMessage : (string) -> void, env : RuState) -> Maybe<RuState> {
-	maybeBind(ruEval(cond, env.vars), \val ->
+ruExecWhile(cond : ScExp, script : ScScript, env : RuExecEnv) -> Maybe<RuState> {
+	maybeBind(ruEval(cond, env.state.vars), \val ->
 		switch (val) {
 			ValBool(c): {
 				if (c) {
 					maybeBind(
-						ruDoExec(script, commands, onMessage, env),
-						\env1 -> ruExecWhile(cond, script, commands, onMessage, env1)
+						ruDoExec(script, env),
+						\state -> ruExecWhile(cond, script, RuExecEnv(env with state = state))
 					);
 				} else {
-					Some(env);
+					Some(env.state);
 				}
 			}
 			default: {
-				onMessage("'while' condition must return boolean value " + ruScExp2s(cond));
+				env.onMessage("'while' condition must return boolean value " + ruScExp2s(cond));
 				None();
 			}
 		}
 	);
 }
 
-ruExecPrint(ex : ScExp, onMessage : (string) -> void, env : RuState) -> Maybe<RuState> {
-	maybeMap(ruEval(ex, env.vars), \val -> {
-		onMessage(ruValue2s(val));
-		env;
+ruExecPrint(ex : ScExp, env : RuExecEnv) -> Maybe<RuState> {
+	maybeMap(ruEval(ex, env.state.vars), \val -> {
+		env.onMessage(ruApplyScriptVars(ruValue2s(val), env.state.vars));
+		env.state;
 	});
 }
 
-ruExecTask(task : ScTask, commands : Tree<string, RuComm>, onMessage : (string) -> void, env : RuState) -> Maybe<RuState> {
+ruExecTask(task : ScTask, env : RuExecEnv) -> Maybe<RuState> {
 	upd_conf = \e -> {
 		RuState(e with 
 			conf = RuConf(e.conf with 
-				onMessage = onMessage,
-				onError = ruMakeOnError(e.conf.opts, onMessage)
+				onMessage = env.onMessage,
+				onError = ruMakeOnError(e.conf.opts, env.onMessage)
 			)
 		);
 	}
-	switch (lookupTree(commands, task.command)) {
+	state = env.state;
+	switch (lookupTree(env.commands, task.command)) {
 		Some(command): {
-			fold(ruPrepareTask(task, command, env.conf), Some(env),  
-				\ac, t -> maybeBind(ac, \e -> {
+			fold(ruPrepareTask(task, command, state), Some(env.state),  
+				\ac, t -> maybeBind(ac, \s -> {
 					task_start = timestamp();
 					log_task = !existsTree(t.args, \arg,__ -> arg == "do_not_log_this");
 					task_src = ruTask2s(t);
 					uuid = ruMakeUuid();
 					if (log_task) {
-						ruScriptLog("<" + uuid + "> Task started:    " + task_src + " ... ", env.conf);
+						ruScriptLog("<" + uuid + "> Task started:    " + task_src + " ... ", state.conf);
 					}
-					ret = command.run(t, upd_conf(e));
+					ret = command.run(t, upd_conf(s));
 					if (log_task) {
 						ruScriptLog(
 							"<" + uuid + "> Task finished:   " +
 							(if (isSome(ret)) "Ok " else "Fail ") +
-							"in " + d2st((timestamp() - task_start) / 1000.0, 2) + "s", env.conf
+							"in " + d2st((timestamp() - task_start) / 1000.0, 2) + "s", state.conf
 						);
 					}
 					ret;
@@ -156,13 +171,26 @@ ruExecTask(task : ScTask, commands : Tree<string, RuComm>, onMessage : (string) 
 			);
 		}
 		None(): {
-			onMessage("Unknown command: '" + task.command + "'");
+			env.onMessage("Unknown command: '" + task.command + "'");
 			None();
 		}
 	}
 }
 
-ruPrepareTask(task : ScTask, command : RuComm, conf : RuConf) -> [ScTask] {
+ruApplyScriptVars(s : string, vars : Tree<string, ValValue>) -> string {
+	vars_subst = fold(tree2pairs(vars), [], \acc, kv -> 
+		concat(acc, ["$" + kv.first, ruValue2s(kv.second)])
+	);
+	strReplaces(s, vars_subst);
+}
+
+ruPrepareTask(task0 : ScTask, command : RuComm, state : RuState) -> [ScTask] {
+	conf = state.conf;
+	task = ScTask(task0 with 
+		args = foldTree(task0.args, makeTree(), \k, v, acc -> 
+			if (v != "" || k == command.defarg || command.defarg == "") setTree(acc, k, v) else setTree(acc, command.defarg, k)
+		)
+	);
 	induced_tasks = 
 		if (containsKeyTree(task.args, "file") || conf.projectRoots == []) {
 			[task];
@@ -171,26 +199,18 @@ ruPrepareTask(task : ScTask, command : RuComm, conf : RuConf) -> [ScTask] {
 		}
 	filtermap(induced_tasks, 
 		\t -> {
-			args_w_module = eitherMap(
+			args_w_path = eitherMap(
 				lookupTree(t.args, "file"), 
-				\file -> {
-					absolute = resolveRelativePath(file);
-					w_file = setTree(t.args, "file", absolute);
-					if (containsKeyTree(w_file, "module")) {
-						w_file;
-					} else {
-						setTree(w_file, "module", ruTrimPath(absolute, conf, getFileExt(file)));
-					}
-				}, 
+				\file -> setTree(t.args, "path", resolveRelativePath(file)), 
 				t.args
 			);
-			args_w_defvals = fold(command.args, args_w_module, \acc, arg ->
+			args_w_defvals = fold(command.args, args_w_path, \acc, arg ->
 				if (arg.defval == "") acc else {
 					if (containsKeyTree(acc, arg.name)) acc else setTree(acc, arg.name, arg.defval)
 				}
 			);
 			updated_args = foldTree(args_w_defvals, makeTree(), \k, v, acc -> 
-				if (v != "" || k == command.defarg || command.defarg == "") setTree(acc, k, v) else setTree(acc, command.defarg, k)
+				setTree(acc, ruApplyScriptVars(k, state.vars), ruApplyScriptVars(v, state.vars))
 			);
 			updated_task = ScTask(t with args = updated_args);
 			check = forall(command.args, \arg ->

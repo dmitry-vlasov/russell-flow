@@ -66,6 +66,7 @@ ruCommandsTree() -> Tree<string, RuComm> {
 				ruCommServerShutdown,
 				ruCommRunScript,
 				ruCommClearMath,
+				ruCommClearVars,
 				ruCommVerifyMetamath,
 				ruApplyToProjectRoots(ruCommReadAny),
 				ruCommMergeMath(ruExecScript),
@@ -81,9 +82,21 @@ ruCommandsTree() -> Tree<string, RuComm> {
 }
 
 ruCommClearMath = RuComm(
-	"clear-math", "misc", "clear all math state", "",
+	"clear-math", "misc", "clear all math structures", "",
 	[],
-	\__,__ -> { ruClearMemCache(); Some(ruEmptyState); }
+	\__,state -> { 
+		ruClearMemCache(); 
+		Some(RuState(state with 
+			ruMath = ruEmptyMath,
+			mmMath = mmEmptyMath
+		)); 
+	}
+);
+
+ruCommClearVars = RuComm(
+	"clear-vars", "misc", "clear all script variable values", "",
+	[],
+	\__,state -> Some(RuState(state with vars = makeTree())) 
 );
 
 ruCommReadAny = RuComm(
@@ -111,9 +124,14 @@ ruCommServerShutdown = RuComm(
 );
 
 ruCommRunScript = RuComm(
-	"run-script", "misc", "load a script", "script",
+	"script", "misc", "load and run a script", "script",
 	[RuCommArg("script", false, "the file with russell commands", "")],
 	ruRunScript
+);
+
+RuScriptWithArgs(
+	script : ScScript,
+	args : Tree<string, ValValue>
 );
 
 ruRunScript(task : ScTask, env : RuState) -> Maybe<RuState> {
@@ -121,7 +139,11 @@ ruRunScript(task : ScTask, env : RuState) -> Maybe<RuState> {
 	file = ruFindScript(name, env.conf);
 	maybeMap(
 		ruLoadScript(file, task.args, env.conf),
-		\script -> ruExecScript(script, env.conf.onMessage, env)
+		\sa -> ruExecScript(
+			sa.script, 
+			env.conf.onMessage, 
+			RuState(env with vars = mergeTree(env.vars, sa.args))
+		)
 	);
 }
 
@@ -137,45 +159,24 @@ ruFindScript(name : string, conf : RuConf) -> string {
 	}
 }
 
-ruLoadScript(file : string, args : Tree<string, string>, conf : RuConf) -> Maybe<ScScript> {
+ruLoadScript(file : string, args : Tree<string, string>, conf : RuConf) -> Maybe<RuScriptWithArgs> {
 	if (!fileExists(file)) {
 		conf.onMessage("Script " + file + " is not found");
 		None();
 	} else {
-		src0 = getFileContent(file);
-		vars = ruScriptVars(src0);
-		vars_without_vals = filter(vars, \var -> !containsKeyTree(args, var));
-		if (length(vars_without_vals) > 0) {
-			conf.onMessage("Script " + file + " has variables: " + strGlue(map(vars_without_vals, \v -> "$" + v), ", ") + " with no values provided");
-			None();
-		} else {
-			replacing = fold(vars, [], \acc, var -> 
-				concat(acc, ["$" + var, lookupTreeDef(args, var, "")])
-			);
-			src = strReplaces(src0, replacing);
-			s = ruParseScript(src);
-			switch (s) {
-				Some(script):
-					if (conf.verbose >= 2) {
-						conf.onMessage("\tAbout to execute script: " + ruScript2s(script));
-					}
-				None(): {
-					conf.onMessage("\tSyntax error in script: " + src);
+		src = getFileContent(file);
+		switch (ruParseScript(src)) {
+			Some(script): {
+				if (conf.verbose >= 2) {
+					conf.onMessage("\tAbout to execute script: " + ruScript2s(script));
 				}
+				Some(RuScriptWithArgs(script, mapTree(args, \arg -> ValString(arg))));
 			}
-			s;
+			None(): {
+				conf.onMessage("\tSyntax error in script: " + src);
+				None();
+			}
 		}
-	}
-}
-
-ruScriptVars(src : string) -> [string] {
-	map(multipleStrIndexOf(src, "$"), \i -> ruScriptVar(src, i + 1, ""));
-}
-
-ruScriptVar(src : string, i : int, acc : string) -> string {
-	c = getCharAt(src, i);
-	if (!(isLetter(c) || isDigit(c))) acc else {
-		ruScriptVar(src, i + 1, acc + c);
 	}
 }
 
@@ -190,10 +191,11 @@ ruRunVerifyMetamath(task : ScTask, env : RuState) -> Maybe<RuState> {
 	if (env.conf.verbose > 1) {
 		env.conf.onMessage("Going to verify " + file + " with Metamath");
 	}
+	dir = ruDirName(file);
 	code = execSystemProcess(
 		"metamath", 
 		["read " + fileNameOnly(file) + "",	"verify proof *", "exit"],
-		ruDirName(file),
+		if (dir == "") "." else dir,
 		\out -> env.conf.onMessage(out),
 		\err -> env.conf.onMessage(err),
 	);
