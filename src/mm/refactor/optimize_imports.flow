@@ -1,0 +1,115 @@
+import command;
+
+export {
+	mmCommOptimizeImports : RuComm;
+	mmRunOptimizeImports(task : ScTask, env : RuState) -> Maybe<RuState>;
+}
+
+mmCommOptimizeImports = RuComm(
+	"optimize-imports-mm", "misc", "optimize imports", "", [],
+	mmRunOptimizeImports
+);
+
+mmRunOptimizeImports(task : ScTask, env : RuState) -> Maybe<RuState> {
+	math = env.mmMath;
+	conf = env.conf;
+	start = timestamp();
+	name2src = foldTree(math.sources, makeTree(), \src_name, src, acc ->
+		fold(src.decls, acc, \ac, decl ->
+			switch (decl) {
+				MmAssertion(__,__,__,stat): setTree(ac, stat.label, src_name);
+				MmConst(consts): fold(consts, ac, \a, c -> setTree(ac, c, src_name));
+				MmComment(__): ac;
+			}
+		)
+	);
+	optimized = mmDoOptimizeMathImports(math.sources, math, conf, MmOptImportsAcc(name2src, makeTree(), makeTree()));
+	if (conf.verbose > 0) {
+		conf.onMessage("ru imports optimized: " +i2s(sizeTree(optimized.sources)) + " files in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
+	}
+	new_math = MmMath(math with sources = optimized.sources);
+	Some(RuState(env with mmMath = new_math));
+}
+
+MmOptImportsAcc(
+	name2src : Tree<string, string>,
+	sources : Tree<string, MmSource>,
+	cumulativeImports : Tree<string, Set<string>>
+);
+
+mmDoOptimizeMathImports(left : Tree<string, MmSource>, math : MmMath, conf : RuConf, acc : MmOptImportsAcc) -> MmOptImportsAcc {
+	if (sizeTree(left) == 0) acc else {
+		ready = filter(
+			getTreeValues(left), 
+			\src -> forall(src.imports, \imp -> !containsKeyTree(left, imp.module))
+		);
+		if (conf.verbose >= 3) {
+			conf.onMessage("\t\tready: " + strGlue(map(ready, \r -> r.info.module), ", "));
+		}
+		optimized = ruConcurrent(map(ready, \s -> \-> mmOptimizeSourceImports(s, acc, math, conf))); 
+		new_acc = MmOptImportsAcc(
+			acc.name2src,
+			fold(optimized, acc.sources, \ac, src -> setTree(ac, src.info.module, src)),
+			fold(optimized, acc.cumulativeImports, \ac, src ->
+				setTree(ac, src.info.module, 
+					fold(src.imports, makeSet1(src.info.module), \a, imp -> insertSet(a, imp.module))
+				)
+			)
+		);
+		new_left = fold(ready, left, \ac, src -> removeFromTree(ac, src.info.module));
+		if (conf.verbose >= 3) {
+			conf.onMessage("\t\tnew_left: " + strGlue(getTreeKeys(new_left), ", "));
+		}
+		mmDoOptimizeMathImports(new_left, math, conf, new_acc);
+	}
+}
+
+mmOptimizeSourceImports(src : MmSource, acc : MmOptImportsAcc, math : MmMath, conf : RuConf) -> MmSource {
+	if (conf.verbose >= 2) {
+		conf.onMessage("\toptimizing imports in module: " + src.info.module);
+	}
+	if (length(src.decls) == 0) src else {
+		deps = set2array(mapSet(mmCollectDependencies(src), \n -> {
+				switch (lookupTree(acc.name2src, n)) {
+					Some(s): s;
+					None(): {
+						conf.onError("unknown name: " + n, []);
+						"";
+					}
+				}
+			}
+		));
+		optimized = filter(deps, \d1 -> 
+			(d1 != src.info.module) && forall(deps, \d2 -> {
+				switch (lookupTree(acc.cumulativeImports, d2)) {
+					Some(imps): (d1 == d2) || !containsSet(imps, d1);
+					None(): true;
+				}
+			})
+		);
+		MmSource(src with imports = map(optimized, \imp -> MmImport(imp)));
+	}
+}
+
+mmCollectDependencies(src : MmSource) -> Set<string> {
+	exprDeps = \acc, expr -> fold(expr.symbs, acc, \ac, symb -> if (symb.isVar) ac else insertSet(ac, symb.literal));
+	proofDeps = \acc, proof -> fold(proof.labels, acc, \ac, l -> insertSet(ac, l));
+	statDeps = \acc, stat -> 
+		switch (stat) {
+			MmAxiomatic(__,expr): exprDeps(acc, expr);
+			MmProvable(__, expr, proof): proofDeps(exprDeps(acc, expr), proof);
+		}
+	hypDeps = \acc, hyp ->
+		switch (hyp) {
+			MmEssential(__, expr): exprDeps(acc, expr);
+			MmFloating(__,type,__): insertSet(acc, type);
+		}
+	fold(src.decls, makeSet(), \acc, decl ->
+		switch (decl) {
+			MmAssertion(disjs, hyps, inner, stat): 
+				statDeps(fold(inner, fold(hyps, acc, hypDeps), hypDeps), stat);
+			MmConst(name): acc;
+			MmComment(__): acc;
+		}
+	)
+}
