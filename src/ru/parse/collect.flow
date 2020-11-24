@@ -4,14 +4,14 @@ import ru/parse/parse;
 import ru/verify;
 
 export {
-	ruCollectMath(parsed : Tree<string, RuParsed>, conf : RuConf) -> Maybe<RuMath>;
+	ruCollectMath(parsed : Tree<string, RuParsed>, conf : RuConf, skip_proofs : bool) -> Maybe<RuMath>;
 }
 
-ruCollectMath(parsed : Tree<string, RuParsed>, conf0 : RuConf) -> Maybe<RuMath> {
+ruCollectMath(parsed : Tree<string, RuParsed>, conf0 : RuConf, skip_proofs : bool) -> Maybe<RuMath> {
 	err_count = ref 0;
 	conf = ruAddErrCounter(conf0, err_count);
 	start = timestamp();
-	collected = ruDoCollectMath(parsed, makeSet(), conf, ruMakeEmptyCollectEnv()).math;
+	collected = ruDoCollectMath(parsed, makeSet(), conf, ruMakeEmptyCollectEnv(skip_proofs)).math;
 	if (conf.verbose > 0) {
 		conf.onMessage("ru collected: " + i2s(sizeTree(collected.sources)) + " files in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
 	}
@@ -23,16 +23,18 @@ ruCollectMath(parsed : Tree<string, RuParsed>, conf0 : RuConf) -> Maybe<RuMath> 
 }
 
 RuCollectEnv(
+	skipProofs : bool,
 	math : RuMath,
 	tenv : Tree<string, RuTypeEnv>
 );
 
-ruMakeEmptyCollectEnv() -> RuCollectEnv {
-	RuCollectEnv(ruEmptyMath, makeTree());
+ruMakeEmptyCollectEnv(skip_proofs : bool) -> RuCollectEnv {
+	RuCollectEnv(skip_proofs, ruEmptyMath, makeTree());
 }
 
 ruMergeCollectEnv(e1 : RuCollectEnv, e2 : RuCollectEnv, conf : RuConf) -> RuCollectEnv {
 	RuCollectEnv(
+		e1.skipProofs,
 		ruMergeMath(e1.math, e2.math, conf),
 		ruMergeTypeEnvTree(e1.tenv, e2.tenv)
 	);
@@ -101,7 +103,7 @@ ruDoCollectMath(left : Tree<string, RuParsed>, done : Set<string>, conf : RuConf
 			}
 			new_acc = ruMergeCollectEnv(acc, 
 				fold(collected, 
-					ruMakeEmptyCollectEnv(), 
+					ruMakeEmptyCollectEnv(acc.skipProofs), 
 					\ac, coll -> ruMergeCollectEnv(coll, ac, conf)), 
 				conf
 			);
@@ -116,6 +118,7 @@ ruDoCollectMath(left : Tree<string, RuParsed>, done : Set<string>, conf : RuConf
 }
 
 RuCollectAcc(
+	skipProofs : bool,
 	file : string,
 	module : string,
 	global : RuMath,
@@ -127,6 +130,7 @@ RuCollectAcc(
 ruCollectCached(src : RuSource, acc : RuCollectEnv, conf : RuConf) -> RuCollectEnv {
 	m = ruMakeMathFromSource(src, conf);
 	RuCollectEnv(
+		acc.skipProofs,
 		RuMath(m with sources = setTree(m.sources, src.info.module, src)),
 		mergeTree(
 			acc.tenv,
@@ -151,7 +155,7 @@ ruCollectParsed(src : RuParseSource, acc : RuCollectEnv, conf : RuConf) -> RuCol
 		}
 		None(): {
 			imps = map(src.imports, \imp -> RuImport(imp.module, imp.pos));
-			acc0 = RuCollectAcc(src.info.path, src.info.module, acc.math, ruEmptyMath, acc.tenv, conf);
+			acc0 = RuCollectAcc(acc.skipProofs, src.info.path, src.info.module, acc.math, ruEmptyMath, acc.tenv, conf);
 			acc1 = fold(src.decls, acc0, \ac, block -> 
 				switch(block) {
 					RuParseDecl(): ruCollectSyntax(block, ac);
@@ -199,7 +203,7 @@ ruCollectParsed(src : RuParseSource, acc : RuCollectEnv, conf : RuConf) -> RuCol
 			ru_src = ruBclocks2Src(RuSource(imps, [], [], src.info), blocks);
 			ruToMemCache(ru_src, conf);
 			ruToDiskCache(ru_src, conf);
-			RuCollectEnv(
+			RuCollectEnv(acc2.skipProofs,
 				RuMath(acc2.local with sources = makeTree1(src.info.module, ru_src)),
 				acc2.tenv
 			);
@@ -462,24 +466,26 @@ ruCreateTheorem(th : RuParseTheorem, acc : RuCollectAcc) -> Maybe<RuTheorem> {
 }
 
 ruCollectProof(proof : RuParseProof, vars : Tree<string, RuVar>, acc : RuCollectAcc, conf : RuConf) -> Maybe<RuProof> {
-	proof_vars = ruCollectVars(proof.vars, acc, conf);
-	all_vars = mergeTreeCustom(proof_vars, vars, \v, w,__ -> {
-		conf.onError("duplicate variable " + v, [RuPlace(acc.file, proof.pos)]);
-		w
-	});
-	proof_disjs = ruCollectDisjs(proof.disjs, all_vars, acc, conf);
-	do_ref = \r -> switch (r) {
-		RuParseHypRef(i, p): RuHypRef(i, p);
-		RuParseStepRef(i, p): RuStepRef(i, p);
-	}
-	steps = filtermap(proof.steps,
-		\s ->
-			maybeMap(ruCollectExp(s.expr, all_vars, acc, conf),
-				\expr -> RuStep(s.ind, s.assertion, map(s.refs, do_ref), expr, s.pos)
-			)
-	);
-	if (length(steps) != length(proof.steps)) None() else {
-		Some(RuProof(proof_vars, proof_disjs, steps, proof.pos));
+	if (acc.skipProofs) Some(RuProof(makeTree(), makeSet(), [], proof.pos)) else {
+		proof_vars = ruCollectVars(proof.vars, acc, conf);
+		all_vars = mergeTreeCustom(proof_vars, vars, \v, w,__ -> {
+			conf.onError("duplicate variable " + v, [RuPlace(acc.file, proof.pos)]);
+			w
+		});
+		proof_disjs = ruCollectDisjs(proof.disjs, all_vars, acc, conf);
+		do_ref = \r -> switch (r) {
+			RuParseHypRef(i, p): RuHypRef(i, p);
+			RuParseStepRef(i, p): RuStepRef(i, p);
+		}
+		steps = filtermap(proof.steps,
+			\s ->
+				maybeMap(ruCollectExp(s.expr, all_vars, acc, conf),
+					\expr -> RuStep(s.ind, s.assertion, map(s.refs, do_ref), expr, s.pos)
+				)
+		);
+		if (length(steps) != length(proof.steps)) None() else {
+			Some(RuProof(proof_vars, proof_disjs, steps, proof.pos));
+		}
 	}
 }
 
