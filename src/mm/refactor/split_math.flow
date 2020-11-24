@@ -1,0 +1,142 @@
+import base/split;
+import mm/src;
+import command;
+
+export {
+	mmCommSplitMath : RuComm;
+}
+
+mmCommSplitMath = RuComm(
+	"split-math-mm", "misc", "split a single file into a filesystem", "file",
+	[RuCommArg("file", false, "input file", "")],
+	mmRunSplitMath
+);
+
+mmRunSplitMath(task : ScTask, env : RuState) -> Maybe<RuState> {
+	file = lookupTreeDef(task.args, "file", "");
+	math = env.mmMath;
+	conf = env.conf;
+	module = ruTrimPath(file, conf, ".ru");
+	start = timestamp();
+	num1 = sizeTree(math.sources);
+	if (conf.verbose > 1) {
+		conf.onMessage("mm going to split: " + i2s(num1) + " modules");
+	}
+	split_sources = foldTree(math.sources, makeTree(), \name, src, acc -> {
+			if (conf.verbose > 1) {
+				conf.onMessage("\tgoing to split module: '" + src.info.module + "'");
+			}
+			mergeTree(acc, mmSplitSources(src, conf, math, module))
+		}
+	);
+	ret = MmMath(math with sources = split_sources);
+	created = timestamp();
+	root_info = ruNewFileInfo(module, conf, ".ru");
+	if (conf.verbose > 1) {
+		conf.onMessage("\troot module: '" + root_info.module + "', path: '" + root_info.path + "'");
+	}
+	root_src = MmSource(
+		map(getTreeValues(ret.sources), \src -> MmImport(src.info.module)),
+		[], root_info
+	);
+	if (conf.verbose > 0) {
+		conf.onMessage("mm split " + i2s(num1) + " files into " + i2s(sizeTree(ret.sources) + 1) + " in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
+	}
+	//new_math = ruUpdateSourceNames(RuMath(ret with sources = setTree(ret.sources, module, root_src)));
+	new_math = MmMath(ret with sources = setTree(ret.sources, module, root_src));
+	Some(RuState(env with mmMath = new_math));
+}
+
+MmSplitSource(
+	pattern : string,
+	header : string,
+	path : string,
+	blocks : ref [MmElement],
+	subs : ref [MmSplitSource]
+);
+
+mmSplitLevel(src : MmSplitSource, pattern : string) -> MmSplitSource {
+	makePath = \h -> ruStrReplaceAll(h, " /:.?!;$\\\"'`#", "_");
+	addBlock = \acc, block -> { 
+		refArrayPush(lastElement(^(acc.subs), acc).blocks, block); 
+		acc 
+	}
+	addSrc = \acc, h -> {
+		path = (if (src.path != "") src.path + "/" else "") + makePath(h);
+		refArrayPush(acc.subs, MmSplitSource(pattern, h, path, ref [], ref [])); 
+		acc 
+	}
+	getHeader = \txt -> trim2(strSplit(txt, "\n")[2], " \t\n\r");
+	isHeader = \txt -> {
+		if (!(strContains(txt, pattern) && strCountOf(txt, "\n") > 1)) false else {
+			getHeader(txt) != "";
+		}
+	}
+	fold(^(src.blocks), MmSplitSource(src with blocks = ref [], subs = ref []), \acc, block -> 
+		switch (block) {
+			MmComment(text): {
+				if (!isHeader(text)) {
+					addBlock(acc, block)
+				} else {
+					addBlock(addSrc(acc, getHeader(text)), block);
+				}
+			}
+			default: addBlock(acc, block);
+		}
+	);
+}
+
+mmSplitSourceRec(src : MmSplitSource, p : RuSplitPattern) -> MmSplitSource {
+	parts = mmSplitLevel(src, p.pattern);
+	switch (p.child) {
+		None(): parts;
+		Some(ch_p):
+			MmSplitSource(parts with
+				subs = ref map(^(parts.subs), \part -> mmSplitSourceRec(part, ch_p))
+			);
+	}
+}
+
+mmDoSplitSource(src : MmSource, conf : RuConf) -> MmSplitSource {
+	mmSplitSourceRec(
+		MmSplitSource("", "", "", ref src.decls, ref []), 
+		mm_split_pattern
+	)
+}
+
+MmLinearizeAcc(
+	srcs : Tree<string, MmSource>,
+	last : Maybe<MmSource>
+);
+
+mmMakeSplittedFile(file : string, acc : MmLinearizeAcc) -> string {
+	if (!containsKeyTree(acc.srcs, file)) file else {
+		mmMakeSplittedFile(file + "1", acc)
+	}
+}
+
+mmLinearizeSplitSources(src : MmSplitSource, acc : MmLinearizeAcc, conf : RuConf, math : MmMath, file0 : string) -> MmLinearizeAcc {
+	file = mmMakeSplittedFile(if (src.path == "") file0 + "_init" else src.path, acc);
+	module = ruTrimPath(file, conf, ".ru");
+	header_pattern = lpad("", src.pattern, 40);
+	curr_src = MmSource(
+		eitherMap(acc.last, \last -> [MmImport(last.info.module)], []), 
+		[], 
+		ruNewFileInfo(module, conf, ".ru")
+	);
+	if (conf.verbose > 1) {
+		conf.onMessage("\tru splitted file: '" + curr_src.info.module + "'");
+	}
+	fold(^(src.subs), 
+		MmLinearizeAcc(setTree(acc.srcs, file, curr_src), Some(curr_src)), 
+		\ac, sub -> mmLinearizeSplitSources(sub, ac, conf, math, file0)
+	);
+}
+
+mmSplitSources(src : MmSource, conf : RuConf, math : MmMath, file : string) -> Tree<string, MmSource> {
+	mmLinearizeSplitSources(
+		mmDoSplitSource(src, conf),
+		MmLinearizeAcc(makeTree(), None()), 
+		conf, math, file
+	).srcs;
+}
