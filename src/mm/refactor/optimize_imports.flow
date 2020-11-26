@@ -10,30 +10,138 @@ mmCommOptimizeImports = RuComm(
 	mmRunOptimizeImports
 );
 
-mmRunOptimizeImports(task : ScTask, env : RuState) -> Maybe<RuState> {
-	math = env.mmMath;
-	conf = env.conf;
-	start = timestamp();
-	name2src = foldTree(math.sources, makeTree(), \src_name, src, acc ->
+MmRuleSymbMaps(
+	symb2rules : Tree<string, [string]>,
+	rule2symbs : Tree<string, [string]>,
+);
+
+MmOptImportsEnv(
+	name2src : Tree<string, string>,
+	maps     : MmRuleSymbMaps
+);
+
+mmMakeOptImportsEnv(sources : Tree<string, MmSource>, conf : RuConf) -> MmOptImportsEnv {
+	env = foldTree(sources, 
+		MmOptImportsEnv(makeTree(), MmRuleSymbMaps(makeTree(), makeTree())),
+		\src_name, src, acc ->
 		fold(src.decls, acc, \ac, decl ->
 			switch (decl) {
-				MmAssertion(__,__,__,stat): setTree(ac, stat.label, src_name);
-				MmConst(consts): fold(consts, ac, \a, c -> setTree(a, c, src_name));
+				MmAssertion(__,__,__,stat): {
+					ac1 = MmOptImportsEnv(ac with name2src = setTree(ac.name2src, stat.label, src_name));
+					if (!mmStatIsRule(stat)) ac1 else {
+						MmOptImportsEnv(ac1 with 
+							maps = foldi(stat.expr.symbs, ac1.maps, \i, a, symb ->
+								if (i == 0 || symb.isVar) a else
+								MmRuleSymbMaps(a with
+									symb2rules = setTree(a.symb2rules, symb.literal, 
+										concat(
+											lookupTreeDef(a.symb2rules, symb.literal, []),
+											[stat.label]
+										)
+									),
+									rule2symbs = setTree(a.rule2symbs, stat.label, 
+										concat(
+											lookupTreeDef(a.symb2rules, stat.label, []),
+											[symb.literal]
+										)
+									),
+								)
+							);
+						);
+					}
+				}
+				MmConst(consts): 
+					fold(consts, ac, \a, c -> 
+						MmOptImportsEnv(a with name2src = setTree(a.name2src, c, src_name))
+					);
 				MmComment(__): ac;
 			}
 		)
 	);
-	//println("names:\n" + strGlue(map(getTreeKeys(name2src), \n -> "\t" + n), "\n"));
-	optimized = mmDoOptimizeMathImports(math.sources, math, conf, MmOptImportsAcc(name2src, makeTree(), makeTree()));
-	if (conf.verbose > 0) {
-		conf.onMessage("ru imports optimized: " +i2s(sizeTree(optimized.sources)) + " files in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
+	MmOptImportsEnv(env with
+		maps = mmRefineSymb2Rules(env.maps, MmRuleSymbMaps(makeTree(), makeTree()))
+	);
+}
+
+mmRefineSymb2Rules(curr : MmRuleSymbMaps, acc : MmRuleSymbMaps) -> MmRuleSymbMaps {
+	tree_decreesed = \t1, t2 -> {
+		sizeTree(t1) < sizeTree(t2) ||
+		existsTree(t1, \x, y -> length(y) < length(lookupTreeDef(t2, x, [])));
 	}
-	new_math = MmMath(math with sources = optimized.sources);
-	Some(RuState(env with mmMath = new_math));
+	uniq_pairs = foldTree(curr.symb2rules, [], \s, rules, ac -> 
+		if (length(rules) == 1) concat(ac, [Pair(s, rules[0])]) else ac
+	);
+	new_acc = MmRuleSymbMaps(
+		fold(uniq_pairs, acc.symb2rules, \ac, p -> setTree(ac, p.first, [p.second])),
+		fold(uniq_pairs, acc.rule2symbs, \ac, p -> setTree(ac, p.second, [p.first])),
+	);
+	uniq_rules = buildSet(map(uniq_pairs, \p -> p.second));
+	uniq_symbs = buildSet(map(uniq_pairs, \p -> p.first));
+	new_curr = MmRuleSymbMaps(
+		mapTree(
+			filterTree(curr.symb2rules, \s,__ -> !containsSet(uniq_symbs, s)), 
+			\rules -> filter(rules, \r -> !containsSet(uniq_rules, r))
+		),
+		mapTree(
+			filterTree(curr.rule2symbs, \r,__ -> !containsSet(uniq_rules, r)), 
+			\symbs -> filter(symbs, \s -> !containsSet(uniq_symbs, s))
+		)
+	);
+	if (tree_decreesed(new_curr.symb2rules, curr.symb2rules) ||
+		tree_decreesed(new_curr.rule2symbs, curr.rule2symbs)) {
+		mmRefineSymb2Rules(new_curr, new_acc);
+	} else {
+		MmRuleSymbMaps(
+			mergeTree(new_acc.symb2rules, new_curr.symb2rules),
+			mergeTree(new_acc.rule2symbs, new_curr.rule2symbs),
+		);
+	}
+}
+
+mmRunOptimizeImports(task : ScTask, env : RuState) -> Maybe<RuState> {
+	math = env.mmMath;
+	conf = env.conf;
+	start = timestamp();
+	opt_env = mmMakeOptImportsEnv(math.sources, conf);
+	if (conf.verbose > 1) {
+		conf.onMessage("No rules:\n" +
+			strGlue(filtermap(tree2pairs(opt_env.maps.symb2rules), \p -> 
+				if (length(p.second) != 0) None() else {
+					Some("\t" + p.first + " is in " + strGlue(p.second, ", "))
+				}
+			), "\n")
+		);
+		conf.onMessage("Uniq rules:\n" +
+			strGlue(filtermap(tree2pairs(opt_env.maps.symb2rules), \p -> 
+				if (length(p.second) != 1) None() else {
+					Some("\t" + p.first + " is in " + strGlue(p.second, ", "))
+				}
+			), "\n")
+		);
+	}
+	non_unique = filtermap(tree2pairs(opt_env.maps.symb2rules), \p -> 
+		if (length(p.second) <= 1) None() else {
+			Some("\t" + p.first + " is in " + strGlue(p.second, ", "))
+		}
+	);
+	if (length(non_unique) > 0) {
+		conf.onMessage("WARNING: Non-bijective rule to const correspondence :\n" +
+			strGlue(non_unique, "\n") + "\n" +
+			"import optimization may not be correct"
+		);
+		None();
+	} else {
+		optimized = mmDoOptimizeMathImports(math.sources, math, conf, MmOptImportsAcc(opt_env, makeTree(), makeTree()));
+		if (conf.verbose > 0) {
+			conf.onMessage("mm imports optimized: " +i2s(sizeTree(optimized.sources)) + " files in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
+		}
+		new_math = MmMath(math with sources = optimized.sources);
+		Some(RuState(env with mmMath = new_math));
+	}
 }
 
 MmOptImportsAcc(
-	name2src : Tree<string, string>,
+	optEnv : MmOptImportsEnv,
 	sources : Tree<string, MmSource>,
 	cumulativeImports : Tree<string, Set<string>>
 );
@@ -44,12 +152,12 @@ mmDoOptimizeMathImports(left : Tree<string, MmSource>, math : MmMath, conf : RuC
 			getTreeValues(left), 
 			\src -> forall(src.imports, \imp -> !containsKeyTree(left, imp.module))
 		);
-		if (conf.verbose >= 3) {
+		if (conf.verbose > 2) {
 			conf.onMessage("\t\tready: " + strGlue(map(ready, \r -> r.info.module), ", "));
 		}
 		optimized = ruConcurrent(map(ready, \s -> \-> mmOptimizeSourceImports(s, acc, math, conf))); 
 		new_acc = MmOptImportsAcc(
-			acc.name2src,
+			acc.optEnv,
 			fold(optimized, acc.sources, \ac, src -> setTree(ac, src.info.module, src)),
 			fold(optimized, acc.cumulativeImports, \ac, src ->
 				setTree(ac, src.info.module, 
@@ -66,12 +174,9 @@ mmDoOptimizeMathImports(left : Tree<string, MmSource>, math : MmMath, conf : RuC
 }
 
 mmOptimizeSourceImports(src : MmSource, acc : MmOptImportsAcc, math : MmMath, conf : RuConf) -> MmSource {
-	if (conf.verbose >= 2) {
-		conf.onMessage("\toptimizing imports in module: " + src.info.module);
-	}
 	if (length(src.decls) == 0) src else {
-		deps = set2array(mapSet(mmCollectDependencies(src), \n -> {
-				switch (lookupTree(acc.name2src, n)) {
+		deps = set2array(mapSet(mmCollectDependencies(src, acc.optEnv.maps.symb2rules), \n -> {
+				switch (lookupTree(acc.optEnv.name2src, n)) {
 					Some(s): s;
 					None(): {
 						conf.onError("unknown name: '" + n + "'", [RuPlace(src.info.module, -1)]);
@@ -88,12 +193,24 @@ mmOptimizeSourceImports(src : MmSource, acc : MmOptImportsAcc, math : MmMath, co
 				}
 			})
 		);
+		if (conf.verbose > 1) {
+			conf.onMessage("\toptimized imports in module " + src.info.module + ":\n" +
+				strGlue(map(optimized, \imp -> "\t\t" + imp), "\n")
+			);
+		}
 		MmSource(src with imports = map(optimized, \imp -> MmImport(imp)));
 	}
 }
 
-mmCollectDependencies(src : MmSource) -> Set<string> {
-	exprDeps = \acc, expr -> fold(expr.symbs, acc, \ac, symb -> if (symb.isVar) ac else insertSet(ac, symb.literal));
+mmCollectDependencies(src : MmSource, symb2rules : Tree<string, [string]>) -> Set<string> {
+	exprDeps = \acc, expr -> fold(expr.symbs, acc, \ac, symb -> 
+		if (symb.isVar) ac else {
+			fold(
+				lookupTreeDef(symb2rules, symb.literal, []), 
+				insertSet(ac, symb.literal), \a, r -> insertSet(a, r)
+			);
+		}
+	);
 	proofDeps = \acc, proof, hyps -> fold(proof.labels, acc, \ac, l -> 
 		if (exists(hyps, \hyp -> hyp.label == l)) ac else
 		insertSet(ac, l)
