@@ -45,8 +45,13 @@ export {
 	// In case a declaration has comments before it, we take the start position of a first
 	// comment right before the declaration. Otherwise the position of decl itself.
 	ruStartPosition(decl : RuDecl) -> int;
+
+	RuComputedDisjs ::= RuDisjsInherent, RuDisjViolation;
+		RuDisjsInherent(disjs : Set<RuDisj>);
+		RuDisjViolation(disj : RuDisj, commonVars : Set<RuVar>);
+	ruComputeDisjs(s : Tree<RuVar, RuExp>, disjs : Set<RuDisj>, acc : RuComputedDisjs) -> RuComputedDisjs;
 	ruCheckDisjs(s : Tree<RuVar, RuExp>, disjs : Set<RuDisj>) -> bool;
-	ruChechDisjsInherent(s : Tree<RuVar, RuExp>, ass_disjs : Set<RuDisj>, thm_disjs : Set<RuDisj>) -> bool;
+	ruCheckDisjsInherent(s : Tree<RuVar, RuExp>, ass_disjs : Set<RuDisj>, thm_disjs : Set<RuDisj>) -> bool;
 	ruArity(a : RuAssertion) -> int;
 
 	RuDAG(data : ?, children : [RuDAG<?>]);
@@ -101,7 +106,7 @@ ruIsConst(e : RuExp) -> bool {
 	length(e.nodes) == 1 && 
 	switch (e.nodes[0]) { 
 		RuVar(__,__,__): false; 
-		RuRuleNode(name, __, arity, len): 
+		RuRuleNode(name, id, __, arity, len): 
 			arity == 0 && len == 1;
 	}
 }
@@ -110,7 +115,7 @@ ruExp2Const(e : RuExp) -> Maybe<Pair<string, string>> {
 	if (length(e.nodes) != 1) None() else {
 		switch (e.nodes[0]) { 
 			RuVar(__,__,__): None(); 
-			RuRuleNode(name, type, arity, len): 
+			RuRuleNode(name, id, type, arity, len): 
 				if (arity == 0 && len == 1) Some(Pair(name, type)) else None();
 		}
 	}
@@ -123,7 +128,7 @@ ruTerm2s(term : RuTerm) -> string {
 ruExpRPN2s(exp : RuExp) -> string {
 	strGlue(map(exp.nodes, \n -> {
 		switch (n) {
-			RuRuleNode(r, t, a, l): r + "-" + i2s(l);
+			RuRuleNode(r, id, t, a, l): r + "-" + i2s(l);
 			RuVar(v, id, t): v;
 		}
 	}), " ")
@@ -132,7 +137,7 @@ ruExpRPN2s(exp : RuExp) -> string {
 ruExp2Vars(exp : RuExp) -> Set<RuVar> {
 	fold(exp.nodes, makeSet(), \acc, n ->
 		switch (n) {
-			RuRuleNode(__,__,__,__): acc;
+			RuRuleNode(__,__,__,__,__): acc;
 			RuVar(__,__,__): insertSet(acc, n);
 		}
 	)
@@ -326,7 +331,7 @@ ruExp2sAccOperation(node : RuExpNode, stack : Maybe<RuExp2sStack>, rules : Tree<
 	switch (node) {
 		RuVar(var,__,__): 
 			Some(RuExp2sStack(stack, [node]));
-		RuRuleNode(name, type, arity, len): {
+		RuRuleNode(name, id, type, arity, len): {
 			switch (lookupTree(rules, name)) {
 				Some(rule): {
 					stack_str = fold(rule.term.nodes, Pair(stack, []), 
@@ -431,6 +436,7 @@ ru2sWrapExp(a : RuAny, rules : Tree<string, RuRule>, wrap_exp : (string) -> stri
 		RuTerm(type, expr, __): 
 			": " + type + " = # " + strGlue(map(expr, aru2s), " ") + " ;;";
 		RuConstRef(name, id): id2s(id);
+		RuRuleNode(name, id, type, arity, len): id2s(id);
 	}
 }
 
@@ -522,6 +528,36 @@ ruStartPosition(decl : RuDecl) -> int {
 	}
 }
 
+ruComputeDisjs(s : Tree<RuVar, RuExp>, disjs : Set<RuDisj>, acc : RuComputedDisjs) -> RuComputedDisjs {
+	foldSet(disjs, RuDisjsInherent(makeSet()), \ac, disj -> {
+		e1 = lookupTreeDef(s, disj.v1, RuExp([disj.v1], -1));
+		e2 = lookupTreeDef(s, disj.v2, RuExp([disj.v2], -1));
+		e1_vars = ruExp2Vars(e1);
+		e2_vars = ruExp2Vars(e2);
+		common_vars = intersectSets(e1_vars, e2_vars);
+		if (!isEmptySet(common_vars)) {
+			switch (acc) {
+				RuComputedDisjs(__):  RuDisjViolation(disj, common_vars);
+				RuDisjViolation(__,__): acc;
+			}
+		} else {
+			switch (acc) {
+				RuDisjsInherent(dsj): {
+					RuDisjsInherent(
+						foldSet(e1_vars, dsj, \ac1, v1 ->
+							foldSet(e2_vars, ac1, \a, v2 ->
+								if (v1.name < v2.name) insertSet(a, RuDisj(v1, v2)) else
+								if (v2.name < v1.name) insertSet(a, RuDisj(v2, v1)) else a
+							)
+						)
+					);
+				}
+				RuDisjViolation(__,__): acc;
+			}
+		}
+	});
+}
+
 ruCheckDisjs(s : Tree<RuVar, RuExp>, disjs : Set<RuDisj>) -> bool {
 	forall(set2array(disjs), \disj -> {
 		e1 = lookupTreeDef(s, disj.v1, RuExp([disj.v1], -1));
@@ -532,7 +568,7 @@ ruCheckDisjs(s : Tree<RuVar, RuExp>, disjs : Set<RuDisj>) -> bool {
 	})
 }
 
-ruChechDisjsInherent(s : Tree<RuVar, RuExp>, ass_disjs : Set<RuDisj>, thm_disjs : Set<RuDisj>) -> bool {
+ruCheckDisjsInherent(s : Tree<RuVar, RuExp>, ass_disjs : Set<RuDisj>, thm_disjs : Set<RuDisj>) -> bool {
 	forall(set2array(ass_disjs), \disj -> {
 		e1 = lookupTreeDef(s, disj.v1, RuExp([disj.v1], -1));
 		e2 = lookupTreeDef(s, disj.v2, RuExp([disj.v2], -1));

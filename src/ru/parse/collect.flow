@@ -1,7 +1,7 @@
 import ru/parse/exp;
 import ru/parse/parse;
 
-import ru/verify;
+import ru/verify/verify;
 
 export {
 	ruCollectMath(parsed : Tree<string, RuParsed>, conf : RuConf, skip_proofs : bool) -> Maybe<RuMath>;
@@ -12,7 +12,8 @@ ruCollectMath(parsed : Tree<string, RuParsed>, conf0 : RuConf, skip_proofs : boo
 	conf = ruAddErrCounter(conf0, err_count);
 	start = timestamp();
 	ref_collect_counter := 0;
-	collected = ruDoCollectMath(parsed, makeSet(), conf, ruMakeEmptyCollectEnv(skip_proofs)).math;
+	env = ruDoCollectMath(parsed, makeSet(), conf, ruMakeEmptyCollectEnv(skip_proofs));
+	collected = env.verified.math;
 	ruSaveIds(conf);
 	if (conf.verbose > 0) {
 		conf.onMessage("ru collected: " + i2s(sizeTree(collected.sources)) + " files in " + d2st((timestamp() - start)/ 1000.0, 2) + "s");
@@ -32,18 +33,18 @@ ruCollectMath(parsed : Tree<string, RuParsed>, conf0 : RuConf, skip_proofs : boo
 
 RuCollectEnv(
 	skipProofs : bool,
-	math : RuMath,
+	verified : RuVerifyAcc,
 	tenv : Tree<string, RuTypeEnv>
 );
 
 ruMakeEmptyCollectEnv(skip_proofs : bool) -> RuCollectEnv {
-	RuCollectEnv(skip_proofs, ruEmptyMath, makeTree());
+	RuCollectEnv(skip_proofs, RuVerifyAcc(ruEmptyMath, makeSet(), makeSet()), makeTree());
 }
 
 ruMergeCollectEnv(e1 : RuCollectEnv, e2 : RuCollectEnv, conf : RuConf) -> RuCollectEnv {
 	RuCollectEnv(
 		e1.skipProofs,
-		ruMergeMath(e1.math, e2.math, conf),
+		ruMergeVerifyAcc(e1.verified, e2.verified, conf),
 		ruMergeTypeEnvTree(e1.tenv, e2.tenv)
 	);
 }
@@ -73,6 +74,11 @@ ruDoCollectMath(left : Tree<string, RuParsed>, done : Set<string>, conf : RuConf
 					}
 				}
 			}
+			approve_src = \src -> RuVerifyAcc(
+				ruMakeMathFromSource(src, conf),
+				fold(src.decls, makeSet(), \ac, decl -> insertSet(ac, decl.descr.name)),
+				makeSet()
+			);
 			collected = filtermap(ready, \parsed ->
 				switch (parsed) {
 					RuParseSource(__,__,info): {
@@ -91,28 +97,26 @@ ruDoCollectMath(left : Tree<string, RuParsed>, done : Set<string>, conf : RuConf
 						//}
 						if (!depChanged()) {
 							start = timestamp();
-							ret = Some(ruCollectCached(src, acc, conf)); 
+							ret = Some(ruCollectCached(src, RuCollectEnv(acc with verified = approve_src(src)), conf)); 
 							if (conf.verbose > 1) {
 								conf.onMessage("\tru collected cached: '" + src.info.module + "' in " + d2st((timestamp() - start)/ 1000.0, 4) + " s");
 							}
 							ret;
 						} else {
 							start = timestamp();
-							switch (ruVerifySource1(src, ruAddSource(src, acc.math, conf), conf)) {
-								Some(verified): {
-									ret = Some(ruCollectCached(src, acc, conf));
-									if (conf.verbose > 1) {
-										conf.onMessage("\tru collected verified: '" + src.info.module + "' in " + d2st((timestamp() - start)/ 1000.0, 4) + " s");
-									}
-									ret;
+							new_verified = ruVerifySource(src, acc.verified, conf);
+							if (sizeSet(acc.verified.disproved) == sizeSet(new_verified.disproved)) {
+								ret = ruCollectCached(src, RuCollectEnv(acc with verified = new_verified), conf);
+								if (conf.verbose > 1) {
+									conf.onMessage("\tru collected verified: '" + src.info.module + "' in " + d2st((timestamp() - start)/ 1000.0, 4) + " s");
 								}
-								None(): {
-									maybeBind(ruLoadOne(conf, src.info.module, \__,__ -> None()), \l ->
-										maybeMap(ruParseOne(l, conf), \s ->
-											ruCollectOne(s, acc, conf)
-										)
-									);
-								}
+								Some(ret);
+							} else {
+								maybeBind(ruLoadOne(conf, src.info.module, \__,__ -> None()), \l ->
+									maybeMap(ruParseOne(l, conf), \s ->
+										ruCollectOne(s, acc, conf)
+									)
+								);
 							}
 						}
 					}
@@ -137,24 +141,18 @@ ruDoCollectMath(left : Tree<string, RuParsed>, done : Set<string>, conf : RuConf
 	}
 }
 
-RuCollectAcc(
-	skipProofs : bool,
-	file : string,
-	module : int,
-	global : RuMath,
-	local : RuMath,
-	tenv : Tree<string, RuTypeEnv>,
-	conf : RuConf
-);
-
 ruCollectCached(src : RuSource, acc : RuCollectEnv, conf : RuConf) -> RuCollectEnv {
-	m = ruMakeMathFromSource(src, conf);
-	RuCollectEnv(
-		acc.skipProofs,
-		RuMath(m with sources = setTree(m.sources, src.info.id, src)),
-		mergeTree(
+	//m = ruMakeMathFromSource(src, conf);
+	types = fold(src.decls, makeTree(), \ac, decl ->
+		switch (decl) {
+			RuType(descr,__): setTree(ac, descr.name, decl);
+			default: ac;
+		}
+	);
+	RuCollectEnv(acc with 
+		tenv = mergeTree(
 			acc.tenv,
-			mapTree(m.types, \t -> ruMakeTypeEnv(t, conf))
+			mapTree(types, \t -> ruMakeTypeEnv(t, conf))
 		)
 	);
 }
@@ -166,16 +164,26 @@ ruCollectOne(parsed : RuParsed, acc : RuCollectEnv, conf : RuConf) -> RuCollectE
 	}
 }
 
+RuCollectAcc(
+	skipProofs : bool,
+	file : string,
+	module : int,
+	global : RuMath,
+	local : RuMath,
+	tenv : Tree<string, RuTypeEnv>,
+	conf : RuConf
+);
+
 ruCollectParsed(src : RuParseSource, acc : RuCollectEnv, conf : RuConf) -> RuCollectEnv {
 	start = timestamp();
-	switch (lookupTree(acc.math.sources, src.info.id)) {
+	switch (lookupTree(acc.verified.math.sources, src.info.id)) {
 		Some(__): {
 			conf.onError("source '" + src.info.module + "' is already defined", []);
 			acc
 		}
 		None(): {
 			imps = map(src.imports, \imp -> RuImport(s2id(imp.module), imp.pos));
-			acc0 = RuCollectAcc(acc.skipProofs, src.info.path, src.info.id, acc.math, ruEmptyMath, acc.tenv, conf);
+			acc0 = RuCollectAcc(acc.skipProofs, src.info.path, src.info.id, acc.verified.math, ruEmptyMath, acc.tenv, conf);
 			acc1 = fold(src.decls, acc0, \ac, block -> 
 				switch(block) {
 					RuParseDecl(): ruCollectSyntax(block, ac);
@@ -223,8 +231,9 @@ ruCollectParsed(src : RuParseSource, acc : RuCollectEnv, conf : RuConf) -> RuCol
 			ru_src = ruBclocks2Src(RuSource(imps, [], [], src.info), blocks);
 			ruToMemCache(ru_src, conf);
 			ruToDiskCache(ru_src, conf);
-			RuCollectEnv(acc2.skipProofs,
-				RuMath(acc2.local with sources = makeTree1(src.info.id, ru_src)),
+			RuCollectEnv(
+				acc2.skipProofs,
+				ruVerifySource(ru_src, acc.verified,	conf),
 				acc2.tenv
 			);
 		}
@@ -324,7 +333,7 @@ ruCollectRule(rule : RuParseRule, acc : RuCollectAcc) -> RuCollectAcc {
 						tenv = setTree(acc.tenv, type,
 							RuTypeEnv(tenv with 
 								trie = ruAddTerm2RuTrie(new_rule.term, 
-									Some(RuRuleNode(rule.name, type, sizeTree(vars), 0)),
+									Some(RuRuleNode(rule.name, s2id(rule.name), type, sizeTree(vars), 0)),
 									tenv.trie, conf1
 								)
 							)
