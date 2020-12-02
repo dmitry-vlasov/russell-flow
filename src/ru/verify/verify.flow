@@ -1,18 +1,9 @@
 import ru/subst;
-import ru/verify/step;
+import ru/verify/source;
 import command;
 
 export {
-	RuVerifyAcc(
-		math : RuMath,
-		approved  : Set<string>,
-		disproved : Set<string>
-	);
-	ruMergeVerifyAcc(a1 : RuVerifyAcc, a2 : RuVerifyAcc, conf : RuConf) -> RuVerifyAcc;
-	ruVerifyTheorem(th : RuTheorem, math : RuMath, conf : RuConf, verify_local : bool) -> Maybe<RuTheorem>;
-	ruVerifySource(src : RuSource, acc : RuVerifyAcc, conf : RuConf) -> RuVerifyAcc;
 	ruVerifyMath(math : RuMath, conf : RuConf) -> RuVerifyAcc;
-
 	ruCommVerify : RuComm;
 }
 
@@ -37,23 +28,8 @@ ruVerifyMath(math : RuMath, conf : RuConf) -> RuVerifyAcc {
 			(if (conf.verbose > 0) "" else "ru disproved: " +i2s(sizeSet(acc.disproved)) + " theorems in " + d2st((timestamp() - start)/ 1000.0, 2) + "s\n") +
 			"\tdisproved theorems:\n" + strGlue(map(set2array(acc.disproved), \th -> "\t\t" + th), "\n")
 		);
-		//None();
-	} else {
-		//Some(acc.math);
 	}
 	acc;
-}
-
-ruMergeVerifyAcc(a1 : RuVerifyAcc, a2 : RuVerifyAcc, conf : RuConf) -> RuVerifyAcc {
-	RuVerifyAcc(
-		ruMergeMath(a1.math, a2.math, conf),
-		mergeSets(a1.approved, a2.approved),
-		mergeSets(a1.disproved, a2.disproved)
-	);
-}
-
-ruMakeVerifyAcc() -> RuVerifyAcc {
-	RuVerifyAcc(ruEmptyMath, makeSet(), makeSet());
 }
 
 ruDoVerifyMath(left : Tree<int, RuSource>, acc : RuVerifyAcc, conf : RuConf) -> RuVerifyAcc {
@@ -74,143 +50,6 @@ ruDoVerifyMath(left : Tree<int, RuSource>, acc : RuVerifyAcc, conf : RuConf) -> 
 	}
 }
 
-RuVerifySourceAcc(
-	decls  : [RuDecl],
-	local  : RuVerifyAcc,
-	global : RuVerifyAcc
-);
-
-ruVerifySource(src : RuSource, acc : RuVerifyAcc, conf : RuConf) -> RuVerifyAcc {
-	approve_acc = \ac, decl : RuDecl -> 
-		RuVerifyAcc(ac with
-			math = ruAddDecl(decl, ac.math, conf),
-			approved = insertSet(ac.approved, ruDeclName(decl))
-		);
-	disprove_acc = \ac, decl -> 
-		RuVerifyAcc(ac with
-			math = ruAddDecl(decl, ac.math, conf),
-			disproved = insertSet(ac.disproved, ruDeclName(decl))
-		);
-	start = timestamp();
-	approve = \ac, decl -> RuVerifySourceAcc(
-		concat(ac.decls, [decl]), 
-		approve_acc(ac.local, decl),
-		approve_acc(ac.global, decl),
-	);
-	disprove = \ac, decl -> RuVerifySourceAcc(
-		concat(ac.decls, [decl]), 
-		disprove_acc(ac.local, decl),
-		disprove_acc(ac.global, decl),
-	);
-	verify_local = lookupTreeDef(conf.opts, "verify-local", "") == "1";
-	src_acc = fold(src.decls, 
-		RuVerifySourceAcc([], ruMakeVerifyAcc(), acc), 
-		\ac, decl -> {
-			switch (decl) {
-				RuTheorem(__,__,__,__): {
-					switch (ruDoVerifyTheorem(decl, ac.global, conf, verify_local)) {
-						Some(th): approve(ac, th);
-						None():   disprove(ac, decl);
-					}
-				}
-				default: approve(ac, decl);
-			}
-		}
-	);
-	if (conf.verbose > 1) {
-		conf.onMessage("\tru verified: '" + src.info.module + "' in " + d2st((timestamp() - start)/ 1000.0, 4) + " s");
-	}
-	RuVerifyAcc(src_acc.local with
-		math = RuMath(src_acc.local.math with 
-			sources = setTree(src_acc.local.math.sources, src.info.id, 
-				RuSource(src with decls = src_acc.decls)
-			)
-		)
-	);
-}
-
-RuVerifyTheoremAcc(
-	disjs : Set<RuDisj>,
-	errs : [RuVerifyErr]
-);
-
-ruDoVerifyTheorem(th : RuTheorem, acc0 : RuVerifyAcc, conf : RuConf, verify_local : bool) -> Maybe<RuTheorem> {
-	math = acc0.math;
-	last_step = lastElement(th.proof.steps, ruNoStep);
-	acc = fold(
-		th.proof.steps, 
-		RuVerifyTheoremAcc(
-			makeSet(), 
-			if (th.stat.prop.nodes == last_step.expr.nodes) [] else {
-				[RuVerifyErrPropMismatch(last_step, th.stat.prop)]
-			}
-		), 
-		\acc, step -> {
-			if (!verify_local && !containsSet(acc0.approved, step.assertion)) {
-				//if (conf.verbose > 2 || lookupTreeDef(conf.opts, "report-depend-on-non-verified", "") == "1") {
-					//conf.onError(
-					//	"Step '" + ru2s(step, math.rules) + "' depends on a non-verified assertion " + step.assertion,
-					//	[RuPlace(eitherMap(ruFindSource(th.descr.name, math), \src -> src.info.module, ""), th.descr.pos)]
-					//);
-				//}
-				RuVerifyTheoremAcc(acc with errs = concat(acc.errs, [RuVerifyErrNonVerifiedRef(step)]));
-			} else {
-				ms = ruMatchStep(step, th, math, conf);
-				switch (ms) {
-					RuMatchedStep(__,__, disjs): 
-						RuVerifyTheoremAcc(acc with disjs = mergeSets(acc.disjs, disjs));
-					RuVerifyErr(): 
-						RuVerifyTheoremAcc(acc with errs = concat(acc.errs, [ms]));
-				}
-			}
-		}
-	);
-	ret = if (length(acc.errs) > 0) None() else {
-		th_vars = ruAssertion2Vars(th);
-		th_ds = filterSet(acc.disjs, \d -> containsSet(th_vars, d.v1) && containsSet(th_vars, d.v2));
-		pr_ds = filterSet(acc.disjs, \d -> !(containsSet(th_vars, d.v1) && containsSet(th_vars, d.v2)));
-		Some(RuTheorem(th with 
-			stat = RuStatement(th.stat with disjs = th_ds),
-			proof = RuProof(th.proof with disjs = pr_ds)
-		));
-	};
-	if (isNone(ret)) {
-		module = eitherMap(ruFindSource(th.descr.name, math), \src -> src.info.module, "");
-		show_disproved = (conf.verbose > 1 || lookupTreeDef(conf.opts, "show-disproved-theorems", "") == "1");
-		//if (conf.verbose > 2 || !^depends_on_non_verified || lookupTreeDef(conf.opts, "report-depend-on-non-verified", "") == "1") {
-			iter(acc.errs, \err -> 
-				conf.onError(ruVerifyErr2s(err, math, conf), [RuPlace(module, err.step.pos)])
-			);
-			conf.onError(
-				"Theorem '" + th.descr.name + "' is disproved" + 
-				(if (show_disproved) "\n" + ru2s(th, math.rules) else ""),
-				[RuPlace(module, th.descr.pos)]
-			);
-		//}
-		if (lookupTreeDef(conf.opts, "die-at-verify-failure", "") == "1") {
-			conf.onMessage("Since there's an option 'die-at-verify-failure=1' russell terminates ...");
-			quit(0);
-		}
-	} else if (conf.verbose > 2) {
-		conf.onMessage("\tru theorem verified: '" + th.descr.name + "'");
-	}
-	ret;
-}
-
-ruVerifyTheorem(th : RuTheorem, math : RuMath, conf : RuConf, verify_local : bool) -> Maybe<RuTheorem> {
-	maybeBind(lookupTree(math.sources, th.descr.src), \src -> {
-		deps = fold(src.imports, 
-			fold(src.decls, Pair(makeSet(), false), \acc, decl ->
-				if (acc.second) acc else
-				if (ruDeclName(decl) == th.descr.name) Pair(acc.first, true) else	
-				Pair(insertSet(acc.first, ruDeclName(decl)), false)
-			).first, 
-			\acc, imp -> ruSourceDeclNames(imp.id, acc, math, conf)
-		);
-		ruDoVerifyTheorem(th, RuVerifyAcc(math, deps, makeSet()), conf, verify_local);
-	});
-}
-
 ruRunVerify(task : ScTask, env : RuState) -> Maybe<RuState> {
 	target0 = lookupTreeDef(task.args, "target", "");
 	target = if (!endsWith(target0, ".ru")) target0 else ruTrimPath(target0, env.conf, ".ru");
@@ -226,16 +65,15 @@ ruRunVerify(task : ScTask, env : RuState) -> Maybe<RuState> {
 		}
 	} else {
 		id = s2id(target);
-		verify_local = lookupTreeDef(conf.opts, "verify-local", "") == "1";
 		switch (lookupTree(math.assertions, target)) {
 			Some(th): {
 				switch (th) {
 					RuTheorem(__, __,__,__): {
 						start = timestamp();
-						verified = ruVerifyTheorem(th, math, conf, verify_local);
-						ret = maybeMap(verified, \t -> ruReplaceAssertion(t, math, conf));
+						res = ruVerifyTheorem(th, math, conf);
+						ret = if (ruIsVerified(res)) Some(ruReplaceAssertion(res.theorem, math, conf)) else None();
 						if (conf.verbose > 0) {
-							msg = "ru " + (if (isSome(verified)) "verified" else "disproved") + " " + target + "' in " + d2st((timestamp() - start)/ 1000.0, 2) + "s";
+							msg = "ru " + (if (ruIsVerified(res)) "verified" else "disproved") + " " + target + "' in " + d2st((timestamp() - start)/ 1000.0, 2) + "s";
 							conf.onMessage(msg);
 						}
 						ret;
@@ -278,89 +116,3 @@ ruRunVerify(task : ScTask, env : RuState) -> Maybe<RuState> {
 	}
 	maybeMap(m, \new_math -> RuState(env with ruMath = new_math));
 }
-
-
-/*
-
-ruVerifySource1(src : RuSource, math : RuMath, conf : RuConf) -> Maybe<RuSource> {
-	start = timestamp();
-	approve = \ac, decl -> Pair(
-		concat(ac.first, [decl]), 
-		RuMath(ac.second with
-			assertions = setTree(ac.second.assertions, ruDeclName(decl), decl)
-		)
-	);
-	err = ref false;
-	p = fold(src.decls, Pair([], math), \ac, decl -> 
-		switch (decl) {
-			RuTheorem(__,__,__,__): {
-				switch (ruDoVerifyTheorem1(decl, ac.second, conf)) {
-					Some(th): approve(ac, th);
-					None(): { err := true; ac; };
-				}
-			}
-			default: Pair(concat(ac.first, [decl]), ac.second);
-		}
-	);
-	if (conf.verbose > 1) {
-		conf.onMessage("\tru verified: '" + src.info.module + "' in " + d2st((timestamp() - start)/ 1000.0, 4) + " s");
-	}
-	if (^err) None() else Some(RuSource(src with decls = p.first));
-}
-
-ruDoVerifyTheorem1(th : RuTheorem, math : RuMath, conf : RuConf) -> Maybe<RuTheorem> {
-	ret = maybeBind(
-		fold(th.proof.steps, Some(makeSet()), \acc, step ->
-			switch (acc) {
-				None(): acc;
-				Some(disjs): {
-					switch (ruMatchStep(step, th, math, conf)) {
-							Some(p): 
-								ruComputeDisjs(p.second, disjs, p.first.stat.disjs, 
-									\disj, common_vars -> conf.onError(
-										"disjointed variables violation, variables: " + disj.v1.name + " and " + disj.v2.name +
-										" are mappped onto expressions, with common vars: " + strGlue(map(set2array(common_vars), \v -> v.name), ", ") +
-										" in application of assertion " + p.first.descr.name + ", step: " + i2s(step.ind + 1), 
-										[RuPlace(eitherMap(ruFindSource(th.descr.name, math), \src -> src.info.module, ""), th.descr.pos)]
-									)
-								);
-							None(): None();
-						}
-					}
-			}
-		), 
-		\ds -> {
-			th_vars = ruAssertion2Vars(th);
-			th_ds = filterSet(ds, \d -> containsSet(th_vars, d.v1) && containsSet(th_vars, d.v2));
-			pr_ds = filterSet(ds, \d -> !(containsSet(th_vars, d.v1) && containsSet(th_vars, d.v2)));
-			if (th.stat.prop.nodes != lastElement(th.proof.steps, ruNoStep).expr.nodes) {
-				conf.onError(
-					"assertion statement does not coincide with the proved statement", 
-					[RuPlace(eitherMap(ruFindSource(th.descr.name, math), \src -> src.info.module, ""), th.descr.pos)]
-				);
-				None();
-			} else {
-				Some(RuTheorem(th with 
-					stat = RuStatement(th.stat with disjs = th_ds),
-					proof = RuProof(th.proof with disjs = pr_ds)
-				));
-			}
-		}
-	)
-	if (isNone(ret)) {
-		show_disproved = (conf.verbose > 1 || lookupTreeDef(conf.opts, "show-disproved-theorems", "") == "1");
-		conf.onError(
-			"Theorem '" + th.descr.name + "' is disproved" + (if (show_disproved) "\n" + ru2s(th, math.rules) else ""),
-			[RuPlace(eitherMap(ruFindSource(th.descr.name, math), \src -> src.info.module, ""), th.descr.pos)]
-		);
-		if (lookupTreeDef(conf.opts, "die-at-verify-failure", "") == "1") {
-			conf.onMessage("Since there's an option 'die-at-verify-failure=1' russell terminates ...");
-			quit(0);
-		}
-	} else if (conf.verbose > 2) {
-		conf.onMessage("ru theorem is disproved: '" + th.descr.name + "'");
-	}
-	ret;
-}
-
-*/
