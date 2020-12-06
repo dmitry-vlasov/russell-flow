@@ -1,3 +1,4 @@
+import ds/vector;
 import fs/filesystem;
 import sys/concurrent;
 import mm/parse/parse;
@@ -31,7 +32,7 @@ mmDoCollectMath(left : Tree<int, MmParseSource>, conf : RuConf, acc : MmMath) ->
 			conf.onError("C) cyclic import detected", []);
 			acc
 		} else {
-			srcs = ruConcurrent(map(ready, \s -> \-> mmCollectSource(s, conf)));
+			srcs = map(ready, \s -> mmCollectSource(s, conf));
 			add_hyps = \ac, hs -> fold(hs, ac, \a, h : MmHyp -> setTree(a, h.label, h));
 			new_acc = fold(srcs, acc, \ac, src -> 
 				MmMath(
@@ -63,57 +64,87 @@ MmCollectAcc(
 	disjs : List<MmDisj>,
 	hyps  : List<MmHyp>,
 	arities : Tree<int, int>,
-	src   : MmSource,
+	toplevel : Vector<MmDecl>
 );
 
 mmCollectSource(src : MmParseSource, conf : RuConf) -> MmSource {
 	start = timestamp();
 	acc = mmCollectElements(src.toplevel, 
-		MmCollectAcc(makeSet(), makeList(), makeList(), makeTree(), MmSource([], [], src.info))
+		MmCollectAcc(makeSet(), makeList(), makeList(), makeTree(), makeVector(length(src.toplevel)))
 	);
 	if (conf.verbose > 1) {
 		conf.onMessage("\tmm collected: '" + src.info.module + "' in " + d2st((timestamp() - start)/ 1000.0, 4) + " s");
 	}
-	acc.src
+	mm_decls = ruConcurrent(map(vector2array(acc.toplevel), \decl -> 
+		\ -> mmDecompressDecl(decl, acc.arities)
+	));
+	MmSource(src.imports, mm_decls, src.info);
+}
+
+mmDecompressDecl(decl : MmDecl, arities : Tree<int, int>) -> MmDecl {
+	switch (decl) {
+		MmAssertion(disjs, hyps, inner, stat): {
+			switch (stat) {
+				MmProvable(label, expr, proof): {
+					switch (proof) {
+						MmCompressedProof(labels, steps):
+							MmAssertion(decl with
+								stat = MmProvable(stat with
+									proof = mmDecompressProof(proof, hyps, arities)
+								)
+							);
+						default: decl;
+					}
+				}
+				default: decl;
+			}
+		}
+		default: decl;
+	}
 }
 
 mmCollectElements(els : [MmElement], acc : MmCollectAcc) -> MmCollectAcc {
 	fold(els, acc,
 		\ac, el -> {
 			switch (el) {
-				MmComment(__): 
-					MmCollectAcc(ac with src = MmSource(ac.src with decls = concat(ac.src.decls, [el])));
+				MmComment(__): {
+					pushVector(ac.toplevel, el);
+					ac;
+				}
 				MmImport(__):
-					MmCollectAcc(ac with src = MmSource(ac.src with imports = concat(ac.src.imports, [el])));
+					ac; 
 				MmVars(vs):
-					MmCollectAcc(ac with vars = fold(vs, ac.vars, \a, v-> insertSet(a, v)));
+					MmCollectAcc(ac with 
+						vars = fold(vs, ac.vars, \a, v-> insertSet(a, v))
+					);
 				MmDisj(__): 
 					MmCollectAcc(ac with disjs = Cons(el, ac.disjs));
-				MmConst(cs): 
-					MmCollectAcc(ac with src = MmSource(ac.src with decls = concat(ac.src.decls, [el])));
+				MmConst(cs): {
+					pushVector(ac.toplevel, el);
+					ac;
+				}
 				MmEssential(l, __):
 					MmCollectAcc(ac with hyps = Cons(el, ac.hyps));
 				MmFloating(l, __, __):
 					MmCollectAcc(ac with hyps = Cons(el, ac.hyps));
 				MmAxiomatic(l, __): {
 					a = mmMakeAssertion(el, ac);
+					pushVector(ac.toplevel, a);
 					MmCollectAcc(ac with 
-						arities = setTree(ac.arities, a.stat.label, length(a.hyps)),
-						src = MmSource(ac.src with decls = concat(ac.src.decls, [a]))
+						arities = setTree(ac.arities, a.stat.label, length(a.hyps))
 					);
 				}
 				MmProvable(l, __, __): {
 					a = mmMakeAssertion(el, ac);
+					pushVector(ac.toplevel, a);
 					MmCollectAcc(ac with 
-						arities = setTree(ac.arities, a.stat.label, length(a.hyps)),
-						src = MmSource(ac.src with decls = concat(ac.src.decls, [a]))
+						arities = setTree(ac.arities, a.stat.label, length(a.hyps))
 					);
 				}
 				MmBlock(es): {
 					block = mmCollectElements(es, ac);
 					MmCollectAcc(ac with 
-						arities = block.arities, 
-						src = block.src
+						arities = block.arities
 					);
 				}
 			}
@@ -172,7 +203,7 @@ mmMakeStatement(stat : MmStat, vars : Set<int>, hyps : [MmHyp], arities : Tree<i
 		MmAxiomatic(label, expr): 
 			MmAxiomatic(label, mmMarkVarsInExpr(expr, vars));
 		MmProvable(label, expr, proof): 
-			MmProvable(label, mmMarkVarsInExpr(expr, vars), mmDecompressProof(proof, hyps, arities));
+			MmProvable(label, mmMarkVarsInExpr(expr, vars), proof /*mmDecompressProof(proof, hyps, arities)*/);
 	}
 }
 
@@ -186,6 +217,7 @@ mmDecompressProof(proof : MmProof, hyps : [MmHyp], arities : Tree<int, int>) -> 
 	switch (proof) {
 		MmNormalProof(__): proof;
 		MmCompressedProof(labels, steps): {
+			len_cache = ref makeTree();
 			MmNormalProof(fold(steps, Pair([],[]), \acc, s ->
 				switch (s) {
 					MmProofIndex(i): {
@@ -202,7 +234,7 @@ mmDecompressProof(proof : MmProof, hyps : [MmHyp], arities : Tree<int, int>) -> 
 						}
 					}
 					MmProofZ(): {
-						len = mmSubexprLength(length(acc.first) - 1, acc.first, arities);
+						len = mmSubexprLength(length(acc.first) - 1, acc.first, arities, len_cache);
 						subexpr = subrange(acc.first, length(acc.first) - len, len);
 						Pair(acc.first, concat(acc.second, [subexpr]));
 					}
@@ -212,16 +244,23 @@ mmDecompressProof(proof : MmProof, hyps : [MmHyp], arities : Tree<int, int>) -> 
 	}
 }
 
-mmSubexprLength(i : int, labels : [int], arities : Tree<int, int>) -> int {
-	switch (lookupTree(arities, labels[i])) {
-		Some(arity): 1 + mmSubexprArgsLength(i - 1, 0, arity, labels, arities);
-		None(): 1;
+mmSubexprLength(i : int, labels : [int], arities : Tree<int, int>, len_cache : ref Tree<int, int>) -> int {
+	switch (lookupTree(^len_cache, i)) {
+		Some(len): len;
+		None(): {
+			len = switch (lookupTree(arities, labels[i])) {
+				Some(arity): 1 + mmSubexprArgsLength(i - 1, 0, arity, labels, arities, len_cache);
+				None(): 1;
+			}
+			len_cache := setTree(^len_cache, i, len);
+			len;
+		}
 	}
 }
 
-mmSubexprArgsLength(i : int, acc : int, arg : int, labels : [int], arities : Tree<int, int>) -> int {
+mmSubexprArgsLength(i : int, acc : int, arg : int, labels : [int], arities : Tree<int, int>, len_cache : ref Tree<int, int>) -> int {
 	if (arg == 0) acc else {
-		arg_len = mmSubexprLength(i, labels, arities);
-		mmSubexprArgsLength(i - arg_len, acc + arg_len, arg - 1, labels, arities)
+		arg_len = mmSubexprLength(i, labels, arities, len_cache);
+		mmSubexprArgsLength(i - arg_len, acc + arg_len, arg - 1, labels, arities, len_cache)
 	}
 }
