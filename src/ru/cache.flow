@@ -27,6 +27,7 @@ export {
 	ruFromCache(file : int, conf : RuConf) -> Maybe<RuCachedSource>;
 	ruLoadToMemCache(file : string, conf : RuConf) -> void;
 	ruRemoveFromCache(file : string, conf : RuConf) -> void;
+	ruLoadMemCacheFromDisk(conf : RuConf) -> void;
 
 	ruClearCache(conf : RuConf) -> void;
 	ruClearMemCache() -> void;
@@ -65,7 +66,7 @@ export {
 	ruDeclRange(d : RuDecl, src : RuSource) -> RuRange;
 }
 
-ruCacheVersion = 4;
+ruCacheVersion = 5;
 
 ruSourceCache = initConcurrentHashMap();
 ruNameCache = initConcurrentHashMap();
@@ -233,7 +234,10 @@ ruFromCache(id : int, conf : RuConf) -> Maybe<RuCachedSource> {
 		file = ruTrimPath(id2s(id), conf, ".ru");
 		cached = switch (ruFromMemoryCache(file, conf)) {
 			Some(cached): Some(cached);
-			None(): ruFromDiskCache(file, conf);
+			None(): {
+				path = ruCachedPath(file, conf);
+				ruFromDiskCache(file, path, conf);
+			}
 		}
 		ruCheckCachedIntegrity(file, cached, conf);
 	}
@@ -276,24 +280,29 @@ ruCheckCachedIntegrity(file : string, mcached : Maybe<RuCachedSource>, conf : Ru
 	});
 }
 
-ruFromDiskCache(file : string, conf : RuConf) -> Maybe<RuCachedSource> {
-	path = ruCachedPath(file, conf);
-	if (lookupTreeDef(conf.opts, "disk-caching", "") == "0" || !fileExists(path)) None() else {
-		deserialized = deserializeBinary(getFileContent(path), IllegalStruct());
-		if (deserialized == IllegalStruct()) {
-			conf.onError("WARNING: Illegal structure of cache file for '" + file + "'. Incremental file deleted.", []);
-			ruDeleteFromCache(file, path, conf);
+ruFromDiskCache(file : string, path : string, conf : RuConf) -> Maybe<RuCachedSource> {
+	if (lookupTreeDef(conf.opts, "disk-caching", "") == "0") None() else {
+		if (!fileExists(path)) {
+			conf.onError("cache file '" + file + "' doesn't exist.", []);
 			None();
 		} else {
-			cached_file = cast(deserialized : flow -> RuCachedFileSource);
-			if (cached_file.version == ruCacheVersion) {
-				Some(RuCachedSource(cached_file.source, ruDepChangedCallback(cached_file.source, conf), cached_file.version));
-			} else {
-				if (conf.verbose > 1) {
-					conf.onMessage("\tcached file " + file + " has outdated version " + i2s(cached_file.version) + " while current version is " + i2s(ruCacheVersion));
-					ruDeleteFromCache(file, path, conf);
-				}
+			serialized = getFileContent(path);
+			deserialized = deserializeBinary(serialized, IllegalStruct());
+			if (deserialized == IllegalStruct()) {
+				conf.onError("WARNING: Illegal structure of cache file for '" + file + "'. Incremental file deleted.\n\n" + serialized + "\n\n", []);
+				ruDeleteFromCache(file, path, conf);
 				None();
+			} else {
+				cached_file = cast(deserialized : flow -> RuCachedFileSource);
+				if (cached_file.version == ruCacheVersion) {
+					Some(RuCachedSource(cached_file.source, ruDepChangedCallback(cached_file.source, conf), cached_file.version));
+				} else {
+					if (conf.verbose > 1) {
+						conf.onMessage("\tcached file " + file + " has outdated version " + i2s(cached_file.version) + " while current version is " + i2s(ruCacheVersion));
+						ruDeleteFromCache(file, path, conf);
+					}
+					None();
+				}
 			}
 		}
 	}
@@ -335,6 +344,21 @@ ruDoLoadToCache(module : int,  conf : RuConf, acc : [RuSource], visited : Set<in
 			}
 		}
 	}
+}
+
+ruLoadMemCacheFromDisk(conf : RuConf) -> void {
+	cached_files = filter(ruDirFiles(ruCacheDir(conf)), \file -> endsWith(file, ".cache"));
+	ruConcurrentVoid(map(cached_files, \f-> \ -> {
+		path = resolveRelativePath(f);
+		file = ruCachedFile(path, conf);
+		if (file == "") {
+			conf.onError("Cache path '" + path + "' was not converted to a cached module name", []);
+		} else {
+			maybeApply(ruFromDiskCache(file, path, conf), \cached -> 
+				ruToMemCache(cached.source, conf)
+			);
+		}
+	}));
 }
 
 ruRemoveFromCache(file : string, conf : RuConf) -> void {
