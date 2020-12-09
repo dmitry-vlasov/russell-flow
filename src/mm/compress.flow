@@ -80,22 +80,38 @@ mmSubexprArgsLength(i : int, acc : int, arg : int, labels : [int], arities : Tre
 }
 
 
-mmPickFromStack1(stack : List<MmExp>, hyps : [MmHyp], conf : RuConf) -> MmExecutionAcc {
-	fold(hyps, MmExecutionAcc(stack, makeList(), makeTree()), \acc, hyp -> {
-		e = headList(acc.stack, MmExp([]));
+MmCompressStackItem(
+	expr : MmExp,
+	len : int
+);
+
+noCompressStackItem = MmCompressStackItem(MmExp([]), -1);
+
+MmExecutionAcc1(
+	stack : List<MmCompressStackItem>,
+	essentials : List<MmExpPair>,
+	subst : Tree<int, MmExp>,
+	len : int
+);
+
+
+mmPickFromStack1(stack : List<MmCompressStackItem>, hyps : [MmHyp], conf : RuConf) -> MmExecutionAcc1 {
+	fold(hyps, MmExecutionAcc1(stack, makeList(), makeTree(), 0), \acc, hyp -> {
+		item = headList(acc.stack, noCompressStackItem);
 		switch (hyp) {
 			MmEssential(__, expr):
-				MmExecutionAcc(
+				MmExecutionAcc1(
 					tailList(acc.stack), 
-					Cons(MmExpPair(e, expr), acc.essentials), 
-					acc.subst
+					Cons(MmExpPair(item.expr, expr), acc.essentials), 
+					acc.subst,
+					acc.len + item.len
 				);
 			MmFloating(__, type, var): {
-				e_expr = MmExp(tail(e.symbs));
-				MmExecutionAcc(
+				MmExecutionAcc1(
 					tailList(acc.stack),
 					acc.essentials,
-					setTree(acc.subst, var, e_expr)
+					setTree(acc.subst, var, MmExp(tail(item.expr.symbs))),
+					acc.len + item.len
 				);
 			}
 		}
@@ -103,21 +119,33 @@ mmPickFromStack1(stack : List<MmExp>, hyps : [MmHyp], conf : RuConf) -> MmExecut
 }
 
 // Do not check, just perform a single step
-mmExecuteRPNstep(label : int, stack : List<MmExp>, entities : Tree<int, MmLabeled>, theorem : MmAssertion, conf : RuConf) -> List<MmExp> {
+mmExecuteRPNstep(label : int, stack : List<MmCompressStackItem>, entities : Tree<int, MmLabeled>, theorem : MmAssertion, conf : RuConf) -> List<MmCompressStackItem> {
 	switch (lookupTreeDef(entities, label, mmNoAssertion)) {
 		MmAssertion(disj, hyps, inner, statement): {
 			exec_acc = mmPickFromStack1(stack, reverseA(hyps), conf);
-			Cons(mmApplySubst(statement.expr, exec_acc.subst), exec_acc.stack);
+			Cons(
+				MmCompressStackItem(
+					mmApplySubst(statement.expr, exec_acc.subst),
+					exec_acc.len + 1
+				), 
+				exec_acc.stack
+			);
 		}
 		MmEssential(__, expr): {
-			Cons(expr, stack);
+			Cons(
+				MmCompressStackItem(expr, 1), 
+				stack
+			);
 		}
 		MmFloating(__, type, var): {
-			Cons(MmExp([MmSymb(type, false), MmSymb(var, true)]), stack);
+			Cons(
+				MmCompressStackItem(MmExp([MmSymb(type, false), MmSymb(var, true)]), 1), 
+				stack
+			);
 		}
 	}
 }
-/*
+
 MmProofExprFeatures(
 	occurrences : [int],
 	length : int
@@ -125,31 +153,33 @@ MmProofExprFeatures(
 
 mmProofExprsFeatures(proof : [int], ass : MmAssertion, math : MmMath, conf : RuConf) -> Tree<MmExp, MmProofExprFeatures> {
 	foldi(proof, Pair(makeList(), makeTree()),
-		\acc, label -> {
+		\i, acc, label -> {
 			stack = mmExecuteRPNstep(label, acc.first, math.labeled, ass, conf);
-			ex = headList(stack, MmExp([]));
-			switch (lookupTree(acc.second, ex)) {
-				Some(features): 
-					Pair(stack, setTree(acc.second, ex, MmProofExprFeatures(features with occurrences = concat(features.occurences, [i]))));
-				None(): 
-			}
+			top = headList(stack, noCompressStackItem);
+			features = lookupTreeDef(acc.second, top.expr, MmProofExprFeatures([], top.len));
+			Pair(
+				stack, 
+				setTree(acc.second, top.expr, 
+					MmProofExprFeatures(features with occurrences = concat(features.occurrences, [i]))
+				)
+			);
 		}
 	).second;
 }
-*/
 
-mmCountExprsInProof(proof : [int], ass : MmAssertion, math : MmMath, conf : RuConf) -> Tree<MmExp, int> {
+
+/*mmCountExprsInProof(proof : [int], ass : MmAssertion, math : MmMath, conf : RuConf) -> Tree<MmExp, int> {
 	fold(proof, Pair(makeList(), makeTree()),
 		\acc, label -> {
 			stack = mmExecuteRPNstep(label, acc.first, math.labeled, ass, conf);
-			ex = headList(stack, MmExp([]));
+			ex = headList(stack, noCompressStackItem).expr;
 			Pair(stack, setTree(acc.second, ex, lookupTreeDef(acc.second, ex, 0) + 1));
 		}
 	).second;
-}
+}*/
 
 MmProofCompressionAcc(
-	stack : List<MmExp>,
+	stack : List<MmCompressStackItem>,
 	compressed : [MmCompressedStep],
 	steps : Tree<MmExp, int>
 );
@@ -190,11 +220,11 @@ mmCompressProof(labels : [int], ass : MmAssertion, math : MmMath, conf : RuConf,
 	arity1 = length(ass.inner);
 	arity2 = length(labs);
 	labs_map = foldi(labs, makeTree(), \i, acc, lab -> setTree(acc, lab, i));
-	count_exps = mmCountExprsInProof(labels, ass, math, conf);
+	exps_features = mmProofExprsFeatures(labels, ass, math, conf);
 	compressed = foldi(labels, MmProofCompressionAcc(makeList(), [], makeTree()),
 		\i, acc, label -> {
 		stack = mmExecuteRPNstep(label, acc.stack, math.labeled, ass, conf);
-		ex = stack_top(stack);
+		ex = headList(stack, noCompressStackItem).expr;
 		switch (findi(ass.hyps, \hyp -> hyp.label == label)) {
 			Some(k): {
 				MmProofCompressionAcc(stack, 
@@ -228,7 +258,7 @@ mmCompressProof(labels : [int], ass : MmAssertion, math : MmMath, conf : RuConf,
 										);
 									}
 									None(): {
-										if (lookupTreeDef(count_exps, ex, 0) == 1) {
+										if (length(lookupTreeDef(exps_features, ex, MmProofExprFeatures([], 0)).occurrences) == 1) {
 											MmProofCompressionAcc(stack, 
 												concat(acc.compressed, [MmProofIndex(arity0 + k)]),
 												acc.steps
