@@ -19,22 +19,25 @@ let mathProvider = new MathProvider();
 export function activate(context: vscode.ExtensionContext) {	
 	serverStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
 	serverStatusBarItem.command = 'russell.toggleHttpServer';
-	context.subscriptions.push(serverStatusBarItem);
-	context.subscriptions.push(vscode.commands.registerCommand('russell.verifyFile', (uri) => processRussellFile(uri, "verify")));
-	context.subscriptions.push(vscode.commands.registerCommand('russell.verifyTheorem', () => processRussellTheorem("verify")));
-	context.subscriptions.push(vscode.commands.registerCommand('russell.reproveFile', (uri) => processRussellFile(uri, "reprove")));
-	context.subscriptions.push(vscode.commands.registerCommand('russell.metamathFile', (uri) => verifyMetamath(uri)));
-	context.subscriptions.push(vscode.commands.registerCommand('russell.reproveTheorem', () => processRussellTheorem("reprove")));
-	context.subscriptions.push(vscode.commands.registerCommand('russell.generalizeFile', (uri) => processRussellFile(uri, "generalize")));
-	context.subscriptions.push(vscode.commands.registerCommand('russell.generalizeTheorem', () => processRussellTheorem("generalize")));
-	context.subscriptions.push(vscode.commands.registerCommand('russell.startHttpServer', startHttpServer));
-	context.subscriptions.push(vscode.commands.registerCommand('russell.stopHttpServer', stopHttpServer));
-	context.subscriptions.push(vscode.commands.registerCommand('russell.restartLspServer', restartLspServer));
-	context.subscriptions.push(vscode.commands.registerCommand('russell.toggleHttpServer', toggleHttpServer));
-	context.subscriptions.push(vscode.commands.registerCommand('russell.findSymbol', findSymbol));
-	context.subscriptions.push(vscode.commands.registerCommand('russell.execCommand', execCommand));
-	context.subscriptions.push(vscode.commands.registerCommand('russell.gotoLocation', gotoLocation));
-	context.subscriptions.push(vscode.commands.registerCommand('russell.refreshMath', mathInfo));
+	const reg_comm = (name : string, fn : any) => vscode.commands.registerCommand(name, fn);
+	context.subscriptions.push(
+		serverStatusBarItem,
+		reg_comm('russell.verifyFile', (uri) => processRussellFile(uri, "verify")),
+		reg_comm('russell.verifyTheorem', () => processRussellTheorem("verify")),
+		reg_comm('russell.reproveFile', (uri) => processRussellFile(uri, "reprove")),
+		reg_comm('russell.metamathFile', (uri) => verifyMetamath(uri)),
+		reg_comm('russell.reproveTheorem', () => processRussellTheorem("reprove")),
+		reg_comm('russell.generalizeFile', (uri) => processRussellFile(uri, "generalize")),
+		reg_comm('russell.generalizeTheorem', () => processRussellTheorem("generalize")),
+		reg_comm('russell.startHttpServer', startHttpServer),
+		reg_comm('russell.stopHttpServer', stopHttpServer),
+		reg_comm('russell.restartLspServer', restartLspServer),
+		reg_comm('russell.toggleHttpServer', toggleHttpServer),
+		reg_comm('russell.findSymbol', findSymbol),
+		reg_comm('russell.execCommand', execCommand),
+		reg_comm('russell.gotoLocation', gotoLocation),
+		reg_comm('russell.refreshMath', mathInfo)
+	);
 
     russellChannel = vscode.window.createOutputChannel("Russell");
 	russellChannel.show(true);
