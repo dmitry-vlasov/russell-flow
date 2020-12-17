@@ -4,6 +4,7 @@ import command;
 
 export {
 	ruExec(s : ScScript, commands : Tree<string, RuComm>, onMessage : (string) -> void, env : RuState) -> Maybe<RuState>;
+	ruApplyScriptVars(s : string, vars : Tree<string, ValValue>) -> string;
 }
 
 ruExec(script : ScScript, commands : Tree<string, RuComm>, onMessage : (string) -> void, env : RuState) -> Maybe<RuState> {
@@ -68,13 +69,13 @@ ruExecSeq(seq : [ScScript], env : RuExecEnv) -> Maybe<RuState> {
 }
 
 ruExecAssign(var : string, ex : ScExp, env : RuExecEnv) -> Maybe<RuState> {
-	maybeMap(ruEval(ex, env.state.vars), \val -> 
+	maybeMap(ruEval(ex, env.state.vars, env.state.conf), \val -> 
 		RuState(env.state with vars = setTree(env.state.vars, var, val))
 	);
 }
 
 ruExecIf(cond : ScExp, script : ScScript, env : RuExecEnv) -> Maybe<RuState> {
-	maybeBind(ruEval(cond, env.state.vars), \val -> 
+	maybeBind(ruEval(cond, env.state.vars, env.state.conf), \val -> 
 		switch (val) {
 			ValBool(c): {
 				if (c) {
@@ -92,7 +93,7 @@ ruExecIf(cond : ScExp, script : ScScript, env : RuExecEnv) -> Maybe<RuState> {
 }
 
 ruExecIfElse(cond : ScExp, pos : ScScript, neg : ScScript, env : RuExecEnv) -> Maybe<RuState> {
-	maybeBind(ruEval(cond, env.state.vars), \val -> 
+	maybeBind(ruEval(cond, env.state.vars, env.state.conf), \val -> 
 		switch (val) {
 			ValBool(c): {
 				if (c) {
@@ -110,7 +111,7 @@ ruExecIfElse(cond : ScExp, pos : ScScript, neg : ScScript, env : RuExecEnv) -> M
 }
 
 ruExecWhile(cond : ScExp, script : ScScript, env : RuExecEnv) -> Maybe<RuState> {
-	maybeBind(ruEval(cond, env.state.vars), \val ->
+	maybeBind(ruEval(cond, env.state.vars, env.state.conf), \val ->
 		switch (val) {
 			ValBool(c): {
 				if (c) {
@@ -131,7 +132,7 @@ ruExecWhile(cond : ScExp, script : ScScript, env : RuExecEnv) -> Maybe<RuState> 
 }
 
 ruExecPrint(ex : ScExp, env : RuExecEnv) -> Maybe<RuState> {
-	maybeMap(ruEval(ex, env.state.vars), \val -> {
+	maybeMap(ruEval(ex, env.state.vars, env.state.conf), \val -> {
 		env.onMessage(ruApplyScriptVars(ruValue2s(val), env.state.vars));
 		env.state;
 	});
@@ -143,7 +144,7 @@ ruExecTask(task : ScTask, env : RuExecEnv) -> Maybe<RuState> {
 			conf_dir = ruFindConfDir(file);
 			if (conf_dir == "") e.conf else {
 				file_conf = ruTree2Conf(ruReadConfFromDir(conf_dir));
-				ruUpdateConf(e.conf, file_conf);
+				ruSetConf(e.conf, file_conf);
 			}
 		} 
 		RuState(e with 
@@ -162,10 +163,11 @@ ruExecTask(task : ScTask, env : RuExecEnv) -> Maybe<RuState> {
 					log_task = !existsTree(t.args, \arg,__ -> arg == "do_not_log_this");
 					task_src = ruTask2s(t);
 					uuid = ruMakeUuid();
+					t_env = upd_conf(s, lookupTreeDef(t.args, "file", ""));
 					if (log_task) {
 						ruScriptLog("<" + uuid + "> Task started:    " + task_src + " ... ", state.conf);
 					}
-					ret = command.run(t, upd_conf(s, lookupTreeDef(t.args, "file", "")));
+					ret = command.run(t, t_env);
 					if (log_task) {
 						ruScriptLog(
 							"<" + uuid + "> Task finished:   " +
@@ -206,18 +208,17 @@ ruPrepareTask(task0 : ScTask, command : RuComm, state : RuState) -> [ScTask] {
 		}
 	filtermap(induced_tasks, 
 		\t -> {
-			args_w_path = eitherMap(
-				lookupTree(t.args, "file"), 
-				\file -> setTree(t.args, "path", resolveRelativePath(file)), 
-				t.args
+			args_evaled = foldTree(t.args,
+				makeTree(),	\k, v, acc -> setTree(acc, ruApplyScriptVars(k, state.vars), ruApplyScriptVars(v, state.vars))
 			);
-			args_w_defvals = fold(command.args, args_w_path, \acc, arg ->
+			args_w_defvals = fold(command.args, args_evaled, \acc, arg ->
 				if (arg.defval == "") acc else {
 					if (containsKeyTree(acc, arg.name)) acc else setTree(acc, arg.name, arg.defval)
 				}
 			);
+			all_vars = mergeTree(state.vars, mapTree(args_w_defvals, \s -> ValString(s)));
 			updated_args = foldTree(args_w_defvals, makeTree(), \k, v, acc -> 
-				setTree(acc, ruApplyScriptVars(k, state.vars), ruApplyScriptVars(v, state.vars))
+				setTree(acc, ruApplyScriptVars(k, all_vars), ruApplyScriptVars(v, all_vars))
 			);
 			updated_task = ScTask(t with args = updated_args);
 			check = forall(command.args, \arg ->
