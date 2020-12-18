@@ -1,0 +1,82 @@
+import script/script;
+import command;
+
+export {
+	ruUpdateTaskConf(state : RuState, file : string, onMessage : (string) -> void) -> RuState;
+	ruApplyScriptVars(s : string, vars : Tree<string, ValValue>) -> string;
+	ruAddCommandDefaults(task : ScTask, command : RuComm, conf : RuConf) -> ScTask;
+	ruCheckCommandArgs(task : ScTask, command : RuComm, conf : RuConf) -> bool;
+	ruEvalTaskArgs(task : ScTask, state : RuState) -> ScTask;
+	ruMakeInducedTasks(task : ScTask, conf : RuConf) -> [ScTask];
+}
+
+ruUpdateTaskConf(state : RuState, file : string, onMessage : (string) -> void) -> RuState {
+	conf = state.conf;
+	upd_conf = if (file == "") conf else {
+		conf_dir = ruFindConfDir(file);
+		if (conf_dir == "") conf else {
+			file_conf = ruTree2Conf(ruReadConfFromDir(conf_dir));
+			ruSetConf(conf, file_conf);
+		}
+	} 
+	RuState(state with 
+		conf = RuConf(upd_conf with 
+			onMessage = onMessage,
+			onError = ruMakeOnError(upd_conf.opts, onMessage)
+		)
+	);
+}
+
+ruApplyScriptVars(s : string, vars : Tree<string, ValValue>) -> string {
+	vars_subst = fold(tree2pairs(vars), [], \acc, kv -> 
+		concat(acc, ["$" + kv.first, ruValue2s(kv.second)])
+	);
+	strReplaces(s, vars_subst);
+}
+
+ruCheckCommandArgs(task : ScTask, command : RuComm, conf : RuConf) -> bool {
+	forall(command.args, \arg ->
+		if (arg.optional || containsKeyTree(task.args, arg.name)) true else {
+			conf.onMessage("Obligatory argument '" + arg.name + "' of the command '" + task.command + "' is missing");
+			false;
+		}
+	);
+}
+
+ruAddCommandDefaults(task : ScTask, command : RuComm, conf : RuConf) -> ScTask {
+	args_w_defargs = foldTree(task.args, makeTree(), \k, v, acc -> 
+		if (v != "" || k == command.defarg || command.defarg == "") setTree(acc, k, v) else setTree(acc, command.defarg, k)
+	);
+	args_w_defvals = fold(command.args, args_w_defargs, \acc, arg ->
+		if (arg.defval == "") acc else {
+			if (containsKeyTree(acc, arg.name)) acc else setTree(acc, arg.name, arg.defval)
+		}
+	);
+	check = forall(command.args, \arg ->
+		if (arg.optional || containsKeyTree(args_w_defvals, arg.name)) true else {
+			conf.onMessage("Obligatory argument '" + arg.name + "' of the command '" + task.command + "' is missing");
+			false;
+		}
+	);
+	ScTask(task with args = args_w_defvals);
+}
+
+ruEvalTaskArgs(task : ScTask, state : RuState) -> ScTask {
+	conf = state.conf;
+	args_evaled_1 = foldTree(task.args, makeTree(), \k, v, acc -> 
+		setTree(acc, ruApplyScriptVars(k, state.vars), ruApplyScriptVars(v, state.vars))
+	);
+	all_vars = mergeTree(state.vars, mapTree(args_evaled_1, \s -> ValString(s)));
+	args_evaled_2 = foldTree(args_evaled_1, makeTree(), \k, v, acc -> 
+		setTree(acc, ruApplyScriptVars(k, all_vars), ruApplyScriptVars(v, all_vars))
+	);
+	ScTask(task with args = args_evaled_2);
+}
+
+ruMakeInducedTasks(task : ScTask, conf : RuConf) -> [ScTask] {
+	if (containsKeyTree(task.args, "file") || conf.projectRoots == []) {
+		[task];
+	} else {
+		map(conf.projectRoots, \root -> ScTask(task with args = setTree(task.args, "file", root)));
+	}
+}
