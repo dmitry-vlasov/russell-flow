@@ -11,6 +11,7 @@ const isPortReachable = require('is-port-reachable');
 
 let client: LanguageClient = null;
 let russellChannel : vscode.OutputChannel = null;
+let serverChannel : vscode.OutputChannel = null;
 let serverStatusBarItem: vscode.StatusBarItem;
 let httpServer : ChildProcess;
 let httpServerOnline : boolean = false;
@@ -39,7 +40,8 @@ export function activate(context: vscode.ExtensionContext) {
 		reg_comm('russell.refreshMath', mathInfo)
 	);
 
-    russellChannel = vscode.window.createOutputChannel("Russell");
+	russellChannel = vscode.window.createOutputChannel("Russell output");
+	serverChannel = vscode.window.createOutputChannel("Russell server");
 	russellChannel.show(true);
 
 	vscode.workspace.onDidOpenTextDocument(mathInfo);
@@ -168,9 +170,8 @@ function outputHttpServerMemStats() {
 		arguments : ["mem-stats do_not_log_this=1"]
 	}).then(
 		(out : string) => {
-			let msg_start = out.indexOf("Used:");
-			let msg_end = out.indexOf("\n", msg_start);
-			let mem_stats = out.substr(msg_start, msg_end - msg_start);
+			const lines = out.split("\n");
+			const mem_stats = lines.find((line) => line.indexOf("free") != -1);
 			showHttpServerOnline(mem_stats);
 		},
 		(err : any) => {
@@ -191,7 +192,7 @@ function toggleHttpServer() {
 function startHttpServer() {
     if (!httpServerOnline) {
 		const port : number = vscode.workspace.getConfiguration("russell").get("portOfHttpServer");
-		httpServer = tools.launchHttpServer(port, showHttpServerOnline, showHttpServerOffline);
+		httpServer = tools.launchHttpServer(port, showHttpServerOnline, showHttpServerOffline, russellChannel);
 		httpServerOnline = true;
     }
 }
@@ -268,7 +269,7 @@ function verifyMetamath(uri : vscode.Uri): void {
 		arguments: [
 			"read-ru   file=" + ru_file + ";\n" +
 			"ru-to-mm  file=" + ru_file + ";\n" +
-			"write-mm  file=" + mm_file + " monolithic=1 strip-comments=1;\n" +
+			"write-mm  target=" + mm_file + " monolithic=1 strip-comments=1;\n" +
 			"verify-mm file=" + mm_file + ";"
 		] 
 	});

@@ -15,7 +15,9 @@ export {
 
 	ruTrimPath(file : string, conf : RuConf, ext : string) -> string;
 	ruFindPath(file : string, conf : RuConf, ext : string) -> string;
-	ruResolveRelativePath(file : string, working_dir : string) -> string;
+	ruResolveRelativePath(path : string, working_dir : string) -> string;
+	ruResolveRelativeFile(file : string, working_dir : string) -> string;
+	ruResolveRelativeDir(dir : string, working_dir : string) -> string;
 	ruIncVerbose(conf : RuConf) -> RuConf;
 	ruDecVerbose(conf : RuConf) -> RuConf;
 	ruAddErr2Conf(conf : RuConf, msg : string) -> RuConf;
@@ -35,7 +37,8 @@ export {
 	ruConf2Tree(conf : RuConf) -> Tree<string, string>;
 	ruTree2Conf(opts : Tree<string, string>) -> RuConf;
 	ruMergeConfs(conf1 : RuConf, conf2 : RuConf) -> RuConf;
-	ruSetConf(conf1 : RuConf, conf2 : RuConf) -> RuConf;
+	ruSetConf(conf1 : RuConf, opts : Tree<string, string>) -> RuConf;
+	ruUnsetConf(conf : RuConf, opts : Tree<string, string>) -> RuConf;
 	ruConf2s(conf : RuConf) -> string;
 	ruVerbose(conf : RuConf) -> int;
 
@@ -77,12 +80,37 @@ ruFindPath(file : string, conf : RuConf, ext0 : string) -> string {
 	}
 }
 
-ruResolveRelativePath(file : string, working_dir : string) -> string {
-	if (working_dir == "") {
-		resolveRelativePath(file);
-	} else {
-		shifted = working_dir + "/" + file;
-		if (fileExists(shifted)) shifted else resolveRelativePath(file);
+ruResolveRelativePath(path : string, working_dir : string) -> string {
+	if (isAbsolutePath(path)) path else {
+		if (working_dir == "" || fileExists(path) || isDirectory(path)) {
+			resolveRelativePath(path);
+		} else {
+			resolveRelativePath(working_dir + "/" + path);
+			//shifted = working_dir + "/" + file;
+			//if (fileExists(shifted)) shifted else resolveRelativePath(file);
+		}
+	}
+}
+
+ruResolveRelativeFile(file : string, working_dir : string) -> string {
+	if (isAbsolutePath(file)) file else {
+		if (working_dir == "" || fileExists(file)) {
+			resolveRelativePath(file);
+		} else {
+			wd_file = working_dir + "/" + file;
+			if (fileExists(wd_file)) resolveRelativePath(wd_file) else "";
+		}
+	}
+}
+
+ruResolveRelativeDir(dir : string, working_dir : string) -> string {
+	if (isAbsolutePath(dir)) dir else {
+		if (working_dir == "" || isDirectory(dir)) {
+			resolveRelativePath(dir);
+		} else {
+			wd_dir = working_dir + "/" + dir;
+			if (isDirectory(wd_dir)) resolveRelativePath(wd_dir) else "";
+		}
 	}
 }
 
@@ -223,19 +251,6 @@ ruMergeOpts(opts1 : Tree<string, string>, opts2 : Tree<string, string>) -> Tree<
 	mergeTreeCustom(opts1, opts2, \opt, val1, val2 -> if (val1 == "") val2 else val1 + "," + val2);
 }
 
-ruOptionPathArray(opts : Tree<string, string>, opt : string) -> [string] {
-	switch (lookupTree(opts, opt)) {
-		Some(paths): {
-			working_dir = lookupTreeDef(opts, "working-dir", "");
-			filtermap(strSplit(paths, ","), \p -> {
-				path = rtrim2(strReplace(p, "\\", "/"), "/") + "/";
-				if (path == "") None() else Some(ruResolveRelativePath(path, working_dir));
-			});
-		}
-		None(): [];
-	}
-}
-
 ruMakeOnError(opts : Tree<string, string>, onMessage : (string) -> void) -> (string, [RuPlace]) -> void {
 	\err, places -> {
 		onMessage("Error: " + err + (if (places == []) "" else "\n" + strGlue(map(places, ruPlace2s), "\n")));
@@ -253,15 +268,7 @@ ruMakeConf(dir_ : string, params : [[string]]) -> RuConf {
 		ruReadConfFromDir(conf_dir), 
 		ruParams2Tree(params)
 	);
-	RuConf(
-		uniq(ruOptionPathArray(opts, "import-roots")),
-		uniq(ruOptionPathArray(opts, "project-roots")),
-		lookupTreeDef(opts, "working-dir", ""), 
-		s2i(lookupTreeDef(opts, "verbose", "-1")), 
-		opts,
-		ruMakeOnError(opts, ruPrintln),
-		ruPrintln
-	);
+	ruTree2Conf(opts);
 }
 
 ruMakeConfDef() -> RuConf {
@@ -308,6 +315,7 @@ ruReadConfFromDir(dir : string) -> Tree<string, string> {
 ruConf2Json(conf : RuConf) -> Json {
 	JsonObject([
 		Pair("importRoots", JsonArray(map(conf.importRoots, \root -> JsonString(root)))),
+		Pair("projectRoots", JsonArray(map(conf.projectRoots, \root -> JsonString(root)))),
 		Pair("workingDir", JsonString(conf.workingDir)),
 		Pair("verbose", JsonString(i2s(conf.verbose))),
 		Pair("opts", JsonArray(map(tree2pairs(conf.opts), 
@@ -325,9 +333,9 @@ ruJson2Conf(json : Json) -> Maybe<RuConf> {
 			\opt -> Pair(getJsonStringField(opt, "key", ""), getJsonStringField(opt, "value", ""))
 		));
 		Some(RuConf(
-			map(getJsonArrayField(json,  "importRoots"), \root -> getJsonStringValue(root, "")),
-			map(getJsonArrayField(json,  "projectRoots"), \root -> getJsonStringValue(root, "")),
-			getJsonStringField(json,     "workingDir", ""),
+			map(getJsonArrayField(json,  "importRoots"), \root -> getJsonStringValue(root, "__no__")),
+			map(getJsonArrayField(json,  "projectRoots"), \root -> getJsonStringValue(root, "__no__")),
+			getJsonStringField(json,     "workingDir", "__no__"),
 			s2i(getJsonStringField(json, "verbose", "-1")),
 			opts,
 			ruMakeOnError(opts, ruPrintln),
@@ -340,23 +348,38 @@ ruConf2Tree(conf : RuConf) -> Tree<string, string> {
 	mergeTree(
 		conf.opts,
 		pairs2tree(filtermap([
-			if (length(conf.importRoots) == 0) None() else Some(Pair("import-roots", strGlue(conf.importRoots, ","))),
-			if (length(conf.projectRoots) == 0) None() else Some(Pair("project-roots", strGlue(conf.projectRoots, ","))),
+			if (conf.importRoots == []) None() else Some(Pair("import-roots", strGlue(conf.importRoots, ","))),
+			if (conf.projectRoots == []) None() else Some(Pair("project-roots", strGlue(conf.projectRoots, ","))),
 			if (conf.workingDir == "") None() else Some(Pair("working-dir", conf.workingDir)),
 			if (conf.verbose == -1) None() else Some(Pair("verbose", i2s(conf.verbose)))
 		], idfn))
 	);
 }
 
+ruMakePaths(opts : Tree<string, string>, opt : string) -> [string] {
+	switch (lookupTree(opts, opt)) {
+		Some(paths): {
+			working_dir = lookupTreeDef(opts, "working-dir", "");
+			uniq(filtermap(strSplit(paths, ","), \p -> {
+				path = rtrim2(strReplace(p, "\\", "/"), "/");
+				if (path == "") None() else {
+					Some(ruResolveRelativePath(path, working_dir));
+				}
+			}));
+		}
+		None(): [];
+	}
+}
+
+ru_conf_fields = ["import-roots", "project-roots", "working-dir", "verbose"];
+
 ruTree2Conf(opts : Tree<string, string>) -> RuConf {
 	RuConf(
-		uniq(ruOptionPathArray(opts, "import-roots")),
-		uniq(ruOptionPathArray(opts, "project-roots")),
+		ruMakePaths(opts, "import-roots"),
+		ruMakePaths(opts, "project-roots"),
 		lookupTreeDef(opts, "working-dir", ""),
 		s2i(lookupTreeDef(opts, "verbose", "-1")),
-		filterTree(opts, \opt,__ -> 
-			!contains(["import-roots", "project-roots", "working-dir", "verbose"], opt)
-		),
+		filterTree(opts, \opt,__ -> !contains(ru_conf_fields, opt)),
 		ruMakeOnError(opts, ruPrintln),
 		ruPrintln
 	);
@@ -369,31 +392,46 @@ ruMergeConfs(conf1 : RuConf, conf2 : RuConf) -> RuConf {
 		if (conf2.workingDir != "") conf2.workingDir else conf1.workingDir,
 		if (conf2.verbose != -1) conf2.verbose else conf1.verbose,
 		mergeTree(conf1.opts, conf2.opts),
-		conf2.onError,
-		conf2.onMessage
-	);
-}
-
-ruSetConf(conf1 : RuConf, conf2 : RuConf) -> RuConf {
-	RuConf(
-		if (conf2.importRoots != []) conf2.importRoots else conf1.importRoots,
-		if (conf2.projectRoots != []) conf2.projectRoots else conf1.projectRoots,
-		if (conf2.workingDir != "") conf2.workingDir else conf1.workingDir,
-		if (conf2.verbose != -1) conf2.verbose else conf1.verbose,
-		if (!isEmptyTree(conf2.opts)) conf2.opts else conf1.opts,
-		conf1.onError, // Functional fields shouldn's be set by user, only programmatically
+		conf1.onError,
 		conf1.onMessage
 	);
 }
 
+ruSetConf(conf : RuConf, opts : Tree<string, string>) -> RuConf {
+	RuConf(
+		if (!containsKeyTree(opts, "import-roots")) conf.importRoots else ruMakePaths(opts, "import-roots"),
+		if (!containsKeyTree(opts, "project-roots")) conf.projectRoots else ruMakePaths(opts, "project-roots"),
+		lookupTreeDef(opts, "working-dir", conf.workingDir),
+		s2i(lookupTreeDef(opts, "verbose", i2s(conf.verbose))),
+		mergeTree(conf.opts, filterTree(opts, \opt,__ -> !contains(ru_conf_fields, opt))),
+		conf.onError,
+		conf.onMessage
+	);
+}
+
+ruUnsetConf(conf : RuConf, opts : Tree<string, string>) -> RuConf {
+	conf.onMessage("UNSETTING OPTS: " + strGlue(getTreeKeys(opts), ", "));
+	ret = RuConf(
+		if (!containsKeyTree(opts, "import-roots")) conf.importRoots else [],
+		if (!containsKeyTree(opts, "project-roots")) conf.projectRoots else [],
+		if (!containsKeyTree(opts, "working-dir")) conf.workingDir else "",
+		if (!containsKeyTree(opts, "verbose")) conf.verbose else -1,
+		filterTree(conf.opts, \opt,__ -> !containsKeyTree(opts, opt)),
+		conf.onError, 
+		conf.onMessage
+	);
+	conf.onMessage("RET: \n" + strIndent(ruConf2s(ret)));
+	ret
+}
+
 ruConf2s(conf : RuConf) -> string {
-	(if (length(conf.importRoots) == 0)  "" else "import-roots=" + strGlue(conf.importRoots, ",") + "\n") +
-	(if (length(conf.projectRoots) == 0) "" else "project-roots=" + strGlue(conf.projectRoots, ",") + "\n") +
-	(if (conf.workingDir == "")          "" else "working-dir=" + conf.workingDir + "\n") +
-	(if (conf.verbose == -1)             "" else "verbose=" + i2s(conf.verbose) + "\n") +
-	(if (sizeTree(conf.opts) == 0)       "" else 
+	(if (conf.importRoots == [])   "" else "import-roots=" + strGlue(conf.importRoots, ",") + "\n") +
+	(if (conf.projectRoots == [])  "" else "project-roots=" + strGlue(conf.projectRoots, ",") + "\n") +
+	(if (conf.workingDir == "")    "" else "working-dir=" + conf.workingDir + "\n") +
+	(if (conf.verbose == -1)       "" else "verbose=" + i2s(conf.verbose) + "\n") +
+	(if (sizeTree(conf.opts) == 0) "" else 
 		strGlue(filtermap(tree2pairs(conf.opts), \p -> 
-			if (contains(["import-roots", "project-roots", "working-dir", "verbose", "file", "path", "target", "module"], p.first)) None() else
+			if (contains(ru_conf_fields, p.first)) None() else
 			Some(if (p.second == "") p.first else p.first + "=" + p.second)
 		), "\n")
 	);

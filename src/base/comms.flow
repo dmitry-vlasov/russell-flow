@@ -3,38 +3,50 @@ import command;
 
 export {
 	ruBaseCommands : [RuComm];
-	ruConfCommands : [RuComm];
-	ruStatsCommands : [RuComm];
-	ruFileSyncCommands : [RuComm];
 	ruRunGC(task : ScTask, state : RuState) -> Maybe<RuState>;
 }
 
 ruBaseCommands = 
 	concat(
-		concat3(ruConfCommands, ruFileSyncCommands, ruStatsCommands), 
-		[RuComm("run-gc", "misc", "force garbage collection", "", [], ruRunGC)]
+		concat3(ruConfCommands, ruSyncCommands, ruCacheCommands), 
+		concat(ruStatsCommands, ruMiscCommands)
 	);
 
-ruConfCommands = [
-	RuComm("russell-dir", "conf", "prints a russell distribution directory", "", [], 
+ru_conf_stack : ref List<RuConf> = ref makeList();
+
+ruMiscCommands = [
+	RuComm("run-gc", "misc", "force garbage collection", "", false, [], ruRunGC),
+	RuComm("russell-dir", "misc", "prints a russell distribution directory", "", false, [], 
 		\task, env -> {
 			env.conf.onMessage(findRussellDir());
 			Some(env);
 		}
 	),
-	RuComm("set-conf", "conf", "update configuration", "", [], 
-		\task, env -> Some(RuState(env with conf = ruSetConf(env.conf, ruTree2Conf(task.args))))
+	RuComm("cwd", "misc", "show true current working directory", "", false, [],
+		\task, env -> {
+			env.conf.onMessage(ruCurrentWorkingDir());
+			Some(env);
+		}
 	),
-	RuComm("conf", "conf", "a shortcut for 'set-conf'", "", [], 
-		\task, env -> Some(RuState(env with conf = ruSetConf(env.conf, ruTree2Conf(task.args)))) 
+];
+
+ruConfCommands = [
+	RuComm("conf-set", "conf", "update configuration", "", false, [], 
+		\task, env -> Some(RuState(env with conf = ruSetConf(env.conf, task.args)))
 	),
-	RuComm("merge-conf", "conf", "merge current and given configs", "", [], 
+	RuComm("conf-unset", "conf", "remove a configuration option", "", false, [], 
+		\task, env -> Some(RuState(env with conf = ruUnsetConf(env.conf, task.args)))
+	),
+	RuComm("conf", "conf", "a shortcut for 'conf-set'", "", false, [], 
+		\task, env -> Some(RuState(env with conf = ruSetConf(env.conf, task.args))) 
+	),
+	RuComm("conf-merge", "conf", "merge current and given configs", "", false, [], 
 		\task, env -> Some(RuState(env with conf = ruMergeConfs(env.conf, ruTree2Conf(task.args)))) 
 	),
-	RuComm("clear-conf", "conf", "clear configuration", "", [],
+	RuComm("conf-clear", "conf", "clear configuration", "", false, [],
 		\task, env -> Some(RuState(env with conf = ruTree2Conf(makeTree())))
 	),
-	RuComm("show-conf", "conf", "show current configuration key-value pairs", "", [], 
+	RuComm("conf-show", "conf", "show current configuration key-value pairs", "", false, [], 
 		\task, env -> {
 			conf_str = ruConf2s(env.conf);
 			env.conf.onMessage(
@@ -44,25 +56,43 @@ ruConfCommands = [
 		}
 	),
 	RuComm(
-		"load-conf", "conf", "load config file from given directory", "dir",
+		"conf-load", "conf", "load config file from given directory", "dir", false, 
 		[RuCommArg("dir", false, "project directory with config file", "")], 
 		\task, env -> {
-			Some(RuState(env with 
-				conf = ruSetConf(
-					env.conf, 
-					ruMakeConf(lookupTreeDef(task.args, "dir", ""), [])
-				)
-			));
+			conf_dir = ruResolveRelativePath(lookupTreeDef(task.args, "dir", "."), env.conf.workingDir);
+			file_conf = ruReadConfFromDir(conf_dir);
+			Some(RuState(env with conf = ruSetConf(env.conf, file_conf)));
 		}
 	),
-	RuComm("save-conf", "conf", "save values to the config file", "dir", 
-		[RuCommArg("dir", true, "project directory", "")], 
+	RuComm("conf-save", "conf", "save values to the config file", "dir", false, 
+		[RuCommArg("dir", true, "project directory", ".")], 
 		\task, env -> {
-			dir = lookupTreeDef(task.args, "dir", ruResolveRelativePath(".", env.conf.workingDir));
+			conf = env.conf;
+			dir0 = lookupTreeDef(task.args, "dir", ".");
+			dir = if (conf.workingDir == "") dir0 else conf.workingDir + "/" + dir0;
 			ensureDirectoryExists(dir);
-			conf = ruConf2s(env.conf);
-			setFileContent(pathCombine(dir, "russell.conf"), conf);
-			Some(env);
+			if (setFileContent(dir + "/russell.conf", ruConf2s(conf))) {
+				Some(env);
+			} else {
+				conf.onError("Failed to save config", []);
+				None();
+			}
+		}
+	),
+	RuComm("conf-push", "conf", "push current conf onto a stack, current conf will be created from command arguments", "", false, [],
+		\task, env -> {
+			ru_conf_stack := Cons(env.conf, ^ru_conf_stack);
+			Some(RuState(env with conf = ruTree2Conf(task.args)));
+		}
+	),
+	RuComm("conf-pop", "conf", "pop a conf from a stack", "", false, [],
+		\task, env -> {
+			if (isEmptyList(^ru_conf_stack)) {
+				env.conf.onError("Attempt to pop an empty conf stack", []);
+			}
+			conf = headList(^ru_conf_stack, ruTree2Conf(task.args));
+			ru_conf_stack := tailList(^ru_conf_stack);
+			Some(RuState(env with conf = conf));
 		}
 	),
 ];
@@ -73,25 +103,23 @@ ruRunGC(task : ScTask, state : RuState) -> Maybe<RuState> {
 }
 
 ruStatsCommands = [
-	RuComm("math-stats", "stats", "show math statistics", "", [],
+	RuComm("stats-math", "stats", "show math statistics", "", false, [],
 		\task, env -> { 
 			env.conf.onMessage("Mathematics statistics:");
 			env.conf.onMessage("-----------------------");
-			env.conf.onMessage(ruMathStats(env.ruMath));
+			env.conf.onMessage(ruMathStats(env.ruMath) + "\n");
 			Some(env); 
 		}
 	),
-	RuComm("mem-stats", "stats", "show memory usage statistics", "", [],
+	RuComm("stats-mem", "stats", "show memory usage statistics", "", false, [],
 		\task, env -> {
 			env.conf.onMessage(
-				"Used: " + memory2s(usedMemory()) + " " + 
-				"Free: " + memory2s(freeMemory()) + " " + 
-				"Total: " + memory2s(totalMemory())
+				memory2s(usedMemory()) + " + " + memory2s(freeMemory()) + " free = " + memory2s(totalMemory())
 			);
 			Some(env); 
 		}
 	),
-	RuComm("cache-stats", "stats", "show cache statistics", "", 
+	RuComm("stats-cache", "stats", "show cache statistics", "", false,
 		[RuCommArg("full", true, "show cached names", "")], 
 		\task, env -> {
 			env.conf.onMessage(ruCacheInfo(lookupTreeDef(task.args, "full", "") == "1"));
@@ -100,9 +128,9 @@ ruStatsCommands = [
 	)
 ];
 
-ruFileSyncCommands = [
+ruCacheCommands = [
 	RuComm(
-		"load-cache", "file-sync", "read cached sources", "file",
+		"cache-load", "sync", "read cached sources", "file", false,
 		[RuCommArg("file", true, "input file", "")],
 		\task, env -> {
 			conf = env.conf;
@@ -123,7 +151,7 @@ ruFileSyncCommands = [
 		}
 	),
 	RuComm(
-		"clear-cache", "file-sync", "clear up a cache: mem, disk or all", "cache",
+		"cache-clear", "sync", "clear up a cache: mem, disk or all", "cache", false,
 		[RuCommArg("cache", false, "which cache: mem, disk or all to clear", "mem")],
 		\task, env -> {
 			cache = lookupTreeDef(task.args, "cache", "");
@@ -138,7 +166,7 @@ ruFileSyncCommands = [
 		}
 	),
 	RuComm(
-		"save-cache", "file-sync", "save cached sources", "file",
+		"cache-save", "sync", "save cached sources", "file", false,
 		[RuCommArg("file", true, "input file", "")],
 		\task, env -> { 
 			file = lookupTreeDef(task.args, "file", "");
@@ -150,8 +178,11 @@ ruFileSyncCommands = [
 			Some(env); 
 		}
 	),
+];
+
+ruSyncCommands = [
 	RuComm(
-		"file-source", "file-sync", "load an updated file source", "file",
+		"sync-file-source", "sync", "load an updated file source", "file", false,
 		[RuCommArg("file", false, "input file", ""),  RuCommArg("text", false, "updated source", "")],
 		\task, env -> { 
 			ruSetFileSource(lookupTreeDef(task.args, "file", ""), 
@@ -160,7 +191,7 @@ ruFileSyncCommands = [
 		}
 	),
 	RuComm(
-		"file-changed", "file-sync", "apply changes to a file source", "file",
+		"sync-file-changed", "sync", "apply changes to a file source", "file", false,
 		[RuCommArg("file", false, "input file", ""),  RuCommArg("change", false, "change in JSON format", "")],
 		\task, env -> {
 			json = lookupTreeDef(task.args, "change-json", "");
@@ -179,7 +210,7 @@ ruFileSyncCommands = [
 		}
 	),
 	RuComm(
-		"file-saved", "file-sync", "file was saved", "file",
+		"sync-file-saved", "sync", "file was saved", "file", false,
 		[RuCommArg("file", false, "input file", "")],
 		\task, env -> { 
 			ruLoadFileSource(lookupTreeDef(task.args, "file", "")); 
