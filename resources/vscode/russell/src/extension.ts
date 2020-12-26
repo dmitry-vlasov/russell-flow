@@ -167,7 +167,7 @@ function checkHttpServerStatus(initial : boolean) {
 function outputHttpServerMemStats() {
 	client.sendRequest("workspace/executeCommand", { 
 		command : "command", 
-		arguments : ["mem-stats do_not_log_this=1"]
+		arguments : ["stats-mem do_not_log_this=1"]
 	}).then(
 		(out : string) => {
 			const lines = out.split("\n");
@@ -192,7 +192,7 @@ function toggleHttpServer() {
 function startHttpServer() {
     if (!httpServerOnline) {
 		const port : number = vscode.workspace.getConfiguration("russell").get("portOfHttpServer");
-		httpServer = tools.launchHttpServer(port, showHttpServerOnline, showHttpServerOffline, russellChannel);
+		httpServer = tools.launchHttpServer(port, showHttpServerOnline, showHttpServerOffline, serverChannel);
 		httpServerOnline = true;
     }
 }
