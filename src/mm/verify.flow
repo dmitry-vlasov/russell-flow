@@ -2,43 +2,37 @@ import mm/math_utils;
 import command;
 
 export {
-	MmExecutionAcc(
-		stack : List<MmExp>,
-		essentials : List<MmExpPair>,
-		subst : Tree<int, MmExp>
-	);
-
 	MmExpPair(
 		fromStack : MmExp,
 		fromHyp   : MmExp
 	);
-	mmPickFromStack(stack : List<MmExp>, hyps : [MmHyp], conf : RuConf) -> Maybe<MmExecutionAcc>;
-	mmVerifyMath(math : MmMath, conf : RuConf) -> Maybe<MmMath>;
-	mmVerifyAssertion(assertion : MmAssertion, math : MmMath, conf : RuConf) -> bool;
-	mmVerifyDecl(decl : MmDecl, math : MmMath, conf : RuConf) -> bool;
 	mmCommVerifyMm : RuComm;
 }
 
 mmCommVerifyMm = RuComm(
 	"mm-verify", "misc", "verify Metamath", "file", true, 
-	[RuCommArg("file", true, "input file", "")],
+	[
+		RuCommArg("file", true, "input file", ""),
+		RuCommArg("stack-trace", true, "comma separated list of theorems, at which print a stack trace during verification", ""),
+	],
 	mmRunVerifyMm
 );
 
 mmRunVerifyMm(task : ScTask, env : RuState) -> Maybe<RuState> {
 	math = env.mmMath;
 	conf = env.conf;
+	stack_trace = map(strSplit(lookupTreeDef(task.args, "stack-trace", ""), ","), s2id);
 	maybeMap(
-		mmVerifyMath(math, conf), 
+		mmVerifyMath(math, conf, stack_trace), 
 		\new_math -> RuState(env with mmMath = new_math)
 	);
 }
 
-mmVerifyMath(math : MmMath, conf0 : RuConf) -> Maybe<MmMath> {
+mmVerifyMath(math : MmMath, conf0 : RuConf, stack_trace : [int]) -> Maybe<MmMath> {
 	err_count = ref 0;
 	conf = ruAddErrCounter(conf0, err_count);
 	timer = ruMakeTimer();
-	verified = all(map(getTreeValues(math.sources), \s -> mmVerifySource(s, math, conf)));
+	verified = all(map(getTreeValues(math.sources), \s -> mmVerifySource(s, math, conf, stack_trace)));
 	if (ruVerbose(conf) > 0) {
 		conf.onMessage("mm verified: " +i2s(sizeTree(math.sources)) + " files in " + ruTimePassed2s(timer));
 	}
@@ -49,25 +43,33 @@ mmVerifyMath(math : MmMath, conf0 : RuConf) -> Maybe<MmMath> {
 	}
 }
 
-mmVerifySource(src : MmSource, math : MmMath, conf : RuConf) -> bool {
+mmVerifySource(src : MmSource, math : MmMath, conf : RuConf, stack_trace : [int]) -> bool {
 	timer = ruMakeTimer();
-	ret = all(ruConcurrent(map(src.decls, \decl -> \-> mmVerifyDecl(decl, math, conf))));
+	ret = all(ruConcurrent(map(src.decls, \decl -> 
+		\-> mmVerifyDecl(decl, math, conf, stack_trace)
+	)));
 	if (ruVerbose(conf) > 1) {
 		conf.onMessage("\tmm verified: '" + src.info.module + "' in " + ruTimePassed2s(timer));
 	}
 	ret;
 }
 
-mmVerifyDecl(decl : MmDecl, math : MmMath, conf : RuConf) -> bool {
+mmVerifyDecl(decl : MmDecl, math : MmMath, conf : RuConf, stack_trace : [int]) -> bool {
 	switch (decl) {
 		MmAssertion(__,__,__,stat): 
 			switch (stat) {
-				MmProvable(__,__,__): mmVerifyAssertion(decl, math, conf);
+				MmProvable(__,__,__): mmVerifyAssertion(decl, math, conf, stack_trace);
 				default: true;
 			}
 		default: true;
 	}
 }
+
+MmExecutionAcc(
+	stack : List<MmExp>,
+	essentials : List<MmExpPair>,
+	subst : Tree<int, MmExp>
+);
 
 mmPickFromStack(stack : List<MmExp>, hyps : [MmHyp], conf : RuConf) -> Maybe<MmExecutionAcc> {
 	fold(hyps, Some(MmExecutionAcc(stack, makeList(), makeTree())),
@@ -195,14 +197,34 @@ mmVerifyRPNstep(label : int, mstack : Maybe<List<MmExp>>, entities : Tree<int, M
 	)
 }
 
-mmVerifyAssertion(assertion : MmAssertion, math : MmMath, conf : RuConf) -> bool {
+mmVerifyAssertion(assertion : MmAssertion, math : MmMath, conf : RuConf, stack_trace : [int]) -> bool {
 	ret = switch(assertion.stat) {
 		MmAxiomatic(__,__): true;
 		MmProvable(th_label, expr, proof): {
+			trace = contains(stack_trace, th_label);
+			if (trace) {
+				conf.onMessage("Tracing verification stack of " + id2s(th_label));
+			}
 			switch (proof) {
 				MmNormalProof(labels): {
 					maybe_stack = fold(labels, Some(makeList()),
-						\stack, label -> mmVerifyRPNstep(label, stack, math.labeled, assertion, conf)
+						\stack, label -> {
+							if (trace) {
+								conf.onMessage(id2s(label) + ":");
+							}
+							new_stack = mmVerifyRPNstep(label, stack, math.labeled, assertion, conf);
+							if (trace) {
+								switch (new_stack) {
+									Some(s): {
+										conf.onMessage(
+											strIndent(strGlue(map(list2array(s), mm2s), "\n")) + "\n"
+										);
+									}
+									None(): conf.onMessage("\t<EMPTY STACK>\n");
+								}
+							}
+							new_stack;
+						}
 					);
 					eitherMap(maybe_stack,
 						\stack -> {
