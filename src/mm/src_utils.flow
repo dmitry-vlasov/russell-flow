@@ -12,6 +12,15 @@ export {
 	
 	mmStatIsRule(stat : MmStat) -> bool;
 	mmJavaMmVol(any : MmAny) -> double;
+
+	mmSources2structs(sources : Tree<int, MmSource>) -> MmStructs;
+	mmSources2SingleSource(sources : Tree<int, MmSource>, file : string, conf : RuConf) -> MmSource;
+	mmFindLeafSources(sources : Tree<int, MmSource>) -> [MmSource];
+	mmAssertions(sources : Tree<int, MmSource>) -> [MmAssertion];
+	mmAxiomatic(sources : Tree<int, MmSource>) -> [MmAssertion];
+	mmProvable(sources : Tree<int, MmSource>) -> [MmAssertion];
+	mmStats(sources : Tree<int, MmSource>) -> string;
+	mmOrderSources(sources : Tree<int, MmSource>) -> [MmSource];
 }
 
 mmApplySubst(expr : MmExp, subst : Tree<int, MmExp>) -> MmExp {
@@ -131,3 +140,110 @@ mmJavaMmVol(any : MmAny) -> double {
 	);
 }
 
+mmSources2structs(sources : Tree<int, MmSource>) -> MmStructs {
+	foldTree(sources, MmStructs(makeTree(), makeSet()), \id, src, acc ->
+		fold(src.decls, acc, \ac, decl -> 
+			switch (decl) {
+				MmAssertion(__,hyps, inner, stat): 
+					fold(inner,
+						fold(hyps, 
+							MmStructs(ac with labeled = setTree(ac.labeled, stat.label, decl)),
+							\a, hyp : MmHyp -> MmStructs(a with labeled = setTree(a.labeled, hyp.label, hyp))
+						),
+						\a, inn : MmHyp -> MmStructs(a with labeled = setTree(a.labeled, inn.label, inn))
+					);
+				MmConst(symbs): 
+					fold(symbs, ac, \a, symb -> 
+						MmStructs(a with consts = insertSet(a.consts, symb))
+					);
+				MmComment(__): ac;
+			}
+		)
+	);
+}
+
+mmFindLeafSources(sources : Tree<int, MmSource>) -> [MmSource] {
+	filter(getTreeValues(sources), \src -> src.imports == [])
+}
+
+mmSources2SingleSource(sources : Tree<int, MmSource>, file : string, conf : RuConf) -> MmSource {
+	MmSource([],
+		concatA(foldTree(sources, Pair([[]], makeSet()), \__,src, acc ->
+			mmDoSources2SingleSource(src, sources, acc)
+		).first),
+		ruNewFileInfo(file, conf, ".mm")
+	);
+}
+
+mmDoSources2SingleSource(src : MmSource, sources : Tree<int, MmSource>, acc : Pair<[[MmDecl]], Set<int>>) -> Pair<[[MmDecl]], Set<int>> {
+	if (containsSet(acc.second, src.info.id)) acc else {
+		acc1 = fold(src.imports, Pair(acc.first, insertSet(acc.second, src.info.id)), 
+			\ac, imp -> {
+				switch (lookupTree(sources, imp.module)) {
+					Some(inc_src): mmDoSources2SingleSource(inc_src, sources, ac);
+					None(): ac;
+				}
+			}
+		);
+		Pair(concat(acc1.first, [src.decls]), acc1.second)
+	}
+}
+
+mmAssertions(sources : Tree<int, MmSource>) -> [MmAssertion] {
+	foldTree(sources, [], \id, src, acc ->
+		fold(src.decls, acc, \ac, decl -> 
+			switch (decl) {
+				MmAssertion(__,__,__,stat): concat(ac, [decl]);
+				default: ac;
+			}
+		)
+	);
+}
+
+mmAxiomatic(sources : Tree<int, MmSource>) -> [MmAssertion] {
+	filter(mmAssertions(sources), \ass ->
+		switch (ass.stat) {
+			MmAxiomatic(__,__): true;
+			default: false;
+		}
+	);
+}
+
+mmProvable(sources : Tree<int, MmSource>) -> [MmAssertion] {
+	filter(mmAssertions(sources), \ass ->
+		switch (ass.stat) {
+			MmProvable(__,__,__): true;
+			default: false;
+		}
+	);
+}
+
+mmStats(sources : Tree<int, MmSource>) -> string {
+	structs = mmSources2structs(sources);
+	strGlue([
+		"sources:     " + i2s(sizeTree(sources)),
+		"consts:      " + i2s(sizeSet(structs.consts)),
+		"labeled:     " + i2s(sizeTree(structs.labeled)),
+		"assertions:  " + i2s(length(mmAssertions(sources))),
+		"  axiomatic: " + i2s(length(mmAxiomatic(sources))),
+		"  provable:  " + i2s(length(mmProvable(sources))),
+	], "\n")
+}
+
+mmOrderSources(sources : Tree<int, MmSource>) -> [MmSource] {
+	mmDoOrderSources(getTreeValues(sources), [], makeSet());
+}
+
+mmDoOrderSources(srcs : [MmSource], acc : [MmSource], visited: Set<int>) -> [MmSource] {
+	new_level = filter(srcs, \src -> forall(src.imports, \imp -> containsSet(visited, imp.module)));
+	level_names = buildSet(map(new_level, \src -> src.info.id));
+	if (new_level == []) {
+		if (length(srcs) == 0) acc else {
+			println("Cycilc imports detected:\n" + strIndent(strGlue(map(srcs, \src -> id2s(src.info.id)), "\n")));
+			[]
+		};
+	} else {
+		new_srcs = filter(srcs, \src -> !containsSet(level_names, src.info.id));
+		mmDoOrderSources(new_srcs, concat(acc, new_level), mergeSets(visited, level_names));
+	}
+}
