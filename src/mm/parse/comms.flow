@@ -2,16 +2,15 @@ import mm/parse/load;
 import mm/parse/collect;
 import mm/mm2ru;
 import mm/verify;
-
-import command;
+//import command;
 
 export {
 	mmIoCommands : [RuComm] = [
 		mmCommRead,
 		mmCommWrite
 	];
-	mmRunRead(task : ScTask, env : RuState) -> Maybe<RuState>;
-	mmRunWrite(task : ScTask, env : RuState) -> Maybe<RuState>;
+	mmRunRead(unit : RuUnit) -> Maybe<RuState>;
+	mmRunWrite(unit : RuUnit) -> Maybe<RuState>;
 }
 
 mmCommRead = RuComm(
@@ -22,33 +21,36 @@ mmCommRead = RuComm(
 	mmRunRead
 );
 
-mmRunRead(task : ScTask, env : RuState) -> Maybe<RuState> {
+mmRunRead(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	task = unit.task;
+	state = unit.state;
 	file = lookupTreeDef(task.args, "file", "");
 	if (!endsWith(file, ".mm")) {
-		env.conf.onError("Wrong extension of a file '" + file + "' , must be *.mm", []);
+		env.out.onError("Wrong extension of a file '" + file + "' , must be *.mm", []);
 		None();
 	} else {
-		conf = env.conf;
+		conf = state.conf;
 		path = ruResolveRelativePath(file, conf.workingDir);
 		if (!fileExists(path)) {
-			conf.onError("mm file: '" + file + "' is not found", []);
+			env.out.onError("mm file: '" + file + "' is not found", []);
 			None();
 		} else {
 			module = ruTrimPath(path, conf, getFileExt(file));
 			if (module == "") {
-				conf.onError("mm module for file: '" + file + "' cannot be empty string", []);
+				env.out.onError("mm module for file: '" + file + "' cannot be empty string", []);
 				None();
 			} else {
 				maybeMap(
-					maybeBind(mmLoad(conf, s2id(module)), \loaded ->
-						maybeBind(mmParse(getTreeValues(loaded), conf), \parsed ->
-							mmCollectSources(parsed, conf)
+					maybeBind(mmLoad(env, s2id(module)), \loaded ->
+						maybeBind(mmParse(getTreeValues(loaded), env), \parsed ->
+							mmCollectSources(parsed, env)
 							//maybeBind(mmCollectMath(parsed, env.conf), \collected ->
 							//	mmVerifyMath(collected, env.conf)
 							//)
 						)
 					), 
-					\mm -> RuState(env with mm = mm)
+					\mm -> RuState(state with mm = mm)
 				);
 			}
 		}
@@ -68,9 +70,12 @@ mmCommWrite = RuComm(
 	mmRunWrite
 );
 
-mmRunWrite(task : ScTask, env : RuState) -> Maybe<RuState> {
-	sources = env.mm;
-	conf = env.conf;
+mmRunWrite(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	task = unit.task;
+	state = unit.state;
+	sources = state.mm;
+	conf = state.conf;
 	test = lookupTreeDef(task.args, "test-write", "");
 	write_mm = \src0 : MmSource -> {
 		path = src0.info.path;
@@ -79,17 +84,17 @@ mmRunWrite(task : ScTask, env : RuState) -> Maybe<RuState> {
 			if (dir != "") {
 				err = ensureDirectoryExists(dir);
 				if (err != "") {
-					conf.onError("failed to create directory: '" + dir + "', error: '" + err + "'", [RuPlace(src0.info.module, -1)]);
+					env.out.onError("failed to create directory: '" + dir + "', error: '" + err + "'", [RuPlace(src0.info.module, -1)]);
 				}
 			}
 		}
-		if (ruVerbose(conf) > 1) {
-			conf.onMessage("\tmm writing : '" + path + "'");
+		if (ruVerbose(env.conf) > 1) {
+			env.out.onMessage("\tmm writing : '" + path + "'");
 		}
 		src = if (lookupTreeDef(task.args, "strip-comments", "") == "1") mmStripComments(src0) else src0;
 		if (test != "1") {
 			if (!setFileContent(path, mm2s(src))) {
-				conf.onError("error while writing '" + path + "'", [RuPlace(src.info.module, -1)]);
+				env.out.onError("error while writing '" + path + "'", [RuPlace(src.info.module, -1)]);
 			}
 		}
 	}
@@ -101,24 +106,24 @@ mmRunWrite(task : ScTask, env : RuState) -> Maybe<RuState> {
 					write_mm(src);
 				} else {
 					if (monolith != "1") {
-						write_mm(mmSources2SingleSource(env.mm, monolith, env.conf));
+						write_mm(mmSources2SingleSource(state.mm, monolith, env));
 					} else {
-						write_mm(mmSources2SingleSource(env.mm, src.info.module, env.conf));
+						write_mm(mmSources2SingleSource(state.mm, src.info.module, env));
 					}
 				}
 			}
-			None(): conf.onMessage("unknown module: '" + id2s(module) + "'");
+			None(): env.out.onMessage("unknown module: '" + id2s(module) + "'");
 		}
 	}
 	if (sizeTree(sources) == 0) {
-		conf.onError("There are no Metamath sources at all.", []);
+		env.out.onError("There are no Metamath sources at all.", []);
 	} else {
 		file = lookupTreeDef(task.args, "target", "");
 		if (file == "all") {
 			timer = ruMakeTimer();
 			iter(getTreeValues(sources), write_mm);
-			if (ruVerbose(conf) > 0) {
-				conf.onMessage("mm written " + i2s(sizeTree(sources)) + " files in " + ruTimePassed2s(timer));
+			if (ruVerbose(env.conf) > 0) {
+				env.out.onMessage("mm written " + i2s(sizeTree(sources)) + " files in " + ruTimePassed2s(timer));
 			}
 		} else {
 			file_id = s2id(file);
@@ -126,22 +131,22 @@ mmRunWrite(task : ScTask, env : RuState) -> Maybe<RuState> {
 			if (containsKeyTree(sources, file_id)) {
 				timer = ruMakeTimer();
 				write_module(file_id);
-				if (ruVerbose(conf) > 0) {
-					conf.onMessage("mm written '" + module + "'' file in " + ruTimePassed2s(timer));
+				if (ruVerbose(env.conf) > 0) {
+					env.out.onMessage("mm written '" + module + "'' file in " + ruTimePassed2s(timer));
 				}
 			} else {
 				module_id = s2id(module);
 				if (containsKeyTree(sources, module_id)) {
 					timer = ruMakeTimer();
 					write_module(module_id);
-					if (ruVerbose(conf) > 0) {
-						conf.onMessage("mm written '" + module + "' file in " + ruTimePassed2s(timer));
+					if (ruVerbose(env.conf) > 0) {
+						env.out.onMessage("mm written '" + module + "' file in " + ruTimePassed2s(timer));
 					}
 				} else {
-					conf.onError("Metamath source '" + file + "' is not found", []);
+					env.out.onError("Metamath source '" + file + "' is not found", []);
 				}
 			}
 		}
 	}
-	Some(env);
+	Some(state);
 }

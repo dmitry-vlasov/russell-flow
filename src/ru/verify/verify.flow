@@ -1,9 +1,8 @@
 import ru/subst;
 import ru/verify/source;
-import command;
 
 export {
-	ruVerifyMath(math : RuMath, conf : RuConf) -> RuVerifyAcc;
+	ruVerifyMath(math : RuMath, env : RuEnv) -> RuVerifyAcc;
 	ruCommVerify : RuComm;
 }
 
@@ -15,51 +14,54 @@ ruCommVerify = RuComm(
 	ruRunVerify
 );
 
-ruVerifyMath(math : RuMath, conf : RuConf) -> RuVerifyAcc {
+ruVerifyMath(math : RuMath, env : RuEnv) -> RuVerifyAcc {
 	err_count = ref 0;
 	timer = ruMakeTimer();
-	acc = ruDoVerifyMath(math.sources, ruMakeVerifyAcc(), conf);
-	if (ruVerbose(conf) > 0) {
-		conf.onMessage(
+	acc = ruDoVerifyMath(math.sources, ruMakeVerifyAcc(), env);
+	if (ruVerbose(env.conf) > 0) {
+		env.out.onMessage(
 			"ru verified: " +i2s(sizeTree(math.sources)) + " files in " + ruTimePassed2s(timer) +
-			(if (ruVerbose(conf) > 2) "\n\tapproved theorems:\n" + strGlue(map(set2array(acc.approved), \th -> "\t" + id2s(th)), "\n") else "")
+			(if (ruVerbose(env.conf) > 2) "\n\tapproved theorems:\n" + strGlue(map(set2array(acc.approved), \th -> "\t" + id2s(th)), "\n") else "")
 		);
 	}
 	if (sizeSet(acc.disproved) > 0) {
-		conf.onMessage(
-			(if (ruVerbose(conf) > 0) "" else "ru disproved: " +i2s(sizeSet(acc.disproved)) + " theorems in " + ruTimePassed2s(timer) + "\n") +
+		env.out.onMessage(
+			(if (ruVerbose(env.conf) > 0) "" else "ru disproved: " +i2s(sizeSet(acc.disproved)) + " theorems in " + ruTimePassed2s(timer) + "\n") +
 			"\tdisproved theorems:\n" + strGlue(map(set2array(acc.disproved), \th -> "\t\t" + id2s(th)), "\n")
 		);
 	}
 	acc;
 }
 
-ruDoVerifyMath(left : Tree<int, RuSource>, acc : RuVerifyAcc, conf : RuConf) -> RuVerifyAcc {
+ruDoVerifyMath(left : Tree<int, RuSource>, acc : RuVerifyAcc, env : RuEnv) -> RuVerifyAcc {
 	if (sizeTree(left) == 0) acc else {
 		ready = filter(
 			getTreeValues(left), 
 			\src -> forall(src.imports, \imp -> !containsKeyTree(left, imp.id))
 		);
 		if (ready == []) {
-			conf.onError("cannot verify: " +i2s(sizeTree(left)) + " files - cyclic import", []);
+			env.out.onError("cannot verify: " +i2s(sizeTree(left)) + " files - cyclic import", []);
 			acc;
 		} else {
-			verified = ruConcurrent(map(ready, \s -> \-> ruVerifySource(s, acc, conf)));
-			new_acc = fold(verified, acc, \ac, v -> ruMergeVerifyAcc(ac, v, conf));
+			verified = ruConcurrent(map(ready, \s -> \-> ruVerifySource(s, acc, env)));
+			new_acc = fold(verified, acc, \ac, v -> ruMergeVerifyAcc(ac, v, env));
 			new_left = fold(ready, left, \ac, src -> removeFromTree(ac, src.info.id));
-			ruDoVerifyMath(new_left, new_acc, conf);
+			ruDoVerifyMath(new_left, new_acc, env);
 		}
 	}
 }
 
-ruRunVerify(task : ScTask, env : RuState) -> Maybe<RuState> {
+ruRunVerify(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	task = unit.task;
+	state = unit.state;
 	target0 = lookupTreeDef(task.args, "target", "");
 	target = if (!endsWith(target0, ".ru")) target0 else ruTrimPath(target0, env.conf, ".ru");
-	conf = env.conf;
-	math = ruMakeMathFromSources(env.ru, conf);
+	conf = state.conf;
+	math = ruMakeMathFromSources(state.ru, env);
 	m = if (target == "" || target == "all" || target == "1") {
 		//ruDebugLog("target: " + target, math.conf);
-		verified = ruVerifyMath(math, conf);
+		verified = ruVerifyMath(math, env);
 		if (sizeSet(verified.disproved) == 0) {
 			Some(verified.math);
 		} else {
@@ -72,15 +74,15 @@ ruRunVerify(task : ScTask, env : RuState) -> Maybe<RuState> {
 				switch (th) {
 					RuTheorem(__, __,__,__): {
 						timer = ruMakeTimer();
-						res = ruVerifyTheorem(th, math, conf);
-						ret = if (ruIsVerified(res)) Some(ruReplaceAssertion(res.theorem, math, conf)) else None();
+						res = ruVerifyTheorem(th, math, env);
+						ret = if (ruIsVerified(res)) Some(ruReplaceAssertion(res.theorem, math, env)) else None();
 						if (ruVerbose(conf) > 0) {
-							conf.onMessage("ru " + (if (ruIsVerified(res)) "verified" else "disproved") + " " + target + "' in " + ruTimePassed2s(timer));
+							unit.out.onMessage("ru " + (if (ruIsVerified(res)) "verified" else "disproved") + " " + target + "' in " + ruTimePassed2s(timer));
 						}
 						ret;
 					}
 					default: {
-						conf.onError("assertion '" + target + "' is not a theorem", []);
+						unit.out.onError("assertion '" + target + "' is not a theorem", []);
 						None();
 					}
 				}
@@ -89,16 +91,16 @@ ruRunVerify(task : ScTask, env : RuState) -> Maybe<RuState> {
 				switch (lookupTree(math.sources, id)) {
 					Some(src): {
 						timer = ruMakeTimer();
-						deps = fold(src.imports, makeSet(), \acc, imp -> ruSourceDeclNames(imp.id, acc, math, conf));
-						acc = ruVerifySource(src, RuVerifyAcc(math, deps, makeSet()), conf);
+						deps = fold(src.imports, makeSet(), \acc, imp -> ruSourceDeclNames(imp.id, acc, math, env));
+						acc = ruVerifySource(src, RuVerifyAcc(math, deps, makeSet()), env);
 						if (ruVerbose(conf) > 0) {
-							conf.onMessage(
+							unit.out.onMessage(
 								"ru verified: '" + target + "' in " + ruTimePassed2s(timer) +
 								(if (ruVerbose(conf) > 2) "\n\tapproved theorems:\n" + strGlue(map(set2array(acc.approved), \th -> "\t\t" + id2s(th)), "\n") else "")
 							);
 						}
 						if (sizeSet(acc.disproved) > 0) {
-							conf.onMessage(
+							unit.out.onMessage(
 								(if (ruVerbose(conf) > 0) "" else "ru disproved: '" + target + "' in " + ruTimePassed2s(timer) + "\n") +
 								"\tdisproved theorems:\n" + strGlue(map(set2array(acc.disproved), \th -> "\t\t" + id2s(th)), "\n")
 							);
@@ -108,12 +110,12 @@ ruRunVerify(task : ScTask, env : RuState) -> Maybe<RuState> {
 						}
 					}
 					None(): {
-						conf.onError("verification target '" + target + "' is not found", []);
+						unit.out.onError("verification target '" + target + "' is not found", []);
 						None();
 					}
 				}
 			}
 		}
 	}
-	maybeMap(m, \new_math -> RuState(env with ru = new_math.sources));
+	maybeMap(m, \new_math -> RuState(state with ru = new_math.sources));
 }

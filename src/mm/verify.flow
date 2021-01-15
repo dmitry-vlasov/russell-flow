@@ -1,5 +1,5 @@
 import mm/src_utils;
-import command;
+import comm;
 
 export {
 	MmExpPair(
@@ -20,41 +20,42 @@ mmCommVerifyMm = RuComm(
 	mmRunVerifyMm
 );
 
-mmRunVerifyMm(task : ScTask, env : RuState) -> Maybe<RuState> {
-	sources = env.mm;
-	conf = env.conf;
-	stack_trace = map(filter(strSplit(lookupTreeDef(task.args, "stack-trace", ""), ","), isNotSpace), s2id);
-	if (mmVerifyMath(sources, conf, stack_trace)) Some(env) else None();
+mmRunVerifyMm(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	state = unit.state;
+	sources = state.mm;
+	stack_trace = map(filter(strSplit(lookupTreeDef(unit.task.args, "stack-trace", ""), ","), isNotSpace), s2id);
+	if (mmVerifyMath(sources, env, stack_trace)) Some(state) else None();
 }
 
-mmVerifyMath(sources : Tree<int, MmSource>, conf0 : RuConf, stack_trace : [int]) -> bool {
+mmVerifyMath(sources : Tree<int, MmSource>, env0 : RuEnv, stack_trace : [int]) -> bool {
 	err_count = ref 0;
-	conf = ruAddErrCounter(conf0, err_count);
+	env = ruAddErrCounter2Env(env0, err_count);
 	timer = ruMakeTimer();
 	structs = mmSources2structs(sources); 
-	verified = all(map(getTreeValues(sources), \s -> mmVerifySource(s, structs, conf, stack_trace)));
-	if (ruVerbose(conf) > 0) {
-		conf.onMessage("mm verified: " +i2s(sizeTree(sources)) + " files in " + ruTimePassed2s(timer));
+	verified = all(map(getTreeValues(sources), \s -> mmVerifySource(s, structs, env, stack_trace)));
+	if (ruVerbose(env.conf) > 0) {
+		env.out.onMessage("mm verified: " +i2s(sizeTree(sources)) + " files in " + ruTimePassed2s(timer));
 	}
 	^err_count == 0;
 }
 
-mmVerifySource(src : MmSource, structs : MmStructs, conf : RuConf, stack_trace : [int]) -> bool {
+mmVerifySource(src : MmSource, structs : MmStructs, env : RuEnv, stack_trace : [int]) -> bool {
 	timer = ruMakeTimer();
 	ret = all(ruConcurrent(map(src.decls, \decl -> 
-		\-> mmVerifyDecl(decl, structs, conf, stack_trace)
+		\-> mmVerifyDecl(decl, structs, env, stack_trace)
 	)));
-	if (ruVerbose(conf) > 1) {
-		conf.onMessage("\tmm verified: '" + src.info.module + "' in " + ruTimePassed2s(timer));
+	if (ruVerbose(env.conf) > 1) {
+		env.out.onMessage("\tmm verified: '" + src.info.module + "' in " + ruTimePassed2s(timer));
 	}
 	ret;
 }
 
-mmVerifyDecl(decl : MmDecl, structs : MmStructs, conf : RuConf, stack_trace : [int]) -> bool {
+mmVerifyDecl(decl : MmDecl, structs : MmStructs, env : RuEnv, stack_trace : [int]) -> bool {
 	switch (decl) {
 		MmAssertion(__,__,__,stat): 
 			switch (stat) {
-				MmProvable(__,__,__): mmVerifyAssertion(decl, structs, conf, stack_trace);
+				MmProvable(__,__,__): mmVerifyAssertion(decl, structs, env, stack_trace);
 				default: true;
 			}
 		default: true;
@@ -67,13 +68,13 @@ MmExecutionAcc(
 	subst : Tree<int, MmExp>
 );
 
-mmPickFromStack(stack : List<MmExp>, hyps : [MmHyp], conf : RuConf) -> Maybe<MmExecutionAcc> {
+mmPickFromStack(stack : List<MmExp>, hyps : [MmHyp], env : RuEnv) -> Maybe<MmExecutionAcc> {
 	fold(hyps, Some(MmExecutionAcc(stack, makeList(), makeTree())),
 		\macc, hyp -> {
 			maybeBind(macc,
 				\acc -> {
 					if (isEmptyList(acc.stack)) {
-						conf.onError("empty stack in the middle of proof", []);
+						env.out.onError("empty stack in the middle of proof", []);
 						None();
 					} else {
 						e = headList(acc.stack, MmExp([]));
@@ -86,12 +87,12 @@ mmPickFromStack(stack : List<MmExp>, hyps : [MmHyp], conf : RuConf) -> Maybe<MmE
 								));
 							MmFloating(__, type, var): {
 								if (length(e.symbs) == 0) {
-									conf.onError("empty expression on stack", []);
+									env.out.onError("empty expression on stack", []);
 									None();
 								} else {
 									e_type = e.symbs[0].literal;
 									if (e_type != type) {
-										conf.onError("wrong type of expression on stack: " + id2s(e_type) + " != " + id2s(type), []);
+										env.out.onError("wrong type of expression on stack: " + id2s(e_type) + " != " + id2s(type), []);
 										None()
 									} else {
 										e_expr = MmExp(tail(e.symbs));
@@ -111,7 +112,7 @@ mmPickFromStack(stack : List<MmExp>, hyps : [MmHyp], conf : RuConf) -> Maybe<MmE
 	)
 }
 
-mmCheckSubstitution(subst : Tree<int, MmExp>, disj : [MmDisj], theorem : MmAssertion, conf : RuConf) -> bool {
+mmCheckSubstitution(subst : Tree<int, MmExp>, disj : [MmDisj], theorem : MmAssertion, env : RuEnv) -> bool {
 	forall(disj, \dis -> {
 			mapped = fold(dis.vars, [], 
 				\acc, v -> switch(lookupTree(subst, v)) {
@@ -126,7 +127,7 @@ mmCheckSubstitution(subst : Tree<int, MmExp>, disj : [MmDisj], theorem : MmAsser
 						vars1 = getVars(e1);
 						vars2 = getVars(e2);
 						if (!isEmptySet(intersectSets(vars1, vars2))) {
-							conf.onError("expressions " + mm2s(e1) + " and " + mm2s(e2) + " have common vars - disjointed restrictions violation", []);
+							env.out.onError("expressions " + mm2s(e1) + " and " + mm2s(e2) + " have common vars - disjointed restrictions violation", []);
 							false;
 						} else {
 							foldSet(vars1, true, \ac1, v1 ->
@@ -135,7 +136,7 @@ mmCheckSubstitution(subst : Tree<int, MmExp>, disj : [MmDisj], theorem : MmAsser
 											\d -> contains(d.vars, v1) && contains(d.vars, v2)
 										);
 										if (!ret) {
-											conf.onError("variables " + id2s(v1) + " and " + id2s(v2) + " are not inherently disjointed in theorem " + id2s(theorem.stat.label), []);
+											env.out.onError("variables " + id2s(v1) + " and " + id2s(v2) + " are not inherently disjointed in theorem " + id2s(theorem.stat.label), []);
 										}
 										ret
 									}
@@ -149,19 +150,19 @@ mmCheckSubstitution(subst : Tree<int, MmExp>, disj : [MmDisj], theorem : MmAsser
 	)
 }
 
-mmVerifyRPNstep(label : int, mstack : Maybe<List<MmExp>>, entities : Tree<int, MmLabeled>, theorem : MmAssertion, conf : RuConf) -> Maybe<List<MmExp>> {
+mmVerifyRPNstep(label : int, mstack : Maybe<List<MmExp>>, entities : Tree<int, MmLabeled>, theorem : MmAssertion, env : RuEnv) -> Maybe<List<MmExp>> {
 	maybeBind(mstack, 
 		\stack -> {
 			switch (lookupTree(entities, label)) {
 				Some(labeled): {
 					switch (labeled) {
 						MmAssertion(disj, hyps, inner, statement): {
-							maybeBind(mmPickFromStack(stack, reverseA(hyps), conf),
+							maybeBind(mmPickFromStack(stack, reverseA(hyps), env),
 								\acc -> {
 									if (forall(list2array(acc.essentials), \pair -> {
 											applied = mmApplySubst(pair.fromHyp, acc.subst);
 											if (applied != pair.fromStack) {
-												conf.onError("applied expression differs from stack value: " + mm2s(applied) + " != " + mm2s(pair.fromStack), []);
+												env.out.onError("applied expression differs from stack value: " + mm2s(applied) + " != " + mm2s(pair.fromStack), []);
 												false;
 											} else {
 												true;
@@ -169,7 +170,7 @@ mmVerifyRPNstep(label : int, mstack : Maybe<List<MmExp>>, entities : Tree<int, M
 										}
 									)) {
 										applied = mmApplySubst(statement.expr, acc.subst);
-										if (mmCheckSubstitution(acc.subst, disj, theorem, conf)) {
+										if (mmCheckSubstitution(acc.subst, disj, theorem, env)) {
 											Some(Cons(applied, acc.stack));
 										} else {
 											None();
@@ -185,7 +186,7 @@ mmVerifyRPNstep(label : int, mstack : Maybe<List<MmExp>>, entities : Tree<int, M
 					}
 				}
 				None(): {
-					conf.onError("unknown label: " + id2s(label), []);
+					env.out.onError("unknown label: " + id2s(label), []);
 					None();
 				}
 			}
@@ -193,30 +194,30 @@ mmVerifyRPNstep(label : int, mstack : Maybe<List<MmExp>>, entities : Tree<int, M
 	)
 }
 
-mmVerifyAssertion(assertion : MmAssertion, structs : MmStructs, conf : RuConf, stack_trace : [int]) -> bool {
+mmVerifyAssertion(assertion : MmAssertion, structs : MmStructs, env : RuEnv, stack_trace : [int]) -> bool {
 	ret = switch(assertion.stat) {
 		MmAxiomatic(__,__): true;
 		MmProvable(th_label, expr, proof): {
 			trace = contains(stack_trace, th_label);
 			if (trace) {
-				conf.onMessage("Tracing verification stack of " + id2s(th_label));
+				env.out.onMessage("Tracing verification stack of " + id2s(th_label));
 			}
 			switch (proof) {
 				MmNormalProof(labels): {
 					maybe_stack = fold(labels, Some(makeList()),
 						\stack, label -> {
 							if (trace) {
-								conf.onMessage(id2s(label) + ":");
+								env.out.onMessage(id2s(label) + ":");
 							}
-							new_stack = mmVerifyRPNstep(label, stack, structs.labeled, assertion, conf);
+							new_stack = mmVerifyRPNstep(label, stack, structs.labeled, assertion, env);
 							if (trace) {
 								switch (new_stack) {
 									Some(s): {
-										conf.onMessage(
+										env.out.onMessage(
 											strIndent(strGlue(map(list2array(s), mm2s), "\n")) + "\n"
 										);
 									}
-									None(): conf.onMessage("\t<EMPTY STACK>\n");
+									None(): env.out.onMessage("\t<EMPTY STACK>\n");
 								}
 							}
 							new_stack;
@@ -225,11 +226,11 @@ mmVerifyAssertion(assertion : MmAssertion, structs : MmStructs, conf : RuConf, s
 					eitherMap(maybe_stack,
 						\stack -> {
 							if (!isEmptyList(tailList(stack))) {
-								conf.onError("non-empty stack at the end of proof", []);
+								env.out.onError("non-empty stack at the end of proof", []);
 								false;
 							} else if (expr != headList(stack, MmExp([]))) {
 								head = headList(stack, MmExp([]));
-								conf.onError("expression on the top of the stack differs from provable expression: " + mm2s(expr) + " != " + mm2s(head), []);
+								env.out.onError("expression on the top of the stack differs from provable expression: " + mm2s(expr) + " != " + mm2s(head), []);
 								false;
 							} else {
 								true;
@@ -239,7 +240,7 @@ mmVerifyAssertion(assertion : MmAssertion, structs : MmStructs, conf : RuConf, s
 					)
 				}
 				MmCompressedProof(__,__): {
-					conf.onError("Decompress proofs before verification", []);
+					env.out.onError("Decompress proofs before verification", []);
 					quit(0);
 					false;
 				}
@@ -247,11 +248,11 @@ mmVerifyAssertion(assertion : MmAssertion, structs : MmStructs, conf : RuConf, s
 		}
 	};
 	if (!ret) {
-		conf.onError("proof of " + id2s(assertion.stat.label) + " is wrong", []);
+		env.out.onError("proof of " + id2s(assertion.stat.label) + " is wrong", []);
 	} else {
-		if (ruVerbose(conf) > 2) {
+		if (ruVerbose(env.conf) > 2) {
 			switch(assertion.stat) {
-				MmProvable(__,__,__): conf.onMessage("theorem " + id2s(assertion.stat.label) + " is verified");
+				MmProvable(__,__,__): env.out.onMessage("theorem " + id2s(assertion.stat.label) + " is verified");
 				default: {}
 			}
 		}

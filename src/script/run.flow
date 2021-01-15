@@ -1,0 +1,110 @@
+import script/script;
+import comm;
+
+export {
+	ruApplyScriptVars(s : string, vars : Tree<string, ValValue>, conf : RuConf) -> string;
+	ruRun(unit : RuUnit, run : (RuUnit) -> Maybe<RuState>, descr : RuCommDescr) -> Maybe<RuState>;
+}
+
+ruUpdateTaskConf(state : RuState, file : string) -> RuState {
+	conf = state.conf;
+	upd_conf = if (file == "") conf else {
+		conf_dir = ruFindConfDir(file);
+		if (conf_dir == "") conf else {
+			file_conf = ruReadConfFromDir(conf_dir);
+			ruSetConf(conf, file_conf);
+		}
+	} 
+	RuState(state with conf = upd_conf);
+}
+
+ruApplyScriptVars(s : string, vars : Tree<string, ValValue>, conf : RuConf) -> string {
+	vars_subst = fold(tree2pairs(vars), [], \acc, kv -> 
+		concat(acc, ["$" + kv.first, ruValue2s(kv.second)])
+	);
+	conf_subst = foldTree(ruConf2Tree(conf), vars_subst, \k, v, acc -> 
+		concat(acc, ["$" + k, v])
+	);
+	strReplaces(s, conf_subst);
+}
+
+ruCheckCommandArgs(task : ScTask, command : RuCommDescr, out : RuOut) -> bool {
+	forall(command.args, \arg ->
+		if (arg.optional || containsKeyTree(task.args, arg.name)) true else {
+			out.onMessage("Obligatory argument '" + arg.name + "' of the command '" + task.command + "' is missing");
+			false;
+		}
+	);
+}
+
+ruAddCommandDefaults(task : ScTask, command : RuCommDescr, conf : RuConf) -> ScTask {
+	args_w_defargs = foldTree(task.args, makeTree(), \k, v, acc -> 
+		if (v != "" || k == command.defarg || command.defarg == "") setTree(acc, k, v) else setTree(acc, command.defarg, k)
+	);
+	args_w_defvals = fold(command.args, args_w_defargs, \acc, arg ->
+		if (arg.defval == "") acc else {
+			if (containsKeyTree(acc, arg.name)) acc else setTree(acc, arg.name, arg.defval)
+		}
+	);
+	ScTask(task with args = args_w_defvals);
+}
+
+ruEvalTaskArgs(task : ScTask, state : RuState) -> ScTask {
+	conf = state.conf;
+	args_evaled_1 = foldTree(task.args, makeTree(), \k, v, acc -> 
+		setTree(acc, ruApplyScriptVars(k, state.vars, conf), ruApplyScriptVars(v, state.vars, conf))
+	);
+	all_vars = mergeTree(state.vars, mapTree(args_evaled_1, \s -> ValString(s)));
+	args_evaled_2 = foldTree(args_evaled_1, makeTree(), \k, v, acc -> 
+		setTree(acc, ruApplyScriptVars(k, all_vars, conf), ruApplyScriptVars(v, all_vars, conf))
+	);
+	ScTask(task with args = args_evaled_2);
+}
+
+ruMakeAutofileTasks(task : ScTask, comm : RuCommDescr, conf : RuConf) -> [ScTask] {
+	if (containsKeyTree(task.args, "file") || conf.projectRoots == [] || !comm.autofile) {
+		[task];
+	} else {
+		map(conf.projectRoots, \root -> 
+			ScTask(task with args = setTree(task.args, "file", root))
+		);
+	}
+}
+
+ruRun(unit : RuUnit, run : (RuUnit) -> Maybe<RuState>, descr : RuCommDescr) -> Maybe<RuState> {
+	out = if (!descr.autoindent) unit.out else ruIndentOut(unit.out);
+	state = unit.state;
+	conf = state.conf;
+	t0 = ruAddCommandDefaults(unit.task, descr, conf);
+	fold(ruMakeAutofileTasks(t0, descr, conf), Some(state),  \ac, t1 -> 
+		maybeBind(ac, \s0 -> {
+			t = ruEvalTaskArgs(t1, s0);
+			s = RuState(s0 with 
+				vars = mergeTree(s0.vars, 
+					mapTree(t.args, \str -> 
+						ValString(ruApplyScriptVars(str, s0.vars, s0.conf))
+					)
+				)
+			);
+			if (!ruCheckCommandArgs(t, descr, out)) None() else {
+				timer = ruMakeTimer();
+				log_task = !existsTree(t.args, \arg,__ -> arg == "do_not_log_this");
+				task_src = ruTask2s(t);
+				uuid = ruMakeUuid();
+				t_env = ruUpdateTaskConf(s, lookupTreeDef(t.args, "file", ""));
+				if (log_task) {
+					ruScriptLog("<" + uuid + "> Task started:    " + task_src + " ... ", conf);
+				}
+				ret = run(RuUnit(t, t_env, out));
+				if (log_task) {
+					ruScriptLog(
+						"<" + uuid + "> Task finished:   " +
+						(if (isSome(ret)) "Ok " else "Fail ") +
+						"in " + ruTimePassed2s(timer), conf
+					);
+				}
+				ret;
+			}
+		})
+	);
+}

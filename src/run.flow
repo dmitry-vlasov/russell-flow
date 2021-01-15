@@ -7,24 +7,24 @@ import help;
 import clear;
 
 export {
-	ruRun(s : ScScript, onMessage : (string) -> void, onRunComplete : (int) -> void) -> void;
-	ruRunLocal(s : ScScript, onMessage : (string) -> void, onRunComplete : (int) -> void) -> void;
+	ruProcess(s : ScScript, onRunComplete : (int) -> void, out : RuOut) -> void;
+	ruProcessLocal(s : ScScript, onRunComplete : (int) -> void, out : RuOut) -> void;
 	ruCommandsTree(conf : RuConf) -> Tree<string, RuComm>;
-}
-
-ruRun(s : ScScript, onMessage : (string) -> void, onRunComplete : (int) -> void) -> void {
-	if (getUrlParameterBoolDef("local", false)) {
-		ruRunLocal(s, onMessage, onRunComplete);
-	} else {
-		ruRunRemote(s, onMessage, onMessage, onRunComplete, 
-			\code -> ruRunLocal(s, onMessage, onRunComplete)
-		);
-	}
 }
 
 ru_env = ref ruEmptyState;
 
-ruRunRemote(s : ScScript, onMessage: (string) -> void, onError : (string) -> void, onRunComplete : (int) -> void, onServerError : (int) -> void) -> void {
+ruProcess(s : ScScript, onRunComplete : (int) -> void, out : RuOut) -> void {
+	if (getUrlParameterBoolDef("local", false)) {
+		ruProcessLocal(s, onRunComplete, out);
+	} else {
+		ruProcessRemote(s, out.onMessage, onRunComplete, 
+			\code -> ruProcessLocal(s, onRunComplete, out)
+		);
+	}
+}
+
+ruProcessRemote(s : ScScript, onMessage: (string) -> void, onRunComplete : (int) -> void, onServerError : (int) -> void) -> void {
 	serverUrl = 
 		"http://" + getUrlParameterDef("server-url", "localhost") + 
 		":" + getUrlParameterDef("server-port", "20001");
@@ -39,7 +39,7 @@ ruRunRemote(s : ScScript, onMessage: (string) -> void, onError : (string) -> voi
 				onMessage(msg);
 				onRunComplete(0);
 			} else if (0 < code && code < 64) {
-				onError("Compilation error " + i2s(code) + "\n" + msg);
+				onMessage("Compilation error " + i2s(code) + "\n" + msg);
 				onRunComplete(code);
 			} else {
 				onServerError(status);
@@ -49,13 +49,13 @@ ruRunRemote(s : ScScript, onMessage: (string) -> void, onError : (string) -> voi
 	)
 }
 
-ruRunLocal(s : ScScript, onMessage : (string) -> void, onRunComplete : (int) -> void) -> void {
-	ru_env := ruRunScriptLocal(s, onMessage, ^ru_env);
+ruProcessLocal(s : ScScript, onRunComplete : (int) -> void, out : RuOut) -> void {
+	ru_env := ruProcessScript(s, ^ru_env, out);
 	onRunComplete(0);
 }
 
-ruRunScriptLocal(s : ScScript, onMessage : (string) -> void, env : RuState) -> RuState {
-	either(ruExecScript(s, ruCommandsTree(env.conf), onMessage, env), env);
+ruProcessScript(s : ScScript, env : RuState, out : RuOut) -> RuState {
+	either(ruExecScript(s, ruCommandsTree(env.conf), env, out), env);
 }
 
 ru_commands_tree : ref Maybe<Tree<string, RuComm>> = ref None();
@@ -70,7 +70,7 @@ ruCommandsTree(conf : RuConf) -> Tree<string, RuComm> {
 				ruApplyToProjectRoots(ruCommReadAny),
 				ruCommSplitMathAny,
 				ruCommOptimizeImportsAny,
-				ruCommMergeMath(ruRunScriptLocal),
+				ruCommMergeMath(ruProcessScript),
 			],
 			ruHelpCommands(ruCommandsTree),
 			ruBaseCommands,
@@ -108,17 +108,17 @@ ruCommOptimizeImportsAny = RuComm(
 );
 
 ruChooseRunerByExt( 
-	run_ru : (ScTask,RuState) -> Maybe<RuState>,
-	run_mm : (ScTask,RuState) -> Maybe<RuState>
-) -> (ScTask, RuState) -> Maybe<RuState> {
-	\task : ScTask, env : RuState -> {
-		file = lookupTreeDef(task.args, "file", "");
+	run_ru : (RuUnit) -> Maybe<RuState>,
+	run_mm : (RuUnit) -> Maybe<RuState>
+) -> (RuUnit) -> Maybe<RuState> {
+	\unit -> {
+		file = lookupTreeDef(unit.task.args, "file", "");
 		if (endsWith(file, ".ru")) {
-			run_ru(task, env);
+			run_ru(unit);
 		} else if (endsWith(file, ".mm")) {
-			run_mm(task, env);
+			run_mm(unit);
 		} else {
-			env.conf.onError("Unknown file '" + file + "' extension: '" + getFileExt(file) + "', must be '*.ru' or '*.mm'", []);
+			unit.out.onError("Unknown file '" + file + "' extension: '" + getFileExt(file) + "', must be '*.ru' or '*.mm'", []);
 			None();
 		}
 	}
@@ -129,7 +129,7 @@ ruCommServerShutdown = RuComm(
 		"server-shutdown", "server", "send the command to exit to a server", "", false, false, 
 		[RuCommArg("server-port", true, "port using by a server", "20001")], []
 	),
-	\task, env -> { Some(env); }
+	\unit -> { Some(unit.state); }
 );
 
 ruCommRunScript = RuComm(
@@ -140,27 +140,24 @@ ruCommRunScript = RuComm(
 	ruRunScript
 );
 
-ruRunScript(task : ScTask, env : RuState) -> Maybe<RuState> {
+ruRunScript(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	task = unit.task;
+	state = unit.state;
 	name = lookupTreeDef(task.args, "script", "");
-	depth = ruScriptDepth(env.vars);
-	env1 = RuState(env with vars = setTree(env.vars, "script.depth", ValInt(depth + 1)));
 	maybeMap(
-		ruLoadScript(name, env1.conf),
+		ruLoadScript(name, env),
 		\src -> {
-			env2 = ruRunScriptLocal(
-				src.script, 
-				env1.conf.onMessage, 
-				RuState(env1 with 
-					vars = mergeTree(env1.vars, mapTree(task.args, \s -> 
-						ValString(ruApplyScriptVars(s, env1.vars, env1.conf))
+			ruProcessScript(
+				src.script,
+				RuState(state with 
+					vars = mergeTree(state.vars, mapTree(task.args, \s -> 
+						ValString(ruApplyScriptVars(s, state.vars, state.conf))
 					)),
-					depth = env1.depth + 1
-				)
-			);
-			RuState(env2 with 
-				vars = setTree(env2.vars, "script.depth", ValInt(depth)),
-				depth = env.depth
-			);
+					depth = state.depth + 1
+				),
+				env.out
+			)
 		}
 	);
 }
@@ -173,17 +170,19 @@ ruCommVerifyMetamath = RuComm(
 	ruRunVerifyMetamath
 );
 
-ruRunVerifyMetamath(task : ScTask, env : RuState) -> Maybe<RuState> {
+ruRunVerifyMetamath(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	task = unit.task;
 	conf = env.conf;
 	file = changeFileExt(lookupTreeDef(task.args, "file", ""), ".mm");
-	module = ruTrimPath(file, conf, ".mm");
+	module = ruTrimPath(file, unit.state.conf, ".mm");
 	resolved = ruResolveRelativeFile(file, conf.workingDir);
 	dir = ruDirName(resolved);
-	if (ruVerbose(conf) > 1) {
-		conf.onMessage("Going to verify file: '" + file + "' with Metamath, dir: '" + dir + "', resolved: '" + resolved + "', module: " + module);
+	if (ruVerbose(env.conf) > 1) {
+		env.out.onMessage("Going to verify file: '" + file + "' with Metamath, dir: '" + dir + "', resolved: '" + resolved + "', module: " + module);
 	}
 	if (!fileExists(resolved)) {
-		conf.onError("mm file '" + file + "' doesn't exist", []);
+		env.out.onError("mm file '" + file + "' doesn't exist", []);
 	} else {
 		timer = ruMakeTimer();
 		lines = ref [];
@@ -194,14 +193,14 @@ ruRunVerifyMetamath(task : ScTask, env : RuState) -> Maybe<RuState> {
 			\out -> refArrayPush(lines, out),
 			\err -> refArrayPush(lines, err),
 		);
-		conf.onMessage(strGlue(^lines, "\n"));
+		env.out.onMessage(strGlue(^lines, "\n"));
 		if (code != 0) {
-			conf.onError("Verification of '" + file + "' with Metamath eneded up with return code: " + i2s(code), []);
+			env.out.onError("Verification of '" + file + "' with Metamath eneded up with return code: " + i2s(code), []);
 		} else {
-			if (ruVerbose(conf) > 0) {
-				conf.onMessage("mm file '" + module + "' is verified with Metamath in " + ruTimePassed2s(timer));
+			if (ruVerbose(env.conf) > 0) {
+				env.out.onMessage("mm file '" + module + "' is verified with Metamath in " + ruTimePassed2s(timer));
 			}
 		}
 	}
-	Some(env);
+	Some(unit.state);
 }

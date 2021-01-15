@@ -1,28 +1,28 @@
 import math/uuid;
 import script/eval;
 import script/load;
-import script/util;
-import command;
+import script/run;
+import comm;
 
 export {
-	ruExecScript(s : ScScript, commands : Tree<string, RuComm>, onMessage : (string) -> void, env : RuState) -> Maybe<RuState>;
+	ruExecScript(s : ScScript, commands : Tree<string, RuComm>, state : RuState, out : RuOut) -> Maybe<RuState>;
 }
 
-ruExecScript(script : ScScript, commands : Tree<string, RuComm>, onMessage : (string) -> void, env : RuState) -> Maybe<RuState> {
+ruExecScript(script : ScScript, commands : Tree<string, RuComm>, state : RuState, out : RuOut) -> Maybe<RuState> {
 	timer = ruMakeTimer();
 	log_script = exists(ruScriptTasks(script), \task -> !existsTree(task.args, \arg, __ -> arg == "do_not_log_this"));
 	script_src = ruScript2s(script);
 	uuid = ruMakeUuid();
 	if (log_script) {
-		ruScriptLog("<" + uuid + "> Script started:  " + ruServerEscapeString(script_src), env.conf);
+		ruScriptLog("<" + uuid + "> Script started:  " + ruServerEscapeString(script_src), state.conf);
 	}
 	err = ref false;
-	ret = ruDoExecScript(script, RuExecEnv(commands, onMessage, env, err));
+	ret = ruDoExecScript(script, RuExecEnv(commands, state, out, err));
 	if (log_script) {
 		ruScriptLog(
 			"<" + uuid + "> Script finished: " +
 			(if (isSome(ret)) "Ok " else "Fail ") + 
-			"in " + ruTimePassed2s(timer), env.conf
+			"in " + ruTimePassed2s(timer), state.conf
 		);
 	}
 	ret
@@ -30,8 +30,8 @@ ruExecScript(script : ScScript, commands : Tree<string, RuComm>, onMessage : (st
 
 RuExecEnv(
 	commands : Tree<string, RuComm>, 
-	onMessage : (string) -> void, 
 	state : RuState, 
+	out : RuOut,
 	err : ref bool
 );
 
@@ -56,7 +56,7 @@ ruDoExecScript(script : ScScript, env : RuExecEnv) -> Maybe<RuState> {
 	}
 	if (isNone(ret) && !^(env.err)) {
 		if (script != ScExit()) {
-			env.onMessage("error at evaluation of <<<\n" + ruScript2s(script) + "\n>>>");
+			env.out.onMessage("error at evaluation of <<<\n" + ruScript2s(script) + "\n>>>");
 		}
 		env.err := true;
 	}
@@ -86,7 +86,7 @@ ruExecIf(cond : ScExp, script : ScScript, env : RuExecEnv) -> Maybe<RuState> {
 				}
 			}
 			default: {
-				env.onMessage("'if' condition must return boolean value " + ruScExp2s(cond));
+				env.out.onMessage("'if' condition must return boolean value " + ruScExp2s(cond));
 				None();
 			}
 		}
@@ -104,7 +104,7 @@ ruExecIfElse(cond : ScExp, pos : ScScript, neg : ScScript, env : RuExecEnv) -> M
 				}
 			}
 			default: {
-				env.onMessage("'if' condition must return boolean value " + ruScExp2s(cond));
+				env.out.onMessage("'if' condition must return boolean value " + ruScExp2s(cond));
 				None();
 			}
 		}
@@ -125,7 +125,7 @@ ruExecWhile(cond : ScExp, script : ScScript, env : RuExecEnv) -> Maybe<RuState> 
 				}
 			}
 			default: {
-				env.onMessage("'while' condition must return boolean value " + ruScExp2s(cond));
+				env.out.onMessage("'while' condition must return boolean value " + ruScExp2s(cond));
 				None();
 			}
 		}
@@ -137,8 +137,8 @@ ruExecPrint(ex : ScExp, env : RuExecEnv) -> Maybe<RuState> {
 		msg = ruApplyScriptVars(ruValue2s(val), env.state.vars, env.state.conf);
 		msg_unescaped = strReplaces(msg, ["\\n", "\n", "\\t", "\t"]);
 		//depth = env.state.depth;
-		//env.onMessage(ruIndentTimes(msg_unescaped, depth));
-		env.onMessage(msg_unescaped);
+		//env.out.onMessage(ruIndentTimes(msg_unescaped, depth));
+		env.out.onMessage(msg_unescaped);
 		env.state;
 	});
 }
@@ -148,19 +148,23 @@ ruExecTask(task : ScTask, env : RuExecEnv) -> Maybe<RuState> {
 	conf = state.conf;
 	switch (lookupTree(env.commands, task.command)) {
 		Some(command): {
-			ruRunTask(task, command.run, command.descr, state);
+			ruRun(RuUnit(task, state, env.out), command.run, command.descr);
 		}
 		None(): {
-			switch (ruLoadScript(task.command, env.state.conf)) {
+			switch (ruLoadScript(task.command, RuEnv(env.state.conf, env.out))) {
 				Some(src): {
 					deeper_state = RuState(state with depth = state.depth + 1);
 					maybeMap(
-						ruRunTask(task, \t,s -> ruExecScript(src.script, env.commands, env.onMessage, s), src.descr, deeper_state),
+						ruRun(
+							RuUnit(task, deeper_state, env.out), 
+							\unit -> ruExecScript(src.script, env.commands, unit.state, env.out), 
+							src.descr
+						),
 						\s -> RuState(s with depth = state.depth)
 					);
 				}
 				None(): {
-					env.onMessage("Unknown command or script: '" + task.command + "'");
+					env.out.onMessage("Unknown command or script: '" + task.command + "'");
 					None();
 				}
 			}
