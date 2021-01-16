@@ -167,7 +167,7 @@ function checkHttpServerStatus(initial : boolean) {
 function outputHttpServerMemStats() {
 	client.sendRequest("workspace/executeCommand", { 
 		command : "command", 
-		arguments : ["stats-mem do_not_log_this=1"]
+		arguments : ["stats-mem show=1 do_not_log_this=1"]
 	}).then(
 		(out : string) => {
 			const lines = out.split("\n");
