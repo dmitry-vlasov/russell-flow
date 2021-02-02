@@ -6,6 +6,7 @@ export {
 		ruCommReprove,
 		ruCommProveStart,
 		ruCommProveFinish,
+		ruCommProveConfirmProof,
 		ruCommProveTry,
 		ruCommProveExpandLeafs
 	]
@@ -43,7 +44,7 @@ ruRunProveStart(unit : RuUnit) -> Maybe<RuState> {
 					}
 					prover_env = ruInitProverEnv(th, math, env, None(), time_limit);
 					Some(RuState(state with 
-						prove = Some(prover_env),
+						prover = Some(RuProverState(th, prover_env)),
 						vars = setTree(state.vars, 
 							"prove-start.time", ValDouble(ruTimePassed(timer))
 						)
@@ -58,7 +59,7 @@ ruRunProveStart(unit : RuUnit) -> Maybe<RuState> {
 ruCommProveFinish = RuComm(
 	RuCommDescr(
 		"prove-finish", "prover", "finish proving a theorem", "", true, false, 
-		[], []
+		[], [],
 	),
 	ruRunProveFinish
 );
@@ -67,14 +68,67 @@ ruRunProveFinish(unit : RuUnit) -> Maybe<RuState> {
 	env = ruUnitEnv(unit);
 	state = unit.state;
 	conf = state.conf;
-	maybeMap(state.prove, \penv -> {
+	math = ruMakeMathFromSources(state.ru, env);
+	maybeMap(state.prover, \prover_state -> {
+		penv = prover_state.env;
 		if (ruVerbose(conf) > 0) {
-			env.out.onMessage(
-				"finished proving: '" + penv.descr + "', it was " + 
-				(if (ruIsProved(penv)) "PROVED" else "NOT proved")
+			env.out.onMessage("finished proving: '" + penv.descr + "', it was " + 
+				(if (ruProvedEnvIsProved(penv)) "PROVED" else "NOT proved")
 			);
 		}
-		RuState(state with prove = None());
+		RuState(state with prover = None());
+	});
+}
+
+ruCommProveConfirmProof = RuComm(
+	RuCommDescr(
+		"prove-confirm-proof", "prover", "attach a proof to a target theorem", "index", true, false, 
+		[RuCommArg("index", true, "an index of a choosen proof. -1 means automatic choice of the shortest", "-1")], []
+	),
+	ruRunProveConfirmProof
+);
+
+ruRunProveConfirmProof(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	state = unit.state;
+	task = unit.task;
+	conf = state.conf;
+	maybeMap(state.prover, \prover_state -> {
+		penv = prover_state.env;
+		theorem = prover_state.theorem;
+		index = s2i(lookupTreeDef(task.args, "index", "-1"));
+		confirm = \proof -> {
+			if (ruVerbose(conf) > 0) {
+				env.out.onMessage("proof of: '" + penv.descr + "' is confirmed");
+			}
+			proved = RuTheorem(theorem with 
+				proof = ruUpdateProofVars(RuProof(proof with steps = proof.steps), theorem, theorem)
+			);
+			math = ruMakeMathFromSources(state.ru, env);
+			new_math = ruReplaceDecl(proved, math, env);
+			RuState(state with 
+				ru = new_math.sources,
+				prover = None()
+			);
+		}
+		if (index >= length(^(penv.proofs))) {
+			if (length(^(penv.proofs)) == 0) {
+				env.out.onError("target '" + penv.descr + "'' is NOT proved", []);
+			} else {
+				env.out.onError("proof index " + i2s(index) + " is out of bounds (must be <= " + i2s(length(^(penv.proofs))) + ")", []);
+			}
+			state;
+		} else if (index < 0) {
+			switch (ruProverEnvProof(penv)) {
+				Some(proof):  confirm(proof);
+				None(): {
+					env.out.onError("target '" + penv.descr + "'' is NOT proved", []);
+					state;
+				}
+			}
+		} else {
+			confirm(^(penv.proofs)[index]);
+		}
 	});
 }
 
@@ -93,8 +147,9 @@ ruRunProveTry(unit : RuUnit) -> Maybe<RuState> {
 	conf = state.conf;
 	math = ruMakeMathFromSources(state.ru, env);
 	timer = ruMakeTimer();
-	maybeMap(state.prove,
-		\penv0 -> {
+	maybeMap(state.prover,
+		\prover_state -> {
+			penv0 = prover_state.env;
 			time_limit = s2d(lookupTreeDef(task.args, "time-limit", "-1.0"));
 			if (ruVerbose(conf) > 0) {
 				env.out.onMessage(
@@ -104,10 +159,10 @@ ruRunProveTry(unit : RuUnit) -> Maybe<RuState> {
 			}
 			penv1 = ruProve(penv0);
 			RuState(state with 
-				prove = Some(penv1),
+				prover = Some(RuProverState(prover_state with env = penv1)),
 				vars = setTree(setTree(state.vars, 
 					"prove-try.time", ValDouble(ruTimePassed(timer))),
-					"prove-try.success", ValBool(length(^(penv1.proofs)) > 0)
+					"prove.success", ValBool(length(^(penv1.proofs)) > 0)
 				)
 			);
 		}
@@ -129,8 +184,9 @@ ruRunProveExpandLeafs(unit : RuUnit) -> Maybe<RuState> {
 	conf = state.conf;
 	math = ruMakeMathFromSources(state.ru, env);
 	timer = ruMakeTimer();
-	maybeMap(state.prove,
-		\penv0 -> {
+	maybeMap(state.prover,
+		\prover_state -> {
+			penv0 = prover_state.env;
 			time_limit = s2d(lookupTreeDef(task.args, "time-limit", "-1.0"));
 			if (ruVerbose(conf) > 1) {
 				env.out.onMessage(
@@ -139,15 +195,15 @@ ruRunProveExpandLeafs(unit : RuUnit) -> Maybe<RuState> {
 				);
 			}
 			leafs = buildSet(getTreeKeys(penv0.tree.leafs));
-			penv1 = ruSetProverTactic(penv0, \tree -> 
+			penv1 = ruSetProverEnvTactic(penv0, \tree -> 
 				findInOrder(tree.leafs, \id, n -> if (containsSet(leafs, id)) Some(n) else None())
 			);
 			penv2 = ruProve(penv1);
 			RuState(state with 
-				prove = Some(penv2),
+				prover = Some(RuProverState(prover_state with env = penv2)),
 				vars = setTree(setTree(state.vars, 
 					"prove-try.time", ValDouble(ruTimePassed(timer))),
-					"prove-try.success", ValBool(length(^(penv2.proofs)) > 0)
+					"prove.success", ValBool(length(^(penv2.proofs)) > 0)
 				)
 			);
 		}
