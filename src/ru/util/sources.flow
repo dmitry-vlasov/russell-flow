@@ -1,0 +1,310 @@
+import ru/util/src;
+
+export {
+	ruSourcesMerge(s1 : Tree<int, RuSource>, s2 : Tree<int, RuSource>, env : RuEnv) -> Tree<int, RuSource>;
+	ruSourcesDecls(sources : Tree<int, RuSource>) ->Tree<int, RuDecl>;
+	ruSources2SingleSource(sources : Tree<int, RuSource>, path : string, env : RuEnv) -> RuSource;
+	ruSourceAllImported(id : int, sources : Tree<int, RuSource>) -> Set<RuSource>;
+	ruSourcesAllImported(sources : Tree<int, RuSource>, env : RuEnv) -> Tree<int, Set<int>>;
+	ruSourcesOrder(sources : Tree<int, RuSource>) -> [RuSource];
+	ruSourcesDeclNames(src : int, acc : Set<int>, sources : Tree<int, RuSource>, env : RuEnv) -> Set<int>;
+	ruSourcesRootSource(sources : Tree<int, RuSource>) -> Maybe<RuSource>;
+	ruSourcesUpdateSrcs(sources : Tree<int, RuSource>) -> Tree<int, RuSource>;
+
+	//ruSourceChangeDecl(src : RuSource, decl : RuDecl, change : RuChange, env : RuEnv) -> RuSource;
+	ruSourceSetDecl(src : RuSource, decl : RuDecl, env : RuEnv) -> RuSource;
+	ruSourceInsertDecl(src : RuSource, decl : RuDecl, ind : int, env : RuEnv) -> RuSource;
+	ruSourceAddDecl(src : RuSource, decl : RuDecl, env : RuEnv) -> RuSource;
+	ruSourceRemoveDecl(src : RuSource, decl : RuDecl, env : RuEnv) -> RuSource;
+	ruSourceReplaceDecl(src : RuSource, decl : RuDecl, env : RuEnv) -> RuSource;
+
+	ruSourcesSetDecl(sources : Tree<int, RuSource>, decl : RuDecl, env : RuEnv) -> Tree<int, RuSource>;
+	ruSourcesInsertDecl(sources : Tree<int, RuSource>, decl : RuDecl, ind : int, env : RuEnv) -> Tree<int, RuSource>;
+	ruSourcesAddDecl(sources : Tree<int, RuSource>, decl : RuDecl, env : RuEnv) -> Tree<int, RuSource>;
+	ruSourcesRemoveDecl(sources : Tree<int, RuSource>, decl : RuDecl, env : RuEnv) -> Tree<int, RuSource>;
+	ruSourcesReplaceDecl(sources : Tree<int, RuSource>, decl : RuDecl, env : RuEnv) -> Tree<int, RuSource>;
+}
+
+ruSourcesMerge(sources1 : Tree<int, RuSource>, sources2 : Tree<int, RuSource>, env : RuEnv) -> Tree<int, RuSource> {
+	mergeTreeCustom(sources1, sources2, \id, s1, s2 -> { 
+		env.out.onError("duplicate source: " + id2s(id), []);
+		s1 
+	});
+}
+
+ruSourcesDecls(sources : Tree<int, RuSource>) ->Tree<int, RuDecl> {
+	foldTree(sources, makeTree(), \__, src, acc -> 
+		fold(src.decls, acc, \ac, decl -> 
+			setTree(ac, decl.descr.id, decl)
+		)
+	);
+}
+/*
+ruAddImportToSource(src : RuSource, id : int, math : RuMath, env : RuEnv) -> RuMath {
+	if (exists(src.imports, \imp -> imp.id == id)) math else {
+		RuMath(math with 
+			sources = setTree(math.sources, src.info.id, RuSource(src with
+				imports = concat(src.imports, [RuImport(id, -1)])
+			))
+		);
+	}
+}*/
+
+ruSources2SingleSource(sources : Tree<int, RuSource>, path : string, env : RuEnv) -> RuSource {
+	module = ruTrimPath(path, env.conf, ".ru");
+	RuSource([],
+		concatA(foldTree(sources, Pair([], makeSet()), \__,src, acc ->
+			ruDoSources2SingleSource(src, sources, acc)
+		).first),
+		foldTree(sources, [], \__,src, acc ->
+			concat(acc, src.comments)
+		),
+		ruNewFileInfo(module, env.conf, ".ru")
+	);
+}
+
+ruDoSources2SingleSource(src : RuSource, sources : Tree<int, RuSource>, acc : Pair<[[RuDecl]], Set<int>>) -> Pair<[[RuDecl]], Set<int>> {
+	if (containsSet(acc.second, src.info.id)) acc else {
+		acc1 = fold(src.imports, Pair(acc.first, insertSet(acc.second, src.info.id)), 
+			\ac, imp -> {
+				switch (lookupTree(sources, imp.id)) {
+					Some(inc_src): ruDoSources2SingleSource(inc_src, sources, ac);
+					None(): ac;
+				}
+			}
+		);
+		Pair(concat(acc1.first, [src.decls]), acc1.second)
+	}
+}
+
+//ruNameAllImported(id : int, math : RuMath) -> Set<RuSource> {
+//	ruSourceAllImported(ruFindSourceId(id, math), math);
+//}
+
+ruSourceAllImported(id : int, sources : Tree<int, RuSource>) -> Set<RuSource> {
+	switch (lookupTree(sources, id)) {
+		Some(src): ruDoSourceAllImported(src, sources, makeSet());
+		None(): makeSet();
+	}
+}
+
+ruDoSourceAllImported(src : RuSource, sources : Tree<int, RuSource>, acc : Set<RuSource>) -> Set<RuSource> {
+	if (containsSet(acc, src)) acc else {
+		fold(src.imports, insertSet(acc, src), 
+			\ac, imp -> ruDoSourceAllImported(lookupTreeDef(sources, imp.id, ruNoSource), sources, ac)
+		);
+	}
+}
+
+ruSourcesAllImported(sources : Tree<int, RuSource>, env : RuEnv) -> Tree<int, Set<int>> {
+	fold(ruSourcesOrder(sources), makeTree(), \acc, src ->
+		setTree(acc, src.info.id, 
+			fold(src.imports, makeSet(), \ac, imp -> {
+				if (!containsKeyTree(acc, imp.id)) {
+					println("MISSING IMPORT!!! " + id2s(imp.id) + " in module " + id2s(src.info.id));
+					quit(0);
+				}
+				mergeSets(ac, insertSet(lookupTreeDef(acc, imp.id, makeSet()), imp.id))
+			})
+		)
+	);
+}
+
+ruSourcesOrder(sources : Tree<int, RuSource>) -> [RuSource] {
+	ruDoSourcesOrder(getTreeValues(sources), [], makeSet());
+}
+
+ruDoSourcesOrder(srcs : [RuSource], acc : [RuSource], visited: Set<int>) -> [RuSource] {
+	new_level = filter(srcs, \src -> forall(src.imports, \imp -> containsSet(visited, imp.id)));
+	level_names = buildSet(map(new_level, \src -> src.info.id));
+	if (new_level == []) {
+		if (length(srcs) == 0) acc else {
+			println("Cycilc imports detected:\n" + strIndent(strGlue(map(srcs, \src -> id2s(src.info.id)), "\n")));
+			[]
+		};
+	} else {
+		new_srcs = filter(srcs, \src -> !containsSet(level_names, src.info.id));
+		ruDoSourcesOrder(new_srcs, concat(acc, new_level), mergeSets(visited, level_names));
+	}
+}
+
+ruSourcesDeclNames(src : int, acc : Set<int>, sources : Tree<int, RuSource>, env : RuEnv) -> Set<int> {
+	ruDoSourcesDeclNames(src, Pair(acc, makeSet()), sources, env).first;
+}
+
+ruDoSourcesDeclNames(src : int, acc : Pair<Set<int>, Set<int>>, sources : Tree<int, RuSource>, env : RuEnv) -> Pair<Set<int>, Set<int>> {
+	if (containsSet(acc.second, src)) acc else {
+		eitherMap(lookupTree(sources, src), 
+			\s -> fold(s.imports, 
+				fold(s.decls, 
+					Pair(acc.first, insertSet(acc.second, src)), 
+					\ac, decl -> Pair(insertSet(ac.first, decl.descr.id), ac.second)
+				),
+				\ac, imp -> ruDoSourcesDeclNames(imp.id, ac, sources, env)
+			),
+			acc
+		);
+	}
+}
+
+ruSourcesRootSource(sources : Tree<int, RuSource>) -> Maybe<RuSource> {
+	all_sources = buildSet(getTreeKeys(sources));
+	only_imports = filtermap(getTreeValues(sources), \src -> 
+		if (src.decls != [] || src.imports == []) None() else {
+			Some(Pair(src, buildSet(map(src.imports, \imp -> imp.id))));
+		}
+	);
+	maybeMap(
+		find(only_imports, \pair ->
+			equalSet(pair.second, removeSet(all_sources, pair.first.info.id))
+		),
+		\pair -> pair.first
+	);
+}
+
+ruSourcesUpdateSrcs(sources : Tree<int, RuSource>) -> Tree<int, RuSource> {
+	mapTree(sources, \src -> {
+		id = src.info.id;
+		RuSource(src with 
+			decls = map(src.decls, \decl -> 
+				ruSetDeclDescr(decl, RuDescr(decl.descr with src = id))
+			)
+		);
+	});
+}
+/*
+ruSourceChangeDecl(src : RuSource, decl : RuDecl, change : RuChange, env : RuEnv) -> RuSource {
+	ind = ruIndexOfDecl(decl.descr.id, src);
+	if (ind >= 0) {
+		RuSource(src with decls = replace(src.decls, ind, decl));
+	} else {
+		RuSource(src with decls = concat(src.decls, [decl]));
+	}
+}*/
+
+ruSourceSetDecl(src : RuSource, decl : RuDecl, env : RuEnv) -> RuSource {
+	ind = ruIndexOfDecl(decl.descr.id, src);
+	if (ind >= 0) {
+		RuSource(src with decls = replace(src.decls, ind, decl));
+	} else {
+		RuSource(src with decls = concat(src.decls, [decl]));
+	}
+}
+
+ruSourceInsertDecl(src : RuSource, decl : RuDecl, ind : int, env : RuEnv) -> RuSource {
+	if (ind < 0 || ind > length(src.decls)) {
+		env.out.onError(
+			"ruSourceInsertDecl: trying to insert decl '" + id2s(decl.descr.id) + "' into a illegal index: " + i2s(ind), 
+			[ruDeclPlace(decl)]
+		);
+		src;
+	} else {
+		RuSource(src with decls = insertArray(src.decls, ind, decl));
+	}
+}
+
+ruSourceAddDecl(src : RuSource, decl : RuDecl, env : RuEnv) -> RuSource {
+	RuSource(src with decls = concat(src.decls, [decl]));
+}
+
+ruSourceRemoveDecl(src : RuSource, decl : RuDecl, env : RuEnv) -> RuSource {
+	ind = ruIndexOfDecl(decl.descr.id, src);
+	if (ind >= 0) {
+		RuSource(src with decls = removeIndex(src.decls, ind));
+	} else {
+		env.out.onError(
+			"ruSourceRemoveDecl: trying to remove decl '" + id2s(decl.descr.id) + "' which is absent", 
+			[ruDeclPlace(decl)]
+		);
+		src;
+	}
+}
+
+ruSourceReplaceDecl(src : RuSource, decl : RuDecl, env : RuEnv) -> RuSource {
+	ind = ruIndexOfDecl(decl.descr.id, src);
+	if (ind >= 0) {
+		RuSource(src with decls = replace(src.decls, ind, decl));
+	} else {
+		env.out.onError(
+			"ruSourceReplaceDecl: trying to replace decl '" + id2s(decl.descr.id) + "' which is absent", 
+			[ruDeclPlace(decl)]
+		);
+		src;
+	}
+}
+
+ruSourcesSetDecl(sources : Tree<int, RuSource>, decl : RuDecl, env : RuEnv) -> Tree<int, RuSource> {
+	switch (lookupTree(sources, decl.descr.src)) {
+		Some(src): {
+			setTree(sources, decl.descr.src, ruSourceSetDecl(src, decl, env));
+		}
+		None(): {
+			env.out.onError(
+				"ruSourcesSetDecl: source '" + id2s(decl.descr.src) + "' of decl '" + id2s(decl.descr.id) + "' is not found", 
+				[]
+			);
+			sources;
+		}
+	}
+}
+
+ruSourcesAddDecl(sources : Tree<int, RuSource>, decl : RuDecl, env : RuEnv) -> Tree<int, RuSource> {
+	switch (lookupTree(sources, decl.descr.src)) {
+		Some(src): {
+			setTree(sources, decl.descr.src, ruSourceAddDecl(src, decl, env));
+		}
+		None(): {
+			ruCrash("ruSourcesAddDecl: source '" + id2s(decl.descr.src) + "' of decl '" + id2s(decl.descr.id) + "' is not found");
+			env.out.onError(
+				"ruSourcesAddDecl: source '" + id2s(decl.descr.src) + "' of decl '" + id2s(decl.descr.id) + "' is not found", 
+				[]
+			);
+			sources;
+		}
+	}
+}
+
+ruSourcesInsertDecl(sources : Tree<int, RuSource>, decl : RuDecl, ind : int, env : RuEnv) -> Tree<int, RuSource> {
+	switch (lookupTree(sources, decl.descr.src)) {
+		Some(src): {
+			setTree(sources, decl.descr.src, ruSourceInsertDecl(src, decl, ind, env));
+		}
+		None(): {
+			env.out.onError(
+				"ruSourcesInsertDecl: source '" + id2s(decl.descr.src) + "' of decl '" + id2s(decl.descr.id) + "' is not found", 
+				[]
+			);
+			sources;
+		}
+	}
+}
+
+ruSourcesRemoveDecl(sources : Tree<int, RuSource>, decl : RuDecl, env : RuEnv) -> Tree<int, RuSource> {
+	switch (lookupTree(sources, decl.descr.src)) {
+		Some(src): {
+			setTree(sources, decl.descr.src, ruSourceRemoveDecl(src, decl, env));
+		}
+		None(): {
+			env.out.onError(
+				"ruSourcesRemoveDecl: source '" + id2s(decl.descr.src) + "' of decl '" + id2s(decl.descr.id) + "' is not found", 
+				[]
+			);
+			sources;
+		}
+	}
+}
+
+ruSourcesReplaceDecl(sources : Tree<int, RuSource>, decl : RuDecl, env : RuEnv) -> Tree<int, RuSource> {
+	switch (lookupTree(sources, decl.descr.src)) {
+		Some(src): {
+			setTree(sources, decl.descr.src, ruSourceReplaceDecl(src, decl, env));
+		}
+		None(): {
+			env.out.onError(
+				"ruSourcesReplaceDecl: source '" + id2s(decl.descr.src) + "' of decl '" + id2s(decl.descr.id) + "' is not found", 
+				[]
+			);
+			sources;
+		}
+	}
+}
