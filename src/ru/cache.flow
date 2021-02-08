@@ -3,6 +3,7 @@ import formats/lsp;
 import base/util/concurrent;
 import base/log;
 import ru/util/utils;
+import ru/cache/code;
 
 export {
 	RuCachedSource(
@@ -14,12 +15,6 @@ export {
 	RuCachedDecl(
 		decl : RuDecl,
 		info : RuFileInfo
-	);
-
-	// Cached source code.
-	RuCachedSourceText(
-		text : string,
-		modified : double
 	);
 
 	ruToMemCache(src : RuSource, env : RuEnv) -> void;
@@ -46,13 +41,6 @@ export {
 	ruCachedAssertoins() -> Tree<string, RuAssertion>;
 	ruCachedTheoremAxioms() -> Tree<string, Set<string>>;
 
-	// Lookups a cached file source, if not found - loads and stores.
-	ruFileSource(path : string) -> string;
-	// Stores a certain string as a source for some path.
-	ruSetFileSource(path : string, src : string) -> void;
-	// Loads file source from filesystem. May be used to undo fcSetFileSource function.
-	ruLoadFileSource(path : string) -> void;
-
 	ruRange2LspLocation(range : RuRange, path : string) -> LspLocation;
 	ruRange2s(path : string, range : RuRange, msg : string) -> string;
 	ruRangeWithResolver2s(path : string, range : RuRange, msg : string, resolver : LineResolver) -> string;
@@ -64,14 +52,12 @@ export {
 	// Declaration statistics
 	ruDeclInfo(mode : [string], env : RuEnv) -> string;
 
-	ruDeclRange(d : RuDecl, src : RuSource) -> RuRange;
 }
 
 ruCacheVersion = 5;
 
 ruSourceCache = initConcurrentHashMap();
 ruNameCache = initConcurrentHashMap();
-ruTextCache = initConcurrentHashMap(); // Sources of files as strings
 ruDefCache = initConcurrentHashMap();  // Definitions
 
 ruClearCache(env : RuEnv) -> void {
@@ -82,7 +68,7 @@ ruClearCache(env : RuEnv) -> void {
 ruClearMemCache() -> void {
 	clearConcurrentHashMap(ruSourceCache);
 	clearConcurrentHashMap(ruNameCache);
-	clearConcurrentHashMap(ruTextCache);
+	ruClearSourceCodeCache();
 	clearConcurrentHashMap(ruDefCache);
 }
 
@@ -233,14 +219,17 @@ ruToDiskCache(s : RuSource, env : RuEnv) -> void {
 ruFromCache(id : int, env : RuEnv) -> Maybe<RuCachedSource> {
 	ret = if (lookupTreeDef(env.conf.opts, "caching", "") == "0") None() else {
 		file = ruTrimPath(id2s(id), env.conf, ".ru");
-		cached = switch (ruFromMemoryCache(file, env)) {
-			Some(cached): Some(cached);
+		switch (ruFromMemoryCache(file, env)) {
+			Some(cached): {
+				Some(cached);
+			}
 			None(): {
 				path = ruCachedPath(file, env.conf);
-				ruFromDiskCache(file, path, env);
+				cached = ruFromDiskCache(file, path, env);
+				ruCheckCachedIntegrity(file, cached, env);
 			}
 		}
-		ruCheckCachedIntegrity(file, cached, env);
+		
 	}
 	/*switch (ret) {
 		Some(cached): println("LOADED from cache: " + cached.source.info.path);
@@ -317,12 +306,14 @@ ruFromMemoryCache(file : string, env : RuEnv) -> Maybe<RuCachedSource> {
 }
 
 ruLoadToMemCache(file : string,  env : RuEnv) -> void {
-	module = ruTrimPath(file, env.conf, ".ru");
-	//ruServerLog("ruLoadToCache: started file: " + file + ", module: " + module, env.conf);
-	sources = ruDoLoadToCache(s2id(module), env, [], makeSet()).first;
-	//ruDebugLog1("ruLoadToCache: sources are loaded " + file);
-	iter(sources, \src -> ruUpdateDefCache(src, env));
-	//ruDebugLog1("ruLoadToCache: finished " + file);
+	if (!containsConcurrentHashMap(ruSourceCache, file)) {
+		module = ruTrimPath(file, env.conf, ".ru");
+		//ruServerLog("ruLoadToCache: started file: " + file + ", module: " + module, env.conf);
+		sources = ruDoLoadToCache(s2id(module), env, [], makeSet()).first;
+		//ruDebugLog1("ruLoadToCache: sources are loaded " + file);
+		iter(sources, \src -> ruUpdateDefCache(src, env));
+		//ruDebugLog1("ruLoadToCache: finished " + file);
+	}
 }
 
 ruDoLoadToCache(module : int,  env : RuEnv, acc : [RuSource], visited : Set<int>) -> Pair<[RuSource], Set<int>> {
@@ -370,7 +361,7 @@ ruDeleteFromCache(file : string, path : string, env : RuEnv) -> void {
 			env.out.onMessage("\tDeleting cached " + file);
 		}
 		// Remove from the source code (string) cache
-		removeConcurrentHashMap(ruTextCache, file);
+		ruRemoveFileSourceCode(file);
 		// Remove from the source (RuSource) cache
 		if (lookupTreeDef(env.conf.opts, "mem-caching", "") != "0") {
 			removeConcurrentHashMap(ruSourceCache, file);
@@ -416,37 +407,8 @@ ruCachedAssertoins() -> Tree<string, RuAssertion> {
 	);
 }
 
-ruFileSource(path : string) -> string {
-	if (!containsConcurrentHashMap(ruTextCache, path)) {
-		setConcurrentHashMap(ruTextCache, path, RuCachedSourceText(getFileContent(path), fileModified(path)));
-	}
-	cached = getConcurrentHashMap(ruTextCache, path, RuCachedSourceText("", 0.0));
-	modified = fileModified(path);
-	if (cached.modified != modified) {
-		// Reload outdated source.
-		text = getFileContent(path);
-		setConcurrentHashMap(ruTextCache, path, RuCachedSourceText(text, modified));
-		text;
-	} else {
-		cached.text;
-	}
-}
-
-ruSetFileSource(path : string, text : string) -> void {
-	if (!containsConcurrentHashMap(ruTextCache, path)) {
-		setConcurrentHashMap(ruTextCache, path, RuCachedSourceText(text, fileModified(path)));
-	} else {
-		cached = getConcurrentHashMap(ruTextCache, path, RuCachedSourceText("", 0.0));
-		setConcurrentHashMap(ruTextCache, path, RuCachedSourceText(text, cached.modified));
-	}
-}
-
-ruLoadFileSource(path : string) -> void {
-	setConcurrentHashMap(ruTextCache, path, RuCachedSourceText(getFileContent(path), fileModified(path)));
-}
-
 ruRange2LspLocation(range : RuRange, path : string) -> LspLocation {
-	code = ruFileSource(path);
+	code = ruFileSourceCode(path);
 	resolver = makeLineResolver(code);
 	s = findLine(resolver, range.start);
 	if (range.end < 0) {
@@ -471,7 +433,7 @@ ruRange2LspLocation(range : RuRange, path : string) -> LspLocation {
 
 ruRange2s(path : string, range : RuRange, msg : string) -> string {
 	if (path == "") "" else {
-		code = ruFileSource(path);
+		code = ruFileSourceCode(path);
 		resolver = makeLineResolver(code);
 		s = findLine(resolver, range.start);
 		if (range.end < 0) {
@@ -500,7 +462,7 @@ ruCachedDecl2s(name : string, env : RuEnv) -> string {
 		filtermap(ruCachedDecl(name), \d -> 
 			maybeMap(ruFromCache(d.info.id, env), \cached -> {
 				range = ruDeclRange(d.decl, cached.source);
-				text = ruFileSource(cached.source.info.path);
+				text = ruFileSourceCode(cached.source.info.path);
 				ruTrimAll(substring(text, range.start, range.end - range.start))
 			})
 		), "\n"
@@ -532,11 +494,13 @@ ruCacheInfo(full : bool) -> string {
 	ret = 
 	"cached sources: " + i2s(sizeConcurrentHashMap(ruSourceCache)) + "\n" +
 	"cached names: " + i2s(sizeConcurrentHashMap(ruNameCache)) + "\n" +
-	"cached source texts: " + i2s(sizeConcurrentHashMap(ruTextCache)) + "\n" +
+	//"cached source texts: " + i2s(sizeConcurrentHashMap(ruTextCache)) + "\n" +
+	ruSourceCodeCacheInfo(false) + "\n" +
 	"cached definitions: " + i2s(sizeConcurrentHashMap(ruDefCache)) + "\n" +
 	if (!full) "" else {
-		"cached sources:\n" + strGlue(map(keysConcurrentHashMap(ruSourceCache), \n -> "\t" + n), "\n") + "\n"
-		"cached source texts:\n" + strGlue(map(keysConcurrentHashMap(ruTextCache), \n -> "\t" + n),"\n") + "\n"
+		"cached sources:\n" + strGlue(map(keysConcurrentHashMap(ruSourceCache), \n -> "\t" + n), "\n") + "\n" + 
+		//"cached source texts:\n" + strGlue(map(keysConcurrentHashMap(ruTextCache), \n -> "\t" + n),"\n") + "\n"
+		ruSourceCodeCacheInfo(true) + "\n" +
 		"cached definitions:\n" + strGlue(map(keysConcurrentHashMap(ruDefCache), \n -> "\t" + n),"\n")
 	};
 	//ruDebugLog1("ruCacheInfo:\n" + ret);
@@ -595,6 +559,7 @@ ruDeclInfo(mode : [string], env : RuEnv) -> string {
 	} else "");
 }
 
+/*
 ruDeclRange(d : RuDecl, src : RuSource) -> RuRange {
 	ind = ruIndexOfDecl(d.descr.id, src);
 	if (ind < 0) RuRange(-1, -1) else {
@@ -612,7 +577,7 @@ ruDeclRange(d : RuDecl, src : RuSource) -> RuRange {
 		}
 	}
 }
-
+*/
 ruCachedTheoremAxioms() -> Tree<string, Set<string>> {
 	assertions = ruCachedAssertoins();
 	foldTree(assertions, makeTree(), \name, __, acc -> ruDoCachedTheoremAxioms(assertions, name, acc));
