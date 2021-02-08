@@ -1,0 +1,206 @@
+import ru/util/src;
+
+export {
+	ruProofQedStep(proof : RuProof) -> RuStep;
+	ruIndexOfDecl(id : int, src : RuSource) -> int;
+
+	// In case a declaration has comments before it, we take the start position of a first
+	// comment right before the declaration. Otherwise the position of decl itself.
+	ruStartPosition(decl : RuDecl) -> int;
+
+	ruUpdateTheoremVars(theorem : RuTheorem) -> RuTheorem;
+	ruUpdateProofVars(proof : RuProof, th_new : RuTheorem, th_old : RuTheorem) -> RuProof;
+
+	ruSrc2Blocks(src : RuSource) -> [RuBlock];
+	ruBclocks2Src(src : RuSource, blocks : [RuBlock]) -> RuSource;
+	ruBlockId(block : RuBlock) -> int;
+
+	ruSetDeclDescr(decl : RuDecl, descr : RuDescr) -> RuDecl;
+	ruSetDeclComments(decl : RuDecl, comms : [RuComment]) -> RuDecl;
+	ruModifyAnnotation(decl : RuDecl, modify : (JsonObject) -> JsonObject) -> RuDecl;
+
+	ruMakeSuperRule(super : int, infer : int, src : int, pos : int) -> RuRule;
+	ruFixLeftRecursiveRule(r : RuRule) -> RuRule;
+
+	ruSourceTheorems(src : RuSource) -> [RuTheorem];
+}
+
+ruProofQedStep(proof : RuProof) -> RuStep {
+	proof.steps[length(proof.steps) - 1];
+}
+
+ruIndexOfDecl(id : int, src : RuSource) -> int {
+	findiDef(src.decls, 
+		\decl -> switch (decl) {
+			RuConst(d,__,__):      d.id == id;
+			RuType(d,__):          d.id == id;
+			RuRule(d,__,__):       d.id == id;
+			RuAxiom(d,__):         d.id == id;
+			RuTheorem(d,__,__,__): d.id == id;
+			RuDef(d,__,__,__):     d.id == id;
+		},
+		-1
+	)
+}
+
+ruStartPosition(decl : RuDecl) -> int {
+	if (decl.descr.comments == []) decl.descr.pos else {
+		lastElement(decl.descr.comments, ruNoComment).pos;
+	}
+}
+
+ruUpdateProofVars(proof : RuProof, th_new : RuTheorem, th_old : RuTheorem) -> RuProof {
+	proof_vars = ruProof2Vars(proof);
+	RuProof(proof with
+		vars = filterTree(
+			mergeTree(proof.vars, th_old.stat.vars), 
+			\__,v -> 
+				containsSet(proof_vars, v) && 
+				!containsKeyTree(th_new.stat.vars, v.id)
+		),
+		disjs = filterSet(
+			mergeSets(proof.disjs, th_old.stat.disjs), 
+			\d -> 
+				containsSet(proof_vars, d.v1) && 
+				containsSet(proof_vars, d.v2) &&
+				!containsSet(th_new.stat.disjs, d)
+		)
+	);
+}
+
+ruUpdateTheoremVars(th_old : RuTheorem) -> RuTheorem {
+	ass_vars = ruAssertion2Vars(th_old);
+	th_new = RuTheorem(th_old with 
+		stat = RuStatement(th_old.stat with
+			vars = filterTree(th_old.stat.vars, \__,v -> containsSet(ass_vars, v)),
+			disjs = filterSet(th_old.stat.disjs, \d -> containsSet(ass_vars, d.v1) && containsSet(ass_vars, d.v2))
+		)
+	);
+	RuTheorem(th_new with
+		proof = ruUpdateProofVars(th_new.proof, th_new, th_old)
+	);
+}
+
+ruSrc2Blocks(src : RuSource) -> [RuBlock] {
+	comms2blocks = \comms -> map(comms, \comm -> cast(comm : RuComment -> RuBlock));
+	concat(
+		comms2blocks(src.comments),
+		fold(src.decls, [], \acc, decl ->
+			concat3(acc, comms2blocks(decl.descr.comments), [cast(decl : RuDecl -> RuBlock)])
+		)
+	);
+}
+
+RuBclocks2SrcAcc(
+	decls : [RuDecl],
+	comms : [RuComment]
+);
+
+ruSetDeclComments(decl : RuDecl, comms : [RuComment]) -> RuDecl {
+	switch (decl) {
+		RuConst(__,__,__):
+			RuConst(decl with descr = RuDescr(decl.descr with comments = comms));
+		RuType(__,__):
+			RuType(decl with descr = RuDescr(decl.descr with comments = comms));
+		RuRule(__,__,__):
+			RuRule(decl with descr = RuDescr(decl.descr with comments = comms));
+		RuAxiom(__,__):
+			RuAxiom(decl with descr = RuDescr(decl.descr with comments = comms));
+		RuTheorem(__,__,__,__):
+			RuTheorem(decl with descr = RuDescr(decl.descr with comments = comms));
+		RuDef(__,__,__,__):
+			RuDef(decl with descr = RuDescr(decl.descr with comments = comms));
+	}
+}
+
+ruBclocks2Src(src : RuSource, blocks : [RuBlock]) -> RuSource {
+	accum = fold(blocks, RuBclocks2SrcAcc([], []), \acc, block ->
+		switch (block) {
+			RuComment(__,__,__): 
+				RuBclocks2SrcAcc(acc.decls, concat(acc.comms, [block]));
+			RuDecl(): {
+				RuBclocks2SrcAcc(
+					concat(acc.decls, [ruSetDeclComments(block, acc.comms)]), 
+					[]
+				);
+			}
+		}
+	);
+	RuSource(src with 
+		comments = accum.comms,
+		decls = accum.decls
+	);
+}
+
+ruBlockId(block : RuBlock) -> int {
+	switch (block) {
+		RuConst(d,__,__):      d.id;
+		RuType(d,__):          d.id;
+		RuRule(d,__,__):       d.id;
+		RuAxiom(d,__):         d.id;
+		RuDef(d,__,__,__):     d.id;
+		RuTheorem(d,__,__,__): d.id;
+		RuComment(text,__,__): s2id("<comment>");
+	}
+}
+
+ruSetDeclDescr(decl : RuDecl, descr : RuDescr) -> RuDecl {
+	switch (decl) {
+		RuConst(__,__,__):      RuConst(decl with descr = descr);
+		RuType(__,__):          RuType(decl with descr = descr);
+		RuRule(__,__,__):       RuRule(decl with descr = descr);
+		RuAxiom(__,__):         RuAxiom(decl with descr = descr);
+		RuDef(__,__,__,__):     RuDef(decl with descr = descr);
+		RuTheorem(__,__,__,__): RuTheorem(decl with descr = descr);
+	}
+}
+
+ruModifyAnnotation(decl : RuDecl, modify : (JsonObject) -> JsonObject) -> RuDecl {
+	old_annotation = JsonObject(fold(decl.descr.comments, [], \acc, comm -> concat(acc, comm.annotation.members)));
+	new_annotation = modify(old_annotation);
+	num_comments = length(decl.descr.comments);
+	comments_modified = if (num_comments == 0) {
+		if (new_annotation == JsonNull()) [] else
+		[RuComment("", new_annotation, -1)];
+	} else {
+		mapi(decl.descr.comments, \i, comm ->
+			if (i + 1 == num_comments) {
+				RuComment(comm with annotation = new_annotation)
+			} else {
+				RuComment(comm with annotation = JsonObject([]))
+			}
+		);
+	}
+	ruSetDeclDescr(decl, RuDescr(decl.descr with comments = comments_modified));
+}
+
+ruMakeSuperRule(super : int, infer : int, src : int, pos : int) -> RuRule {
+	id = ruSuperTypeName(super, infer);
+	x = RuVar(s2id("x"), infer);
+	RuRule(
+		RuDescr(id, src, [], pos),
+		makeTree1(x.id, x), 
+		RuTerm(super, [x], pos)
+	);
+}
+
+ruFixLeftRecursiveRule(r : RuRule) -> RuRule { 
+	if (length(r.term.nodes) <= 1) r else {
+		switch (r.term.nodes[0]) {
+			RuVar(__,__):
+				RuRule(r with term = RuTerm(r.term with nodes = 
+					concat3([RuConstRef(s2id("("))], r.term.nodes, [RuConstRef(s2id(")"))])
+				));
+			default: r;
+		}
+	}
+}
+
+ruSourceTheorems(src : RuSource) -> [RuTheorem] {
+	filtermap(src.decls, \decl -> 
+		switch (decl) {
+			RuTheorem(__,__,__,__): Some(decl);
+			default: None();
+		}
+	)
+}
