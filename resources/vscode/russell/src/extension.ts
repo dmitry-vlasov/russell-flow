@@ -255,6 +255,7 @@ function processRussell(uri : vscode.Uri, target : string, action : string): voi
 		command : "command", 
 		arguments: [
 			"read file=" + uri.fsPath + ";\n" +
+			"conf verbose=1;\n" + 
 			action + " target=" + target + ";"
 		] 
 	});
