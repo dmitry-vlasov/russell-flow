@@ -1,0 +1,110 @@
+import text/binary;
+import ru/util/src;
+
+export {
+	ruDiskCacheFiles(env : RuEnv) -> [string];
+	ruDiskCacheMakeDir(env : RuEnv) -> void;
+	ruDiskCacheClear(env : RuEnv) -> void;
+	ruDiskCacheSave(src : RuSource, env : RuEnv) -> void;
+	ruDiskCacheDelete(id : int, env : RuEnv) -> void;
+	ruDiskCacheLoad(id : int, env : RuEnv) -> Maybe<RuSource>;
+
+	ruDiskCacheInfo(full : bool, env : RuEnv) -> string;
+}
+
+ruCacheVersion = 5;
+
+RuCachedFileSource(
+	source : RuSource,
+	version : int
+);
+
+ruDiskCacheMakeDir(env : RuEnv) -> void {
+	err = ensureDirectoryExists(ruCacheDir(env.conf));
+	if (err != "") {
+		env.out.onMessage(err);
+	}
+}
+
+ruDiskCacheFiles(env : RuEnv) -> [string] {
+	cache_dir = ruCacheDir(env.conf);
+	dir_content = readDirectory(cache_dir);
+	filtermap(readDirectory(cache_dir), \file -> 
+		if (!endsWith(file, ".cache")) None() else {
+			Some(cache_dir + "/" + file);
+		}
+	);
+}
+
+ruDiskCacheClear(env : RuEnv) -> void {
+	iter(ruDiskCacheFiles(env), \file -> {
+		err = deleteFile(file);
+		if (err != "") {
+			env.out.onError("while deleting a cache file '" + file + "' happened: '" + err + "'", []);
+		}
+	});
+}
+
+ruDiskCacheSave(s : RuSource, env : RuEnv) -> void {
+	src = RuSource(s with info = ruUpdateFileInfo(s.info, env.conf.workingDir));
+	binary = toBinary(RuCachedFileSource(src, ruCacheVersion));
+	if (!setFileContent(ruCachedPath(src.info.module, env.conf), binary)) {
+		env.out.onError("cannot save cached source '" + src.info.module + "'", []);
+	}
+	if (ruVerbose(env.conf) > 1) {
+		env.out.onMessage("\tsaved to cache: '" + src.info.module + "'");
+	}
+}
+
+ruDiskCacheLoad(id : int, env : RuEnv) -> Maybe<RuSource> {
+	if (lookupTreeDef(env.conf.opts, "disk-caching", "") == "0") None() else {
+		file = id2s(id);
+		path = ruCachedPath(file, env.conf);
+		if (!fileExists(path)) None() else {
+			serialized = getFileContent(path);
+			deserialized = deserializeBinary(serialized, IllegalStruct());
+			if (deserialized == IllegalStruct()) {
+				env.out.onError("WARNING: Illegal structure of cache file for '" + file + "'. Incremental file deleted.\n\n" + serialized + "\n\n", []);
+				ruDiskCacheDelete(id, env);
+				None();
+			} else {
+				cached = cast(deserialized : flow -> RuCachedFileSource);
+				if (cached.version == ruCacheVersion) {
+					src = cached.source;
+					changed = ruFileChangedMessage(src.info);
+					if (changed == "") Some(src) else None();
+				} else {
+					if (ruVerbose(env.conf) > 1) {
+						env.out.onMessage("\tcached file " + file + " has outdated version " + i2s(cached.version) + " while current version is " + i2s(ruCacheVersion));
+						ruDiskCacheDelete(id, env);
+					}
+					None();
+				}
+			}
+		}
+	}
+}
+
+ruDiskCacheDelete(id : int, env : RuEnv) -> void {
+	if (lookupTreeDef(env.conf.opts, "disk-caching", "") != "0") {
+		file = id2s(id);
+		path = ruCachedPath(file, env.conf);
+		if (!fileExists(path)) {
+			env.out.onMessage("source '" + file + "' is not cached on filesystem");
+		} else {
+			err = deleteFile(path);
+			if (err != "") {
+				env.out.onMessage("error wile deleting source '" + file + "': " + err);
+			}
+		}
+	}
+}
+
+ruDiskCacheInfo(full : bool, env : RuEnv) -> string {
+	cached = ruDiskCacheFiles(env);
+	if (!full) {
+		"filesystem cache: " + i2s(length(cached))
+	} else {
+		"filesystem cache:\n" + strGlue(map(cached, \n -> "\t" + n), "\n")
+	};
+}

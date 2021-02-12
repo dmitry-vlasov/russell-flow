@@ -1,6 +1,6 @@
 import comm;
 import ru/util/vol;
-import ru/cache;
+import ru/cache/cache;
 
 export {
 	ruInfoCommands : [RuComm];
@@ -41,13 +41,17 @@ ruRunInfoDecl(unit : RuUnit) -> Maybe<RuState> {
 	line = s2i(lookupTreeDef(task.args, "line", "-1"));
 	col = s2i(lookupTreeDef(task.args, "col", "-1"));
 	name = ruNameByLineCol(line, col, getFileContent(file));
-	maybeApply(ruCachedDecl(name), \d ->
-		maybeApply(ruFromCache(d.info.id, env), \cached -> {
-			path = cached.source.info.path;
+	maybeApply(ruDeclCacheGet(s2id_(name)), \decl ->
+		maybeApply(ruCacheGet(decl.descr.src, env), \cached -> 
 			env.out.onMessage(
-				ruRange2s(ruDeclRange(d.decl, cached.source), "declaration of " + name, path, ruFileSourceCode(path))
+				ruRange2s(
+					ruDeclRange(decl, cached, env), 
+					"declaration of " + name, 
+					cached.info.path, 
+					ruCodeCacheGet(decl.descr.src, env).code
+				)
 			)
-		})
+		)
 	);
 	Some(state);
 }
@@ -70,20 +74,20 @@ ruRunInfoHover(unit : RuUnit) -> Maybe<RuState> {
 	state = unit.state;
 	conf = state.conf;
 	file = lookupTreeDef(task.args, "file", "");
-	file_id = s2id(ruTrimPath(file, conf, ".ru"));
+	file_id = ruFileId(file, conf);
 	line = s2i(lookupTreeDef(task.args, "line", "-1"));
 	col = s2i(lookupTreeDef(task.args, "col", "-1"));
-	code = ruFileSourceCode(file);
+	code = ruCodeCacheGet(file_id, env).code;
 	name = ruNameByLineCol(line, col, code);
 	do_hover = \nm -> {
-		env.out.onMessage(ruCachedDecl2s(nm, env));
+		env.out.onMessage(ruCachedDecl2s(s2id_(nm), env));
 		Some(state);
 	}
-	switch (ruFromCache(file_id, env)) {
+	switch (ruCacheGet(file_id, env)) {
 		Some(cached): {
 			resolver = makeLineResolver(code);
 			pos = findLineIndex(resolver, line, col);
-			posTree = ruPositionsTree(cached.source);
+			posTree = ruPositionsTree(cached);
 			positions = getTreeKeys(posTree);
 			switch (treeIntervalSearch(posTree, pos)) {
 				Some(x): {
@@ -149,14 +153,18 @@ ruRunInfoFind(unit : RuUnit) -> Maybe<RuState> {
 	state = unit.state;
 	conf = state.conf;
 	name = lookupTreeDef(task.args, "name", "");
-	switch (ruCachedDecl(name)) {
-		Some(d): {
-			maybeApply(ruFromCache(d.info.id, env), \cached -> {
-				path = cached.source.info.path;
+	switch (ruDeclCacheGet(s2id_(name))) {
+		Some(decl): {
+			maybeApply(ruCacheGet(decl.descr.src, env), \cached ->
 				env.out.onMessage(
-					ruRange2s(ruDeclRange(d.decl, cached.source), "declaration of " + name, path, ruFileSourceCode(path))
+					ruRange2s(
+						ruDeclRange(decl, cached, env), 
+						"declaration of " + name, 
+						cached.info.path, 
+						ruCodeCacheGet(cached.info.id, env).code
+					)
 				)
-			})
+			)
 		}
 		None(): {
 			env.out.onMessage("Declaration '" + name + "' is not found");
@@ -179,7 +187,7 @@ ruRunInfoSymbol(unit : RuUnit) -> Maybe<RuState> {
 	state = unit.state;
 	conf = state.conf;
 	name = lookupTreeDef(task.args, "name", "");
-	maybeApply(ruCachedDecl2LspSymbolInfo(name, env), \info -> {
+	maybeApply(ruCachedDecl2LspSymbolInfo(s2id_(name), env), \info -> {
 		json = JsonArray([lspSymbolInformation2Json(info)]);
 		env.out.onMessage(json2string(json));
 	});
@@ -200,9 +208,8 @@ ruRunInfoSource(unit : RuUnit) -> Maybe<RuState> {
 	state = unit.state;
 	conf = state.conf;
 	name = lookupTreeDef(task.args, "name", "");
-	switch (ruFromCache(s2id(name), env)) {
-		Some(cached): {
-			src = cached.source;
+	switch (ruCacheGet(s2id_(name), env)) {
+		Some(src): {
 			env.out.onMessage("Source '" + name + "' decls (" + i2s(length(src.decls)) + "):\n" +
 				strGlue(map(src.decls, \d -> "\t" + ruDeclKind(d) + " " + id2s(d.descr.id)), "\n")
 			);
@@ -229,7 +236,7 @@ ruRunInfoShow(unit : RuUnit) -> Maybe<RuState> {
 	conf = state.conf;
 	math = ruMathFromSources(state.ru, env);
 	name = lookupTreeDef(task.args, "name", "");
-	switch (ruFindDecl(s2id(name), math.decls, env)) {
+	switch (ruFindDecl(s2id_(name), math.decls, env)) {
 		Some(decl): {
 			env.out.onMessage(ru2s(decl, math));
 		}
@@ -254,9 +261,8 @@ ruRunInfoOutline(unit : RuUnit) -> Maybe<RuState> {
 	state = unit.state;
 	conf = state.conf;
 	file = lookupTreeDef(task.args, "file", "");
-	maybeApply(ruFromCache(s2id(file), env), \cached -> {
-		src = cached.source;
-		code = ruFileSourceCode(src.info.path);
+	maybeApply(ruCacheGet(s2id_(file), env), \src -> {
+		code = ruCodeCacheGet(src.info.id, env).code;
 		resolver = makeLineResolver(code);
 		iter(src.imports, \imp -> 
 			maybeApply(ruNameRangeByPos(imp.pos, code), \range -> 
@@ -287,18 +293,18 @@ ruRunInfoUses(unit : RuUnit) -> Maybe<RuState> {
 	state = unit.state;
 	conf = state.conf;
 	name = lookupTreeDef(task.args, "name", "");
-	maybeApply(ruCachedDecl(name), \decl ->
-		maybeApply(ruFromCache(decl.info.id, env), \cached ->
-			iter(ruSourcesCache(), \s -> { 
+	maybeApply(ruDeclCacheGet(s2id_(name)), \decl ->
+		maybeApply(ruCacheGet(decl.descr.src, env), \cached ->
+			iter(ruSourceCacheAll(env), \s -> { 
 				iter(s.decls, \d ->
 					switch (d) {
 						RuTheorem(__,__,__,proof):
 							iter(proof.steps, \step ->
 								if (id2s(step.assertion) == name) {
-									code = ruFileSourceCode(s.info.path);
+									code = ruCodeCacheGet(s.info.id, env).code;
 									maybeApply(ruNameRangeByPos(step.pos, code),
 										\range -> 
-											env.out.onMessage(ruRange2s(range, "uses " + name, cached.source.info.path, code))
+											env.out.onMessage(ruRange2s(range, "uses " + name, cached.info.path, code))
 									);
 								}
 							);
@@ -326,8 +332,8 @@ ruRunInfoMath(unit : RuUnit) -> Maybe<RuState> {
 	conf = state.conf;
 	kind = lookupTreeDef(task.args, "kind", "");
 	info = JsonArray(filtermap(
-		filter(ruCachedDecls(), \cached ->
-			switch (cached.decl) {
+		filter(ruDeclCacheAll(), \decl ->
+			switch (decl) {
 				RuConst(__,__,__):      kind == "const" || kind == "";
 				RuType(__,__):          kind == "type"  || kind == "";
 				RuRule(__,__,__):       kind == "rule"  || kind == "";
@@ -336,18 +342,18 @@ ruRunInfoMath(unit : RuUnit) -> Maybe<RuState> {
 				RuTheorem(__,__,__,__): kind == "theorem";
 			}
 		),
-		\cached -> {
-			path = cached.info.path;
-			decl = cached.decl;
+		\decl -> {
+			path0 = decl.descr.src;
+			path = eitherMap(ruSourceCacheGet(path0, env), \src -> src.info.path, id2s(path0));
 			name = id2s(decl.descr.id);
-			code = ruFileSourceCode(path);
+			code = ruCodeCacheGet(decl.descr.src, env).code;
 			maybeMap(ruNameRangeByPos(decl.descr.pos, code),
 				\range ->
 					JsonObject([
 						Pair("kind", JsonString(ruDeclKind(decl))),
 						Pair("location", lspLocation2Json(ruRange2LspLocation(range, path, code))),
 						Pair("name", JsonString(name)),
-						Pair("tooltip", JsonString(ruCachedDecl2s(name, env)))
+						Pair("tooltip", JsonString(ruCachedDecl2s(s2id_(name), env)))
 					])
 			)
 		}
@@ -366,7 +372,7 @@ ruRunInfoAxiomatics(unit : RuUnit) -> Maybe<RuState> {
 	task = unit.task;
 	state = unit.state;
 	conf = state.conf;
-	th_axioms = ruCachedTheoremAxioms();
+	th_axioms = ruDeclCacheTheoremAxioms();
 	ax_sets = foldTree(th_axioms, makeTree(), \th, axs, acc -> 
 		switch (findInOrder(acc, \as, ths -> if (equalSet(as, axs)) Some(Pair(as, ths)) else None())) {
 			Some(pair): setTree(acc, pair.first, insertSet(pair.second, th));

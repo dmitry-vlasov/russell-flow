@@ -1,0 +1,158 @@
+import ru/cache/code;
+import ru/cache/rule;
+import ru/cache/decl;
+import ru/cache/def;
+import ru/cache/src;
+import ru/cache/disk;
+
+export {
+	ruCacheAdd(src : RuSource, env : RuEnv) -> void;
+	ruCacheGet(id : int, env : RuEnv) -> Maybe<RuSource>;
+	ruCacheRemove(id : int, env : RuEnv) -> void;
+
+	ruCacheLoad(id : int, env : RuEnv) -> void;
+	ruCacheLoadAll(env : RuEnv) -> void;
+
+	ruCacheClear(env : RuEnv) -> void;
+	ruMemCacheClear() -> void;
+
+	ruCacheSaveAll(env : RuEnv) -> void;
+	ruCacheSave(id : int, env : RuEnv) -> void;
+
+	ruCachedDecl2s(id : int, env : RuEnv) -> string;
+	ruCachedDecl2LspSymbolInfo(id : int, env : RuEnv) -> Maybe<LspSymbolInformation>;
+
+	ruCacheInfo(full : bool, env : RuEnv) -> string;
+}
+
+
+ruCacheClear(env : RuEnv) -> void {
+	ruDiskCacheClear(env);
+	ruMemCacheClear();
+}
+
+ruMemCacheClear() -> void {
+	ruCodeCacheClear();
+	ruSourceCacheClear();
+	ruRuleCacheClear();
+	ruDefCacheClear();
+	ruDeclCacheClear();
+}
+
+ruCacheAdd(src : RuSource, env : RuEnv) -> void {
+	if (!ruSourceCacheContains(src.info.id, env)) {
+		ruSourceCacheAdd(src, env);
+		ruRuleCacheAdd(src, env);
+		ruDefCacheAdd(src, env);
+		ruDeclCacheAdd(src, env);
+	}
+}
+
+ruCacheGet(id : int, env : RuEnv) -> Maybe<RuSource> {
+	if (lookupTreeDef(env.conf.opts, "caching", "") == "0") None() else {
+		switch (ruSourceCacheGet(id, env)) {
+			Some(cached): Some(cached);
+			None(): {
+				switch (ruDiskCacheLoad(id, env)) {
+					Some(loaded): {
+						ruCacheAdd(loaded, env);
+						Some(loaded);
+					}
+					None(): None();
+				}
+			}
+		}	
+	}
+}
+
+ruCacheRemove(id : int, env : RuEnv) -> void {
+	maybeApply(ruCacheGet(id, env), \src -> {
+		ruRuleCacheRemove(src, env);
+		ruDefCacheRemove(src, env);
+		ruDeclCacheRemove(src, env);
+	});
+	ruCodeCacheRemove(id, env);
+	ruSourceCacheRemove(id, env);
+}
+
+ruCacheSaveAll(env : RuEnv) -> void {
+	iter(ruSourceCacheAll(env), 
+		\src -> ruDiskCacheSave(src, env)
+	);
+}
+
+ruCacheSave(id : int, env : RuEnv) -> void {
+	switch (ruSourceCacheGet(id, env)) {
+		Some(cached): ruDiskCacheSave(cached, env);
+		None(): { }
+	}
+}
+
+ruCacheLoad(id : int,  env : RuEnv) -> void {
+	if (!ruSourceCacheContains(id, env)) {
+		loaded = ruDoCacheLoad(id, env, [], makeSet()).first;
+		iter(loaded, \src -> ruCacheAdd(src, env));
+	}
+}
+
+ruDoCacheLoad(id : int,  env : RuEnv, acc : [RuSource], visited : Set<int>) -> Pair<[RuSource], Set<int>> {
+	if (containsSet(visited, id) || ruSourceCacheContains(id, env)) {
+		Pair(acc, visited) 
+	} else {
+		new_visited = insertSet(visited, id);
+		switch (ruDiskCacheLoad(id, env)) {
+			Some(cached): {
+				fold(
+					cached.imports,
+					Pair(concat(acc, [cached]), new_visited), 
+					\ac, imp -> ruDoCacheLoad(imp.id, env, ac.first, ac.second)
+				);
+			}
+			None(): {
+				Pair(acc, new_visited);
+			}
+		}
+	}
+}
+
+ruCacheLoadAll(env : RuEnv) -> void {
+	cached = ruDiskCacheFiles(env);
+	ruConcurrentVoid(map(cached, \path -> \ -> {
+		file = ruCachedFile(path, env.conf);
+		if (file == "") {
+			env.out.onError("Cache path '" + path + "' was not converted to a cached module name", []);
+		} else {
+			module = ruTrimPath(file, env.conf, ".ru");
+			maybeApply(ruDiskCacheLoad(s2id(module), env), \loaded -> 
+				ruCacheAdd(loaded, env)
+			);
+		}
+	}));
+}
+
+ruCachedDecl2s(id : int, env : RuEnv) -> string {
+	eitherMap(ruDeclCacheGet(id), \decl -> 
+		eitherMap(ruCacheGet(decl.descr.src, env), \src -> 
+			ruDeclCode(decl, src, env), ""
+		), ""
+	);
+}
+
+ruCachedDecl2LspSymbolInfo(id : int, env : RuEnv) -> Maybe<LspSymbolInformation> {
+	maybeBind(ruDeclCacheGet(id), \decl -> 
+		maybeMap(ruCacheGet(decl.descr.src, env), \src -> {
+			range = ruDeclRange(decl, src, env);
+			location = ruRange2LspLocation(range, src.info.path, ruCodeCacheGet(decl.descr.src, env).code);
+			LspSymbolInformation(id2s(id), ruDecl2LspSymbolKind(decl), false, location, "");
+		})
+	);
+}
+
+ruCacheInfo(full : bool, env : RuEnv) -> string {
+	ruSourceCacheInfo(full) + "\n" +
+	ruDeclCacheInfo(full) + "\n" +
+	ruDefCacheInfo(full) + "\n" +
+	ruRuleCacheInfo(full) + "\n" +
+	ruCodeCacheInfo(full) + "\n" +
+	ruDiskCacheInfo(full, env) + "\n";
+}
