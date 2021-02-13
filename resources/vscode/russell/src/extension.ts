@@ -71,7 +71,7 @@ function execCommand() {
 			client.sendRequest("workspace/executeCommand", { command : "command", arguments: [value, file] }).then(
 				(out : string) => { },
 				(err : any) => {
-					vscode.window.showErrorMessage(`command ${value} failed: ${err}`);
+					vscode.window.showErrorMessage(`command '${value}' failed: ${err}`);
 				}
 			);
 		}
@@ -125,7 +125,18 @@ function startLspServer() {
 	// Start the client. This will also launch the server
 	client.start();
 	client.onReady().then(
-		() => client.onNotification("console/message", (msg : string) => russellChannel.appendLine(msg))
+		() => {
+			client.onNotification("console/message", (msg : string) => russellChannel.appendLine(msg));
+			setTimeout(() =>
+				client.sendRequest("workspace/executeCommand", { command : "command", arguments: ["cache-load"] }).then(
+					(out : string) => { },
+					(err : any) => {
+						vscode.window.showErrorMessage(`command 'cache-load' failed: ${err}`);
+					}
+				),
+				200
+			);
+		}
 	);
 }
 
