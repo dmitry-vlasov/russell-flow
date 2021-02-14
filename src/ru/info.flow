@@ -1,5 +1,6 @@
 import comm;
 import ru/util/vol;
+import ru/util/info;
 import ru/cache/cache;
 
 export {
@@ -40,21 +41,23 @@ ruRunInfoDecl(unit : RuUnit) -> Maybe<RuState> {
 	file = lookupTreeDef(task.args, "file", "");
 	line = s2i(lookupTreeDef(task.args, "line", "-1"));
 	col = s2i(lookupTreeDef(task.args, "col", "-1"));
-	module = ruTrimPath(file, conf, ".ru");
-	code = ruCodeCacheGet(s2id_(module), env).code;
-	name = ruNameByLineCol(line, col, code);
-	maybeApply(ruDeclCacheGet(s2id_(name)), \decl ->
-		maybeApply(ruCacheGet(decl.descr.src, false, env), \cached -> 
-			env.out.onMessage(
-				ruRange2s(
-					ruDeclRange(decl, cached, env), 
-					"declaration of " + name, 
-					cached.info.path, 
-					ruCodeCacheGet(decl.descr.src, env).code
+	module = ruFileId(file, conf);
+	cursor = ruUnderACursor(module, line, col, env);
+	id = ruCursorMostSpecific(cursor, env);
+	if (id != -1) {
+		maybeApply(ruDeclCacheGet(id), \decl ->
+			maybeApply(ruCacheGet(decl.descr.src, false, env), \src -> 
+				env.out.onMessage(
+					ruRange2s(
+						ruCodeCacheDeclRange(decl, src, env), 
+						"declaration of " + cursor.act, 
+						src.info.path, 
+						ruCodeCacheGet(decl.descr.src, env).code
+					)
 				)
 			)
-		)
-	);
+		);
+	}
 	Some(state);
 }
 
@@ -76,75 +79,15 @@ ruRunInfoHover(unit : RuUnit) -> Maybe<RuState> {
 	state = unit.state;
 	conf = state.conf;
 	file = lookupTreeDef(task.args, "file", "");
-	file_id = ruFileId(file, conf);
+	module = ruFileId(file, conf);
 	line = s2i(lookupTreeDef(task.args, "line", "-1"));
 	col = s2i(lookupTreeDef(task.args, "col", "-1"));
-	code = ruCodeCacheGet(file_id, env).code;
-	name = ruNameByLineCol(line, col, code);
-	do_hover = \nm -> {
-		id = s2id_(nm);
-		if (id != -1) {
-			env.out.onMessage(ruCachedDecl2s(id, env));
-		}
-		Some(state);
+	cursor = ruUnderACursor(module, line, col, env);
+	hover = ruCursorHover(cursor, env);
+	if (hover != "") {
+		env.out.onMessage(hover);
 	}
-	switch (ruCacheGet(file_id, true, env)) {
-		Some(src): {
-			resolver = makeLineResolver(code);
-			pos = findLineIndex(resolver, line, col);
-			posTree = ruPositionsTree(src);
-			positions = getTreeKeys(posTree);
-			switch (treeIntervalSearch(posTree, pos)) {
-				Some(x): {
-					curr = ruPos(x);
-					ind = elemIndex(positions, curr, -1) + 1;
-					next = if (ind == length(positions)) strlen(code) else positions[ind];
-					switch (x) {
-						RuExp(nodes, __): {
-							expr = substring(code, curr, next - curr);
-							exp_ind = ruIndexOfPosInsideExp(expr, pos - curr);
-							exp_nodes = ruExp2Nodes(x, ruRuleCacheGet());
-							if (exp_ind >= length(exp_nodes)) {
-								do_hover(name);
-							} else {
-								switch (exp_nodes[exp_ind]) {
-									RuVar(v, t): {
-										env.out.onMessage(id2s(v) + " : " + id2s(t));
-										Some(state);
-									}
-									RuRuleNode(rule,__,__,__): {
-										switch (ruDefCacheGetName(rule)) {
-											Some(def): do_hover(id2s(def));
-											None(): do_hover(id2s(rule));
-										}
-									}
-								}
-							}
-						}
-						RuTerm(type, nodes, __): do_hover(name);
-						default: do_hover(name);
-					}
-				}
-				None(): do_hover(name);
-			}
-		}
-		None(): do_hover(name);
-	}
-}
-
-ruIndexOfPosInsideExp(expr : string, pos : int) -> int {
-	ruDoIndexOfPosInsideExp(expr, pos, false, 0, 0);
-}
-
-ruDoIndexOfPosInsideExp(expr : string, pos : int, ws : bool, curr : int, acc : int) -> int {
-	if (curr == pos) acc else {
-		ch = getCharAt(expr, curr);
-		ws1 = (ch == " " || ch == "\n" || ch == "\t" || ch == "\r");
-		ruDoIndexOfPosInsideExp(
-			expr, pos, ws1, curr + 1, 
-			acc + (if (!ws && ws1) 1 else 0)
-		);
-	}
+	Some(state);
 }
 
 ruCommInfoFind = RuComm(
@@ -166,7 +109,7 @@ ruRunInfoFind(unit : RuUnit) -> Maybe<RuState> {
 			maybeApply(ruCacheGet(decl.descr.src, false, env), \cached ->
 				env.out.onMessage(
 					ruRange2s(
-						ruDeclRange(decl, cached, env), 
+						ruCodeCacheDeclRange(decl, cached, env), 
 						"declaration of " + name, 
 						cached.info.path, 
 						ruCodeCacheGet(cached.info.id, env).code
@@ -340,40 +283,71 @@ ruCommInfoMath = RuComm(
 	ruRunInfoMath
 );
 
+// Source with helper info: code and line resolver.
+RuInfoSource(
+	src : RuSource,
+	code : string,
+	path : string,
+	resolver : LineResolver
+);
+
 ruRunInfoMath(unit : RuUnit) -> Maybe<RuState> {
 	env = ruUnitEnv(unit);
 	task = unit.task;
 	state = unit.state;
 	conf = state.conf;
 	kind = lookupTreeDef(task.args, "kind", "");
-	info = JsonArray(filtermap(
-		filter(ruDeclCacheAll(), \decl ->
-			switch (decl) {
-				RuConst(__,__,__):      kind == "const" || kind == "";
-				RuType(__,__):          kind == "type"  || kind == "";
-				RuRule(__,__,__):       kind == "rule"  || kind == "";
-				RuAxiom(__,__):         kind == "axiom" || kind == "";
-				RuDef(__,__,__,__):     kind == "def"   || kind == "";
-				RuTheorem(__,__,__,__): kind == "theorem";
+	timer = ruMakeTimer();
+	decls = filter(ruDeclCacheAll(), \decl ->
+		switch (decl) {
+			RuConst(__,__,__):      kind == "const" || kind == "";
+			RuType(__,__):          kind == "type"  || kind == "";
+			RuRule(__,__,__):       kind == "rule"  || kind == "";
+			RuAxiom(__,__):         kind == "axiom" || kind == "";
+			RuDef(__,__,__,__):     kind == "def"   || kind == "";
+			RuTheorem(__,__,__,__): kind == "theorem";
+		}
+	);
+	env.out.onMessage("decls in: " + ruTimePassed2s(timer));
+	infos = fold(
+		set2array(fold(decls, makeSet(), \acc, decl -> insertSet(acc, decl.descr.src))), makeTree(),
+		\acc, s -> {
+			switch (ruSourceCacheGet(s, false, env)) {
+				Some(src): {
+					code = ruCodeCacheGet(s, env);
+					if (!ruCodeIsDefined(code)) acc else {
+						setTree(acc, s, 
+							RuInfoSource(
+								src, code.code, code.path, 
+								makeLineResolver(code.code)
+							)
+						);
+					}
+				}
+				None(): acc;
 			}
-		),
+		}
+	);
+	env.out.onMessage("codes in: " + ruTimePassed2s(timer));
+	info = JsonArray(filtermap(decls,
 		\decl -> {
-			path0 = decl.descr.src;
-			path = eitherMap(ruSourceCacheGet(path0, false, env), \src -> src.info.path, id2s(path0));
-			name = id2s(decl.descr.id);
-			code = ruCodeCacheGet(decl.descr.src, env).code;
-			maybeMap(ruNameRangeByPos(decl.descr.pos, code),
-				\range ->
-					JsonObject([
-						Pair("kind", JsonString(ruDeclKind(decl))),
-						Pair("location", lspLocation2Json(ruRange2LspLocation(range, path, code))),
-						Pair("name", JsonString(name)),
-						Pair("tooltip", JsonString(ruCachedDecl2s(s2id_(name), env)))
-					])
-			)
+			maybeBind(lookupTree(infos, decl.descr.src), \info -> {
+				maybeMap(ruNameRangeByPos(decl.descr.pos, info.code),
+					\range -> {
+						JsonObject([
+							Pair("kind", JsonString(ruDeclKind(decl))),
+							Pair("location", lspLocation2Json(ruRangeResolver2LspLocation(range, info.path, info.resolver))),
+							Pair("name", JsonString(id2s(decl.descr.id))),
+							Pair("tooltip", JsonString(ruDeclCode(decl, info.src, info.code, env)))
+						])
+					}
+				)
+			});
 		}
 	));
+	env.out.onMessage("info in: " + ruTimePassed2s(timer));
 	env.out.onMessage(json2string(info));
+	env.out.onMessage("json2string in: " + ruTimePassed2s(timer));
 	Some(state);
 }
 
