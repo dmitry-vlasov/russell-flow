@@ -7,12 +7,12 @@ import ru/cache/src;
 import ru/cache/disk;
 
 export {
-	ruCacheAdd(src : RuSource, add_src : bool, env : RuEnv) -> void;
-	ruCacheGet(id : int, env : RuEnv) -> Maybe<RuSource>;
+	ruCacheAdd(src : RuSource, exact : bool, env : RuEnv) -> void;
+	ruCacheGet(id : int, exact, env : RuEnv) -> Maybe<RuSource>;
 	ruCacheRemove(id : int, env : RuEnv) -> void;
 
-	ruCacheLoad(id : int, env : RuEnv) -> void;
-	ruCacheLoadAll(env : RuEnv, mode : string) -> void;
+	ruCacheLoad(id : int, mode : string, env : RuEnv) -> void;
+	ruCacheLoadAll(mode : string, env : RuEnv) -> void;
 
 	ruCacheClear(env : RuEnv) -> void;
 	ruMemCacheClear() -> void;
@@ -40,23 +40,22 @@ ruMemCacheClear() -> void {
 	ruDeclCacheClear();
 }
 
-ruCacheAdd(src : RuSource, add_src : bool, env : RuEnv) -> void {
-	if (!ruSourceCacheContains(src.info.id, env)) {
-		if (add_src) {
-			ruSourceCacheAdd(src, env);
-		}
+ruCacheAdd(src : RuSource, exact : bool, env : RuEnv) -> void {
+	if (!ruSourceCacheContains(src.info.id, exact, env)) {
+		ruSourceCacheAdd(src, exact, env);
 		ruRuleCacheAdd(src, env);
 		ruDefCacheAdd(src, env);
 		ruDeclCacheAdd(src, env);
 	}
 }
 
-ruCacheGet(id : int, env : RuEnv) -> Maybe<RuSource> {
+ruCacheGet(id : int, exact : bool, env : RuEnv) -> Maybe<RuSource> {
+	mode = if (exact) "exact" else "proofless";
 	if (lookupTreeDef(env.conf.opts, "caching", "") == "0") None() else {
-		switch (ruSourceCacheGet(id, env)) {
+		switch (ruSourceCacheGet(id, exact, env)) {
 			Some(cached): Some(cached);
 			None(): {
-				switch (ruDiskCacheLoad(id, "exact", env)) {
+				switch (ruDiskCacheLoad(id, mode, env)) {
 					Some(loaded): {
 						ruCacheAdd(loaded, true, env);
 						Some(loaded);
@@ -69,46 +68,56 @@ ruCacheGet(id : int, env : RuEnv) -> Maybe<RuSource> {
 }
 
 ruCacheRemove(id : int, env : RuEnv) -> void {
-	maybeApply(ruCacheGet(id, env), \src -> {
+	maybeApply(ruCacheGet(id, false, env), \src -> {
 		ruRuleCacheRemove(src, env);
 		ruDefCacheRemove(src, env);
 		ruDeclCacheRemove(src, env);
 	});
 	ruCodeCacheRemove(id, env);
-	ruSourceCacheRemove(id, env);
+	ruSourceCacheRemove(id, true, env);
+	ruSourceCacheRemove(id, false, env);
 }
 
 ruCacheSaveAll(env : RuEnv) -> void {
-	iter(ruSourceCacheAll(env), 
+	all_sources = concat(
+		ruSourceCacheAll(true, env),
+		ruSourceCacheAll(false, env)
+	);
+	iter(all_sources, 
 		\src -> ruDiskCacheSave(src, env)
 	);
 }
 
 ruCacheSave(id : int, env : RuEnv) -> void {
-	switch (ruSourceCacheGet(id, env)) {
+	switch (ruSourceCacheGet(id, true, env)) {
+		Some(cached): ruDiskCacheSave(cached, env);
+		None(): { }
+	}
+	switch (ruSourceCacheGet(id, false, env)) {
 		Some(cached): ruDiskCacheSave(cached, env);
 		None(): { }
 	}
 }
 
-ruCacheLoad(id : int,  env : RuEnv) -> void {
-	if (!ruSourceCacheContains(id, env)) {
-		loaded = ruDoCacheLoad(id, env, [], makeSet()).first;
-		iter(loaded, \src -> ruCacheAdd(src, true, env));
+ruCacheLoad(id : int, mode : string, env : RuEnv) -> void {
+	exact = (mode == "exact");
+	if (!ruSourceCacheContains(id, exact, env)) {
+		loaded = ruDoCacheLoad(id, mode, env, [], makeSet()).first;
+		iter(loaded, \src -> ruCacheAdd(src, exact, env));
 	}
 }
 
-ruDoCacheLoad(id : int,  env : RuEnv, acc : [RuSource], visited : Set<int>) -> Pair<[RuSource], Set<int>> {
-	if (containsSet(visited, id) || ruSourceCacheContains(id, env)) {
+ruDoCacheLoad(id : int, mode : string, env : RuEnv, acc : [RuSource], visited : Set<int>) -> Pair<[RuSource], Set<int>> {
+	if (containsSet(visited, id) || ruSourceCacheContains(id, mode == "exact", env)) {
 		Pair(acc, visited) 
 	} else {
 		new_visited = insertSet(visited, id);
-		switch (ruDiskCacheLoad(id, "exact", env)) {
+		switch (ruDiskCacheLoad(id, mode, env)) {
 			Some(cached): {
 				fold(
 					cached.imports,
 					Pair(concat(acc, [cached]), new_visited), 
-					\ac, imp -> ruDoCacheLoad(imp.id, env, ac.first, ac.second)
+					\ac, imp -> ruDoCacheLoad(imp.id, mode, env, ac.first, ac.second)
 				);
 			}
 			None(): {
@@ -118,10 +127,11 @@ ruDoCacheLoad(id : int,  env : RuEnv, acc : [RuSource], visited : Set<int>) -> P
 	}
 }
 
-ruCacheLoadAll(env : RuEnv, mode : string) -> void {
+ruCacheLoadAll(mode : string, env : RuEnv) -> void {
 	conf = env.conf;
 	timer = ruMakeTimer();
 	cached = ruDiskCacheFiles(env, mode);
+	exact = (mode == "exact");
 	ruConcurrentVoid(map(cached, \path -> \ -> {
 		file = ruCachedFile(path, mode, env.conf);
 		if (file == "") {
@@ -132,7 +142,7 @@ ruCacheLoadAll(env : RuEnv, mode : string) -> void {
 				env.out.onMessage("\tmem cache loading: '" + module + "' module from disk");
 			}
 			maybeApply(ruDiskCacheLoad(s2id(module), mode, env), \loaded -> 
-				ruCacheAdd(loaded, mode == "exact", env)
+				ruCacheAdd(loaded, exact, env)
 			);
 		}
 	}));
@@ -143,7 +153,7 @@ ruCacheLoadAll(env : RuEnv, mode : string) -> void {
 
 ruCachedDecl2s(id : int, env : RuEnv) -> string {
 	eitherMap(ruDeclCacheGet(id), \decl -> 
-		eitherMap(ruCacheGet(decl.descr.src, env), \src -> 
+		eitherMap(ruCacheGet(decl.descr.src, false, env), \src -> 
 			ruDeclCode(decl, src, env), ""
 		), ""
 	);
@@ -151,7 +161,7 @@ ruCachedDecl2s(id : int, env : RuEnv) -> string {
 
 ruCachedDecl2LspSymbolInfo(id : int, env : RuEnv) -> Maybe<LspSymbolInformation> {
 	maybeBind(ruDeclCacheGet(id), \decl -> 
-		maybeMap(ruCacheGet(decl.descr.src, env), \src -> {
+		maybeMap(ruCacheGet(decl.descr.src, false, env), \src -> {
 			range = ruDeclRange(decl, src, env);
 			location = ruRange2LspLocation(range, src.info.path, ruCodeCacheGet(decl.descr.src, env).code);
 			LspSymbolInformation(id2s(id), ruDecl2LspSymbolKind(decl), false, location, "");
