@@ -1,0 +1,164 @@
+import math/uuid;
+import lsp/request;
+import lsp/methods/textDocument;
+import lsp/methods/workspace;
+
+import process;
+
+export {
+	ruLspProcessRequest(
+		conf : RuConf, json : Json,  
+		out : (string) ->  void, 
+		exit : () -> void, 
+		process : (ScScript, (int) -> void, RuOut) -> void
+	) -> void;
+}
+
+RuServerRequest(
+	request : LspRequestMessage,
+	callback : (LspResponseMessage) -> void
+);
+
+RuLspServerState(
+	mutable clientConf : Json,
+	mutable currId : int,
+	mutable requests : Tree<Json, RuServerRequest>
+);
+
+ruLspServerState = RuLspServerState(JsonNull(), 1, makeTree());
+
+ruLspProcessRequest(
+	conf : RuConf, json : Json, 
+	out : (string) ->  void, 
+	exit : () -> void, 
+	process : (ScScript, (int) -> void, RuOut) -> void
+) -> void {
+	out_cb = \msg -> {
+		js_out = json2string(msg);
+		js_len = strlen(expandUtf8(js_out));
+		out("Content-Length: " + i2s(js_len) + "\r\n\r\n" + js_out);
+	}
+	switch (json2LspRequestMessage(json)) {
+		Some(request): {
+			if (request.method == "") {
+				out_cb(ruLspErrorResponse(request.id, 1, "request method is not set"));
+			} else {
+				switch (lookupTree(ruLspMethods, request.method)) {
+					Some(m): m(RuLspArgs(conf, request.id, request.params, out_cb, exit, process));
+					None(): {
+						out_cb(ruLspErrorResponse(request.id, 1, "request method " + request.method + " is not found"));
+					}
+				}
+			}
+		}
+		None(): {
+			switch (json2LspResponseMessage(json)) {
+				Some(response): {
+					switch (lookupTree(ruLspServerState.requests, response.id)) {
+						Some(req): req.callback(response);
+						None(): {
+							ruLspServerLog("Server: unknown request: " + json2string(response.id), conf);
+						}
+					}
+				}
+				None(): {
+					out_cb(ruLspErrorResponse(getJsonFieldValue(json, "id", JsonNull()), 1, "illegal request '" + json2string(json) + "'"));
+				}
+			}
+		}
+	}
+}
+
+ruMakeServerRequest(method : string, params : Json, out_cb : (Json) -> void, callback : (LspResponseMessage) -> void) -> void {
+	request = LspRequestMessage("2.0", JsonDouble(i2d(ruLspServerState.currId)), method, params);
+	ruLspServerState.requests ::= setTree(ruLspServerState.requests, request.id, 
+		RuServerRequest(request, callback)
+	);
+	ruLspServerState.currId ::= ruLspServerState.currId + 1;
+	out_cb(lspRequestMessage2Json(request));
+}
+
+ruLspShutdown(call : RuLspArgs) -> void {
+	ruLspServerState.clientConf ::= JsonNull();
+	ruLspServerState.currId ::= 1;
+	ruLspServerState.requests ::= makeTree();
+	ruMemCacheClear(); // reset memory cache
+	call.out_cb(ruLspNormalResponse(call.id, JsonNull()));
+}
+
+ruLspExit(call : RuLspArgs) -> void {
+	call.exit_cb();
+}
+
+ruLspInitialized(call: RuLspArgs) -> void {
+	if (getJsonBoolField(getJsonNestedField(ruLspServerState.clientConf, ["capabilities", "workspace", "didChangeConfiguration"]), "dynamicRegistration", false)) {
+		params = lspRegistrationParams2Json(LspRegistrationParams([
+			LspRegistration(makeUuid(), "textDocument/didChange", 
+				lspTextDocumentChangeRegistrationOptions2Json(
+					LspTextDocumentChangeRegistrationOptions([LspDocumentFilter("flow", "file", "*.{flow}")], 1)
+				)
+			),
+			//LspRegistration(makeUuid(), "workspace/executeCommand", ruExecuteCommandOptions)
+		]));
+		ruMakeServerRequest("client/registerCapability", params, call.out_cb, nop1);
+	}
+	// It's a notification, no response.
+}
+
+ruExecuteCommandOptions = JsonObject([
+	Pair("commands", 
+		JsonArray([
+			JsonString("verify"), 
+			JsonString("metamath"),
+			JsonString("math-info"),
+			JsonString("find-symbol"),
+			JsonString("command"),
+		])
+	),
+	Pair("workDoneProgress", JsonBool(true))
+]);
+
+ruLspInitialize(call: RuLspArgs) -> void {
+	ruLspServerState.clientConf ::= call.params;
+	call.out_cb(ruLspNormalResponse(call.id, 
+		JsonObject([
+			Pair("capabilities", JsonObject([
+					Pair("declarationProvider", JsonBool(true)),
+					Pair("definitionProvider", JsonBool(true)),
+					Pair("referencesProvider", JsonBool(true)),
+					Pair("documentSymbolProvider", JsonBool(true)),
+					Pair("hoverProvider", JsonBool(true)),
+					Pair("renameProvider", JsonBool(true)),
+					Pair("workspaceSymbolProvider", JsonBool(true)),
+					Pair("executeCommandProvider", ruExecuteCommandOptions),
+					/*Pair("codeActionProvider", 
+						JsonObject([
+							Pair("codeActionKinds", JsonArray([
+								JsonString("verify"), JsonString("prove"), JsonString("reprove"), JsonString("generalize")
+							])),
+						])
+					),*/
+					//Pair("codeActionProvider", JsonBool(true)),
+					Pair("textDocumentSync",
+						JsonObject([
+							Pair("openClose", JsonBool(true)),
+							Pair("change", JsonDouble(2.0))
+						])
+					)
+				])
+			)
+		])
+	));
+}
+
+ruLspInitMethods = pairs2tree([
+	Pair("initialize", ruLspInitialize),
+	Pair("initialized", ruLspInitialized),
+	Pair("shutdown", ruLspShutdown),
+	Pair("exit", ruLspExit),
+]);
+
+ruLspMethods = mergeTree(
+	mergeTree(ruLspInitMethods, ruLspWorkspaceMethods), 
+	ruLspTextDocumentMethods
+);
