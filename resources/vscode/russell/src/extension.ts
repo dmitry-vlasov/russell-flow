@@ -209,16 +209,14 @@ function toggleHttpServer() {
 
 function startHttpServer() {
     if (!httpServerOnline) {
-		const port : number = vscode.workspace.getConfiguration("russell").get("portOfHttpServer");
-		httpServer = tools.launchHttpServer(port, showHttpServerOnline, showHttpServerOffline, serverChannel);
+		httpServer = tools.launchHttpServer(showHttpServerOnline, showHttpServerOffline, serverChannel);
 		httpServerOnline = true;
     }
 }
 
 function stopHttpServer() {
 	if (httpServerOnline) {
-		const port : number = vscode.workspace.getConfiguration("russell").get("portOfHttpServer");
-		tools.shutdownHttpServer(port).on("exit", (code, msg) => httpServer = null);
+		tools.shutdownHttpServer().on("exit", (code, msg) => httpServer = null);
 		httpServerOnline = false;
 	}
 }
@@ -244,7 +242,7 @@ export function deactivate() {
 	// First, shutdown Russell server, if it is owned by current vscode instance
 	if (httpServer) {
 		const port : number = vscode.workspace.getConfiguration("russell").get("portOfHttpServer");
-		tools.shutdownHttpServer(port).on("exit", (code, msg) => httpServer = null);
+		tools.shutdownHttpServer().on("exit", (code, msg) => httpServer = null);
 	}
     if (!client) {
         return undefined;

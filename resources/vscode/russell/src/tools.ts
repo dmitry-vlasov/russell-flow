@@ -18,13 +18,15 @@ export function run_cmd_sync(cmd: string, wd: string, args: string[]) {
     return spawnSync(cmd, args, options);
 }
 
-export function shutdownHttpServer(port : number) {
+export function shutdownHttpServer() {
+	const port = vscode.workspace.getConfiguration("russell").get("portOfHttpServer");
     return run_cmd("russell", ".", ["server-shutdown", "server-port=" + port], (s) => { console.log(s); } );
 }
 
-export function launchHttpServer(port : number, on_start : () => void, on_stop : () => void, russellChannel : vscode.OutputChannel) {
+export function launchHttpServer(on_start : () => void, on_stop : () => void, russellChannel : vscode.OutputChannel) {
 	on_start();
 	const russell_dir = getRussellDir();
+	const port = vscode.workspace.getConfiguration("russell").get("portOfHttpServer");
 	const memory = vscode.workspace.getConfiguration("russell").get("memForHttpServer");
 	russellChannel.appendLine(
 		(new Date()).toString() + " Russell Http server is starting in '" + russell_dir + "' directory"
