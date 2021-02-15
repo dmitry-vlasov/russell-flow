@@ -44,7 +44,7 @@ export function activate(context: vscode.ExtensionContext) {
 	serverChannel = vscode.window.createOutputChannel("Russell server");
 	russellChannel.show(true);
 
-	vscode.workspace.onDidOpenTextDocument(mathInfo);
+	//vscode.workspace.onDidOpenTextDocument(mathInfo);
 
 	checkHttpServerStatus(true);
 	setInterval(checkHttpServerStatus, 3000, false);
@@ -129,7 +129,7 @@ function startLspServer() {
 			client.onNotification("console/message", (msg : string) => russellChannel.appendLine(msg));
 			setTimeout(() =>
 				client.sendRequest("workspace/executeCommand", { command : "command", arguments: ["cache-load"] }).then(
-					(out : string) => { },
+					mathInfo,
 					(err : any) => {
 						vscode.window.showErrorMessage(`command 'cache-load' failed: ${err}`);
 					}
