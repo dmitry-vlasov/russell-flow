@@ -43,13 +43,15 @@ export function activate(context: vscode.ExtensionContext) {
 	russellChannel = vscode.window.createOutputChannel("Russell output");
 	serverChannel = vscode.window.createOutputChannel("Russell server");
 	russellChannel.show(true);
-
-	//vscode.workspace.onDidOpenTextDocument(mathInfo);
-
-	checkHttpServerStatus(true);
 	setInterval(checkHttpServerStatus, 3000, false);
 	serverStatusBarItem.show();
-	startLspServer();
+
+	// launch russell server at startup
+	if (vscode.workspace.getConfiguration("russell").get("autostartHttpServer")) {
+		initHttpServer();
+	} else {
+		startLspServer();
+	}
 }
 
 function mathInfo(): void {
@@ -127,14 +129,11 @@ function startLspServer() {
 	client.onReady().then(
 		() => {
 			client.onNotification("console/message", (msg : string) => russellChannel.appendLine(msg));
-			setTimeout(() =>
-				client.sendRequest("workspace/executeCommand", { command : "command", arguments: ["cache-load"] }).then(
-					mathInfo,
-					(err : any) => {
-						vscode.window.showErrorMessage(`command 'cache-load' failed: ${err}`);
-					}
-				),
-				200
+			client.sendRequest("workspace/executeCommand", { command : "command", arguments: ["cache-load"] }).then(
+				mathInfo,
+				(err : any) => {
+					vscode.window.showErrorMessage(`command 'cache-load' failed: ${err}`);
+				}
 			);
 		}
 	);
@@ -151,25 +150,33 @@ function restartLspServer() {
 	}
 }
 
-function checkHttpServerStatus(initial : boolean) {
+function initHttpServer() {
 	const port = vscode.workspace.getConfiguration("russell").get("portOfHttpServer");
 	isPortReachable(port, {host: 'localhost'}).then(
 		(reacheable : boolean) => {
 			if (reacheable) {
-				//showHttpServerOnline();
+				outputHttpServerMemStats();
+				httpServerOnline = true;
+			} else {
+				showHttpServerIsLaunching();
+				startHttpServer();
+			}
+			startLspServer();
+		}
+	);
+}
+
+function checkHttpServerStatus() {
+	const port = vscode.workspace.getConfiguration("russell").get("portOfHttpServer");
+	isPortReachable(port, {host: 'localhost'}).then(
+		(reacheable : boolean) => {
+			if (reacheable) {
 				outputHttpServerMemStats();
 				httpServerOnline = true;
 			} else {
 				httpServer = null;
 				httpServerOnline = false;
 				showHttpServerOffline();
-				if (initial) {
-					// launch russell server at startup
-					let autostart = vscode.workspace.getConfiguration("russell").get("autostartHttpServer");
-					if (autostart) {
-						startHttpServer();
-					}
-				}
 			}
 		}
 	);
@@ -226,6 +233,10 @@ function showHttpServerOnline(mem_stats? : string) {
 
 function showHttpServerOffline() {
 	serverStatusBarItem.text = `$(vm-outline) russell: http server: offline`;
+}
+
+function showHttpServerIsLaunching() {
+	serverStatusBarItem.text = `$(vm-connect) russell: http server: starting...`;
 }
 
 // this method is called when your extension is deactivated
