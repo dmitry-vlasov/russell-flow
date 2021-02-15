@@ -25,12 +25,13 @@ export function shutdownHttpServer(port : number) {
 export function launchHttpServer(port : number, on_start : () => void, on_stop : () => void, russellChannel : vscode.OutputChannel) {
 	on_start();
 	const russell_dir = getRussellDir();
+	const memory = vscode.workspace.getConfiguration("russell").get("memForHttpServer");
 	russellChannel.appendLine(
 		(new Date()).toString() + " Russell Http server is starting in '" + russell_dir + "' directory"
 	); 
     let httpServer = run_cmd(
 		"russell", russell_dir, 
-		["server=http", "server-port=" + port], 
+		["mem=" + memory + "g", "server=http", "server-port=" + port], 
 		(s) => russellChannel.append(s)
 	);
     httpServer.addListener("close", (code: number, signal: string) => { 
