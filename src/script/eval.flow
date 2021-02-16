@@ -8,119 +8,136 @@ import script/funcs/time;
 import script/funcs/util;
 
 export {
-	ruEval(ex : ScExp, state : RuState, out : RuOut) -> Maybe<ValValue>;
+	ruEval(ex : ScExp, state : RuState, out : RuOut) -> ValValue;
 }
 
 ru_script_fns : ref Maybe<Tree<string, ScriptFn>> = ref None();
 
 ruScriptFns() -> Tree<string, ScriptFn> {
 	onlyOnce(ru_script_fns, 
-		\-> pairs2tree(concatA([
+		\-> values2tree(concatA([
 			ruScriptBooleanFuncs(),
 			ruScriptCompareFuncs(),
 			ruScriptConvertFuncs(),
 			ruScriptNumericFuncs(),
 			ruScriptTimeFuncs(),
 			ruScriptUtilFuncs()
-		]))
+		]), \sf -> sf.name)
 	);
 }
 
-ruEval(ex : ScExp, state : RuState, out : RuOut) -> Maybe<ValValue> {
+ruEval(ex : ScExp, state : RuState, out : RuOut) -> ValValue {
 	conf = state.conf;
 	switch (ex) {
 		ScInfixOp(e, args): {
-			vals = filtermap(
+			vals = map(
 				concat([e], map(args, \arg -> arg.exp)), 
 				\arg -> ruEval(arg, state, out)
 			);
-			if (length(vals) != length(args) + 1) None() else {
-				maybeBind(
-					lookupTree(ruScriptFns(), args[0].op),
-					\func -> func.fn(vals, state, out)
-				);
+			func = lookupTreeDef(ruScriptFns(), args[0].op, ruNoScriptFn);
+			errs = concat(
+				ruErrorArgs(vals),
+				if (func.name != "") [] else ["infix operator: '" + args[0].op + "'' is not found"]
+			);
+			if (length(errs) > 0) {
+				ValError(errs);
+			} else {
+				func.fn(vals, state, out);
 			}
 		}
 		ScPrefixOp(op, e): {
-			maybeBind2(\func, val -> func.fn([val], state, out))
-			(
-				lookupTree(ruScriptFns(), op),
-				ruEval(e, state, out)
+			val = ruEval(e, state, out);
+			func = lookupTreeDef(ruScriptFns(), op, ruNoScriptFn);
+			errs = concat(
+				ruErrorArgs([val]),
+				if (func.name != "") [] else ["prefix operator: '" + op + "'' is not found"]
 			);
+			if (length(errs) > 0) {
+				ValError(errs);
+			} else {
+				func.fn([val], state, out);
+			}
 		}
 		ScFunc(fn, args): {
-			vals = filtermap(args, \arg -> ruEval(arg, state, out));
-			if (length(vals) != length(args)) None() else {
-				maybeBind(
-					lookupTree(ruScriptFns(), fn),
-					\func -> func.fn(vals, state, out)
-				);
+			vals = map(args, \arg -> ruEval(arg, state, out));
+			func = lookupTreeDef(ruScriptFns(), fn, ruNoScriptFn);
+			errs = concat(
+				ruErrorArgs(vals),
+				if (func.name != "") [] else ["function: '" + fn + "'' is not found"]
+			);
+			if (length(errs) > 0) {
+				ValError(errs);
+			} else {
+				func.fn(vals, state, out);
 			}
 		}
 		ScIndex(e, i): {
-			maybeBind2(\ev, val -> 
-				switch (ev) {
-					ValMap(mapping): {
-						switch (lookupTree(mapping, val)) {
-							Some(v): Some(v);
-							None():  Some(ValUndef());
-						}
+			e_val = ruEval(e, state, out);
+			i_val = ruEval(i, state, out);
+			errs = ruErrorArgs([e_val, i_val]);
+			switch (e_val) {
+				ValMap(mapping): {
+					switch (lookupTree(mapping, i_val)) {
+						Some(v): v;
+						None():  ValUndef();
 					}
-					ValArray(arr): {
-						switch (val) {
-							ValInt(ind): {
-								if (0 <= ind && ind < length(arr)) {
-									Some(arr[ind]);
-								} else {
-									Some(ValUndef());
-								}
-							}
-							default: Some(ValUndef());
-						}
-					}
-					default: None();
 				}
-			)(ruEval(e, state, out), ruEval(i, state, out));
+				ValArray(arr): {
+					switch (i_val) {
+						ValInt(ind): {
+							if (0 <= ind && ind < length(arr)) {
+								arr[ind];
+							} else {
+								ValUndef();
+							}
+						}
+						default: {
+							 ValError(concat(errs, ["second argument of array index operator must be an integer value, but got: " + ruValue2s(i_val)]));
+						}
+					}
+				}
+				default: ValError(concat(errs, ["first argument of index operator must be a map or array"]));
+			}
 		}
-		ScUndefConst():     Some(ValUndef());
-		ScBoolConst(val):   Some(ValBool(val));
-		ScIntConst(val):    Some(ValInt(val));
-		ScDoubleConst(val): Some(ValDouble(val));
-		ScStringConst(val): Some(ValString(val));
+		ScUndefConst():     ValUndef();
+		ScBoolConst(val):   ValBool(val);
+		ScIntConst(val):    ValInt(val);
+		ScDoubleConst(val): ValDouble(val);
+		ScStringConst(val): ValString(val);
 		ScVar(var):         ruEvalVar(var, state, out);
 	}
 }
 
-ruEvalVar(var : string, state : RuState, out : RuOut) -> Maybe<ValValue> {
+ruEvalVar(var : string, state : RuState, out : RuOut) -> ValValue {
 	conf = state.conf;
 	switch (lookupTree(state.vars, var)) {
-		Some(val): Some(val);
+		Some(val): val;
 		None(): {
 			if (startsWith(var, "conf.")) {
 				opt = strRight(var, 5);
 				switch (lookupTree(conf.opts, opt)) {
-					Some(val): Some(ValString(val));
+					Some(val): ValString(val);
 					None(): {
 						if (opt == "working-dir") {
-							Some(ValString(conf.workingDir));
+							ValString(conf.workingDir);
 						} else if (opt == "verbose") {
-							Some(ValInt(conf.verbose));
+							ValInt(conf.verbose);
 						} else if (opt == "import-roots") {
-							Some(ValArray(map(conf.importRoots, \r -> ValString(r))));
+							ValArray(map(conf.importRoots, \r -> ValString(r)));
 						} else if (opt == "project-roots") {
-							Some(ValArray(map(conf.projectRoots, \r -> ValString(r))));
+							ValArray(map(conf.projectRoots, \r -> ValString(r)));
 						} else {
-							Some(ValUndef());
+							ValUndef();
 						}
 					}
 				}
 			} else if (var == "sources") {
-				Some(ValMap(foldTree(state.ru, makeTree(), \id, src, acc -> 
+				ValMap(foldTree(state.ru, makeTree(), \id, src, acc -> 
 					setTree(acc, ValString(id2s(id)), ValData("RuSource", src))
-				)));
+				));
 			} else if (var == "math") {
 				math = ruMathFromSources(state.ru, RuEnv(conf, out));
-				Some(ValMap(pairs2tree([
+				ValMap(pairs2tree([
 					Pair(ValString("sources"), ValMap(foldTree(math.sources, makeTree(), \id, src, acc -> 
 						setTree(acc, ValString(id2s(id)), ValData("RuSource", src))
 					))),
@@ -136,9 +153,9 @@ ruEvalVar(var : string, state : RuState, out : RuOut) -> Maybe<ValValue> {
 					Pair(ValString("assertions"), ValMap(foldTree(math.decls.assertions, makeTree(), \id, assertion, acc -> 
 						setTree(acc, ValString(id2s(id)), ValData("RuAssertion", assertion))
 					))),
-				])));
+				]));
 			} else {
-				Some(ValUndef());
+				ValUndef();
 			}
 		}
 	}

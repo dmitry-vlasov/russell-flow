@@ -5,10 +5,10 @@ import script/run;
 import comm;
 
 export {
-	ruExecScript(s : ScScript, commands : Tree<string, RuComm>, state : RuState, out : RuOut) -> Maybe<RuState>;
+	ruExecScript(s : ScScript, commands : Tree<string, RuComm>, state : RuState, out : RuOut) -> RuState;
 }
 
-ruExecScript(script : ScScript, commands : Tree<string, RuComm>, state : RuState, out : RuOut) -> Maybe<RuState> {
+ruExecScript(script : ScScript, commands : Tree<string, RuComm>, state : RuState, out : RuOut) -> RuState {
 	timer = ruMakeTimer();
 	log_script = exists(ruScriptTasks(script), \task -> !existsTree(task.args, \arg, __ -> arg == "do_not_log_this"));
 	script_src = ruScript2s(script);
@@ -16,12 +16,10 @@ ruExecScript(script : ScScript, commands : Tree<string, RuComm>, state : RuState
 	if (log_script) {
 		ruScriptLog("<" + uuid + "> Script started:  " + ruServerEscapeString(script_src), state.conf);
 	}
-	err = ref false;
-	ret = ruDoExecScript(script, RuExecEnv(commands, state, out, err));
+	ret = ruDoExecScript(script, RuExecEnv(commands, state, out));
 	if (log_script) {
 		ruScriptLog(
-			"<" + uuid + "> Script finished: " +
-			(if (isSome(ret)) "Ok " else "Fail ") + 
+			"<" + uuid + "> Script finished: " + 
 			"in " + ruTimePassed2s(timer), state.conf
 		);
 	}
@@ -31,12 +29,11 @@ ruExecScript(script : ScScript, commands : Tree<string, RuComm>, state : RuState
 RuExecEnv(
 	commands : Tree<string, RuComm>, 
 	state : RuState, 
-	out : RuOut,
-	err : ref bool
+	out : RuOut
 );
 
-ruDoExecScript(script : ScScript, env : RuExecEnv) -> Maybe<RuState> {
-	ret = switch (script) {
+ruDoExecScript(script : ScScript, env : RuExecEnv) -> RuState {
+	switch (script) {
 		ScSeq(seq):
 			ruExecSeq(seq, env);
 		ScAssign(var, ex): 
@@ -52,99 +49,107 @@ ruDoExecScript(script : ScScript, env : RuExecEnv) -> Maybe<RuState> {
 		ScTask(comm, args): 
 			ruExecTask(script, env);
 		ScExit(): 
-			None();
+			env.state;
 	}
-	if (isNone(ret) && !^(env.err)) {
-		if (script != ScExit()) {
-			env.out.onMessage("error at evaluation of <<<\n" + ruScript2s(script) + "\n>>>");
+}
+
+ruExecSeq(seq : [ScScript], env : RuExecEnv) -> RuState {
+	fold(seq, env.state, \acc, script -> 
+		ruDoExecScript(script, RuExecEnv(env with state = acc))
+	);
+}
+
+ruExecAssign(var : string, ex : ScExp, env : RuExecEnv) -> RuState {
+	val = ruEval(ex, env.state, env.out);
+	switch (val) {
+		ValError(errs): {
+			env.out.onMessage("at assigning '" + ruScExp2s(ex) + "' to '" + var + "' met " + ruValue2s(val));
 		}
-		env.err := true;
+		default: { }
 	}
-	ret;
+	RuState(env.state with vars = setTree(env.state.vars, var, val));
 }
 
-ruExecSeq(seq : [ScScript], env : RuExecEnv) -> Maybe<RuState> {
-	fold(seq, Some(env.state), \acc, s -> 
-		maybeBind(acc, \state -> ruDoExecScript(s, RuExecEnv(env with state = state)))
-	);
-}
-
-ruExecAssign(var : string, ex : ScExp, env : RuExecEnv) -> Maybe<RuState> {
-	maybeMap(ruEval(ex, env.state, env.out), \val -> 
-		RuState(env.state with vars = setTree(env.state.vars, var, val))
-	);
-}
-
-ruExecIf(cond : ScExp, script : ScScript, env : RuExecEnv) -> Maybe<RuState> {
-	maybeBind(ruEval(cond, env.state, env.out), \val -> 
-		switch (val) {
-			ValBool(c): {
-				if (c) {
-					ruDoExecScript(script, env);
-				} else {
-					Some(env.state);
-				}
-			}
-			default: {
-				env.out.onMessage("'if' condition must return boolean value " + ruScExp2s(cond));
-				None();
+ruExecIf(cond : ScExp, script : ScScript, env : RuExecEnv) -> RuState {
+	val = ruEval(cond, env.state, env.out);
+	switch (val) {
+		ValBool(c): {
+			if (c) {
+				ruDoExecScript(script, env);
+			} else {
+				env.state;
 			}
 		}
-	);
+		ValError(err): {
+			env.out.onMessage("at computing 'if' condition '" + ruScExp2s(cond) + "' met " + ruValue2s(val));
+			env.state;
+		}
+		default: {
+			env.out.onMessage("'if' condition '" + ruScExp2s(cond) + "' must return boolean value, while returned " + ruValue2s(val));
+			env.state;
+		}
+	}
 }
 
-ruExecIfElse(cond : ScExp, pos : ScScript, neg : ScScript, env : RuExecEnv) -> Maybe<RuState> {
-	maybeBind(ruEval(cond, env.state, env.out), \val -> 
-		switch (val) {
-			ValBool(c): {
-				if (c) {
-					ruDoExecScript(pos, env);
-				} else {
-					ruDoExecScript(neg, env);
-				}
-			}
-			default: {
-				env.out.onMessage("'if' condition must return boolean value " + ruScExp2s(cond));
-				None();
+ruExecIfElse(cond : ScExp, pos : ScScript, neg : ScScript, env : RuExecEnv) -> RuState {
+	val = ruEval(cond, env.state, env.out);
+	switch (val) {
+		ValBool(c): {
+			if (c) {
+				ruDoExecScript(pos, env);
+			} else {
+				ruDoExecScript(neg, env);
 			}
 		}
-	);
+		ValError(err): {
+			env.out.onMessage("at computing 'if' condition '" + ruScExp2s(cond) + "' met " + ruValue2s(val));
+			env.state;
+		}
+		default: {
+			env.out.onMessage("'if' condition '" + ruScExp2s(cond) + "' must return boolean value, while returned " + ruValue2s(val));
+			env.state;
+		}
+	}
 }
 
-ruExecWhile(cond : ScExp, script : ScScript, env : RuExecEnv) -> Maybe<RuState> {
-	maybeBind(ruEval(cond, env.state, env.out), \val ->
-		switch (val) {
-			ValBool(c): {
-				if (c) {
-					maybeBind(
-						ruDoExecScript(script, env),
-						\state -> ruExecWhile(cond, script, RuExecEnv(env with state = state))
-					);
-				} else {
-					Some(env.state);
-				}
-			}
-			default: {
-				env.out.onMessage("'while' condition must return boolean value " + ruScExp2s(cond));
-				None();
+ruExecWhile(cond : ScExp, script : ScScript, env : RuExecEnv) -> RuState {
+	val = ruEval(cond, env.state, env.out);
+	switch (val) {
+		ValBool(c): {
+			if (c) {
+				state = ruDoExecScript(script, env);
+				ruExecWhile(cond, script, RuExecEnv(env with state = state));
+			} else {
+				env.state;
 			}
 		}
-	);
+		ValError(err): {
+			env.out.onMessage("at computing 'while' condition '" + ruScExp2s(cond) + "' met " + ruValue2s(val));
+			env.state;
+		}
+		default: {
+			env.out.onMessage("'while' condition '" + ruScExp2s(cond) + "' must return boolean value, while returned " + ruValue2s(val));
+			env.state;
+		}
+	}
 }
 
-ruExecPrint(ex : ScExp, env : RuExecEnv) -> Maybe<RuState> {
-	maybeMap(ruEval(ex, env.state, env.out), \val -> {
-		msg = ruApplyScriptVars(ruValue2s(val), env.state.vars, env.state.conf);
-		env.out.onMessage(strReplaces(msg, ["\\n", "\n", "\\t", "\t"]));
-		env.state;
-	});
+ruExecPrint(ex : ScExp, env : RuExecEnv) -> RuState {
+	val = ruEval(ex, env.state, env.out);
+	msg = ruApplyScriptVars(ruValue2s(val), env.state.vars, env.state.conf);
+	env.out.onMessage(strReplaces(msg, ["\\n", "\n", "\\t", "\t"]));
+	env.state;
 }
 
-ruExecTask(task : ScTask, env : RuExecEnv) -> Maybe<RuState> {
+ruExecTask(task : ScTask, env : RuExecEnv) -> RuState {
 	state = env.state;
 	switch (lookupTree(env.commands, task.command)) {
 		Some(command): {
-			ruRun(RuUnit(task, state, env.out), command.run, command.descr);
+			ruRun(
+				RuUnit(task, state, env.out), 
+				\unit -> either(command.run(unit), unit.state), 
+				command.descr
+			);
 		}
 		None(): {
 			switch (ruLoadScript(task.command, RuEnv(env.state.conf, env.out))) {
@@ -157,7 +162,7 @@ ruExecTask(task : ScTask, env : RuExecEnv) -> Maybe<RuState> {
 				}
 				None(): {
 					env.out.onMessage("Unknown command or script: '" + task.command + "'");
-					None();
+					state;
 				}
 			}
 		}
