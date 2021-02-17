@@ -68,7 +68,7 @@ ruDoCollectMath(left : Tree<int, RuAnySource>, done : Set<int>, env : RuEnv, acc
 					RuRawSource(__,__,info): {
 						maybeMap(ruParseSource(src, env), \parsed -> ruCollectParsed(parsed, acc, env));
 					}
-					RuParseSource(__,__,info): {
+					RuParseSource(__,__,__,info): {
 						Some(ruCollectParsed(src, acc, env));
 					}
 					RuSource(__,__,__,info): {
@@ -125,8 +125,8 @@ ruCollectCached(src : RuSource, acc : RuCollectEnv, env : RuEnv) -> RuCollectEnv
 
 ruCollectOne(parsed : RuParsed, acc : RuCollectEnv, env : RuEnv) -> RuCollectEnv {
 	switch (parsed) {
-		RuParseSource(__,__,__): ruCollectParsed(parsed, acc, env);
-		RuSource(__,__,__,__): ruCollectCached(parsed, acc, env);
+		RuParseSource(__,__,__,__): ruCollectParsed(parsed, acc, env);
+		RuSource(__,__,__,__):      ruCollectCached(parsed, acc, env);
 	}
 }
 
@@ -150,21 +150,9 @@ ruCollectParsed(src : RuParseSource, acc : RuCollectEnv, env : RuEnv) -> RuColle
 		None(): {
 			imps = map(src.imports, \imp -> RuImport(imp.module, imp.pos));
 			acc0 = RuCollectAcc(acc.skipProofs, src.info.path, src.info.id, acc.verified.math, ruEmptyMath, acc.tenv, env);
-			acc1 = fold(src.decls, acc0, \ac, block -> 
-				switch(block) {
-					RuParseDecl(): ruCollectSyntax(block, ac);
-					RuParseComment(__,__,__): ac;
-				}
-			);
-			parse_decls : [RuParseDecl] = filtermap(src.decls, \block -> 
-				switch(block) {
-					RuParseDecl(): Some(block);
-					RuParseComment(__,__,__): None();
-				}
-			);
-			created_decls = ruConcurrent(map(parse_decls, \decl -> \-> ruCreateAssertion(decl, acc1)));
-			//created_decls = map(parse_decls, \decl -> ruCreateAssertion(decl, acc1));
-			assertions = filtermap(created_decls, idfn);
+			acc1 = fold(src.decls, acc0, \ac, decl -> ruCollectSyntax(decl, ac));
+			assertions = filtermap(ruConcurrent(map(src.decls, \decl -> \-> ruCreateAssertion(decl, acc1))), idfn);
+			//assertions = filtermap(map(parse_decls, \decl -> ruCreateAssertion(decl, acc1)), idfn);
 			acc2 = fold(assertions, acc1, \ac, ass -> 
 				RuCollectAcc(ac with
 					local = RuMath(ac.local with 
@@ -174,28 +162,28 @@ ruCollectParsed(src : RuParseSource, acc : RuCollectEnv, env : RuEnv) -> RuColle
 					)
 				)
 			);
-			blocks = fold(src.decls, [], \ac, block -> 
-				switch (block) {
-					RuParseConst(id,__,__,__):
-						eitherMap(lookupTree(acc2.local.decls.consts, id), \c -> concat(ac, [c]), ac);
-					RuParseType(id,__,__): 
-						eitherMap(lookupTree(acc2.local.decls.types, id), \t -> concat(ac, [t]), ac);
-					RuParseRule(id,__,__,__):
-						eitherMap(lookupTree(acc2.local.decls.rules, id), \r -> concat(ac, [r]), ac);
-					RuParseAxiom(id,__,__,__,__,__):
-						eitherMap(lookupTree(acc2.local.decls.assertions, id), \a -> concat(ac, [a]), ac);
-					RuParseTheorem(id,__,__,__,__,__,__,__):
-						eitherMap(lookupTree(acc2.local.decls.assertions, id), \t -> concat(ac, [t]), ac);
-					RuParseDef(id,__,__,__,__,__,__,__):
-						eitherMap(lookupTree(acc2.local.decls.assertions, id), \d -> concat(ac, [d]), ac);
-					RuParseComment(text, json, pos):
-						concat(ac, [RuComment(text, ruCollectAnnotation(json, pos, src.info.module, env), pos)]);
+			decls = filtermap(src.decls, \decl -> 
+				switch (decl) {
+					RuParseConst(id,__,__,__,__):
+						lookupTree(acc2.local.decls.consts, id);
+					RuParseType(id,__,__,__): 
+						lookupTree(acc2.local.decls.types, id);
+					RuParseRule(id,__,__,__,__):
+						lookupTree(acc2.local.decls.rules, id);
+					RuParseAxiom(id,__,__,__,__,__,__):
+						lookupTree(acc2.local.decls.assertions, id);
+					RuParseTheorem(id,__,__,__,__,__,__,__,__):
+						lookupTree(acc2.local.decls.assertions, id);
+					RuParseDef(id,__,__,__,__,__,__,__,__):
+						lookupTree(acc2.local.decls.assertions, id);
+					//RuParseComment(text, json, pos):
+					//	concat(ac, [RuComment(text, ruCollectAnnotation(json, pos, src.info.module, env), pos)]);
 				}
 			);
 			if (ruVerbose(env.conf) > 1) {
 				env.out.onMessage("\tru collected: '" + src.info.path + "' in " + ruTimePassed2s(timer));
 			}
-			ru_src = ruBclocks2Src(RuSource(imps, [], [], src.info), blocks);
+			ru_src = RuSource(imps, decls, ruCollectComments(src.comments, src.info.path, env), src.info);
 			ruCacheAdd(ru_src, true, env);
 			ruDiskCacheSave(ru_src, env);
 			RuCollectEnv(
@@ -205,6 +193,12 @@ ruCollectParsed(src : RuParseSource, acc : RuCollectEnv, env : RuEnv) -> RuColle
 			);
 		}
 	}
+}
+
+ruCollectComments(comms : [RuParseComment], file : string, env : RuEnv) -> [RuComment] {
+	map(comms, \comm -> 
+		RuComment(comm.text, ruCollectAnnotation(comm.json, comm.pos, file, env), comm.pos)
+	);
 }
 
 ruCollectAnnotation(json_str : string, pos : int, file : string, env : RuEnv) -> JsonObject {
@@ -222,18 +216,18 @@ ruCollectAnnotation(json_str : string, pos : int, file : string, env : RuEnv) ->
 
 ruCollectSyntax(decl : RuParseDecl, acc : RuCollectAcc) -> RuCollectAcc {
 	switch (decl) {
-		RuParseConst(__,__,__,__): ruCollectConst(decl, acc);
-		RuParseType(__,__,__):     ruCollectType(decl, acc);
-		RuParseRule(__,__,__,__):  ruCollectRule(decl, acc);
+		RuParseConst(__,__,__,__,__): ruCollectConst(decl, acc);
+		RuParseType(__,__,__,__):     ruCollectType(decl, acc);
+		RuParseRule(__,__,__,__,__):  ruCollectRule(decl, acc);
 		default: acc;
 	}
 }
 
 ruCreateAssertion(decl : RuParseDecl, acc : RuCollectAcc) -> Maybe<RuAssertion> {
 	switch (decl) {
-		RuParseAxiom(__,__,__,__,__,__):         ruCreateAxiom(decl, acc);
-		RuParseTheorem(__,__,__,__,__,__,__,__): ruCreateTheorem(decl, acc);
-		RuParseDef(__,__,__,__,__,__,__,__):     ruCreateDef(decl, acc);
+		RuParseAxiom(__,__,__,__,__,__,__):         ruCreateAxiom(decl, acc);
+		RuParseTheorem(__,__,__,__,__,__,__,__,__): ruCreateTheorem(decl, acc);
+		RuParseDef(__,__,__,__,__,__,__,__,__):     ruCreateDef(decl, acc);
 		default: None();
 	}
 }
@@ -250,7 +244,12 @@ ruCollectConst(const : RuParseConst, acc : RuCollectAcc) -> RuCollectAcc {
 					decls = RuDecls(acc.local.decls with
 						consts = setTree(acc.local.decls.consts, const.id, 
 							RuConst(
-								RuDescr(const.id, acc.module, [], const.pos), 
+								RuDescr(
+									const.id, 
+									acc.module, 
+									ruCollectComments(const.comments, acc.file, acc.env), 
+									const.pos
+								), 
 								if (const.ascii == -1) -1 else const.ascii, 
 								if (const.latex == -1) -1 else const.latex
 							)
@@ -271,7 +270,12 @@ ruCollectType(type : RuParseType, acc : RuCollectAcc) -> RuCollectAcc {
 		None(): {
 			conf1 = ruAddErr2Env(acc.env, "\nat type '" + id2s(type.id) + "'");
 			new_type = RuType(
-				RuDescr(type.id, acc.module, [], type.pos), 
+				RuDescr(
+					type.id, 
+					acc.module, 
+					ruCollectComments(type.comments, acc.file, acc.env), 
+					type.pos
+				), 
 				type.supers
 			);
 			RuCollectAcc(acc with
@@ -298,7 +302,15 @@ ruCollectRule(rule : RuParseRule, acc : RuCollectAcc) -> RuCollectAcc {
 			type = rule.term.type;
 			vars = ruCollectVars(rule.vars, acc, conf1);
 			term = ruMakeTerm(rule.term, vars, acc, ruAddErr2Env(acc.env, "\nat rule: " + id2s(rule.id)));
-			new_rule = RuRule(RuDescr(rule.id, acc.module, [], rule.pos), vars, term);
+			new_rule = RuRule(
+				RuDescr(
+					rule.id, 
+					acc.module, 
+					ruCollectComments(rule.comments, acc.file, acc.env), 
+					rule.pos
+				), 
+				vars, term
+			);
 			switch (lookupTree(acc.tenv, rule.term.type)) {
 				Some(tenv): {
 					RuCollectAcc(acc with
@@ -362,7 +374,12 @@ ruCreateAxiom(ax : RuParseAxiom, acc : RuCollectAcc) -> Maybe<RuAxiom> {
 				switch (ruCollectExp(ax.prop, vars, acc, conf1)) {
 					Some(prop): {
 						Some(RuAxiom(
-							RuDescr(ax.id, acc.module, [], ax.pos), 
+							RuDescr(
+								ax.id, 
+								acc.module, 
+								ruCollectComments(ax.comments, acc.file, acc.env), 
+								ax.pos
+							), 
 							RuStatement(vars, disjs, hyps, prop)
 						));
 					}
@@ -471,7 +488,12 @@ ruCreateTheorem(th : RuParseTheorem, acc : RuCollectAcc) -> Maybe<RuTheorem> {
 					Some(prop): {
 						switch (ruCollectProof(th.proof, vars, acc, conf1)) {
 							Some(proof): Some(RuTheorem(
-								RuDescr(th.id, acc.module, [], th.pos), 
+								RuDescr(
+									th.id, 
+									acc.module, 
+									ruCollectComments(th.comments, acc.file, acc.env), 
+									th.pos
+								), 
 								RuStatement(vars, disjs, hyps, prop), 
 								meta, proof
 							));
@@ -536,7 +558,12 @@ ruCreateDef(df : RuParseDef, acc : RuCollectAcc) -> Maybe<RuDef> {
 								switch (ruCollectExp(df.defs, vars, acc, env1)) {
 									Some(defs): 
 										Some(RuDef(
-											RuDescr(df.id, acc.module, [], df.pos), 
+											RuDescr(
+												df.id, 
+												acc.module, 
+												ruCollectComments(df.comments, acc.file, acc.env), 
+												df.pos
+											), 
 											RuStatement(vars, disjs, hyps, prop), 
 											defm, defs
 										));
