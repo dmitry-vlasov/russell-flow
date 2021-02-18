@@ -14,4 +14,4 @@ To run translation from Metamath to Russell and back:
 
 Vscode extension: is located in 'resources/vscode'. Use it to explore the Russell theorem base.
 
-Prerequisites: java runtime to run, java compiler (11 or higher).
+Prerequisites: java runtime to run, java compiler (11 or higher) to compile.
