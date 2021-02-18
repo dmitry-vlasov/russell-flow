@@ -241,8 +241,12 @@ function showHttpServerIsLaunching() {
 export function deactivate() {
 	// First, shutdown Russell server, if it is owned by current vscode instance
 	if (httpServer) {
-		const port : number = vscode.workspace.getConfiguration("russell").get("portOfHttpServer");
-		tools.shutdownHttpServer().on("exit", (code, msg) => httpServer = null);
+		tools.shutdownHttpServer().on("exit", (code, msg) => {
+			if (code != 0) {
+				httpServer.kill("SIGKILL");
+			}
+			httpServer = null
+		});
 	}
     if (!client) {
         return undefined;
