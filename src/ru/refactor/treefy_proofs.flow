@@ -11,19 +11,139 @@ ruCommTreefyProofs = RuComm(
 		"treefy-proofs", "refactor", "unwrap linear proofs to hierarchical", "target", false, false, 
 		[
 			RuCommArg("target", true, "the target: a theorem, file or all", "all"),
-			RuCommArg("degree", true, "maximum steps number at one level", "16")
+			RuCommArg("max-len", true, "maximum steps number at one level", "10")
 		], []
 	),
 	ruRunTreefyProofs
 );
 
-
-ruTreefyTheorem(th : RuTheorem, degree : int, env : RuEnv) -> RuTheorem {
-	ruNoTheorem
+ruTreefyTheorem(th : RuTheorem, max_len : int, math : RuMath, env : RuEnv) -> RuTheorem {
+	RuTheorem(th with
+		proof = RuProof(th.proof with
+			steps = ruTreefySteps(th.proof.steps, max_len, math, env)
+		)
+	);
 }
 
-ruDoTreefyTheorem(th : RuTheorem, proof : [RuStep], degree : int, env : RuEnv) -> RuTheorem {
-	ruNoTheorem
+ruTreefySteps(steps : [RuStep], max_len : int, math : RuMath, env : RuEnv) -> [RuStep] {
+	mapi(
+		ruFindFactorProof(steps, max_len, steps[length(steps) - 1], math, env), 
+		\i, s -> {
+			if (s.leaf) {
+				RuStep(s.step with
+					proof = RuProof(makeTree(), makeSet(), 
+						ruTreefySteps(ruFindSubProof(steps, i, math, env), max_len, math, env), -1
+					)
+				)
+			} else {
+				s.step;
+			}
+		}
+	);
+}
+
+ruStep2StepRefs(step : RuStep) -> [RuStepRef] {
+	filtermap(step.refs, ruRef2StepRef);
+}
+
+ruFindSubProof(steps : [RuStep], i : int, math : RuMath, env : RuEnv) -> [RuStep] {
+	ruReindexSteps(ruDoFindSubProof(steps, i, [], env), math);
+}
+
+ruDoFindSubProof(steps : [RuStep], i : int, acc : [RuStep], env : RuEnv) -> [RuStep] {
+	fold(
+		ruStep2StepRefs(steps[i]),
+		concat(acc, [steps[i]]),
+		\ac, rf -> ruDoFindSubProof(steps, rf.ind, ac, env)
+	);
+}
+
+RuFactorStep(
+	step : RuStep,
+	leaf : bool
+);
+
+ruFindFactorProof(steps : [RuStep], max_len : int, qed: RuStep, math : RuMath, env : RuEnv) -> [RuFactorStep] {
+	p = ruDoFindFactorProof(steps, max_len, [qed], [], env);
+	leafs = fold(p.first, makeSet(), \acc, leaf -> insertSet(acc, leaf.ind));
+	factored = map(p.second, \step -> RuFactorStep(step, containsSet(leafs, step.ind)));
+	ruReindexFactorSteps(factored, math)
+}
+
+ruDoFindFactorProof(steps : [RuStep], max_len : int, leafs : [RuStep], acc : [RuStep], env : RuEnv) -> Pair<[RuStep], [RuStep]> {
+	switch (find(leafs, \leaf -> length(acc) + length(ruStep2StepRefs(leaf)) <= max_len)) {
+		Some(leaf): {
+			leaf_refs = map(ruStep2StepRefs(leaf), \rf -> steps[rf.ind]);
+			ruDoFindFactorProof(
+				steps, max_len,
+				concat(removeFirst(leafs, leaf), leaf_refs), 
+				concat(leaf_refs, acc), 
+				env
+			);
+		}
+		None(): Pair(leafs, acc);
+	}
+}
+
+ruReindexSteps(steps : [RuStep], math : RuMath) -> [RuStep] {
+	ind_map = foldi(steps, makeTree(), \i, acc, step -> setTree(acc, step.ind, i));
+	mapi(steps, \i, step -> RuStep(step with 
+			ind = i,
+			refs = map(step.refs, \rf -> 
+				switch (rf) {
+					RuStepRef(j, pos): {
+						switch (lookupTree(ind_map, j)) {
+							Some(k): RuStepRef(k, pos);
+							None(): {
+								ruCrash("illegal step index: " + i2s(j) + ", steps:\n" + ruSteps2s(steps, math));
+								rf;
+							}
+						}
+					}
+					default: rf;
+				}
+			)
+		)
+	);
+}
+
+ruReindexFactorSteps(steps : [RuFactorStep], math : RuMath) -> [RuFactorStep] {
+	ind_map = foldi(steps, makeTree(), \i, acc, s -> setTree(acc, s.step.ind, i));
+	mapi(steps, \i, s -> {
+		reindexed = if (s.leaf) {
+			RuStep(s.step with 
+				ind = i,
+				assertion = -1,
+				refs = []
+			);
+		} else {
+			RuStep(s.step with 
+				ind = i,
+				refs = map(s.step.refs, \rf -> 
+					switch (rf) {
+						RuStepRef(j, pos): {
+							switch (lookupTree(ind_map, j)) {
+								Some(k): RuStepRef(k, pos);
+								None(): {
+									ruCrash("illegal step index: " + i2s(j) + ", steps:\n" + ruSteps2s(map(steps, \st -> st.step), math));
+									rf;
+								}
+							}
+						}
+						default: rf;
+					}
+				)
+			);
+		}
+		RuFactorStep(reindexed, s.leaf);
+	});
+}
+
+
+
+ruTreefySteps1(steps : [RuStep], max_len : int, math : RuMath, env : RuEnv) -> [RuStep] {
+	subproofs = mapi(steps, \i, step -> ruFindSubProof(steps, i, math, env));
+	[]
 }
 
 ruRunTreefyProofs(unit : RuUnit) -> Maybe<RuState> {
@@ -34,11 +154,17 @@ ruRunTreefyProofs(unit : RuUnit) -> Maybe<RuState> {
 	timer = ruMakeTimer();
 	math = ruMathFromSources(state.ru, env);
 	target = ruDetermineTarget(task, math, env);
-	degree = s2i(lookupTreeDef(task.args, "degree", "16"));
+	max_len = s2i(lookupTreeDef(task.args, "max-len", "10"));
 	theorems = filtermap(ruTargetAssertions(target, math, env), ruDecl2Theorem);
-	ret = fold(theorems, math, \acc, th -> {
-		ruMathReplaceDecl(acc, ruTreefyTheorem(th, degree, env), env)
-	});
+	ret = fold(theorems, math, \acc, th ->
+		if (length(th.proof.steps) <= max_len) acc else {
+			treefied = ruTreefyTheorem(th, max_len, math, env);
+			if (ruVerbose(conf) > 1) {
+				env.out.onMessage("\ttreefied theorem:\n" + ru2s(treefied, math));
+			}
+			ruMathReplaceDecl(acc, treefied, env)
+		}
+	);
 	Some(RuState(state with 
 		ru = ret.sources,
 		vars = setTree(state.vars,
