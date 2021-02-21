@@ -20,7 +20,7 @@ ruCommTreefyProofs = RuComm(
 ruTreefyTheorem(th : RuTheorem, max_len : int, math : RuMath, env : RuEnv) -> RuTheorem {
 	RuTheorem(th with
 		proof = RuProof(th.proof with
-			steps = ruTreefySteps(th.proof.steps, max_len, math, env)
+			steps = ruTreefySteps1(th.proof.steps, max_len, math, env)
 		)
 	);
 }
@@ -142,9 +142,140 @@ ruReindexFactorSteps(steps : [RuFactorStep], math : RuMath) -> [RuFactorStep] {
 
 
 ruTreefySteps1(steps : [RuStep], max_len : int, math : RuMath, env : RuEnv) -> [RuStep] {
-	subproofs = mapi(steps, \i, step -> ruFindSubProof(steps, i, math, env));
-	[]
+	if (length(steps) <= max_len) steps else {
+		i = 3 + round(random() * i2d(length(steps) - 6));
+		full_subproof = ruFindSubProof1(steps, i, [], env);
+		if (length(full_subproof) == 1) steps else {
+			println("ruTreefySteps1:\n" + ruSteps2s(steps, math));
+			println("i: " + i2s(i + 1));
+			println("full_subproof:\n" + ruSteps2s(full_subproof, math));
+			other = set2array(differenceSets(buildSet(steps), buildSet(full_subproof)));
+			println("other:\n" + ruSteps2s(other, math));
+			other_ref_inds = fold(other, makeSet(), \acc, step -> 
+				fold(ruStep2StepRefs(step), acc,  \ac, rf -> insertSet(ac, rf.ind))
+			);
+			common_steps = filter(full_subproof, \step -> 
+				step.ind != i && containsSet(other_ref_inds, step.ind)
+			);
+			println("common_steps:\n" + ruSteps2s(common_steps, math));
+			common_steps_ind = buildSet(map(common_steps, \step -> step.ind));
+			transitive_common = for(buildSet(common_steps),
+				\comm -> exists(set2array(comm), \step -> 
+					exists(ruStep2StepRefs(step), \rf -> 
+						!containsSet(comm, steps[rf.ind])
+					)
+				),
+				\comm -> foldSet(comm, comm, \acc,step ->
+					fold(ruStep2StepRefs(step), acc, \ac, rf ->
+						insertSet(ac, steps[rf.ind])
+					)
+				)
+			);
+			println("transitive_common:\n" + ruSteps2s(set2array(transitive_common), math));
+			reduced_subproof = filter(full_subproof, \step -> !containsSet(transitive_common, step));
+			println("reduced_subproof:\n" + ruSteps2s(reduced_subproof, math));
+			reduced_subproof_inds = buildSet(map(reduced_subproof, \step -> step.ind));
+			ri = fold(steps, RuReindexStepsAcc(makeTree(), makeTree(), 0, 0), \acc, step ->
+				if (!containsSet(reduced_subproof_inds, step.ind)) {
+					reindexHyps = if (!containsSet(common_steps_ind, step.ind)) {
+						acc.reindexHyps;
+					} else {
+						setTree(acc.reindexHyps, step.ind, findiDef(common_steps, \st -> st.ind == step.ind, -1));
+					}
+					RuReindexStepsAcc(
+						setTree(acc.reindexSteps, step.ind, acc.curr_this),
+						reindexHyps,
+						acc.curr_this + 1,
+						acc.curr_sub
+					);
+				} else if (step.ind == i) {
+					RuReindexStepsAcc(
+						setTree(acc.reindexSteps, step.ind, acc.curr_sub),
+						acc.reindexHyps,
+						acc.curr_this + 1,
+						acc.curr_sub + 1
+					);
+				} else {
+					RuReindexStepsAcc(
+						setTree(acc.reindexSteps, step.ind, acc.curr_sub),
+						acc.reindexHyps,
+						acc.curr_this,
+						acc.curr_sub + 1
+					);
+				}
+			);
+			fold(steps, [], \acc, step ->
+				if (!containsSet(reduced_subproof_inds, step.ind)) {
+					concat(acc, [ruReindexStep(step, ri.reindexSteps, makeTree())])
+				} else if (step.ind == i) {
+					qed = RuStep(step with 
+						ind = length(acc),
+						assertion = -1,
+						refs = map(common_steps, \st -> RuStepRef(st.ind, -1)),
+						proof = RuProof(makeTree(), makeSet(), 
+							map(reduced_subproof, \st ->
+								ruReindexStep(st, ri.reindexSteps, ri.reindexHyps)
+							), -1
+						),
+						pos = -1
+					);
+					concat(acc, [qed])
+				} else {
+					acc;
+				}
+			);
+		}
+	}
 }
+
+RuReindexStepsAcc(
+	reindexSteps : Tree<int, int>,
+	reindexHyps : Tree<int, int>,
+	curr_this : int,
+	curr_sub : int
+);
+
+ruReindexStep(step : RuStep, reindex_steps : Tree<int, int>, reindex_hyps : Tree<int, int>) -> RuStep {
+	RuStep(step with 
+		ind = lookupTreeDef(reindex_steps, step.ind, step.ind),
+		refs = map(step.refs, \rf ->
+			switch (rf) {
+				RuStepRef(i,__): {
+					switch (lookupTree(reindex_hyps, step.ind)) {
+						Some(k): RuHypRef(k, -1)
+						None():  RuStepRef(lookupTreeDef(reindex_steps, i, i), -1)
+					}
+				}
+				RuHypRef(__,__): rf;
+			}
+		)
+	);
+}
+
+ruFindSubProof1(steps : [RuStep], i : int, acc : [RuStep], env : RuEnv) -> [RuStep] {
+	fold(
+		ruStep2StepRefs(steps[i]),
+		concat(acc, [steps[i]]),
+		\ac, rf -> ruFindSubProof1(steps, rf.ind, ac, env)
+	);
+}
+
+
+/*
+ruTreefySteps2(steps : [RuStep], max_len : int, math : RuMath, env : RuEnv) -> [RuStep] {
+	if (length(step) <= max_len) steps else {
+		rand_ind = \-> round(random() * i2d(length(steps) - 3));
+		i1 = rand_ind();
+		i2 = for(rand_ind(), \i -> i == i1, \_ -> rand_ind());
+		k1 = if (i1 < i2) i1 else i2;
+		k2 = if (i1 < i2) i2 else i1;
+		sub1 = ruFindSubProof(steps, k1, math, env);
+		sub2 = 
+		
+		subproofs = mapi(steps, \i, step -> ruFindSubProof(steps, i, math, env));
+		[]
+	}
+}*/
 
 ruRunTreefyProofs(unit : RuUnit) -> Maybe<RuState> {
 	env = ruUnitEnv(unit);
