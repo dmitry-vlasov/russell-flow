@@ -1,4 +1,4 @@
 #!/bin/bash
 
-pegcompile flowparser=parse/ru_parse_file.flow flowparserast=parse/ru_parse_ast.flow file=parse/russell.lingo
-pegcompile flowparser=parse/mm_parse_file.flow flowparserast=parse/mm_parse_ast.flow file=parse/metamath.lingo
+flowcpp --batch lingo/pegcode/pegcompiler.flow -- flowparser=ru/parse/file.flow flowparserast=ru/parse/ast.flow file=ru/parse/russell.lingo
+#flowcpp --batch lingo/pegcode/pegcompiler.flow -- flowparser=mm/parse/file.flow flowparserast=mm/parse/ast.flow file=mm/parse/metamath.lingo
