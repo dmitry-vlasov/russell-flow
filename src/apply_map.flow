@@ -12,23 +12,11 @@ export {
 		message : () -> string
 	);
 
-	// Application function: returns bool value (success or failure).
-	RuApplyFn(
-		descr : RuFnDescr,
-		func : (RuDecl, double) -> bool
-	);
-
 	// Mapping function: transforms (possibly) a decl. If None is returned, old one is kept.
 	RuMapFn(
 		descr : RuFnDescr,
 		func : (RuDecl, double) -> Maybe<RuDecl>
 	);
-
-	// Apply 'f.func' to the decls from 'target' task option. 
-	// Selects decls to process with 'fn.descr.pred' parameter.
-	// Balances the time limit between all admitted decls
-	// proportionally to the 'fn.descr.measure'.
-	ruApplyFnComm(unit : RuUnit, f : RuApplyFn) -> void;
 
 	// Map 'f.func' to the decls from 'target' task option. 
 	// Selects decls to process with 'fn.descr.pred' parameter.
@@ -36,147 +24,6 @@ export {
 	// proportionally to the 'fn.descr.measure'.
 	ruMapFnComm(unit : RuUnit, f : RuMapFn) -> RuState;
 }
-
-ruApplyFnComm(unit : RuUnit, f : RuApplyFn) -> void {
-	task = unit.task;
-	state = unit.state;
-	out = unit.out;
-	file = lookupTreeDef(task.args, "file", "");
-	conf = state.conf;
-	env = RuEnv(conf, out);
-	math = ruMathFromSources(state.ru, env);
-	if (ruVerbose(conf) >= 3) {
-		out.onMessage("\t\tApply '" + f.descr.name + "' task: " + ruTask2s(task));
-	}
-	target0 = lookupTreeDef(task.args, "target", file);
-	target = ruTrimPath(target0, state.conf, ".ru");
-	failure = ref 0;
-	success = ref 0;
-	processed = ref 0;
-	failed_names = ref [];
-	max_time = ref 0.0;
-	max_id = ref -1;
-	time_limit2s = \limit -> if (limit == doubleMax) "no" else ruTime2s(limit);
-	apply_decl = \decl, time_limit -> {
-		if (ruVerbose(conf) >= 3) {
-			out.onMessage("\t\tTime limit on decl '" + id2s(decl.descr.id) + "': " + time_limit2s(time_limit));
-		}
-		timer = ruMakeTimer();
-		atomicRefIntAddition(processed, 1);
-		ret = if (f.func(decl, time_limit)) {
-			atomicRefIntAddition(success, 1);
-			true 
-		} else {
-			atomicRefIntAddition(failure, 1);
-			refArrayPush(failed_names, decl.descr.id);
-			false;
-		} 
-		passed = ruTimePassed(timer);
-		if (passed > ^max_time) {
-			max_time := passed;
-			max_id := decl.descr.id;
-		}
-		ret;
-	}
-	decls2measures = \decls : [RuDecl] -> {
-		map(decls, \d -> f.descr.measure(d));
-	}
-	timer = ruMakeTimer();
-	calc_time_limit = \decls -> {
-		opt = switch (lookupTree(task.args, "time-limit")) {
-			Some(limit): limit;
-			None(): lookupTreeDef(conf.opts, "time-limit", "300");
-		}
-		if (opt == "auto") {
-			// By default we set 3 ms per one measure unit
-			measures = decls2measures(decls);
-			ruSumDoublesFromArray(measures) * 3.0;
-		} else if (opt == "no") doubleMax else {
-			i2d(s2i(opt) * 1000);
-		}
-	}
-	decls = if (target == "all" || target == "1" || target == "1-seq" || target == "all-seq") {
-		filter(concatA(map(ruSourcesOrder(math.sources), \src -> src.decls)), f.descr.pred);
-	} else {
-		id = s2id(target);
-		switch (lookupTree(math.sources, id)) {
-			Some(src): 
-				filter(src.decls, f.descr.pred);
-			None(): {
-				switch (lookupTree(math.decls.assertions, id)) {
-					Some(ass): [ass];
-					None(): {
-						out.onError("no target found for " + f.descr.name, []);
-						[];
-					}
-				}
-			}
-		}
-	}
-	time_limit = calc_time_limit(decls);
-	if (ruVerbose(conf) > 0) {
-		out.onMessage(
-			"\tgoing to process " + i2s(length(decls)) + 
-			"\n\ttime limit: " + time_limit2s(time_limit) +
-			(if (ruVerbose(conf) >=2) "\n\ttime limit per unit: " + d2st(time_limit / i2d(length(decls)), 3) else "")
-		);
-		if (ruVerbose(conf) > 2) {
-			out.onMessage("\tdecls:\n" + 
-				strGlue(map(decls, \d -> "\t" + id2s(d.descr.id)), "\n") + "\n\n"
-			);
-		}
-	}
-	track_progress = ref true;
-	ruTrackProgress(track_progress, processed, length(decls), ruProgressUpdateMs(task, conf), timer, out, f.descr.message);
-	ret = if (target == "1-seq" || target == "all-seq") {
-		measures = decls2measures(decls);
-		sum_measure = ruSumDoublesFromArray(measures);
-		all(mapi(decls, \i, d ->
-			apply_decl(d, time_limit * measures[i] / sum_measure)
-		));
-	} else {
-		chunks = splitByNumber(decls, s2i(lookupTreeDef(conf.opts, "decls-split-num", "256")));
-		chunk_measures = map(chunks, decls2measures);
-		sum_chunk_measures = map(chunk_measures, ruSumDoublesFromArray);
-		total_measure = ruSumDoublesFromArray(sum_chunk_measures);
-		foldi(chunks, true, \n, acc, chunk -> {
-			left_time = time_limit - ruTimePassed(timer);
-			if (left_time <= 0.0) false else {
-				time_left_on_chunk = left_time * i2d(availableProcessors()) * sum_chunk_measures[n] / total_measure;
-				acc && all(ruConcurrent(mapi(chunk, \i, decl -> 
-						\-> apply_decl(decl, time_left_on_chunk * chunk_measures[n][i] / sum_chunk_measures[n])
-				)));
-			}
-		});
-	}
-	track_progress := false;
-	passed = ruTimePassed(timer);
-	if (ruVerbose(conf) > 0 && length(decls) > 0) {
-		msg = if (length(decls) == 1) { 
-			"ru applied '" + f.descr.name + "' to '" + target + "' in " + ruTime2s(passed);
-		} else {
-			"ru applied '" + f.descr.name + "' to '" + target + "'" + "\n" +
-				"\ttotal time: " + ruTime2s(passed) + "\n"
-				"\tavg time:   " + ruTime2s(passed / i2d(length(decls))) + "\n"
-				"\tdecls num:  " + i2s(^success)
-		}
-		out.onMessage(msg);
-	}
-	if (^failure > 0) {
-		msg = 
-			(if (ruVerbose(conf) > 0) "" else "ru applied '" + f.descr.name + "' to '" + target + "' in " + ruTime2s(passed) + "\n") +
-				"\tfailures:  " + i2s(^failure) + "\n" +
-				"\tsuccess: " + i2s(^success) +
-				(if (ruVerbose(conf) >=2) "\n\tfailed:\n" + strGlue(map(^failed_names, \n -> "\t\t" + id2s(n)), "\n") else "");
-				//"\n\tfailed:\n" + strGlue(map(^failed_names, \n -> "\t\t" + id2s(n)), "\n");
-		out.onMessage(msg);
-	}
-}
-
-// Get a callback in x ms
-// native timer : io (int, () -> void) -> void = Native.timer;
-
-// ruTrackProcessing(counter : ref int, num : int, tr : RuTimer, out : RuOut, msg : string) -> void
 
 ruMapFnComm(unit : RuUnit, f : RuMapFn) -> RuState {
 	task = unit.task;
