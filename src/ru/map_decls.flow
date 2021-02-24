@@ -1,4 +1,5 @@
 import comm;
+import base/util/progress;
 import ru/util/target;
 
 export {
@@ -44,38 +45,41 @@ ruCalcTimeLimit(decls : [RuDecl], f : RuMapFn, task : ScTask, conf : RuConf) -> 
 	}
 }
 
-RuMapFnProgress(
+RuMapFnStats(
+	progress    : RuProgress,
 	not_mapped  : ref int,
 	was_mapped  : ref int,
-	processed   : ref int,
 	max_time    : ref double,
-	max_time_id : ref int,
+	max_time_id : ref int
 );
 
-ruWrapFnWithProgress(f : RuMapFn, progress : RuMapFnProgress, env : RuEnv) -> (RuDecl, double) -> Maybe<RuDecl> {
+ruWrapFnWithProgress(f : RuMapFn, stats : RuMapFnStats, env : RuEnv) -> (RuDecl, double) -> Maybe<RuDecl> {
 	\decl, time_limit -> {
 		if (ruVerbose(env.conf) >= 3) {
 			env.out.onMessage("\t\tTime limit on decl '" + id2s(decl.descr.id) + "': " + ruTime2s(time_limit));
 		}
 		timer = ruMakeTimer();
 		ret = f.func(decl, time_limit);
-		atomicRefIntAddition(progress.processed, 1);
+		atomicRefIntAddition(stats.progress.counter, 1);
 		if (isSome(ret)) {
-			atomicRefIntAddition(progress.was_mapped, 1);
+			atomicRefIntAddition(stats.was_mapped, 1);
 		} else {
-			atomicRefIntAddition(progress.not_mapped, 1);
+			atomicRefIntAddition(stats.not_mapped, 1);
 		} 
 		time = ruTimePassed(timer);
-		if (time > ^(progress.max_time)) {
-			progress.max_time := time;
-			progress.max_time_id := decl.descr.id;
+		if (time > ^(stats.max_time)) {
+			stats.max_time := time;
+			stats.max_time_id := decl.descr.id;
 		}
 		ret;
 	}
 }
 
-ruMakeMapFnProgress() -> RuMapFnProgress {
-	RuMapFnProgress(ref 0, ref 0, ref 0, ref 0.0, ref -1);
+ruMakeMapFnStats(time_limit : double, total : int, delta) -> RuMapFnStats {
+	RuMapFnStats(
+		ruMakeProgress(time_limit, total, delta),
+		ref 0, ref 0, ref 0.0, ref -1
+	);
 }
 
 ruMapDeclsSequentially(decls : [RuDecl], f : RuMapFn, time_limit : double, timer : RuTimer, math : RuMath, env : RuEnv) -> RuMath {
@@ -133,24 +137,35 @@ ruMapFnComm(unit : RuUnit, f : RuMapFn) -> RuState {
 		out.onMessage("\t\tMap '" + f.descr.name + "' task: " + ruTask2s(task));
 	}
 	target = ruDetermineTarget(task, math, env);
-	progress = ruMakeMapFnProgress();
-	prog_f = RuMapFn(f with func = ruWrapFnWithProgress(f, progress, env));
 	decls = filter(ruTargetDecls(target, math, env), f.descr.pred);
 	time_limit = ruCalcTimeLimit(decls, f, task, conf);
-
+	stats = ruMakeMapFnStats(time_limit, length(decls), ruProgressUpdateMs(task, conf));
+	prog_f = RuMapFn(f with func = ruWrapFnWithProgress(f, stats, env));
 	ruMapDeclsStartMessage(decls, time_limit, env);
-	
-	timer = ruMakeLimitedTimer(time_limit);
-	track_progress = ref true;
-	ruTrackProgress(track_progress, progress.processed, length(decls), ruProgressUpdateMs(task, conf), timer, out, f.descr.message);
-	mapped_math = if (!ruTargetIsConcurrent(target)) {
-		ruMapDeclsSequentially(decls, prog_f, time_limit, timer, math, env);
-	} else {
-		ruMapDeclsConcurrently(decls, prog_f, time_limit, timer, math, env);
-	}
-	track_progress := false;
-	ruMapDeclsEndMessage(progress, f.descr.name, ruTarget2s(target), decls, timer, env);
-	RuState(state with ru = mapped_math.sources);
+	ruTrackProgress(stats.progress, out, f.descr.message);
+		mapped_math = if (!ruTargetIsConcurrent(target)) {
+			ruMapDeclsSequentially(decls, prog_f, time_limit, stats.progress.timer, math, env);
+		} else {
+			ruMapDeclsConcurrently(decls, prog_f, time_limit, stats.progress.timer, math, env);
+		}
+	stats.progress.isOn := false;
+	ruMapDeclsEndMessage(stats, f.descr.name, ruTarget2s(target), decls, env);
+	ruMapDeclsResult(state, mapped_math.sources, f.descr.name, stats);
+}
+
+ruMapDeclsResult(state : RuState, mapped : Tree<int, RuSource>, f_name : string, stats : RuMapFnStats) -> RuState {
+	RuState(state with 
+		ru = mapped,
+		vars = mergeTree(state.vars, pairs2tree([
+			Pair(f_name + ".counter", ValInt(^(stats.progress.counter))),
+			Pair(f_name + ".total", ValInt(stats.progress.total)),
+			Pair(f_name + ".was_mapped", ValInt(^(stats.was_mapped))),
+			Pair(f_name + ".not_mapped", ValInt(^(stats.not_mapped))),
+			Pair(f_name + ".max_time", ValDouble(^(stats.max_time))),
+			Pair(f_name + ".max_time_id", ValString(id2s(^(stats.max_time_id)))),
+			Pair(f_name + ".time", ValDouble(ruTimePassed(stats.progress.timer)))
+		]))
+	);
 }
 
 ruMapDeclsStartMessage(decls : [RuDecl], time_limit : double, env : RuEnv) -> void {
@@ -170,19 +185,21 @@ ruMapDeclsStartMessage(decls : [RuDecl], time_limit : double, env : RuEnv) -> vo
 	}
 }
 
-ruMapDeclsEndMessage(progress : RuMapFnProgress, f_name : string, target : string, decls : [RuDecl], timer : RuTimer, env : RuEnv) -> void {
+ruMapDeclsEndMessage(stats : RuMapFnStats, f_name : string, target : string, decls : [RuDecl], env : RuEnv) -> void {
 	conf = env.conf;
 	out = env.out;
 	if (ruVerbose(conf) > 0 && length(decls) > 0) {
 		msg = if (length(decls) == 1) { 
-			"ru mapped '" + f_name + "' to '" + target + "' in " + ruTime2s(ruTimePassed(timer));
+			"ru mapped '" + f_name + "' to '" + target + "' in " + ruTime2s(ruTimePassed(stats.progress.timer));
 		} else {
 			"ru mapped '" + f_name + "' to '" + target + "'" + 
-				"\n\ttotal time: " + ruTime2s(ruTimePassed(timer)) +
-				"\n\tavg time:   " + ruTime2s(ruTimePassed(timer) / i2d(length(decls))) +
-				"\n\twas mapped: " + i2s(^(progress.was_mapped)) +
-				"\n\tnot mapped: " + i2s(^(progress.not_mapped)) + 
-				"\n\t%processed: " + d2st(100.0 * i2d(^(progress.was_mapped) + ^(progress.not_mapped)) / i2d(length(decls)), 2);
+				"\n\ttotal time: " + ruTime2s(ruTimePassed(stats.progress.timer)) +
+				"\n\tavg time:   " + ruTime2s(ruTimePassed(stats.progress.timer) / i2d(length(decls))) +
+				"\n\tmax time:   " + ruTime2s(^(stats.max_time)) +
+				"\n\tmax time id:" + id2s(^(stats.max_time_id)) +
+				"\n\twas mapped: " + i2s(^(stats.was_mapped)) +
+				"\n\tnot mapped: " + i2s(^(stats.not_mapped)) + 
+				"\n\t%processed: " + d2st(100.0 * i2d(^(stats.was_mapped) + ^(stats.not_mapped)) / i2d(length(decls)), 2);
 		}
 		out.onMessage(msg);
 	}
