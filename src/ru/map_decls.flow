@@ -1,0 +1,189 @@
+import comm;
+import ru/util/target;
+
+export {
+	// A struct describing a general function, which operates on decls.
+	// pred - the predicate, which selects decls to process.
+	// measure - the function, which return the relative 'size' of the decl. Used to balance time limits.
+	// message - the function, which is used to indicate the progress of applying of a function.
+	RuFnDescr(
+		name : string, 
+		pred : (RuDecl) -> bool, 
+		measure : (RuDecl) -> double, 
+		message : () -> string
+	);
+
+	// Mapping function: transforms (possibly) a decl. If None is returned, old one is kept.
+	RuMapFn(
+		descr : RuFnDescr,
+		func : (RuDecl, double) -> Maybe<RuDecl>
+	);
+
+	// Map 'f.func' to the decls from 'target' task option. 
+	// Selects decls to process with 'fn.descr.pred' parameter.
+	// Balances the time limit between all admitted decls
+	// proportionally to the 'fn.descr.measure'.
+	ruMapFnComm(unit : RuUnit, f : RuMapFn) -> RuState;
+}
+
+ruDecls2Measures(decls : [RuDecl], f : RuMapFn) -> [double] {
+	map(decls, \d -> f.descr.measure(d));
+}
+
+ruCalcTimeLimit(decls : [RuDecl], f : RuMapFn, task : ScTask, conf : RuConf) -> double {
+	opt = switch (lookupTree(task.args, "time-limit")) {
+		Some(limit): limit;
+		None(): lookupTreeDef(conf.opts, "time-limit", "300");
+	}
+	if (opt == "auto") {
+		// By default we set 3 ms per one measure unit
+		measures = ruDecls2Measures(decls, f);
+		ruSumDoublesFromArray(measures) * 3.0;
+	} else if (opt == "no") doubleMax else {
+		i2d(s2i(opt) * 1000);
+	}
+}
+
+RuMapFnProgress(
+	not_mapped  : ref int,
+	was_mapped  : ref int,
+	processed   : ref int,
+	max_time    : ref double,
+	max_time_id : ref int,
+);
+
+ruWrapFnWithProgress(f : RuMapFn, progress : RuMapFnProgress, env : RuEnv) -> (RuDecl, double) -> Maybe<RuDecl> {
+	\decl, time_limit -> {
+		if (ruVerbose(env.conf) >= 3) {
+			env.out.onMessage("\t\tTime limit on decl '" + id2s(decl.descr.id) + "': " + ruTime2s(time_limit));
+		}
+		timer = ruMakeTimer();
+		ret = f.func(decl, time_limit);
+		atomicRefIntAddition(progress.processed, 1);
+		if (isSome(ret)) {
+			atomicRefIntAddition(progress.was_mapped, 1);
+		} else {
+			atomicRefIntAddition(progress.not_mapped, 1);
+		} 
+		time = ruTimePassed(timer);
+		if (time > ^(progress.max_time)) {
+			progress.max_time := time;
+			progress.max_time_id := decl.descr.id;
+		}
+		ret;
+	}
+}
+
+ruMakeMapFnProgress() -> RuMapFnProgress {
+	RuMapFnProgress(ref 0, ref 0, ref 0, ref 0.0, ref -1);
+}
+
+ruMapDeclsSequentially(decls : [RuDecl], f : RuMapFn, time_limit : double, timer : RuTimer, math : RuMath, env : RuEnv) -> RuMath {
+	measures = ruDecls2Measures(decls, f);
+	sum_measure = ruSumDoublesFromArray(measures);
+	foldi(decls, math, \i, acc, d ->
+		eitherMap(
+			f.func(d, time_limit * measures[i] / sum_measure),
+			\mapped_d -> ruMathReplaceDecl(acc, mapped_d, env),
+			acc
+		)
+	);
+}
+
+ruMapDeclsConcurrently(decls : [RuDecl], f : RuMapFn, time_limit : double, timer : RuTimer, math : RuMath, env : RuEnv) -> RuMath {
+	chunks = splitByNumber(decls, s2i(lookupTreeDef(env.conf.opts, "decls-split-num", "256")));
+	chunk_measures = map(chunks, \chunk -> ruDecls2Measures(chunk, f));
+	sum_chunk_measures = map(chunk_measures, ruSumDoublesFromArray);
+	total_measure = ruSumDoublesFromArray(sum_chunk_measures);
+	planned_times = map(sum_chunk_measures, \m -> 
+		time_limit * m / total_measure
+	);
+	planned_passed = mapi(sum_chunk_measures, \i,__ -> 
+		ruSumDoublesFromArray(map(enumFromTo(0, i - 1), \j -> planned_times[j]))
+	);
+	planned_left = map(planned_passed, \passed -> time_limit - passed);
+	foldi(chunks, math, \n, acc, chunk -> {
+		left_time = ruTimeLeft(timer);
+		if (left_time <= 0.0) acc else {
+			time_planned_on_chunk = time_limit * sum_chunk_measures[n] / total_measure;
+			time_left_on_chunk = time_planned_on_chunk * left_time / planned_left[n];
+			scaled_time_limit_on_chunk = time_left_on_chunk * i2d(availableProcessors());
+			mapped = ruConcurrent(mapi(chunk, \i, decl -> 
+				\-> f.func(decl, scaled_time_limit_on_chunk * chunk_measures[n][i] / sum_chunk_measures[n])
+			));
+			fold(mapped, acc, \ac, d -> 
+				eitherMap(d,
+					\mapped_d -> ruMathReplaceDecl(ac, mapped_d, env),
+					ac
+				)
+			)
+		}
+	});
+}
+
+ruMapFnComm(unit : RuUnit, f : RuMapFn) -> RuState {
+	task = unit.task;
+	state = unit.state;
+	out = unit.out;
+	file = lookupTreeDef(task.args, "file", "");
+	conf = state.conf;
+	env = RuEnv(conf, out);
+	math = ruMathFromSources(state.ru, env);
+	if (ruVerbose(conf) >= 3) {
+		out.onMessage("\t\tMap '" + f.descr.name + "' task: " + ruTask2s(task));
+	}
+	target = ruDetermineTarget(task, math, env);
+	progress = ruMakeMapFnProgress();
+	prog_f = RuMapFn(f with func = ruWrapFnWithProgress(f, progress, env));
+	decls = filter(ruTargetDecls(target, math, env), f.descr.pred);
+	time_limit = ruCalcTimeLimit(decls, f, task, conf);
+
+	ruMapDeclsStartMessage(decls, time_limit, env);
+	
+	timer = ruMakeLimitedTimer(time_limit);
+	track_progress = ref true;
+	ruTrackProgress(track_progress, progress.processed, length(decls), ruProgressUpdateMs(task, conf), timer, out, f.descr.message);
+	mapped_math = if (!ruTargetIsConcurrent(target)) {
+		ruMapDeclsSequentially(decls, prog_f, time_limit, timer, math, env);
+	} else {
+		ruMapDeclsConcurrently(decls, prog_f, time_limit, timer, math, env);
+	}
+	track_progress := false;
+	ruMapDeclsEndMessage(progress, f.descr.name, ruTarget2s(target), decls, timer, env);
+	RuState(state with ru = mapped_math.sources);
+}
+
+ruMapDeclsStartMessage(decls : [RuDecl], time_limit : double, env : RuEnv) -> void {
+	conf = env.conf;
+	out = env.out;
+	if (ruVerbose(conf) > 0) {
+		out.onMessage(
+			"\tgoing to process " + i2s(length(decls)) + "\n" +
+			"\ttime limit: " + ruTime2s(time_limit) + " (" + d2st(time_limit, 2) + "s)" +
+			(if (ruVerbose(conf) >= 2) "\n\ttime limit per unit: " + ruTime2s(time_limit / i2d(length(decls))) else "")
+		);
+		if (ruVerbose(conf) > 2) {
+			out.onMessage("\tdecls:\n" + 
+				strGlue(map(decls, \d -> "\t" + id2s(d.descr.id)), "\n") + "\n\n"
+			);
+		}
+	}
+}
+
+ruMapDeclsEndMessage(progress : RuMapFnProgress, f_name : string, target : string, decls : [RuDecl], timer : RuTimer, env : RuEnv) -> void {
+	conf = env.conf;
+	out = env.out;
+	if (ruVerbose(conf) > 0 && length(decls) > 0) {
+		msg = if (length(decls) == 1) { 
+			"ru mapped '" + f_name + "' to '" + target + "' in " + ruTime2s(ruTimePassed(timer));
+		} else {
+			"ru mapped '" + f_name + "' to '" + target + "'" + 
+				"\n\ttotal time: " + ruTime2s(ruTimePassed(timer)) +
+				"\n\tavg time:   " + ruTime2s(ruTimePassed(timer) / i2d(length(decls))) +
+				"\n\twas mapped: " + i2s(^(progress.was_mapped)) +
+				"\n\tnot mapped: " + i2s(^(progress.not_mapped)) + 
+				"\n\t%processed: " + d2st(100.0 * i2d(^(progress.was_mapped) + ^(progress.not_mapped)) / i2d(length(decls)), 2);
+		}
+		out.onMessage(msg);
+	}
+}
