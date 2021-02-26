@@ -1,0 +1,187 @@
+import ru/lang;
+import ru/util/utils;
+import script/value;
+
+export {
+	//ruFindSourceId(id : int, lang : RuLang) -> int;
+
+	ruLangTree(lang : RuLang) ->Tree<int, RuDecl>;
+
+	ruLangStats(lang : RuLang) -> string;
+	ruLangStats1(lang : RuLang) -> ValMap;
+
+	ruLangMerge(d1 : RuLang, d2 : RuLang, env : RuEnv) -> RuLang;
+
+	ruLangContainsDecl(lang : RuLang, decl : RuDecl, env : RuEnv) -> bool;
+	ruLangSetDecl(lang : RuLang, decl : RuDecl, env : RuEnv) -> RuLang;
+	ruLangAddDecl(lang : RuLang, decl : RuDecl, env : RuEnv) -> RuLang;
+	ruLangReplaceDecl(lang : RuLang, decl : RuDecl, env : RuEnv) -> RuLang;
+	ruLangRemoveDecl(lang : RuLang, decl : RuDecl, env : RuEnv) -> RuLang;
+
+	ruLangAddSource(lang : RuLang, src : RuSource, env : RuEnv) -> RuLang;
+	ruLangRemoveSource(lang : RuLang, src : RuSource, env : RuEnv) -> RuLang;
+
+	ruLangFindDecl(id : int, m : RuLang, env : RuEnv) -> Maybe<RuDecl>;
+	
+	ruLangFromSource(src : RuSource, env : RuEnv) -> RuLang;
+	ruLangFromSources(srcs : Tree<int, RuSource>, env : RuEnv) -> RuLang;
+
+	ruSuperRule(infer : int, super : int, lang : RuLang, env : RuEnv) -> Maybe<RuRule>;
+}
+/*
+ruFindSourceId(id : int, lang : RuLang) -> int {
+	switch (lookupTree(lang.consts, id)) {
+		Some(c): c.info.src;
+		None(): {
+			switch (lookupTree(lang.types, id)) {
+				Some(t): t.info.src;
+				None(): {
+					switch (lookupTree(lang.rules, id)) {
+						Some(r): r.info.src;
+						None(): -1;
+					}
+				}
+			}
+		}
+	}
+}
+*/
+ruLangTree(lang : RuLang) ->Tree<int, RuDecl> { 
+	foldTree(lang.rules, 
+		foldTree(lang.types, 
+			foldTree(lang.consts, makeTree(), 
+				\id, type, acc -> setTree(acc, id, type)
+			),
+			\id, type, acc -> setTree(acc, id, type)
+		),
+		\id, rule, acc -> setTree(acc, id, rule)
+	);
+}
+
+ruLangStats(lang : RuLang) -> string {
+	strGlue([
+		"  consts:     " + i2s(sizeTree(lang.consts)),
+		"  types:      " + i2s(sizeTree(lang.types)),
+		"  rules:      " + i2s(sizeTree(lang.rules)),
+	], "\n")
+}
+
+ruLangStats1(lang : RuLang) -> ValMap {
+	ValMap(pairs2tree([
+		Pair(ValString("consts"), ValInt(sizeTree(lang.consts))),
+		Pair(ValString("types"), ValInt(sizeTree(lang.types))),
+		Pair(ValString("rules"), ValInt(sizeTree(lang.rules)))
+	]));
+}
+
+ruLangMerge(d1 : RuLang, d2 : RuLang, env : RuEnv) -> RuLang {
+	RuLang(
+		mergeTreeCustom(d1.consts, d2.consts, \id, c1, c2 -> { env.out.onError("duplicate constant: " + id2s(id), []); c1 }),
+		mergeTreeCustom(d1.types, d2.types, \id, t1, t2 -> { env.out.onError("duplicate type: " + id2s(id), []); t1 }),
+		mergeTreeCustom(d1.rules, d2.rules, \id, r1, r2 -> { env.out.onError("duplicate rule: " + id2s(id), []); r1 }),
+	);
+}
+
+ruLangContainsDecl(lang : RuLang, decl : RuDecl, env : RuEnv) -> bool {
+	switch (decl) {
+		RuConst(info,__,__): containsKeyTree(lang.consts, info.id);
+		RuType(info,__):     containsKeyTree(lang.types, info.id);
+		RuRule(info, __,__): containsKeyTree(lang.rules, info.id);
+		default:             false;
+	}
+}
+
+ruLangSetDecl(lang : RuLang, decl : RuDecl, env : RuEnv) -> RuLang {
+	switch (decl) {
+		RuConst(info,__,__):
+			RuLang(lang with consts = setTree(lang.consts, info.id, decl));
+		RuType(info, supers):
+			RuLang(lang with 
+				types = setTree(lang.types, info.id, decl),
+				rules = fold(supers, lang.rules, \a, super -> {
+					rule = ruMakeSuperRule(super, info.id, info.src, info.pos);
+					setTree(a, rule.info.id, rule);
+				})
+			);
+		RuRule(info, __,__):
+			RuLang(lang with rules = setTree(lang.rules, info.id, decl));
+		default:
+			lang;
+	}
+}
+
+ruLangAddDecl(lang : RuLang, decl : RuDecl, env : RuEnv) -> RuLang {
+	if (ruLangContainsDecl(lang, decl, env)) {
+		ruCrash("decl '" + id2s(decl.info.id) + "' is already added");
+		env.out.onError("decl '" + id2s(decl.info.id) + "' is already added", [ruDeclPlace(decl)]); 
+		lang;
+	} else {
+		ruLangSetDecl(lang, decl, env);
+	}
+}
+
+ruLangReplaceDecl(lang : RuLang, decl : RuDecl, env : RuEnv) -> RuLang {
+	if (!ruLangContainsDecl(lang, decl, env)) {
+		ruCrash("decl '" + id2s(decl.info.id) + "' is not found");
+		env.out.onError("decl '" + id2s(decl.info.id) + "' is not found", [ruDeclPlace(decl)]); 
+		lang;
+	} else {
+		ruLangSetDecl(ruLangRemoveDecl(lang, decl, env), decl, env);
+	}
+}
+
+ruLangRemoveDecl(lang : RuLang, decl : RuDecl, env : RuEnv) -> RuLang {
+	if (!ruLangContainsDecl(lang, decl, env)) {
+		env.out.onError("decl '" + id2s(decl.info.id) + "' is not found", [ruDeclPlace(decl)]); 
+		lang;
+	} else {
+		switch (decl) {
+			RuConst(info,__,__):
+				RuLang(lang with consts = removeFromTree(lang.consts, info.id));
+			RuType(info, supers):
+				RuLang(lang with 
+					types = removeFromTree(lang.types, info.id),
+					rules = fold(supers, lang.rules, \a, super ->
+						removeFromTree(a, ruSuperTypeName(super, info.id))
+					)
+				);
+			RuRule(info, __,__):
+				RuLang(lang with rules = removeFromTree(lang.rules, info.id));
+			default:
+				lang;
+		}
+	}
+}
+
+ruLangAddSource(lang : RuLang, src : RuSource, env : RuEnv) -> RuLang {
+	fold(src.decls, lang, \acc, decl -> ruLangAddDecl(acc, decl, env));
+}
+
+ruLangRemoveSource(lang : RuLang, src : RuSource, env : RuEnv) -> RuLang {
+	fold(src.decls, lang, \acc, decl -> ruLangRemoveDecl(acc, decl, env));
+}
+
+ruLangFromSource(src : RuSource, env : RuEnv) -> RuLang {
+	ruLangAddSource(ruEmptyLang, src, env);
+}
+
+ruLangFromSources(srcs : Tree<int, RuSource>, env : RuEnv) -> RuLang {
+	foldTree(srcs, ruEmptyLang, \__, src, acc -> ruLangAddSource(acc, src, env));
+}
+
+ruLangFindDecl(id : int, lang : RuLang, env : RuEnv) -> Maybe<RuDecl> {
+	switch (lookupTree(lang.consts, id)) {
+		Some(decl): Some(decl);
+		None(): {
+			switch (lookupTree(lang.rules, id)) {
+				Some(decl): Some(decl);
+				None(): lookupTree(lang.types, id);
+			}
+		}
+	}
+}
+
+ruSuperRule(infer : int, super : int, lang : RuLang, env : RuEnv) -> Maybe<RuRule> {
+	id = ruSuperTypeName(super, infer);
+	lookupTree(lang.rules, id);
+}
