@@ -4,17 +4,18 @@ import ru/parse/parse;
 import ru/verify/math;
 
 export {
-	ruCollectSourcesLang(sources : [RuParsed], env : RuEnv) -> RuLang;
+	ruCollectSourcesLang(sources : [RuParsed], src_deps : Tree<int, Set<int>>, env : RuEnv) -> RuLang;
 }
 
-ruCollectSourcesLang(sources : [RuParsed], env : RuEnv) -> RuLang {
-	pass1 = fold(sources, ruEmptyLang, \acc, src ->
+ruCollectSourcesLang(sources : [RuParsed], src_deps : Tree<int, Set<int>>, env : RuEnv) -> RuLang {
+	lang = fold(sources, ruEmptyLang, \acc, src -> {
 		switch (src) {
 			RuParseSource(__,decls,__,info): {
 				fold(src.decls, acc, \ac, decl ->
 					switch (decl) {
 						RuParseConst(__,__,__,__,__): ruCollectConst(ruCreateConst(decl, info, env), ac, info, env);
 						RuParseType(__,__,__,__):     ruCollectType(ruCreateType(decl, info, env), ac, info, env);
+						RuParseRule(__,__,__,__,__):  ruCollectRule(ruCreateRule(decl, info, env), acc, info, env);
 						default: ac;
 					}
 				)
@@ -24,39 +25,21 @@ ruCollectSourcesLang(sources : [RuParsed], env : RuEnv) -> RuLang {
 					switch (decl) {
 						RuConst(__,__,__): ruCollectConst(decl, ac, info, env);
 						RuType(__,__):     ruCollectType(decl, ac, info, env);
+						RuRule(__,__,__):  ruCollectRule(decl, ac, info, env);
 						default: ac;
 					}
 				)
 			}
 		}
-	);
-	pass2 = fold(sources, ruEmptyLang, \acc, src ->
-		switch (src) {
-			RuParseSource(__,decls,__,info): {
-				fold(src.decls, acc, \ac, decl ->
-					switch (decl) {
-						RuParseRule(__,__,__,__,__):  ruCollectRule(ruCreateRule(decl, pass1, info, env), acc, info, env);
-						default: ac;
-					}
-				)
-			}
-			RuSource(__,decls,__,info): {
-				fold(src.decls, acc, \ac, decl ->
-					switch (decl) {
-						RuRule(__,__,__): ruCollectRule(decl, ac, info, env);
-						default: ac;
-					}
-				)
-			}
-		}
-	);
-	pass2;
+	});
+	ruCheckLang(lang, src_deps, env);
+	lang;
 }
 
 ruCollectConst(const : RuConst, acc : RuLang, src_info : RuFileInfo, env : RuEnv) -> RuLang {
 	switch (lookupTree(acc.consts, const.info.id)) {
 		Some(__): {
-			env.out.onError("constant '" + id2s(const.info.id) + "' is already defined", [RuPlace(src_info.path, const.info.pos)]);
+			env.out.onError("constant '" + id2s(const.info.id) + "' is already defined", [ruDeclPlace(const, env)]);
 			acc
 		}
 		None(): {
@@ -75,15 +58,15 @@ ruCreateConst(const : RuParseConst, src_info : RuFileInfo, env : RuEnv) -> RuCon
 			ruCollectComments(const.comments, src_info, env), 
 			const.pos
 		), 
-		if (const.ascii == -1) -1 else const.ascii, 
-		if (const.latex == -1) -1 else const.latex
+		const.ascii, 
+		const.latex
 	);
 }
 
 ruCollectType(type : RuType, acc : RuLang, src_info : RuFileInfo, env : RuEnv) -> RuLang {
 	switch (lookupTree(acc.types, type.info.id)) {
 		Some(__): {
-			env.out.onError("type '" + id2s(type.info.id) + "' is already defined", [RuPlace(src_info.path, type.info.pos)]);
+			env.out.onError("type '" + id2s(type.info.id) + "' is already defined", [ruDeclPlace(type, env)]);
 			acc
 		}
 		None(): {
@@ -110,7 +93,7 @@ ruCreateType(type : RuParseType, src_info : RuFileInfo, env : RuEnv) -> RuType {
 ruCollectRule(rule : RuRule, acc : RuLang, src_info : RuFileInfo, env : RuEnv) -> RuLang {
 	switch (lookupTree(acc.rules, rule.info.id)) {
 		Some(__): {
-			env.out.onError("rule '" + id2s(rule.info.id) + "' is already defined", [RuPlace(src_info.path, rule.info.pos)]);
+			env.out.onError("rule '" + id2s(rule.info.id) + "' is already defined", [ruDeclPlace(rule, env)]);
 			acc
 		}
 		None(): {
@@ -121,10 +104,8 @@ ruCollectRule(rule : RuRule, acc : RuLang, src_info : RuFileInfo, env : RuEnv) -
 	}
 }
 
-ruCreateRule(rule : RuParseRule, lang : RuLang, src_info : RuFileInfo, env : RuEnv) -> RuRule {
-	type = rule.term.type;
-	vars = ruCreateVars(rule.vars, lang, src_info, env);
-	term = ruCreateTerm(rule.term, vars, lang, src_info, env);
+ruCreateRule(rule : RuParseRule, src_info : RuFileInfo, env : RuEnv) -> RuRule {
+	vars = ruCreateVars(rule.vars);
 	RuRule(
 		RuDeclInfo(
 			rule.id, 
@@ -132,23 +113,16 @@ ruCreateRule(rule : RuParseRule, lang : RuLang, src_info : RuFileInfo, env : RuE
 			ruCollectComments(rule.comments, src_info, env), 
 			rule.pos
 		), 
-		vars, term
+		vars, 
+		ruCreateTerm(rule.term, vars, src_info, env)
 	);
 }
 
-ruCreateTerm(term : RuParseExp, vars : Tree<int, RuVar>, lang : RuLang, src_info : RuFileInfo, env : RuEnv) -> RuTerm {
-	expr = fold(term.symbs, [], \ac, symb -> {
-		switch (lookupTree(lang.consts, symb)) {
-			Some(s): concat(ac, [RuConstRef(symb)]);
-			None(): 
-				switch (lookupTree(vars, symb)) {
-					Some(v): concat(ac, [RuVar(symb, v.type)]);
-					None(): {
-						env.out.onError("unknown symbol '" + id2s(symb) + "' in term '" + ruParse2s(term) + "'", [RuPlace(src_info.path, term.pos)]);
-						ac
-					}
-				}
-			}
+ruCreateTerm(term : RuParseExp, vars : Tree<int, RuVar>, src_info : RuFileInfo, env : RuEnv) -> RuTerm {
+	expr = fold(term.symbs, [], \ac, symb ->
+		switch (lookupTree(vars, symb)) {
+			Some(v): concat(ac, [RuVar(symb, v.type)]);
+			None():  concat(ac, [RuConstRef(symb)]);
 		}
 	);
 	RuTerm(term.type, expr, term.pos);
@@ -173,33 +147,55 @@ ruCollectAnnotation(json_str : string, pos : int, info : RuFileInfo, env : RuEnv
 	}
 }
 
-ruCreateVars(vars : [RuParseVar], lang : RuLang, src_info : RuFileInfo, env : RuEnv) -> Tree<int, RuVar> {
-	fold(vars, makeTree(), \ac, v ->
-		switch (lookupTree(lang.types, v.type)) {
-			Some(tp): {
-				setTree(ac, v.id, RuVar(v.id, v.type));
-			}
-			None(): {
-				env.out.onError("unknown var '" + id2s(v.id) + "' of type '" + id2s(v.type) + "'", [RuPlace(src_info.path, v.pos)]);
-				ac
-			}
-		}
-	)
+ruCreateVars(vars : [RuParseVar]) -> Tree<int, RuVar> {
+	fold(vars, makeTree(), \ac, v -> setTree(ac, v.id, RuVar(v.id, v.type)));
 }
 
-ruCheckLangDeclOrder(lang : RuLang, transitive_imports : Tree<int, Set<int>>, env : RuEnv) -> void {
-	traverseInOrder(lang.types, \id, type ->
-		iter(type.supers, \sup ->
-			switch (lookupTree(lang.types, sup)) {
-				Some(super): {
-					if (!ruDeclPreceeds(super, type, transitive_imports)) {
-						env.out.onError("super type: '" + id2s(sup) + "' must preceed the infer type '" + id2s(id) + "'", [ruDeclPlace(type, env)]);
-					}
-				}
-				None(): {
-					env.out.onError("unknown type: '" + id2s(sup) + "'", [ruDeclPlace(type, env)]);
+ruCheckLang(lang : RuLang, imports : Tree<int, Set<int>>, env : RuEnv) -> void {
+	traverseInOrder(lang.types, \id, type -> 
+		iter(type.supers, \sup -> ruCheckTypePreceeds(sup, lang, type, imports, env))
+	);
+	traverseInOrder(lang.rules, \id, rule -> {
+		ruCheckVars(rule.vars, lang, rule, imports, env);
+		ruCheckTerm(rule.term, rule.vars, lang, rule, imports, env);
+	});
+}
+
+//ruCheckType(type : RuType, lang : RuLang, decl : RuDecl, imports : Tree<int, Set<int>>, env : RuEnv) -> void {
+//	iter(type.supers, \sup -> ruCheckTypePreceeds(sup, lang, type, imports, env));
+//}
+
+ruCheckVars(vars : Tree<int, RuVar>, lang : RuLang, decl : RuDecl, imports : Tree<int, Set<int>>, env : RuEnv) -> void {
+	traverseInOrder(vars, \id, v -> ruCheckTypePreceeds(v.type, lang, decl, imports, env));
+}
+
+ruCheckTerm(term : RuTerm, vars : Tree<int, RuVar>, lang : RuLang, decl : RuDecl, imports : Tree<int, Set<int>>, env : RuEnv) -> void {
+	ruCheckTypePreceeds(term.type, lang, decl, imports, env);
+	iter(term.nodes, \node -> 
+		switch (node) {
+			RuConstRef(id): {
+				if (!containsKeyTree(lang.consts, id)) {
+					env.out.onError("symbol '" + id2s(id) + "' is not declared as constant", [ruDeclPlace(decl, env)]);
 				}
 			}
-		)
+			RuVar(id, type): {
+				if (!containsKeyTree(vars, id)) {
+					env.out.onError("variable '" + id2s(id) + "' is not declared as variable", [ruDeclPlace(decl, env)]);
+				}
+			}
+		}
 	);
+}
+
+ruCheckTypePreceeds(type_id : int, lang : RuLang, decl : RuDecl, imports : Tree<int, Set<int>>, env : RuEnv) -> void {
+	switch (lookupTree(lang.types, type_id)) {
+		Some(type): {
+			if (!ruDeclPreceeds(type, decl, imports)) {
+				env.out.onError("type: '" + id2s(type_id) + "' must preceed '" + id2s(decl.info.id) + "'", [ruDeclPlace(decl, env)]);
+			}
+		}
+		None(): {
+			env.out.onError("type: '" + id2s(type_id) + "' is undefined", [ruDeclPlace(decl, env)]);
+		}
+	}
 }
