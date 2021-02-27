@@ -2,53 +2,63 @@ import base/stats;
 import ru/parse/exp;
 import ru/parse/parse;
 import ru/verify/math;
+import ru/parse/fast/decl;
 
 export {
 	ruCollectSourcesLang(sources : [RuParsed], env : RuEnv) -> RuLang;
+
+	ruCreateLang(decls : [RuDeclAux], env : RuEnv) -> RuLang;
+
+	ruCreateVars(vars : [RuParseVar]) -> Tree<int, RuVar>;
+	ruCreateComments(comms : [RuParseComment], info : RuFileInfo, env : RuEnv) -> [RuComment];
+	ruCreateTerm(term : RuParseExp, vars : Tree<int, RuVar>, env : RuEnv) -> RuTerm;
+
 	ruCheckLang(lang : RuLang, imports : Tree<int, Set<int>>, env : RuEnv) -> void;
 }
 
 ruCollectSourcesLang(sources : [RuParsed], env : RuEnv) -> RuLang {
-	langs = ruConcurrent(map(sources, \src -> \-> ruCollectSource(src, env)));
-	fold(langs, ruEmptyLang, \acc, lang -> ruLangMerge(acc, lang, env));
+	fold(
+		ruConcurrent(map(sources, \src -> \-> ruCollectSourceLang(src, env))), 
+		ruEmptyLang, 
+		\acc, lang -> ruLangMerge(acc, lang, env)
+	);
 }
 
-ruCollectSource(src : RuParsed, env : RuEnv) -> RuLang {
+ruCollectSourceLang(src : RuParsed, env : RuEnv) -> RuLang {
 	switch (src) {
 		RuParseSource(__,decls,__,info): {
 			fold(src.decls, ruEmptyLang, \ac, decl ->
-				switch (decl) {
-					RuParseConst(__,__,__,__,__): ruCollectConst(ruCreateConst(decl, info, env), ac, info, env);
-					RuParseType(__,__,__,__):     ruCollectType(ruCreateType(decl, info, env), ac, info, env);
-					RuParseRule(__,__,__,__,__):  ruCollectRule(ruCreateRule(decl, info, env), ac, info, env);
-					default: ac;
-				}
+				eitherMap(ruCreateLangDecl(decl, info, env), \lang -> ruLangAddDecl(ac, lang, env), ac)
 			)
 		}
 		RuSource(__,decls,__,info): {
-			fold(src.decls, ruEmptyLang, \ac, decl ->
-				switch (decl) {
-					RuConst(__,__,__): ruCollectConst(decl, ac, info, env);
-					RuType(__,__):     ruCollectType(decl, ac, info, env);
-					RuRule(__,__,__):  ruCollectRule(decl, ac, info, env);
-					default: ac;
-				}
+			fold(src.decls, ruEmptyLang, \ac, decl -> 
+				ruLangAddDecl(ac, decl, env)
 			)
 		}
 	}
 }
 
-ruCollectConst(const : RuConst, acc : RuLang, src_info : RuFileInfo, env : RuEnv) -> RuLang {
-	switch (lookupTree(acc.consts, const.info.id)) {
-		Some(__): {
-			env.out.onError("constant '" + id2s(const.info.id) + "' is already defined", [ruDeclPlace(const, env)]);
-			acc
-		}
-		None(): {
-			RuLang(acc with
-				consts = setTree(acc.consts, const.info.id, const)
-			);
-		}
+ruCreateLang(decls : [RuDeclAux], env : RuEnv) -> RuLang {
+	fold(
+		filtermap(ruConcurrent(map(decls, \ad -> \-> 
+			switch (ad.decl) {
+				RuParseDecl(): ruCreateLangDecl(ad.decl, ad.srcInfo, env);
+				RuLangDecl():  Some(ad.decl);
+				default:       None();
+			}
+		)), idfn),
+		ruEmptyLang,
+		\acc, decl -> ruLangAddDecl(acc, decl, env)
+	);
+}
+
+ruCreateLangDecl(decl : RuParseDecl, src_info : RuFileInfo, env : RuEnv) -> Maybe<RuLangDecl> {
+	switch (decl) {
+		RuParseConst(__,__,__,__,__): Some(ruCreateConst(decl, src_info, env));
+		RuParseType(__,__,__,__):     Some(ruCreateType(decl, src_info, env));
+		RuParseRule(__,__,__,__,__):  Some(ruCreateRule(decl, src_info, env));
+		default: None();
 	}
 }
 
@@ -57,7 +67,7 @@ ruCreateConst(const : RuParseConst, src_info : RuFileInfo, env : RuEnv) -> RuCon
 		RuDeclInfo(
 			const.id, 
 			src_info.id, 
-			ruCollectComments(const.comments, src_info, env), 
+			ruCreateComments(const.comments, src_info, env), 
 			const.pos
 		), 
 		const.ascii, 
@@ -65,45 +75,16 @@ ruCreateConst(const : RuParseConst, src_info : RuFileInfo, env : RuEnv) -> RuCon
 	);
 }
 
-ruCollectType(type : RuType, acc : RuLang, src_info : RuFileInfo, env : RuEnv) -> RuLang {
-	switch (lookupTree(acc.types, type.info.id)) {
-		Some(__): {
-			env.out.onError("type '" + id2s(type.info.id) + "' is already defined", [ruDeclPlace(type, env)]);
-			acc
-		}
-		None(): {
-			RuLang(acc with
-				types = setTree(acc.types, type.info.id, type)
-			);
-		}
-	}
-}
-
-
 ruCreateType(type : RuParseType, src_info : RuFileInfo, env : RuEnv) -> RuType {
 	RuType(
 		RuDeclInfo(
 			type.id, 
 			src_info.id, 
-			ruCollectComments(type.comments, src_info, env), 
+			ruCreateComments(type.comments, src_info, env), 
 			type.pos
 		), 
 		type.supers
 	);
-}
-
-ruCollectRule(rule : RuRule, acc : RuLang, src_info : RuFileInfo, env : RuEnv) -> RuLang {
-	switch (lookupTree(acc.rules, rule.info.id)) {
-		Some(__): {
-			env.out.onError("rule '" + id2s(rule.info.id) + "' is already defined", [ruDeclPlace(rule, env)]);
-			acc
-		}
-		None(): {
-			RuLang(acc with
-				rules = setTree(acc.rules, rule.info.id, rule)
-			);
-		}
-	}
 }
 
 ruCreateRule(rule : RuParseRule, src_info : RuFileInfo, env : RuEnv) -> RuRule {
@@ -112,15 +93,15 @@ ruCreateRule(rule : RuParseRule, src_info : RuFileInfo, env : RuEnv) -> RuRule {
 		RuDeclInfo(
 			rule.id, 
 			src_info.id, 
-			ruCollectComments(rule.comments, src_info, env), 
+			ruCreateComments(rule.comments, src_info, env), 
 			rule.pos
 		), 
 		vars, 
-		ruCreateTerm(rule.term, vars, src_info, env)
+		ruCreateTerm(rule.term, vars, env)
 	);
 }
 
-ruCreateTerm(term : RuParseExp, vars : Tree<int, RuVar>, src_info : RuFileInfo, env : RuEnv) -> RuTerm {
+ruCreateTerm(term : RuParseExp, vars : Tree<int, RuVar>, env : RuEnv) -> RuTerm {
 	expr = fold(term.symbs, [], \ac, symb ->
 		switch (lookupTree(vars, symb)) {
 			Some(v): concat(ac, [RuVar(symb, v.type)]);
@@ -130,13 +111,13 @@ ruCreateTerm(term : RuParseExp, vars : Tree<int, RuVar>, src_info : RuFileInfo, 
 	RuTerm(term.type, expr, term.pos);
 }
 
-ruCollectComments(comms : [RuParseComment], info : RuFileInfo, env : RuEnv) -> [RuComment] {
+ruCreateComments(comms : [RuParseComment], info : RuFileInfo, env : RuEnv) -> [RuComment] {
 	map(comms, \comm -> 
-		RuComment(comm.text, ruCollectAnnotation(comm.json, comm.pos, info, env), comm.pos)
+		RuComment(comm.text, ruCreateAnnotation(comm.json, comm.pos, info, env), comm.pos)
 	);
 }
 
-ruCollectAnnotation(json_str : string, pos : int, info : RuFileInfo, env : RuEnv) -> JsonObject {
+ruCreateAnnotation(json_str : string, pos : int, info : RuFileInfo, env : RuEnv) -> JsonObject {
 	if (json_str == "") JsonObject([]) else {
 		json = parseJson(json_str);
 		switch (json) {

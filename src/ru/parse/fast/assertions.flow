@@ -1,0 +1,248 @@
+import base/stats;
+import ru/parse/exp;
+import ru/parse/parse;
+import ru/parse/fast/lang;
+import ru/verify/math;
+
+export {
+	ruCollectSourcesAssertions(sources : [RuParsed], lang : RuLang, env : RuEnv) -> Tree<int, RuAssertion>;
+
+	ruLang2Tenv(lang : RuLang, env : RuEnv) -> Tree<int, RuTypeEnv>;
+	ruCreateAssertions(decls : [RuDeclAux], lang : RuLang, env : RuEnv) -> Tree<int, RuAssertion>;
+}
+
+ruLang2Tenv(lang : RuLang, env : RuEnv) -> Tree<int, RuTypeEnv> {
+	foldTree(
+		lang.rules, 
+		foldTree(lang.types, makeTree(), \id, type, acc ->
+			setTree(acc, id, ruMakeTypeEnv(type, env))
+		),
+		\id, rule, acc -> ruAddRule2TypeEnvTree(rule, acc, env)
+	);
+}
+
+ruCollectSourcesAssertions(sources : [RuParsed], lang : RuLang, env : RuEnv) -> Tree<int, RuAssertion> {
+	tenv = ruLang2Tenv(lang, env);
+	fold(
+		ruConcurrent(map(sources, \src -> \-> ruCollectSourceAssertions(src, tenv, env))), 
+		makeTree(), 
+		\acc, ass -> ruAssertionsMerge(acc, ass, env)
+	);
+}
+
+ruCollectSourceAssertions(src : RuParsed, tenv : Tree<int, RuTypeEnv>, env : RuEnv) -> Tree<int, RuAssertion> {
+	switch (src) {
+		RuParseSource(__,decls,__,info): {
+			fold(src.decls, makeTree(), \ac, decl ->
+				eitherMap(
+					ruCreateAssertion1(decl, tenv, info, env), 
+					\ass -> ruAssertionsAddDecl(ac, ass, env), 
+					ac
+				)
+			)
+		}
+		RuSource(__,decls,__,info): {
+			fold(src.decls, makeTree(), 
+				\ac, decl -> ruAssertionsAddDecl(ac, decl, env)
+			)
+		}
+	}
+}
+
+ruCreateAssertions(decls : [RuDeclAux], lang : RuLang, env : RuEnv) -> Tree<int, RuAssertion> {
+	tenv = ruLang2Tenv(lang, env);
+	fold(
+		filtermap(ruConcurrent(map(decls, \ad -> \-> 
+			switch (ad.decl) {
+				RuParseDecl(): ruCreateAssertion1(ad.decl, tenv, ad.srcInfo, env);
+				RuAssertion():  Some(ad.decl);
+				default:       None();
+			}
+		)), idfn),
+		makeTree(),
+		\acc, ass -> ruAssertionsAddDecl(acc, ass, env)
+	);
+}
+
+ruCreateAssertion1(decl : RuParseDecl, tenv : Tree<int, RuTypeEnv>, src_info : RuFileInfo, env : RuEnv) -> Maybe<RuAssertion> {
+	switch (decl) {
+		RuParseAxiom(__,__,__,__,__,__,__):         ruCreateAxiom(decl, tenv, src_info, env);
+		RuParseTheorem(__,__,__,__,__,__,__,__,__): ruCreateTheorem(decl, tenv, src_info, env);
+		RuParseDef(__,__,__,__,__,__,__,__,__):     ruCreateDef(decl, tenv, src_info, env);
+		default: None();
+	}
+}
+
+ruCreateAxiom(ax : RuParseAxiom, tenv : Tree<int, RuTypeEnv>, src_info : RuFileInfo, env : RuEnv) -> Maybe<RuAxiom> {
+	vars = ruCreateVars(ax.vars);
+	disjs = ruCreateDisjs(ax.disjs, vars, src_info, env);
+	hyps = filtermap(ax.hyps, \h -> ruCreateHyp(h, vars, tenv, src_info, env));
+	if (length(hyps) != length(ax.hyps)) {
+		None();
+	} else {
+		maybeMap(ruCreateExp(ax.prop, vars, tenv, src_info, env), \prop ->
+			RuAxiom(
+				RuDeclInfo(
+					ax.id, 
+					src_info.id, 
+					ruCreateComments(ax.comments, src_info, env), 
+					ax.pos
+				), 
+				RuStatement(RuVarsDisjs(vars, disjs), hyps, prop)
+			)
+		);
+	}
+}
+
+ruCreateExp(ex : RuParseExp, vars : Tree<int, RuVar>, tenv : Tree<int, RuTypeEnv>, src_info : RuFileInfo, env : RuEnv) -> Maybe<RuExp> {
+	ruParseExp(
+		ruCreateTerm(ex, vars, env), 
+		tenv, 
+		RuPlace(src_info.path, ex.pos), env
+	);
+}
+
+ruCreateMeta(m : RuParseMeta, vars : Tree<int, RuVar>, src_info : RuFileInfo, env : RuEnv) -> Set<int> {
+	fold(m.meta, makeSet(), \ac, v -> {
+		if (containsKeyTree(vars, v)) insertSet(ac, v) else {
+			env.out.onError("unknown var '" + id2s(v) + "'", [RuPlace(src_info.path, m.pos)]);
+			ac
+		}
+	});
+}
+
+ruCreateDisjs(disjs : [RuParseDisj], vars : Tree<int, RuVar>, src_info : RuFileInfo, env : RuEnv) -> Set<RuDisj> {
+	make_var = \v, t -> RuVar(v, t);
+	fold(disjs, makeSet(), \acc1, disj -> 
+		fold(disj.vars, acc1, \acc2, v1 ->
+			fold(disj.vars, acc2, \acc3, v2 -> {
+					switch (lookupTree(vars, v1)) {
+						Some(vr1): {
+							switch (lookupTree(vars, v2)) {
+								Some(vr2): {
+									if (vr1.id < vr2.id) 
+										insertSet(acc3, 
+											RuDisj(
+												make_var(vr1.id, vr1.type), 
+												make_var(vr2.id, vr2.type)
+											)
+										) 
+									else if (vr2.id < vr1.id) 
+										insertSet(acc3, 
+											RuDisj(
+												make_var(vr2.id, vr2.type), 
+												make_var(vr1.id, vr1.type)
+											)
+										) 
+									else acc3 
+								}
+								None(): {
+									env.out.onError("unknown var '" + id2s(v2) + "' in disjointed set, vars: " + 
+									strGlue(map(getTreeValues(vars), \v -> "'" + id2s(v.id) + "'"), ", "), 
+									[RuPlace(src_info.path, disj.pos)]); acc3;
+								}
+							}
+						}
+						None(): {
+							env.out.onError("unknown var '" + id2s(v1) + "' in disjointed set, vars: " + 
+							strGlue(map(getTreeValues(vars), \v -> "'" + id2s(v.id) + "'"), ", "), 
+							[RuPlace(src_info.path, disj.pos)]); acc3;
+						}
+					}
+				}
+			)
+		)
+	)
+}
+
+ruCreateHyp(hyp : RuParseHyp, vars : Tree<int, RuVar>, tenv : Tree<int, RuTypeEnv>, src_info : RuFileInfo,  env : RuEnv) -> Maybe<RuHyp> {
+	maybeMap(
+		ruCreateExp(hyp.expr, vars, tenv, src_info, env), 
+		\expr -> RuHyp(hyp.ind, expr, hyp.pos)
+	)
+}
+
+ruCreateTheorem(th : RuParseTheorem, tenv : Tree<int, RuTypeEnv>, src_info : RuFileInfo, env : RuEnv) -> Maybe<RuTheorem> {
+	vars = ruCreateVars(th.vars);
+	disjs = ruCreateDisjs(th.disjs, vars, src_info, env);
+	meta = ruCreateMeta(th.meta, vars, src_info, env);
+	hyps = filtermap(th.hyps, \h -> ruCreateHyp(h, vars, tenv, src_info, env));
+	if (length(hyps) != length(th.hyps)) {
+		None();
+	} else {
+		maybeMap2(
+			\prop, proof -> RuTheorem(
+				RuDeclInfo(
+					th.id, 
+					src_info.id, 
+					ruCreateComments(th.comments, src_info, env), 
+					th.pos
+				), 
+				RuStatement(RuVarsDisjs(vars, disjs), hyps, prop), 
+				meta, proof
+			)
+		)(
+			ruCreateExp(th.prop, vars, tenv, src_info, env),
+			ruCreateProof(th.proof, vars, tenv, src_info, env)
+		);
+	}
+}
+
+ruCreateProof(proof : RuParseProof, vars : Tree<int, RuVar>, tenv : Tree<int, RuTypeEnv>, src_info : RuFileInfo, env : RuEnv) -> Maybe<RuProof> {
+	proof_vars = ruCreateVars(proof.vars);
+	all_vars = mergeTreeCustom(proof_vars, vars, \v, w,__ -> {
+		env.out.onError("duplicate variable '" + id2s(v) + "'", [RuPlace(src_info.path, proof.pos)]);
+		w
+	});
+	proof_disjs = ruCreateDisjs(proof.disjs, all_vars, src_info, env);
+	do_ref = \r -> switch (r) {
+		RuParseHypRef(i): RuHypRef(i);
+		RuParseStepRef(i): RuStepRef(i);
+	}
+	steps = filtermap(proof.steps,
+		\s ->
+			maybeMap2(\expr, subproof -> 
+				RuStep(s.ind, s.assertion, map(s.refs, do_ref), expr, subproof, s.pos)
+			)(
+				ruCreateExp(s.expr, all_vars, tenv, src_info, env),
+				ruCreateProof(s.proof, all_vars, tenv, src_info, env)
+			)
+	);
+	if (length(steps) != length(proof.steps)) None() else {
+		Some(RuProof(RuVarsDisjs(proof_vars, proof_disjs), steps, proof.pos));
+	}
+}
+
+ruCreateDef(df : RuParseDef, tenv : Tree<int, RuTypeEnv>, src_info : RuFileInfo, env : RuEnv) -> Maybe<RuDef> {
+	vars = ruCreateVars(df.vars);
+	disjs = ruCreateDisjs(df.disjs, vars, src_info, env);
+	prop_ex = fold(df.prop.symbs, [], \ac, s ->
+		if (s == s2id("defiendum")) concat(ac, df.defm.symbs) else
+		if (s == s2id("definiens")) concat(ac, df.defs.symbs) else
+		concat(ac, [s])
+	);
+	hyps = filtermap(df.hyps, \h -> ruCreateHyp(h, vars, tenv, src_info, env));
+	if (length(hyps) != length(df.hyps)) {
+		None();
+	} else {
+		maybeBind(
+			ruCreateExp(RuParseExp(df.prop.type, prop_ex, df.prop.pos), vars, tenv, src_info, env), 
+			\prop ->
+				maybeMap2(\dfm, dfs ->
+					RuDef(
+						RuDeclInfo(
+							df.id, 
+							src_info.id, 
+							ruCreateComments(df.comments, src_info, env), 
+							df.pos
+						), 
+						RuStatement(RuVarsDisjs(vars, disjs), hyps, prop), 
+						dfm, dfs
+					)
+				)(
+					ruCreateExp(df.defm, vars, tenv, src_info, env),
+					ruCreateExp(df.defs, vars, tenv, src_info, env)
+				)
+		);
+	}
+}
