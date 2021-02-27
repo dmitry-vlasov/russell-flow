@@ -3,6 +3,66 @@ import ru/parse/type_env;
 
 export {
 	ruParseExp(term : RuTerm, types : Tree<int, RuTypeEnv>, place : RuPlace, env : RuEnv) -> Maybe<RuExp>;
+	ruParseExp1(term : RuTerm, lang : RuLang, place : RuPlace, env : RuEnv) -> Maybe<RuExp>;
+}
+
+ruCreateTypeEnv(term : RuTerm, lang : RuLang, env : RuEnv) -> Tree<int, RuTypeEnv> {
+	types = foldTree(lang.types, 
+		makeTree(), 
+		\id, type, acc -> setTree(acc, id, ruMakeTypeEnv(type, env))
+	);
+	symbs = fold(term.nodes, makeSet(),
+		\acc, node -> 
+			switch (node) {
+				RuVar(__, type): acc;
+				RuConstRef(c): insertSet(acc, c);
+			}
+	);
+	fold(
+		filter(
+			sortCustom(getTreeValues(lang.rules), \rule -> length(rule.term.nodes), true), 
+			//sortCustom(getTreeValues(lang.rules), \rule -> length(rule.term.nodes), false), 
+			//sortCustom(getTreeValues(lang.rules), \rule -> rule.info.src, true), 
+			//sortCustom(getTreeValues(lang.rules), \rule -> rule.info.src, false), 
+			\rule -> forall(rule.term.nodes, \node ->
+				switch (node) {
+					RuConstRef(c): containsSet(symbs, c);
+					default: true;
+				}
+			)
+		), 
+		types,
+		\acc, rule -> ruAddRule2TypeEnvTree(rule, acc, env)
+	);
+}
+
+ruParseExp1(term : RuTerm, lang : RuLang, place : RuPlace, env : RuEnv) -> Maybe<RuExp> {
+	if (length(term.nodes) == 0) {
+		env.out.onError("empty expression is met", []);
+		None()
+	} else {
+		types = ruCreateTypeEnv(term, lang, env);
+		switch (lookupTree(types, term.type)) {
+			Some(tenv): {
+				ret = maybeMap(
+					ruParseExpr(RuParseEnv(term.nodes, types, env), 0, RuParseStack(None(), 0, 0, term.type, tenv.trie, [])),
+					\nodes -> RuExp(nodes, term.pos)
+				);
+				if (ret == None()) {
+					env.out.onError(
+						"expr: '" + ruTerm2s(term) + "' was not parsed\n" + 
+						ruTypeEnvTree2s(types), 
+						[place]
+					);
+				}
+				ret
+			}
+			None(): {
+				env.out.onError("unknown type: '" + id2s(term.type) + "'", []);
+				None();
+			}
+		}
+	}
 }
 
 ruParseExp(term : RuTerm, types : Tree<int, RuTypeEnv>, place : RuPlace, env : RuEnv) -> Maybe<RuExp> {
@@ -91,13 +151,28 @@ ruParseExpr(env : RuParseEnv, pos : int, stack0 : RuParseStack) -> Maybe<[RuExpN
 			poped = ruPopExprStack(env, pos, RuParseStack(st with trie = n));
 			ruParseExpr(env, pos + 1, poped);
 		}
+		try_var = \t, n -> {
+			switch (lookupTree(env.types, t)) {
+				Some(tenv): {
+					if (t == stack.type_id && stack.curr == stack.start) None() else {
+						ruParseExpr(env, pos, 
+							RuParseStack(
+								Some(RuParseStack(stack with trie = n)), 
+								pos, pos, t, tenv.trie, []
+							)
+						)
+					}
+				}
+				None(): None();
+			}
+		}
 		try_supers = \v, t -> {
 			supers = lookupTreeDef(env.types, t, ruNoTypeEnv).supers;
 			foldTree(stack.trie.map, None(), \tp, m, ac -> 
 				if (ac != None()) ac else {
 					switch (lookupTree(supers, tp)) {
-						Some(r): 
-							do_step(RuParseStack(stack with 
+						Some(r): {
+							ret = do_step(RuParseStack(stack with 
 								expr = concat(
 									[[
 										RuRuleNode(r.info.id, r.term.type, 1, 1), 
@@ -106,7 +181,10 @@ ruParseExpr(env : RuParseEnv, pos : int, stack0 : RuParseStack) -> Maybe<[RuExpN
 									stack.expr
 								)
 							), m);
-						None(): ac;
+							if (isSome(ret)) ret else try_var(tp, m);
+						}
+						None(): //ac;
+							try_var(tp, m);
 					}
 				}
 			);
@@ -114,7 +192,8 @@ ruParseExpr(env : RuParseEnv, pos : int, stack0 : RuParseStack) -> Maybe<[RuExpN
 		try_vars = \-> {
 			foldTree(stack.trie.map, None(), \t, n, ac ->
 				if (ac != None()) ac else {
-					switch (lookupTree(env.types, t)) {
+					try_var(t, n);
+					/*switch (lookupTree(env.types, t)) {
 						Some(tenv): {
 							if (t == stack.type_id && stack.curr == stack.start) ac else {
 								ruParseExpr(env, pos, 
@@ -126,7 +205,7 @@ ruParseExpr(env : RuParseEnv, pos : int, stack0 : RuParseStack) -> Maybe<[RuExpN
 							}
 						}
 						None(): ac;
-					}
+					}*/
 				}
 			)
 		}
@@ -136,18 +215,18 @@ ruParseExpr(env : RuParseEnv, pos : int, stack0 : RuParseStack) -> Maybe<[RuExpN
 					Some(n): {
 						switch (do_step(RuParseStack(stack with expr = concat([[RuVar(v, t_id)]], stack.expr)), n)) {
 							Some(ret): Some(ret);
-							None(): 
-								switch (try_supers(v, t_id)) {
+							None(): try_supers(v, t_id);
+								/*switch (try_supers(v, t_id)) {
 									Some(ret): Some(ret);
 									None(): try_vars();
-								}
+								}*/
 						}
 					}
-					None(): 
-						switch (try_supers(v, t_id)) {
+					None(): try_supers(v, t_id);
+						/*switch (try_supers(v, t_id)) {
 							Some(ret): Some(ret);
 							None(): try_vars();
-						}
+						}*/
 				}
 			}
 			RuConstRef(id): {
