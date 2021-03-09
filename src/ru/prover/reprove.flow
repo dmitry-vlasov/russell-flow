@@ -2,6 +2,7 @@ import ds/vector;
 import base/util/progress;
 import ru/prover/prove;
 import ru/prover/stats;
+import ru/map_decls;
 import comm;
 
 export {
@@ -163,264 +164,133 @@ ruReproveUnifyAssertion(
 	}
 }
 
+ruReproveTheorem(
+	th : RuTheorem, 
+	index : RuIndex<RuAssertion>, 
+	time_limit : double, 
+	max_proofs : int,
+	max_variants : int, 
+	math : RuMath, 
+	env : RuEnv
+) -> bool {
+	timer = ruMakeTimer();
+	mapping = ref makeTree();
+	root = lookupTreeDef(math.decls.assertions, ruProofQedStep(th.proof).assertion, ruNoAxiom);
+	prover_env0 = ruInitProverEnv(th, math, env, Some(index), time_limit);
+	prover_env1 = RuProverEnv(prover_env0 with
+		fns = RuProverFuncs(prover_env0.fns with
+			unifyAssertion = ruReproveUnifyAssertion(
+				prover_env0.fns.unifyAssertion, mapping, root, math, env, max_variants 
+			),
+			unifyPremise = ruReproveUnifyPremise(
+				th, prover_env0.fns.unifyPremise, mapping, math, env, max_proofs
+			),
+			tactic = ruReproveTactic(th, math, mapping)
+		)
+	);
+	prover_env2 = ruExpandHyp(prover_env1.tree.root, prover_env1);
+	if (lookupTreeDef(env.conf.opts, "reprove-stats", "") == "1") {
+		init_stats = RuStatsRow("reprove init " + id2s(th.info.id), 
+			pairs2tree([
+				Pair("size", i2d(length(th.proof.steps))), 
+				Pair("time", ruTimePassed(timer))
+			])
+		);
+		ruAddStats("reprove_init", init_stats);
+	}
+	t = ruMakeTimer();
+	prover_env3 = ruProve(prover_env2);
+	prove_time = ruTimePassed(t);
+	tm = ruTimePassed(timer);
+	time = tm / 1000.0;
+	if (lookupTreeDef(env.conf.opts, "reprove-stats", "") == "1") {
+		reprove_stats = RuStatsRow("reprove do " + id2s(th.info.id), 
+			pairs2tree([
+				//Pair("depth", i2d(lookupTreeDef(depths, th.info.id, -1))),
+				Pair("size", i2d(ruSizeProverTree(prover_env2.tree.root))),
+				Pair("proof-size", i2d(length(th.proof.steps))), 
+				Pair("proof-vol", i2d(fold(th.proof.steps, 0, \acc, step -> acc + length(step.expr.nodes)))), 
+				Pair("time", prove_time),
+				Pair("time-per-step", prove_time / i2d(length(th.proof.steps)))
+			])
+		);
+		ruAddStats("reprove_time", reprove_stats);
+		stats = RuStatsRow("reproved all " + id2s(th.info.id), 
+			pairs2tree([
+				Pair("size", i2d(ruSizeProverTree(prover_env2.tree.root))), 
+				Pair("time", tm)
+			])
+		);
+		ruAddStats("reprove_all", stats);
+	}
+	length(^(prover_env3.proofs)) > 0
+}
+
 ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 	env = ruUnitEnv(unit);
-	state = unit.state;
 	task = unit.task;
-	// At first read the math from file
-	file = lookupTreeDef(task.args, "file", "");
+	state = unit.state;
 	conf = state.conf;
 	math = ruMathFromSources(state.ru, env);
-	target0 = lookupTreeDef(task.args, "target", file);
-	target = ruTrimPath(target0, conf, ".ru");
-	if (ruVerbose(conf) > 0) {
-		env.out.onMessage("repoving target: '" + target + "'");
-	}
-	reproved_count = ref 0;
-	failed_count = ref 0;
-	failed_th_names = ref [];
-	max_time = ref 0.0;
-	max_th_id = ref -1;
-	depths = ruAssertionsDepths(math.decls.assertions);
-	/*if (lookupTreeDef(conf.opts, "reprove-singleton", "") == "1") {
-		env.out.onMessage("YEXX");
-	}*/
-	/*if (lookupTreeDef(conf.opts, "reprove-stats", "") == "1") {
-		ruCommandTheoremDepthStats(math);
-	}*/
-
-	max_proofs = s2i(lookupTreeDef(task.args, "max-proofs", "-1"));
-	max_variants = s2i(lookupTreeDef(task.args, "max-variants", "-1"));
-	reproved = ref 0;
-	disproved = ref [];
-	push_disproved = ruMakeAtomicArrayPush(disproved);
-	processed = ref 0;
-	reprove_th = \th, index, time_limit -> {
-		//if (math.ruVerbose(conf) > 0) {
-		//	env.out.onMessage("going to reprove theorem " + th.info.name);
-		//}
-		timer = ruMakeTimer();
-		mapping = ref makeTree();
-		root = lookupTreeDef(math.decls.assertions, ruProofQedStep(th.proof).assertion, ruNoAxiom);
-		prover_env0 = ruInitProverEnv(th, math, env, index, time_limit);
-		prover_env1 = RuProverEnv(prover_env0 with
-			fns = RuProverFuncs(prover_env0.fns with
-				unifyAssertion = ruReproveUnifyAssertion(
-					prover_env0.fns.unifyAssertion, mapping, root, math, env, max_variants 
-				),
-				unifyPremise = ruReproveUnifyPremise(
-					th, prover_env0.fns.unifyPremise, mapping, math, env, max_proofs
-				),
-				tactic = ruReproveTactic(th, math, mapping)
-			)
-		);
-		prover_env2 = ruExpandHyp(prover_env1.tree.root, prover_env1);
-		if (lookupTreeDef(conf.opts, "reprove-stats", "") == "1") {
-			init_stats = RuStatsRow("reprove init " + id2s(th.info.id), 
-				pairs2tree([
-					Pair("size", i2d(length(th.proof.steps))), 
-					Pair("time", ruTimePassed(timer))
-				])
-			);
-			ruAddStats("reprove_init", init_stats);
-		}
-		t = ruMakeTimer();
-		prover_env3 = ruProve(prover_env2);
-		prove_time = ruTimePassed(t);
-		tm = ruTimePassed(timer);
-		time = tm / 1000.0;
-		if (time > ^max_time) {
-			max_time := time;
-			max_th_id := th.info.id;
-		}
-		if (lookupTreeDef(conf.opts, "reprove-stats", "") == "1") {
-			reprove_stats = RuStatsRow("reprove do " + id2s(th.info.id), 
-				pairs2tree([
-					Pair("depth", i2d(lookupTreeDef(depths, th.info.id, -1))),
-					Pair("size", i2d(ruSizeProverTree(prover_env2.tree.root))),
-					Pair("proof-size", i2d(length(th.proof.steps))), 
-					Pair("proof-vol", i2d(fold(th.proof.steps, 0, \acc, step -> acc + length(step.expr.nodes)))), 
-					Pair("time", prove_time),
-					Pair("time-per-step", prove_time / i2d(length(th.proof.steps)))
-				])
-			);
-			ruAddStats("reprove_time", reprove_stats);
-			stats = RuStatsRow("reproved all " + id2s(th.info.id), 
-				pairs2tree([
-					Pair("size", i2d(ruSizeProverTree(prover_env2.tree.root))), 
-					Pair("time", tm)
-				])
-			);
-			ruAddStats("reprove_all", stats);
-		}
-		atomicRefIntAddition(processed, 1);
-		if (^(prover_env3.proofs) == []) {
-			atomicRefIntAddition(failed_count, 1);
-			push_disproved(th.info.id);
-			env.out.onError(
-				"theorem '" + id2s(th.info.id) + "' was NOT reproved in " + d2st(time, 2) + "s\n" + 
-				ru2s(th, math), [ruDeclPlace(th, env)]
-			);
-			refArrayPush(failed_th_names, id2s(th.info.id));
-			false;
-		} else {
-			atomicRefIntAddition(reproved_count, 1);
-			atomicRefIntAddition(reproved, 1);
-			if (ruVerbose(conf) > 0) {
-				env.out.onMessage(i2s(^reproved_count) + " theorem '" + id2s(th.info.id) + "' was REPROVED in " + d2st(time, 2) + "s");
-			}
-			true;
-		}
-	}
-	reprove_ass = \ass : RuAssertion, time_limit -> 
-		switch (ass) {
-			RuTheorem(__,__,__,__): reprove_th(ass, None(), time_limit);
-			default: true;
-		}
-	reprove_decl = \decl : RuDecl, time_limit ->
-		switch (decl) {
-			RuTheorem(__,__,__,__): reprove_th(decl, None(), time_limit);
-			default: true;
-		}
-	reprove_decls = \decls, time_limit -> {
-		proof_lens = map(decls, \d -> {
-			switch (d) {
-				RuTheorem(__,__,__,proof): length(proof.steps);
-				default: 0;
-			}
-		});
-		sum_proof_lens = i2d(fold(proof_lens, 0, \acc, len -> acc + len));
-		all(ruConcurrent(mapi(decls, \i, d -> {
-			limit = time_limit * i2d(availableProcessors()) * i2d(proof_lens[i]) / sum_proof_lens;
-			\-> reprove_decl(d, limit)
-		})));
-	}
 	timer = ruMakeTimer();
-	calc_total_steps = \decls -> fold(decls, 0, \acc, d ->
-		switch (d) {
-			RuTheorem(__,__,__,proof): acc + length(proof.steps);
-			default: acc;
-		}
-	);
-	calc_time_limit = \decls -> {
-		opt = lookupTreeDef(conf.opts, "time-limit", lookupTreeDef(task.args, "time-limit", "600"));
-		limit = if (opt == "auto") {
-			i2d(calc_total_steps(decls)) * 3.0;
-		} else {
-			i2d(s2i(opt) * 1000);
-		}
-		if (ruVerbose(conf) > 0) {
-			env.out.onMessage("reprove time limit: " + ruTime2s(limit));
-		}
-		limit
-	}
-
-	// ruTrackProgress(isOn : ref bool, counter : ref int, num : int, delta : int, tr : RuTimer, out : RuOut, msg : () -> string) -> void;
-	track_progress = ref true;
-	ret = if (target == "all" || target == "1") {
-		decls = filtermap(concatA(map(ruSourcesOrder(math.sources), \src -> src.decls)), ruDecl2Assertion);
-		time_limit = calc_time_limit(decls);
-		chunks = splitByNumber(decls, s2i(lookupTreeDef(conf.opts, "reprove-split-num", "256")));
-		//time_limit = time_limit * i2d(availableProcessors());
-		//env.out.onMessage("reprove concurrent time limit: " + d2s(time_limit / 1000.0) + ".s");
-		proof_lens = map(chunks, \chunk ->
-			map(chunk, \d ->
-				switch (d) {
-					RuTheorem(__,__,__,proof): length(proof.steps);
-					default: 0;
+	target = ruDetermineTarget(unit.task, math, env);
+	if (target != RuTargetNone()) {
+		reproved_count = ref 0;
+		failed_theorems = ref [];
+		inc_reproved = ruAtomicIntInc(reproved_count);
+		th_fail = ruAtomicRefArrayPush(failed_theorems);
+		max_proofs = s2i(lookupTreeDef(task.args, "max-proofs", "-1"));
+		max_variants = s2i(lookupTreeDef(task.args, "max-variants", "-1"));
+		all_imported = ruSourcesAllImported(math.sources, env);
+		index = ruMakeIndexForTarget(target, math, env);
+		reprove_fn = \decl, time_limit -> {
+			th = cast(decl : RuDecl -> RuTheorem);
+			th_timer = ruMakeTimer();
+			if (ruReproveTheorem(th, index, time_limit, max_proofs, max_variants, math, env)) {
+				inc_reproved(1);
+				if (ruVerbose(env.conf) > 1) {
+					env.out.onMessage(i2s(^reproved_count) + " theorem '" + id2s(th.info.id) + "' was REPROVED in " + ruTimePassed2s(th_timer));
 				}
-			)
-		);
-		sum_proof_lens = map(proof_lens, \lens -> i2d(fold(lens, 0, \ac, len -> ac + len)));
-		total_steps = fold(sum_proof_lens, 0.0, \acc, len -> acc + len);
-
-		progress = ruMakeProgress(time_limit, length(decls), ruProgressUpdateMs(task, conf));
-		ruTrackProgress(progress, unit.out, \ ->
-			"reproved: " + i2s(^reproved) + (if (^disproved == []) "" else ", disproved: " + 
-				strGlue(map(^disproved, id2s), ", ")
-			)
-		);
-		r = foldi(chunks, Pair(ruMakeIndex(), true), \n, acc, chunk -> {
-			indexes = foldi(chunk, Pair(acc.first, []), \i, ac, ass ->
-				Pair(ruSetIndex(ass.stat.prop, ass, ac.first), concat(ac.second, [ac.first]))
-			);
-			left_time = time_limit - ruTimePassed(timer);
-			if (left_time <= 0.0) Pair(indexes.first, false) else {
-				time_left_on_chunk = left_time * i2d(availableProcessors()) * sum_proof_lens[n] / total_steps * 2.0;
-				//control_sum = foldi(chunk, 0.0, \i, ac, __ -> 
-				//	ac + time_left_on_chunk * i2d(proof_lens[n][i]) / sum_proof_lens[n]
-				//);
-				//env.out.onMessage("time_left_on_chunk: " + d2s(time_left_on_chunk) + ", control_sum: " + d2s(control_sum));
-				ret = all(ruConcurrent(mapi(chunk, \i, ass -> 
-						\-> eitherMap(ruDecl2Theorem(ass), 
-							\th -> {
-								limit = time_left_on_chunk * i2d(proof_lens[n][i]) / sum_proof_lens[n];
-								reprove_th(th, Some(indexes.second[i]), limit);
-							}, 
-							true
-						)
-				)));
-				Pair(indexes.first, ret && acc.second);
+			} else {
+				th_fail(th.info.id);
+				env.out.onError(
+					"theorem '" + id2s(th.info.id) + "' was NOT reproved in " + ruTimePassed2s(th_timer) + "\n" + 
+					ru2s(th, math), [ruDeclPlace(th, env)]
+				);
 			}
-		}).second;
-		progress.isOn := false;
-		env.out.onMessage("average time per step: " + ruTime2s(ruTimePassed(timer) / total_steps));
-		r;
-	} else if (target == "1-seq" || target == "all-seq") {
-		decls = concatA(map(ruSourcesOrder(math.sources), \src -> src.decls));
-		time_limit = calc_time_limit(decls);
-		progress = ruMakeProgress(time_limit, length(decls), ruProgressUpdateMs(task, conf));
-		ruTrackProgress(progress, unit.out, \ ->
-			"reproved: " + i2s(^reproved) + (if (^disproved == []) "" else ", disproved: " + 
-				strGlue(map(^disproved, id2s), ", ")
+			None();
+		}
+		new_state = ruMapFnComm(
+			RuUnit(unit.task, state, env.out),
+			RuMapFn(
+				RuMapFnInfo(
+					"reprove-proofs", 
+					\decl -> ruTargetPredicate(target)(decl) && ruDeclIsTheorem(decl), 
+					ruProofLengthMeasure, 
+					\ -> "reproved: " + i2s(^reproved_count) + " theorems, failed: " + strGlue(map(^failed_theorems, id2s), ", ")
+				),
+				reprove_fn
 			)
 		);
-		all(mapi(decls, \i, d -> {
-			left_time = time_limit - ruTimePassed(timer);
-			if (left_time <= 0.0) false else { 
-				limit_on_one = left_time / i2d(length(decls) - i);
-				//env.out.onMessage("limit_on_one: " + d2s(limit_on_one / 1000.0) + ".s");
-				reprove_decl(d, limit_on_one);
+		if (ruVerbose(env.conf) > 0) {
+			env.out.onMessage("reproved: " + i2s(^reproved_count) + " theorems");
+		}
+		if (length(^failed_theorems) > 0) {
+			if (length(^failed_theorems) < 10) {
+				env.out.onMessage("Failed to reprove theorems: " + strGlue(map(^failed_theorems, id2s), ", "));
+			} else {
+				env.out.onMessage("Failed to reprove theorems:\n" + strIndent(strGlue(map(^failed_theorems, id2s), "\n")));
 			}
-		}));
+		}
+		Some(RuState(new_state with 
+			vars = mergeTree(new_state.vars, pairs2tree([
+				Pair("reprove-proofs.failed-count", ValInt(length(^failed_theorems))),
+				Pair("reprove-proofs.failed-theorems", ValArray(map(^failed_theorems, \id -> ValString(id2s(id))))),
+				Pair("reprove-proofs.reproved-count", ValInt(^reproved_count))
+			]));
+		));
 	} else {
-		id = s2id(target);
-		switch (lookupTree(math.sources, id)) {
-			Some(src): {
-				ms_time_limit = calc_time_limit(src.decls);
-				reprove_decls(src.decls, ms_time_limit);
-			}
-			None(): {
-				switch (lookupTree(math.decls.assertions, id)) {
-					Some(ass): {
-						ms_time_limit = calc_time_limit([ass]);
-						reprove_ass(ass, ms_time_limit);
-					}
-					None(): {
-						env.out.onMessage("no target for reproving");
-						false
-					}
-				}
-			}
-		}
+		env.out.onMessage("no target for proof reproving");
+		Some(state);
 	}
-	if (ruVerbose(conf) > 0) {
-		env.out.onMessage("ru reproved '" + target + "' in " + ruTimePassed2s(timer));
-		env.out.onMessage("Max time: " + d2st(^max_time, 2) + "s for a theorem: " + id2s(^max_th_id));
-	}
-	if (/*math.ruVerbose(conf) > 0 ||*/ ^failed_count > 0) {
-		env.out.onMessage("Reproved: " + i2s(^reproved_count) + " theorems,");
-		env.out.onMessage("Failed to reprove: " + i2s(^failed_count) + " theorems:");
-		iter(^failed_th_names, \th -> env.out.onMessage("\t" + th));
-	}
-	if (lookupTreeDef(conf.opts, "reprove-stats", "") == "1") {
-		ruCommandReproveTimeStats(math, env);
-		//ruCommandReproveAllStats(math);
-	}
-	Some(RuState(state with 
-		ru = math.sources,
-		vars = setTree(state.vars, 
-			"reprove.time", ValDouble(ruTimePassed(timer))
-		)
-	));
 }
