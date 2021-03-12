@@ -1,80 +1,57 @@
+import base/util/concurrent;
 import ru/subst;
 import ru/verify/theorem;
-import ru/verify/acc;
 
 export {
-	ruVerifySource(src : RuSource, acc : RuVerifyAcc, env : RuEnv) -> RuVerifyAcc;
-	ruMakeVerifyAcc() -> RuVerifyAcc;
+	RuVerifySourceResult(
+		source : RuSource,
+		disproved : [RuVerifyTheoremResult]
+	);
+	ruVerifySource(src : RuSource, imported_map : Tree<int, Set<int>>, math : RuMath, env : RuEnv) -> RuVerifySourceResult;
 }
 
-ruMakeVerifyAcc() -> RuVerifyAcc {
-	RuVerifyAcc(ruEmptyMath, makeSet(), makeSet());
-}
-
-RuVerifySourceAcc(
-	decls  : [RuDecl],
-	local  : RuVerifyAcc,
-	global : RuVerifyAcc
-);
-
-ruVerifySource(src : RuSource, acc : RuVerifyAcc, env : RuEnv) -> RuVerifyAcc {
-	approve_acc = \ac, decl : RuDecl -> 
-		RuVerifyAcc(ac with
-			math = ruMathSetDeclInDecls(ac.math, decl, env),
-			approved = insertSet(ac.approved, decl.info.id)
-		);
-	disprove_acc = \ac, decl -> 
-		RuVerifyAcc(ac with
-			math = ruMathSetDeclInDecls(ac.math, decl, env),
-			disproved = insertSet(ac.disproved, decl.info.id)
-		);
-	approve = \ac, decl -> RuVerifySourceAcc(
-		concat(ac.decls, [decl]), 
-		approve_acc(ac.local, decl),
-		approve_acc(ac.global, decl),
-	);
-	disprove = \ac, decl -> RuVerifySourceAcc(
-		concat(ac.decls, [decl]), 
-		disprove_acc(ac.local, decl),
-		disprove_acc(ac.global, decl),
-	);
+ruVerifySource(src : RuSource, imported_map : Tree<int, Set<int>>, math : RuMath, env : RuEnv) -> RuVerifySourceResult {
 	timer = ruMakeTimer();
-	pre_math = ruMathAddSource(acc.math, src, env);
-	src_acc = fold(src.decls, 
-		RuVerifySourceAcc([], ruMakeVerifyAcc(), acc), 
-		\ac, decl -> {
+	disproved = ref [];
+	add_disproved = ruAtomicRefArrayPush(disproved);
+	verified_decls = filtermap(ruConcurrent(map(src.decls, 
+		\decl -> \-> {
 			switch (decl) {
 				RuTheorem(info,__,__,__): {
-					res = ruVerifyTheorem(decl, ac.global.math, env);
-					filtered = ruFilterOutVerifyErrs(res, ruIsNonVerifiedRef);
-					ruOutputVerifyErrs(filtered, pre_math, env);
-					if (ruIsVerified(filtered)) {
+					res = ruVerifyTheorem(decl, math, env);
+					errs = concat(res.errs, ruVerifyPrecedenceInTheorem(decl, imported_map, math, env));
+					if (length(errs) == 0) {
 						if (ruVerbose(env.conf) > 2) {
 							env.out.onMessage("Theorem '" + id2s(info.id) + "' is approved");
 						}
-						approve(ac, res.theorem);
+						Some(res.theorem);
 					} else {
-						if (ruVerbose(env.conf) > 0 && length(filtered.errs) > 0) {
+						if (ruVerbose(env.conf) > 0 && length(res.errs) > 0) {
+							add_disproved(res);
 							env.out.onMessage("Theorem '" + id2s(info.id) + "' is disproved");
-							env.out.onMessage(ru2s(decl, pre_math));
+							env.out.onMessage(ru2s(decl, math));
 						}
-						disprove(ac, decl);
+						Some(decl);
 					}
 				}
 				default: {
-					approve(ac, decl);
+					Some(decl);
 				}
 			}
 		}
-	);
+	)), idfn);
 	if (ruVerbose(env.conf) > 1) {
 		env.out.onMessage("\tru verified: '" + src.info.module + "' in " + ruTimePassed2s(timer));
 	}
-	RuVerifyAcc(src_acc.local with
+	RuVerifySourceResult(
+		RuSource(src with decls = verified_decls),
+		^disproved
+	);
+	/*RuVerifyAcc(src_acc.local with
 		math = RuMath(src_acc.local.math with 
 			sources = setTree(src_acc.local.math.sources, src.info.id, 
 				RuSource(src with decls = src_acc.decls)
 			)
 		)
-	);
+	);*/
 }
