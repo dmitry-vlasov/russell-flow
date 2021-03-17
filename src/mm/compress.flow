@@ -1,4 +1,6 @@
 import mm/verify;
+import base/util/concurrent;
+import ds/vector;
 
 export {
 	mmDecompressProof(proof : MmProof, hyps : [MmHyp], arities : Tree<int, int>) -> MmNormalProof;
@@ -33,91 +35,76 @@ MmStepLen(
 );
 
 MmDecompressAcc(
-	decompressed : [MmStepLen],
-	subexprs : [[MmStepLen]]
+	decompressed : Vector<MmStepLen>,
+	subexprs : [Vector<MmStepLen>]
 );
 
 mmDecompressProof(proof : MmProof, hyps : [MmHyp], arities : Tree<int, int>) -> MmNormalProof {
 	switch (proof) {
 		MmNormalProof(__): proof;
 		MmCompressedProof(labels, steps): {
-			decompressed = fold(steps, MmDecompressAcc([], []), \acc, i ->
+			decompressed = fold(steps, MmDecompressAcc(makeVector(128), []), \acc, i ->
 				if (i >= 0) {
 					if (i < length(hyps)) {
-						MmDecompressAcc(acc with 
-							decompressed = concat(acc.decompressed, 
-								[MmStepLen(hyps[i].label, 1)]
-							)
-						);
+						pushVector(acc.decompressed, MmStepLen(hyps[i].label, 1));
 					} else {
 						j = i - length(hyps);
 						if (j < length(labels)) {
 							arity = lookupTreeDef(arities, labels[j], -1);
 							if (arity == -1) {
 								// Case of inner floating variable declaration
-								MmDecompressAcc(acc with 
-									decompressed = concat(acc.decompressed, 
-										[MmStepLen(labels[j], 1)]
-									)
-								);
+								pushVector(acc.decompressed, MmStepLen(labels[j], 1));
 							} else {
-								MmDecompressAcc(acc with 
-									decompressed = concat(acc.decompressed, 
-										[MmStepLen(
-											labels[j], 
-											mmCalcSubproofLen(
-												length(acc.decompressed) - 1, 
-												arity, 1, acc.decompressed
-											)
-										)]
-									)
+								len = mmCalcSubproofLen(
+									sizeVector(acc.decompressed) - 1,
+									arity, 1, acc.decompressed
 								);
+								pushVector(acc.decompressed, MmStepLen(labels[j], len));
 							}
 						} else {
 							k = j - length(labels);
 							subexpr = acc.subexprs[k];
-							MmDecompressAcc(acc with 
-								decompressed = concat(acc.decompressed, subexpr)
-							);
+							appendVector(acc.decompressed, subexpr);
 						}
 					}
+					acc;
 				} else {
-					len = lastElement(acc.decompressed, MmStepLen(0, 0)).len;
-					subexpr = subrange(acc.decompressed, length(acc.decompressed) - len, len);
+					len = getVectorUnsafe(acc.decompressed, sizeVector(acc.decompressed) - 1).len;
+					subexpr = subVector(acc.decompressed, sizeVector(acc.decompressed) - len, len);
 					MmDecompressAcc(acc with subexprs = concat(acc.subexprs, [subexpr]));
 				}
 			).decompressed;
-			MmNormalProof(map(decompressed, \s -> s.step));
+			MmNormalProof(map(vector2array(decompressed), \s -> s.step));
 		}
 	}
 }
 
-mmCalcSubproofLen(i : int, arity : int, acc : int, steps : [MmStepLen]) -> int {
+mmCalcSubproofLen(i : int, arity : int, acc : int, steps : Vector<MmStepLen>) -> int {
 	if (arity == 0) acc else {
-		arg_len = steps[i].len;
+		arg_len = getVectorUnsafe(steps, i).len;
 		mmCalcSubproofLen(i - arg_len, arity - 1, acc + arg_len, steps);
 	}
 }
 
 
-MmExecutionAcc1(
+MmCompressExecutionAcc(
 	stack : List<MmExp>,
 	essentials : List<MmExpPair>,
 	subst : Tree<int, MmExp>
 );
 
-mmPickFromStack1(stack : List<MmExp>, hyps : [MmHyp], env : RuEnv) -> MmExecutionAcc1 {
-	fold(hyps, MmExecutionAcc1(stack, makeList(), makeTree()), \acc, hyp -> {
+mmCompressPickFromStack(stack : List<MmExp>, hyps : [MmHyp], env : RuEnv) -> MmCompressExecutionAcc {
+	fold(hyps, MmCompressExecutionAcc(stack, makeList(), makeTree()), \acc, hyp -> {
 		e = headList(acc.stack, MmExp([]));
 		switch (hyp) {
 			MmEssential(__, expr):
-				MmExecutionAcc1(
+				MmCompressExecutionAcc(
 					tailList(acc.stack), 
 					Cons(MmExpPair(e, expr), acc.essentials), 
 					acc.subst
 				);
 			MmFloating(__, type, var): {
-				MmExecutionAcc1(
+				MmCompressExecutionAcc(
 					tailList(acc.stack),
 					acc.essentials,
 					setTree(acc.subst, var, MmExp(tail(e.symbs)))
@@ -128,10 +115,10 @@ mmPickFromStack1(stack : List<MmExp>, hyps : [MmHyp], env : RuEnv) -> MmExecutio
 }
 
 // Do not check, just perform a single step
-mmExecuteRPNstep(label : int, stack : List<MmExp>, entities : Tree<int, MmLabeled>, theorem : MmAssertion, env : RuEnv) -> List<MmExp> {
+mmCompressExecuteRPNstep(label : int, stack : List<MmExp>, entities : Tree<int, MmLabeled>, theorem : MmAssertion, env : RuEnv) -> List<MmExp> {
 	switch (lookupTreeDef(entities, label, mmNoAssertion)) {
 		MmAssertion(disj, hyps, inner, statement): {
-			exec_acc = mmPickFromStack1(stack, reverseA(hyps), env);
+			exec_acc = mmCompressPickFromStack(stack, reverseA(hyps), env);
 			Cons(mmApplySubst(statement.expr, exec_acc.subst), exec_acc.stack);
 		}
 		MmEssential(__, expr): {
@@ -143,10 +130,10 @@ mmExecuteRPNstep(label : int, stack : List<MmExp>, entities : Tree<int, MmLabele
 	}
 }
 
-mmCountExprsInProof(proof : [int], ass : MmAssertion, sources : Tree<int, MmSource>, structs : MmStructs, env : RuEnv) -> Tree<MmExp, int> {
+mmCompressCountExprsInProof(proof : [int], ass : MmAssertion, sources : Tree<int, MmSource>, structs : MmStructs, env : RuEnv) -> Tree<MmExp, int> {
 	fold(proof, Pair(makeList(), makeTree()),
 		\acc, label -> {
-			stack = mmExecuteRPNstep(label, acc.first, structs.labeled, ass, env);
+			stack = mmCompressExecuteRPNstep(label, acc.first, structs.labeled, ass, env);
 			ex = headList(stack, MmExp([]));
 			Pair(stack, setTree(acc.second, ex, lookupTreeDef(acc.second, ex, 0) + 1));
 		}
@@ -178,8 +165,9 @@ mmCompressAssertion(ass : MmAssertion, sources : Tree<int, MmSource>, structs : 
 
 MmProofCompressionAcc(
 	stack : List<MmExp>,
-	compressed : [MmStepLen],
-	steps : Tree<MmExp, int>
+	compressed : Vector<MmStepLen>,
+	steps : Tree<MmExp, int>,
+	count : int
 );
 
 mmCompressProof(labels : [int], ass : MmAssertion, sources : Tree<int, MmSource>, structs : MmStructs, env : RuEnv, arities : Tree<int, int>) -> MmCompressedProof {
@@ -191,45 +179,42 @@ mmCompressProof(labels : [int], ass : MmAssertion, sources : Tree<int, MmSource>
 	hyps_map = foldi(concat(ass.hyps, ass.inner), makeTree(), \i, acc, hyp -> setTree(acc, hyp.label, i));
 	labs_map = foldi(labs, makeTree(), \i, acc, lab -> setTree(acc, lab, length(ass.hyps) + i));
 	Z = length(ass.hyps) + sizeTree(labs_map);
-	
-	exps_counts = if (level == 0) makeTree() else mmCountExprsInProof(labels, ass, sources, structs, env);
+
+	exps_counts = if (level == 0) makeTree() else mmCompressCountExprsInProof(labels, ass, sources, structs, env);
 	calc_acc = \bad_steps -> 
-		foldi(labels, MmProofCompressionAcc(makeList(), [], makeTree()), \i, acc, label -> {
-			stack = mmExecuteRPNstep(label, acc.stack, structs.labeled, ass, env);
+		foldi(labels, MmProofCompressionAcc(makeList(), makeVector(128), makeTree(), 0), \i, acc, label -> {
+			stack = mmCompressExecuteRPNstep(label, acc.stack, structs.labeled, ass, env);
 			ex = headList(stack, MmExp([]));
+			acc1 = MmProofCompressionAcc(acc with stack = stack);
 			switch (lookupTree(hyps_map, label)) {
 				Some(k): {
-					MmProofCompressionAcc(stack, 
-						concat(acc.compressed, [MmStepLen(k, 1)]),
-						acc.steps
-					);
+					pushVector(acc.compressed, MmStepLen(k, 1));
+					acc1;
 				}
 				None(): {
 					switch (lookupTree(labs_map, label)) {
 						Some(k): {
-							arity = lookupTreeDef(arities, label, -1);
 							len = mmCalcSubproofLen(
-								length(acc.compressed) - 1, 
-								arity, 0, acc.compressed
+								sizeVector(acc.compressed) - 1,
+								lookupTreeDef(arities, label, -1), 
+								0, acc.compressed
 							);
 							switch (lookupTree(acc.steps, ex)) {
 								Some(n): {
-									MmProofCompressionAcc(
-										stack, 
-										concat(take(acc.compressed, length(acc.compressed) - len), [MmStepLen(n, 1)]), 
-										acc.steps
-									);
+									shrinkVector(acc.compressed, sizeVector(acc.compressed) - len);
+									pushVector(acc.compressed, MmStepLen(n, 1));
+									acc1
 								}
 								None(): {
 									if (lookupTreeDef(exps_counts, ex, 0) <= 1 || containsSet(bad_steps, ex)) {
-										MmProofCompressionAcc(stack, 
-											concat(acc.compressed, [MmStepLen(k, len + 1)]),
-											acc.steps
-										);
+										pushVector(acc.compressed, MmStepLen(k, len + 1));
+										acc1
 									} else {
-										MmProofCompressionAcc(stack, 
-											concat(acc.compressed, [MmStepLen(k, len + 1), MmStepLen(-1, len + 2)]),
-											setTree(acc.steps, ex, Z + sizeTree(acc.steps))
+										pushVector(acc.compressed, MmStepLen(k, len + 1));
+										pushVector(acc.compressed, MmStepLen(-1, len + 2));
+										MmProofCompressionAcc(acc1 with
+											steps = setTree(acc.steps, ex, Z + acc.count),
+											count = acc.count + 1
 										);
 									}
 								}
@@ -245,10 +230,10 @@ mmCompressProof(labels : [int], ass : MmAssertion, sources : Tree<int, MmSource>
 		});
 	acc1 = calc_acc(makeSet());
 	steps_inds = buildSet(getTreeValues(acc1.steps));
-	unused_inds = differenceSets(steps_inds, buildSet(map(acc1.compressed, \s -> s.step)));
+	unused_inds = differenceSets(steps_inds, buildSet(map(vector2array(acc1.compressed), \s -> s.step)));
 	unused_exps = foldTree(acc1.steps, makeSet(), \ex, i, acc ->
 		if (containsSet(unused_inds, i)) insertSet(acc, ex) else acc
 	);
 	acc2 = calc_acc(unused_exps);
-	MmCompressedProof(labs, map(acc2.compressed, \s -> s.step));
+	MmCompressedProof(labs, map(vector2array(acc2.compressed), \s -> s.step));
 }
