@@ -2,8 +2,8 @@ import base/stats;
 import ru/parse/exp;
 import ru/parse/parse;
 import ru/verify/math;
-import ru/parse/fast/lang;
-import ru/parse/fast/assertions;
+import ru/parse/exps/lang;
+import ru/parse/exps/assertions;
 
 export {
 	ruCreateMath(sources : [RuAnySource], env : RuEnv) -> Maybe<RuMath>;
@@ -18,32 +18,44 @@ ruCreateMath(sources : [RuAnySource], env0 : RuEnv) -> Maybe<RuMath> {
 	err_count = ref 0;
 	env = ruAddErrCounter2Env(env0, err_count);
 	timer = ruMakeTimer();
-	p_timer = ruMakeTimer();
-	parsed : [RuParsed] = filtermap(ruConcurrent(map(sources, \src -> \-> 
+	already_parsed = filtermap(sources, \src ->
 		switch (src) {
-			RuRawSource(__,__,__): ruParseSource(src, env);
+			RuRawSource(__,__,__): None();
 			RuParsed():            Some(src)
 		}
-	)), idfn);
-	env.out.onMessage("PARSED: in " + ruTimePassed2s(p_timer));
-	d_timer = ruMakeTimer();
+	);
+	raw = filtermap(sources, \src ->
+		switch (src) {
+			RuRawSource(__,__,__): Some(src);
+			RuParsed():            None();
+		}
+	);
+	parse_src_timer = ruMakeTimer();
+	just_parsed : [RuParsed] = filtermap(
+		concatA(ruConcurrent(map(
+			ruParseSplitRawSources(raw),
+			\srcs -> \-> map(srcs, \src -> ruParseSource(src, env))
+		))), 
+		idfn
+	);
+	if (ruVerbose(env.conf) > 1) {
+		env.out.onMessage("\tru parsed sources in " + i2s(length(raw)) + " files in " + ruTimePassed2s(parse_src_timer));
+	}
+	parsed = ruParsedSourcesOrder(concat(just_parsed, already_parsed));
 	all_decls = ruSources2AnyDecls(parsed);
-	env.out.onMessage("ALL DECLS: " + i2s(length(all_decls)) + " in " + ruTimePassed2s(d_timer));
-	l_timer = ruMakeTimer();
 	lang = ruCreateLang(all_decls, env);
-	env.out.onMessage("LANG: " + ruTimePassed2s(l_timer));
-	a_timer = ruMakeTimer();
+	parse_exps_timer = ruMakeTimer();
 	assertions = ruCreateAssertions(all_decls, lang, env);
-	env.out.onMessage("ASS: " + ruTimePassed2s(a_timer));
+	if (ruVerbose(env.conf) > 1) {
+		env.out.onMessage("\tru parsed expressions in " + i2s(length(all_decls)) + " declarations in " + ruTimePassed2s(parse_exps_timer));
+	}
 	decls = RuDecls(lang, assertions);
-	s_timer = ruMakeTimer();
 	sources_tree = fold(parsed, makeTree(), \acc, src ->
 		switch (src) {
 			RuSource(__,__,__,info):      setTree(acc, info.id, src);
 			RuParseSource(__,__,__,info): setTree(acc, info.id, ruCreateSource(src, decls, env));
 		}
 	);
-	env.out.onMessage("SRC: " + ruTimePassed2s(s_timer));
 	created = RuMath(sources_tree, decls);
 	ruSaveIds(env);
 	if (ruVerbose(env.conf) > 0) {
@@ -53,6 +65,27 @@ ruCreateMath(sources : [RuAnySource], env0 : RuEnv) -> Maybe<RuMath> {
 		Some(created);
 	} else {
 		None();
+	}
+}
+
+ruParseSplitRawSources(raw : [RuRawSource]) -> [[RuRawSource]] {
+	sum_length = fold(raw, 0.0, \acc, s -> acc + i2d(strlen(s.src)));
+	length_per_processor = sum_length / i2d(availableProcessors());
+	curr = makeVector(128);
+	split = fold(raw, Pair([], 0.0), \acc, s -> {
+		sum =  acc.second + i2d(strlen(s.src));
+		if (sum < length_per_processor) {
+			pushVector(curr, s);
+			Pair(acc with second = sum);
+		} else {
+			slice = vector2array(curr);
+			clearVector(curr);
+			pushVector(curr, s);
+			Pair(concat(acc.first, [slice]), 0.0);
+		}
+	});
+	if (sizeVector(curr) == 0) split.first else {
+		concat(split.first, [vector2array(curr)]);
 	}
 }
 
