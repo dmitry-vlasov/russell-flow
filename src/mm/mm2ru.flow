@@ -4,6 +4,8 @@ import ru/parse/exps/sources;
 import ru/src;
 import ru/refactor/fix_left_recursion;
 import mm/compress;
+import mm/proof_tree;
+import mm/symbols;
 
 export {
 	mm2ru(sources : Tree<int, MmSource>, env : RuEnv) -> Maybe<RuMath>;
@@ -183,24 +185,6 @@ mmAssertion2ru(ass : MmAssertion, structs : MmStructs, syntax : MmRuSyntax, env 
 	}
 }
 
-mmAssertionHyps(hyps : [MmHyp]) -> [MmEssential] {
-	filtermap(hyps, \h -> 
-		switch (h) {
-			MmEssential(__,__): Some(h);
-			default: None();
-		}
-	)
-}
-
-mmAssertionFlos(hyps : [MmHyp]) -> [MmFloating] {
-	filtermap(hyps, \h -> 
-		switch (h) {
-			MmFloating(__,__,__): Some(h);
-			default: None();
-		}
-	)
-}
-
 mmAxiom2ru(ass : MmAssertion, env : RuEnv) -> [RuParseDecl] {
 	[RuParseAxiom(ass.stat.label, [], mmVars2ru(ass.hyps), mmDisjs2ru(ass.disjs, mmAssertionVars(ass)), 
 		mapi(mmAssertionHyps(ass.hyps), \i, h -> RuParseHyp(i, mmExp2ru(h.expr.symbs, env), -1)), 
@@ -348,79 +332,14 @@ mmSources2Syntax(sources : Tree<int, MmSource>, env : RuEnv) -> MmRuSyntax {
 	MmRuSyntax(typeMap, ruleMap, supers);
 }
 
-Mm2RuExecAcc(
-	stack : Maybe<MmRuStack>,
-	subst : Tree<int, MmExp>,
-	refs : [MmRuProofTree]
-);
-
-MmRuProofTree ::= MmRuProofTreeStep, MmRuProofTreeHyp, MmRuProofTreeNone;
-	MmRuProofTreeStep(name  : int, expr  : RuParseExp, refs : [MmRuProofTree]);
-	MmRuProofTreeHyp(ind : int, expr  : RuParseExp);
-	MmRuProofTreeNone();
-
-MmRuStack(
-	parent : Maybe<MmRuStack>,
-	expr   : MmExp,
-	proof  : MmRuProofTree,
-);
-
-mm2ruPickFromStack(s : Maybe<MmRuStack>, mmHyps : [MmHyp]) -> Mm2RuExecAcc {
-	fold(mmHyps, Mm2RuExecAcc(s, makeTree(), []),
-		\acc, hyp -> {
-			eitherMap(acc.stack,
-				\stack -> {
-					switch (hyp) {
-						MmEssential(__, expr):
-							Mm2RuExecAcc(stack.parent, acc.subst, concat([stack.proof], acc.refs));
-						MmFloating(__, type, var):
-							Mm2RuExecAcc(stack.parent, setTree(acc.subst, var, MmExp(tail(stack.expr.symbs))), acc.refs);
-					}
-				},
-				acc
-			)
-		}
-	)
-}
-
-mm2ruExecRPNstep(lab : int, stack : Maybe<MmRuStack>, th_hyps : [MmHyp], labeled : Tree<int, MmLabeled>, env : RuEnv) -> Maybe<MmRuStack> {
-	switch (lookupTreeDef(labeled, lab, mmNoAssertion)) {
-		MmAssertion(disj, hyps, inner, stat): {
-			acc = mm2ruPickFromStack(stack, reverseA(hyps));
-			applied = mmApplySubst(stat.expr, acc.subst);
-			Some(MmRuStack(acc.stack, applied, 
-				if (mmStatIsRule(stat)) MmRuProofTreeNone() else MmRuProofTreeStep(lab, mmExp2ru(applied.symbs, env), acc.refs)
-			));
-		}
-		MmEssential(l, expr): {
-			i = findiDef(th_hyps, \h -> l == h.label, -1);
-			switch (th_hyps[i]) {
-				MmEssential(__, ex):
-					Some(MmRuStack(stack, expr, MmRuProofTreeHyp(i, mmExp2ru(ex.symbs, env))));
-				default:
-					Some(MmRuStack(stack, expr, MmRuProofTreeNone()));
-			}
-		}
-		MmFloating(__, type, var):
-			Some(MmRuStack(stack, MmExp([MmSymb(type, false), MmSymb(var, true)]), MmRuProofTreeNone()));
-	}
-}
-
 mmTheorem2ru(ass : MmAssertion, stat : MmProvable, structs : MmStructs, env : RuEnv) -> [RuParseDecl] {
-	th_hyps = mmAssertionHyps(ass.hyps);
-	labels = switch (stat.proof) {
-		MmNormalProof(labs): labs;
-		MmCompressedProof(__,__): {
-			env.out.onError("Compressed proof is met while translating Metamath to Russell. Decompress first.", []);
-			[];
-		}
-	}
 	eitherMap(
-		fold(labels, None(), \s, lab -> mm2ruExecRPNstep(lab, s, th_hyps, structs.labeled, env)), 
-		\stack -> {
+		mmTheorem2ProofTree(ass, stat, structs, env),
+		\proof -> {
+			th_hyps = mmAssertionHyps(ass.hyps);
 			th_vars = mmVars2ru(ass.hyps);
 			th_vars_map = fold(th_vars, makeTree(), \acc, v -> setTree(acc, v.id, v.type));
-			steps = mmProofTree2ru(stack.proof, th_vars_map);
+			steps = mmProofTree2ru(proof, th_vars_map, env);
 			vars_map = fold(mmAssertionFlos(concat(ass.hyps, ass.inner)), makeTree(), 
 				\acc, v -> setTree(acc, v.var, RuVar(mmVar2ru(v.var), v.type))
 			);
@@ -487,182 +406,40 @@ mmRemoveTrivialSteps(proof : MmRuProofTree) -> MmRuProofTree {
 	}
 }
 
-mmProofTree2ru(proof : MmRuProofTree, vars : Tree<int, int>) -> [RuParseStep] {
+mmProofTree2ru(proof : MmRuProofTree, vars : Tree<int, int>, env : RuEnv) -> [RuParseStep] {
 	new_proof = mmRemoveTrivialSteps(proof);
 	switch (new_proof) {
 		MmRuProofTreeStep(__,__,__): 
-			vector2array(mmDoProofTree2ru(new_proof, MmRuProofAcc(makeTree(), makeVector(128)), vars).linear);
+			vector2array(mmDoProofTree2ru(new_proof, MmRuProofAcc(makeTree(), makeVector(128)), vars, env).linear);
 		default: [];
 	}
 }
 
-mmDoProofTree2ru(proof : MmRuProofTreeStep, acc0 : MmRuProofAcc, vars : Tree<int, int>) -> MmRuProofAcc {
+mmDoProofTree2ru(proof : MmRuProofTreeStep, acc0 : MmRuProofAcc, vars : Tree<int, int>, env : RuEnv) -> MmRuProofAcc {
 	acc1 = fold(proof.refs, acc0, \ac, aref -> 
 		switch (aref) {
-			MmRuProofTreeStep(__,__,__): mmDoProofTree2ru(aref, ac, vars);
+			MmRuProofTreeStep(__,__,__): mmDoProofTree2ru(aref, ac, vars, env);
 			default: ac;
 		}
 	);
-	switch (lookupTree(acc1.steps, proof.expr)) {
+	ru_expr = mmExp2ru(proof.expr.symbs, env);
+	switch (lookupTree(acc1.steps, ru_expr)) {
 		Some(__): acc1;
 		None(): {
 			ind = sizeVector(acc1.linear);
 			refs = fold(proof.refs, [], \ac, aref -> 
 				switch (aref) {
 					MmRuProofTreeStep(label, ex, refs):
-						concat(ac, [RuParseStepRef(lookupTreeDef(acc1.steps, ex, -1))]);
+						concat(ac, [RuParseStepRef(lookupTreeDef(acc1.steps, mmExp2ru(ex.symbs, env), -1))]);
 					MmRuProofTreeHyp(i,__): 
 						concat(ac, [RuParseHypRef(i)]);
 					MmRuProofTreeNone(): ac;
 				}
 			);
-			pushVector(acc1.linear, RuParseStep(ind, proof.name, refs, proof.expr, ruParseNoProof, -1));
-			MmRuProofAcc(
-				setTree(acc1.steps, proof.expr, ind),
-				acc1.linear//concat(acc1.linear, [RuParseStep(ind, proof.name, refs, proof.expr, ruParseNoProof, -1)])
-			);
+			pushVector(acc1.linear, RuParseStep(ind, proof.name, refs, ru_expr, ruParseNoProof, -1));
+			MmRuProofAcc(setTree(acc1.steps, ru_expr, ind), acc1.linear);
 		}
 	}
 }
 
 ruNoParseType = RuParseType(-1, [], [], -1);
-
-mmMakeParseConst(ascii : string, utf : string, latex : string) -> RuParseConst {
-	RuParseConst(s2id(utf), [], s2id(ascii), s2id(latex), -1);
-}
-
-mmSymbTable_ref : ref Maybe<Tree<int, RuParseConst>> = ref None();
-
-mmSymbTable() -> Tree<int, RuParseConst> {
-	onlyOnce(mmSymbTable_ref, mmInitSymbTable);
-}
-
-mmInitSymbTable() -> Tree<int, RuParseConst> {
-	values2tree([
-		mmMakeParseConst("|-", "⊢", "vdash"),
-		mmMakeParseConst("->", "→", "\\rightarrow"),
-		mmMakeParseConst("-.", "¬", "\\lnot"),
-		mmMakeParseConst("<->", "↔", "\\leftrightarrow"),
-		mmMakeParseConst("\\/", "∨", "\\lor"),
-		mmMakeParseConst("/\\", "∧", "\\land"),
-		mmMakeParseConst("-/\\", "⊼", "\\bar{\\wedge}"),
-		mmMakeParseConst("A.", "∀", "\\forall"),
-		mmMakeParseConst("E.", "∃", "\\exists"),
-		mmMakeParseConst("e.", "∈", "\\in"),
-		mmMakeParseConst("E!", "∃!", "\\exists{!}"),
-		mmMakeParseConst("E*", "∃*", "\\exists^{\\ast}"),
-		mmMakeParseConst("{", "{", "\\{"),
-		mmMakeParseConst("}", "}", "\\}"),
-		mmMakeParseConst("=/=", "≠", "\\ne"),
-		mmMakeParseConst("e/", "∉", "\\notin"),
-		//mmMakeParseConst("_V", "���", "\\rm{V}"),
-		mmMakeParseConst("[_", "[_", "["),
-		mmMakeParseConst("]_", "]_", "]"),
-		mmMakeParseConst("C_", "⊆", "\\subseteq"),
-		mmMakeParseConst("C.", "⊂", "\\subset"),
-		mmMakeParseConst("\\", "∖", "\\setminus"),
-		mmMakeParseConst("u.", "∪", "\\cup"),
-		mmMakeParseConst("i^i", "∩", "\\cap"),
-		mmMakeParseConst("(/)", "∅", "\\emptyset"),
-		mmMakeParseConst("~P", "Pow", "\\cal{P}"),
-		mmMakeParseConst("<.", "〈", "\\langle"),
-		mmMakeParseConst(">.", "〉", "\\rangle"),
-		mmMakeParseConst("U.", "⋃", "\\bigcup"),
-		mmMakeParseConst("|^|", "⋂", "\\bigcap"),
-		mmMakeParseConst("U_", "⋃_", "\\bigcup"),
-		mmMakeParseConst("|^|_", "⋂_", "\\bigcap"),
-		//mmMakeParseConst("_E", "���", "\\epsilon"),
-		mmMakeParseConst("_E", "_E", "\\epsilon"),
-		mmMakeParseConst("_I", "_I", "\\rm{Id}"),
-		mmMakeParseConst("om", "ω", "\\omega"),
-		mmMakeParseConst("X.", "×", "\\times"),
-		mmMakeParseConst("`'", "⁻¹", "{}^{-1}"),
-		mmMakeParseConst("|`", "↾", "\\upharpoonright"),
-		mmMakeParseConst("\"", "\"", "``"),
-		mmMakeParseConst("o.", "∘", "\\circ"),
-		mmMakeParseConst("-->", "⟶", "\\longrightarrow"),
-		mmMakeParseConst("-1-1->", "↣", "\\rightarrowtail"),
-		mmMakeParseConst("-onto->", "↠", "\\twoheadrightarrow"),
-		mmMakeParseConst("-1-1-onto->", "⤖", "\\rightarrowtail\\twoheadrightarrow"),
-		mmMakeParseConst("X_", "×_", "\\times"),
-		mmMakeParseConst("|->", "↦", "\\mapsto"),
-		mmMakeParseConst("^m", "↑m", "\\uparrow_m"),
-		mmMakeParseConst("^pm", "↑pm", "\\uparrow_{pm}"),
-		mmMakeParseConst("+o", "+ₒ", "+_o"),
-		mmMakeParseConst(".o", "∙ₒ", "\\cdot_o"),
-		mmMakeParseConst("^o", "↑ₒ", "\\uparrow_o"),
-		mmMakeParseConst("1o", "1ₒ", "1_o"),
-		mmMakeParseConst("2o", "2ₒ", "2_o"),
-		mmMakeParseConst("/.", "/.", "\\diagup"),
-		mmMakeParseConst("~~", "≈", "\\approx"),
-		mmMakeParseConst("~<_", "≼", "\\preccurlyeq"),
-		mmMakeParseConst("~<", "≺", "\\prec"),
-		mmMakeParseConst("aleph", "ℵ", "\\aleph"),
-		//mmMakeParseConst("+c", "+���", "+_c"),
-		mmMakeParseConst("+c", "+c", "+_c"),
-		mmMakeParseConst("R1", "R₁", "R_1"),
-		mmMakeParseConst(".N", "∙N", "\\cdot_{\\cal{N}}"),
-		mmMakeParseConst("<N", "<N", "<_{\\cal{N}}"),
-		mmMakeParseConst("+pQ", "+pQ", "+_{p\\cal{Q}}"),
-		mmMakeParseConst(".pQ", "∙pQ", "\\cdot_{p\\cal{Q}}"),
-		mmMakeParseConst("Q.", "Q.", "\\cal{Q}"),
-		mmMakeParseConst(".Q", "∙Q", "\\cdot_{\\cal{Q}}"),
-		mmMakeParseConst("P.", "Pos", "\\rm{Pos}"),
-		mmMakeParseConst("1P", "1Pos", "1_{\\rm{Pos}}"),
-		mmMakeParseConst("+P.", "+Pos", "+_{\\rm{Pos}}"),
-		mmMakeParseConst(".P.", "∙Pos", "\\cdot_{\\rm{Pos}}"),
-		mmMakeParseConst("<P", "<Pos", "<_{\\rm{Pos}}"),
-		mmMakeParseConst("+pR", "+pR", "+_{p\\cal{R}}"),
-		mmMakeParseConst(".pR", "∙pR", "\\cdot_{p\\cal{R}}"),
-		mmMakeParseConst("-1R", "-1R", "-1_{p\\cal{R}}"),
-		mmMakeParseConst(".R", "∙R", "\\cdot_{p\\cal{R}}"),
-		mmMakeParseConst("<R", "<R", "<_{p\\cal{R}}"),
-		mmMakeParseConst("<RR", "<ℝ", "<_{\\mathbb{R}}"),
-		mmMakeParseConst("CC", "ℂ", "\\mathbb{C}"),
-		mmMakeParseConst("RR", "ℝ", "\\mathbb{R}"),
-		mmMakeParseConst("x.", "∙", "\\cdot"),
-		mmMakeParseConst("+oo", "+∞", "+\\infty"),
-		mmMakeParseConst("-oo", "-∞", "-\\infty"),
-		mmMakeParseConst("RR*", "ℝ*", "\\mathbb{R}*"),
-		mmMakeParseConst("<_", "≤", "\\le"),
-		mmMakeParseConst("NN", "ℕ", "\\mathbb{N}"),
-		mmMakeParseConst("NN0", "ℕ₀", "\\mathbb{N}_0"),
-		mmMakeParseConst("ZZ", "ℤ", "\\mathbb{Z}"),
-		mmMakeParseConst("QQ", "ℚ", "\\mathbb{Q}"),
-		mmMakeParseConst("RR+", "ℝ⁺", "\\mathbb{R}^+"),
-		mmMakeParseConst("sqr", "√", "\\surd"),
-		mmMakeParseConst("Re", "ℜ", "\\Re"),
-		mmMakeParseConst("Im", "ℑ", "\\Im"),
-		mmMakeParseConst("|_", "⌊", "\\lfloor"),
-		mmMakeParseConst("==", "≡", "\\equiv"),
-		mmMakeParseConst("seq1", "seq₁", "\\rm{seq}_1"),
-		mmMakeParseConst("ZZ>=", "ℤ≥", "\\mathbb{Z}_\\ge"),
-		mmMakeParseConst("seq0", "seq₀", "\\rm{seq}_0"),
-		mmMakeParseConst("^", "↑", "\\uparrow"),
-		mmMakeParseConst("~~>", "⇝", "\\rightsquigarrow"),
-		mmMakeParseConst("...", "...", "\\ldots"),
-		mmMakeParseConst("sum_", "∑", "\\sigma"),
-		mmMakeParseConst("_e", "ℇ", "\\rm{e}"),
-		mmMakeParseConst("pi", "π", "\\pi"),
-		mmMakeParseConst("-cn->", "‒cn→", "\\longrightarrow_{\\rm{cn}}"),
-		mmMakeParseConst("~~>m", "⇝m", "\\rightsquigarrow_{\\rm{m}}"),
-		mmMakeParseConst("Id", "Id", "\\rm{Id}"),
-		mmMakeParseConst("^d", "↑g", "\\uparrow_g"),
-		mmMakeParseConst(".s", "∙s", "\\cdot_s"),
-		mmMakeParseConst(".i", "∙i", "\\cdot_i"),
-		mmMakeParseConst("~~>v", "⇝v", "\\rightsquigarrow_{\\rm{v}}"),
-		mmMakeParseConst("_|_", "⊥", "\\perp"),
-		mmMakeParseConst("vH", "vH", "\\vee_\\mathfrak{H}"),
-		mmMakeParseConst("\\/H", "\\/H", "\\bigvee_\\mathfrak{H}"),
-		mmMakeParseConst("<_op", "≤op", "\\le_{\\rm{op}}"),
-		mmMakeParseConst("Lambda", "Λ", "\\Lambda"),
-		mmMakeParseConst("<o", "⋖", "\\lessdot"),
-		mmMakeParseConst("1stc", "1stω", "1^{\\rm{st}}\\omega"),
-		mmMakeParseConst("2ndc", "2ndω", "2^{\\rm{nd}}\\omega"),
-		mmMakeParseConst("prod_", "∏", "\\Pi"),
-		mmMakeParseConst("(+)", "⊕", "\\oplus"),
-		mmMakeParseConst("~~>t", "⇝t", "\\rightsquigarrow_{\\rm{t}}"),
-		mmMakeParseConst("=~ph", "=~φ", "\\mbox{$=$\\~{}ph}"),
-		mmMakeParseConst("->..", "⇒", "\\Longrightarrow"),
-	], \c -> c.ascii);
-}
