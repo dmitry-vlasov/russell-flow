@@ -4,7 +4,7 @@ import mm/proof_tree;
 import comm;
 
 export {
-	mmSourcesExtractVars(sources : Tree<int, MmSource>, env : RuEnv) -> Tree<int, MmParseSource>;
+	mmSourcesExtractVars(sources : Tree<int, MmSource>, env : RuEnv) -> Tree<int, MmSource>;
 	mmCommExtractVars : RuComm;
 }
 
@@ -16,44 +16,104 @@ mmCommExtractVars = RuComm(
 		state = unit.state;
 		sources = state.mm;
 		conf = state.conf;
-		Some(state);
+		extracted = mmSourcesExtractVars(sources, env);
+		Some(RuState(state with mm = extracted));
 	}
 );
 
-MmVarsPermutation(
-	inds : [int]
-);
-
-mmSourcesExtractVars(sources : Tree<int, MmSource>, env : RuEnv) -> Tree<int, MmParseSource> {
+mmSourcesExtractVars(sources : Tree<int, MmSource>, env : RuEnv) -> Tree<int, MmSource> {
 	assertions = mmAssertions(sources);
-	all_vars = mmAllVars(sources);
-	vars_map = foldi(all_vars, makeTree(), \i, acc, var ->
+	vars = mmAllVars(sources);
+	vars_map = foldi(vars, makeTree(), \i, acc, var ->
 		setTree(acc, var.label, i)
 	);
-	permutations = map(assertions, \ass -> {
+	perms = mmMakeVarsPermutations(assertions, vars_map, env);
+	env.out.onMessage("mm vars:\n" +
+		concatStrings(map(vars, \v -> "\t" + id2s(v.var) + " : " + id2s(v.type) + "\n"))
+	);
+	structs = mmSources2structs(sources);
+	permuted = mapTree(sources, \src -> 
+		mmApplyPermutation2Source(src, perms, structs, env)
+	);
+	mmAddVars(vars, permuted, env);
+}
+
+mmMakeVarsPermutations(assertions : [MmAssertion], vars_map : Tree<int, int>, env : RuEnv) -> Tree<int, [int]> {
+	fold(assertions, makeTree(), \acc, ass -> {
 		all_hyps = concat(ass.hyps, ass.inner);
 		flows = mmAssertionFlos(all_hyps);
-		fold(all_hyps, Pair([], 0), \acc, hyp -> {
+		pair = fold(all_hyps, Pair([], 0), \ac, hyp -> {
 			switch (hyp) {
 				MmFloating(lab, type, var): {
 					Pair(
-						concat(acc.first, [lookupTreeDef(vars_map, var, -1)]),
-						acc.second
+						concat(ac.first, [lookupTreeDef(vars_map, var, -1)]),
+						ac.second
 					);
 				}
 				MmEssential(__, __): {
 					Pair(
-						concat(acc.first, [acc.second + length(flows)]),
-						acc.second + 1
+						concat(ac.first, [ac.second + length(flows)]),
+						ac.second + 1
 					);
 				}
 			}
-		})
+		});
+		setTree(acc, ass.stat.label, pair.first);
 	});
-	env.out.onMessage("mm vars:\n" +
-		concatStrings(map(all_vars, \v -> "\t" + id2s(v.var) + " : " + id2s(v.type) + "\n"))
+}
+
+mmApplyPermutation2Source(src : MmSource, perms : Tree<int, [int]>, structs : MmStructs, env : RuEnv) -> MmSource {
+	MmSource(src with 
+		decls = map(src.decls, \decl ->
+			switch (decl) {
+				MmAssertion(__,__,__,__): 
+					mmApplyPermutation2Assertion(decl, perms, structs, env);
+				default: 
+					decl;
+			}
+		)
 	);
-	makeTree();
+}
+
+
+mmApplyPermutation2Assertion(ass : MmAssertion, perms : Tree<int, [int]>, structs : MmStructs, env : RuEnv) -> MmAssertion {
+	MmAssertion(ass with
+		hyps = mmAssertionHyps(ass.hyps),
+		stat = switch (ass.stat) {
+			MmAxiomatic(__,__): ass.stat;
+			MmProvable(__,__,proof): {
+				switch (proof) {
+					MmNormalProof(labs): {
+						switch (mmTheorem2MmProofTree(ass, ass.stat, structs, env)) {
+							Some(proof_tree): {
+								permuted_tree = mmApplyPermutation2ProofTree(proof_tree, perms, env);
+								permuted_labs = mmProofTree2NormalProof(permuted_tree, env);
+								MmProvable(ass.stat with proof = MmNormalProof(permuted_labs));
+							}
+							None(): {
+								env.out.onError("Couldn't transform an RPN proof to tree", []);
+								ass.stat;
+							}
+						}
+					}
+					MmCompressedProof(__,__): {
+						env.out.onError("Compressed proofs are not allowed at applying a permutations to assertion hyps", []);
+						ass.stat;
+					}
+				}
+			}
+		}
+	);
+}
+
+mmApplyPermutation2ProofTree(proof : MmProofTree, perms : Tree<int, [int]>, env : RuEnv) -> MmProofTree {
+	switch (proof) {
+		MmProofTreeHyp(h): proof;
+		MmProofTreeStep(lab, hyps): {
+			perm = lookupTreeDef(perms, lab, []);
+			MmProofTreeStep(lab, mapi(hyps, \i,__ -> hyps[perm[i]]));
+		}
+	}
 }
 
 mmAddVars(vars : [MmFloating], sources : Tree<int, MmSource>, env : RuEnv) -> Tree<int, MmSource> {
