@@ -1,4 +1,5 @@
 import base/path;
+import base/permute;
 import mm/src;
 import mm/proof_tree;
 import comm;
@@ -9,29 +10,35 @@ export {
 }
 
 mmCommExtractVars = RuComm(
-	RuCommInfo("extract-vars-mm", "misc", "extract common vars", "", false, false, [], []),
+	RuCommInfo("mm-extract-vars", "misc", "extract common vars", "", false, false, [], []),
 	\unit -> {
 		env = ruUnitEnv(unit);
 		task = unit.task;
 		state = unit.state;
 		sources = state.mm;
 		conf = state.conf;
+		timer = ruMakeTimer();
 		extracted = mmSourcesExtractVars(sources, env);
-		Some(RuState(state with mm = extracted));
+		if (ruVerbose(conf) > 0) {
+			env.out.onMessage("mm vars are extracted in " + ruTimePassed2s(timer));
+		}
+		Some(RuState(state with 
+			mm = extracted,
+			vars = setTree(state.vars, 
+				"mm-extract-vars.time", ValDouble(ruTimePassed(timer))
+			)
+		));
 	}
 );
 
 mmSourcesExtractVars(sources : Tree<int, MmSource>, env : RuEnv) -> Tree<int, MmSource> {
 	assertions = mmAssertions(sources);
 	vars = mmAllVars(sources);
-	vars_map = foldi(vars, makeTree(), \i, acc, var ->
-		setTree(acc, var.label, i)
+	vars_map = foldi(vars, makeTree(), \i, acc, v ->
+		setTree(acc, v.var, i)
 	);
 	perms = mmMakeVarsPermutations(assertions, vars_map, env);
-	env.out.onMessage("mm vars:\n" +
-		concatStrings(map(vars, \v -> "\t" + id2s(v.var) + " : " + id2s(v.type) + "\n"))
-	);
-	structs = mmSources2structs(sources);
+	structs = MmStructs(mmSources2structs(sources) with vars = vars);
 	permuted = mapTree(sources, \src -> 
 		mmApplyPermutation2Source(src, perms, structs, env)
 	);
@@ -40,25 +47,29 @@ mmSourcesExtractVars(sources : Tree<int, MmSource>, env : RuEnv) -> Tree<int, Mm
 
 mmMakeVarsPermutations(assertions : [MmAssertion], vars_map : Tree<int, int>, env : RuEnv) -> Tree<int, [int]> {
 	fold(assertions, makeTree(), \acc, ass -> {
-		all_hyps = concat(ass.hyps, ass.inner);
-		flows = mmAssertionFlos(all_hyps);
-		pair = fold(all_hyps, Pair([], 0), \ac, hyp -> {
+		flows = mmAssertionFlos(ass.hyps);
+		flows_inds = map(flows, \flo -> lookupTreeDef(vars_map, flo.var, -1));
+		inds_ordered = sort(flows_inds);
+		flows_perm = map(flows_inds, \ind -> elemIndex(inds_ordered, ind, -1));
+		perm = fold(ass.hyps, Triple([], 0, 0), \ac, hyp -> {
 			switch (hyp) {
 				MmFloating(lab, type, var): {
-					Pair(
-						concat(ac.first, [lookupTreeDef(vars_map, var, -1)]),
-						ac.second
+					Triple(
+						concat(ac.first, [flows_perm[ac.third]]),
+						ac.second,
+						ac.third + 1
 					);
 				}
 				MmEssential(__, __): {
-					Pair(
+					Triple(
 						concat(ac.first, [ac.second + length(flows)]),
-						ac.second + 1
+						ac.second + 1,
+						ac.third
 					);
 				}
 			}
-		});
-		setTree(acc, ass.stat.label, pair.first);
+		}).first;
+		setTree(acc, ass.stat.label, ruReversePermutation(perm, env));
 	});
 }
 
@@ -66,7 +77,7 @@ mmApplyPermutation2Source(src : MmSource, perms : Tree<int, [int]>, structs : Mm
 	MmSource(src with 
 		decls = map(src.decls, \decl ->
 			switch (decl) {
-				MmAssertion(__,__,__,__): 
+				MmAssertion(__,__,__,__,__): 
 					mmApplyPermutation2Assertion(decl, perms, structs, env);
 				default: 
 					decl;
@@ -75,10 +86,22 @@ mmApplyPermutation2Source(src : MmSource, perms : Tree<int, [int]>, structs : Mm
 	);
 }
 
-
 mmApplyPermutation2Assertion(ass : MmAssertion, perms : Tree<int, [int]>, structs : MmStructs, env : RuEnv) -> MmAssertion {
+	vars = mmAssertionFlos(ass.hyps);
+	all_vars = mmAssertionFlos(concat(ass.hyps, ass.inner));
+	vars_map = fold(all_vars, makeTree(), \acc, v -> 
+		setTree(acc, v.label, mmMakeFloatingTypedLabel(v))
+	);
+	rename_vars = \hyps : [MmHyp] -> map(hyps,
+		\hyp -> switch (hyp) {
+			MmFloating(lab, type, var): MmFloating(hyp with label = lookupTreeDef(vars_map, lab, lab));
+			default: hyp;
+		}
+	);
 	MmAssertion(ass with
-		hyps = mmAssertionHyps(ass.hyps),
+		outer = true,
+		hyps = rename_vars(ruPermute(ass.hyps, lookupTreeDef(perms, ass.stat.label, []))),
+		inner = rename_vars(ass.inner),
 		stat = switch (ass.stat) {
 			MmAxiomatic(__,__): ass.stat;
 			MmProvable(__,__,proof): {
@@ -88,7 +111,8 @@ mmApplyPermutation2Assertion(ass : MmAssertion, perms : Tree<int, [int]>, struct
 							Some(proof_tree): {
 								permuted_tree = mmApplyPermutation2ProofTree(proof_tree, perms, env);
 								permuted_labs = mmProofTree2NormalProof(permuted_tree, env);
-								MmProvable(ass.stat with proof = MmNormalProof(permuted_labs));
+								renamed_labs = map(permuted_labs, \lab -> lookupTreeDef(vars_map, lab, lab));
+								MmProvable(ass.stat with proof = MmNormalProof(renamed_labs));
 							}
 							None(): {
 								env.out.onError("Couldn't transform an RPN proof to tree", []);
@@ -109,9 +133,10 @@ mmApplyPermutation2Assertion(ass : MmAssertion, perms : Tree<int, [int]>, struct
 mmApplyPermutation2ProofTree(proof : MmProofTree, perms : Tree<int, [int]>, env : RuEnv) -> MmProofTree {
 	switch (proof) {
 		MmProofTreeHyp(h): proof;
-		MmProofTreeStep(lab, hyps): {
+		MmProofTreeStep(lab, hyps0): {
+			hyps = map(hyps0, \hyp -> mmApplyPermutation2ProofTree(hyp, perms, env));
 			perm = lookupTreeDef(perms, lab, []);
-			MmProofTreeStep(lab, mapi(hyps, \i,__ -> hyps[perm[i]]));
+			MmProofTreeStep(lab, ruPermute(hyps, perm));
 		}
 	}
 }
@@ -122,20 +147,43 @@ mmAddVars(vars : [MmFloating], sources : Tree<int, MmSource>, env : RuEnv) -> Tr
 	path = common_dir + "vars.mm";
 	module = ruTrimPath(path, env.conf, ".mm");
 	module_id = s2id(module);
-	vars_src = MmSource(
-		[], 
-		vars, 
+
+	types = fold(vars, makeSet(), \acc, v -> insertSet(acc, v.type));
+	type_consts_removed = mapTree(sources, \src ->
+		MmSource(src with 
+			decls = filtermap(src.decls, \decl -> 
+				switch (decl) {
+					MmConst(symbs): {
+						filtered = filter(symbs, \s -> !containsSet(types, s));
+						if (filtered == []) None() else Some(MmConst(filtered));
+					}
+					default: Some(decl);
+				}
+			)
+		)
+	);
+
+	vars_src = MmSource([], 
+		concat([
+			MmComment("Types (non-terminals) used in grammar"), 
+			MmConst(set2array(types)),
+			MmComment("$f - statements for all variables, used in source"), 
+		], vars), 
 		RuFileInfo(module_id, module, path, 0.0, ruIdsVersion())
 	);
-	fold(leaf_srcs, setTree(sources, module_id, vars_src), \acc, src ->
+	fold(leaf_srcs, setTree(type_consts_removed, module_id, vars_src), \acc, src ->
 		setTree(acc, src.info.id, 
 			MmSource([MmImport(module_id)], src.decls, src.info)
 		)
 	);
 }
 
+mmMakeFloatingTypedLabel(f : MmFloating) -> int {
+	s2id(id2s(f.type) + "_" + ruMakeValidMmId(id2s(f.var)));
+}
+
 mmAllVars(sources : Tree<int, MmSource>) -> [MmFloating] {
-	strip_name = \hyp -> MmFloating(hyp with label = hyp.var);
+	strip_name = \hyp -> MmFloating(hyp with label = mmMakeFloatingTypedLabel(hyp));
 	filter_floatings = \hyps -> {
 		filtermap(hyps, \hyp -> 
 			switch (hyp) {
@@ -147,11 +195,8 @@ mmAllVars(sources : Tree<int, MmSource>) -> [MmFloating] {
 	all_vars = foldTree(sources, makeSet(), \__,src, acc ->
 		fold(src.decls, acc, \ac, decl -> 
 			switch (decl) {
-				MmAssertion(__,hyps, inner,__): {
-					fold(filter_floatings(inner),
-						fold(filter_floatings(hyps), ac, \a, hyp -> 
-							insertSet(a, strip_name(hyp))
-						),
+				MmAssertion(__,__, hyps, inner,__): {
+					fold(filter_floatings(concat(hyps, inner)), ac,
 						\a, hyp -> insertSet(a, strip_name(hyp))
 					)
 				}
