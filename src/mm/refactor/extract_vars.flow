@@ -5,12 +5,15 @@ import mm/proof_tree;
 import comm;
 
 export {
-	mmSourcesExtractVars(sources : Tree<int, MmSource>, env : RuEnv) -> Tree<int, MmSource>;
+	mmSourcesExtractVars(sources : Tree<int, MmSource>, shorten_vars : bool, env : RuEnv) -> Tree<int, MmSource>;
 	mmCommExtractVars : RuComm;
 }
 
 mmCommExtractVars = RuComm(
-	RuCommInfo("mm-extract-vars", "misc", "extract common vars", "", false, false, [], []),
+	RuCommInfo(
+		"mm-extract-vars", "misc", "extract common vars", "", false, false, 
+		[RuCommArg("shorten-vars", true, "set to 0 in order to keep vars name in the form <type>_<name>, otherwise vars names will be shortened", "1")], []
+	),
 	\unit -> {
 		env = ruUnitEnv(unit);
 		task = unit.task;
@@ -18,7 +21,8 @@ mmCommExtractVars = RuComm(
 		sources = state.mm;
 		conf = state.conf;
 		timer = ruMakeTimer();
-		extracted = mmSourcesExtractVars(sources, env);
+		shorten_vars = lookupTreeDef(task.args, "shorten-vars", "1") == "1";
+		extracted = mmSourcesExtractVars(sources, shorten_vars, env);
 		if (ruVerbose(conf) > 0) {
 			env.out.onMessage("mm vars are extracted in " + ruTimePassed2s(timer));
 		}
@@ -31,18 +35,23 @@ mmCommExtractVars = RuComm(
 	}
 );
 
-mmSourcesExtractVars(sources : Tree<int, MmSource>, env : RuEnv) -> Tree<int, MmSource> {
+mmSourcesExtractVars(sources : Tree<int, MmSource>, shorten_vars : bool, env : RuEnv) -> Tree<int, MmSource> {
+	decls = mmSources2structs(sources);
 	assertions = mmAssertions(sources);
 	vars = mmAllVars(sources);
-	vars_map = foldi(vars, makeTree(), \i, acc, v ->
+	vars_labels = if (shorten_vars) mmVarTypeShortLabels(vars, assertions, decls.consts) else {
+		fold(vars, makeTree(), \acc, v -> setTree(acc, v.label, v.label));
+	}
+	relabeled_vars = map(vars, \v -> MmFloating(v with label = lookupTreeDef(vars_labels, v.label, -1)));
+	vars_map = foldi(relabeled_vars, makeTree(), \i, acc, v ->
 		setTree(acc, v.var, i)
 	);
 	perms = mmMakeVarsPermutations(assertions, vars_map, env);
-	structs = MmStructs(mmSources2structs(sources) with vars = vars);
+	structs = MmStructs(mmSources2structs(sources) with vars = relabeled_vars);
 	permuted = mapTree(sources, \src -> 
-		mmApplyPermutation2Source(src, perms, structs, env)
+		mmApplyPermutation2Source(src, perms, structs, vars_labels, env)
 	);
-	mmAddVars(vars, permuted, env);
+	mmAddVars(relabeled_vars, permuted, env);
 }
 
 mmMakeVarsPermutations(assertions : [MmAssertion], vars_map : Tree<int, int>, env : RuEnv) -> Tree<int, [int]> {
@@ -73,12 +82,12 @@ mmMakeVarsPermutations(assertions : [MmAssertion], vars_map : Tree<int, int>, en
 	});
 }
 
-mmApplyPermutation2Source(src : MmSource, perms : Tree<int, [int]>, structs : MmStructs, env : RuEnv) -> MmSource {
+mmApplyPermutation2Source(src : MmSource, perms : Tree<int, [int]>, structs : MmStructs, relabling : Tree<int, int>, env : RuEnv) -> MmSource {
 	MmSource(src with 
 		decls = map(src.decls, \decl ->
 			switch (decl) {
 				MmAssertion(__,__,__,__,__): 
-					mmApplyPermutation2Assertion(decl, perms, structs, env);
+					mmApplyPermutation2Assertion(decl, perms, structs, relabling, env);
 				default: 
 					decl;
 			}
@@ -86,11 +95,11 @@ mmApplyPermutation2Source(src : MmSource, perms : Tree<int, [int]>, structs : Mm
 	);
 }
 
-mmApplyPermutation2Assertion(ass : MmAssertion, perms : Tree<int, [int]>, structs : MmStructs, env : RuEnv) -> MmAssertion {
+mmApplyPermutation2Assertion(ass : MmAssertion, perms : Tree<int, [int]>, structs : MmStructs, relabling : Tree<int, int>, env : RuEnv) -> MmAssertion {
 	vars = mmAssertionFlos(ass.hyps);
 	all_vars = mmAssertionFlos(concat(ass.hyps, ass.inner));
 	vars_map = fold(all_vars, makeTree(), \acc, v -> 
-		setTree(acc, v.label, mmMakeFloatingTypedLabel(v))
+		setTree(acc, v.label, lookupTreeDef(relabling, mmMakeFloatingTypedLabel(v), -1))
 	);
 	rename_vars = \hyps : [MmHyp] -> map(hyps,
 		\hyp -> switch (hyp) {
@@ -178,26 +187,18 @@ mmAddVars(vars : [MmFloating], sources : Tree<int, MmSource>, env : RuEnv) -> Tr
 	);
 }
 
-mmMakeFloatingTypedLabel(f : MmFloating) -> int {
+mmMakeFloatingTypedLabel(f : MmFloating, ) -> int {
 	s2id(id2s(f.type) + "_" + ruMakeValidMmId(id2s(f.var)));
 }
 
 mmAllVars(sources : Tree<int, MmSource>) -> [MmFloating] {
 	strip_name = \hyp -> MmFloating(hyp with label = mmMakeFloatingTypedLabel(hyp));
-	filter_floatings = \hyps -> {
-		filtermap(hyps, \hyp -> 
-			switch (hyp) {
-				MmFloating(__,__,__): Some(hyp);
-				default: None();
-			}
-		)
-	}
 	all_vars = foldTree(sources, makeSet(), \__,src, acc ->
 		fold(src.decls, acc, \ac, decl -> 
 			switch (decl) {
 				MmAssertion(__,__, hyps, inner,__): {
-					fold(filter_floatings(concat(hyps, inner)), ac,
-						\a, hyp -> insertSet(a, strip_name(hyp))
+					fold(mmAssertionFlos(concat(hyps, inner)), ac, \a, hyp -> 
+						insertSet(a, MmFloating(hyp with label = mmMakeFloatingTypedLabel(hyp)))
 					)
 				}
 				default: ac;
@@ -205,4 +206,41 @@ mmAllVars(sources : Tree<int, MmSource>) -> [MmFloating] {
 		)
 	);
 	sortCustom(set2array(all_vars), \v -> id2s(v.label), true);
+}
+
+mmVarTypeShortLabels(vars : [MmFloating], assertions : [MmAssertion], consts : Set<int>) -> Tree<int, int> {
+	labels = mergeSets(fold(assertions, makeSet(), \acc, ass -> insertSet(acc, ass.stat.label)), consts);
+	types = set2array(fold(vars, makeSet(), \acc, v -> insertSet(acc, v.type)));
+	mmFindVarTypeShortLabels(types, vars, labels, 1);
+}
+
+mmFindVarTypeShortLabels(types : [int], vars : [MmFloating], labels : Set<int>, i : int) -> Tree<int, int> {
+	max_type_len = fold(types, 0, \acc, tp -> max(acc, strlen(id2s(tp))));
+	if (i > max_type_len) {
+		ruCrash("var names collision: some type has a variale with the same name and different labels. Must not happen");
+		makeTree();
+	} else {
+		relabling = mmMakeVarTypeShortLabels(types, vars, i);
+		if (!mmVarTypeShortLabelsHaveCollision(relabling, vars, labels)) relabling else {
+			println("relabling:\n" + 
+				concatStrings(map(tree2pairs(relabling), \p -> "\t" + id2s(p.first) + " --> " + id2s(p.second) + "\n"))
+			);
+			mmFindVarTypeShortLabels(types, vars, labels, i + 1);
+		}
+	}
+}
+
+mmVarTypeShortLabelsHaveCollision(relabling : Tree<int, int>, vars : [MmFloating], labels : Set<int>) -> bool {
+	vars_collision = sizeSet(buildSet(getTreeValues(relabling))) < length(vars);
+	labels_collision = exists(getTreeValues(relabling), \lab -> containsSet(labels, lab));
+	vars_collision || labels_collision;
+}
+
+mmMakeVarTypeShortLabels(types : [int], vars : [MmFloating], i : int) -> Tree<int, int> {
+	prefixes = fold(types, makeTree(), \acc, tp -> 
+		setTree(acc, tp, strLeft(id2s(tp), i))
+	);
+	fold(vars, makeTree(), \acc, v ->
+		setTree(acc, v.label, s2id(lookupTreeDef(prefixes, v.type, "") + ruMakeValidMmId(id2s(v.var))))
+	);
 }
