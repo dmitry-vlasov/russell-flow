@@ -25,7 +25,8 @@ export class MathProvider {
 	}
 
 	public update(data : MathEntity[]): void {
-		this.providers.forEach(provider => provider.update(data));
+		const sorted = data.sort((a: MathEntity, b: MathEntity) => a.name.localeCompare(b.name));
+		this.providers.forEach(provider => provider.update(sorted));
 	}
 }
 
