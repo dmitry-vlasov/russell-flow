@@ -32,7 +32,7 @@ export function activate(context: vscode.ExtensionContext) {
 		reg_comm('russell.generalizeTheorem', () => processRussellTheorem("generalize")),
 		reg_comm('russell.startHttpServer', startHttpServer),
 		reg_comm('russell.stopHttpServer', stopHttpServer),
-		reg_comm('russell.restartLspServer', restartLspServer),
+		reg_comm('russell.restartLspServer', startLspClient),
 		reg_comm('russell.toggleHttpServer', toggleHttpServer),
 		reg_comm('russell.findSymbol', findSymbol),
 		reg_comm('russell.execCommand', execCommand),
@@ -41,17 +41,14 @@ export function activate(context: vscode.ExtensionContext) {
 	);
 
 	russellChannel = vscode.window.createOutputChannel("Russell output");
-	serverChannel = vscode.window.createOutputChannel("Russell server");
-	russellChannel.show(true);
-	setInterval(checkHttpServerStatus, 3000, false);
-	serverStatusBarItem.show();
+	//serverChannel = vscode.window.createOutputChannel("Russell server");
+	//russellChannel.show(true);
 
-	// launch russell server at startup
-	if (vscode.workspace.getConfiguration("russell").get("autostartHttpServer")) {
-		initHttpServer();
-	} else {
-		startLspServer();
-	}
+	checkHttpServerStatus(true);
+	setInterval(checkHttpServerStatus, 3000, false);
+
+	startLspClient();
+	serverStatusBarItem.show();
 }
 
 function mathInfo(): void {
@@ -99,7 +96,17 @@ function findSymbol() {
 	});
 }
 
-function startLspServer() {
+function stopLspClient() {
+	if (client) {
+		client.sendNotification("exit");
+		client.stop();
+	}
+	client = null;
+}
+
+function startLspClient() {
+	stopLspClient();
+	serverStatusBarItem.show();
 	// If the extension is launched in debug mode then the debug server options are used
 	// Otherwise the run options are used
 	let serverOptions: ServerOptions = {
@@ -138,35 +145,8 @@ function startLspServer() {
 		}
 	);
 }
-
-function restartLspServer() {
-	if (client) {
-        client.stop().then(
-			startLspServer,
-			(reason) => { vscode.window.showInformationMessage(`Restart of LSP server failed: ${reason}.`) }
-		);
-	} else {
-		startLspServer();
-	}
-}
-
-function initHttpServer() {
-	const port = vscode.workspace.getConfiguration("russell").get("portOfHttpServer");
-	isPortReachable(port, {host: 'localhost'}).then(
-		(reacheable : boolean) => {
-			if (reacheable) {
-				outputHttpServerMemStats();
-				httpServerOnline = true;
-			} else {
-				showHttpServerIsLaunching();
-				startHttpServer();
-			}
-			startLspServer();
-		}
-	);
-}
-
-function checkHttpServerStatus() {
+/*
+function initHttpServer(initial: boolean) {
 	const port = vscode.workspace.getConfiguration("russell").get("portOfHttpServer");
 	isPortReachable(port, {host: 'localhost'}).then(
 		(reacheable : boolean) => {
@@ -177,6 +157,36 @@ function checkHttpServerStatus() {
 				httpServer = null;
 				httpServerOnline = false;
 				showHttpServerOffline();
+				if (initial) {
+					// launch russell server at startup
+					let autostart = vscode.workspace.getConfiguration("russell").get("autostartHttpServer");
+					if (autostart) {
+						startHttpServer();
+					}
+				}
+			}
+		}
+	);
+}*/
+
+function checkHttpServerStatus(initial: boolean) {
+	const port = vscode.workspace.getConfiguration("russell").get("portOfHttpServer");
+	isPortReachable(port, {host: 'localhost'}).then(
+		(reacheable : boolean) => {
+			if (reacheable) {
+				outputHttpServerMemStats();
+				httpServerOnline = true;
+			} else {
+				httpServer = null;
+				httpServerOnline = false;
+				showHttpServerOffline();
+				if (initial) {
+					// launch russell server at startup
+					let autostart = vscode.workspace.getConfiguration("russell").get("autostartHttpServer");
+					if (autostart) {
+						startHttpServer();
+					}
+				}
 			}
 		}
 	);
@@ -209,7 +219,15 @@ function toggleHttpServer() {
 
 function startHttpServer() {
     if (!httpServerOnline) {
-		httpServer = tools.launchHttpServer(showHttpServerOnline, showHttpServerOffline, serverChannel);
+		if (!serverChannel) {
+			serverChannel = vscode.window.createOutputChannel("Flow server");
+			serverChannel.show();
+		}
+		httpServer = tools.launchHttpServer(
+			showHttpServerIsLaunching, 
+			showHttpServerOffline, 
+			serverChannel
+		);
 		httpServerOnline = true;
     }
 }
