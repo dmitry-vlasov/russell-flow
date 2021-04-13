@@ -1,22 +1,221 @@
 import comm;
+import ru/util/assertions;
 
 export {
 	ruCommComplexityStats : RuComm;
 }
 
 ruCommComplexityStats = RuComm(
-	RuCommInfo("stats-theorem-complexity", "stats", "gather statistics about theorem complexity", "", false, false, [], []),
+	RuCommInfo(
+		"stats-theorem-complexity", "stats", "gather statistics about theorem complexity", "output", false, false, 
+		[RuCommArg("output", false, "output file for CSV statistics data", "")], []
+	),
 	\unit -> {
 		env = ruUnitEnv(unit);
 		state = unit.state;
 		timer = ruMakeTimer();
+		conf = env.conf;
+		out = env.out;
 		math = ruMathFromSources(state.ru, env);
+		output =  lookupTreeDef(unit.task.args, "output", "");
+
+		ordered = ruAssertionsOrder(math.decls.assertions);
+		if (ruVerbose(conf) > 1) {
+			out.onMessage("ru assertion complexity statistics: ordering is done in " + ruTimePassed2s(timer));
+		}
+		sizes_timer = ruMakeTimer();
+		sizes = ruAssertionProofCumulativeSize(ordered);
+		if (ruVerbose(conf) > 1) {
+			out.onMessage("ru assertion complexity statistics: cumulative proof sizes is done in " + ruTimePassed2s(sizes_timer));
+		}
+		depths_timer = ruMakeTimer();
+		depths = ruAssertionProofCumulativeDepth(ordered);
+		if (ruVerbose(conf) > 1) {
+			out.onMessage("ru assertion complexity statistics: cumulative depths is done in " + ruTimePassed2s(depths_timer));
+		}
+		uses_timer = ruMakeTimer();
+		uses = ruAssertionsUses(math.decls.assertions);
+		if (ruVerbose(conf) > 1) {
+			out.onMessage("ru assertion complexity statistics: uses is done in " + ruTimePassed2s(uses_timer));
+		}
+		axioms_timer = ruMakeTimer();
+		axioms = ruAssertionCumulativeAxioms(ordered);
+		if (ruVerbose(conf) > 1) {
+			out.onMessage("ru assertion complexity statistics: axioms is done in " + ruTimePassed2s(axioms_timer));
+		}
+		defs_timer = ruMakeTimer();
+		defs = ruAssertionCumulativeDefs(ordered);
+		if (ruVerbose(conf) > 1) {
+			out.onMessage("ru assertion complexity statistics: defs is done in " + ruTimePassed2s(defs_timer));
+		}
+		raw_stats = ruComplexityStats(ordered, sizes, depths, uses, axioms, defs);
+		stats_str = ruCommpexityStats2s(raw_stats);
+
+		ruTopTen(raw_stats, 
+			\data -> data.cumulativeProofSize * i2d(sizeSet(data.isUsedBy)), 
+			"powerful", out
+		);
+		ruTopTen(raw_stats, 
+			\data -> i2d(ruAssertionProofSize(data.assertion)) * i2d(sizeSet(data.isUsedBy)), 
+			"mighty", out
+		);
+		
+		if (!setFileContent(output, stats_str)) {
+			out.onError("failed to write statistics data to '" + output + "'", []);
+		}
+		if (ruVerbose(conf) > 0) {
+			out.onMessage("ru assertion complexity statistics is done in " + ruTimePassed2s(timer));
+		}
+
 		Some(RuState(state with 
 			ru = state.ru,
-			vars = setTree(setTree(state.vars, 
-				"extract-constants.time", ValDouble(ruTimePassed(timer))), 
-				"extract-constants.size", ValInt(sizeTree(math.decls.lang.consts))
-			)
+			vars = setTree(state.vars, 
+				"stats-theorem-complexity.time", ValDouble(ruTimePassed(timer))
+			),
 		));
 	}
 );
+
+ruTopTen(stats : [RuComplexityData], func : (RuComplexityData) -> double, msg : string, out : RuOut) -> void {
+	cplx = map(stats, \data -> Pair(data.assertion.info.id, func(data)));
+	cplx_sorted = sortCustom(cplx, \p -> p.second, false);
+	out.onMessage("top 10 of most " + msg + " theorems:\n" + 
+		concatStrings(map(take(cplx_sorted, 10), \p -> "\t" + id2s(p.first) + " : " + d2s(p.second) + "\n"))
+	);
+}
+
+ruAssertionProofCumulativeSize(as : [RuAssertion]) -> Tree<int, double> {
+	fold(as, makeTree(), \acc, a -> 
+		switch (a) {
+			RuTheorem(__,__,__,proof): 
+				setTree(acc, a.info.id, ruProofCumulativeSize(proof, acc))
+			default: 
+				setTree(acc, a.info.id, 0.0);
+		}
+	);
+}
+
+ruProofCumulativeSize(proof : RuProof, sizes : Tree<int, double>) -> double {
+	fold(proof.steps, 0.0, \ac, step ->
+		if (step.assertion == ruStepLemma) {
+			ac + ruProofCumulativeSize(step.proof, sizes);
+		} else if (step.assertion == ruStepProblem) {
+			ac;
+		} else {
+			ac + lookupTreeDef(sizes, step.assertion, 0.0) + 1.0
+		}
+	);
+}
+
+ruAssertionProofCumulativeDepth(as : [RuAssertion]) -> Tree<int, int> {
+	fold(as, makeTree(), \acc, a -> 
+		switch (a) {
+			RuTheorem(__,__,__,proof): 
+				setTree(acc, a.info.id, ruProofCumulativeDepth(proof, acc))
+			default: 
+				setTree(acc, a.info.id, 0);
+		}
+	);
+}
+
+ruProofCumulativeDepth(proof : RuProof, depths : Tree<int, int>) -> int {
+	fold(proof.steps, 0, \ac, step ->
+		if (step.assertion == ruStepLemma) {
+			max(ac, ruProofCumulativeDepth(step.proof, depths));
+		} else if (step.assertion == ruStepProblem) {
+			ac;
+		} else {
+			max(ac, lookupTreeDef(depths, step.assertion, 0) + 1)
+		}
+	);
+}
+
+ruAssertionCumulativeAxioms(as : [RuAssertion]) -> Tree<int, Set<int>> {
+	fold(as, makeTree(), \acc, a -> 
+		switch (a) {
+			RuTheorem(__,__,__,proof): 
+				setTree(acc, a.info.id, ruCumulativeAxioms(proof, acc))
+			RuAxiom(__,__):
+				setTree(acc, a.info.id, makeSet1(a.info.id));
+			RuDef(__,__,__,__):
+				setTree(acc, a.info.id, makeSet());
+		}
+	);
+}
+
+ruCumulativeAxioms(proof : RuProof, axs : Tree<int, Set<int>>) -> Set<int> {
+	fold(proof.steps, makeSet(), \ac, step ->
+		if (step.assertion == ruStepLemma) {
+			mergeSets(ac, ruCumulativeAxioms(step.proof, axs));
+		} else if (step.assertion == ruStepProblem) {
+			ac;
+		} else {
+			mergeSets(ac, lookupTreeDef(axs, step.assertion, makeSet()));
+		}
+	);
+}
+
+ruAssertionCumulativeDefs(as : [RuAssertion]) -> Tree<int, Set<int>> {
+	fold(as, makeTree(), \acc, a -> 
+		switch (a) {
+			RuTheorem(__,__,__,proof): 
+				setTree(acc, a.info.id, ruCumulativeDefs(proof, acc))
+			RuAxiom(__,__):
+				setTree(acc, a.info.id, makeSet());
+			RuDef(__,__,__,__):
+				setTree(acc, a.info.id, makeSet1(a.info.id));
+		}
+	);
+}
+
+ruCumulativeDefs(proof : RuProof, defs : Tree<int, Set<int>>) -> Set<int> {
+	fold(proof.steps, makeSet(), \ac, step ->
+		if (step.assertion == ruStepLemma) {
+			mergeSets(ac, ruCumulativeDefs(step.proof, defs));
+		} else if (step.assertion == ruStepProblem) {
+			ac;
+		} else {
+			mergeSets(ac, lookupTreeDef(defs, step.assertion, makeSet()));
+		}
+	);
+}
+
+RuComplexityData(
+	assertion : RuAssertion,
+	cumulativeProofSize : double,
+	cumulativeDepth : int,
+	isUsedBy : Set<int>,
+	usesAxioms : Set<int>,
+	usesDefs : Set<int>
+);
+
+ruComplexityStats(
+	ordered : [RuAssertion], 
+	sizes : Tree<int, double>, 
+	depths : Tree<int, int>, 
+	uses : Tree<int, Set<int>>, 
+	axioms : Tree<int, Set<int>>, 
+	defs : Tree<int, Set<int>>
+) -> [RuComplexityData] {
+	map(ordered, \a -> 
+		RuComplexityData(a,
+			lookupTreeDef(sizes, a.info.id, -1.0),
+			lookupTreeDef(depths, a.info.id, -1),
+			lookupTreeDef(uses, a.info.id, makeSet()),
+			lookupTreeDef(axioms, a.info.id, makeSet()),
+			lookupTreeDef(defs, a.info.id, makeSet()),
+		)
+	);
+}
+
+ruCommpexityStats2s(stats : [RuComplexityData]) -> string {
+	"name\tcumulative_size\tcumulative_depth\tused_by\taxioms\tdefs\n" +
+	concatStrings(map(stats, \data ->
+		id2s(data.assertion.info.id) + "\t" +
+		d2s(data.cumulativeProofSize) + "\t" +
+		i2s(data.cumulativeDepth) + "\t" +
+		i2s(sizeSet(data.isUsedBy)) + "\t" +
+		i2s(sizeSet(data.usesAxioms)) + "\t" +
+		i2s(sizeSet(data.usesDefs)) + "\n"
+	));
+}
