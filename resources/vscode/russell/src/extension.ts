@@ -25,9 +25,9 @@ export function activate(context: vscode.ExtensionContext) {
 		serverStatusBarItem,
 		reg_comm('russell.verifyFile', (uri) => processRussellFile(uri, "verify")),
 		reg_comm('russell.verifyTheorem', () => processRussellTheorem("verify")),
-		reg_comm('russell.reproveFile', (uri) => processRussellFile(uri, "reprove")),
+		reg_comm('russell.reproveFile', (uri) => processRussellFile(uri, "reprove-oracle")),
 		reg_comm('russell.metamathFile', (uri) => verifyMetamath(uri)),
-		reg_comm('russell.reproveTheorem', () => processRussellTheorem("reprove")),
+		reg_comm('russell.reproveTheorem', () => processRussellTheorem("reprove-oracle")),
 		reg_comm('russell.generalizeFile', (uri) => processRussellFile(uri, "generalize")),
 		reg_comm('russell.generalizeTheorem', () => processRussellTheorem("generalize")),
 		reg_comm('russell.startHttpServer', startHttpServer),
@@ -145,29 +145,6 @@ function startLspClient() {
 		}
 	);
 }
-/*
-function initHttpServer(initial: boolean) {
-	const port = vscode.workspace.getConfiguration("russell").get("portOfHttpServer");
-	isPortReachable(port, {host: 'localhost'}).then(
-		(reacheable : boolean) => {
-			if (reacheable) {
-				outputHttpServerMemStats();
-				httpServerOnline = true;
-			} else {
-				httpServer = null;
-				httpServerOnline = false;
-				showHttpServerOffline();
-				if (initial) {
-					// launch russell server at startup
-					let autostart = vscode.workspace.getConfiguration("russell").get("autostartHttpServer");
-					if (autostart) {
-						startHttpServer();
-					}
-				}
-			}
-		}
-	);
-}*/
 
 function checkHttpServerStatus(initial: boolean) {
 	const port = vscode.workspace.getConfiguration("russell").get("portOfHttpServer");
