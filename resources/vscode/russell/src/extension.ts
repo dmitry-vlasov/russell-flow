@@ -289,7 +289,7 @@ function verifyMetamath(uri : vscode.Uri): void {
 		arguments: [
 			"read-ru   file=" + ru_file + ";\n" +
 			"ru-to-mm  file=" + ru_file + ";\n" +
-			"write-mm  target=" + mm_file + " monolithic=1 strip-comments=1;\n" +
+			"write-mm  file=" + mm_file + " monolithic=1 strip-comments=1;\n" +
 			"verify-mm file=" + mm_file + ";"
 		] 
 	});
