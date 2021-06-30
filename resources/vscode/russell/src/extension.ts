@@ -3,7 +3,9 @@
 // Import the module and reference it with the alias vscode in your code below
 import { ChildProcess } from 'child_process';
 import * as vscode from 'vscode';
-import { LanguageClient, LanguageClientOptions, RevealOutputChannelOn, ServerOptions, CancellationToken, Event, CancellationTokenSource } from 'vscode-languageclient';
+import { 
+	LanguageClient, LanguageClientOptions, RevealOutputChannelOn, ServerOptions
+} from 'vscode-languageclient/node';
 import { MathEntity, MathProvider } from "./mathProvider";
 import * as tools from "./tools";
 

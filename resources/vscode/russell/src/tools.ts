@@ -13,8 +13,8 @@ export function run_cmd(cmd: string, wd: string, args: string[], on_out: (string
 
 export function run_cmd_sync(cmd: string, wd: string, args: string[]) {
 	const options = wd && wd.length > 0 ? 
-		{ cwd: wd, shell: true, encoding: 'utf8' } :
-        { shell: true, encoding: 'utf8' };
+		{ cwd: wd, shell: true, encoding: "utf8" as BufferEncoding } :
+        { shell: true, encoding: "utf8" as BufferEncoding };
     return spawnSync(cmd, args, options);
 }
 

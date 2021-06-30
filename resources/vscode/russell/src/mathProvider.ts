@@ -46,7 +46,7 @@ class MathKindProvider implements vscode.TreeDataProvider<string> {
 			(acc, c) => (c.kind == this.kind) ? acc.set(c.name, c) : acc, 
 			new Map()
 		);
-		this._onDidChangeTreeData.fire();
+		this._onDidChangeTreeData.fire(undefined);
 	}
 
 	getChildren(name?: string): Thenable<string[]> {
