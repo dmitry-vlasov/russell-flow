@@ -1,5 +1,7 @@
 import net/http;
 import sys/process;
+import text/serialize;
+import text/blueprint;
 import base/comms;
 import ru/comms;
 import mm/comms;
@@ -8,9 +10,21 @@ import help;
 import clear;
 
 export {
+
+	RuRequest(
+		uuid : string, // The main id of a request
+		body : string, // JSON of script or LSP JSON - is passed only once per uuid
+	);
+
+	RuResponse(
+		uuid : string,
+		body : string,     // is passed in a partial / final response
+		code : Maybe<int>  // is 'Some' for a final exit code of a response.
+	);
+
 	ruInitConf(conf : RuConf) -> void;
-	ruProcess(s : ScScript, onRunComplete : (int) -> void, out : RuOut) -> void;
-	ruProcessLocal(s : ScScript, onRunComplete : (int) -> void, out : RuOut) -> void;
+	ruProcess(uuid : string, script : ScScript, onRunComplete : (int) -> void, env : RuEnv) -> void;
+	ruProcessLocal(script : ScScript, onRunComplete : (int) -> void, out : RuOut) -> void;
 	ruCommandsTree() -> Tree<string, RuComm>;
 }
 
@@ -20,43 +34,97 @@ ruInitConf(conf : RuConf) -> void {
 	ru_state := RuState(^ru_state with conf = conf);
 }
 
-ruProcess(s : ScScript, onRunComplete : (int) -> void, out : RuOut) -> void {
+ruProcess(uuid : string, script : ScScript, onRunComplete : (int) -> void, env : RuEnv) -> void {
 	if (getUrlParameterBoolDef("no-server", false)) {
-		ruProcessLocal(s, onRunComplete, out);
+		ruProcessLocal(script, onRunComplete, env.out);
 	} else {
-		ruProcessRemote(s, out.onMessage, onRunComplete, 
-			\code -> ruProcessLocal(s, onRunComplete, out)
-		);
+		ruProcessRemote(uuid, Some(script), onRunComplete, env, \-> ruProcessLocal(script, onRunComplete, env.out));
 	}
 }
 
-ruProcessRemote(s : ScScript, onMessage: (string) -> void, onRunComplete : (int) -> void, onServerError : (int) -> void) -> void {
+ruProcessRemote(uuid : string, script : Maybe<ScScript>, onRunComplete : (int) -> void, env : RuEnv, onServerError : () -> void) -> void {
 	serverUrl = 
 		"http://" + getUrlParameterDef("server-url", "localhost") + 
 		":" + getUrlParameterDef("server-port", "20001");
 	cwd = strReplace(resolveRelativePath("."), "\\", "/");
-	remote_s = ScSeq([ScTask("conf-load", makeTree1("dir", cwd)), ScTask("conf-set", makeTree1("working-dir", cwd)), s]);
+	patch_remote = \s -> ScSeq([ScTask("conf-load", makeTree1("dir", cwd)), ScTask("conf-set", makeTree1("working-dir", cwd)), s]);
+	request = RuRequest(uuid,
+		eitherMap(script, \s -> 
+			json2string(ruScript2Json(patch_remote(s))), ""
+		)
+	);
+	ruClientLog(blueprint("<%uuid%> Client: '%body%'",
+		[
+			"uuid", uuid,
+			"body", ruCutLongString(ruServerEscapeString(request.body))
+		]), env.conf
+	);
 	httpCustomRequest(
 		serverUrl,
-		GET(), [], RequestPayload(json2string(ruScript2Json(remote_s))),
-		\status, msg, headers -> {
-			code = status - 200;
-			if (code == 0) {
-				onMessage(msg);
-				onRunComplete(0);
-			} else if (0 < code && code < 64) {
-				onMessage("Compilation error " + i2s(code) + "\n" + msg);
-				onRunComplete(code);
+		GET(), [], RequestPayload(serialize(request)),
+		\status, resp, headers -> {
+			if (status == 200) {
+				value = deserialize(resp, IllegalStruct());
+				if (value == IllegalStruct()) {
+					ruClientLog("WARNING: Illegal serialized data in response. (ruProcessRemote 1): \n" + resp, env.conf);
+					onRunComplete(1);
+				} else {
+					switch (value) {
+						RuResponse(uuid_, body, mcode): {
+							if (uuid == uuid_) {
+								ruClientLog(blueprint("<%uuid%> %code% Server: '%body%'",
+									[
+										"uuid", uuid,
+										"code", eitherMap(mcode, \code -> "exit: " + i2s(code), ""),
+										"body", ruCutLongString(ruServerEscapeString(body))
+									]), env.conf
+								);
+								switch (mcode) {
+									Some(code): {
+										// Final response
+										if (body != "") {
+											env.out.onData(body);
+										}
+										onRunComplete(code);
+									}
+									None(): {
+										// Intermediate response
+										if (body != "") {
+											env.out.onMessage(body);
+										}
+										ruProcessRemote(uuid, None(), onRunComplete, env, onServerError);
+									}
+								}
+							} else {
+								ruClientLog(blueprint("<%uuid%> != <%uuid_%> %code% Server [%time%]: '%body%'",
+									[
+										"uuid", uuid, 
+										"uuid_", uuid_,
+										"code", eitherMap(mcode, \code -> "exit: " + i2s(code), ""),
+										"body", ruCutLongString(ruServerEscapeString(body))
+									]), env.conf
+								);
+							}
+						}
+						default: {
+							ruClientLog("WARNING: Illegal serialized data in response. (ruProcessRemote 2): \n" + resp, env.conf);
+							onRunComplete(1);
+						}
+					}
+					//onData(value);
+				}
+				//onMessage(msg);
+				//onRunComplete(0);
 			} else {
-				onServerError(status);
+				onServerError();
 			}
 		},
 		false
 	)
 }
 
-ruProcessLocal(s : ScScript, onRunComplete : (int) -> void, out : RuOut) -> void {
-	ru_state := ruProcessScript(s, ^ru_state, out);
+ruProcessLocal(script : ScScript, onRunComplete : (int) -> void, out : RuOut) -> void {
+	ru_state := ruProcessScript(script, ^ru_state, out);
 	onRunComplete(0);
 }
 
