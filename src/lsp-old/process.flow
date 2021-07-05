@@ -6,30 +6,13 @@ import lsp/methods/workspace;
 import process;
 
 export {
-	ruLspRequest2Script(request : LspRequestMessage, env : RuEnv) -> ScScript;
-	//ruLspOut(id : Json, out : RuOut) -> RuOut;
+	ruLspProcessRequest(
+		conf : RuConf, json : Json, funcs : RuReqFuncs, 
+		process : (ScScript, (int) -> void, RuOut) -> void
+	) -> void;
 }
 
-ruLspRequest2Script(request : LspRequestMessage, env : RuEnv) -> ScScript {
-	if (startsWith(request.method, " $/")) {
-		// TODO: implement such methods as:
-		// - $/cancelRequest
-		// - $/progress
-		ScStop();
-	} else {
-		switch (lookupTree(ruLspMethods, request.method)) {
-			Some(method): {
-				method(request.params, env);
-			}
-			None(): {
-				env.out.onError("request method '" + request.method + "' is not found", []);
-				ScStop();
-			}
-		}
-	}
-}
-
-RuLspServerRequest(
+RuServerRequest(
 	request : LspRequestMessage,
 	callback : (LspResponseMessage) -> void
 );
@@ -37,21 +20,62 @@ RuLspServerRequest(
 RuLspServerState(
 	mutable clientConf : Json,
 	mutable currId : int,
-	mutable requests : Tree<Json, RuLspServerRequest>
+	mutable requests : Tree<Json, RuServerRequest>
 );
 
 ruLspServerState = RuLspServerState(JsonNull(), 1, makeTree());
 
-ruLspShutdown(json : Json, env : RuEnv) -> ScScript {
-	ruLspServerState.clientConf ::= JsonNull();
-	ruLspServerState.currId ::= 1;
-	ruLspServerState.requests ::= makeTree();
-	ruMemCacheClear(); // reset memory cache
-	ScStop();
-}
-
-ruLspExit(json : Json, env : RuEnv) -> ScScript {
-	ScExit();
+ruLspProcessRequest(
+	conf : RuConf, json : Json, funcs : RuReqFuncs,
+	process : (ScScript, (int) -> void, RuOut) -> void
+) -> void {
+	data_cb = \js -> {
+		js_out = json2string(js);
+		js_len = strlen(expandUtf8(js_out));
+		funcs.out.onData("Content-Length: " + i2s(js_len) + "\r\n\r\n" + js_out);
+	}
+	msg_cb = \msg -> {
+		js_out = json2string(ruLspNotification("console/message", JsonString(msg)));
+		js_len = strlen(expandUtf8(js_out));
+		funcs.out.onMessage("Content-Length: " + i2s(js_len) + "\r\n\r\n" + js_out);
+	}
+	switch (json2LspRequestMessage(json)) {
+		Some(request): {
+			if (request.method == "") {
+				data_cb(ruLspErrorResponse(request.id, 1, "request method is not set"));
+			} else {
+				if (startsWith(request.method, " $/")) {
+					// TODO: implement such methods as:
+					// - $/cancelRequest
+					// - $/progress
+				} else {
+					switch (lookupTree(ruLspMethods, request.method)) {
+						Some(m): {
+							m(RuLspArgs(conf, request.id, request.params, msg_cb, data_cb, funcs.exit, process));
+						}
+						None(): {
+							data_cb(ruLspErrorResponse(request.id, 1, "request method '" + request.method + "'' is not found"));
+						}
+					}
+				}
+			}
+		}
+		None(): {
+			switch (json2LspResponseMessage(json)) {
+				Some(response): {
+					switch (lookupTree(ruLspServerState.requests, response.id)) {
+						Some(req): req.callback(response);
+						None(): {
+							ruLspServerLog("Server: unknown request: " + json2string(response.id), conf);
+						}
+					}
+				}
+				None(): {
+					data_cb(ruLspErrorResponse(getJsonFieldValue(json, "id", JsonNull()), 1, "illegal request '" + json2string(json) + "'"));
+				}
+			}
+		}
+	}
 }
 
 ruMakeServerRequest(method : string, params : Json, data_cb : (Json) -> void, callback : (LspResponseMessage) -> void) -> void {
@@ -61,6 +85,18 @@ ruMakeServerRequest(method : string, params : Json, data_cb : (Json) -> void, ca
 	);
 	ruLspServerState.currId ::= ruLspServerState.currId + 1;
 	data_cb(lspRequestMessage2Json(request));
+}
+
+ruLspShutdown(call : RuLspArgs) -> void {
+	ruLspServerState.clientConf ::= JsonNull();
+	ruLspServerState.currId ::= 1;
+	ruLspServerState.requests ::= makeTree();
+	ruMemCacheClear(); // reset memory cache
+	call.data_cb(ruLspNormalResponse(call.id, JsonNull()));
+}
+
+ruLspExit(call : RuLspArgs) -> void {
+	call.exit_cb();
 }
 
 ruLspInitialized(call: RuLspArgs) -> void {
@@ -91,9 +127,9 @@ ruExecuteCommandOptions = JsonObject([
 	Pair("workDoneProgress", JsonBool(true))
 ]);
 
-ruLspInitialize(json : Json, env : RuEnv) -> ScScript {
-	ruLspServerState.clientConf ::= json;
-	ScData(ScStringConst(json2string(
+ruLspInitialize(call: RuLspArgs) -> void {
+	ruLspServerState.clientConf ::= call.params;
+	call.data_cb(ruLspNormalResponse(call.id, 
 		JsonObject([
 			Pair("capabilities", JsonObject([
 					Pair("declarationProvider", JsonBool(true)),
@@ -121,7 +157,7 @@ ruLspInitialize(json : Json, env : RuEnv) -> ScScript {
 				])
 			)
 		])
-	)));
+	));
 }
 
 ruLspInitMethods = pairs2tree([

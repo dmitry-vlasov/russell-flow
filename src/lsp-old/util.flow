@@ -1,0 +1,160 @@
+import base/util/str;
+import base/out;
+import base/log;
+
+export {
+	ruLspErrorResponse(id : Json, code : int, msg : string) -> Json;
+	ruLspNormalResponse(id : Json, result : Json) -> Json;
+	ruLspNotification(method : string, params : Json) -> Json;
+
+	ruLspMakeOut(lines : ref [string], datas : ref [string], conf : RuConf) -> RuOut;
+	ruLspMakeOutMessage(lines : ref [string], datas : ref [string], conf : RuConf, message : (Json) -> void) -> RuOut;
+
+	ruDetectLspError(lines0 : [string], conf : RuConf) -> bool;
+	ruLspFileConfig(def : RuConf, path : string) -> RuConf;
+	ruLspParseLocations(lines : [string]) -> [Json];
+	ruString2SymbolKind(str : string) -> int;
+	ruLspParseSymbols(lines : [string]) -> [Json];
+	ruLspParseLocation(s : string) -> Maybe<Pair<LspLocation, string>>;
+}
+
+ruLspErrorResponse(id : Json, code : int, msg : string) -> Json {
+	lspResponseMessage2Json(LspResponseMessage("2.0", id, JsonNull(), 
+		Some(LspResponseError(code, msg, JsonNull()))
+	));
+}
+
+ruLspNormalResponse(id : Json, result : Json) -> Json {
+	lspResponseMessage2Json(LspResponseMessage("2.0", id, result, None()));
+}
+
+ruLspNotification(method : string, params : Json) -> Json {
+	lspNotificationMessage2Json(LspNotificationMessage("2.0", method, params));
+}
+
+ruLspMakeOut(lines : ref [string], datas : ref [string], conf : RuConf) -> RuOut {
+	ruMakeOut(
+		\line -> refArrayPush(lines, line), 
+		\data -> refArrayPush(datas, data), 
+		conf.opts
+	);
+}
+
+ruLspMakeOutMessage(lines : ref [string], datas : ref [string], conf : RuConf, message : (Json) -> void) -> RuOut {
+	ruMakeOut(
+		\line -> {
+			message(ruLspNotification("console/message", JsonString(line)));
+			refArrayPush(lines, line);
+		},
+		\data -> refArrayPush(datas, data),
+		conf.opts
+	);
+}
+
+ruDetectLspError(lines0 : [string], conf : RuConf) -> bool {
+	lines = ruSplitLines(lines0);
+	if (exists(lines, \l -> strContains(l, "Error: ") || strContains(l, "Fail: "))) {
+		ruLspServerLog("Server error: " + strGlue(lines, "\\n"), conf);
+		true
+	} else false;
+}
+
+ruLspFileConfig(def : RuConf, path : string) -> RuConf {
+	cwd_dir = strReplace(resolveRelativePath("."), "\\", "/");
+	ext = getFileExt(path);
+	file_dir = dirName(path);
+	conf_dir = ruFindConfDir(file_dir);
+	if (conf_dir == "") def else {
+		conf = ruMakeConf(conf_dir, []);
+		RuConf(conf with 
+			importRoots = uniq(concat(def.importRoots, map(conf.importRoots, \inc ->
+				if (isAbsolutePath(inc)) inc else {
+					if (inc == ".") {
+						conf_dir;
+					} else {
+						conf_dir + "/" + inc;
+					}
+				}
+			))),
+			workingDir = file_dir,
+			opts = mergeTree(def.opts, conf.opts)
+		);
+	}
+}
+
+ruLspParseLocations(lines : [string]) -> [Json] {
+	filtermap(ruSplitLines(lines), \l -> 
+		maybeMap(ruLspParseLocation(l), \p -> lspLocation2Json(p.first))
+	);
+}
+
+ruString2SymbolKind(str : string) -> int {
+	if (str == "const") {
+		lookupTreeDef(lspSymbolKindName2id, "Object", 0);
+	} else if (str == "import") {
+		lookupTreeDef(lspSymbolKindName2id, "Package", 0);
+	} else if (str == "type") {
+		lookupTreeDef(lspSymbolKindName2id, "Enum", 0);
+	} else if (str == "theorem") {
+		lookupTreeDef(lspSymbolKindName2id, "Function", 0);
+	} else if (str == "axiom") {
+		lookupTreeDef(lspSymbolKindName2id, "Interface", 0);
+	} else if (str == "rule") {
+		lookupTreeDef(lspSymbolKindName2id, "Variable", 0);
+	} else if (str == "def") {
+		lookupTreeDef(lspSymbolKindName2id, "Method", 0);
+	} else {
+		0
+	}
+}
+
+ruLspParseSymbols(lines : [string]) -> [Json] {
+	filtermap(ruSplitLines(lines), \l -> 
+		maybeBind(ruLspParseLocation(l), \p -> {
+			loc = p.first;
+			details = strSplit(trim(p.second), " ");
+			if (length(details) == 1) {
+				Some(lspSymbol2Json(LspSymbol(p.second, "", 0, false, loc.range, loc.range, [])))
+			} else if (length(details) > 1) {
+				name = details[1];
+				kind = ruString2SymbolKind(details[0]);
+				Some(lspSymbol2Json(LspSymbol(name, "", kind, false, loc.range, loc.range, [])));
+			} else {
+				None();
+			}
+		})
+	);
+}
+
+ruLspParseLocation(s : string) -> Maybe<Pair<LspLocation, string>> {
+	isNum = \st -> st != "" && isDigits(st);
+	parts0 = strSplit(s, ":");
+	if (length(parts0) < 3 || strContains(s, "Error: ") || strContains(s, "Fail: ")) None() else {
+		// Windows path may start with C:/... and 
+		parts = if (!hasTargetName("windows") || !isLetter(parts0[0])) parts0 else {
+			concat(["/" + parts0[0] + ":" + parts0[1]], tailFrom(parts0, 2));
+		}
+		if (length(parts) < 3 || parts[0] == "" || !isNum(parts[1]) || !isNum(parts[2])) {
+			None() ;
+		} else {
+			path = strReplace(parts[0], "\\", "/");
+			sline = s2i(parts[1]) - 1;
+			schar = s2i(parts[2]) - 1;
+			if (length(parts) < 5 || !isNum(parts[3]) || !isNum(parts[4])) {
+				Some(Pair(LspLocation(
+					URI("file", URIAuthority("", "", ""), path, "", ""),
+					LspRange(LspPosition(sline, schar), LspPosition(sline, schar + 1))
+					), trim(parts[3]))
+				);
+			} else {
+				eline = s2i(parts[3]) - 1;
+				echar = s2i(parts[4]) - 1;
+				Some(Pair(LspLocation(
+					URI("file", URIAuthority("", "", ""), path, "", ""),
+					LspRange(LspPosition(sline, schar), LspPosition(eline, echar))
+					), trim(parts[5]))
+				);
+			}
+		}
+	}
+}
