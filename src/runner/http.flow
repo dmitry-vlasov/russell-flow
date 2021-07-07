@@ -1,5 +1,5 @@
 import server/http;
-import runner/process;
+import process;
 import text/blueprint;
 
 export {
@@ -58,115 +58,59 @@ ruHttpServer(env : RuEnv) -> void {
 							), conf);
 						}
 						if (body != "") {
-							funcs = RuReqFuncs(
-								// RuOut
-								ruMakeOut(
-									// onMessage
-									\msg -> {
-										env.out.onMessage(msg);
-										response = HttpResponse(200, serialize(RuResponse(uuid, msg, None())), []);
-										if (isSome(^(state.request))) {
-											ruHttpServerLog(blueprint("<%uuid%> Server message: '%body%'",
-												[
-													"uuid", uuid, 
-													"body", ruCutLongString(ruServerEscapeString(msg))
-												]
-											), conf);
-											state.request := None();
-											respond(response);
-										} else {
-											refArrayPush(state.queue, 
-												RuQueuedResponse(uuid, response, 
-													\-> ruHttpServerLog(blueprint("<%uuid%> Server message: RESPONDED '%body%'",
-														[
-															"uuid", uuid, 
-															"body", ruCutLongString(ruServerEscapeString(msg))
-														]
-													), conf)
-												)
-											);
-											ruHttpServerLog(blueprint("<%uuid%> Server message: ENQUEUED '%body%', queue len: %queue%",
-												[
-													"uuid", uuid, 
-													"body", ruCutLongString(ruServerEscapeString(msg)),
-													"queue", i2s(length(^(state.queue)))
-												]
-											), conf);
-										}
-									},
-									// onData
-									\data -> {
-										state.data := data;
-									},
-									conf.opts
-								),
-								// finish
-								\code -> {
-									response = HttpResponse(200, serialize(RuResponse(uuid, ^(state.data), Some(code))), []);
-									if (isSome(^(state.request))) {
-										if (log_request) {
-											ruHttpServerLog(blueprint("<%uuid%> exit %code% Server [%time%]: '%data%'" + ,
-												[
-													"uuid", uuid, 
-													"code", if (code == 0) "" else "code: " + i2s(code), 
-													"time", ruTimePassed2s(timer),
-													"data", ruCutLongString(ruServerEscapeString(^(state.data)))
-												]
-											), conf);
-										}
-										state.request := None();
-										respond(response);
-									} else {
-										refArrayPush(state.queue, 
-											RuQueuedResponse(uuid, response,
-												if (!log_request) nop else {
-													\->	ruHttpServerLog(blueprint("<%uuid%> exit %code% Server [%time%]: RESPONDED '%data%'" + ,
-														[
-															"uuid", uuid, 
-															"code", if (code == 0) "" else "code: " + i2s(code), 
-															"time", ruTimePassed2s(timer),
-															"data", ruCutLongString(ruServerEscapeString(^(state.data)))
-														]
-													), conf)
-												}
-											), 
-										);
-										if (log_request) {
-											ruHttpServerLog(blueprint("<%uuid%> exit %code% Server [%time%]: ENQUEUED '%data%', queue len: %queue%" + ,
-												[
-													"uuid", uuid, 
-													"code", if (code == 0) "" else "code: " + i2s(code), 
-													"time", ruTimePassed2s(timer),
-													"data", ruCutLongString(ruServerEscapeString(^(state.data))), 
-													"queue", i2s(length(^(state.queue)))
-												]
-											), conf);
-										}
-									}
-								},
-								// log
-								\msg -> ruHttpServerLog(msg, conf),
-								// exit
-								\-> {
-									response = HttpResponse(200, serialize(RuResponse(uuid, "Http server stopped.", Some(0))), []);
-									if (isSome(^(state.request))) {
-										state.request := None();
-										respond(response);
-									} else {
-										refArrayPush(state.queue, 
-											RuQueuedResponse(uuid, response,
-												\-> {
-													env.out.onMessage("Http server stopped.");
-													ruHttpServerLog("Server stopped.", conf);
-													^server();
-													quit(0);
-												}
-											)
-										);
-									}
-								},
-							);
-							ruProcessRequest(conf, req, funcs, ruProcessLocal);
+							log_response = \code, msg -> {
+								if (log_request) {
+									ruHttpServerLog(blueprint("<%uuid%> %code% Server [%time%]: %msg% '%data%', queue len: %queue%" + ,
+										[
+											"uuid", uuid, 
+											"msg", msg,
+											"code", if (code < 0) "message" else if (code == 0) "exit" else "exit code: " + i2s(code), 
+											"time", ruTimePassed2s(timer),
+											"data", ruCutLongString(ruServerEscapeString(^(state.data))), 
+											"queue", i2s(length(^(state.queue)))
+										]
+									), conf);
+								}
+							}
+
+							do_respond = \code, response -> {
+								if (isSome(^(state.request))) {
+									log_response(code, "");
+									state.request := None();
+									respond(response);
+								} else {
+									refArrayPush(state.queue, 
+										RuQueuedResponse(uuid, response, \-> log_response(code, "RESPONDED")), 
+									);
+									log_response(code, "ENQUEUED");
+								}
+							}
+
+							switch (ruJson2Script(parseJsonSafe(body))) {
+								Some(script): {
+									ruProcess(uuid, script, 
+										\code -> do_respond(code, 
+											HttpResponse(200, serialize(RuResponse(uuid, ^(state.data), Some(code))), [])
+										),
+										RuEnv(
+											conf, 
+											ruMakeOut(
+												// onMessage
+												\msg -> {
+													env.out.onMessage(msg);
+													do_respond(-1, HttpResponse(200, serialize(RuResponse(uuid, msg, None())), []));
+												},
+												// onData
+												\data -> state.data := data,
+												conf.opts
+											),
+										)
+									);
+								}
+								None(): {
+									ruHttpServerLog("Illegal request: " + ruCutLongString(ruServerEscapeString(request.body)), conf);
+								}
+							}
 						} else {
 							ruDeferredResopnse(uuid, state.queue, respond, conf);
 						}

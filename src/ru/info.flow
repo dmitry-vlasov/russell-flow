@@ -1,3 +1,4 @@
+import text/blueprint;
 import comm;
 import base/util/lsp;
 import lsp/util;
@@ -92,13 +93,19 @@ ruRunInfoHover(unit : RuUnit) -> Maybe<RuState> {
 	state = unit.state;
 	conf = state.conf;
 	file = lookupTreeDef(task.args, "file", "");
+	lsp = lookupTreeDef(task.args, "lsp", "") == "1";
 	module = ruFileId(file, conf);
 	line = s2i(lookupTreeDef(task.args, "line", "-1"));
 	col = s2i(lookupTreeDef(task.args, "col", "-1"));
 	cursor = ruUnderACursor(module, line, col, env);
-	hover = ruCursorHover(cursor, env);
-	if (hover != "") {
-		env.out.onMessage(hover);
+	message = ruCursorHover(cursor, env);
+	if (message != "") {
+		if (lsp) {
+			hover = LspHover([LspMarkedString("russell", message)], None());
+			env.out.onData(json2string(lspHover2Json(hover)));
+		} else {
+			env.out.onMessage(message);
+		}
 	}
 	Some(state);
 }
@@ -151,10 +158,18 @@ ruRunInfoSymbol(unit : RuUnit) -> Maybe<RuState> {
 	state = unit.state;
 	conf = state.conf;
 	name = lookupTreeDef(task.args, "name", "");
-	maybeApply(ruCachedDecl2LspSymbolInfo(s2id_(name), env), \info -> {
-		json = JsonArray([lspSymbolInformation2Json(info)]);
-		env.out.onMessage(json2string(json));
-	});
+	lsp = lookupTreeDef(task.args, "lsp", "") == "1";
+	if (lsp) {
+		maybeApply(ruCachedDecl2LspSymbolInfo(s2id_(name), env), \info -> {
+			json = JsonArray([lspSymbolInformation2Json(info)]);
+			env.out.onData(json2string(json));
+		});
+	} else {
+		info = ruCachedDecl2s(s2id_(name), env);
+		if (info != "") {
+			env.out.onMessage(info);
+		}
+	}
 	Some(state);
 }
 
@@ -225,26 +240,50 @@ ruRunInfoOutline(unit : RuUnit) -> Maybe<RuState> {
 	state = unit.state;
 	conf = state.conf;
 	file = lookupTreeDef(task.args, "file", "");
+	lsp = lookupTreeDef(task.args, "lsp", "") == "1";
 	module = ruTrimPath(file, conf, ".ru");
 	maybeApply(ruCacheGet(s2id_(module), false, env), \src -> {
 		code = ruCodeCacheGet(src.info.id, env).code;
 		resolver = makeLineResolver(code);
-		iter(src.imports, \imp -> 
-			maybeApply(ruNameRangeByPos(imp.pos, code), \range -> 
-				env.out.onMessage(
-					ruRangeWithResolver2s(src.info.path, range, "import " + id2s(imp.id), resolver)
+		if (lsp) {
+			imports = filtermap(src.imports, \imp -> 
+				maybeMap(ruNameRangeByPos(imp.pos, code), \range -> {
+						name = id2s(imp.id);
+						loc = ruRangeResolver2LspLocation(range, src.info.path, resolver);
+						kind = ruString2LspSymbolKind("import");
+						lspSymbol2Json(LspSymbol(name, "", kind, false, loc.range, loc.range, []));
+					}
 				)
-			)
-		);
-		iter(src.decls, \decl ->
-			maybeApply(ruNameRangeByPos(decl.info.pos, code),
-				\range ->
+			);
+			decls = filtermap(src.decls, \decl -> 
+				maybeMap(ruNameRangeByPos(decl.info.pos, code), \range -> {
+						name = id2s(decl.info.id);
+						loc = ruRangeResolver2LspLocation(range, src.info.path, resolver);
+						kind = ruString2LspSymbolKind(ruDeclKind(decl));
+						lspSymbol2Json(LspSymbol(name, "", kind, false, loc.range, loc.range, []));
+					}
+				)
+			);
+			json = JsonArray(concat(imports, decls));
+			env.out.onData(json2string(json));
+		} else {
+			iter(src.imports, \imp -> 
+				maybeApply(ruNameRangeByPos(imp.pos, code), \range -> 
 					env.out.onMessage(
-						ruRangeWithResolver2s(src.info.path, range, ruDeclKind(decl) + " " + 
-						id2s(decl.info.id), resolver)
+						ruRangeWithResolver2s(src.info.path, range, "import " + id2s(imp.id), resolver)
 					)
-			)
-		);
+				)
+			);
+			iter(src.decls, \decl ->
+				maybeApply(ruNameRangeByPos(decl.info.pos, code),
+					\range ->
+						env.out.onMessage(
+							ruRangeWithResolver2s(src.info.path, range, ruDeclKind(decl) + " " + 
+							id2s(decl.info.id), resolver)
+						)
+				)
+			);
+		}
 	});
 	Some(state)
 }
@@ -252,7 +291,12 @@ ruRunInfoOutline(unit : RuUnit) -> Maybe<RuState> {
 ruCommInfoUses = RuComm(
 	RuCommInfo(
 		"info-uses", "info", "prints all uses of a name", "name", false, false, 
-		[RuCommArg("name", false, "entity name", "")], []
+		[
+			RuCommArg("name", true, "entity name", ""),
+			RuCommArg("file", false, "input file", ""), 
+			RuCommArg("line", false, "line of expr", ""), 
+			RuCommArg("col", false, "column of expr", "")
+		], []
 	),
 	ruRunInfoUses
 );
@@ -262,30 +306,53 @@ ruRunInfoUses(unit : RuUnit) -> Maybe<RuState> {
 	task = unit.task;
 	state = unit.state;
 	conf = state.conf;
-	name = lookupTreeDef(task.args, "name", "");
-	id = s2id_(name);
-	maybeApply(ruDeclCacheGet(id), \decl ->
-		maybeApply(ruCacheGet(decl.info.src, false, env), \src ->
-			iter(ruSourceCacheAll(true, env), \s -> { 
-				iter(s.decls, \d ->
-					switch (d) {
-						RuTheorem(__,__,__,proof):
-							iter(proof.steps, \step ->
-								if (step.assertion == id) {
-									code = ruCodeCacheGet(s.info.id, env).code;
-									maybeApply(ruNameRangeByPos(step.pos, code),
-										\range -> 
-											env.out.onMessage(ruRange2s(range, "uses " + name, src.info.path, code))
-									);
-								}
-							);
-						default: { }
-					}
+	
+	file = lookupTreeDef(task.args, "file", "");
+	module = ruFileId(file, conf);
+	line = s2i(lookupTreeDef(task.args, "line", "-1"));
+	col = s2i(lookupTreeDef(task.args, "col", "-1"));
+	cursor = ruUnderACursor(module, line, col, env);
+
+	name = lookupTreeDef(task.args, "name", cursor.act);
+	if (name != "") {
+		lsp = lookupTreeDef(task.args, "lsp", "") == "1";
+		id = s2id_(name);
+		maybeApply(ruDeclCacheGet(id), \decl ->
+			maybeApply(ruCacheGet(decl.info.src, false, env), \src -> {
+				locations = fold(ruSourceCacheAll(true, env), makeList(), \acc, s ->
+					fold(s.decls, acc, \ac, d ->
+						switch (d) {
+							RuTheorem(__,__,__,proof):
+								fold(proof.steps, ac, \a, step ->
+									if (step.assertion != id) a else {
+										code = ruCodeCacheGet(s.info.id, env).code;
+										resolver = makeLineResolver(code);
+										eitherMap(ruNameRangeByPos(step.pos, code),
+											\range -> Cons(Pair(RuLocation(s.info.id, s.info.path, range), resolver), a), a
+										);
+									}
+								);
+							default: ac;
+						}
+					)
 				);
+				if (lsp) {
+					env.out.onData(json2string(JsonArray(
+							map(list2array(locations), 
+								\location -> lspLocation2Json(ruLocation2LspLocation(location.first, "", Some(location.second)))
+							)
+					)));
+				} else {
+					env.out.onMessage(superglue(
+							list2array(locations), 
+							\location -> ruLocationWithResolver2s(location.first, "uses " + name, location.second), 
+							"\n"
+					));
+				}
 			})
-		)
-	);
-	Some(state)
+		);
+	}
+	Some(state);
 }
 
 ruCommInfoMath = RuComm(
