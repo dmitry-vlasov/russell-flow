@@ -33,9 +33,9 @@ export function activate(context: vscode.ExtensionContext) {
 		reg_comm('russell.reproveTheorem', () => processRussellTheorem("reprove-oracle")),
 		reg_comm('russell.generalizeFile', (uri) => 
 			processRussellFile(uri, "generalize").then(
-				(data : string[]) => {
-					if (data.length > 0) {
-						vscode.workspace.openTextDocument({'language': 'russell', 'content': data.join('\n\n')});
+				(data: any) => {
+					if (data && data.theorems && data.theorems.length > 0) {
+						vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + data.theorems.join('\n\n')});
 					}
 				},
 				vscode.window.showErrorMessage
@@ -43,9 +43,9 @@ export function activate(context: vscode.ExtensionContext) {
 		),
 		reg_comm('russell.generalizeTheorem', () =>
 			processRussellTheorem("generalize").then(
-				(data : string[]) => {
-					if (data.length > 0) {
-						vscode.workspace.openTextDocument({'language': 'russell', 'content': data.join('\n\n')});
+				(data : any) => {
+					if (data && data.theorems && data.theorems.length > 0) {
+						vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + data.theorems.join('\n\n')});
 					}
 				},
 				vscode.window.showErrorMessage
