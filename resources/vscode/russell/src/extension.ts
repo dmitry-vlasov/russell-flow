@@ -245,11 +245,16 @@ export function deactivate() {
 			httpServer = null
 		});
 	}
-    if (!client) {
-        return undefined;
-    } else {
-		client.sendNotification("exit");
-        return client.stop();
+    if (client) {
+		client.sendRequest("shutdown").then(
+			(data : any) => {
+				client.sendNotification("exit");
+				client.stop();
+			},
+			(err : any) => {
+				vscode.window.showErrorMessage("error while shutting down: " + err);
+			}
+		);
     }
 }
 
