@@ -23,21 +23,21 @@ export function shutdownHttpServer() {
     return run_cmd("russell", ".", ["server-shutdown", "server-port=" + port], (s) => { console.log(s); } );
 }
 
-export function launchHttpServer(on_start : () => void, on_stop : () => void, russellChannel : vscode.OutputChannel) {
+export function launchHttpServer(on_start : () => void, on_stop : () => void, serverChannel : vscode.OutputChannel) {
 	on_start();
 	const russell_dir = getRussellDir();
 	const port = vscode.workspace.getConfiguration("russell").get("portOfHttpServer");
 	const memory = vscode.workspace.getConfiguration("russell").get("memForHttpServer");
-	russellChannel.appendLine(
+	serverChannel.appendLine(
 		(new Date()).toString() + " Russell Http server is starting in '" + russell_dir + "' directory"
 	); 
     let httpServer = run_cmd(
 		"russell", russell_dir, 
 		["mem=" + memory + "g", "server=http", "server-port=" + port], 
-		(s) => russellChannel.append(s)
+		(s) => serverChannel.append(s)
 	);
     httpServer.addListener("close", (code: number, signal: string) => { 
-		russellChannel.appendLine(
+		serverChannel.appendLine(
 			(new Date()).toString() + " Russell Http server closed" + 
 			(code == 0 ? "" : " code: " + code) + 
 			(signal ? " signal: " + signal : "")
@@ -45,11 +45,11 @@ export function launchHttpServer(on_start : () => void, on_stop : () => void, ru
 		on_stop();
 	});
     httpServer.addListener("disconnect", () => { 
-		russellChannel.appendLine((new Date()).toString() + " Russell Http server disconnected"); 
+		serverChannel.appendLine((new Date()).toString() + " Russell Http server disconnected"); 
 		on_stop();
 	});
 	httpServer.addListener("exit", (code: number, signal: string) => { 
-		russellChannel.appendLine(
+		serverChannel.appendLine(
 			(new Date()).toString() + " Russell Http server exited" +
 			(code == 0 ? "" : " code: " + code) + 
 			(signal ? " signal: " + signal : "")
@@ -61,4 +61,26 @@ export function launchHttpServer(on_start : () => void, on_stop : () => void, ru
 
 export function getRussellDir(): string {
 	return run_cmd_sync("russell", ".", ["russell-dir"]).stdout.toString().trim();
+}
+
+export function roundTo2Digits(num: number): number {
+	return Math.round((num + Number.EPSILON) * 100) / 100;
+}
+
+export function num2memory(mem: number): string {
+	if (mem < 1024) {
+		return Math.round(mem) + " b";
+	}
+	mem /= 1024;
+	if (mem < 1024) {
+		return Math.round(mem) + " Kb";
+	}
+	mem /= 1024;
+	if (mem < 1024) {
+		return Math.round(mem) + " Mb";
+	}
+	mem /= 1024;
+	if (mem < 1024) {
+		return Math.round(mem) + " Gb";
+	}
 }

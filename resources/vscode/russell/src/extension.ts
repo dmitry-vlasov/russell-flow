@@ -8,6 +8,7 @@ import {
 } from 'vscode-languageclient/node';
 import { MathEntity, MathProvider } from "./mathProvider";
 import * as tools from "./tools";
+import { num2memory } from './tools';
 
 const isPortReachable = require('is-port-reachable');
 
@@ -174,15 +175,14 @@ function checkHttpServerStatus(initial: boolean) {
 function outputHttpServerMemStats() {
 	client.sendRequest("workspace/executeCommand", { 
 		command : "command", 
-		arguments : ["stats-mem show=1 do_not_log_this=1"]
+		arguments : ["stats-mem"]
 	}).then(
-		(out : string) => {
-			const lines = out.split("\n");
-			const mem_stats = lines.find((line) => line.indexOf("free") != -1);
+		(data : any) => {
+			const mem_stats = num2memory(data.used) + " + " + num2memory(data.free) + " free = " + num2memory(data.total);
 			showHttpServerOnline(mem_stats);
 		},
 		(err : any) => {
-			russellChannel.appendLine(err);
+			russellChannel.appendLine("mem stats error: " + err);
 			showHttpServerOffline();
 		}
 	);
@@ -199,7 +199,7 @@ function toggleHttpServer() {
 function startHttpServer() {
     if (!httpServerOnline) {
 		if (!serverChannel) {
-			serverChannel = vscode.window.createOutputChannel("Flow server");
+			serverChannel = vscode.window.createOutputChannel("Russell server");
 			serverChannel.show();
 		}
 		httpServer = tools.launchHttpServer(
@@ -220,9 +220,9 @@ function stopHttpServer() {
 
 function showHttpServerOnline(mem_stats? : string) {
 	if (mem_stats) {
-		serverStatusBarItem.text = `$(vm-active) russell http server: online (` + mem_stats + ")";
+		serverStatusBarItem.text = `$(vm-active) russell http: online (` + mem_stats + ")";
 	} else {
-		serverStatusBarItem.text = `$(vm-active) russell http server: online`;
+		serverStatusBarItem.text = `$(vm-active) russell http: online`;
 	}
 }
 
