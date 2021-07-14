@@ -31,8 +31,26 @@ export function activate(context: vscode.ExtensionContext) {
 		reg_comm('russell.reproveFile', (uri) => processRussellFile(uri, "reprove-oracle")),
 		reg_comm('russell.metamathFile', (uri) => verifyMetamath(uri)),
 		reg_comm('russell.reproveTheorem', () => processRussellTheorem("reprove-oracle")),
-		reg_comm('russell.generalizeFile', (uri) => processRussellFile(uri, "generalize")),
-		reg_comm('russell.generalizeTheorem', () => processRussellTheorem("generalize")),
+		reg_comm('russell.generalizeFile', (uri) => 
+			processRussellFile(uri, "generalize").then(
+				(data : string[]) => {
+					if (data.length > 0) {
+						vscode.workspace.openTextDocument({'language': 'russell', 'content': data.join('\n\n')});
+					}
+				},
+				vscode.window.showErrorMessage
+			)
+		),
+		reg_comm('russell.generalizeTheorem', () =>
+			processRussellTheorem("generalize").then(
+				(data : string[]) => {
+					if (data.length > 0) {
+						vscode.workspace.openTextDocument({'language': 'russell', 'content': data.join('\n\n')});
+					}
+				},
+				vscode.window.showErrorMessage
+			)
+		),
 		reg_comm('russell.startHttpServer', startHttpServer),
 		reg_comm('russell.stopHttpServer', stopHttpServer),
 		reg_comm('russell.restartLspServer', startLspClient),
@@ -258,26 +276,26 @@ export function deactivate() {
     }
 }
 
-function processRussellFile(uri : vscode.Uri, action : string): void {
+function processRussellFile<T>(uri : vscode.Uri, action : string): Promise<T> {
 	if (!uri) {
 		uri = vscode.window.activeTextEditor.document.uri;
 	}
-	processRussell(uri, uri.fsPath, action);
+	return processRussell(uri, uri.fsPath, action);
 }
 
-function processRussellTheorem(action : string): void {
+function processRussellTheorem<T>(action : string): Promise<T> {
 	let uri = vscode.window.activeTextEditor.document.uri;
 	let pos = vscode.window.activeTextEditor.selection.active;
 	if (pos instanceof vscode.Position) {
 		let range = vscode.window.activeTextEditor.document.getWordRangeAtPosition(pos);
 		let target = vscode.window.activeTextEditor.document.getText(range);
-		processRussell(uri, target, action);
+		return processRussell(uri, target, action);
 	}
 }
 
-function processRussell(uri : vscode.Uri, target : string, action : string): void {
+function processRussell<T>(uri : vscode.Uri, target : string, action : string): Promise<T> {
 	russellChannel.show(true);
-	client.sendRequest("workspace/executeCommand", { 
+	return client.sendRequest("workspace/executeCommand", { 
 		command : "command", 
 		arguments: [
 			"read file=" + uri.fsPath + ";\n" +
