@@ -175,7 +175,7 @@ function checkHttpServerStatus(initial: boolean) {
 function outputHttpServerMemStats() {
 	client.sendRequest("workspace/executeCommand", { 
 		command : "command", 
-		arguments : ["stats-mem"]
+		arguments : ["stats-mem do_not_log_this=1"]
 	}).then(
 		(data : any) => {
 			const mem_stats = num2memory(data.used) + " + " + num2memory(data.free) + " free = " + num2memory(data.total);
