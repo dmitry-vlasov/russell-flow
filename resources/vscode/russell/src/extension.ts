@@ -7,30 +7,32 @@ import {
 	LanguageClient, LanguageClientOptions, RevealOutputChannelOn, ServerOptions
 } from 'vscode-languageclient/node';
 import { MathEntity, MathProvider } from "./mathProvider";
+import { ProverProvider } from "./proverProvider";
 import * as tools from "./tools";
 import { num2memory } from './tools';
 
 const isPortReachable = require('is-port-reachable');
 
 let client: LanguageClient = null;
-let russellChannel : vscode.OutputChannel = null;
-let serverChannel : vscode.OutputChannel = null;
+let russellChannel: vscode.OutputChannel = null;
+let serverChannel: vscode.OutputChannel = null;
 let serverStatusBarItem: vscode.StatusBarItem;
-let httpServer : ChildProcess;
-let httpServerOnline : boolean = false;
+let httpServer: ChildProcess;
+let httpServerOnline: boolean = false;
 let mathProvider = new MathProvider();
+let proverProvider: ProverProvider = null;
 
 export function activate(context: vscode.ExtensionContext) {	
 	serverStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
 	serverStatusBarItem.command = 'russell.toggleHttpServer';
-	const reg_comm = (name : string, fn : any) => vscode.commands.registerCommand(name, fn);
+	const reg_comm = (name: string, fn: any) => vscode.commands.registerCommand(name, fn);
 	context.subscriptions.push(
 		serverStatusBarItem,
 		reg_comm('russell.verifyFile', (uri) => processRussellFile(uri, "verify")),
-		reg_comm('russell.verifyTheorem', () => processRussellTheorem("verify")),
+		reg_comm('russell.verifyTheorem', () => processRussellTarget("verify")),
 		reg_comm('russell.reproveFile', (uri) => processRussellFile(uri, "reprove-oracle")),
 		reg_comm('russell.metamathFile', (uri) => verifyMetamath(uri)),
-		reg_comm('russell.reproveTheorem', () => processRussellTheorem("reprove-oracle")),
+		reg_comm('russell.reproveTheorem', () => processRussellTarget("reprove-oracle")),
 		reg_comm('russell.generalizeFile', (uri) => 
 			processRussellFile(uri, "generalize").then(
 				(data: any) => {
@@ -42,7 +44,7 @@ export function activate(context: vscode.ExtensionContext) {
 			)
 		),
 		reg_comm('russell.generalizeTheorem', () =>
-			processRussellTheorem("generalize").then(
+			processRussellTarget("generalize").then(
 				(data : any) => {
 					if (data && data.theorems && data.theorems.length > 0) {
 						vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + data.theorems.join('\n\n')});
@@ -51,6 +53,26 @@ export function activate(context: vscode.ExtensionContext) {
 				vscode.window.showErrorMessage
 			)
 		),
+		reg_comm('russell.prove', () => {
+			proverProvider = new ProverProvider();
+			client.onNotification("prover/proved", (proved : any) => {
+				if (proved) {
+					vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + proved});
+				}
+				client.onNotification("prover/proved", () => {});
+			});
+			processRussellPosition("prove-start").then(
+				(data : any) => {
+					if (data) {
+						const proof = proverProvider.update(data);
+						if (proof) {
+							vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + proof});
+						}
+					}
+				},
+				vscode.window.showErrorMessage
+			)
+		}),
 		reg_comm('russell.startHttpServer', startHttpServer),
 		reg_comm('russell.stopHttpServer', stopHttpServer),
 		reg_comm('russell.restartLspServer', startLspClient),
@@ -58,7 +80,8 @@ export function activate(context: vscode.ExtensionContext) {
 		reg_comm('russell.findSymbol', findSymbol),
 		reg_comm('russell.execCommand', execCommand),
 		reg_comm('russell.gotoLocation', gotoLocation),
-		reg_comm('russell.refreshMath', mathInfo)
+		reg_comm('russell.refreshMath', mathInfo),
+		reg_comm('russell.proverExpand', proverExpand)
 	);
 
 	russellChannel = vscode.window.createOutputChannel("Russell output");
@@ -78,7 +101,20 @@ function mathInfo(): void {
 	);
 }
 
-function removeAllSpaces(str : string) : string { 
+function proverExpand(id : number): void {
+	client.sendRequest("workspace/executeCommand", { command: "prover-expand", arguments: ["id=" + id] }).then(
+		(data : any) => {
+			if (data) {
+				const proof = proverProvider.update(data);
+				if (proof) {
+					vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + proof});
+				}
+			}
+		}
+	);
+}
+
+function removeAllSpaces(str: string) : string { 
     return str.replace(/[\r\n\t ]+/gm, ''); 
 } 
 
@@ -283,14 +319,26 @@ function processRussellFile<T>(uri : vscode.Uri, action : string): Promise<T> {
 	return processRussell(uri, uri.fsPath, action);
 }
 
-function processRussellTheorem<T>(action : string): Promise<T> {
+function processRussellTarget<T>(action : string): Promise<T> {
 	let uri = vscode.window.activeTextEditor.document.uri;
 	let pos = vscode.window.activeTextEditor.selection.active;
-	if (pos instanceof vscode.Position) {
-		let range = vscode.window.activeTextEditor.document.getWordRangeAtPosition(pos);
-		let target = vscode.window.activeTextEditor.document.getText(range);
-		return processRussell(uri, target, action);
-	}
+	let range = vscode.window.activeTextEditor.document.getWordRangeAtPosition(pos);
+	let target = vscode.window.activeTextEditor.document.getText(range);
+	return processRussell(uri, target, action);
+}
+
+function processRussellPosition<T>(action : string): Promise<T> {
+	let uri = vscode.window.activeTextEditor.document.uri;
+	let pos = vscode.window.activeTextEditor.selection.active;
+	russellChannel.show(true);
+	return client.sendRequest("workspace/executeCommand", { 
+		command : "command", 
+		arguments: [
+			"read file=" + uri.fsPath + ";\n" +
+			"conf verbose=1;\n" + 
+			action + " line=" + pos.line + " col=" + pos.character + ";"
+		] 
+	});
 }
 
 function processRussell<T>(uri : vscode.Uri, target : string, action : string): Promise<T> {
