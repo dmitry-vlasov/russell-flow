@@ -29,14 +29,69 @@ ruCommProveStart = RuComm(
 	ruRunProveStart
 );
 
-// ruFindPositioned(file : string, line : int, col : int, env : RuEnv) -> Maybe<RuPositioned>;
+RuStepInProof(
+	proof : RuProof,
+	step : RuStep
+);
+
+RuStepPath(
+	theorem : RuTheorem,
+	path : [RuStepInProof]
+);
+
+ruStepPath2s(step_path : RuStepPath) -> string {
+	"theorem " + id2s(step_path.theorem.info.id) + "; " +
+	superglue(step_path.path, \sp -> i2s(sp.step.ind), ", ");
+}
+
+ruStepPath(path : [RuPositioned]) -> Maybe<RuStepPath> {
+	if (length(path) < 3) None() else {
+		theorem = path[0];
+		switch (theorem) {
+			RuTheorem(__,__,__,__): {
+				proof_steps = tail(path);
+				pair = unzipi(proof_steps, \i,__ -> i % 2 == 0);
+				if (length(pair.first) != length(pair.second)) None() else {
+					proofs = filtermap(pair.first, \proof -> switch (proof) {
+						RuProof(__,__,__): Some(proof);
+						default: None();
+					});
+					steps = filtermap(pair.second, \step -> switch (step) {
+						RuStep(__,__,__,__,__,__): Some(step);
+						default: None();
+					});
+					if (length(proofs) != length(pair.first) || 
+						length(steps) != length(pair.second)) None() else {
+						if (length(proofs) != length(steps)) None() else {
+							Some(RuStepPath(
+								theorem, 
+								zipWith(proofs, steps, \proof, step -> RuStepInProof(proof, step))
+							));
+						}
+					}
+				}
+			}
+			default: None();
+		}
+	}
+}
+
+ruStepPathPremises(step_path : RuStepPath) -> [RuPremise] {
+	concat(step_path.theorem.stat.hyps, 
+		concatA(map(step_path.path, \ps ->
+			take(ps.proof.steps, ps.step.ind))
+		)
+	);
+}
 
 ruRunProveStart(unit : RuUnit) -> Maybe<RuState> {
 	env = ruUnitEnv(unit);
 	state = unit.state;
 	task = unit.task;
 	conf = state.conf;
+	math = ruMathFromSources(state.ru, env);
 	th_name = lookupTreeDef(task.args, "theorem", "");
+	time_limit = s2d(lookupTreeDef(task.args, "time-limit", "-1.0"));
 	if (th_name != "") {
 		ruRunProveTheoremStart(unit, th_name);
 	} else {
@@ -46,28 +101,52 @@ ruRunProveStart(unit : RuUnit) -> Maybe<RuState> {
 					Some(path): {
 						if (length(path) == 0) {
 							env.out.onMessage("No entities are found at location " + ruLineCol2s(lc));
+							Some(state);
 						} else {
-							step = lastElement(path, ruNoAxiom);
-							switch (step) {
-								RuStep(__,__,__,__,__,__): {
-									
+							switch (ruStepPath(path)) {
+								Some(step_path): {
+									timer = ruMakeTimer();
+									goal = step_path.path[length(step_path.path) - 1];
+									msg = "start proving step: '" + ruStepPath2s(step_path) + "'" + 
+										(if (time_limit > 0.0) ", time limit: " + ruTime2s(time_limit) else "");
+									if (ruVerbose(conf) > 0) {
+										env.out.onMessage(
+											"start proving step: '" + ruStepPath2s(step_path) + "'" + 
+											(if (time_limit > 0.0) ", time limit: " + ruTime2s(time_limit) else "")
+										);
+									}
+									prover_task = RuProverTask(
+										"proving step: '" + ruStepPath2s(step_path) + "'",
+										ruStepPathPremises(step_path),
+										goal.step,
+									);
+									index = ruInitTheoremAssertionsIndex(step_path.theorem, math, env);
+									prover_env = ruInitProver(prover_task, math, env, index, time_limit);
+									Some(RuState(state with 
+										prover = Some(RuProverState(step_path.theorem, prover_env)),
+										vars = setTree(state.vars, 
+											"prove-start.time", ValDouble(ruTimePassed(timer))
+										)
+									));
 								}
-								default: {
-									env.out.onMessage("Proof step expected, but " + ruPositionedKind(step) + " is found");
+								None(): {
+									env.out.onMessage("Proof step path expected, but " + strGlue(map(path, ruPositioned2s), ", ") + " is found");
+									Some(state);
 								}
 							}
 						}
 					}
 					None(): {
 						env.out.onMessage("No entities are found at location " + ruLineCol2s(lc));
+						Some(state);
 					}
 				}
 			}
 			None(): {
 				env.out.onMessage("No target for proving is provided");
+				Some(state);
 			}
 		}
-		Some(state);
 	}
 }
 
