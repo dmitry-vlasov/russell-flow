@@ -30,26 +30,23 @@ RuProverProp(
 export interface PropEntity {
 	id: number;
 	assertion: string;
-	proofs: number;
+	proofs: string[];
 	children : HypEntity[];
-	parent: number;
-	tooltip: string;
+	grand: number;
 }
 
 export interface HypEntity {
-	id: number;
+	ind: number;
 	expr: string;
-	proofs: number;
+	proofs: string[];
 	children : number[];
 	parent: number;
-	tooltip: string;
 }
 
 export interface RootEntity {
 	expr: string;
 	proofs: string[];
 	children : number[];
-	tooltip: string;
 }
 
 export interface ProofVariantTree {
@@ -59,13 +56,12 @@ export interface ProofVariantTree {
 
 // Internal data structure for a tree node
 
-export type NodeKind = 'prop' | 'hyp';
+export type NodeKind = 'prop' | 'hyp' | 'root';
 
 export interface NodeEntity {
 	id: number;
 	kind: NodeKind;
 	label: string;
-	proofs: number;
 	children : number[];
 	parent: number;
 	tooltip: string;
@@ -91,7 +87,7 @@ export class ProverProvider {
 			vscode.window.showErrorMessage("error wile parsing JSON:\n" + data);
 		}
 		this.provider.update(tree);
-		return (tree.root.proofs.length == 0) ? undefined : tree.root.proofs[0];
+		return (tree.root.proofs.length == 0) ? null : tree.root.proofs[0];
 	}
 }
 
@@ -100,11 +96,12 @@ class ProofVariantProvider implements vscode.TreeDataProvider<NodeEntity> {
 	private _onDidChangeTreeData: vscode.EventEmitter<NodeEntity> = new vscode.EventEmitter<NodeEntity>();
 	readonly onDidChangeTreeData: vscode.Event<NodeEntity> = this._onDidChangeTreeData.event;
 
-	private nodes: Map<number, NodeEntity> = new Map();
+	private props: Map<number, PropEntity> = new Map();
+	private root: RootEntity;
 
 	constructor() { }
 	update(tree : ProofVariantTree): void {
-		const root = <NodeEntity> {
+		/*const root = <NodeEntity> {
 			'id': 0,
 			'kind': 'hyp',
 			'label': tree.root.expr,
@@ -134,39 +131,144 @@ class ProofVariantProvider implements vscode.TreeDataProvider<NodeEntity> {
 				'label': prop.assertion,
 				'proofs': prop.proofs,
 				'children' : prop_children.map(child => child.id),
-				'parent': -1,
+				'parent': prop.parent,
 				'tooltip': prop.tooltip
 			});
-		});
+		});*/
+		this.root = tree.root;
+		tree.nodes.forEach(prop => this.props.set(prop.id, prop));
+		const root = <NodeEntity> {
+			'id': 0,
+			'kind': 'root',
+			'label': tree.root.expr,
+			'children' : tree.root.children,
+			'parent': -1,
+			'tooltip': tree.root.proofs.join('\n')
+		};
 		this._onDidChangeTreeData.fire(root);
 	}
+	
+/*
+export type NodeKind = 'prop' | 'hyp';
+
+export interface NodeEntity {
+	id: number;
+	kind: NodeKind;
+	label: string;
+	proofs: number;
+	children : number[];
+	parent: number;
+	tooltip: string;
+}
+
+*/
 
 	getChildren(item: NodeEntity): Thenable<NodeEntity[]> {
-		if (this.nodes.has(item.id)){
-			return Promise.resolve(item.children.map((id) => this.nodes.get(id)));
+		if (item.kind == 'root') {
+			return Promise.resolve(
+				item.children.map((id) => propEntity2Node(this.props.get(id)))
+			);
+		} else if (item.kind == 'prop') {
+			if (this.props.has(item.id)){
+				const prop = this.props.get(item.id);
+				return Promise.resolve(prop.children.map(hypEntity2Node));
+			} else {
+				return Promise.resolve([]);
+			}
 		} else {
-			return Promise.resolve([]);
+			return Promise.resolve(
+				item.children.map((id) => propEntity2Node(this.props.get(id)))
+			);
+		}
+	}
+
+	getParent(item: NodeEntity): Thenable<NodeEntity> {
+		if (item.kind == 'root') {
+			return Promise.resolve(null);
+		} else if (item.kind == 'prop') {
+			if (this.props.has(item.id)){
+				const prop = this.props.get(item.id);
+				if (prop.grand == -1) {
+					return Promise.resolve(rootEntity2Node(this.root));
+				} else {
+					const grand =  this.props.get(prop.grand);
+					return Promise.resolve(hypEntity2Node(grand.children[item.id]));
+				}
+			} else {
+				return Promise.resolve(null);
+			}
+		} else {
+			const parent = this.props.get(item.parent);
+			return Promise.resolve(propEntity2Node(parent));
 		}
 	}
 
 	getTreeItem(item: NodeEntity): vscode.TreeItem {
-		if (this.nodes.has(item.id)) {
-			const node = this.nodes.get(item.id);
+		if (item.kind == 'root') {
 			let treeItem: vscode.TreeItem = new vscode.TreeItem(
-				node.label, 
+				item.label, 
 				vscode.TreeItemCollapsibleState.Collapsed
 			);
-			if (item.kind == 'prop') {
+			treeItem.tooltip = item.tooltip;
+			return treeItem;
+		} else if (item.kind == 'prop') {
+			if (this.props.has(item.id)) {
+				const prop = this.props.get(item.id);
+				let treeItem: vscode.TreeItem = new vscode.TreeItem(
+					item.label, 
+					vscode.TreeItemCollapsibleState.Collapsed
+				);
 				treeItem.command = {
 					command: 'russell.proverExpand', 
 					title: 'expand the node',
 					arguments: [item.id]
 				};
-			}
+				treeItem.tooltip = item.tooltip;
+				return treeItem;
+			} 
+		} else {
+			let treeItem: vscode.TreeItem = new vscode.TreeItem(
+				item.label, 
+				vscode.TreeItemCollapsibleState.Collapsed
+			);
 			treeItem.tooltip = item.tooltip;
 			return treeItem;
-		} else {
-			return null;
 		}
+	}
+}
+
+function propEntity2Node(prop : PropEntity): NodeEntity {
+	return <NodeEntity> {
+		'id': prop.id,
+		'kind': 'prop',
+		'label': prop.assertion,
+		'proofs': prop.proofs,
+		'children' : [],
+		'parent': -1,
+		'tooltip': prop.proofs.join('\n')
+	}
+}
+
+function hypEntity2Node(hyp : HypEntity): NodeEntity {
+	return <NodeEntity> {
+		'id': hyp.ind,
+		'kind': 'hyp',
+		'label': hyp.expr,
+		'proofs': hyp.proofs,
+		'children' : hyp.children,
+		'parent': hyp.parent,
+		'tooltip': hyp.proofs.join('\n')
+	}
+}
+
+function rootEntity2Node(root : RootEntity): NodeEntity {
+	return <NodeEntity> {
+		'id': -1,
+		'kind': 'root',
+		'label': root.expr,
+		'proofs': root.proofs,
+		'children' : root.children,
+		'parent': -1,
+		'tooltip': root.proofs.join('\n')
 	}
 }
