@@ -17,7 +17,7 @@ export {
 	// Mapping function: transforms (possibly) a decl. If None is returned, old one is kept.
 	RuMapFn(
 		info : RuMapFnInfo,
-		func : (RuDecl, double) -> Maybe<RuDecl>
+		func : (RuDecl, double, RuEnv) -> Maybe<RuDecl>
 	);
 
 	// Map 'f.func' to the decls from 'target' task option. 
@@ -64,13 +64,13 @@ ruMakeMapFnStats(time_limit : double, total : int, delta, info : RuMapFnInfo, ou
 	);
 }
 
-ruWrapFnWithProgress(f : RuMapFn, stats : RuMapFnStats, env : RuEnv) -> (RuDecl, double) -> Maybe<RuDecl> {
-	\decl, time_limit -> {
+ruWrapFnWithProgress(f : RuMapFn, stats : RuMapFnStats) -> (RuDecl, double, RuEnv) -> Maybe<RuDecl> {
+	\decl, time_limit, env -> {
 		if (ruVerbose(env.conf) >= 3) {
 			env.out.onMessage("\t\tTime limit on decl '" + id2s(decl.info.id) + "': " + ruTime2s(time_limit));
 		}
 		timer = ruMakeTimer();
-		ret = f.func(decl, time_limit);
+		ret = f.func(decl, time_limit, env);
 		atomicRefIntAddition(stats.progress.counter, 1);
 		if (isSome(ret)) {
 			atomicRefIntAddition(stats.was_mapped, 1);
@@ -91,7 +91,7 @@ ruMapDeclsSequentially(decls : [RuDecl], f : RuMapFn, time_limit : double, timer
 	sum_measure = ruSumDoublesFromArray(measures);
 	foldi(decls, math, \i, acc, d ->
 		eitherMap(
-			f.func(d, time_limit * measures[i] / sum_measure),
+			f.func(d, time_limit * measures[i] / sum_measure, env),
 			\mapped_d -> ruMathReplaceDecl(acc, mapped_d, env),
 			acc
 		)
@@ -111,11 +111,11 @@ ruMapDeclsConcurrently(decls : [RuDecl], f : RuMapFn, time_limit : double, timer
 ruMapDeclsConcurrentlyAll(decls : [RuDecl], f : RuMapFn, time_limit : double, timer : RuTimer, math : RuMath, env : RuEnv) -> RuMath {
 	measures = ruDecls2Measures(decls, f);
 	sum_measure = ruSumDoublesFromArray(measures);
-	mapped = filtermap(ruConcurrent(mapi(decls, \i, d -> \ -> {
+	mapped = filtermap(ruConcurrent(mapi(decls, \i, d -> \cf -> {
 		if (ruTimeLeft(timer) <= 0.0) None() else {
-			f.func(d, time_limit * i2d(availableProcessors()) * measures[i] / sum_measure)
+			f.func(d, time_limit * i2d(availableProcessors()) * measures[i] / sum_measure, RuEnv(env with conf = cf))
 		}
-	})), idfn);
+	}), env.conf), idfn);
 	fold(mapped, math, \acc, decl -> ruMathReplaceDecl(acc, decl, env));
 }
 
@@ -137,8 +137,8 @@ ruMapDeclsConcurrentlyByChunks(chunks : [[RuDecl]], f : RuMapFn, time_limit : do
 			time_left_on_chunk = time_planned_on_chunk * left_time / planned_left[n];
 			scaled_time_limit_on_chunk = time_left_on_chunk * i2d(availableProcessors());
 			mapped = ruConcurrent(mapi(chunk, \i, decl -> 
-				\-> f.func(decl, scaled_time_limit_on_chunk * chunk_measures[n][i] / sum_chunk_measures[n])
-			));
+				\cf -> f.func(decl, scaled_time_limit_on_chunk * chunk_measures[n][i] / sum_chunk_measures[n], RuEnv(env with conf = cf))
+			), env.conf);
 			fold(mapped, acc, \ac, d -> 
 				eitherMap(d,
 					\mapped_d -> ruMathReplaceDecl(ac, mapped_d, env),
@@ -164,7 +164,7 @@ ruMapFnComm(unit : RuUnit, f : RuMapFn) -> RuState {
 	decls = filter(ruTargetDecls(target, math, env), f.info.pred);
 	time_limit = ruCalcTimeLimit(decls, f, task, conf);
 	stats = ruMakeMapFnStats(time_limit, length(decls), ruProgressUpdateMs(task, conf), f.info, out);
-	prog_f = RuMapFn(f with func = ruWrapFnWithProgress(f, stats, env));
+	prog_f = RuMapFn(f with func = ruWrapFnWithProgress(f, stats));
 	ruMapDeclsStartMessage(decls, time_limit, env);
 	if (ruVerbose(conf) > 0) {
 		ruTrackProgress(stats.progress);
