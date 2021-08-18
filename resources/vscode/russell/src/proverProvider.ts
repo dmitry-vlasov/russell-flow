@@ -37,14 +37,16 @@ export interface PropEntity {
 
 export interface HypEntity {
 	ind: number;
-	expr: string;
+	expr_plain: string;
+	expr_multyline: string;
 	proofs: string[];
 	children : number[];
 	parent: number;
 }
 
 export interface RootEntity {
-	expr: string;
+	expr_plain: string;
+	expr_multyline: string;
 	proofs: string[];
 	children : number[];
 }
@@ -79,15 +81,22 @@ export class ProverProvider {
 	//	vscode.window. registerTreeDataProvider("russell-prover", this.provider);
 	//}
 
-	public update(data : string): string | null {
-		var tree: ProofVariantTree;
+	public update(data : any): string | null {
+		var tree: ProofVariantTree = null;
+		const json = (typeof data == 'object') ? <JSON>data : JSON.parse(data.toString())
 		try {
-			tree = <ProofVariantTree>JSON.parse(data);
+			tree = <ProofVariantTree>json;
 		} catch {
-			vscode.window.showErrorMessage("error wile parsing JSON:\n" + data);
+			vscode.window.showErrorMessage("error wile parsing JSON:\n" + JSON.stringify(data));
 		}
-		this.provider.update(tree);
-		return (tree.root.proofs.length == 0) ? null : tree.root.proofs[0];
+		if (!tree) {
+			vscode.window.showErrorMessage("update of a prover tree failed:\n" + JSON.stringify(data));
+			return null;	
+		} else {
+			//vscode.window.showErrorMessage("A prover tree:\n" + JSON.stringify(tree));
+			this.provider.update(tree);
+			return (tree.root.proofs.length == 0) ? null : tree.root.proofs[0];
+		}
 	}
 }
 
@@ -137,14 +146,16 @@ class ProofVariantProvider implements vscode.TreeDataProvider<NodeEntity> {
 		});*/
 		this.root = tree.root;
 		tree.nodes.forEach(prop => this.props.set(prop.id, prop));
-		const root = <NodeEntity> {
+		const root = rootEntity2Node(tree.root);
+		/*<NodeEntity> {
 			'id': 0,
 			'kind': 'root',
-			'label': tree.root.expr,
+			'label': tree.root.expr_plain,
 			'children' : tree.root.children,
 			'parent': -1,
-			'tooltip': tree.root.proofs.join('\n')
-		};
+			'tooltip': tree.root.expr_multyline + 
+				(tree.root.proofs.length == 0 ? "" : "\n" + tree.root.proofs.join('\n'))
+		};*/
 		this._onDidChangeTreeData.fire(root);
 	}
 	
@@ -163,76 +174,107 @@ export interface NodeEntity {
 
 */
 
-	getChildren(item: NodeEntity): Thenable<NodeEntity[]> {
-		if (item.kind == 'root') {
-			return Promise.resolve(
-				item.children.map((id) => propEntity2Node(this.props.get(id)))
-			);
-		} else if (item.kind == 'prop') {
-			if (this.props.has(item.id)){
-				const prop = this.props.get(item.id);
-				return Promise.resolve(prop.children.map(hypEntity2Node));
+	getChildren(item?: NodeEntity): Thenable<NodeEntity[]> {
+		/*if (!item) {
+			vscode.window.showErrorMessage("Null item (getChildren)");
+			return Promise.reject();
+		} else {*/
+			vscode.window.showErrorMessage("getChildren of: " + item);
+			if (!item) {
+				return Promise.resolve([rootEntity2Node(this.root)]);
+			} else if (item.kind == 'root') {
+				return Promise.resolve(
+					item.children.map((id) => propEntity2Node(this.props.get(id)))
+				);
+			} else if (item.kind == 'prop') {
+				vscode.window.showErrorMessage("getChildren of: prop");
+				if (this.props.has(item.id)){
+					if (!this.props.has(item.id)) {
+						vscode.window.showErrorMessage("Prop " + JSON.stringify(item) + " with " + item.id + " is absent");
+					}
+					const prop = this.props.get(item.id);
+					return Promise.resolve(prop.children.map(hypEntity2Node));
+				} else {
+					return Promise.resolve([]);
+				}
 			} else {
-				return Promise.resolve([]);
+				vscode.window.showErrorMessage("getChildren of: hyp");
+				return Promise.resolve(
+					item.children.map((id) => {
+						if (!this.props.has(id)) {
+							vscode.window.showErrorMessage("Hyp " + JSON.stringify(item) + " child " + id + " is absent");
+						}
+						return propEntity2Node(this.props.get(id));
+					})
+				);
 			}
-		} else {
-			return Promise.resolve(
-				item.children.map((id) => propEntity2Node(this.props.get(id)))
-			);
-		}
+		//}
 	}
 
 	getParent(item: NodeEntity): Thenable<NodeEntity> {
-		if (item.kind == 'root') {
-			return Promise.resolve(null);
-		} else if (item.kind == 'prop') {
-			if (this.props.has(item.id)){
-				const prop = this.props.get(item.id);
-				if (prop.grand == -1) {
-					return Promise.resolve(rootEntity2Node(this.root));
+		if (!item) {
+			vscode.window.showErrorMessage("Null item (getParent)");
+			return Promise.reject();
+		} else {
+			vscode.window.showErrorMessage("getParent of: " + JSON.stringify(item));
+			if (item.kind == 'root') {
+				return Promise.resolve(null);
+			} else if (item.kind == 'prop') {
+				if (this.props.has(item.id)){
+					const prop = this.props.get(item.id);
+					if (prop.grand == -1) {
+						return Promise.resolve(rootEntity2Node(this.root));
+					} else {
+						const grand =  this.props.get(prop.grand);
+						return Promise.resolve(hypEntity2Node(grand.children[item.id]));
+					}
 				} else {
-					const grand =  this.props.get(prop.grand);
-					return Promise.resolve(hypEntity2Node(grand.children[item.id]));
+					return Promise.resolve(null);
 				}
 			} else {
-				return Promise.resolve(null);
+				const parent = this.props.get(item.parent);
+				return Promise.resolve(propEntity2Node(parent));
 			}
-		} else {
-			const parent = this.props.get(item.parent);
-			return Promise.resolve(propEntity2Node(parent));
 		}
 	}
 
 	getTreeItem(item: NodeEntity): vscode.TreeItem {
-		if (item.kind == 'root') {
-			let treeItem: vscode.TreeItem = new vscode.TreeItem(
-				item.label, 
-				vscode.TreeItemCollapsibleState.Collapsed
-			);
-			treeItem.tooltip = item.tooltip;
-			return treeItem;
-		} else if (item.kind == 'prop') {
-			if (this.props.has(item.id)) {
-				const prop = this.props.get(item.id);
+		if (!item) {
+			vscode.window.showErrorMessage("Null item (getTreeItem)");
+			return null;
+		} else {
+			vscode.window.showErrorMessage("getTreeItem of: " + JSON.stringify(item));
+			if (item.kind == 'root') {
 				let treeItem: vscode.TreeItem = new vscode.TreeItem(
 					item.label, 
 					vscode.TreeItemCollapsibleState.Collapsed
 				);
-				treeItem.command = {
-					command: 'russell.proverExpand', 
-					title: 'expand the node',
-					arguments: [item.id]
-				};
 				treeItem.tooltip = item.tooltip;
 				return treeItem;
-			} 
-		} else {
-			let treeItem: vscode.TreeItem = new vscode.TreeItem(
-				item.label, 
-				vscode.TreeItemCollapsibleState.Collapsed
-			);
-			treeItem.tooltip = item.tooltip;
-			return treeItem;
+			} else if (item.kind == 'prop') {
+				if (this.props.has(item.id)) {
+					const prop = this.props.get(item.id);
+					let treeItem: vscode.TreeItem = new vscode.TreeItem(
+						item.label, 
+						vscode.TreeItemCollapsibleState.Collapsed
+					);
+					treeItem.command = {
+						command: 'russell.proverExpand', 
+						title: 'expand the node',
+						arguments: [item.id]
+					};
+					treeItem.tooltip = item.tooltip;
+					treeItem.contextValue = 'russell-prover-prop';
+					return treeItem;
+				} 
+			} else {
+				let treeItem: vscode.TreeItem = new vscode.TreeItem(
+					item.label, 
+					vscode.TreeItemCollapsibleState.Collapsed
+				);
+				treeItem.tooltip = item.tooltip;
+				return treeItem;
+			}
 		}
 	}
 }
@@ -253,11 +295,12 @@ function hypEntity2Node(hyp : HypEntity): NodeEntity {
 	return <NodeEntity> {
 		'id': hyp.ind,
 		'kind': 'hyp',
-		'label': hyp.expr,
+		'label': hyp.expr_plain,
 		'proofs': hyp.proofs,
 		'children' : hyp.children,
 		'parent': hyp.parent,
-		'tooltip': hyp.proofs.join('\n')
+		'tooltip': hyp.expr_multyline + 
+			(hyp.proofs.length == 0 ? "" : "\n" + hyp.proofs.join('\n'))
 	}
 }
 
@@ -265,10 +308,11 @@ function rootEntity2Node(root : RootEntity): NodeEntity {
 	return <NodeEntity> {
 		'id': -1,
 		'kind': 'root',
-		'label': root.expr,
+		'label': root.expr_plain,
 		'proofs': root.proofs,
 		'children' : root.children,
 		'parent': -1,
-		'tooltip': root.proofs.join('\n')
+		'tooltip': root.expr_multyline + 
+			(root.proofs.length == 0 ? "" : "\n" + root.proofs.join('\n'))
 	}
 }

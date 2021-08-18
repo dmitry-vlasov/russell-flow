@@ -20,7 +20,7 @@ let serverStatusBarItem: vscode.StatusBarItem;
 let httpServer: ChildProcess;
 let httpServerOnline: boolean = false;
 let mathProvider = new MathProvider();
-let proverProvider: ProverProvider = null;
+let proverProvider : ProverProvider = null;
 
 export function activate(context: vscode.ExtensionContext) {	
 	serverStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
@@ -336,7 +336,7 @@ function processRussellPosition<T>(action : string): Promise<T> {
 		arguments: [
 			"read file=" + uri.fsPath + ";\n" +
 			"conf verbose=1;\n" + 
-			action + " line=" + pos.line + " col=" + pos.character + ";"
+			action + " file=" + uri.fsPath + " line=" + pos.line + " col=" + pos.character + ";"
 		] 
 	});
 }
@@ -362,7 +362,9 @@ function verifyMetamath(uri : vscode.Uri): void {
 		arguments: [
 			"read-ru   file=" + ru_file + ";\n" +
 			"ru-to-mm  file=" + ru_file + ";\n" +
+			//"conf-set  verb=2;\n" +
 			"write-mm  file=" + mm_file + " monolithic=1 strip-comments=1;\n" +
+			//"conf-set  verb=1;\n" +
 			"verify-mm file=" + mm_file + ";"
 		] 
 	});
