@@ -33,7 +33,8 @@ export {
 			sub       : Tree<RuVar, RuExp>,
 			outer     : Tree<RuVar, RuExp>,
 			children  : ref [RuProverExp],
-			parent    : RuProverHyp
+			parent    : RuProverHyp,
+			expanded  : ref bool
 		);
 		RuProverExp(
 			ind      : int,
@@ -50,22 +51,26 @@ export {
 
 	RuProverTree(
 		leafs : Tree<int, RuProverProp>,
+		nodes : Tree<int, RuProverProp>,
 		root  : RuProverRoot
 	);
 
 	ruProverNode2s(node : RuProverNode, math : RuMath) -> string;
 	ruProverTree2s(node : RuProverNode, math : RuMath) -> string;
 	ruProverNode2json(node : RuProverNode, math : RuMath, conf : RuConf) -> Json;
+	ruProverNodes2json(nodes : [RuProverNode], math : RuMath, conf : RuConf) -> Json;
 	ruProverTree2json(node : RuProverTree, math : RuMath, conf : RuConf) -> Json;
 	ruSizeProverTree(node : RuProverNode) -> int;
 
+	ruProverTreeDiff(tree1 : RuProverTree, tree2 : RuProverTree) -> [RuProverProp];
+
 	ruNoProverHyp = RuProverRoot(ref [], ruNoExp, ref []);
-	ruNoProverProp = RuProverProp(-1, ruNoAxiom, ref [], makeTree(), makeTree(), ref [], ruNoProverHyp);
+	ruNoProverProp = RuProverProp(-1, ruNoAxiom, ref [], makeTree(), makeTree(), ref [], ruNoProverHyp, ref false);
 }
 
 ruSizeProverTree(node : RuProverNode) -> int {
 	1 + switch (node) {
-		RuProverProp(__,__,__,__,__, children,__): fold(^children, 0, \ac, ch -> ac + ruSizeProverTree(ch));
+		RuProverProp(__,__,__,__,__, children,__,__): fold(^children, 0, \ac, ch -> ac + ruSizeProverTree(ch));
 		RuProverExp(__,__,__, children,__): fold(^children, 0, \ac, ch -> ac + ruSizeProverTree(ch));
 		RuProverRoot(__,__, children): fold(^children, 0, \ac, ch -> ac + ruSizeProverTree(ch));
 	}
@@ -101,8 +106,13 @@ ruMakeProofTree(proof : RuProverProof) -> RuProofTree {
 
 ruProverNode2s(node : RuProverNode, math : RuMath) -> string {
 	switch (node) {
-		RuProverProp(ind, ass, proofs, sub, outer, children, parent):
-			"Prop<ass=" + id2s(ass.info.id) + ", proofs_num=" + i2s(length(^proofs)) + ", children num:" + i2s(length(^children)) + ">" + 
+		RuProverProp(ind, ass, proofs, sub, outer, children, parent, expanded):
+			"Prop<" + 
+				"ass=" + id2s(ass.info.id) + ", " + 
+				"proofs_num=" + i2s(length(^proofs)) + ", " + 
+				"children_num=" + i2s(length(^children)) + ", " + 
+				"expanded=" + b2s(^expanded) +
+			">" + 
 			(if (length(^proofs) == 0) "" else
 				"\n" + strIndent(strGlue(map(^proofs, \p -> RuProofTree2s(ruMakeProofTree(p), math)), "\n"))
 			);
@@ -128,7 +138,7 @@ ruProverTree2s(node : RuProverNode, math : RuMath) -> string {
 ruProverNode2json(node : RuProverNode, math : RuMath, conf : RuConf) -> Json {
 	maxlen = s2i(lookupTreeDef(conf.opts, "maxlen-expr", "32"));
 	switch (node) {
-		RuProverProp(ind, ass, proofs, sub, outer, children, parent): {
+		RuProverProp(ind, ass, proofs, sub, outer, children, parent, expanded): {
 			/* export interface PropEntity {
 				id: number;
 				assertion: string;
@@ -138,6 +148,7 @@ ruProverNode2json(node : RuProverNode, math : RuMath, conf : RuConf) -> Json {
 				tooltip: string;
 			} */
 			expr = ruApplySubst(parent.expr, sub);
+			tooltip = ru2s(ass, math);
 			JsonObject([
 				Pair("id", JsonDouble(i2d(ind))),
 				Pair("assertion", JsonString(id2s(ass.info.id))),
@@ -154,7 +165,8 @@ ruProverNode2json(node : RuProverNode, math : RuMath, conf : RuConf) -> Json {
 						RuProverRoot(__,__,__): -1;
 					}
 				))),
-				Pair("tooltip", JsonString("TODO")),
+				Pair("expanded", JsonBool(^expanded)),
+				Pair("tooltip", JsonString(tooltip)),
 			]);
 		}
 		RuProverExp(ind, proofs, expr, children, parent): {
@@ -215,31 +227,34 @@ ruProverNode2json(node : RuProverNode, math : RuMath, conf : RuConf) -> Json {
 /*
 export interface ProofVariantTree {
 	nodes: PropEntity[],
-	root: RootEntity 
+	root?: RootEntity 
 }
 */
 
 ruProverTree2json(tree : RuProverTree, math : RuMath, conf : RuConf) -> Json {
 	JsonObject([
-		Pair("nodes", JsonArray(map(ruAllPropNodes(tree), \leaf -> ruProverNode2json(leaf, math, conf)))),
+		Pair("nodes", JsonArray(map(getTreeValues(tree.nodes), \leaf -> ruProverNode2json(leaf, math, conf)))),
 		Pair("root", ruProverNode2json(tree.root, math, conf)),
 	]);
 }
 
-ruAllPropNodes(tree : RuProverTree) -> [RuProverProp] {
-	list2array(ruDoAllPropNodes(makeList(), tree.root));
+ruProverNodes2json(nodes : [RuProverNode], math : RuMath, conf : RuConf) -> Json {
+	JsonObject([
+		Pair("nodes", JsonArray(map(nodes, \leaf -> ruProverNode2json(leaf, math, conf)))),
+	]);
 }
 
-ruDoAllPropNodes(acc : List<RuProverProp>, node : RuProverNode) -> List<RuProverProp> {
-	switch (node) {
-		RuProverProp(ind, ass, proofs, sub, outer, children, parent): {
-			fold(^children, Cons(node, acc), ruDoAllPropNodes);
+ruProverTreeDiff(tree1 : RuProverTree, tree2 : RuProverTree) -> [RuProverProp] {
+	filter(getTreeValues(tree2.nodes), \n2 ->
+		switch (lookupTree(tree1.nodes, n2.id)) {
+			Some(n1): ruRroverPropNodeChanged(n1, n2);
+			None(): true;
 		}
-		RuProverExp(ind, proofs, expr, children, parent): {
-			fold(^children, acc, ruDoAllPropNodes);
-		}
-		RuProverRoot(proofs, expr, children): {
-			fold(^children, acc, ruDoAllPropNodes);
-		}
-	}
+	);
+}
+
+ruRroverPropNodeChanged(n1 : RuProverProp, n2 : RuProverProp) -> bool {
+	length(^(n2.proofs)) != length(^(n1.proofs)) ||
+	length(^(n2.children)) != length(^(n1.children)) ||
+	^(n2.expanded) != ^(n2.expanded);
 }

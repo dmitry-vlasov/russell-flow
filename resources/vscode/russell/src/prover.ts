@@ -1,38 +1,17 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-/*
-RuProverProp(
-			id        : int,
-			assertion : RuAssertion,
-			proofs    : ref [RuProverProofProp],
-			sub       : Tree<RuVar, RuExp>,
-			outer     : Tree<RuVar, RuExp>,
-			children  : ref [RuProverExp],
-			parent    : RuProverHyp,
-		);
-		RuProverExp(
-			ind      : int,
-			proofs   : ref [RuProverProofHyp],
-			expr     : RuExp,
-			children : ref [RuProverProp],
-			parent   : RuProverProp,
-		);
-		RuProverRoot(
-			proofs   : ref [RuProverProofHyp],
-			expr     : RuExp,
-			children : ref [RuProverProp]
-		);
-
-*/
+import * as requests from './requests';
+import { LanguageClient } from 'vscode-languageclient/node';
 
 // Passed by a prover
-
 export interface PropEntity {
 	id: number;
 	assertion: string;
 	proofs: string[];
 	children : HypEntity[];
 	grand: number;
+	expanded: boolean;
+	tooltip : string;
 }
 
 export interface HypEntity {
@@ -42,6 +21,7 @@ export interface HypEntity {
 	proofs: string[];
 	children : number[];
 	parent: number;
+	tooltip : string;
 }
 
 export interface RootEntity {
@@ -49,11 +29,12 @@ export interface RootEntity {
 	expr_multyline: string;
 	proofs: string[];
 	children : number[];
+	tooltip : string;
 }
 
 export interface ProofVariantTree {
 	nodes: PropEntity[],
-	root: RootEntity 
+	root?: RootEntity 
 }
 
 // Internal data structure for a tree node
@@ -66,21 +47,21 @@ export interface NodeEntity {
 	label: string;
 	children : number[];
 	parent: number;
+	expanded: boolean;
 	tooltip: string;
 }
 
-
 export class ProverProvider {
-	private provider: ProofVariantProvider;
+	private provider = new ProofVariantProvider();
+	private client: LanguageClient = null;
 
 	public constructor() {
-		this.provider = new ProofVariantProvider();
 		vscode.window.registerTreeDataProvider("russell-prover", this.provider);
 	}
-	//public destroy(): void {
-	//	vscode.window. registerTreeDataProvider("russell-prover", this.provider);
-	//}
-
+	public setClient(client: LanguageClient) {
+		this.client = client;
+		this.provider.setClient(client);
+	}
 	public update(data : any): string | null {
 		var tree: ProofVariantTree = null;
 		const json = (typeof data == 'object') ? <JSON>data : JSON.parse(data.toString())
@@ -93,10 +74,35 @@ export class ProverProvider {
 			vscode.window.showErrorMessage("update of a prover tree failed:\n" + JSON.stringify(data));
 			return null;	
 		} else {
-			//vscode.window.showErrorMessage("A prover tree:\n" + JSON.stringify(tree));
+			//vscode.window.showInformationMessage("A prover tree:\n" + JSON.stringify(tree));
 			this.provider.update(tree);
-			return (tree.root.proofs.length == 0) ? null : tree.root.proofs[0];
 		}
+	}
+	public clear(): void {
+		this.provider.update({nodes: [], root: null});
+	}
+	public startProving(): void {
+		this.clear();
+		this.client.onNotification("prover/proved", (proved : any) => {
+			if (proved) {
+				vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + proved});
+			}
+			this.client.onNotification("prover/proved", () => {});
+		});
+		this.client.sendRequest("workspace/executeCommand", requests.filePositionCommand("prove-start")).then(
+			(data : any) => {
+				if (data) {
+					const proof = this.update(data);
+					if (proof) {
+						vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + proof});
+					}
+				}
+			},
+			vscode.window.showErrorMessage
+		)
+	}
+	public expandProp(node : NodeEntity): void {
+		this.provider.expandProp(node);
 	}
 }
 
@@ -105,110 +111,76 @@ class ProofVariantProvider implements vscode.TreeDataProvider<NodeEntity> {
 	private _onDidChangeTreeData: vscode.EventEmitter<NodeEntity> = new vscode.EventEmitter<NodeEntity>();
 	readonly onDidChangeTreeData: vscode.Event<NodeEntity> = this._onDidChangeTreeData.event;
 
+	private client: LanguageClient = null;
 	private props: Map<number, PropEntity> = new Map();
 	private root: RootEntity;
 
 	constructor() { }
-	update(tree : ProofVariantTree): void {
-		/*const root = <NodeEntity> {
-			'id': 0,
-			'kind': 'hyp',
-			'label': tree.root.expr,
-			'proofs': tree.root.proofs.length,
-			'children' : tree.root.children,
-			'parent': -1,
-			'tooltip': tree.root.tooltip
-		};
-		this.nodes.set(root.id, root);
-		let cur_hyp_id = tree.nodes.length + 1;
-		tree.nodes.forEach(prop => {
-			const prop_children = prop.children.map(
-				hyp => <NodeEntity> {
-					'id': cur_hyp_id ++,
-					'kind': 'hyp',
-					'label': hyp.expr,
-					'proofs': hyp.proofs,
-					'children': hyp.children,
-					'parent': prop.id,
-					'tooltip': hyp.tooltip
-				}
-			);
-			prop_children.forEach(child => this.nodes.set(child.id, child));
-			this.nodes.set(prop.id, {
-				'id': prop.id,
-				'kind': 'prop',
-				'label': prop.assertion,
-				'proofs': prop.proofs,
-				'children' : prop_children.map(child => child.id),
-				'parent': prop.parent,
-				'tooltip': prop.tooltip
-			});
-		});*/
-		this.root = tree.root;
-		tree.nodes.forEach(prop => this.props.set(prop.id, prop));
-		const root = rootEntity2Node(tree.root);
-		/*<NodeEntity> {
-			'id': 0,
-			'kind': 'root',
-			'label': tree.root.expr_plain,
-			'children' : tree.root.children,
-			'parent': -1,
-			'tooltip': tree.root.expr_multyline + 
-				(tree.root.proofs.length == 0 ? "" : "\n" + tree.root.proofs.join('\n'))
-		};*/
-		this._onDidChangeTreeData.fire(root);
+	public setClient(client: LanguageClient) {
+		this.client = client;
 	}
-	
-/*
-export type NodeKind = 'prop' | 'hyp';
-
-export interface NodeEntity {
-	id: number;
-	kind: NodeKind;
-	label: string;
-	proofs: number;
-	children : number[];
-	parent: number;
-	tooltip: string;
-}
-
-*/
+	public update(tree : ProofVariantTree): void {
+		if (tree.root) {
+			this.root = tree.root;
+		}
+		tree.nodes.forEach(prop => this.props.set(prop.id, prop));
+	}
+	public async expandProp(node : NodeEntity): Promise<void> {
+		const expand_command = { command: "command", arguments: ["conf verb=1; prove-expand nodes=" + node.id] };
+		return this.client.sendRequest("workspace/executeCommand",expand_command).then((data: any) => {
+			const update = <ProofVariantTree>data;
+			if (!update) {
+				vscode.window.showErrorMessage("update of a prover tree failed:\n" + JSON.stringify(data));
+				return Promise.reject();
+			} else {
+				vscode.window.showInformationMessage("A prover tree update:\n" + JSON.stringify(data));
+				this.update(data);
+				return Promise.resolve();
+			}
+		});
+	}
 
 	getChildren(item?: NodeEntity): Thenable<NodeEntity[]> {
-		/*if (!item) {
-			vscode.window.showErrorMessage("Null item (getChildren)");
-			return Promise.reject();
-		} else {*/
-			vscode.window.showErrorMessage("getChildren of: " + item);
-			if (!item) {
+		//vscode.window.showInformationMessage("getChildren of: " + item);
+		if (!item) {
+			if (this.root) {
 				return Promise.resolve([rootEntity2Node(this.root)]);
-			} else if (item.kind == 'root') {
-				return Promise.resolve(
-					item.children.map((id) => propEntity2Node(this.props.get(id)))
-				);
-			} else if (item.kind == 'prop') {
-				vscode.window.showErrorMessage("getChildren of: prop");
-				if (this.props.has(item.id)){
-					if (!this.props.has(item.id)) {
-						vscode.window.showErrorMessage("Prop " + JSON.stringify(item) + " with " + item.id + " is absent");
-					}
-					const prop = this.props.get(item.id);
-					return Promise.resolve(prop.children.map(hypEntity2Node));
+			} else {
+				return Promise.resolve([]);
+			}
+		} else if (item.kind == 'root') {
+			return Promise.resolve(
+				item.children.map((id) => propEntity2Node(this.props.get(id)))
+			);
+		} else if (item.kind == 'prop') {
+			//vscode.window.showErrorMessage("getChildren of: prop");
+			if (this.props.has(item.id)){
+				if (!this.props.has(item.id)) {
+					vscode.window.showErrorMessage("Prop " + JSON.stringify(item) + " with " + item.id + " is absent");
+				}
+				const prop = this.props.get(item.id);
+				const prop_children = () => {
+					return Promise.resolve(this.props.get(item.id).children.map(hypEntity2Node));
+				}
+				if (prop.expanded) {
+					return prop_children();
 				} else {
-					return Promise.resolve([]);
+					return this.expandProp(item).then(prop_children);
 				}
 			} else {
-				vscode.window.showErrorMessage("getChildren of: hyp");
-				return Promise.resolve(
-					item.children.map((id) => {
-						if (!this.props.has(id)) {
-							vscode.window.showErrorMessage("Hyp " + JSON.stringify(item) + " child " + id + " is absent");
-						}
-						return propEntity2Node(this.props.get(id));
-					})
-				);
+				return Promise.resolve([]);
 			}
-		//}
+		} else {
+			//vscode.window.showInformationMessage("getChildren of: hyp");
+			return Promise.resolve(
+				item.children.map((id) => {
+					if (!this.props.has(id)) {
+						vscode.window.showErrorMessage("Hyp " + JSON.stringify(item) + " child " + id + " is absent");
+					}
+					return propEntity2Node(this.props.get(id));
+				})
+			);
+		}
 	}
 
 	getParent(item: NodeEntity): Thenable<NodeEntity> {
@@ -216,7 +188,7 @@ export interface NodeEntity {
 			vscode.window.showErrorMessage("Null item (getParent)");
 			return Promise.reject();
 		} else {
-			vscode.window.showErrorMessage("getParent of: " + JSON.stringify(item));
+			//vscode.window.showInformationMessage("getParent of: " + JSON.stringify(item));
 			if (item.kind == 'root') {
 				return Promise.resolve(null);
 			} else if (item.kind == 'prop') {
@@ -240,10 +212,10 @@ export interface NodeEntity {
 
 	getTreeItem(item: NodeEntity): vscode.TreeItem {
 		if (!item) {
-			vscode.window.showErrorMessage("Null item (getTreeItem)");
+			//vscode.window.showErrorMessage("Null item (getTreeItem)");
 			return null;
 		} else {
-			vscode.window.showErrorMessage("getTreeItem of: " + JSON.stringify(item));
+			//vscode.window.showInformationMessage("getTreeItem of: " + JSON.stringify(item));
 			if (item.kind == 'root') {
 				let treeItem: vscode.TreeItem = new vscode.TreeItem(
 					item.label, 
@@ -287,7 +259,9 @@ function propEntity2Node(prop : PropEntity): NodeEntity {
 		'proofs': prop.proofs,
 		'children' : [],
 		'parent': -1,
-		'tooltip': prop.proofs.join('\n')
+		'expanded': prop.expanded,
+		'tooltip': prop.tooltip + 
+			(prop.proofs.length == 0 ? "" : "\n" + prop.proofs.join('\n'))
 	}
 }
 
@@ -299,7 +273,8 @@ function hypEntity2Node(hyp : HypEntity): NodeEntity {
 		'proofs': hyp.proofs,
 		'children' : hyp.children,
 		'parent': hyp.parent,
-		'tooltip': hyp.expr_multyline + 
+		'expanded': true,
+		'tooltip': hyp.tooltip + 
 			(hyp.proofs.length == 0 ? "" : "\n" + hyp.proofs.join('\n'))
 	}
 }
@@ -312,7 +287,8 @@ function rootEntity2Node(root : RootEntity): NodeEntity {
 		'proofs': root.proofs,
 		'children' : root.children,
 		'parent': -1,
-		'tooltip': root.expr_multyline + 
+		'expanded': true,
+		'tooltip': root.tooltip + 
 			(root.proofs.length == 0 ? "" : "\n" + root.proofs.join('\n'))
 	}
 }

@@ -6,10 +6,11 @@ import * as vscode from 'vscode';
 import { 
 	LanguageClient, LanguageClientOptions, RevealOutputChannelOn, ServerOptions
 } from 'vscode-languageclient/node';
-import { MathEntity, MathProvider } from "./mathProvider";
-import { ProverProvider } from "./proverProvider";
+import { MathEntity, MathProvider } from "./math";
+import * as prover from "./prover";
 import * as tools from "./tools";
 import { num2memory } from './tools';
+import * as requests from './requests';
 
 const isPortReachable = require('is-port-reachable');
 
@@ -20,11 +21,12 @@ let serverStatusBarItem: vscode.StatusBarItem;
 let httpServer: ChildProcess;
 let httpServerOnline: boolean = false;
 let mathProvider = new MathProvider();
-let proverProvider : ProverProvider = null;
+let proverProvider = new prover.ProverProvider();
 
 export function activate(context: vscode.ExtensionContext) {	
 	serverStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
 	serverStatusBarItem.command = 'russell.toggleHttpServer';
+	russellChannel = vscode.window.createOutputChannel("Russell output");
 	const reg_comm = (name: string, fn: any) => vscode.commands.registerCommand(name, fn);
 	context.subscriptions.push(
 		serverStatusBarItem,
@@ -33,46 +35,8 @@ export function activate(context: vscode.ExtensionContext) {
 		reg_comm('russell.reproveFile', (uri) => processRussellFile(uri, "reprove-oracle")),
 		reg_comm('russell.metamathFile', (uri) => verifyMetamath(uri)),
 		reg_comm('russell.reproveTheorem', () => processRussellTarget("reprove-oracle")),
-		reg_comm('russell.generalizeFile', (uri) => 
-			processRussellFile(uri, "generalize").then(
-				(data: any) => {
-					if (data && data.theorems && data.theorems.length > 0) {
-						vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + data.theorems.join('\n\n')});
-					}
-				},
-				vscode.window.showErrorMessage
-			)
-		),
-		reg_comm('russell.generalizeTheorem', () =>
-			processRussellTarget("generalize").then(
-				(data : any) => {
-					if (data && data.theorems && data.theorems.length > 0) {
-						vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + data.theorems.join('\n\n')});
-					}
-				},
-				vscode.window.showErrorMessage
-			)
-		),
-		reg_comm('russell.prove', () => {
-			proverProvider = new ProverProvider();
-			client.onNotification("prover/proved", (proved : any) => {
-				if (proved) {
-					vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + proved});
-				}
-				client.onNotification("prover/proved", () => {});
-			});
-			processRussellPosition("prove-start").then(
-				(data : any) => {
-					if (data) {
-						const proof = proverProvider.update(data);
-						if (proof) {
-							vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + proof});
-						}
-					}
-				},
-				vscode.window.showErrorMessage
-			)
-		}),
+		reg_comm('russell.generalizeFile', generalizeFile),
+		reg_comm('russell.generalizeTheorem', generalizeTheorem),
 		reg_comm('russell.startHttpServer', startHttpServer),
 		reg_comm('russell.stopHttpServer', stopHttpServer),
 		reg_comm('russell.restartLspServer', startLspClient),
@@ -81,13 +45,9 @@ export function activate(context: vscode.ExtensionContext) {
 		reg_comm('russell.execCommand', execCommand),
 		reg_comm('russell.gotoLocation', gotoLocation),
 		reg_comm('russell.refreshMath', mathInfo),
-		reg_comm('russell.proverExpand', proverExpand)
+		reg_comm('russell.prover-expand-prop', (node: prover.NodeEntity) => proverProvider.expandProp(node)),
+		reg_comm('russell.prover-start', () => proverProvider.startProving()),
 	);
-
-	russellChannel = vscode.window.createOutputChannel("Russell output");
-	//serverChannel = vscode.window.createOutputChannel("Russell server");
-	//russellChannel.show(true);
-
 	checkHttpServerStatus(true);
 	setInterval(checkHttpServerStatus, 3000, false);
 
@@ -98,19 +58,6 @@ export function activate(context: vscode.ExtensionContext) {
 function mathInfo(): void {
 	client.sendRequest("workspace/executeCommand", { command: "math-info", arguments: [] }).then(
 		(data : MathEntity[]) => mathProvider.update(data)
-	);
-}
-
-function proverExpand(id : number): void {
-	client.sendRequest("workspace/executeCommand", { command: "prover-expand", arguments: ["id=" + id] }).then(
-		(data : any) => {
-			if (data) {
-				const proof = proverProvider.update(data);
-				if (proof) {
-					vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + proof});
-				}
-			}
-		}
 	);
 }
 
@@ -192,6 +139,7 @@ function startLspClient() {
 	client.start();
 	client.onReady().then(
 		() => {
+			proverProvider.setClient(client);
 			client.onNotification("console/message", (msg : string) => russellChannel.appendLine(msg));
 			client.sendRequest("workspace/executeCommand", { command : "command", arguments: ["cache-load"] }).then(
 				mathInfo,
@@ -331,41 +279,80 @@ function processRussellPosition<T>(action : string): Promise<T> {
 	let uri = vscode.window.activeTextEditor.document.uri;
 	let pos = vscode.window.activeTextEditor.selection.active;
 	russellChannel.show(true);
-	return client.sendRequest("workspace/executeCommand", { 
-		command : "command", 
-		arguments: [
-			"read file=" + uri.fsPath + ";\n" +
-			"conf verbose=1;\n" + 
-			action + " file=" + uri.fsPath + " line=" + pos.line + " col=" + pos.character + ";"
-		] 
-	});
+	return client.sendRequest("workspace/executeCommand", requests.filePositionCommand(action));
 }
 
 function processRussell<T>(uri : vscode.Uri, target : string, action : string): Promise<T> {
 	russellChannel.show(true);
-	return client.sendRequest("workspace/executeCommand", { 
-		command : "command", 
-		arguments: [
-			"read file=" + uri.fsPath + ";\n" +
-			"conf verbose=1;\n" + 
-			action + " target=" + target + ";"
-		] 
-	});
+	return client.sendRequest("workspace/executeCommand", requests.fileCommand(uri, target, action));
 }
 
 function verifyMetamath(uri : vscode.Uri): void {
 	russellChannel.show(true);
 	let ru_file = uri.fsPath;
 	let mm_file = ru_file.substr(0, ru_file.lastIndexOf(".")) + ".mm";
-	client.sendRequest("workspace/executeCommand", { 
-		command : "command", 
-		arguments: [
-			"read-ru   file=" + ru_file + ";\n" +
-			"ru-to-mm  file=" + ru_file + ";\n" +
-			//"conf-set  verb=2;\n" +
-			"write-mm  file=" + mm_file + " monolithic=1 strip-comments=1;\n" +
-			//"conf-set  verb=1;\n" +
-			"verify-mm file=" + mm_file + ";"
-		] 
-	});
+	client.sendRequest("workspace/executeCommand", verifyMetamath(uri));
 }
+
+
+function generalizeFile(uri : vscode.Uri): void {
+	processRussellFile(uri, "generalize").then(
+		(data: any) => {
+			if (data && data.theorems && data.theorems.length > 0) {
+				vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + data.theorems.join('\n\n')});
+			}
+		},
+		vscode.window.showErrorMessage
+	);
+}
+
+function generalizeTheorem(): void {
+	processRussellTarget("generalize").then(
+		(data : any) => {
+			if (data && data.theorems && data.theorems.length > 0) {
+				vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + data.theorems.join('\n\n')});
+			}
+		},
+		vscode.window.showErrorMessage
+	);
+}
+/*
+function startProving(): void {
+	if (!proverProvider) {
+		proverProvider = new ProverProvider(client);
+	} else {
+		proverProvider.clear();
+	}
+	client.onNotification("prover/proved", (proved : any) => {
+		if (proved) {
+			vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + proved});
+		}
+		client.onNotification("prover/proved", () => {});
+	});
+	processRussellPosition("prove-start").then(
+		(data : any) => {
+			if (data) {
+				const proof = proverProvider.update(data);
+				if (proof) {
+					vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + proof});
+				}
+			}
+		},
+		vscode.window.showErrorMessage
+	)
+}
+*/
+/*
+function proverExpand(id : number): void {
+	client.sendRequest("workspace/executeCommand", { command: "prover-expand", arguments: ["id=" + id] }).then(
+		(data : any) => {
+			if (data) {
+				const proof = proverProvider.update(data);
+				if (proof) {
+					vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + proof});
+				}
+			}
+		}
+	);
+}
+*/
