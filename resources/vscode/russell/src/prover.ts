@@ -108,8 +108,8 @@ export class ProverProvider {
 
 class ProofVariantProvider implements vscode.TreeDataProvider<NodeEntity> {
 
-	private _onDidChangeTreeData: vscode.EventEmitter<NodeEntity> = new vscode.EventEmitter<NodeEntity>();
-	readonly onDidChangeTreeData: vscode.Event<NodeEntity> = this._onDidChangeTreeData.event;
+	private _onDidChangeTreeData: vscode.EventEmitter<NodeEntity | undefined | void> = new vscode.EventEmitter<NodeEntity>();
+	readonly onDidChangeTreeData: vscode.Event<NodeEntity | undefined | void> = this._onDidChangeTreeData.event;
 
 	private client: LanguageClient = null;
 	private props: Map<number, PropEntity> = new Map();
@@ -122,8 +122,10 @@ class ProofVariantProvider implements vscode.TreeDataProvider<NodeEntity> {
 	public update(tree : ProofVariantTree): void {
 		if (tree.root) {
 			this.root = tree.root;
+			this._onDidChangeTreeData.fire(rootEntity2Node(this.root));
 		}
 		tree.nodes.forEach(prop => this.props.set(prop.id, prop));
+		this._onDidChangeTreeData.fire();
 	}
 	public async expandProp(node : NodeEntity): Promise<void> {
 		const expand_command = { command: "command", arguments: ["conf verb=1; prove-expand nodes=" + node.id] };
@@ -133,7 +135,7 @@ class ProofVariantProvider implements vscode.TreeDataProvider<NodeEntity> {
 				vscode.window.showErrorMessage("update of a prover tree failed:\n" + JSON.stringify(data));
 				return Promise.reject();
 			} else {
-				vscode.window.showInformationMessage("A prover tree update:\n" + JSON.stringify(data));
+				//vscode.window.showInformationMessage("A prover tree update:\n" + JSON.stringify(data));
 				this.update(data);
 				return Promise.resolve();
 			}
@@ -261,7 +263,7 @@ function propEntity2Node(prop : PropEntity): NodeEntity {
 		'parent': -1,
 		'expanded': prop.expanded,
 		'tooltip': prop.tooltip + 
-			(prop.proofs.length == 0 ? "" : "\n" + prop.proofs.join('\n'))
+			(prop.proofs.length == 0 ? "" : "\nproved:\n" + prop.proofs.join('\n'))
 	}
 }
 
@@ -275,7 +277,7 @@ function hypEntity2Node(hyp : HypEntity): NodeEntity {
 		'parent': hyp.parent,
 		'expanded': true,
 		'tooltip': hyp.tooltip + 
-			(hyp.proofs.length == 0 ? "" : "\n" + hyp.proofs.join('\n'))
+			(hyp.proofs.length == 0 ? "" : "\nproved:\n" + hyp.proofs.join('\n'))
 	}
 }
 
@@ -289,6 +291,6 @@ function rootEntity2Node(root : RootEntity): NodeEntity {
 		'parent': -1,
 		'expanded': true,
 		'tooltip': root.tooltip + 
-			(root.proofs.length == 0 ? "" : "\n" + root.proofs.join('\n'))
+			(root.proofs.length == 0 ? "" : "\nproved:\n" + root.proofs.join('\n'))
 	}
 }
