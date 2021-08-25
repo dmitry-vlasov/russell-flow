@@ -1,0 +1,264 @@
+import ru/cache/decl;
+import ru/util/src2json;
+import ru/util/src2s;
+
+export {
+	RuOntologyItem(
+		rule : RuRule,
+		def : Maybe<RuDef>,
+		children : ref Set<int>,
+		parents : ref Set<int>,
+		deps : ref Set<int>
+	);
+
+	ruMakeOntology(env : RuEnv) -> Tree<int, RuOntologyItem>;
+	ruOntology2json(ontology : Tree<int, RuOntologyItem>, env : RuEnv) -> Json;
+	ruOntologyItem2json(item : RuOntologyItem, math : RuMath) -> Json;
+	ruOntologyItem2s(item : RuOntologyItem, math : RuMath) -> string;
+	ruOntology2s(ontology : Tree<int, RuOntologyItem>, math : RuMath) -> string;
+
+	ruNoOntologyItem = RuOntologyItem(ruNoRule, None(), ref makeSet(), ref makeSet(), ref makeSet());
+}
+
+ruMakeOntology(env : RuEnv) -> Tree<int, RuOntologyItem> {
+	decls = ruDeclCacheDecls(env);
+	math = RuMath(makeTree(), decls);
+	rules_tree = decls.lang.rules;
+	rules = getTreeValues(rules_tree);
+	
+	env.out.onMessage("RULES: " + i2s(length(rules)) + "\n" + strIndent(superglue(rules, \r -> ru2s(r, math), "\n")));
+
+	defs = filtermap(getTreeValues(decls.assertions), \ass -> 
+		switch (ass) {
+			RuDef(__,__,__,__): Some(ass);
+			default: None();
+		}
+	);
+
+	env.out.onMessage("DEFS: " + i2s(length(defs)) + "\n" + strIndent(superglue(defs, \d -> ru2s(d, math), "\n")));
+
+	defs_tree = values2tree(defs, \def -> def.info.id);
+	rule2def = fold(defs, makeTree(), \acc, def -> 
+		switch (def.defm.nodes[0]) {
+			RuRuleNode(rule,__,__,__): setTree(acc, rule, def);
+			default: { 
+				ruCrash("defiendum must not be a variable: '" + ruExpRPN2s(def.defm) + "'");
+				acc
+			}
+		}
+	);
+
+	items = map(rules, \rule ->
+		RuOntologyItem(rule, lookupTree(rule2def, rule.info.id), ref makeSet(), ref makeSet(), ref makeSet())
+	);
+
+	env.out.onMessage("ITEMS: " + i2s(length(items)) + "\n" + strIndent(superglue(items, \item -> ruOntologyItem2s(item, math), "\n")));
+
+	tree = fold(items, makeTree(), \acc, item -> setTree(acc, item.rule.info.id, item));
+	ruDoMakeOntology(items, makeSet(), tree, env, math, 1);
+	tree;
+}
+
+ruDefDeps(def : RuDef) -> [int] {
+	filtermap(def.defs.nodes, \node ->
+		switch (node) {
+			RuRuleNode(rule,__,__,__): Some(rule);
+			RuVar(__,__): None();
+		}
+	);
+}
+
+ruOntologyItemAncestorSiblings(item : RuOntologyItem, tree : Tree<int, RuOntologyItem>, acc : Set<int>) -> Set<int> {
+	acc1 = mergeSets(acc, ^(item.children));
+	if (containsSet(acc, item.rule.info.id)) {
+		acc1;
+	} else {
+		foldSet(^(item.parents), 
+			insertSet(acc1, item.rule.info.id), 
+			\ac, id -> ruOntologyItemAncestorSiblings(
+				lookupTreeDef(tree, id, ruNoOntologyItem), tree, ac
+			)
+		);
+	}
+}
+
+ruDoMakeOntology(
+	left : [RuOntologyItem], 
+	visited: Set<int>, 
+	tree : Tree<int, RuOntologyItem>, 
+	env : RuEnv,
+	math : RuMath,
+	count : int
+) -> void {
+	ready0 = filter(left, \item -> 
+		switch (item.def) {
+			Some(def): forall(ruDefDeps(def), \dep -> containsSet(visited, dep) || dep == item.rule.info.id);
+			None(): true; // root
+		}
+	);
+	env.out.onMessage("READY " + i2s(count) + ": " + i2s(length(ready0)) + "\n" + strIndent(superglue(ready0, \item -> ruOntologyItem2s(item, math), "\n")));
+	
+	proc_ready = \ready -> {
+		iter(ready, \item -> 
+			maybeApply(item.def, 
+				\def -> {
+					deps = ruDefDeps(def);
+					iter(deps, \dep -> {
+						parent = lookupTreeDef(tree, dep, ruNoOntologyItem);
+						ansector_siblings = ruOntologyItemAncestorSiblings(parent, tree, makeSet());
+						if (!containsSet(ansector_siblings, item.rule.info.id)) {
+							parent.children := insertSet(^(parent.children), item.rule.info.id);
+						}
+						item.parents := insertSet(^(item.parents), dep);
+						item.deps := mergeSets(insertSet(^(item.deps), dep), ^(parent.deps));
+					});
+				}
+			)
+		);
+		new_left = filter(left, \item -> 
+			!exists(ready, \it -> it.rule.info.id == item.rule.info.id)
+		);
+		new_visited = fold(ready, visited, \acc, item -> insertSet(acc, item.rule.info.id));
+		ruDoMakeOntology(new_left, new_visited, tree, env, math, count + 1);
+	}
+
+	if (ready0 == []) {
+		if (left != []) {
+			closures = map(left, \item -> {
+				closure = map(
+					set2array(ruOntologyItemClosure(item, item, visited, makeSet(), tree, env, math, 1, false)), 
+					\i -> lookupTreeDef(tree, i, ruNoOntologyItem)
+				);
+				
+				/*env.out.onMessage("CLOSURE " + i2s(count) + ": " + i2s(length(closure)) + " OF: " + 
+					//strIndent(ruOntologyItem2s(item, math)) + 
+					id2s(item.rule.info.id) + " = [" + 
+					//"-----------\n" + 
+					//strIndent(superglue(closure, \it -> ruOntologyItem2s(it, math), "\n"))
+					superglue(closure, \it -> id2s(it.rule.info.id), ", ") + "]\n"
+				);*/
+
+				Pair(item, closure);
+			});
+			sorted = sortCustom(closures, \pair -> length(pair.second), true);
+
+			least = sorted[0].first;
+			closure = sorted[0].second;
+			/*
+			env.out.onMessage("LEAST " + i2s(count) + ": \n" + strIndent(ruOntologyItem2s(least, math)));
+			env.out.onMessage("CLOSURE " + i2s(count) + ": " + i2s(length(closure)) + "[" + 
+				//strIndent(superglue(closure, \item -> ruOntologyItem2s(item, math), "\n"))
+				superglue(closure, \item -> id2s(item.rule.info.id), ", ") + "]\n"
+			);*/
+
+			proc_ready(closure);
+
+			/*if (left != []) {
+				env.out.onError(
+					"ready == [] && items != []\n" +
+					"LEFT: " + i2s(length(left)) + "\n" + 
+					strIndent(superglue(left, \item ->
+						ruOntologyItem2s(item, math) + 
+						eitherMap(item.def, 
+							\def -> {
+								deps = ruDefDeps(def);
+								"deps: " + superglue(deps, \dep -> 
+									id2s(dep) + ": " + (if (containsSet(visited, dep) || dep == item.rule.info.id) "Ok" else "X"), ", "
+								) + "\n"
+							},
+							"\n"
+						), "\n")) + "\n", []
+				);
+			}*/
+		}
+	} else {
+		proc_ready(ready0);
+	}
+}
+
+ruOntologyItemClosure(
+	orig : RuOntologyItem,
+	item : RuOntologyItem,
+	visited : Set<int>,
+	closure : Set<int>,
+	tree : Tree<int, RuOntologyItem>,
+	env : RuEnv,
+	math : RuMath,
+	count : int,
+	debug : bool
+) -> Set<int> {
+	if (count > sizeTree(tree)) {
+		if (debug) {
+			ruCrash("");
+			closure;
+		} else {
+			env.out.onMessage(
+				"COUNT IS TOO MUCH " + i2s(count) + " > sizeTree = " + i2s(sizeTree(tree)) + "\n" +
+				"ORIG " + i2s(count) + ": \n" + strIndent(ruOntologyItem2s(orig, math)) + "\n" + 
+				"ITEM " + i2s(count) + ": \n" + strIndent(ruOntologyItem2s(item, math)) + "\n" + 
+				"TMP CLOSURE " + i2s(count) + ": " + i2s(sizeSet(closure)) + "\n" + 
+				strIndent(superglue(set2array(closure), \id -> id2s(id), ", ")) + "\n" + 
+				"================================\n"
+			);
+			ruOntologyItemClosure(orig, orig, visited, makeSet(), tree, env, math, 1, true);
+		}
+	} else {
+		if (debug) {
+			env.out.onMessage(strIndent("ruOntologyItemClosure: ITEM " + i2s(count) + ": \n" + strIndent(ruOntologyItem2s(item, math))));
+			env.out.onMessage(strIndent("TMP CLOSURE " + i2s(count) + ": " + i2s(sizeSet(closure)) + "\n" + 
+				strIndent(superglue(set2array(closure), \id -> id2s(id), ", ")))
+			);
+		}
+		closure1 = if (containsSet(visited, item.rule.info.id)) closure else insertSet(closure, item.rule.info.id);
+		switch (item.def) {
+			Some(def): {
+				deps = ruDefDeps(def);
+				
+				not_visited = filter(deps, \dep -> 
+					!(containsSet(visited, dep) || containsSet(closure1, dep))
+				);
+				if (not_visited == []) closure1 else {
+					fold(not_visited, closure1, \ac, dep -> {
+						dep_item = lookupTreeDef(tree, dep, ruNoOntologyItem);
+						ruOntologyItemClosure(orig, dep_item, visited, ac, tree, env, math, count + 1, debug);
+					});
+				}
+			}
+			None(): {
+				if (item.rule == ruNoRule) {
+					ruCrash("item.rule == ruNoRule");
+				}
+				closure1;
+			}
+		}
+	}
+}
+
+ruOntology2json(ontology : Tree<int, RuOntologyItem>, env : RuEnv) -> Json {
+	decls = ruDeclCacheDecls(env);
+	math = RuMath(makeTree(), decls);
+	JsonArray(map(getTreeValues(ontology), \item -> ruOntologyItem2json(item, math)));
+}
+
+ruOntologyItem2json(item : RuOntologyItem, math : RuMath) -> Json {
+	JsonObject(filtermap([
+		Some(Pair("id", JsonString(id2s(item.rule.info.id)))),
+		Some(Pair("rule", ru2json(item.rule, math.decls.lang.rules))),
+		maybeMap(item.def, \def -> Pair("def", ru2json(def, math.decls.lang.rules))),
+		Some(Pair("rule_str", JsonString(ru2s(item.rule, math)))),
+		maybeMap(item.def, \def -> Pair("def_str", JsonString(ru2s(def, math)))),
+		Some(Pair("children", JsonArray(map(set2array(^(item.children)), \ch -> JsonString(id2s(ch)))))),
+		Some(Pair("parents", JsonArray(map(set2array(^(item.parents)), \par -> JsonString(id2s(par)))))),
+	], idfn));
+}
+
+ruOntologyItem2s(item : RuOntologyItem, math : RuMath) -> string {
+	"rule: " + id2s(item.rule.info.id) + " " + 
+	"def: " + (switch (item.def) { Some(def): id2s(def.info.id); None(): "none" } ) + " " + 
+	"children: [" + superglue(set2array(^(item.children)), id2s, ", ") + "] " +
+	"parents: [" + superglue(set2array(^(item.parents)), id2s, ", ") + "]";
+}
+
+ruOntology2s(ontology : Tree<int, RuOntologyItem>, math : RuMath) -> string {
+	superglue(getTreeValues(ontology), \item -> ruOntologyItem2s(item, math), "\n");
+}

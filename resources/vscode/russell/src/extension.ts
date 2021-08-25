@@ -6,7 +6,7 @@ import * as vscode from 'vscode';
 import { 
 	LanguageClient, LanguageClientOptions, RevealOutputChannelOn, ServerOptions
 } from 'vscode-languageclient/node';
-import { MathEntity, MathProvider } from "./math";
+import { MathEntity, MathProvider, OntologyItem } from "./math";
 import * as prover from "./prover";
 import * as tools from "./tools";
 import { num2memory } from './tools';
@@ -45,6 +45,7 @@ export function activate(context: vscode.ExtensionContext) {
 		reg_comm('russell.execCommand', execCommand),
 		reg_comm('russell.gotoLocation', gotoLocation),
 		reg_comm('russell.refreshMath', mathInfo),
+		reg_comm('russell.refreshOntology', mathOntology),
 		reg_comm('russell.prover-expand-prop', (node: prover.NodeEntity) => proverProvider.expandProp(node)),
 		reg_comm('russell.prover-start', () => proverProvider.startProving()),
 	);
@@ -55,9 +56,15 @@ export function activate(context: vscode.ExtensionContext) {
 	serverStatusBarItem.show();
 }
 
-function mathInfo(): void {
-	client.sendRequest("workspace/executeCommand", { command: "math-info", arguments: [] }).then(
-		(data : MathEntity[]) => mathProvider.update(data)
+function mathInfo(): Promise<void> {
+	return client.sendRequest("workspace/executeCommand", { command: "math-info", arguments: [] }).then(
+		(data : MathEntity[]) => mathProvider.updateMath(data)
+	);
+}
+
+function mathOntology(): Promise<void> {
+	return client.sendRequest("workspace/executeCommand", { command: "math-ontology", arguments: [] }).then(
+		(data : OntologyItem[]) => mathProvider.updateOntology(data)
 	);
 }
 
@@ -142,7 +149,7 @@ function startLspClient() {
 			proverProvider.setClient(client);
 			client.onNotification("console/message", (msg : string) => russellChannel.appendLine(msg));
 			client.sendRequest("workspace/executeCommand", { command : "command", arguments: ["cache-load"] }).then(
-				mathInfo,
+				() => mathInfo().then(mathOntology),
 				(err : any) => {
 					vscode.window.showErrorMessage(`command 'cache-load' failed: ${err}`);
 				}
