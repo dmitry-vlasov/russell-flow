@@ -1,8 +1,537 @@
+//import formats/html/html;
 import ru/parse/src;
+import mm/src;
+import base/html;
 
 export {
+	MmSymbDef(
+		symb  : int, 
+		html  : string,
+		alt   : MmSymbAltDef,
+		latex : string,
+	);
+	MmSymbAltDef(
+		full : string, // i.e. "&uarr;<SUB>&#x1D45A;</SUB>
+		html : Maybe<[HtmlElement]>,
+		unicode : string // unicode representation of the symbol
+	);
+
+	mmGatherSymbolDefs(srcs : Tree<int, MmParseSource>) -> Tree<int, MmSymbDef>;
+	mmSymbolDef2s(def : MmSymbDef) -> string;
+	mmSymbolDefs2s(defs : Tree<int, MmSymbDef>) -> string;
+	mmSynbDefs2SymbTable(defs : Tree<int, MmSymbDef>) -> Tree<int, RuParseConst>;
+	mmCompareSymbolTables(tab1 : Tree<int, RuParseConst>, tab2 : Tree<int, RuParseConst>) -> string;
+
 	mmSymbTable() -> Tree<int, RuParseConst>;
+	mmSetSymbolTable(table : Tree<int, RuParseConst>) -> void;
+	mmSymbTable2s(tab : Tree<int, RuParseConst>, full : bool) -> string;
 }
+
+/*
+	htmldef "(" as "<IMG SRC='lp.gif' WIDTH=5 HEIGHT=19 ALT=' (' TITLE='('>";
+	althtmldef "(" as "(";
+	latexdef "(" as "(";
+
+	htmldef "A." as "<IMG SRC='forall.gif' WIDTH=10 HEIGHT=19 ALT=' A.' TITLE='A.'>";
+	althtmldef "A." as '&forall;';  / * "#8704; * /
+	latexdef "A." as "\forall";
+
+	htmldef "T." as " <IMG SRC='top.gif' WIDTH=11 HEIGHT=19 ALT='T.' TITLE='T.'> ";
+	althtmldef "T." as '&#x22A4;';
+	latexdef "T." as "\top";
+
+	althtmldef "'''" as '&#39&#39&#39';
+	&uarr;<SUB>&#x1D45A;</SUB>
+	althtmldef "~<_*" as ' &#8828;<SUP>*</SUP> ';
+	althtmldef "Fin1a" as "Fin<SUP>Ia</SUP>";
+	althtmldef "N." as '<I><B>N</B></I>';
+	althtmldef "seqz" as 'seq<SUB><FONT FACE=sans-serif>&#8484;</FONT></SUB>';
+	
+*/
+
+mmSymbolDef2s(def : MmSymbDef) -> string {
+	"symb: '" + id2s(def.symb) + "'\n" + 
+	(if (def.latex != "") "\tlatex: '" + def.latex + "'\n" else "") +
+	(if (def.alt.full != "") "\talt:\n" + strIndent(mmSymbAltDef2s(def.alt)) + "\n" else "");
+}
+
+mmSymbAltDef2s(alt : MmSymbAltDef) -> string {
+	if (alt.full == "") "" else {
+		"full: " + alt.full + "\n" + 
+		"html: " + eitherMap(alt.html, html2s, "NONE") + "\n" +
+		"unicode: " + alt.unicode + "\n";
+	}
+}
+
+mmSymbolDefs2s(defs : Tree<int, MmSymbDef>) -> string {
+	superglue(getTreeValues(defs), mmSymbolDef2s, "\n");
+}
+
+mmGatherSymbolDefs(srcs : Tree<int, MmParseSource>) -> Tree<int, MmSymbDef> {
+	vars = mmGatherAllVars(srcs);
+	fold(getTreeValues(srcs), makeTree(), \acc, src -> 
+		fold(src.toplevel, acc, \ac, elem -> 
+			switch (elem) {
+				MmComment(text): {
+					i = strIndexOf(text, "$t");
+					if (i == -1) ac else {
+						uncommented = mmRemoveDefComments(text, 0, makeList());
+						mmGatherTextSymbDefs(uncommented, i, vars, ac);
+					}
+				}
+				default: ac;
+			}
+		)
+	);
+}
+
+mmGatherAllVars(srcs : Tree<int, MmParseSource>) -> Set<string> {
+	fold(getTreeValues(srcs), makeSet(), \acc, src -> 
+		fold(src.toplevel, acc, mmGatherAllElemVars)
+	);
+}
+
+mmGatherAllElemVars(acc : Set<string>, elem : MmElement) -> Set<string> {
+	switch (elem) {
+		MmVars(vars): mergeSets(acc, buildSet(map(vars, id2s)));
+		MmBlock(elems): fold(elems, acc, mmGatherAllElemVars)
+		default: acc;
+	}
+}
+
+mmRemoveDefComments(text : string, pos : int, acc : List<string>) -> string {
+	open = ruFindSubstring(text, pos, "/*");
+	if (open == -1) {
+		// No comments are left
+		concatStrings(list2array(acc));
+	} else {
+		close = ruFindSubstring(text, open + 2, "*/");
+		if (close == -1) {
+			// unclosed comment. Just skip it.
+			concatStrings(list2array(acc));
+		} else {
+			uncommented = substring(text, pos, open - pos);
+			mmRemoveDefComments(text, close + 2, Cons(uncommented, acc));
+		}
+	}
+}
+
+mmGatherTextSymbDefs(txt : string, pos : int, vars : Set<string>, acc : Tree<int, MmSymbDef>) -> Tree<int, MmSymbDef> {
+	keywords = ["htmldef", "althtmldef", "latexdef"];
+	escapes = "'\"";
+	p = ruFindOneOfSubstrings(txt, pos, keywords);
+	if (p.first == -1) acc else {
+		pos1 = p.second + strlen(keywords[p.first]);
+		pos2 = ruFindSubstringEscaped(txt, pos1, ";", escapes);
+		if (pos2 == -1) {
+			ruCrash(" wrong typesetting def - doesn't end with ';' \n" + substring(txt, pos1, strlen(txt) - pos1));
+			acc;
+		} else {
+			body = substring(txt, pos1, pos2 - pos1);
+			//println("BODY: " + body);
+			if (!strContains(body, " as ") && !strContains(body, " as\n")) {
+				// Bad situation. 
+				ruCrash("BODY NOT CONTAINS as: " + body);
+				mmGatherTextSymbDefs(txt, pos2 + 1, vars, acc);
+			} else {
+				els = if (strContains(body, " as ")) strSplit(body, " as ") else strSplit(body, " as\n");
+				symb1 = ruUnwrapQuotations(trim2(els[0], " \n\t\r"));
+				if (symb1 == "") {
+					// Bad situation. 
+					ruCrash("Bad definition: " + body);
+					mmGatherTextSymbDefs(txt, pos2 + 1, vars, acc);
+				} else {
+					symb = s2id(symb1);
+					def1 = ruJoinMultDef(trim2(els[1], " \n\t\r"));
+					def = trim2(ruUnwrapQuotations(def1), " \n\r\t");
+					symb_def_old = lookupTreeDef(acc, symb, MmSymbDef(symb, "", MmSymbAltDef("", None(), ""), ""));
+					symb_def_new = if (p.first == 0) {
+						MmSymbDef(symb_def_old with html = def);
+					} else if (p.first == 1) {
+						html = parseHtml(def);
+						if (isNone(html)) {
+							println("Symbol definition:\n" + strIndent(def) + "\nis not parsed (sic!)");
+						}
+						unicode = switch (html) {
+							Some(elems): {
+								uni = mmSymbolHtml2unicode(elems);
+								if (uni == "X") {
+									println(uni + " !! " + b2s(containsSet(vars, uni)) + "\n" +
+										strGlue(set2array(vars), "  ")
+									);
+								}
+								if (containsSet(vars, uni)) symb1 else uni;
+							}
+							None(): "";
+						}
+						MmSymbDef(symb_def_old with 
+							alt = MmSymbAltDef(def, html, unicode)
+						);
+					} else {
+						MmSymbDef(symb_def_old with latex = def);
+					}
+					//if (startsWith(symb1, "limsup")) {
+					//	println(mmSymbolDef2s(symb_def_new));
+					//}
+					mmGatherTextSymbDefs(txt, pos2 + 1, vars, setTree(acc, symb, symb_def_new));
+				}
+			}
+		}
+	}
+}
+
+/*
+  To parse definitions like this:
+
+	althtmldef "-1-1-onto->" as '&ndash;<FONT SIZE=-2 '
+		+ 'FACE=sans-serif>1-1</FONT>-<FONT SIZE=-2 '
+		+ 'FACE=sans-serif>onto</FONT>&rarr;';
+
+  we need to glue such multi-string definitions into a one string.
+*/
+
+mm_mult_def_parser : ref Maybe<[PegOp]> = ref None();
+
+mmMultDefParser() -> [PegOp] {
+	onlyOnce(mm_mult_def_parser, \ -> 
+		compilePegGrammar("
+mult_def = def:d defs+:ds { makeDefs(:d, :ds) };
+def = def0 | def1;
+def0 = ws '\\'' (!'\\'' any)+ $d '\\'' ws { $d };
+def1 = ws \"\\\"\" (!\"\\\"\" any)+ $d \"\\\"\" ws { $d };
+defs = '+' ws def:d { :d };
+
+ws = (' ' | '\\t' | '\\n' | '\\r')*;
+any = '\\u0000'-'\\uFFFF';
+"
+		)
+	);
+}
+
+ruJoinMultDef(def : string) -> string {
+	triple = parsic3(mmMultDefParser(), def, 
+		SemanticActions(mergeTree(defaultPegActions.t, makeTree1(
+			"makeDefs", \s -> concat([s[0]], s[1]))
+		)), []
+	);
+	if (triple.third != "") def else concatStrings(triple.first);
+}
+
+ruUnwrapQuotations(str : string) -> string {
+	if (startsWith(str, "'") && endsWith(str, "'")) {
+		trim2(str, "'");
+	} else if (startsWith(str, "\"") && endsWith(str, "\"")) {
+		trim2(str, "\"");
+	} else {
+		str;
+	}
+}
+
+mmSymbolHtml2unicode(html : [HtmlElement]) -> string {
+	concatStrings(map(html, mmSymbolHtmlElement2unicode));
+}
+
+mmSymbolHtmlElement2unicode(elem : HtmlElement) -> string {
+	switch (elem) {
+		HtmlTag(title, attribs, body):
+			mmSymbolHtml2unicode(body);
+		HtmlText(text):
+			strReplaces(text, [" ", "", "\n", "", "\r", "", "\t", ""]);
+		HtmlDecEntity(dec):  
+			// like &#8828
+			fromCharCode(s2i(dec));
+		HtmlHexEntity(hex):
+			// like &#x22A4;
+			fromCharCode(parseHex(hex));
+		HtmlCodeEntity(code): {
+			// like &forall;
+			dec = lookupTreeDef(html2code_table, code, "");
+			if (dec == "") {
+				println("Unknown html entity: '" + code + "'");
+				code;
+			} else {
+				fromCharCode(s2i(dec));
+			}
+		}
+	}
+}
+
+mmSynbDefs2SymbTable(defs : Tree<int, MmSymbDef>) -> Tree<int, RuParseConst> {
+	all_defs = getTreeValues(defs);
+	fold(getTreeValues(defs), makeTree(), \acc, def -> {
+		if (def.alt.unicode == "") {
+			ruCrash("def.alt.unicode == '':\n" + mmSymbolDef2s(def));
+			acc;
+		} else {
+			// Try to correct ambiguities
+			symb = lookupTreeDef(mm_symb_ambiguities, id2s(def.symb), def.alt.unicode);
+			id = s2id(symb);
+			if (id == def.symb && def.latex == "") acc else {
+				setTree(acc, def.symb, RuParseConst(
+					id, [], 
+					if (id == def.symb) -1 else def.symb,
+					if (def.latex == "") -1 else s2id(def.latex), 
+					-1
+				));
+			}
+		}
+	});
+}
+
+mmCompareSymbolTables(tab1 : Tree<int, RuParseConst>, tab2 : Tree<int, RuParseConst>) -> string {
+	keys_1 = buildSet(getTreeKeys(tab1));
+	keys_2 = buildSet(getTreeKeys(tab2));
+	no_const = RuParseConst(-1, [], -1, -1, -1);
+	common_keys = intersectSets(keys_1, keys_2);
+	"common keys:\n" + 
+		strIndent(concatStrings(map(set2array(common_keys), \k -> {
+			c1 = lookupTreeDef(tab1, k, no_const);
+			c2 = lookupTreeDef(tab2, k, no_const);
+			id2s(k) + " " + id2s(c1.id) + (if (c1.id == c2.id) "" else " != " + id2s(c2.id)) + "\n";
+		}))) + "\n"
+	"keys from tab1 missed in tab2 :\n" + 
+		strIndent(concatStrings(map(set2array(differenceSets(keys_1, common_keys)), \k -> {
+			c1 = lookupTreeDef(tab1, k, no_const);
+			id2s(k) + " " + id2s(c1.id) + "\n";
+		}))) + "\n"
+	"keys from tab2 missed in tab1 :\n" + 
+		strIndent(concatStrings(map(set2array(differenceSets(keys_2, common_keys)), \k -> {
+			c2 = lookupTreeDef(tab2, k, no_const);
+			id2s(k) + " " + id2s(c2.id) + "\n";
+		}))) + "\n";
+}
+
+mmSymbTable2s(tab : Tree<int, RuParseConst>, full : bool) -> string {
+	if (full) {
+		superglue(getTreeValues(tab), ruParse2s, "\n");	
+	} else {
+		consts = filter(getTreeValues(tab), \c -> c.id != c.ascii);
+		const2s = \c -> {
+			"\t" + 
+			id2s(c.id) + 
+			(if (c.ascii == -1) "" else ", ascii: " + id2s(c.ascii)) + 
+			(if (c.latex == -1) "" else ", latex: " + id2s(c.latex))
+		}
+		superglue(consts, const2s, "\n");
+	}
+}
+
+mmSetSymbolTable(table : Tree<int, RuParseConst>) -> void {
+	// Add a constant for |- 
+	vdash = mmMakeParseConst("|-", "⊢", "\\vdash");
+	table1 = setTree(table, vdash.ascii, vdash);
+	table2 = fold(getTreeValues(table1), makeTree(), \acc, const -> {
+		key = if (const.ascii == -1) const.id else const.ascii;
+		if (containsKeyTree(acc, key)) {
+			println("non unique ascii - key: " + id2s(key));
+		}
+		setTree(acc, key, const.id)
+	});
+	reversed = reverseTreeArray(table2);
+	duplicate_keys = filter(tree2pairs(reversed), \p -> 
+		length(p.second) != 1
+	);
+	/*println("duplicate keys in symbol table:\n" + 
+			strIndent(superglue(duplicate_keys, \p -> 
+				id2s(p.first) + " -> \n" + strIndent(superglue(p.second, id2s, "\n")) + "\n"
+			, "\n")));*/
+	if (length(duplicate_keys) > 0) {
+		ruCrash("duplicate keys in symbol table:\n" + 
+			strIndent(superglue(duplicate_keys, \p -> 
+				id2s(p.first) + " -> \n" + strIndent(superglue(p.second, id2s, "\n")) + "\n"
+			, "\n"))
+		);
+	} else {
+		println("all keys are unique");
+	}
+	println("limsup duplicate keys in symbol table:\n" + 
+			strIndent(
+				"limsup -> \n" + strIndent(superglue(lookupTreeDef(reversed, s2id("limsup"), []), id2s, "\n")) + "\n"
+			)
+	);
+	/*debug = \symb -> {
+		if (containsKeyTree(table1, s2id(symb))) {
+			s1 = lookupTreeDef(table1, s2id(symb), RuParseConst(-1, [], -1, -1, -1));
+			println("table1: " + symb + ":\n" + ruParse2s(s1));
+			s2 = lookupTreeDef(table2, s2id(symb), -1);
+			println("table2: " + symb + " -> " + id2s(s2) + "\n----------------\n");
+		} else {
+			println(symb + " - no such symbol");
+		}
+	}
+	debug("X");*/
+	mmSymbTable_ref := Some(table1);
+}
+
+mm_symb_ambiguities = pairs2tree([
+	//Pair("_d", "_d"),
+	//Pair("X_", "X_"),
+	
+	Pair("].", "]."),
+	Pair("]", "]"),
+
+	Pair(".,", ".,"),
+	Pair(",,", ",,"), /* , -> .,    ,, */
+	
+	Pair("[.", "[."),
+	Pair("[b", "[b"), /* [ ->  [.   [b */
+	
+	Pair("./", "./"),
+	Pair("/.", "/."),
+	Pair("/b", "/b"), /* / ->  ./    /.   /b */
+	
+	Pair("_lcm", "_lcm"),
+	Pair("lcmOLD", "lcmOLD"),
+	Pair("_lcmOLD", "_lcmOLD"), /* lcm ->  _lcm    lcmOLD   _lcmOLD */
+	
+	Pair("->", "→"),
+	Pair("->..", "→.."), /*  → ->  ->   ->.. */
+
+	Pair("\\/", "∨"),
+	Pair(".\\/", ".∨"),  /* ∨ ->  \/  .\/  */
+	
+	Pair("/\\", "∧"),
+	Pair("./\\", ".∧"),  /* ∧ ->  /\  ./\  */
+
+	Pair("F.", "F."),
+	Pair("._|_", ".⊥"),
+	Pair("_|_", "⊥"),   /* ⊥ ->  F.   ._|_  _|_ */
+	
+	Pair("F/", "Ⅎ"),
+	Pair("F/_", "Ⅎ_"),  /* Ⅎ ->  F/  F/_  */
+	
+	Pair(".<_", ".≤"),
+	Pair("<_", "≤"),   /* ≤ ->   .<_  <_ */
+	
+	Pair(".-", ".−"),
+	Pair("-", "−"),  /*  − ->  .-  	-  */
+	
+	Pair(".X.", ".×."),
+	Pair("X.", "×."),  /*  × ->  .X.   X.  */
+	
+	Pair(".^", ".↑"),
+	Pair("^", "↑"),   /*  ↑ ->   .^   	^   */
+	
+	Pair(".||", ".∥"),
+	Pair("||", "∥"),  /*  ∥ ->   .||   	||  */
+	
+	Pair(".*", ".∗"),
+	Pair("*", "∗"),   /*   ∗ ->  .*   *   */
+	
+	Pair(".x.", ".x."),
+	Pair("x.", "x."),  /*  · ->  .x.   x.  */
+	
+	Pair(".(x)", ".⊗"),
+	Pair("(x)", "⊗"), /*  ⊗ ->  .(x)    (x) */
+	
+	Pair("u.", "∪"),
+	Pair("U.", "∪."),
+	Pair("U_", "∪_"), /*  ∪ ->  u.   U.   U_  */
+	
+	Pair("i^i", "∩"),
+	Pair("|^|", "∩."),
+	Pair("|^|_", "∩_"), /* ∩ ->  i^i  |^|  |^|_  */
+	
+	Pair("/_\\", "△"),
+	Pair("_/_\\", "_△"), /*  △ ->  /_\   _/_\  */
+	
+	Pair("iota", "℩"),
+	Pair("iota_", "℩_"), /*  ℩ ->  iota   iota_ */
+	
+	Pair("R1", "𝑅1"),
+	Pair("R1_", "𝑅1_"),  /*  𝑅1 ->  R1   R1_ */
+	
+	Pair("+oo", "+∞"),
+	Pair("pinfty", "+∞."), /* +∞ ->  +oo   pinfty */
+
+	Pair("-oo", "-∞"),
+	Pair("minfty", "-∞."), /* -∞ ->  -oo   minfty */
+	
+	Pair("ZZ", "ℤ"),
+	Pair("_ZZ", "_ℤ"),  /* ℤ ->  ZZ  _ZZ */
+
+	Pair("_pi", "π"),
+	Pair("_piOLD", "πOLD"),
+	Pair("ppi", "pπ"), /* π ->  _pi   _piOLD  ppi */
+	
+	Pair("odZ", "odℤ"),
+	Pair("odZOLD", "odℤOLD"), /* odℤ ->  odZ   odZOLD */
+	
+	Pair("\"s", "“s"),
+	Pair("\"sOLD", "“sOLD"), /* “s ->  "s   "sOLD */
+	
+	Pair("Xs.", "×s"),
+	Pair("sX", "s×"),  /*  ×s ->  Xs.   sX */
+	
+	Pair("~=r", "≃𝑟"),
+	Pair("~=R", "≃R"), /*  ≃𝑟 ->  ~=r   ~=R */
+	
+	Pair("L^1", "𝐿1"),
+	Pair("L1_", "𝐿_1"), /*  𝐿1 ->  L^1  L1_ */
+	
+	Pair("vH", "vℋ"),
+	Pair("\\/H", "∨ℋ"), /* ∨ℋ ->  vH   \/H */
+
+	Pair("Se", "Se"),
+	Pair("_Se", "_Se"), /* Se ->  Se  _Se */
+	
+	Pair("0", "0"),
+	Pair(".0.", ".0."), /*  0 ->  .0.  0  */
+	
+	Pair("1", "1"),
+	Pair(".1.", ".1."),  /*  1 ->  .1.  1 */
+	
+	Pair("+", "+"),
+	Pair(".+", ".+"), /*  + ->  .+   +  */
+	
+	Pair("<", "<"),
+	Pair(".<", ".<"), /*  < ->   .<    <  */
+	
+	Pair("limsup", "limsup"),
+	Pair("limsupOLD", "limsupOLD"), /*  limsup ->  limsup  limsupOLD */
+	
+	Pair("Ramsey", "Ramsey"),
+	Pair("RamseyOLD", "RamseyOLD"), /*  Ramsey ->  Ramsey  RamseyOLD */
+	
+	Pair("Moore", "Moore"),
+	Pair("Moore_", "Moore_"),  /*  Moore ->   Moore     Moore_ */
+	
+	Pair("od", "od"),
+	Pair("odOLD", "odOLD"), /*  od ->  od   odOLD  */
+	
+	Pair("gEx", "gEx"),
+	Pair("gExOLD", "gExOLD"),  /*  gEx ->  gEx   gExOLD */
+	
+	Pair("pGrp", "pGrp"),
+	Pair("pGrpOLD", "pGrpOLD"), /*  pGrp ->   pGrp    pGrpOLD */
+	
+	Pair("Cn", "Cn"),
+	Pair("C^n", "C^n"), /* Cn ->  Cn   C^n */
+
+	Pair("normOp", "normOp"),
+	Pair("normOpOLDOLD", "normOpOLDOLD"), /*  normOp ->   normOp  normOpOLDOLD */
+	
+	Pair("NGHom", "NGHom"),
+	Pair("NGHomOLD", "NGHomOLD"), /*  NGHom ->   NGHom  NGHomOLD */
+	
+	Pair("vol*", "vol*"),
+	Pair("vol*OLD", "vol*OLD"), /* vol* ->  vol*  vol*OLD  */
+	
+	Pair("idlGen1p", "idlGen1p"),
+	Pair("idlGen1pOLD", "idlGen1pOLD"), /* idlGen1p ->  idlGen1p  idlGen1pOLD */
+	
+	Pair("toOMeas", "toOMeas"),
+	Pair("toOMeasOLD", "toOMeasOLD"), /*  toOMeas ->   toOMeas   toOMeasOLD */
+	
+	Pair("PellFund", "PellFund"),
+	Pair("PellFundOLD", "PellFundOLD"), /* PellFund ->  PellFund  PellFundOLD */
+	
+	Pair("degAA", "degAA"),
+	Pair("degAAOLD", "degAAOLD"), /*  degAA ->  degAA	degAAOLD */
+	
+	Pair("jps", "jps"),
+	Pair("jsi", "jsi"), /* jps ->  jps  jsi */
+]);
 
 mmSymbTable_ref : ref Maybe<Tree<int, RuParseConst>> = ref None();
 
@@ -16,7 +545,7 @@ mmMakeParseConst(ascii : string, utf : string, latex : string) -> RuParseConst {
 
 mmInitSymbTable() -> Tree<int, RuParseConst> {
 	values2tree([
-		mmMakeParseConst("|-", "⊢", "vdash"),
+		mmMakeParseConst("|-", "⊢", "\\vdash"),
 		mmMakeParseConst("->", "→", "\\rightarrow"),
 		mmMakeParseConst("-.", "¬", "\\lnot"),
 		mmMakeParseConst("<->", "↔", "\\leftrightarrow"),
@@ -143,3 +672,253 @@ mmInitSymbTable() -> Tree<int, RuParseConst> {
 		mmMakeParseConst("->..", "⇒", "\\Longrightarrow"),
 	], \c -> c.ascii);
 }
+
+html2code_table = pairs2tree([
+	Pair("nbsp", "160"),
+	Pair("iexcl", "161"), 
+	Pair("cent","162"), 
+	Pair("pound", "163"),
+	Pair("curren", "164"), 
+	Pair("yen", "165"), 
+	Pair("brvbar", "166"), 
+	Pair("sect", "167"), 
+	Pair("uml", "168"), 
+	Pair("copy", "169"), 
+	Pair("ordf", "170"), 
+	Pair("laquo", "171"), 
+	Pair("not", "172"), 
+	Pair("shy", "173"), 
+	Pair("reg", "174"), 
+	Pair("macr", "175"), 
+	Pair("deg", "176"), 
+	Pair("plusmn", "177"), 
+	Pair("sup2", "178"), 
+	Pair("sup3", "179"), 
+	Pair("acute", "180"), 
+	Pair("micro", "181"), 
+	Pair("para", "182"), 
+	Pair("middot", "183"), 
+	Pair("cedil", "184"), 
+	Pair("sup1", "185"), 
+	Pair("ordm", "186"), 
+	Pair("raquo", "187"), 
+	Pair("frac14", "188"), 
+	Pair("frac12", "189"),
+	Pair("frac34", "190"), 
+	Pair("iquest", "191"), 
+	Pair("Agrave", "192"), 
+	Pair("Aacute", "193"), 
+	Pair("Acirc", "194"), 
+	Pair("Atilde", "195"), 
+	Pair("Auml", "196"), 
+	Pair("Aring", "197"), 
+	Pair("AElig", "198"), 
+	Pair("Ccedil", "199"), 
+	Pair("Egrave", "200"), 
+	Pair("Eacute", "201"), 
+	Pair("Ecirc", "202"), 
+	Pair("Euml", "203"), 
+	Pair("Igrave", "204"), 
+	Pair("Iacute", "205"), 
+	Pair("Icirc", "206"), 
+	Pair("Iuml", "207"), 
+	Pair("ETH", "208"), 
+	Pair("Ntilde", "209"), 
+	Pair("Ograve", "210"), 
+	Pair("Oacute", "211"), 
+	Pair("Ocirc", "212"), 
+	Pair("Otilde", "213"), 
+	Pair("Ouml", "214"), 
+	Pair("times", "215"), 
+	Pair("Oslash", "216"), 
+	Pair("Ugrave", "217"), 
+	Pair("Uacute", "218"), 
+	Pair("Ucirc", "219"), 
+	Pair("Uuml", "220"), 
+	Pair("Yacute", "221"), 
+	Pair("THORN", "222"), 
+	Pair("szlig", "223"), 
+	Pair("agrave", "224"), 
+	Pair("aacute", "225"), 
+	Pair("acirc", "226"), 
+	Pair("atilde", "227"), 
+	Pair("auml", "228"), 
+	Pair("aring", "229"), 
+	Pair("aelig", "230"), 
+	Pair("ccedil", "231"), 
+	Pair("egrave", "232"), 
+	Pair("eacute", "233"), 
+	Pair("ecirc", "234"), 
+	Pair("euml", "235"), 
+	Pair("igrave", "236"), 
+	Pair("iacute", "237"), 
+	Pair("icirc", "238"), 
+	Pair("iuml", "239"), 
+	Pair("eth", "240"), 
+	Pair("ntilde", "241"), 
+	Pair("ograve", "242"), 
+	Pair("oacute", "243"), 
+	Pair("ocirc", "244"), 
+	Pair("otilde", "245"), 
+	Pair("ouml", "246"), 
+	Pair("divide", "247"), 
+	Pair("oslash", "248"), 
+	Pair("ugrave", "249"), 
+	Pair("uacute", "250"), 
+	Pair("ucirc", "251"), 
+	Pair("uuml", "252"), 
+	Pair("yacute", "253"), 
+	Pair("thorn", "254"), 
+	Pair("yuml", "255"), 
+	Pair("fnof", "402"), 
+	Pair("Alpha", "913"), 
+	Pair("Beta", "914"), 
+	Pair("Gamma", "915"), 
+	Pair("Delta", "916"), 
+	Pair("Epsilon", "917"), 
+	Pair("Zeta", "918"), 
+	Pair("Eta", "919"), 
+	Pair("Theta", "920"), 
+	Pair("Iota", "921"), 
+	Pair("Kappa", "922"), 
+	Pair("Lambda", "923"), 
+	Pair("Mu", "924"), 
+	Pair("Nu", "925"), 
+	Pair("Xi", "926"), 
+	Pair("Omicron", "927"),
+	Pair("Pi", "928"), 
+	Pair("Rho", "929"), 
+	Pair("Sigma", "931"), 
+	Pair("Tau", "932"), 
+	Pair("Upsilon", "933"), 
+	Pair("Phi", "934"), 
+	Pair("Chi", "935"), 
+	Pair("Psi", "936"), 
+	Pair("Omega", "937"), 
+	Pair("alpha", "945"), 
+	Pair("beta", "946"), 
+	Pair("gamma", "947"), 
+	Pair("delta", "948"), 
+	Pair("epsilon", "949"), 
+	Pair("zeta", "950"), 
+	Pair("eta", "951"), 
+	Pair("theta", "952"), 
+	Pair("iota", "953"), 
+	Pair("kappa", "954"), 
+	Pair("lambda", "955"), 
+	Pair("mu", "956"), 
+	Pair("nu", "957"), 
+	Pair("xi", "958"), 
+	Pair("omicron", "959"), 
+	Pair("pi", "960"), 
+	Pair("rho", "961"), 
+	Pair("sigmaf", "962"), 
+	Pair("sigma", "963"), 
+	Pair("tau", "964"), 
+	Pair("upsilon", "965"), 
+	Pair("phi", "966"), 
+	Pair("chi", "967"), 
+	Pair("psi", "968"), 
+	Pair("omega", "969"), 
+	Pair("thetasym", "977"), 
+	Pair("upsih", "978"), 
+	Pair("piv", "982"), 
+	Pair("bull", "8226"), 
+	Pair("hellip", "8230"), 
+	Pair("prime", "8242"), 
+	Pair("Prime", "8243"), 
+	Pair("oline", "8254"), 
+	Pair("frasl", "8260"), 
+	Pair("weierp", "8472"), 
+	Pair("image", "8465"), 
+	Pair("real", "8476"), 
+	Pair("trade", "8482"), 
+	Pair("alefsym", "8501"), 
+	Pair("larr", "8592"), 
+	Pair("uarr", "8593"), 
+	Pair("rarr", "8594"), 
+	Pair("darr", "8595"), 
+	Pair("harr", "8596"), 
+	Pair("crarr", "8629"), 
+	Pair("lArr", "8656"), 
+	Pair("uArr", "8657"), 
+	Pair("rArr", "8658"), 
+	Pair("dArr", "8659"), 
+	Pair("hArr", "8660"), 
+	Pair("forall", "8704"), 
+	Pair("part", "8706"), 
+	Pair("exist", "8707"), 
+	Pair("empty", "8709"), 
+	Pair("nabla", "8711"), 
+	Pair("isin", "8712"), 
+	Pair("notin", "8713"), 
+	Pair("ni", "8715"), 
+	Pair("prod", "8719"), 
+	Pair("sum", "8721"), 
+	Pair("minus", "8722"), 
+	Pair("lowast", "8727"), 
+	Pair("radic", "8730"), 
+	Pair("prop", "8733"), 
+	Pair("infin", "8734"), 
+	Pair("ang", "8736"), 
+	Pair("and", "8743"), 
+	Pair("or", "8744"), 
+	Pair("cap", "8745"), 
+	Pair("cup", "8746"), 
+	Pair("int", "8747"), 
+	Pair("there4", "8756"), 
+	Pair("sim", "8764"), 
+	Pair("cong", "8773"), 
+	Pair("asymp", "8776"), 
+	Pair("ne", "8800"), 
+	Pair("equiv", "8801"), 
+	Pair("le", "8804"), 
+	Pair("ge", "8805"), 
+	Pair("sub", "8834"), 
+	Pair("sup", "8835"),
+	Pair("nsub", "8836"), 
+	Pair("sube", "8838"), 
+	Pair("supe", "8839"), 
+	Pair("oplus", "8853"), 
+	Pair("otimes", "8855"), 
+	Pair("perp", "8869"), 
+	Pair("sdot", "8901"), 
+	Pair("lceil", "8968"), 
+	Pair("rceil", "8969"), 
+	Pair("lfloor", "8970"), 
+	Pair("rfloor", "8971"), 
+	Pair("lang", "9001"), 
+	Pair("rang", "9002"), 
+	Pair("loz", "9674"), 
+	Pair("spades", "9824"), 
+	Pair("clubs", "9827"), 
+	Pair("hearts", "9829"), 
+	Pair("diams", "9830"), 
+	Pair("amp", "38"), 
+	Pair("lt", "60"), 
+	Pair("gt", "62"), 
+	Pair("OElig", "338"), 
+	Pair("oelig", "339"), 
+	Pair("Scaron", "352"), 
+	Pair("scaron", "353"), 
+	Pair("Yuml", "376"), 
+	Pair("circ", "710"), 
+	Pair("tilde", "732"), 
+	Pair("ndash", "8211"), 
+	Pair("mdash", "8212"), 
+	Pair("lsquo", "8216"), 
+	Pair("rsquo", "8217"), 
+	Pair("sbquo", "8218"), 
+	Pair("ldquo", "8220"), 
+	Pair("rdquo", "8221"), 
+	Pair("bdquo", "8222"), 
+	Pair("dagger", "8224"), 
+	Pair("Dagger", "8225"), 
+	Pair("permil", "8240"), 
+	Pair("lsaquo", "8249"), 
+	Pair("rsaquo", "8250"), 
+	Pair("euro", "8364"),
+	Pair("quot", "34"),
+	Pair("angle", "8736"),
+]);
+
