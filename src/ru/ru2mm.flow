@@ -55,7 +55,16 @@ ru2mm(math : RuMath, env : RuEnv) -> Tree<int, MmSource> {
 			setTree(acc, p.second, p.first)
 		);
 	}
-	srcs = mapTree(math.sources, \src -> ruSource2mm(src, turnstile, math, env, var_renames));
+	super_renames = if (env.conf.project == "") makeTree() else {
+		super_json = ruGetDbItem(env.conf.project, ["super_rules"]);
+		super_array = map(getJsonObjectValue(super_json, []), \p -> 
+			Pair(s2id(p.first), s2id(getJsonStringValue(p.second, "")))
+		);
+		fold(super_array, makeTree(), \acc, p -> 
+			setTree(acc, p.second, p.first)
+		);
+	}
+	srcs = mapTree(math.sources, \src -> ruSource2mm(src, turnstile, math, env, var_renames, super_renames));
 	mm = ruAddTurnstile(turnstile, math, srcs, env);
 	if (ruVerbose(env.conf) > 0) {
 		env.out.onMessage("ru translated in " + ruTimePassed2s(timer));
@@ -94,11 +103,11 @@ ruDoMakeTurnstile(turnstile : int, consts : Set<int>) -> int {
 	}
 }
 
-ruSource2mm(src : RuSource, turnstile : int, math : RuMath, env : RuEnv, var_renames : Tree<int, int>) -> MmSource {
+ruSource2mm(src : RuSource, turnstile : int, math : RuMath, env : RuEnv, var_renames : Tree<int, int>, sup_renames : Tree<int, int>) -> MmSource {
 	timer = ruMakeTimer();
 	ret = MmSource(
 		map(src.imports, \imp -> MmImport(imp.id)),
-		concatA(ruConcurrent(map(src.decls, \decl -> \env1 -> ruDecl2mm(decl, turnstile, math, env1, var_renames)), env)),
+		concatA(ruConcurrent(map(src.decls, \decl -> \env1 -> ruDecl2mm(decl, turnstile, math, env1, var_renames, sup_renames)), env)),
 		ruNewFileInfo(src.info.module, env.conf, ".mm")
 	);
 	if (ruVerbose(env.conf) > 1) {
@@ -113,7 +122,7 @@ ruVar2mm(th : int, var : int) -> int {
 	s2id(id2s(th) + "_" + ruMakeValidMmId(id2s(var)));
 }
 
-ruDecl2mm(decl : RuDecl, turnstile : int, math : RuMath, env : RuEnv, var_renames : Tree<int, int>) -> [MmDecl] {
+ruDecl2mm(decl : RuDecl, turnstile : int, math : RuMath, env : RuEnv, var_renames : Tree<int, int>, sup_renames : Tree<int, int>) -> [MmDecl] {
 	const2mm = \c -> if (c.ascii != -1) c.ascii else c.info.id;
 	term2mm = \t -> map(t.nodes, 
 		\s -> switch (s) {
@@ -160,7 +169,7 @@ ruDecl2mm(decl : RuDecl, turnstile : int, math : RuMath, env : RuEnv, var_rename
 				concatA(filtermap(supers, \super -> 
 					maybeMap(
 						lookupTree(math.decls.lang.rules, ruSuperTypeName(super, info.id)),
-						\r -> ruDecl2mm(r, turnstile, math, env, var_renames)
+						\r -> ruDecl2mm(r, turnstile, math, env, var_renames, sup_renames)
 					)
 				))
 			));
@@ -168,7 +177,7 @@ ruDecl2mm(decl : RuDecl, turnstile : int, math : RuMath, env : RuEnv, var_rename
 			add_comments(info, [MmAssertion(
 				[], false,
 				tvars2mm(info.id, term), [],
-				MmAxiomatic(info.id, MmExp(concat([MmSymb(term.type, false)], term2mm(term))))
+				MmAxiomatic(lookupTreeDef(sup_renames, info.id, info.id), MmExp(concat([MmSymb(term.type, false)], term2mm(term))))
 			)]);
 		RuAxiom(info, stat):
 			add_comments(info, [MmAssertion(
@@ -185,7 +194,7 @@ ruDecl2mm(decl : RuDecl, turnstile : int, math : RuMath, env : RuEnv, var_rename
 				MmProvable(info.id, expr2mm(stat.prop), 
 					MmNormalProof(ruProof2mmNormal(
 						lastElement(linearized.steps, ruNoStep), 
-						RuTheorem(decl with proof = linearized), math, env
+						RuTheorem(decl with proof = linearized), math, env, sup_renames
 					))
 				)
 			)]);
@@ -199,32 +208,32 @@ ruDecl2mm(decl : RuDecl, turnstile : int, math : RuMath, env : RuEnv, var_rename
 	}
 }
 
-ruProofExp2mmNormal(i : int, nodes : [RuExpNode], name : int) -> Pair<[int], int> {
+ruProofExp2mmNormal(i : int, nodes : [RuExpNode], name : int, sup_renames : Tree<int, int>) -> Pair<[int], int> {
 	switch (nodes[i]) {
 		RuRuleNode(rule,__,arity, len): {
 			args = fold(enumFromTo(1, arity), Pair([], i + 1), \acc, __ -> {
-				arg = ruProofExp2mmNormal(acc.second, nodes, name);
+				arg = ruProofExp2mmNormal(acc.second, nodes, name, sup_renames);
 				Pair(concat(acc.first, arg.first), arg.second);
 			});
-			Pair(concat(args.first, [rule]), args.second);
+			Pair(concat(args.first, [lookupTreeDef(sup_renames, rule, rule)]), args.second);
 		}
 		RuVar(id,__): Pair([ruVar2mm(name, id)], i + 1);
 	}
 }
 
-ruProof2mmNormal(step : RuStep, th : RuTheorem, math : RuMath, env : RuEnv) -> [int] {
+ruProof2mmNormal(step : RuStep, th : RuTheorem, math : RuMath, env : RuEnv, sup_renames : Tree<int, int>) -> [int] {
 	switch (ruMatchStep(step, th.proof, th.stat.hyps, math, env)) {
 		RuMatchedStep(ass, sub, ___): {
 			subs = fold(getTreeValues(ass.stat.vars.vars), [], \acc, v ->
 				switch (lookupTree(sub, v)) {
 					None(): acc;
-					Some(ex): concat(acc, ruProofExp2mmNormal(0, ex.nodes, th.info.id).first);
+					Some(ex): concat(acc, ruProofExp2mmNormal(0, ex.nodes, th.info.id, sup_renames).first);
 				}
 			)
 			refs = fold(step.refs, [], \acc, ref ->
 				switch (ref) {
 					RuHypRef(ind): concat(acc, [s2id(id2s(th.info.id) + "_" + i2s(ind))]);
-					RuStepRef(ind): concat(acc, ruProof2mmNormal(th.proof.steps[ind], th, math, env));
+					RuStepRef(ind): concat(acc, ruProof2mmNormal(th.proof.steps[ind], th, math, env, sup_renames));
 				}
 			);
 			concat3(subs, refs, [ass.info.id]);
