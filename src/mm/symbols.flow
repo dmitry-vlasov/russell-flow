@@ -2,6 +2,7 @@ import ru/parse/src;
 import mm/src;
 import base/html;
 import base/db;
+import base/id_consts;
 
 export {
 	MmSymbDef(
@@ -16,15 +17,15 @@ export {
 		unicode : string // unicode representation of the symbol
 	);
 
-	mmGatherSymbolDefs(srcs : Tree<int, MmParseSource>) -> Tree<int, MmSymbDef>;
-	mmSymbolDef2s(def : MmSymbDef) -> string;
-	mmSymbolDefs2s(defs : Tree<int, MmSymbDef>) -> string;
-	mmSynbDefs2SymbTable(defs : Tree<int, MmSymbDef>) -> Tree<int, RuParseConst>;
-	mmCompareSymbolTables(tab1 : Tree<int, RuParseConst>, tab2 : Tree<int, RuParseConst>) -> string;
-
+	mmMakeSymbolTable(srcs : Tree<int, MmParseSource>, env : RuEnv) -> void;
 	mmSymbTable() -> Tree<int, RuParseConst>;
-	mmSetSymbolTable(table : Tree<int, RuParseConst>) -> void;
-	mmSymbTable2s(tab : Tree<int, RuParseConst>, full : bool) -> string;
+}
+
+mmMakeSymbolTable(srcs : Tree<int, MmParseSource>, env : RuEnv) -> void {
+	defs = mmGatherSymbolDefs(srcs, env);
+	table = mmSynbDefs2SymbTable(defs, env);
+	mmCheckSymbDefsAmbiguities(table, env);
+	mmSymbTable_ref := Some(table);
 }
 
 /*
@@ -67,16 +68,20 @@ mmSymbolDefs2s(defs : Tree<int, MmSymbDef>) -> string {
 	superglue(getTreeValues(defs), mmSymbolDef2s, "\n");
 }
 
-mmGatherSymbolDefs(srcs : Tree<int, MmParseSource>) -> Tree<int, MmSymbDef> {
+mmGatherSymbolDefs(srcs : Tree<int, MmParseSource>, env : RuEnv) -> Tree<int, MmSymbDef> {
 	vars = mmGatherAllVars(srcs);
-	fold(getTreeValues(srcs), makeTree(), \acc, src -> 
+	//("|-", "⊢", "\\vdash")
+	turnstile = ruIdTurnstile();
+	turnstile_def = MmSymbDef(turnstile, "&#8866;", MmSymbAltDef("&#8866;", Some([HtmlDecEntity("8866")]), "⊢"), "\\vdash");
+	fold(getTreeValues(srcs), 
+		makeTree1(turnstile, turnstile_def), \acc, src -> 
 		fold(src.toplevel, acc, \ac, elem -> 
 			switch (elem) {
 				MmComment(text): {
 					i = strIndexOf(text, "$t");
 					if (i == -1) ac else {
 						uncommented = mmRemoveDefComments(text, 0, makeList());
-						mmGatherTextSymbDefs(uncommented, i, vars, ac);
+						mmGatherTextSymbDefs(uncommented, i, vars, ac, env);
 					}
 				}
 				default: ac;
@@ -116,7 +121,7 @@ mmRemoveDefComments(text : string, pos : int, acc : List<string>) -> string {
 	}
 }
 
-mmGatherTextSymbDefs(txt : string, pos : int, vars : Set<string>, acc : Tree<int, MmSymbDef>) -> Tree<int, MmSymbDef> {
+mmGatherTextSymbDefs(txt : string, pos : int, vars : Set<string>, acc : Tree<int, MmSymbDef>, env : RuEnv) -> Tree<int, MmSymbDef> {
 	keywords = ["htmldef", "althtmldef", "latexdef"];
 	escapes = "'\"";
 	p = ruFindOneOfSubstrings(txt, pos, keywords);
@@ -124,22 +129,21 @@ mmGatherTextSymbDefs(txt : string, pos : int, vars : Set<string>, acc : Tree<int
 		pos1 = p.second + strlen(keywords[p.first]);
 		pos2 = ruFindSubstringEscaped(txt, pos1, ";", escapes);
 		if (pos2 == -1) {
-			ruCrash(" wrong typesetting def - doesn't end with ';' \n" + substring(txt, pos1, strlen(txt) - pos1));
+			env.out.onError(" wrong typesetting def - doesn't end with ';' \n" + substring(txt, pos1, strlen(txt) - pos1), []);
 			acc;
 		} else {
 			body = substring(txt, pos1, pos2 - pos1);
-			//println("BODY: " + body);
 			if (!strContains(body, " as ") && !strContains(body, " as\n")) {
 				// Bad situation. 
-				ruCrash("BODY NOT CONTAINS as: " + body);
-				mmGatherTextSymbDefs(txt, pos2 + 1, vars, acc);
+				env.out.onError("Bad definition: (not contains ' as ' or ' as\\n' )" + body, []);
+				mmGatherTextSymbDefs(txt, pos2 + 1, vars, acc, env);
 			} else {
 				els = if (strContains(body, " as ")) strSplit(body, " as ") else strSplit(body, " as\n");
 				symb1 = ruUnwrapQuotations(trim2(els[0], " \n\t\r"));
 				if (symb1 == "") {
 					// Bad situation. 
-					ruCrash("Bad definition: " + body);
-					mmGatherTextSymbDefs(txt, pos2 + 1, vars, acc);
+					env.out.onError("Bad definition: " + body, []);
+					mmGatherTextSymbDefs(txt, pos2 + 1, vars, acc, env);
 				} else {
 					symb = s2id(symb1);
 					def1 = ruJoinMultDef(trim2(els[1], " \n\t\r"));
@@ -150,11 +154,11 @@ mmGatherTextSymbDefs(txt : string, pos : int, vars : Set<string>, acc : Tree<int
 					} else if (p.first == 1) {
 						html = parseHtml(def);
 						if (isNone(html)) {
-							println("Symbol definition:\n" + strIndent(def) + "\nis not parsed (sic!)");
+							env.out.onError("Symbol definition:\n" + strIndent(def) + "\nis not parsed", []);
 						}
 						unicode = switch (html) {
 							Some(elems): {
-								uni = mmSymbolHtml2unicode(elems);
+								uni = mmSymbolHtml2unicode(elems, env);
 								if (containsSet(vars, uni) || uni == "") symb1 else uni;
 							}
 							None(): "";
@@ -165,7 +169,7 @@ mmGatherTextSymbDefs(txt : string, pos : int, vars : Set<string>, acc : Tree<int
 					} else {
 						MmSymbDef(symb_def_old with latex = def);
 					}
-					mmGatherTextSymbDefs(txt, pos2 + 1, vars, setTree(acc, symb, symb_def_new));
+					mmGatherTextSymbDefs(txt, pos2 + 1, vars, setTree(acc, symb, symb_def_new), env);
 				}
 			}
 		}
@@ -218,27 +222,31 @@ ruUnwrapQuotations(str : string) -> string {
 	}
 }
 
-mmSymbolHtml2unicode(html : [HtmlElement]) -> string {
-	concatStrings(map(html, mmSymbolHtmlElement2unicode));
+mmSymbolHtml2unicode(html : [HtmlElement], env : RuEnv) -> string {
+	concatStrings(map(html, \elem -> mmSymbolHtmlElement2unicode(elem, env)));
 }
 
-mmSymbolHtmlElement2unicode(elem : HtmlElement) -> string {
+mmSymbolHtmlElement2unicode(elem : HtmlElement, env : RuEnv) -> string {
 	switch (elem) {
 		HtmlTag(title, attribs, body):
-			mmSymbolHtml2unicode(body);
+			mmSymbolHtml2unicode(body, env);
 		HtmlText(text):
 			strReplaces(text, [" ", "", "\n", "", "\r", "", "\t", ""]);
 		HtmlEntity(): {
 			code = htmlEntity2UnicodeId(elem);
 			if (code != -1) fromCharCode(code) else {
-				ruCrash("Unknown html entity: '" + htmlElement2s(elem) + "'");
+				env.out.onError(
+					"Unknown html entity: '" + htmlElement2s(elem) + "'\n" + 
+					"Add approptiate correspondence to 'html2unicode' table in db/common.json file"
+					, []
+				);
 				"";
 			}
 		}
 	}
 }
 
-mmSynbDefs2SymbTable(defs : Tree<int, MmSymbDef>) -> Tree<int, RuParseConst> {
+mmSynbDefs2SymbTable(defs : Tree<int, MmSymbDef>, env : RuEnv) -> Tree<int, RuParseConst> {
 	all_defs = getTreeValues(defs);
 	fold(getTreeValues(defs), makeTree(), \acc, def -> {
 		if (def.alt.unicode == "") {
@@ -246,7 +254,7 @@ mmSynbDefs2SymbTable(defs : Tree<int, MmSymbDef>) -> Tree<int, RuParseConst> {
 			acc;
 		} else {
 			// Try to correct ambiguities
-			symb = lookupTreeDef(mmSymbAmbiguities(), id2s(def.symb), def.alt.unicode);
+			symb = lookupTreeDef(mmSymbAmbiguities(env), id2s(def.symb), def.alt.unicode);
 			id = s2id(symb);
 			if (id == def.symb && def.latex == "") acc else {
 				setTree(acc, def.symb, RuParseConst(
@@ -258,29 +266,6 @@ mmSynbDefs2SymbTable(defs : Tree<int, MmSymbDef>) -> Tree<int, RuParseConst> {
 			}
 		}
 	});
-}
-
-mmCompareSymbolTables(tab1 : Tree<int, RuParseConst>, tab2 : Tree<int, RuParseConst>) -> string {
-	keys_1 = buildSet(getTreeKeys(tab1));
-	keys_2 = buildSet(getTreeKeys(tab2));
-	no_const = RuParseConst(-1, [], -1, "", -1);
-	common_keys = intersectSets(keys_1, keys_2);
-	"common keys:\n" + 
-		strIndent(concatStrings(map(set2array(common_keys), \k -> {
-			c1 = lookupTreeDef(tab1, k, no_const);
-			c2 = lookupTreeDef(tab2, k, no_const);
-			id2s(k) + " " + id2s(c1.id) + (if (c1.id == c2.id) "" else " != " + id2s(c2.id)) + "\n";
-		}))) + "\n"
-	"keys from tab1 missed in tab2 :\n" + 
-		strIndent(concatStrings(map(set2array(differenceSets(keys_1, common_keys)), \k -> {
-			c1 = lookupTreeDef(tab1, k, no_const);
-			id2s(k) + " " + id2s(c1.id) + "\n";
-		}))) + "\n"
-	"keys from tab2 missed in tab1 :\n" + 
-		strIndent(concatStrings(map(set2array(differenceSets(keys_2, common_keys)), \k -> {
-			c2 = lookupTreeDef(tab2, k, no_const);
-			id2s(k) + " " + id2s(c2.id) + "\n";
-		}))) + "\n";
 }
 
 mmSymbTable2s(tab : Tree<int, RuParseConst>, full : bool) -> string {
@@ -298,11 +283,34 @@ mmSymbTable2s(tab : Tree<int, RuParseConst>, full : bool) -> string {
 	}
 }
 
-mmSetSymbolTable(table : Tree<int, RuParseConst>) -> void {
+mmCheckSymbDefsAmbiguities(table : Tree<int, RuParseConst>, env : RuEnv) -> void {
+	table2 = fold(getTreeValues(table), makeTree(), \acc, const -> {
+		key = if (const.ascii == -1) const.id else const.ascii;
+		if (containsKeyTree(acc, key)) {
+			ruCrash("non unique ascii - key: " + id2s(key));
+		}
+		setTree(acc, key, const.id)
+	});
+	reversed = reverseTreeArray(table2);
+	duplicate_keys = filter(tree2pairs(reversed), \p -> 
+		length(p.second) != 1
+	);
+	if (length(duplicate_keys) > 0) {
+		env.out.onError("duplicate keys in symbol table:\n" + 
+			strIndent(superglue(duplicate_keys, \p -> 
+				"symbol: '" + id2s(p.first) + "' has ASCII pre-images: \n" + strIndent(superglue(p.second, id2s, "\n")) + "\n", "\n"
+			)) + "\n" +
+			"update the 'symb_ambiguities' table in file 'set.json' with appropriate resolutions", []
+		);
+	}
+}
+
+/*
+mmSetSymbolTable(table : Tree<int, RuParseConst>, env : RuEnv) -> void {
 	// Add a constant for |- 
-	vdash = mmMakeParseConst("|-", "⊢", "\\vdash");
-	table1 = setTree(table, vdash.ascii, vdash);
-	table2 = fold(getTreeValues(table1), makeTree(), \acc, const -> {
+	//vdash = mmMakeParseConst("|-", "⊢", "\\vdash");
+	//table1 = setTree(table, vdash.ascii, vdash);
+	table2 = fold(getTreeValues(table), makeTree(), \acc, const -> {
 		key = if (const.ascii == -1) const.id else const.ascii;
 		if (containsKeyTree(acc, key)) {
 			ruCrash("non unique ascii - key: " + id2s(key));
@@ -321,18 +329,18 @@ mmSetSymbolTable(table : Tree<int, RuParseConst>) -> void {
 			"supplement the 'mm_symb_ambiguities' table in file mm/symbols with appropriate resolutions are recompile the russell"
 		);
 	}
-	mmSymbTable_ref := Some(table1);
+	mmSymbTable_ref := Some(table);
 }
-
+*/
 // Hand written table for resovling ambiguities in symbols,
 // when althtmldef-defined symbols for different ascii-symbols coincide. 
 mm_symb_ambiguities : ref Maybe<Tree<string, string>> = ref None();
 
-mmSymbAmbiguities() -> Tree<string, string> {
-	onlyOnce(mm_symb_ambiguities, mmInitSymbAmbiguities);
+mmSymbAmbiguities(env : RuEnv) -> Tree<string, string> {
+	onlyOnce(mm_symb_ambiguities, \ -> mmInitSymbAmbiguities(env));
 }
 
-mmInitSymbAmbiguities() -> Tree<string, string> {
+mmInitSymbAmbiguities(env : RuEnv) -> Tree<string, string> {
 	json_table = ruGetDbItem("set", ["symb_ambiguities"]);
 	table = map(getJsonObjectValue(json_table, []), \p -> 
 		Pair(p.first, getJsonStringValue(p.second, ""))
@@ -342,10 +350,17 @@ mmInitSymbAmbiguities() -> Tree<string, string> {
 
 mmSymbTable_ref : ref Maybe<Tree<int, RuParseConst>> = ref None();
 
-mmSymbTable() -> Tree<int, RuParseConst> {
-	onlyOnce(mmSymbTable_ref, mmInitSymbTable);
-}
 
+mmSymbTable() -> Tree<int, RuParseConst> {
+	switch (^mmSymbTable_ref) {
+		Some(table): table;
+		None(): {
+			mmSymbTable_ref := Some(makeTree());
+			mmSymbTable();
+		}
+	}
+}
+/*
 mmMakeParseConst(ascii : string, utf : string, latex : string) -> RuParseConst {
 	RuParseConst(s2id(utf), [], s2id(ascii), latex, -1);
 }
@@ -480,3 +495,4 @@ mmInitSymbTable() -> Tree<int, RuParseConst> {
 		mmMakeParseConst("->..", "⇒", "\\Longrightarrow"),
 	], \c -> c.ascii);
 }
+*/
