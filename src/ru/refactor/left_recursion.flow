@@ -1,0 +1,136 @@
+import base/db;
+import comm;
+
+export {
+	ruCommFixLeftRecursion : RuComm;
+	ruCommUnfixLeftRecursion : RuComm;
+	ruFixLeftRecursion(math : RuMath, env : RuEnv) -> RuMath;
+	ruUnfixLeftRecursion(math : RuMath, env : RuEnv) -> RuMath;
+}
+
+ruCommFixLeftRecursion = RuComm(
+	RuCommInfo("fix-left-recursion", "misc", "make all grammar rules non-left-recursive", "", false, false, [], []),
+	ruRunFixLeftRecursion
+);
+
+ruRunFixLeftRecursion(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	state = unit.state;
+	math = ruMathFromSources(state.ru, env);
+	timer = ruMakeTimer();
+	new_math = ruFixLeftRecursion(math, env);
+	if (ruVerbose(env.conf) > 0) {
+		unit.out.onMessage("ru left-recursive rules are fixed" + " in " + ruTimePassed2s(timer));
+	}
+	Some(RuState(state with 
+		ru = new_math.sources,
+		vars = setTree(setTree(state.vars, 
+			"fix-left-recursion.time", ValDouble(ruTimePassed(timer))), 
+			"fix-left-recursion.size", ValInt(sizeTree(math.decls.lang.rules))
+		)
+	));
+}
+
+ruFixLeftRecursion(math : RuMath, env : RuEnv) -> RuMath {
+	table_of_fixed = ref makeList();
+	fixSource = \s -> RuSource(s with
+		decls = map(s.decls, \decl -> 
+			switch (decl) {
+				RuRule(info,__,term): {
+					fixed = ruFixLeftRecursiveRule(decl);
+					if (fixed != decl) {
+						table_of_fixed := Cons(info.id, ^table_of_fixed);
+					}
+					fixed;
+				}
+				default: decl;
+			}
+		)
+	);
+	fixed_math = RuMath(math with
+		decls = RuDecls(math.decls with 
+			lang = RuLang(math.decls.lang with 
+				rules = mapTree(math.decls.lang.rules, \r -> ruFixLeftRecursiveRule(r))
+			)
+		),
+		sources = mapTree(math.sources, fixSource)
+	);
+	if (env.conf.project != "") {
+		ruSetDbItem(env.conf.project, ["left_recursive"], 
+			JsonArray(map(list2array(^table_of_fixed), \id -> JsonString(id2s(id))))
+		);
+	}
+	fixed_math;
+}
+
+ruFixLeftRecursiveRule(r : RuRule) -> RuRule { 
+	if (length(r.term.nodes) <= 1) r else {
+		switch (r.term.nodes[0]) {
+			RuVar(__,__):
+				RuRule(r with term = RuTerm(r.term with nodes = 
+					concat3([RuConstRef(ruIdLeftBracket())], r.term.nodes, [RuConstRef(ruIdRightBracket())])
+				));
+			default: r;
+		}
+	}
+}
+
+ruCommUnfixLeftRecursion = RuComm(
+	RuCommInfo("unfix-left-recursion", "misc", "restore grammar, which may be left-recursive", "", false, false, [], []),
+	ruRunUnfixLeftRecursion
+);
+
+ruRunUnfixLeftRecursion(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	state = unit.state;
+	math = ruMathFromSources(state.ru, env);
+	timer = ruMakeTimer();
+	new_math = ruUnfixLeftRecursion(math, env);
+	if (ruVerbose(env.conf) > 0 && env.conf.project != "") {
+		unit.out.onMessage("ru left-recursive rules are unfixed" + " in " + ruTimePassed2s(timer));
+	}
+	Some(RuState(state with 
+		ru = new_math.sources,
+		vars = setTree(setTree(state.vars, 
+			"unfix-left-recursion.time", ValDouble(ruTimePassed(timer))), 
+			"unfix-left-recursion.size", ValInt(sizeTree(math.decls.lang.rules))
+		)
+	));
+}
+
+ruUnfixLeftRecursion(math : RuMath, env : RuEnv) -> RuMath {
+	if (env.conf.project == "") {
+		math 
+	} else {
+		fixed = buildSet(map(
+			getJsonArrayValue(ruGetDbItem(env.conf.project, ["left_recursive"]), []), 
+			\id_json -> s2id(getJsonStringValue(id_json, ""))
+		));
+		unfixSource = \s -> RuSource(s with
+			decls = map(s.decls, \decl -> 
+				switch (decl) {
+					RuRule(info,__,__): {
+						ruUnfixLeftRecursiveRule(decl, fixed);
+					}
+					default: decl;
+				}
+			)
+		);
+		RuMath(math with
+			decls = RuDecls(math.decls with 
+				lang = RuLang(math.decls.lang with 
+					rules = mapTree(math.decls.lang.rules, \r -> ruUnfixLeftRecursiveRule(r, fixed))
+				)
+			),
+			sources = mapTree(math.sources, unfixSource)
+		);
+	}
+}
+
+ruUnfixLeftRecursiveRule(r : RuRule, fixed : Set<int>) -> RuRule { 
+	if (!containsSet(fixed, r.info.id)) r else {
+		RuRule(r with term = RuTerm(r.term with 
+			nodes = subrange(r.term.nodes, 1, length(r.term.nodes) - 2)
+		));
+	}
+}
