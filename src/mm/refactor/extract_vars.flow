@@ -42,6 +42,7 @@ mmSourcesExtractVars(sources : Tree<int, MmSource>, shorten_vars : bool, env : R
 	decls = mmSources2structs(sources);
 	assertions = mmAssertions(sources);
 	vars = mmAllVars(sources, env);
+	vars_names = buildSet(map(vars, \v -> v.var));
 	vars_labels = if (shorten_vars) {
 		mmVarsShortRelabling(vars, assertions, decls.consts, env);
 	} else {
@@ -51,10 +52,12 @@ mmSourcesExtractVars(sources : Tree<int, MmSource>, shorten_vars : bool, env : R
 	vars_map = foldi(relabeled_vars, makeTree(), \i, acc, v ->
 		setTree(acc, v.var, i)
 	);
-	perms = mmMakeVarsPermutations(assertions, vars_map, env);
+	local_flos = mmLocalFloatings(env);
+	perms = mmMakeVarsPermutations(assertions, vars_map, local_flos, env);
 	structs = MmStructs(mmSources2structs(sources) with vars = relabeled_vars);
-	permuted_assertions = ruConcurrent(map(assertions, \ass -> \env1 -> 
-		mmApplyPermutation2Assertion(ass, perms, structs, vars_labels, env1)
+	//permuted_assertions = ruConcurrent(map(assertions, \ass -> \env1 -> 
+	permuted_assertions = ruSequential(map(assertions, \ass -> \env1 -> 
+		mmApplyPermutation2Assertion(ass, perms, structs, vars_labels, local_flos, ref vars_names, env1)
 	), env);
 	perm_ass_tree = fold(permuted_assertions, makeTree(), \acc, ass ->
 		setTree(acc, ass.stat.label, ass)
@@ -85,12 +88,91 @@ mmMakeVarsRelabling(vars : [MmFloating], env : RuEnv) -> Tree<int, int> {
 	}
 }
 
-mmMakeVarsPermutations(assertions : [MmAssertion], vars_map : Tree<int, int>, env : RuEnv) -> Tree<int, [int]> {
-	pairs = ruConcurrent(map(assertions, \ass -> \env1 -> {
-		flows = mmAssertionFlos(ass.hyps);
+mmLocalFloatings(env : RuEnv) -> Tree<int, [MmFloating]> {
+	if (env.conf.project == "") {
+		makeTree();
+	} else {
+		locals_json = ruGetDbItem(env.conf.project, ["local_floatings"]);
+		locals_array = map(getJsonObjectValue(locals_json, []), \p -> 
+			Pair(p.first, filtermap(getJsonArrayValue(p.second, []), mmJson2Floating))
+		);
+		if (locals_array == []) {
+			makeTree();
+		} else {
+			// Re-label those floatings, which label occur more then once in a list:
+			/*
+			"trujust": [
+					{
+						"label": "vx.tru",
+						"type": "setvar",
+						"var": "x"
+					},
+					{
+						"label": "vy.tru",
+						"type": "setvar",
+						"var": "y"
+					}
+				],
+				"df-tru": [
+					{
+						"label": "vx.tru",
+						"type": "setvar",
+						"var": "x"
+					}
+				],
+				"tru": [
+					{
+						"label": "vx.tru",
+						"type": "setvar",
+						"var": "x"
+					}
+				],
+			*/
+			locals = fold(locals_array, Pair(makeTree(), makeTree()), \acc, p -> {
+				local_flos = map(p.second, \flo -> {
+					count = lookupTreeDef(acc.second, flo.label, 0);
+					//if (count == 0) flo else 
+					MmFloating(flo with label = s2id(id2s(flo.label) + i2s(count)));
+				});
+				Pair(
+					setTree(acc.first, s2id(p.first), local_flos),
+					fold(p.second, acc.second, \ac, flo -> 
+						setTree(ac, flo.label, lookupTreeDef(ac, flo.label, 0) + 1)
+					)
+				);
+			}).first;
+
+			println("Locals:\n" + strIndent(superglue(tree2pairs(locals), \p ->
+				id2s(p.first) + ":\n" + strIndent(superglue(p.second, mm2s, "\n"))
+			, "\n")));
+			locals;
+		}
+	}
+}
+
+mmMakeVarsPermutations(assertions : [MmAssertion], vars_map : Tree<int, int>, local_flos : Tree<int, [MmFloating]>, env : RuEnv) -> Tree<int, [int]> {
+	// Checks if a floating hyp is local or not.
+	is_local = \ass, hyp -> {
+		switch (lookupTree(local_flos, ass.stat.label)) {
+			Some(locals): exists(locals, \loc -> loc.var == hyp.var);
+			None(): false;
+		}
+	}
+	/*make_flows_perm = \flows -> {
 		flows_inds = map(flows, \flo -> lookupTreeDef(vars_map, flo.var, -1));
 		inds_ordered = sort(flows_inds);
+		map(flows_inds, \ind -> elemIndex(inds_ordered, ind, -1));
+	}*/
+	pairs = ruConcurrent(map(assertions, \ass -> \env1 -> {
+		all_flows = mmAssertionFlos(ass.hyps);
+		flows = filter(all_flows, \flo -> !is_local(ass, flo));
+		//if (all_flows != flows) {
+		//	println("AAA: " + id2s(ass.stat.label));
+		//}
+		flows_inds = map(all_flows, \flo -> lookupTreeDef(vars_map, flo.var, -1));
+		inds_ordered = sort(flows_inds);
 		flows_perm = map(flows_inds, \ind -> elemIndex(inds_ordered, ind, -1));
+		//flows_perm = make_flows_perm(all_flows);
 		perm = fold(ass.hyps, Triple([], 0, 0), \ac, hyp -> {
 			switch (hyp) {
 				MmFloating(lab, type, var): {
@@ -102,13 +184,31 @@ mmMakeVarsPermutations(assertions : [MmAssertion], vars_map : Tree<int, int>, en
 				}
 				MmEssential(__, __): {
 					Triple(
-						concat(ac.first, [ac.second + length(flows)]),
+						concat(ac.first, [ac.second + length(all_flows)]),
 						ac.second + 1,
 						ac.third
 					);
 				}
 			}
 		}).first;
+		if (!ruCheckPermutation(perm, env, false)) {
+			ruCrash(
+				"AAA: " + id2s(ass.stat.label) + "\n" + 
+				strIndent(mm2s(ass)) + "\n----------\n" +
+				"all_flows:\n" + strIndent(superglue(all_flows, mm2s, "\n")) + "\n" +
+				"flows:\n" + strIndent(superglue(flows, mm2s, "\n")) + "\n" +
+				"ass.hyps:\n" + strIndent(superglue(ass.hyps, mm2s, "\n")) + "\n" +
+			);
+		}
+		if (all_flows != flows) {
+			/*println(
+				"AAA: " + id2s(ass.stat.label) + "\n" + 
+				strIndent(mm2s(ass)) + "\n----------\n" +
+				"all_flows:\n" + strIndent(superglue(all_flows, mm2s, "\n")) + "\n" +
+				"flows:\n" + strIndent(superglue(flows, mm2s, "\n")) + "\n" +
+				"ass.hyps:\n" + strIndent(superglue(ass.hyps, mm2s, "\n")) + "\n" +
+			);*/
+		}
 		Pair(ass.stat.label, ruReversePermutation(perm, env1));
 	}), env);
 	fold(pairs, makeTree(), \acc, p -> setTree(acc, p.first, p.second));
@@ -118,7 +218,7 @@ mmApplyPermutation2Source(src : MmSource, permuted : Tree<int, MmAssertion>, env
 	MmSource(src with 
 		decls = ruConcurrent(map(src.decls, \decl -> \env1 ->
 			switch (decl) {
-				MmAssertion(__,__,__,__,stat): 
+				MmAssertion(__,__,__,__,__,stat): 
 					lookupTreeDef(permuted, stat.label, decl);
 				default: 
 					decl;
@@ -127,48 +227,142 @@ mmApplyPermutation2Source(src : MmSource, permuted : Tree<int, MmAssertion>, env
 	);
 }
 
-mmApplyPermutation2Assertion(ass : MmAssertion, perms : Tree<int, [int]>, structs : MmStructs, relabling : Tree<int, int>, env : RuEnv) -> MmAssertion {
+mmMakeLocalVarName(v : int, count : int, global_vars : Set<int>) -> int {
+	id = s2id(id2s(v) + i2s(count));
+	if (!containsSet(global_vars, id)) id else mmMakeLocalVarName(v, count + 1, global_vars);
+}
+
+mmApplyPermutation2Assertion(
+	ass : MmAssertion, perms : Tree<int, [int]>, 
+	structs : MmStructs, relabling : Tree<int, int>, 
+	local_flos : Tree<int, [MmFloating]>, global_vars_names : ref Set<int>,
+	env : RuEnv
+) -> MmAssertion {
 	vars = mmAssertionFlos(ass.hyps);
 	all_vars = mmAssertionFlos(concat(ass.hyps, ass.inner));
-	vars_map = fold(all_vars, makeTree(), \acc, v -> 
+	vars_map1 = fold(all_vars, makeTree(), \acc, v -> 
 		setTree(acc, v.label, lookupTreeDef(relabling, mmMakeFloatingTypedLabel(v), -1))
 	);
-	rename_vars = \hyps : [MmHyp] -> map(hyps,
-		\hyp -> switch (hyp) {
-			MmFloating(lab, type, var): MmFloating(hyp with label = lookupTreeDef(vars_map, lab, lab));
-			default: hyp;
+	vars_map = fold(lookupTreeDef(local_flos, ass.stat.label, []), vars_map1, \acc, flo -> {
+		switch (find(all_vars, \v -> v.var == flo.var))	{
+			Some(v): setTree(acc, v.label, flo.label);
+			None(): acc;
+		}
+	});
+	rename_map = fold(lookupTreeDef(local_flos, ass.stat.label, []), makeTree(), \acc, v -> 
+		if (!containsSet(^global_vars_names, v.var)) acc else {
+			new_name = mmMakeLocalVarName(v.var, 1, ^global_vars_names);
+			global_vars_names := insertSet(^global_vars_names, new_name);
+			setTree(acc, v.var, new_name);
 		}
 	);
-	MmAssertion(ass with
-		outer = true,
-		hyps = rename_vars(ruPermute(ass.hyps, lookupTreeDef(perms, ass.stat.label, []))),
-		inner = rename_vars(ass.inner),
-		stat = switch (ass.stat) {
-			MmAxiomatic(__,__): ass.stat;
-			MmProvable(__,__,proof): {
-				switch (proof) {
-					MmNormalProof(labs): {
-						switch (mmTheorem2MmProofTree(ass, ass.stat, structs, env)) {
-							Some(proof_tree): {
-								permuted_tree = mmApplyPermutation2ProofTree(proof_tree, perms, env);
-								permuted_labs = mmProofTree2NormalProof(permuted_tree, env);
-								renamed_labs = map(permuted_labs, \lab -> lookupTreeDef(vars_map, lab, lab));
-								MmProvable(ass.stat with proof = MmNormalProof(renamed_labs));
-							}
-							None(): {
-								env.out.onError("Couldn't transform an RPN proof to tree", []);
-								ass.stat;
-							}
-						}
-					}
-					MmCompressedProof(__,__): {
-						env.out.onError("Compressed proofs are not allowed at applying a permutations to assertion hyps", []);
-						ass.stat;
-					}
-				}
+	rename_exp = \exp -> MmExp(map(exp.symbs, \s -> 
+		if (!s.isVar) s else {
+			switch (lookupTree(rename_map, s.literal)) {
+				Some(id): MmSymb(id, s.isVar);
+				None(): s;
+			}
+		}
+	));
+	/*switch (lookupTree(local_flos, ass.stat.label)) {
+		Some(locals): {
+			println(
+				"ASS " + id2s(ass.stat.label) + "\n" +
+				"locals:\n" + strIndent(superglue(locals, mm2s, "\n")) + "\n" +
+				"vars:\n" + strIndent(superglue(vars, mm2s, "\n")) + "\n" +
+				"all_vars:\n" + strIndent(superglue(all_vars, mm2s, "\n")) + "\n" +
+				"vars_map:\n" + strIndent(superglue(tree2pairs(vars_map), \p -> id2s(p.first) + " => " + id2s(p.second), "\n")) + "\n"
+			);
+		}
+		None():  {}
+	}*/
+	//locals_map = fold(lookupTreeDef(local_flos, ass.stat.label, []), makeTree(), \acc, flo ->
+	//	setTree(acc, flo.var, flo.label)
+	//);
+	relabel_vars = \hyps : [MmHyp] -> map(hyps,
+		\hyp -> switch (hyp) {
+			MmFloating(lab, type, var): {
+				MmFloating(hyp with 
+					label = lookupTreeDef(vars_map, lab, -1),
+					var = lookupTreeDef(rename_map, var, var)
+				);
+			}
+			MmEssential(lab, expr): {
+				MmEssential(hyp with expr = rename_exp(expr));
 			}
 		}
 	);
+	make_outer = switch (lookupTree(local_flos, ass.stat.label)) {
+		Some(locals): {
+			\-> filtermap(all_vars, \v : MmFloating -> 
+				if (exists(locals, \loc : MmFloating -> loc.var == v.var)) {
+					None();
+				} else {
+					Some(lookupTreeDef(vars_map, v.label, -1));
+				}
+			);
+		}
+		None(): {
+			\-> map(all_vars, \v -> lookupTreeDef(vars_map, v.label, -1));
+		}
+	}
+	//ruCheckPermutationApplication(arr : [?], perm : [int], env : RuEnv, crash : bool) -> bool
+
+	if (!containsKeyTree(perms, ass.stat.label)) {
+		ruCrash("!containsKeyTree(perms, ass.stat.label): " + id2s(ass.stat.label) + "\n--------------\n" +
+			"permuted:\n" + strIndent(superglue(getTreeKeys(perms), id2s, "\n"))
+		);
+	}
+	if (!ruCheckPermutationApplication(ass.hyps, lookupTreeDef(perms, ass.stat.label, []), env, false)) {
+		ruCrash("!ruCheckPermutationApplication:\n" +
+			strIndent(mm2s(ass)) + "\n------------------\n" +
+			strIndent(ruPerm2s(lookupTreeDef(perms, ass.stat.label, []))) + "\n"
+		);
+	}
+	ret = MmAssertion(ass with
+		extVars = false,
+		disjs = map(ass.disjs, \disj -> MmDisj(map(disj.vars, \v -> lookupTreeDef(rename_map, v, v)))),
+		outer = make_outer(),
+		hyps = relabel_vars(ruPermute(ass.hyps, lookupTreeDef(perms, ass.stat.label, []))),
+		inner = relabel_vars(ass.inner),
+		stat = switch (ass.stat) {
+			MmAxiomatic(label, expr): {
+				MmAxiomatic(label, rename_exp(expr));
+			}
+			MmProvable(label, expr, proof): {
+				MmProvable(label, rename_exp(expr), 
+					switch (proof) {
+						MmNormalProof(labs): {
+							switch (mmTheorem2MmProofTree(ass, ass.stat, structs, env)) {
+								Some(proof_tree): {
+									permuted_tree = mmApplyPermutation2ProofTree(proof_tree, perms, env);
+									permuted_labs = mmProofTree2NormalProof(permuted_tree, env);
+									renamed_labs = map(permuted_labs, \lab -> lookupTreeDef(vars_map, lab, lab));
+									MmNormalProof(renamed_labs);
+								}
+								None(): {
+									env.out.onError("Couldn't transform an RPN proof to tree", []);
+									proof;
+								}
+							}
+						}
+						MmCompressedProof(__,__): {
+							env.out.onError("Compressed proofs are not allowed at applying a permutations to assertion hyps", []);
+							proof;
+						}
+					}
+				);
+			}
+		}
+	);
+	/*if (containsKeyTree(local_flos, ass.stat.label)) {
+		println("PERMUTED:\n" +
+			strIndent(mm2s(ass)) + "\n------------------\n" +
+			//strIndent(ruPerm2s(lookupTreeDef(perms, ass.stat.label, []))) + "\n" +
+			strIndent(mm2s(ret)) + "\n------------------\n" +
+		);
+	}*/
+	ret;
 }
 
 mmApplyPermutation2ProofTree(proof : MmProofTree, perms : Tree<int, [int]>, env : RuEnv) -> MmProofTree {
@@ -228,7 +422,7 @@ mmAllVars(sources : Tree<int, MmSource>, env : RuEnv) -> [MmFloating] {
 	srcs_vars = ruConcurrent(map(srcs, \src -> \env1 ->
 		fold(src.decls, makeSet(), \ac, decl -> 
 			switch (decl) {
-				MmAssertion(__,__, hyps, inner,__): {
+				MmAssertion(__,__,__, hyps, inner,__): {
 					fold(mmAssertionFlos(concat(hyps, inner)), ac, \a, hyp -> 
 						insertSet(a, MmFloating(hyp with label = mmMakeFloatingTypedLabel(hyp)))
 					)
@@ -256,11 +450,11 @@ mmAllVars(sources : Tree<int, MmSource>, env : RuEnv) -> [MmFloating] {
 }
 
 mmVarsShortRelabling(vars : [MmFloating], assertions : [MmAssertion], consts : Set<int>, env : RuEnv) -> Tree<int, int> {
-	make_relabing = \ -> {
+	//make_relabing = \ -> {
 		labels = mergeSets(fold(assertions, makeSet(), \acc, ass -> insertSet(acc, ass.stat.label)), consts);
 		types = set2array(fold(vars, makeSet(), \acc, v -> insertSet(acc, v.type)));
 		mmDoVarsShortRelabling(types, vars, labels, 1);
-	}
+	/*}
 	if (env.conf.project == "") make_relabing() else {
 		floatings_json = ruGetDbItem(env.conf.project, ["floatings"]);
 		floatings_array = map(getJsonObjectValue(floatings_json, []), \p -> 
@@ -282,7 +476,7 @@ mmVarsShortRelabling(vars : [MmFloating], assertions : [MmAssertion], consts : S
 			});
 			if (^err) make_relabing() else relabling;
 		}
-	}
+	}*/
 }
 
 mmDoVarsShortRelabling(types : [int], vars : [MmFloating], labels : Set<int>, i : int) -> Tree<int, int> {
