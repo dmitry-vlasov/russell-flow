@@ -1,6 +1,7 @@
 import ds/vector;
 import fs/filesystem;
 import sys/concurrent;
+import base/db;
 import mm/parse/parse;
 import mm/src_utils;
 import mm/compress;
@@ -14,6 +15,7 @@ mmCollectSources(parsed : Tree<int, MmParseSource>, env0 : RuEnv) -> Maybe<Tree<
 	env = ruAddErrCounter2Env(env0, err_count);
 	timer = ruMakeTimer();
 	collected = mmDoCollectSources(parsed, env, makeTree());
+	mmCollectFloatings(parsed, collected, env);
 	if (ruVerbose(env.conf) > 0) {
 		env.out.onMessage("mm collected: " +i2s(sizeTree(collected)) + " files in " + ruTimePassed2s(timer));
 	}
@@ -64,7 +66,9 @@ mmCollectSource(src : MmParseSource, env : RuEnv) -> MmSource {
 		mm_decls = ruConcurrent(map(vector2array(acc.toplevel), \decl -> 
 			\env1 -> mmDecompressDecl(decl, acc.arities)
 		), env);
-		env.out.onMessage("\tmm decompresed: " + i2s(sizeVector(acc.toplevel)) + " declarations in " + ruTimePassed2s(decompress_timer));
+		if (ruVerbose(env.conf) > 1) {
+			env.out.onMessage("\tmm decompresed: " + i2s(sizeVector(acc.toplevel)) + " declarations in " + ruTimePassed2s(decompress_timer));
+		}
 		MmSource(src.imports, mm_decls, src.info);
 	} else {
 		MmSource(src.imports, vector2array(acc.toplevel), src.info);
@@ -93,8 +97,9 @@ mmCollectElements(els : [MmElement], acc : MmCollectAcc) -> MmCollectAcc {
 				}
 				MmEssential(l, __):
 					MmCollectAcc(ac with hyps = Cons(el, ac.hyps));
-				MmFloating(l, __, __):
+				MmFloating(l, __, __): {
 					MmCollectAcc(ac with hyps = Cons(el, ac.hyps));
+				}
 				MmAxiomatic(l, __): {
 					a = mmMakeAssertion(el, ac);
 					pushVector(ac.toplevel, a);
@@ -133,7 +138,7 @@ mmMakeAssertion(statement : MmStat, env : MmCollectAcc) -> MmAssertion {
 		}
 	);
 	hyps = reverseA(foldList(env.hyps, [],
-		\acc, hyp : MmHyp -> switch (hyp) {
+		\acc, hyp -> switch (hyp) {
 			MmEssential(label, expr): 
 				concat(acc, [MmEssential(label, mmMarkVarsInExpr(expr, vars))]);
 			MmFloating(label, type, var): 
@@ -150,7 +155,7 @@ mmMakeAssertion(statement : MmStat, env : MmCollectAcc) -> MmAssertion {
 		}
 	}
 	inner = foldList(env.hyps, [],
-		\acc, hyp : MmHyp -> switch (hyp) {
+		\acc, hyp -> switch (hyp) {
 			MmEssential(label, expr): acc;
 			MmFloating(label, type, var): 
 				if (!containsSet(vars, var) && containsSet(labels, label)) concat(acc, [hyp]) else acc;
@@ -184,7 +189,7 @@ mmMakeStatement(stat : MmStat, vars : Set<int>, hyps : [MmHyp], arities : Tree<i
 		MmAxiomatic(label, expr): 
 			MmAxiomatic(label, mmMarkVarsInExpr(expr, vars));
 		MmProvable(label, expr, proof): 
-			MmProvable(label, mmMarkVarsInExpr(expr, vars), proof /*mmDecompressProof(proof, hyps, arities)*/);
+			MmProvable(label, mmMarkVarsInExpr(expr, vars), proof);
 	}
 }
 
@@ -192,4 +197,44 @@ mmMarkVarsInExpr(expr : MmExp, vars : Set<int>) -> MmExp {
 	MmExp(map(expr.symbs, \symb -> 
 		MmSymb(symb.literal, containsSet(vars, symb.literal))
 	))
+}
+
+mmCollectFloatings(parsed : Tree<int, MmParseSource>, collected : Tree<int, MmSource>, env : RuEnv) -> void {
+	toplevel_flos = fold(getTreeValues(parsed), [], \acc, src ->
+		concat(acc, filtermap(src.toplevel, \decl ->
+			switch (decl) {
+				MmFloating(__,__,__): Some(decl);
+				default: None();
+			}
+		))
+	);
+	flo_labels = buildSet(map(toplevel_flos, \flo -> flo.label));
+	local_flos = fold(getTreeValues(collected), makeTree(), \acc, src ->
+		fold(src.decls, acc, \ac, decl ->
+			switch (decl) {
+				MmAssertion(__,__,hyps, inner, stat): {
+					flos = mmAssertionFlos(concat(hyps, inner));
+					local = filter(flos, \flo -> !containsSet(flo_labels, flo.label));
+					if (length(local) > 0) {
+						setTree(ac, stat.label, local);
+					} else {
+						ac;
+					}
+				};
+				default: ac;
+			}
+		)
+	);
+	if (env.conf.project != "") {
+		ruSetDbItem(env.conf.project, ["toplevel_floatings"], 
+			JsonArray(map(toplevel_flos, mmFloating2Json))
+		);
+		ruSetDbItem(env.conf.project, ["local_floatings"],
+			JsonObject(map(tree2pairs(local_flos), \p -> 
+				Pair(id2s(p.first), 
+					JsonArray(map(p.second, mmFloating2Json))
+				)
+			))
+		);
+	}
 }
