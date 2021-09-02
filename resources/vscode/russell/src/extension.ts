@@ -53,7 +53,60 @@ export function activate(context: vscode.ExtensionContext) {
 	setInterval(checkHttpServerStatus, 3000, false);
 
 	startLspClient();
+	//addLatexHover();
 	serverStatusBarItem.show();
+}
+
+function addLatexHover(): void {
+	vscode.languages.registerHoverProvider('russell', {
+		provideHover(document, position, token) {
+			
+			// a markdown table, wrapping in a styled span did not work
+			// had to style each "cell" separately
+			// html entity &nbsp; works
+	
+			const markdown = new vscode.MarkdownString(`
+	|    <span style="color:#ff0;background-color:#000;">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Table&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span>|    Header     |
+	|    :----:    |    :----:     |
+	|first cell    |second cell  |
+	|third cell    |<span style="color:#f00;background-color:#fff;">&nbsp;&nbsp;fourth cell&nbsp;&nbsp;</span>  |
+			\n\n\n`);  // the newline is necessary for any following appends to work correctly, multiple newlines are reduced to one
+			
+			const styledString = `<span style="color:#fff;background-color:#666;">&nbsp;&nbsp;&nbsp;NASA code follows:&nbsp;&nbsp;&nbsp;</span>`;
+	
+			const codeBlock = `const a = 12;
+	if (a) return;`;    // any preceding tabs will be rendered in a template literal, so flush left
+	
+			// const codeBlock2 = `const c = 12;\nif (c) return;`;  // works, alternate form with newline
+	
+			markdown.appendText("______________________________\n");  // a fake separator
+			markdown.appendMarkdown("$ \\frac{x^{2} + y^{2}}{z - 1}$\n\n");
+			markdown.appendMarkdown("```markdown\n$ \\frac{x^{2} + y^{2}}{z - 1}$\n```\n\n");
+			markdown.appendMarkdown(styledString);
+			markdown.appendCodeblock(codeBlock, "javascript");
+			markdown.appendCodeblock("$ \\frac{x^{2} + y^{2}}{z - 1}$", "math");
+			markdown.appendCodeblock("$ \\frac{x^{2} + y^{2}}{z - 1}$", "katex");
+			markdown.appendCodeblock("$ \\frac{x^{2} + y^{2}}{z - 1}$", "latex");
+			markdown.appendCodeblock("$ \\frac{x^{2} + y^{2}}{z - 1}$", "tex");
+			markdown.appendCodeblock("$ \\frac{x^{2} + y^{2}}{z - 1}$", "markdown");
+			markdown.appendCodeblock("$ \\frac{x^{2} + y^{2}}{z - 1}$", "markdown-latex");
+			markdown.appendCodeblock("$ \\frac{x^{2} + y^{2}}{z - 1}$", "markdown-katex");
+			markdown.appendCodeblock("$ \\frac{x^{2} + y^{2}}{z - 1}$", "markdown-tex");
+			markdown.appendCodeblock("$ \\frac{x^{2} + y^{2}}{z - 1}$", "markdown.latex");
+			markdown.appendCodeblock("$ \\frac{x^{2} + y^{2}}{z - 1}$", "markdown.katex");
+			markdown.appendCodeblock("$ \\frac{x^{2} + y^{2}}{z - 1}$", "markdown.tex");
+			markdown.appendMarkdown(
+	`**Bold Text**
+	* some note
+	* another note
+	* final note`
+			);
+	
+			markdown.isTrusted = true;
+	
+			return new vscode.Hover(markdown, new vscode.Range(position, position));
+		}
+	});
 }
 
 function mathInfo(): Promise<void> {
