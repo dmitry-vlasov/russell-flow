@@ -84,7 +84,6 @@ ruWrapFnWithProgress(f : RuMapFn, stats : RuMapFnStats) -> (RuDecl, double, RuEn
 		timer = ruMakeTimer();
 		ret = f.func(decl, time_limit, env);
 		atomicRefIntAddition(stats.progress.counter, 1);
-		//tomicRefIntAddition(stats.processed, 1);
 		if (ret.fail) {
 			atomicRefIntAddition(stats.failed, 1); {}
 		} 
@@ -140,10 +139,7 @@ ruMapDeclsConcurrentlyAll(decls : [RuDecl], f : RuMapFn, time_limit : double, ti
 			Some(f.func(d, time_limit * i2d(availableProcessors()) * measures[i] / sum_measure, env1))
 		}
 	}), env), idfn);
-	fold(mapped, mapped_math, \acc, m -> {
-		//mapped = ruMathReplaceDecl(acc, decl, env);
-		ruAddMappedDecl2MappedMath(acc, m, env);
-	});
+	fold(mapped, mapped_math, \acc, m -> ruAddMappedDecl2MappedMath(acc, m, env));
 }
 
 ruMapDeclsConcurrentlyByChunks(chunks : [[RuDecl]], f : RuMapFn, time_limit : double, timer : RuTimer, mapped_math : RuMappedMath, env : RuEnv) -> RuMappedMath {
@@ -166,12 +162,7 @@ ruMapDeclsConcurrentlyByChunks(chunks : [[RuDecl]], f : RuMapFn, time_limit : do
 			mapped = ruConcurrent(mapi(chunk, \i, decl -> 
 				\env1 -> f.func(decl, scaled_time_limit_on_chunk * chunk_measures[n][i] / sum_chunk_measures[n], env1)
 			), env);
-			fold(mapped, acc, \ac, d -> ruAddMappedDecl2MappedMath(acc, d, env)
-				/*eitherMap(d,
-					\mapped_d -> ruMathReplaceDecl(ac, mapped_d, env),
-					ac
-				)*/
-			)
+			fold(mapped, acc, \ac, d -> ruAddMappedDecl2MappedMath(acc, d, env))
 		}
 	});
 }
@@ -196,50 +187,41 @@ ruMapFnComm(unit : RuUnit, f : RuMapFn) -> RuState {
 	if (ruVerbose(conf) > 0) {
 		ruTrackProgress(stats.progress);
 	}
-	/*proc_cycle = \mapped_math -> {
-		to_proc = filter(decls, \d -> !containsSet(mapped_math.processed, d.info.id));
-		ruMapDeclsSequentially(to_proc, prog_f, time_limit, stats.progress.timer, math, env);
-	}*/
-	initial = RuMappedMath(math, makeSet(), makeSet());
-	mapped = if (!ruTargetIsConcurrent(target)) {
-		ruMapDeclsSequentially(decls, prog_f, time_limit, stats.progress.timer, initial, env);
-	} else {
-		ruMapDeclsConcurrently(decls, prog_f, time_limit, stats.progress.timer, initial, env);
+	timer = ruMakeTimer();
+	initial = ref true;
+	proc_cycle = \mapped_math0 -> {
+		initial := false;
+		to_proc = filter(decls, \d -> !containsSet(mapped_math0.successes, d.info.id));
+		mapped_math = RuMappedMath(mapped_math0 with fails = makeSet());
+		stats.failed := 0;
+		new_time_limit = time_limit - ruTimePassed(timer);
+		if (length(to_proc) != length(decls)) {
+			out.onMessage("Another try to process " + i2s(length(to_proc)) + " failed decls, time limit: " + ruTime2s(new_time_limit));
+		}
+		if (!ruTargetIsConcurrent(target)) {
+			ruMapDeclsSequentially(to_proc, prog_f, new_time_limit, stats.progress.timer, mapped_math, env);
+		} else {
+			ruMapDeclsConcurrently(to_proc, prog_f, new_time_limit, stats.progress.timer, mapped_math, env);
+		}
+	}
+	mapped = for(
+		RuMappedMath(math, makeSet(), makeSet()), 
+		\mm -> (
+			(time_limit - ruTimePassed(timer)) >= 0.0 && 
+			(sizeSet(mm.fails) > 0 || ^initial)
+		), 
+		proc_cycle
+	);
+	failed = set2array(mapped.fails);
+	if (length(failed) > 0) {
+		out.onMessage("Failed " + i2s(length(failed)) + ":\n" + strIndent(concatStrings(map(failed, id2s))));
+	} else if (conf.verbose > 0) {
+		out.onMessage("All " + i2s(length(decls)) + " declarations are mapped successfully");
 	}
 	stats.progress.isOn := false;
 	ruMapDeclsEndMessage(stats, f.info.name, ruTarget2s(target), decls, env);
 	ruMapDeclsResult(state, mapped.math.sources, f.info.name, stats);
 }
-/*
-ruDoMapFnComm(unit : RuUnit, f : RuMapFn, time_limit : double) -> RuState {
-	task = unit.task;
-	state = unit.state;
-	out = unit.out;
-	file = lookupTreeDef(task.args, "file", "");
-	conf = state.conf;
-	env = RuEnv(conf, out);
-	math = ruMathFromSources(state.ru, env);
-	if (ruVerbose(conf) >= 3) {
-		out.onMessage("\t\tMap '" + f.info.name + "' task: " + ruTask2s(task));
-	}
-	target = ruDetermineTarget(task, math, env);
-	decls = filter(ruTargetDecls(target, math, env), f.info.pred);
-	time_limit = ruCalcTimeLimit(decls, f, task, conf);
-	stats = ruMakeMapFnStats(time_limit, length(decls), ruProgressUpdateMs(task, conf), f.info, out);
-	prog_f = RuMapFn(f with func = ruWrapFnWithProgress(f, stats));
-	ruMapDeclsStartMessage(decls, time_limit, env);
-	if (ruVerbose(conf) > 0) {
-		ruTrackProgress(stats.progress);
-	}
-	mapped_math = if (!ruTargetIsConcurrent(target)) {
-		ruMapDeclsSequentially(decls, prog_f, time_limit, stats.progress.timer, math, env);
-	} else {
-		ruMapDeclsConcurrently(decls, prog_f, time_limit, stats.progress.timer, math, env);
-	}
-	stats.progress.isOn := false;
-	ruMapDeclsEndMessage(stats, f.info.name, ruTarget2s(target), decls, env);
-	ruMapDeclsResult(state, mapped_math.sources, f.info.name, stats);
-}*/
 
 ruMapDeclsResult(state : RuState, mapped : Tree<int, RuSource>, f_name : string, stats : RuMapFnStats) -> RuState {
 	RuState(state with 
@@ -261,7 +243,7 @@ ruMapDeclsStartMessage(decls : [RuDecl], time_limit : double, env : RuEnv) -> vo
 	out = env.out;
 	if (ruVerbose(conf) > 0) {
 		out.onMessage(
-			"\tgoing to process " + i2s(length(decls)) + "\n" +
+			"\tgoing to process " + i2s(length(decls)) + " declarations\n" +
 			"\ttime limit: " + ruTime2s(time_limit) + " (" + d2st(time_limit / 1000.0, 2) + "s)" +
 			(if (ruVerbose(conf) >= 2) "\n\ttime limit per unit: " + ruTime2s(time_limit / i2d(length(decls))) else "")
 		);
