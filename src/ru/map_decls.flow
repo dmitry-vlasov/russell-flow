@@ -14,10 +14,22 @@ export {
 		message : () -> string
 	);
 
+	RuMappedDecl(
+		decl : RuDecl,
+		fail : bool,
+		replace : bool
+	);
+
 	// Mapping function: transforms (possibly) a decl. If None is returned, old one is kept.
 	RuMapFn(
 		info : RuMapFnInfo,
-		func : (RuDecl, double, RuEnv) -> Maybe<RuDecl>
+		func : (RuDecl, double, RuEnv) -> RuMappedDecl
+	);
+
+	RuMappedMath(
+		math : RuMath,
+		successes : Set<int>,
+		fails : Set<int>
 	);
 
 	// Map 'f.func' to the decls from 'target' task option. 
@@ -47,8 +59,8 @@ ruCalcTimeLimit(decls : [RuDecl], f : RuMapFn, task : ScTask, conf : RuConf) -> 
 
 RuMapFnStats(
 	progress    : RuProgress,
-	not_mapped  : ref int,
-	was_mapped  : ref int,
+	failed      : ref int,
+	replaced    : ref int,
 	max_time    : ref double,
 	max_time_id : ref int
 );
@@ -64,7 +76,7 @@ ruMakeMapFnStats(time_limit : double, total : int, delta, info : RuMapFnInfo, ou
 	);
 }
 
-ruWrapFnWithProgress(f : RuMapFn, stats : RuMapFnStats) -> (RuDecl, double, RuEnv) -> Maybe<RuDecl> {
+ruWrapFnWithProgress(f : RuMapFn, stats : RuMapFnStats) -> (RuDecl, double, RuEnv) -> RuMappedDecl {
 	\decl, time_limit, env -> {
 		if (ruVerbose(env.conf) >= 3) {
 			env.out.onMessage("\t\tTime limit on decl '" + id2s(decl.info.id) + "': " + ruTime2s(time_limit));
@@ -72,10 +84,11 @@ ruWrapFnWithProgress(f : RuMapFn, stats : RuMapFnStats) -> (RuDecl, double, RuEn
 		timer = ruMakeTimer();
 		ret = f.func(decl, time_limit, env);
 		atomicRefIntAddition(stats.progress.counter, 1);
-		if (isSome(ret)) {
-			atomicRefIntAddition(stats.was_mapped, 1);
-		} else {
-			atomicRefIntAddition(stats.not_mapped, 1);
+		if (ret.fail) {
+			atomicRefIntAddition(stats.failed, 1); {}
+		} 
+		if (ret.replace) {
+			atomicRefIntAddition(stats.replaced, 1); {}
 		} 
 		time = ruTimePassed(timer);
 		if (time > ^(stats.max_time)) {
@@ -86,40 +99,50 @@ ruWrapFnWithProgress(f : RuMapFn, stats : RuMapFnStats) -> (RuDecl, double, RuEn
 	}
 }
 
-ruMapDeclsSequentially(decls : [RuDecl], f : RuMapFn, time_limit : double, timer : RuTimer, math : RuMath, env : RuEnv) -> RuMath {
-	measures = ruDecls2Measures(decls, f);
-	sum_measure = ruSumDoublesFromArray(measures);
-	foldi(decls, math, \i, acc, d ->
-		eitherMap(
-			f.func(d, time_limit * measures[i] / sum_measure, env),
-			\mapped_d -> ruMathReplaceDecl(acc, mapped_d, env),
-			acc
-		)
-	);
-}
-
-ruMapDeclsConcurrently(decls : [RuDecl], f : RuMapFn, time_limit : double, timer : RuTimer, math : RuMath, env : RuEnv) -> RuMath {
-	split_by = lookupTreeDef(env.conf.opts, "decls-split-num", "");
-	if (split_by == "") {
-		ruMapDeclsConcurrentlyAll(decls, f, time_limit, timer, math, env);
+ruAddMappedDecl2MappedMath(acc : RuMappedMath, mapped : RuMappedDecl, env : RuEnv) -> RuMappedMath {
+	if (!mapped.fail) {
+		acc1 = RuMappedMath(acc with successes = insertSet(acc.successes, mapped.decl.info.id));
+		if (mapped.replace) {
+			RuMappedMath(acc1 with math = ruMathReplaceDecl(acc.math, mapped.decl, env));
+		} else {
+			acc1;
+		}
 	} else {
-		chunks = splitByNumber(decls, s2i(split_by));
-		ruMapDeclsConcurrentlyByChunks(chunks, f, time_limit, timer, math, env);
+		RuMappedMath(acc with fails = insertSet(acc.fails, mapped.decl.info.id));
 	}
 }
 
-ruMapDeclsConcurrentlyAll(decls : [RuDecl], f : RuMapFn, time_limit : double, timer : RuTimer, math : RuMath, env : RuEnv) -> RuMath {
+ruMapDeclsSequentially(decls : [RuDecl], f : RuMapFn, time_limit : double, timer : RuTimer, mapped_math : RuMappedMath, env : RuEnv) -> RuMappedMath {
+	measures = ruDecls2Measures(decls, f);
+	sum_measure = ruSumDoublesFromArray(measures);
+	foldi(decls, mapped_math, \i, acc, d -> {
+		mapped = f.func(d, time_limit * measures[i] / sum_measure, env);
+		ruAddMappedDecl2MappedMath(acc, mapped, env);
+	});
+}
+
+ruMapDeclsConcurrently(decls : [RuDecl], f : RuMapFn, time_limit : double, timer : RuTimer, mapped_math : RuMappedMath, env : RuEnv) -> RuMappedMath {
+	split_by = lookupTreeDef(env.conf.opts, "decls-split-num", "");
+	if (split_by == "") {
+		ruMapDeclsConcurrentlyAll(decls, f, time_limit, timer, mapped_math, env);
+	} else {
+		chunks = splitByNumber(decls, s2i(split_by));
+		ruMapDeclsConcurrentlyByChunks(chunks, f, time_limit, timer, mapped_math, env);
+	}
+}
+
+ruMapDeclsConcurrentlyAll(decls : [RuDecl], f : RuMapFn, time_limit : double, timer : RuTimer, mapped_math : RuMappedMath, env : RuEnv) -> RuMappedMath {
 	measures = ruDecls2Measures(decls, f);
 	sum_measure = ruSumDoublesFromArray(measures);
 	mapped = filtermap(ruConcurrent(mapi(decls, \i, d -> \env1 -> {
 		if (ruTimeLeft(timer) <= 0.0) None() else {
-			f.func(d, time_limit * i2d(availableProcessors()) * measures[i] / sum_measure, env1)
+			Some(f.func(d, time_limit * i2d(availableProcessors()) * measures[i] / sum_measure, env1))
 		}
 	}), env), idfn);
-	fold(mapped, math, \acc, decl -> ruMathReplaceDecl(acc, decl, env));
+	fold(mapped, mapped_math, \acc, m -> ruAddMappedDecl2MappedMath(acc, m, env));
 }
 
-ruMapDeclsConcurrentlyByChunks(chunks : [[RuDecl]], f : RuMapFn, time_limit : double, timer : RuTimer, math : RuMath, env : RuEnv) -> RuMath {
+ruMapDeclsConcurrentlyByChunks(chunks : [[RuDecl]], f : RuMapFn, time_limit : double, timer : RuTimer, mapped_math : RuMappedMath, env : RuEnv) -> RuMappedMath {
 	chunk_measures = map(chunks, \chunk -> ruDecls2Measures(chunk, f));
 	sum_chunk_measures = map(chunk_measures, ruSumDoublesFromArray);
 	total_measure = ruSumDoublesFromArray(sum_chunk_measures);
@@ -130,7 +153,7 @@ ruMapDeclsConcurrentlyByChunks(chunks : [[RuDecl]], f : RuMapFn, time_limit : do
 		ruSumDoublesFromArray(map(enumFromTo(0, i - 1), \j -> planned_times[j]))
 	);
 	planned_left = map(planned_passed, \passed -> time_limit - passed);
-	foldi(chunks, math, \n, acc, chunk -> {
+	foldi(chunks, mapped_math, \n, acc, chunk -> {
 		left_time = ruTimeLeft(timer);
 		if (left_time <= 0.0) acc else {
 			time_planned_on_chunk = time_limit * sum_chunk_measures[n] / total_measure;
@@ -139,12 +162,7 @@ ruMapDeclsConcurrentlyByChunks(chunks : [[RuDecl]], f : RuMapFn, time_limit : do
 			mapped = ruConcurrent(mapi(chunk, \i, decl -> 
 				\env1 -> f.func(decl, scaled_time_limit_on_chunk * chunk_measures[n][i] / sum_chunk_measures[n], env1)
 			), env);
-			fold(mapped, acc, \ac, d -> 
-				eitherMap(d,
-					\mapped_d -> ruMathReplaceDecl(ac, mapped_d, env),
-					ac
-				)
-			)
+			fold(mapped, acc, \ac, d -> ruAddMappedDecl2MappedMath(acc, d, env))
 		}
 	});
 }
@@ -169,14 +187,40 @@ ruMapFnComm(unit : RuUnit, f : RuMapFn) -> RuState {
 	if (ruVerbose(conf) > 0) {
 		ruTrackProgress(stats.progress);
 	}
-	mapped_math = if (!ruTargetIsConcurrent(target)) {
-		ruMapDeclsSequentially(decls, prog_f, time_limit, stats.progress.timer, math, env);
-	} else {
-		ruMapDeclsConcurrently(decls, prog_f, time_limit, stats.progress.timer, math, env);
+	timer = ruMakeTimer();
+	initial = ref true;
+	proc_cycle = \mapped_math0 -> {
+		initial := false;
+		to_proc = filter(decls, \d -> !containsSet(mapped_math0.successes, d.info.id));
+		mapped_math = RuMappedMath(mapped_math0 with fails = makeSet());
+		stats.failed := 0;
+		new_time_limit = time_limit - ruTimePassed(timer);
+		if (length(to_proc) != length(decls)) {
+			out.onMessage("Another try to process " + i2s(length(to_proc)) + " failed decls, time limit: " + ruTime2s(new_time_limit));
+		}
+		if (!ruTargetIsConcurrent(target)) {
+			ruMapDeclsSequentially(to_proc, prog_f, new_time_limit, stats.progress.timer, mapped_math, env);
+		} else {
+			ruMapDeclsConcurrently(to_proc, prog_f, new_time_limit, stats.progress.timer, mapped_math, env);
+		}
+	}
+	mapped = for(
+		RuMappedMath(math, makeSet(), makeSet()), 
+		\mm -> (
+			(time_limit - ruTimePassed(timer)) >= 0.0 && 
+			(sizeSet(mm.fails) > 0 || ^initial)
+		), 
+		proc_cycle
+	);
+	failed = set2array(mapped.fails);
+	if (length(failed) > 0) {
+		out.onMessage("Failed " + i2s(length(failed)) + ":\n" + strIndent(concatStrings(map(failed, id2s))));
+	} else if (conf.verbose > 0) {
+		out.onMessage("All " + i2s(length(decls)) + " declarations are mapped successfully");
 	}
 	stats.progress.isOn := false;
 	ruMapDeclsEndMessage(stats, f.info.name, ruTarget2s(target), decls, env);
-	ruMapDeclsResult(state, mapped_math.sources, f.info.name, stats);
+	ruMapDeclsResult(state, mapped.math.sources, f.info.name, stats);
 }
 
 ruMapDeclsResult(state : RuState, mapped : Tree<int, RuSource>, f_name : string, stats : RuMapFnStats) -> RuState {
@@ -185,8 +229,8 @@ ruMapDeclsResult(state : RuState, mapped : Tree<int, RuSource>, f_name : string,
 		vars = mergeTree(state.vars, pairs2tree([
 			Pair(f_name + ".counter", ValInt(^(stats.progress.counter))),
 			Pair(f_name + ".total", ValInt(stats.progress.total)),
-			Pair(f_name + ".was_mapped", ValInt(^(stats.was_mapped))),
-			Pair(f_name + ".not_mapped", ValInt(^(stats.not_mapped))),
+			Pair(f_name + ".failed", ValInt(^(stats.failed))),
+			Pair(f_name + ".replaced", ValInt(^(stats.replaced))),
 			Pair(f_name + ".max_time", ValDouble(^(stats.max_time))),
 			Pair(f_name + ".max_time_id", ValString(id2s(^(stats.max_time_id)))),
 			Pair(f_name + ".time", ValDouble(ruTimePassed(stats.progress.timer)))
@@ -199,7 +243,7 @@ ruMapDeclsStartMessage(decls : [RuDecl], time_limit : double, env : RuEnv) -> vo
 	out = env.out;
 	if (ruVerbose(conf) > 0) {
 		out.onMessage(
-			"\tgoing to process " + i2s(length(decls)) + "\n" +
+			"\tgoing to process " + i2s(length(decls)) + " declarations\n" +
 			"\ttime limit: " + ruTime2s(time_limit) + " (" + d2st(time_limit / 1000.0, 2) + "s)" +
 			(if (ruVerbose(conf) >= 2) "\n\ttime limit per unit: " + ruTime2s(time_limit / i2d(length(decls))) else "")
 		);
@@ -219,13 +263,13 @@ ruMapDeclsEndMessage(stats : RuMapFnStats, f_name : string, target : string, dec
 			"ru mapped '" + f_name + "' to '" + target + "' in " + ruTime2s(ruTimePassed(stats.progress.timer));
 		} else {
 			"ru mapped '" + f_name + "' to '" + target + "'" + 
-				"\n\ttotal time: " + ruTime2s(ruTimePassed(stats.progress.timer)) +
-				"\n\tavg time:   " + ruTime2s(ruTimePassed(stats.progress.timer) / i2d(length(decls))) +
-				"\n\tmax time:   " + ruTime2s(^(stats.max_time)) +
-				"\n\tmax time id:" + id2s(^(stats.max_time_id)) +
-				"\n\twas mapped: " + i2s(^(stats.was_mapped)) +
-				"\n\tnot mapped: " + i2s(^(stats.not_mapped)) + 
-				"\n\t%processed: " + d2st(100.0 * i2d(^(stats.was_mapped) + ^(stats.not_mapped)) / i2d(length(decls)), 2);
+				"\n\ttotal time:   " + ruTime2s(ruTimePassed(stats.progress.timer)) +
+				"\n\tavg time:     " + ruTime2s(ruTimePassed(stats.progress.timer) / i2d(length(decls))) +
+				"\n\tmax time:     " + ruTime2s(^(stats.max_time)) +
+				"\n\tmax time id:  " + id2s(^(stats.max_time_id)) +
+				"\n\twas failed:   " + i2s(^(stats.failed)) +
+				"\n\tnot replaced: " + i2s(^(stats.replaced)) + 
+				"\n\t%processed:   " + d2st(100.0 * i2d(^(stats.progress.counter)) / i2d(length(decls)), 2);
 		}
 		out.onMessage(msg);
 	}
