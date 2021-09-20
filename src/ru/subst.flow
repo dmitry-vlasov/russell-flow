@@ -3,15 +3,19 @@ import base/util/util;
 import ru/util/math;
 
 export {
-	RuSubst(map : Tree<RuVar, RuExp>);
+	RuSubst(map : Tree<RuVar, RuExpVars>);
 	ruEmptySubst = RuSubst(makeTree());
 
+	ruLookupSubst(s : RuSubst, v : RuVar) -> Maybe<RuExp>;
+	ruLookupSubstDef(s : RuSubst, v : RuVar) -> RuExp;
 	ruApplySubst(e : RuExp, s : RuSubst) -> RuExp;
+	ruApplySubstVars(e : RuExpVars, s : RuSubst) -> RuExpVars;
 	ruMatchExp(e : RuExp, pattern : RuExp, math : RuMath, env : RuEnv) -> Maybe<RuSubst>;
 	ruMergeSubst(s1 : RuSubst, s2 : RuSubst) -> Maybe<RuSubst>;
 	ruSubst2s(s : RuSubst, math : RuMath) -> string;
 	ruSubstRPN2s(s : RuSubst) -> string;
 	ruAdd2Subst(s : RuSubst, v : RuVar, e : RuExp) -> Maybe<RuSubst>;
+	ruAdd2SubstVars(s : RuSubst, v : RuVar, e : RuExpVars) -> Maybe<RuSubst>;
 	ruAdd2Subst1(s : RuSubst, v : RuVar, e : RuExp, math : RuMath, env : RuEnv) -> Maybe<RuSubst>;
 	ruIsVarRenaming(s : RuSubst) -> bool;
 	ruReverseVarRenaming(s : RuSubst) -> RuSubst;
@@ -44,20 +48,42 @@ export {
 	ruReduceSubst(s: RuSubst) -> RuSubst;
 }
 
+ruLookupSubst(s : RuSubst, v : RuVar) -> Maybe<RuExp> {
+	maybeMap(lookupTree(s.map, v), \e -> e.exp);
+}
+
+ruLookupSubstDef(s : RuSubst, v : RuVar) -> RuExp {
+	switch (lookupTree(s.map, v)) {
+		Some(ev): {
+			ev.exp;
+		}
+		None(): {
+			ruVar2Exp(v);
+		}
+	}
+}
+
 ruMergeSubst(s1 : RuSubst, s2 : RuSubst) -> Maybe<RuSubst> {
 	conflict = ref false;
-	m0 = mergeTreeCustom(s1.map, s2.map, \__, e1, e2 -> if (e1.nodes == e2.nodes) e1 else { conflict := true; e1 });
+	m0 = mergeTreeCustom(s1.map, s2.map, \__, e1, e2 -> 
+		if (e1.exp.nodes == e2.exp.nodes) e1 else { 
+			conflict := true; 
+			e1 
+		}
+	);
 	if (^conflict) None() else Some(RuSubst(m0));
 }
 
 ruSubst2s(s : RuSubst, math : RuMath) -> string {
-	strGlue(map(tree2pairs(s.map), \p -> id2s(p.first.id) + " => " + ruExp2s(p.second, math.decls.lang.rules)) 
-	, "\n")
+	strGlue(map(tree2pairs(s.map), \p -> 
+		id2s(p.first.id) + " => " + ruExp2s(p.second.exp, math.decls.lang.rules)
+	), "\n")
 }
 
 ruSubstRPN2s(s : RuSubst) -> string {
-	strGlue(map(tree2pairs(s.map), \p -> id2s(p.first.id) + " => " + ruExpRPN2s(p.second)) 
-	, "\n")
+	strGlue(map(tree2pairs(s.map), \p -> 
+		id2s(p.first.id) + " => " + ruExpRPN2s(p.second.exp)
+	), "\n")
 }
 
 ruAdd2Subst1(s : RuSubst, v : RuVar, e : RuExp, math : RuMath, env : RuEnv) -> Maybe<RuSubst> {
@@ -76,19 +102,18 @@ ruAdd2Subst(s : RuSubst, v : RuVar, e0 : RuExp) -> Maybe<RuSubst> {
 	//t = ruTime();
 	e = ruApplySubst(e0, s);
 	ret = if (e.nodes == [v]) Some(s) else {
-		//e_vars = ruExp2Vars(e.nodes);
+		//if (ruExpContainsVar(e, v)) None() else {
 		if (ruExpContainsVar(e, v)) None() else {
 			switch (lookupTree(s.map, v)) {
-				Some(e1): if (e.nodes == e1.nodes) Some(s) else None();
+				Some(e1): if (e.nodes == e1.exp.nodes) Some(s) else None();
 				None(): {
 					e_vars = ruExp2Vars(e);
 					p = foldSet(e_vars, Pair(true, None()), \acc, e_v ->
 						if (!acc.first) acc else {
 							switch (lookupTree(s.map, e_v)) {
 								Some(e2): {
-									//e2_vars = ruExp2Vars(e2.nodes);
-									if (!ruExpContainsVar(e2, e_v)) acc else {
-										Pair(e2.nodes == [v] && e.nodes == [e_v], Some(e_v));
+									if (!ruExpContainsVar(e2.exp, e_v)) acc else {
+										Pair(e2.exp.nodes == [v] && e.nodes == [e_v], Some(e_v));
 									}
 								}
 								None(): acc;
@@ -103,10 +128,66 @@ ruAdd2Subst(s : RuSubst, v : RuVar, e0 : RuExp) -> Maybe<RuSubst> {
 								//tau = mapTree(s, \x -> ruApplySubst(x, theta));
 								//tau = mapTree(s, \x -> ruReplaceVarByExp(x, v, e));
 								affected_vars = filterTree(s.map, \w, x -> 
-									ruExpContainsVar(x, v)
+									ruExpContainsVar(x.exp, v)
 								);
 								tau = foldTree(affected_vars, s.map, \w, x, acc ->
 									setTree(acc, w, ruReplaceVarByExp(x, v, e))
+								);
+								ev = RuExpVars(e, ruExp2Vars(e));
+								Some(RuSubst(setTree(tau, v, ev)));
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	/*time = ruTime() - t;
+	stats = RuStatsRow("", 
+		pairs2tree([
+			Pair("size", i2d(sizeTree(s))), 
+			Pair("time", time),
+			Pair("cplx", i2d(ruSubComplexity(s)))
+		])
+	);
+	ruAddStats("ruAdd2Subst", stats);*/
+	ret
+}
+
+ruAdd2SubstVars(s : RuSubst, v : RuVar, e0 : RuExpVars) -> Maybe<RuSubst> {
+	//t = ruTime();
+	e = ruApplySubstVars(e0, s);
+	ret = if (e.exp.nodes == [v]) Some(s) else {
+		//if (ruExpContainsVar(e, v)) None() else {
+		if (containsSet(e.vars, v)) None() else {
+			switch (lookupTree(s.map, v)) {
+				Some(e1): if (e.exp.nodes == e1.exp.nodes) Some(s) else None();
+				None(): {
+					//e_vars = ruExp2Vars(e);
+					p = foldSet(e.vars, Pair(true, None()), \acc, e_v ->
+						if (!acc.first) acc else {
+							switch (lookupTree(s.map, e_v)) {
+								Some(e2): {
+									if (!containsSet(e2.vars, e_v)) acc else {
+										Pair(e2.exp.nodes == [v] && e.exp.nodes == [e_v], Some(e_v));
+									}
+								}
+								None(): acc;
+							}
+						}
+					);
+					if (!p.first) None() else {
+						switch (p.second) {
+							Some(w): Some(RuSubst(removeFromTree(s.map, w)));
+							None():  {
+								//theta = makeTree1(v, e);
+								//tau = mapTree(s, \x -> ruApplySubst(x, theta));
+								//tau = mapTree(s, \x -> ruReplaceVarByExp(x, v, e));
+								affected_vars = filterTree(s.map, \w, x -> 
+									containsSet(x.vars, v)
+								);
+								tau = foldTree(affected_vars, s.map, \w, x, acc ->
+									setTree(acc, w, ruReplaceVarByExpVars(x, v, e))
 								);
 								Some(RuSubst(setTree(tau, v, e)));
 							}
@@ -130,7 +211,7 @@ ruAdd2Subst(s : RuSubst, v : RuVar, e0 : RuExp) -> Maybe<RuSubst> {
 
 ruSemiCompose(s1 : RuSubst, s2 : RuSubst) -> Maybe<RuSubst> {
 	foldTree(s1.map, Some(RuSubst(makeTree())), \v1, e1, acc ->
-		maybeBind(acc, \s -> ruAdd2Subst(s, v1, ruApplySubst(e1, s2)))
+		maybeBind(acc, \s -> ruAdd2SubstVars(s, v1, ruApplySubstVars(e1, s2)))
 	);
 	/*if (sizeTree(s1) < 64 && sizeTree(s2) < 64) {
 		ruDoSemiCompose(s1, s2);
@@ -168,20 +249,20 @@ ruSemiCompose(s1 : RuSubst, s2 : RuSubst) -> Maybe<RuSubst> {
 
 ruDoSemiCompose(s1 : RuSubst, s2 : RuSubst) -> Maybe<RuSubst> {
 	foldTree(s1.map, Some(RuSubst(makeTree())), \v1, e1, acc ->
-		maybeBind(acc, \s -> ruAdd2Subst(s, v1, ruApplySubst(e1, s2)))
+		maybeBind(acc, \s -> ruAdd2SubstVars(s, v1, ruApplySubstVars(e1, s2)))
 	);
 }
 
 ruDoCompose(s1 : RuSubst, s2 : RuSubst) -> Maybe<RuSubst> {
 	foldTree(s2.map, ruSemiCompose(s1, s2), \v2, e2, acc ->
-		maybeBind(acc, \s -> if (containsKeyTree(s1.map, v2)) Some(s) else ruAdd2Subst(s, v2, e2))
+		maybeBind(acc, \s -> if (containsKeyTree(s1.map, v2)) Some(s) else ruAdd2SubstVars(s, v2, e2))
 	);
 }
 
 ruCompose(s1 : RuSubst, s2 : RuSubst) -> Maybe<RuSubst> {
 	//t= ruTime();
 	ret = foldTree(s2.map, ruSemiCompose(s1, s2), \v2, e2, acc ->
-		maybeBind(acc, \s -> if (containsKeyTree(s1.map, v2)) Some(s) else ruAdd2Subst(s, v2, e2))
+		maybeBind(acc, \s -> if (containsKeyTree(s1.map, v2)) Some(s) else ruAdd2SubstVars(s, v2, e2))
 	);
 	/*stats = RuStatsRow("", 
 		pairs2tree([
@@ -232,8 +313,13 @@ ruCompose(s1 : RuSubst, s2 : RuSubst) -> Maybe<RuSubst> {
 
 ruUnsafeCompose(s1 : RuSubst, s2 : RuSubst) -> RuSubst {
 	RuSubst(foldTree(s2.map, 
-		foldTree(s1.map, makeTree(), \v1, e1, acc -> setTree(acc, v1, ruApplySubst(e1, s2))), 
-		\v2, e2, acc -> if (containsKeyTree(acc, v2)) acc else setTree(acc, v2, e2)
+		foldTree(s1.map, makeTree(), \v1, e1, acc -> 
+			setTree(acc, v1, ruApplySubstVars(e1, s2))
+		), 
+		\v2, e2, acc -> 
+			if (containsKeyTree(acc, v2)) acc else {
+				setTree(acc, v2, e2);
+			}
 	));
 }
 
@@ -276,8 +362,9 @@ ruMatchExp(e : RuExp, pattern : RuExp, math : RuMath, env : RuEnv) -> Maybe<RuSu
 					}
 				}
 			}
-		)
-	), \p -> RuSubst(p.first));
+		)), 
+		\p -> RuSubst(mapTree(p.first, \e1 -> RuExpVars(e1, ruExp2Vars(e1))))
+	);
 }
 
 
@@ -314,6 +401,13 @@ ruApplySubst(e : RuExp, s : RuSubst) -> RuExp {
 	//ruApplySubst2(e, s);
 }
 
+ruApplySubstVars(e : RuExpVars, s : RuSubst) -> RuExpVars {
+	//ruApplySubst0(e, s);
+	e1 = ruApplySubst1(e.exp, s);
+	RuExpVars(e1, ruExp2Vars(e1));
+	//ruApplySubst2(e, s);
+}
+
 ruApplySubst0(e : RuExp, s : RuSubst) -> RuExp {
 	if (forall(e.nodes, \n -> switch (n) {
 		RuRuleNode(__,__,__,__): true;
@@ -335,8 +429,8 @@ ruApplySubst0(e : RuExp, s : RuSubst) -> RuExp {
 						switch (lookupTree(s.map, n)) {
 							Some(x):
 								RuApplyAcc(
-									concat(x.nodes, acc.nodes),
-									RuApplyStack(Some(acc.stack), length(x.nodes))
+									concat(x.exp.nodes, acc.nodes),
+									RuApplyStack(Some(acc.stack), length(x.exp.nodes))
 								);
 							None(): 
 								RuApplyAcc(
@@ -356,10 +450,17 @@ RuApplyAcc1(
 	stack : RuApplyStack
 );
 
+ruSubstAffectsExp(e : RuExp, s : RuSubst) -> bool {
+	exists(e.nodes, \n -> 
+		switch (n) { 
+			RuRuleNode(__,__,__,__): false; 
+			RuVar(__,__): containsKeyTree(s.map, n);
+		}
+	);
+}
+
 ruApplySubst1(e : RuExp, s : RuSubst) -> RuExp {
-	if (forall(e.nodes, \n -> switch (n) { RuRuleNode(__,__,__,__): true; RuVar(__,__): !containsKeyTree(s.map, n); })) {
-		e
-	} else {
+	if (!ruSubstAffectsExp(e, s)) e else {
 		nodes_list = foldr(e.nodes, RuApplyAcc1(makeList(), RuApplyStack(None(), 0)),
 			\acc, n -> {
 				switch (n) {
@@ -374,8 +475,8 @@ ruApplySubst1(e : RuExp, s : RuSubst) -> RuExp {
 						switch (lookupTree(s.map, n)) {
 							Some(x):
 								RuApplyAcc1(
-									Cons(x.nodes, acc.nodes),
-									RuApplyStack(Some(acc.stack), length(x.nodes))
+									Cons(x.exp.nodes, acc.nodes),
+									RuApplyStack(Some(acc.stack), length(x.exp.nodes))
 								);
 							None():
 								RuApplyAcc1(
@@ -395,9 +496,9 @@ ruApplySubst1(e : RuExp, s : RuSubst) -> RuExp {
 
 
 
-ruReplaceVarByExp(e : RuExp, v : RuVar, by : RuExp) -> RuExp {
+ruReplaceVarByExp(e : RuExpVars, v : RuVar, by : RuExp) -> RuExpVars {
 	//if (!ruExpContainsVar(e, v)) e else {
-		nodes_list = foldr(e.nodes, 
+		nodes_list = foldr(e.exp.nodes, 
 			RuApplyAcc1(makeList(), RuApplyStack(None(), 0)), \acc, n -> {
 				switch (n) {
 					RuRuleNode(r, t, a, l): {
@@ -425,11 +526,45 @@ ruReplaceVarByExp(e : RuExp, v : RuVar, by : RuExp) -> RuExp {
 		).nodes;
 		nodes_arr = list2array(nodes_list);
 		applied_nodes = ruConcatAr(nodes_arr);
-		RuExp(applied_nodes, e.pos);
+		e1 = RuExp(applied_nodes, e.exp.pos);
+		RuExpVars(e1, ruExp2Vars(e1));
 	//}
 }
 
-
+ruReplaceVarByExpVars(e : RuExpVars, v : RuVar, by : RuExpVars) -> RuExpVars {
+	//if (!ruExpContainsVar(e, v)) e else {
+		nodes_list = foldr(e.exp.nodes, 
+			RuApplyAcc1(makeList(), RuApplyStack(None(), 0)), \acc, n -> {
+				switch (n) {
+					RuRuleNode(r, t, a, l): {
+						st_len = ruApplyComputeLen(a, Pair(acc.stack, 0));
+						RuApplyAcc1(
+							Cons([RuRuleNode(r, t, a, st_len.second)], acc.nodes),
+							RuApplyStack(Some(st_len.first), st_len.second + 1)
+						);
+					}
+					RuVar(id,__): {
+						if (id == v.id) {
+							RuApplyAcc1(
+								Cons(by.exp.nodes, acc.nodes),
+								RuApplyStack(Some(acc.stack), length(by.exp.nodes))
+							);
+						} else {
+							RuApplyAcc1(
+								Cons([n], acc.nodes),
+								RuApplyStack(Some(acc.stack), 1)
+							);
+						}
+					}
+				}
+			}
+		).nodes;
+		nodes_arr = list2array(nodes_list);
+		applied_nodes = ruConcatAr(nodes_arr);
+		e1 = RuExp(applied_nodes, e.exp.pos);
+		RuExpVars(e1, mergeSets(removeSet(e.vars, v), by.vars));
+	//}
+}
 
 
 
@@ -454,7 +589,7 @@ ruApplySubstLen(e : RuExp, s : RuSubst) -> int {
 			RuRuleNode(r, t, a, l): len + 1;
 			RuVar(__,__):
 				switch (lookupTree(s.map, n)) {
-					Some(x): len + length(x.nodes);
+					Some(x): len + length(x.exp.nodes);
 					None(): len + 1;
 				}
 		}
@@ -479,9 +614,9 @@ ruApplySubst2(e : RuExp, s : RuSubst) -> RuExp {
 					RuVar(__,__): {
 						switch (lookupTree(s.map, n)) {
 							Some(x): {
-								iter(reverseA(x.nodes), \m -> pushVector(nodes_vect, m));
+								iter(reverseA(x.exp.nodes), \m -> pushVector(nodes_vect, m));
 								//foldr(x.nodes, 0, \__, m -> { pushVector(nodes_vect, m); 0 });
-								RuApplyStack(Some(stack), length(x.nodes));
+								RuApplyStack(Some(stack), length(x.exp.nodes));
 							}
 							None(): {
 								pushVector(nodes_vect, n);
@@ -509,15 +644,15 @@ ruApplySubst2(e : RuExp, s : RuSubst) -> RuExp {
 
 
 ruIsVarRenaming(s : RuSubst) -> bool {
-	image_vars = buildSet(filtermap(getTreeValues(s.map), ruExp2Var));
+	image_vars = buildSet(filtermap(getTreeValues(s.map), \x -> ruExp2Var(x.exp)));
 	sizeTree(s.map) == sizeSet(image_vars);
 }
 
 ruReverseVarRenaming(s : RuSubst) -> RuSubst {
-	RuSubst(foldTree(s.map, makeTree(), \v, ex, acc -> {
-		w = ex.nodes[0];
+	RuSubst(foldTree(s.map, makeTree(), \v, e, acc -> {
+		w = e.exp.nodes[0];
 		switch (w) {
-			RuVar(__,__): setTree(acc, w, RuExp([v], -1));
+			RuVar(id,__): setTree(acc, w, RuExpVars(RuExp([v], -1), makeSet1(w)));
 			default: acc;
 		}
 	}));
@@ -557,7 +692,7 @@ ruSubsAreEq(s1 : RuSubst, s2 : RuSubst) -> bool {
 	if (sizeTree(s1.map) != sizeTree(s2.map)) false else {
 		forall(tree2pairs(s1.map), \p ->
 			switch (lookupTree(s2.map, p.first)) {
-				Some(e2): p.second.nodes == e2.nodes;
+				Some(e2): p.second.exp.nodes == e2.exp.nodes;
 				None(): false;
 			}
 		);
@@ -570,10 +705,12 @@ ruSubsAreSim(s1 : RuSubst, s2 : RuSubst) -> Maybe<RuSubst> {
 			switch (lookupTree(s2.map, v1)) {
 				Some(__): acc;
 				None(): {
-					if (length(e1.nodes) != 1) acc else {
-						v2 = e1.nodes[0];
+					if (length(e1.exp.nodes) != 1) acc else {
+						v2 = e1.exp.nodes[0];
 						switch (v2) {
-							RuVar(__,__): RuSubst(setTree(acc.map, v2, RuExp([v1], -1)));
+							RuVar(__,__): RuSubst(setTree(acc.map, v2, 
+								RuExpVars(RuExp([v1], -1), makeSet1(v1))
+							));
 							default: acc;
 						}
 					}
@@ -585,14 +722,14 @@ ruSubsAreSim(s1 : RuSubst, s2 : RuSubst) -> Maybe<RuSubst> {
 }
 
 ruSubComplexity(s : RuSubst) -> int {
-	foldTree(s.map, 0, \v, e, acc -> acc + length(e.nodes));
+	foldTree(s.map, 0, \v, e, acc -> acc + length(e.exp.nodes));
 }
 
 ruSubst2Renaming(s : RuSubst) -> Maybe<Tree<RuVar, RuVar>> {
 	foldTree(s.map, Some(makeTree()), \v, e, acc -> 
 		switch (acc) {
 			Some(r): {
-				switch (ruExp2Var(e)) {
+				switch (ruExp2Var(e.exp)) {
 					Some(w): Some(setTree(r, v, w));
 					None(): None();
 				}
@@ -603,7 +740,9 @@ ruSubst2Renaming(s : RuSubst) -> Maybe<Tree<RuVar, RuVar>> {
 }
 
 ruRenaming2Subst(r : Tree<RuVar, RuVar>) -> RuSubst {
-	RuSubst(mapTree(r, \v -> RuExp([v], -1)));
+	RuSubst(mapTree(r, \v -> 
+		RuExpVars(RuExp([v], -1), makeSet1(v))
+	));
 }
 
 ruRenaming2s(r : Tree<RuVar, RuVar>) -> string {
@@ -705,21 +844,24 @@ ruApplyRenaming2Decl(r : Tree<RuVar, RuVar>, decl : RuDecl) -> RuDecl	{
 }
 
 ruTransformSubst(s: RuSubst, f : (RuExp) -> RuExp) -> RuSubst {
-	RuSubst(mapTree(s.map, f));
+	RuSubst(mapTree(s.map, \e -> {
+		fe = f(e.exp);
+		RuExpVars(fe, ruExp2Vars(fe))
+	}));
 }
 
 ruSubstLevel(s: RuSubst) -> int {
 	foldTree(s.map, 0, \v, e, acc ->
-		max(acc, if (ruIsVar(e)) 0 else length(e.nodes))
+		max(acc, if (ruIsVar(e.exp)) 0 else length(e.exp.nodes))
 	);
 }
 
 ruSubstLen(s: RuSubst) -> int {
 	foldTree(s.map, 0, \v, e, acc ->
-		acc + length(e.nodes) - 1
+		acc + length(e.exp.nodes) - 1
 	);
 }
 
 ruReduceSubst(s: RuSubst) -> RuSubst {
-	RuSubst(filterTree(s.map, \v, e -> length(e.nodes) > 1 || e.nodes[0] != v));
+	RuSubst(filterTree(s.map, \v, e -> length(e.exp.nodes) > 1 || e.exp.nodes[0] != v));
 }
