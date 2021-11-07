@@ -25,13 +25,14 @@ ruReproveCompressTheorem(
 	time_limit : double,
 	args : Tree<string, string>,
 	math : RuMath, 
+	conf : RuConf,
 	env : RuEnv
 ) -> RuTheorem {
 	if (time_limit <= 0.0 || length(th.proof.steps) == 1) th else {
 		timer = ruMakeTimer();
-		reduced = ruReproveReduceProof(0, th, index, time_limit, args, math, env);
+		reduced = ruReproveReduceProof(0, th, index, time_limit, args, math, conf, env);
 		if (reduced == th) th else {
-			ruReproveCompressTheorem(reduced, index, time_limit - ruTimePassed(timer), args, math, env);
+			ruReproveCompressTheorem(reduced, index, time_limit - ruTimePassed(timer), args, math, conf, env);
 		}
 	}
 }
@@ -43,19 +44,33 @@ ruReproveReduceProof(
 	time_limit : double,
 	args : Tree<string, string>,
 	math : RuMath, 
+	conf : RuConf,
 	env : RuEnv
 ) -> RuTheorem {
-	if (step_ind == length(th.proof.steps) || time_limit <= 0.0) th else {
+	if (step_ind + 1 == length(th.proof.steps) || time_limit <= 0.0) th else {
 		timer = ruMakeTimer();
 		reduced = ruRemoveStepFromTheorem(th, step_ind);
+		if (conf.verbose > 3) {
+			env.out.onMessage(strIndent("Going to remove " + i2s(step_ind + 1) + " step: " + ru2s(th.proof.steps[step_ind], math)));
+		}
 		proved = ruReproveReduced(
 			step_ind, Some(reduced), index, 
 			time_limit / i2d(length(th.proof.steps)), 
-			args, math, env
+			args, math, conf, env
 		);
 		switch (proved) {
-			Some(ret): ret;
-			None(): ruReproveReduceProof(step_ind + 1, th, index, time_limit - ruTimePassed(timer), args, math, env);
+			Some(ret): {
+				if (conf.verbose > 3) {
+					env.out.onMessage(strIndent("Step " + i2s(step_ind + 1) + " may be skipped - is reprovable"));
+				}
+				ret;
+			}
+			None(): {
+				if (conf.verbose > 3) {
+					env.out.onMessage(strIndent("Step " + i2s(step_ind + 1) + " CAN't be skipped - is NOT reprovable"));
+				}
+				ruReproveReduceProof(step_ind + 1, th, index, time_limit - ruTimePassed(timer), args, math, conf, env);
+			}
 		}
 	}
 }
@@ -102,23 +117,25 @@ ruReproveReduced(
 	time_limit : double,
 	args : Tree<string, string>,
 	math : RuMath, 
+	conf : RuConf,
 	env : RuEnv
 ) -> Maybe<RuTheorem> {
 	maybeBind(mth, \th -> {
 		if (step_ind == length(th.proof.steps)) Some(th) else {
 			step = th.proof.steps[step_ind];
 			if (step.assertion != ruStepProblem) {
-				ruReproveReduced(step_ind + 1, mth, index, time_limit, args, math, env);
+				ruReproveReduced(step_ind + 1, mth, index, time_limit, args, math, conf, env);
 			} else {
 				max_depth = s2i(lookupTreeDef(args, "max-depth", "3"));
 				max_size = s2i(lookupTreeDef(args, "max-size", "4096"));
 				timer = ruMakeTimer();
-				task = RuProverTask("trying to prove " + i2s(step_ind) + " step of\n" + ru2s(th, math), args,
+				task = RuProverTask(th.info, 
+					"trying to prove " + i2s(step_ind + 1) + " step of\n" + strIndent(ru2s(th, math)), args,
 					concat(th.stat.hyps, subrange(th.proof.steps, 0, step_ind)),
 					step
 				);
 				if (env.conf.verbose > 4) {
-					env.out.onMessage(task.info);
+					env.out.onMessage(strIndent(strIndent(task.header)));
 				}
 				penv0 = ruInitProver(task, math, env, index, time_limit / i2d(length(th.proof.steps) - step_ind));
 				penv1 = RuProverEnv(penv0 with
@@ -144,12 +161,12 @@ ruReproveReduced(
 					}
 					proved = ruSetTheoremStep(th, proved_step);
 					if (env.conf.verbose > 4) {
-						env.out.onMessage("Proved:\n" + ru2s(proved, math));
+						env.out.onMessage(strIndent(strIndent("Proved:\n" + strIndent(ru2s(proved, math)))));
 					}
 					Some(proved)
 				} else {
 					if (env.conf.verbose > 4) {
-						env.out.onMessage("failed to prove");
+						env.out.onMessage(strIndent(strIndent("failed to prove")));
 					}
 					None();
 				}
@@ -166,11 +183,12 @@ ruRunReproveCompress(unit : RuUnit) -> Maybe<RuState> {
 	math = ruMathFromSources(state.ru, env);
 	timer = ruMakeTimer();
 	target = ruDetermineTarget(unit.task, math, env);
-	env.out.onMessage("verbose: " + i2s(conf.verbose));
 	if (target != RuTargetNone()) {
 		reproved_count = ref 0;
+		processed_count = ref 0;
 		failed_theorems = ref [];
 		inc_reproved = ruAtomicIntInc(reproved_count);
+		inc_processed = ruAtomicIntInc(processed_count);
 		th_fail = ruAtomicRefArrayPush(failed_theorems);
 		all_imported = ruSourcesAllImported(math.sources, env);
 		index = ruMakeIndexForTarget(target, math, env);
@@ -178,15 +196,22 @@ ruRunReproveCompress(unit : RuUnit) -> Maybe<RuState> {
 			th = cast(decl : RuDecl -> RuTheorem);
 			th_timer = ruMakeTimer();
 			percent = \compressed -> 100 * length(compressed.proof.steps) / length(th.proof.steps);
+			inc_processed(1);
 			if (conf.verbose > 2) {
-				env.out.onMessage("Going to compress " + i2s(^reproved_count) + " theorem '" + id2s(th.info.id) + "' ... ");
+				env.out.onMessage("Going to compress " + i2s(^processed_count) + " theorem '" + id2s(th.info.id) + ", time limit: " + ruTime2s(time_limit) + "' ... ");
+				if (conf.verbose > 3) {
+					env.out.onMessage(strIndent(ru2s(th, math)));
+				}
 			}
-			compressed = ruReproveCompressTheorem(th, index, time_limit, task.args, math, env1);
+			compressed = ruReproveCompressTheorem(th, index, time_limit, task.args, math, conf, env1);
+			if (th != compressed) {
+				inc_reproved(1);
+			}
 			if (conf.verbose > 1) {
 				if (th == compressed) {
-					env.out.onMessage(i2s(^reproved_count) + " theorem '" + id2s(th.info.id) + "' was NOT COMPRESSED in " + ruTimePassed2s(th_timer));
+					env.out.onMessage(i2s(^processed_count) + " theorem '" + id2s(th.info.id) + "' was NOT COMPRESSED in " + ruTimePassed2s(th_timer));
 				} else {
-					env.out.onMessage(i2s(^reproved_count) + " theorem '" + id2s(th.info.id) + "' was COMPRESSED in " + ruTimePassed2s(th_timer) + 
+					env.out.onMessage(i2s(^processed_count) + " theorem '" + id2s(th.info.id) + "' was COMPRESSED in " + ruTimePassed2s(th_timer) + 
 						" compressed: " + i2s(length(compressed.proof.steps)) + " = " + i2s(percent(compressed)) + 
 						" of original " + i2s(length(th.proof.steps))
 					);
