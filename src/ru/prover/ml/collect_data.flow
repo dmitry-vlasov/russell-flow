@@ -1,0 +1,240 @@
+import ru/prover/ml/learning_data;
+import ds/vector;
+import base/util/progress;
+import ru/prover/prove;
+import ru/prover/stats;
+import ru/map_decls;
+
+export {
+    //ruCollectLearningData(index : RuIndex<RuAssertion>, math : RuMath, env : RuEnv, conf : RuConf) -> Tree<int, RuAssertionUsage>;
+    ruRunCollectLearningData(unit : RuUnit) -> Maybe<RuState>;
+
+    ruCommCollectLearningData : RuComm;
+}
+
+ruCommCollectLearningData = RuComm(
+	RuCommInfo(
+		"collect-learning-data", "prover", "collect data for machine learning", "target", true, false, 
+		[
+			RuCommArg("target", true, "the target: a theorem, file or all", "all"),
+		], []
+	),
+	ruRunCollectLearningData
+);
+
+
+/*ruCollectLearningData(index : RuIndex<RuAssertion>, math : RuMath, env : RuEnv, conf : RuConf) -> Tree<int, RuAssertionUsage> {
+    theorems = ruDeclsTheorems(math.decls);
+    foldTree(theorems, makeTree(), \__, th, acc ->
+        ruCollectLearningDataFromTheorem(th, acc, index, math, env, conf)
+    );
+}*/
+
+ruRunCollectLearningData(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	task = unit.task;
+	state = unit.state;
+	conf = state.conf;
+	math = ruMathFromSources(state.ru, env);
+	timer = ruMakeTimer();
+	target = ruDetermineTarget(unit.task, math, env);
+	if (target != RuTargetNone()) {
+		collected_count = ref 0;
+		failed_theorems = ref [];
+		inc_collected = ruAtomicIntInc(collected_count);
+		th_fail = ruAtomicRefArrayPush(failed_theorems);
+		all_imported = ruSourcesAllImported(math.sources, env);
+		index = ruMakeIndexForTarget(target, math, env);
+        collected_map = initConcurrentHashMap();
+		collect_learning_data_fn = \decl, time_limit, env1 -> {
+			th = cast(decl : RuDecl -> RuTheorem);
+			if (ruTheoremIsProved(th)) {
+				if (ruVerbose(env1.conf) > 2) {
+					env1.out.onMessage(i2s(^collected_count) + ": going to collect_learning_data theorem '" + id2s(th.info.id) + "' ... ");
+				}
+				th_timer = ruMakeTimer();
+                th_collected = ruCollectLearningDataFromTheorem(th, index, time_limit, math, env, conf);
+                setConcurrentHashMap(collected_map, th.info.id, th_collected);
+            }
+            RuMappedDecl(decl, false, false);
+		}
+        collected = fold(keysConcurrentHashMap(collected_map), makeTree(), \acc, id -> {
+            data = getConcurrentHashMap(collected_map, id, makeTree());
+            ruMergeLearningData(acc, data);
+        });
+		new_state = ruMapFnComm(
+			RuUnit(unit.task, state, env.out),
+			RuMapFn(
+				RuMapFnInfo(
+					"collect-learning-data", 
+					\decl -> ruTargetPredicate(target)(decl) && ruDeclIsTheorem(decl), 
+					ruProofLengthMeasure, 
+					//\ -> "collected: " + i2s(^collected_count) + " theorems, failed: " + strGlue(map(^failed_theorems, id2s), ", ")
+					\ -> "collected: " + i2s(^collected_count) + " theorems"
+				),
+				collect_learning_data_fn
+			)
+		);
+		if (ruVerbose(env.conf) > 0) {
+			env.out.onMessage("collected: " + i2s(^collected_count) + " theorems");
+		}
+		if (length(^failed_theorems) > 0) {
+			if (length(^failed_theorems) < 10) {
+				env.out.onMessage("Failed to collect learning data from theorems: " + strGlue(map(^failed_theorems, id2s), ", "));
+			} else {
+				env.out.onMessage("Failed to collect_learning_data theorems:\n" + strIndent(strGlue(map(^failed_theorems, id2s), "\n")));
+			}
+		}
+		Some(RuState(new_state with 
+			vars = mergeTree(new_state.vars, pairs2tree([
+				Pair("collect-learning-data.failed-count", ValInt(length(^failed_theorems))),
+				Pair("collect-learning-data.failed-theorems", ValArray(map(^failed_theorems, \id -> ValString(id2s(id))))),
+				Pair("collect-learning-data.collected-count", ValInt(^collected_count))
+			]));
+		));
+	} else {
+		env.out.onMessage("no target for proof reproving with oracle");
+		Some(state);
+	}
+}
+
+ruCollectLearningDataFromTheorem(
+    th : RuTheorem, index : RuIndex<RuAssertion>,
+    time_limit : double, math : RuMath, env : RuEnv, conf : RuConf
+) -> Tree<int, RuAssertionUsage> {
+
+    mapping = ref makeTree();
+	root = lookupTreeDef(math.decls.assertions, ruProofQedStep(th.proof).assertion, ruNoAxiom);
+	tactic = ruCollectLearningDataTactic(th, math, mapping, env);
+	
+    prover_task = RuProverTask(th.info, ruSingleTacticStrategy(tactic), id2s(th.info.id), makeTree(), th.stat.hyps, ruProofQedStep(th.proof));
+	prover_env0 = ruInitProverEnv(prover_task, math, env, index, time_limit);
+	prover_env1 = RuProverEnv(prover_env0 with
+		fns = RuProverFuncs(prover_env0.fns with
+			unifyPremise = \__ -> [],
+		)
+	);
+
+    makeTree();
+}
+
+ruCollectLearningDataTactic(
+	theorem : RuTheorem, 
+    math : RuMath, 
+    mapping : ref Tree<RuProverProp, RuProofStep>, 
+    env : RuEnv
+) -> RuProverTactic {
+    proof = ruMakeTreeProof(theorem, math);
+    initialized = ref false;
+    RuProverTactic("collect-learning-data", 
+		\tree -> {
+			if (!^initialized) {
+				traverseInOrder(tree.leafs, \__,node ->
+					if (node.assertion.info.id == proof.assertion) {
+						mapping := setTree(^mapping, node, proof);
+					}
+				);
+				initialized := true;
+			}
+			foldTree(tree.leafs, [], \__, node, acc -> 
+				switch (lookupTree(^mapping, node)) {
+					Some(__): {
+						concat(acc, [node]);
+					}
+					None(): {
+						switch (node.parent) {
+							RuProverExp(ind,__,__,__,grand): {
+								switch (lookupTree(^mapping, grand)) {
+									Some(p): {
+										child = p.children[ind];
+										switch (child) {
+											RuProofStep(__,__,__): {
+												mapping := setTree(^mapping, node, child);
+											}
+											RuProofHyp(__,__): { }
+										}
+									}
+									None(): { }
+								}
+							}
+							RuProverRoot(__,__,__): { }
+						}
+						acc;
+					}
+				}
+			);
+		}, 
+		\__ -> false
+	);
+
+
+	/*proof = ruMakeTreeProof(theorem, math);
+	leafs : ref [Pair<RuProverProp, RuProofStep>] = ref [];
+	queue : ref [Pair<RuProverProp, RuProofStep>] = ref [];
+	expand = \tree -> {
+		if (length(^queue) == 0) {
+			if (sizeTree(^mapping) == 0) {
+				traverseInOrder(tree.leafs, \__, n -> 
+					if (length(^queue) == 0) {
+						switch (n.parent) {
+							RuProverRoot(__,__,__):
+								if (n.assertion.info.id == proof.assertion) {
+									refArrayPush(queue, Pair(n, proof));
+								} 
+							default: {	}
+						}
+					}
+				);
+			} else if (length(^leafs) > 0) {
+				first_leaf = ^leafs[0];
+				n = first_leaf.first;
+				s = first_leaf.second;
+				leafs := removeIndex(^leafs, 0);
+				iteriVector(n.children, \i, child -> {
+					if (length(s.children) <= i) {
+						ruCrash("length(s.children) <= i: " + i2s(length(s.children)) + " <= " + i2s(i) + "\n" +
+							"s.assertion.info.id: " + id2s(s.assertion) + "\n" +
+							"n:\n" + strIndent(ruProverNode2s(n, math)));
+					} else {
+						step_child = s.children[i];
+						switch (step_child) {
+							RuProofStep(assertion,__,__) : {
+								iterVector(child.children, \grand ->
+									if (grand.assertion.info.id == assertion) {
+										refArrayPush(queue, Pair(grand, step_child));
+									}
+								);
+							}
+							default: { }
+						}
+					}
+				});
+			} else { }
+		}
+		if (length(^queue) > 0) {
+			out = take(^queue, max_true_nodes);
+			queue := removeRange(^queue, 0, max_true_nodes);
+			true_nodes = map(out, \x -> {
+				n = x.first;
+				s = x.second;
+				if (exists(s.children, \ch -> switch (ch) { RuProofStep(__,__,__): true; default: false; })) {
+					refArrayPush(leafs, Pair(n, s));
+				}
+				mapping := setTree(^mapping, n, s);
+				n
+			});
+			curr_leafs = filter(getTreeValues(tree.leafs), \prop -> forall(out, \x -> prop != x.first));
+			false_nodes = take(curr_leafs, max_false_nodes);
+			iter(out, \x -> {
+				i = findiDef(^queue, \s -> s.first == x.first, -1);
+				if (i != -1) {
+					queue := removeIndex(^queue, i);
+				}
+			});
+			concat(true_nodes, false_nodes);
+		} else {
+			[];
+		}
+	}
+	RuProverTactic("oracle", expand, \__->false);*/
+}
