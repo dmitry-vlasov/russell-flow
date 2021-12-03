@@ -1,0 +1,274 @@
+import ru/prover/ml/learning_data;
+import ds/vector;
+import base/util/progress;
+import ru/prover/prove;
+import ru/prover/stats;
+import ru/map_decls;
+import ru/iproof_tree;
+
+export {
+    ruCommCommonSubproofs : RuComm;
+}
+
+ruCommCommonSubproofs = RuComm(
+	RuCommInfo(
+		"common-subproofs-coverage", "prover", "analyze common subproofs", "target", true, false, 
+		[
+			RuCommArg("target", true, "the target: a theorem, file or all", "all"),
+		], []
+	),
+	ruRunCommonSubproofs
+);
+
+ruRunCommonSubproofs(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	task = unit.task;
+	state = unit.state;
+	conf = state.conf;
+	math = ruMathFromSources(state.ru, env);
+	timer = ruMakeTimer();
+	target = ruDetermineTarget(unit.task, math, env);
+	if (target != RuTargetNone()) {
+		t1 = ruMakeTimer();
+		all_theorems = ruDeclsTheorems(math.decls);
+		all_proof_trees = mapTree(all_theorems, \th ->
+			ruIProofTree2Steps(ruTheoremIProofTree(th, math))
+		);
+		if (conf.verbose > 1) {
+			env.out.onMessage("All proofs are gathered in " + ruTimePassed2s(t1));
+		}
+		t2 = ruMakeTimer();
+		ass_usages0 = foldTree(all_proof_trees, makeTree(), \id, proof, acc ->
+			foldi(proof.steps, acc, \i, ac, n ->
+				switch (n) {
+					RuIProofHyp(__,__,__): ac;
+					RuIProofStep(ass, __,__,__): {
+						usage = RuAssUsage(id, proof, i);
+						switch (lookupTree(ac, ass)) {
+							Some(usages): {
+								pushVector(usages, usage);
+								ac;
+							}
+							None(): {
+								setTree(ac, ass, makeVector1(8, usage));
+							}
+						}
+					}
+				}
+			)
+		);
+		ass_usages = mapTree(ass_usages0, vector2array);
+		if (conf.verbose > 1) {
+			env.out.onMessage("All usages are gathered in " + ruTimePassed2s(t2));
+		}
+		collected_count = ref 0;
+		failed_theorems = ref [];
+		inc_collected = ruAtomicIntInc(collected_count);
+		//th_fail = ruAtomicRefArrayPush(failed_theorems);
+		//all_imported = ruSourcesAllImported(math.sources, env);
+		//index = ruMakeIndexForTarget(target, math, env);
+        coverages = initConcurrentHashMap();
+		collect_coverages_fn = \decl, time_limit, env1 -> {
+			th = cast(decl : RuDecl -> RuTheorem);
+			th_id = th.info.id;
+			if (ruTheoremIsProved(th)) {
+				proof = lookupTreeDef(all_proof_trees, th_id, RuIProofTreeSteps([]));
+				if (ruVerbose(env1.conf) > 2) {
+					env1.out.onMessage(i2s(^collected_count) + ": going to collect_learning_data theorem '" + id2s(th_id) + "' ... ");
+				}
+				env.out.onMessage("PROOF OF: '" + id2s(th_id) + "':\n" + ruIProofTree2Steps2s(proof, math));
+				th_timer = ruMakeTimer();
+                coverage = ruCollectSubproofCoverage(ass_usages, th_id, proof);
+				stats = ruProofCoverageStats(coverage);
+				env.out.onMessage("For '" + id2s(th_id) + "' " + ruProofCoverageStats2s(stats));
+				inc_collected(1);
+                setConcurrentHashMap(coverages, th_id, coverage);
+            }
+            RuMappedDecl(decl, false, false);
+		}
+		//println("Learning data:\n" + ruLearningData2s(collected, ))
+		new_state = ruMapFnComm(
+			RuUnit(unit.task, state, env.out),
+			RuMapFn(
+				RuMapFnInfo(
+					"common-subproofs", 
+					\decl -> ruTargetPredicate(target)(decl) && ruDeclIsTheorem(decl), 
+					ruProofLengthMeasure, 
+					//\ -> "collected: " + i2s(^collected_count) + " theorems, failed: " + strGlue(map(^failed_theorems, id2s), ", ")
+					\ -> "collected: " + i2s(^collected_count) + " theorems"
+				),
+				collect_coverages_fn
+			)
+		);
+		if (ruVerbose(env.conf) > 0) {
+			env.out.onMessage("collected: " + i2s(^collected_count) + " theorems");
+		}
+		if (length(^failed_theorems) > 0) {
+			if (length(^failed_theorems) < 10) {
+				env.out.onMessage("Failed to collect learning data from theorems: " + strGlue(map(^failed_theorems, id2s), ", "));
+			} else {
+				env.out.onMessage("Failed to collect_learning_data theorems:\n" + strIndent(strGlue(map(^failed_theorems, id2s), "\n")));
+			}
+		}
+		Some(RuState(new_state with 
+			vars = mergeTree(new_state.vars, pairs2tree([
+				Pair("collect-learning-data.failed-count", ValInt(length(^failed_theorems))),
+				Pair("collect-learning-data.failed-theorems", ValArray(map(^failed_theorems, \id -> ValString(id2s(id))))),
+				Pair("collect-learning-data.collected-count", ValInt(^collected_count))
+			]));
+		));
+	} else {
+		env.out.onMessage("no target for proof reproving with oracle");
+		Some(state);
+	}
+}
+
+RuProofNodesCoverage(
+	nodes : [int],
+	evidences : [RuAssUsage]
+);
+
+ruIProofStepsDepths(proof : RuIProofTreeSteps) -> [int] {
+	depths = map(proof.steps, \__ -> ref 0);
+	iteri(proof.steps, \i, n -> if (n.parent != -1) {
+		depths[i] := ^(depths[n.parent]) + 1
+	});
+	map(depths, \d -> ^d);
+}
+
+RuProofCoverageStats(
+	distrib : [int]
+);
+
+ruProofCoverageStats(coverage : [RuProofNodesCoverage]) -> RuProofCoverageStats {
+	sorted = sortCustom(coverage, \cov -> length(cov.nodes), true);
+	distrib = fold(sorted, Pair([ref 0], 0), \acc, cov ->
+		if (length(cov.nodes) <= acc.second) {
+			last = length(acc.first) - 1;
+			acc.first[last] := ^(acc.first[last]) + 1;
+			acc;
+		} else {
+			Pair(concat(acc.first, [ref 0]), length(cov.nodes));
+		}
+	).first;
+	RuProofCoverageStats(map(distrib, \v -> ^v));
+}
+
+ruProofCoverageStats2s(stats : RuProofCoverageStats) -> string {
+	"Distrib: " + superglue(stats.distrib, i2s, "  ");
+}
+
+ruProofCoverage2s(proof : RuIProofTreeSteps, coverage : [RuProofNodesCoverage]) -> string {
+	"Coverage:\n" + superglue(coverage, \cov -> "\t" + superglue(cov.nodes, \i -> i2s(i + 1), ", "), "\n");
+}
+
+ruCollectSubproofCoverage(usages : Tree<int, [RuAssUsage]>, theorem : int, proof : RuIProofTreeSteps) -> [RuProofNodesCoverage] {
+	depths = ruIProofStepsDepths(proof);
+
+	debug_depth := 0;
+	list2array(ruDoCollectSubproofCoverage(usages, theorem, proof, depths, makeList()));
+}
+
+ruDoCollectSubproofCoverage(
+	usages : Tree<int, [RuAssUsage]>, 
+	theorem : int, 
+	proof : RuIProofTreeSteps, 
+	depths : [int], 
+	acc : List<RuProofNodesCoverage>
+) -> List<RuProofNodesCoverage> {
+	debug_depth := ^debug_depth + 1;
+	covered = foldList(acc, makeSet(), \ac, cov -> mergeSets(ac, buildSet(cov.nodes)));
+	uncovered = filtermapi(proof.steps, \i,__ -> if (containsSet(covered, i)) None() else Some(i));
+	println("Uncovered: " + superglue(uncovered, i2s, ", "));
+	if (length(uncovered) == 0) acc else {
+		// Find the next node to cover: of max. depth
+		to_cover_i = fold(tail(uncovered), uncovered[0], \tc, i -> 
+			if (depths[i] > depths[tc]) i else tc
+		);
+		to_cover_step = proof.steps[to_cover_i];	
+		max_coverage = switch (lookupTree(usages, to_cover_step.assertion)) {
+			Some(uss): {
+				//if (length(usages) == 0) acc else {
+					i0 = findiDef(uss, \usage -> usage.theorem == theorem, -1);
+					if (i0 == -1) {
+						ruCrash("ruFindMaxCoverage: i0 == -1");
+					}
+					p = ruFindMaxCommonPath(uss, map(uss, \__-> true), i0, 0);
+					len = p.first;
+					common = p.second;
+					println("i0=" + i2s(i0) + ", len=" + i2s(len) + "\n" +
+						"common: [" + superglue(common, b2s, ", ") + "]\n" +
+						"usages:\n" + superglue(uss, \usage -> ruAssUsage2s(usage), "\n")
+					);
+					if (^debug_depth > 10) {
+						fail("debug_depth > 10");
+					}
+					RuProofNodesCoverage(
+						ruUsageParentsChain(uss[i0], len),
+						filtermapi(uss, \i, usage -> if (common[i]) Some(usage) else None())
+					);
+				//}
+			}
+			None(): {
+				ruCrash("ruFindMaxCoverage: ass is unused: " + id2s(to_cover_step.assertion));
+				RuProofNodesCoverage([], [])
+			}
+		}
+		ruDoCollectSubproofCoverage(usages, theorem, proof, depths, Cons(max_coverage, acc));
+	}
+}
+
+RuAssUsage(
+	theorem : int,
+	proof : RuIProofTreeSteps,
+	step : int
+);
+
+ruAssUsage2s(usage : RuAssUsage) -> string {
+	"step " + i2s(usage.step + 1) + " in " + id2s(usage.theorem);
+}
+
+debug_depth = ref 0;
+
+ruFindMaxCommonPath(usages : [RuAssUsage], common : [bool], i0 : int, len : int) -> Pair<int, [bool]> {
+	debug_depth := ^debug_depth + 1;
+	ass = ruUsageAss(usages[i0]);
+	/*println("ASS: " + id2s(ass) + ", i0=" + i2s(i0) + ", len=" + i2s(len) + "\n" +
+		"common: [" + superglue(common, b2s, ", ") + "]\n" +
+		"usages:\n" + superglue(usages, \usage -> ruAssUsage2s(usage), "\n")
+	);
+
+	if (^debug_depth > 5) {
+		fail("debug_depth > 5");
+	}*/
+
+	new_common = mapi(common, \i, b -> b && ass != -1 && ruUsageAss(usages[i]) == ass);
+	if (length(new_common) <= 1) Pair(len, common) else {
+		new_usages = map(usages, ruParentUsage);
+		if (new_usages[i0].step == -1) Pair(len, common) else 
+		ruFindMaxCommonPath(new_usages, new_common, i0, len + 1);
+	}
+}
+
+ruUsageParentsChain(usage : RuAssUsage, max_len : int) -> [int] {
+	ruDoUsageParentsChain(usage.proof, usage.step, max_len, []);
+}
+
+ruDoUsageParentsChain(proof : RuIProofTreeSteps, i : int, max_len : int, acc : [int]) -> [int] {
+	node = proof.steps[i];
+	acc1 = concat(acc, [i]);
+	if (node.parent == -1 || (max_len != -1 && length(acc) == max_len)) acc1 else {
+		ruDoUsageParentsChain(proof, node.parent, max_len, acc1);
+	}
+}
+
+ruParentUsage(usage : RuAssUsage) -> RuAssUsage {
+	if (usage.step == -1) usage else {
+		node = usage.proof.steps[usage.step];
+		RuAssUsage(usage with step = node.parent);
+	}
+}
+
+ruUsageAss(usage : RuAssUsage) -> int {
+	if (usage.step == -1) -1 else usage.proof.steps[usage.step].assertion;
+}
