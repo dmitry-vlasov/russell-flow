@@ -1,5 +1,6 @@
 package com.area9innovation.flow;
 
+import java.util.ArrayList;
 //import java.util.concurrent.ConcurrentHashMap;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -22,5 +23,14 @@ public class RussellTimed extends NativeHost {
 			}
 		}
 		return null;
+	}
+
+	public static final Object[] rvector2array(Object v) {
+		ArrayList vector = (ArrayList)v;
+		Object[] ret = new Object[vector.size()];
+		for (int i = 0; i < ret.length; ++ i) {
+			ret[i] = vector.get(ret.length - (i + 1));
+		}
+		return ret;
 	}
 }
