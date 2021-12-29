@@ -27,6 +27,49 @@ public class RussellTimed extends NativeHost {
 		return interrupted;
 	}
 
+	/*@SuppressWarnings("unchecked")
+	public static final <T1,T2> Object[] map(Object[] arr, Func1<T1,T2> clos, double time_limit) {
+		final long started = System.currentTimeMillis();
+		final long limit = (time_limit > 0) ? started + (long)time_limit : -1;
+		Object[] rv = new Object[arr.length];
+		for (int i = 0; i < arr.length; i++) {
+			rv[i] = clos.invoke((T2)arr[i]);
+		}
+		return rv;
+	}*/
+
+	@SuppressWarnings("unchecked")
+	public static final <T> boolean iter(Object[] arr, Func1<Object,T> clos, double time_limit) {
+		final long started = System.currentTimeMillis();
+		boolean interrupted = false;
+		final long limit = (time_limit > 0) ? started + (long)time_limit : -1;
+		for (int i = 0; i < arr.length; i++) {
+			clos.invoke((T)arr[i]);
+			if (limit > 0 && System.currentTimeMillis() > limit) {
+				interrupted = true;
+				break;
+			}
+		}
+		return interrupted;
+	}
+
+	/*@SuppressWarnings("unchecked")
+	public static final <T1,T2> Object[] mapi(Object[] arr, Func2<T1,Integer,T2> clos, double time_limit) {
+		final long started = System.currentTimeMillis();
+		final long limit = (time_limit > 0) ? started + (long)time_limit : -1;
+		Object[] rv = new Object[arr.length];
+		boolean interrupted = false;
+		for (int i = 0; i < arr.length; i++) {
+			rv[i] = clos.invoke(i, (T2)arr[i]);
+			if (limit > 0 && System.currentTimeMillis() > limit) {
+				interrupted = true;
+				break;
+			}
+		}
+		return rv;
+	}*/
+
+
 	public static final Object[] rvector2array(Object v) {
 		ArrayList vector = (ArrayList)v;
 		Object[] ret = new Object[vector.size()];
