@@ -49,7 +49,7 @@ RuShortenAcc(
 	timer : RuTimer
 );
 
-ruShortenTheorem(th : RuTheorem, time_limit : double, env : RuShortenEnv) -> Maybe<RuTheorem> {
+ruShortenTheorem(th : RuTheorem, time_limit : double, env : RuShortenEnv) -> Pair<Maybe<RuTheorem>, bool> {
 	timer = ruMakeTimer();
 	math0 = env.math;
 	conf = env.env.conf;
@@ -62,11 +62,12 @@ ruShortenTheorem(th : RuTheorem, time_limit : double, env : RuShortenEnv) -> May
 	}
 
 	initPremises = fold(cth.const.stat.hyps, ruMakeIndex(), \acc, hyp -> ruSetIndex(hyp.expr, RuHypRef(hyp.ind), acc));
+	interrupted = ref false;
 	optimized_proof = foldi(cth.const.proof.steps, 
 		RuShortenAcc(env, th, [], initPremises, cth.const.proof.steps, cth.env, ruMakeLimitedTimer(time_limit)), 
 		\i, acc, step -> {
 			step_time_limit = ruTimeLeft(acc.timer) / i2d(length(cth.const.proof.steps) - i);
-			step_timer = ruMakeTaskTimer(step_time_limit);
+			step_timer = RuTaskTimer(ruMakeLimitedTimer(step_time_limit), interrupted);
 			least = ruStepMinVariant(step.ind, cth.const.proof.steps, th, acc, step_timer);
 			RuShortenAcc(acc with
 				optimized = concat(acc.optimized, [least]),
@@ -85,7 +86,7 @@ ruShortenTheorem(th : RuTheorem, time_limit : double, env : RuShortenEnv) -> May
 			"th:\n" + ru2s(th, math) + 
 			"optimized_th:\n" + ru2s(optimized_th.theorem, math)
 		);
-		None();
+		Pair(None(), ^interrupted);
 	} else if (optimized_th.errs != []) {
 		ruCrash(
 			"ERROR IN SHORTENING\n" +
@@ -95,7 +96,7 @@ ruShortenTheorem(th : RuTheorem, time_limit : double, env : RuShortenEnv) -> May
 			ru2s(th, math) + "\n" +
 			ruVerifyErrs2s(optimized_th, math)
 		);
-		None();
+		Pair(None(), ^interrupted);
 	} else {
 		red = ruRemoveTheoremUnusedSteps(optimized_th.theorem, env.env);
 		if (ruVerbose(conf) > 2) {
@@ -131,7 +132,7 @@ ruShortenTheorem(th : RuTheorem, time_limit : double, env : RuShortenEnv) -> May
 					out.onMessage("theorem '" + id2s(th.info.id) + "' was not shortened in " + ruTimePassed2s(timer));
 				}
 		}
-		maybeMap(red, \reduced -> reduced.smaller)
+		Pair(maybeMap(red, \reduced -> reduced.smaller), ^interrupted);
 	}
 }
 
@@ -212,6 +213,10 @@ ruRunShortenProofs(unit : RuUnit) -> Maybe<RuState> {
 	math = ruMathFromSources(state.ru, env);
 	timer = ruMakeTimer();
 	target = ruDetermineTarget(unit.task, math, env);
+	completed = ref [];
+	interrupted = ref [];
+	add_completed = ruMakeAtomicArrayPush(completed);
+	add_interrupted = ruMakeAtomicArrayPush(interrupted);
 	if (target != RuTargetNone()) {
 		shortened_theorems = ref 0;
 		shortened_steps = ref 0;
@@ -220,12 +225,21 @@ ruRunShortenProofs(unit : RuUnit) -> Maybe<RuState> {
 		shorten_fn = \decl, time_limit, env1 -> {
 			shorten_env = RuShortenEnv(index, all_imported, math, env1);
 			th = cast(decl : RuDecl -> RuTheorem);
-			ret = ruShortenTheorem(th, time_limit, shorten_env);
+			p = ruShortenTheorem(th, time_limit, shorten_env);
+			if (p.second) {
+				// Was interrupted - non complete traverse of all variants
+				add_interrupted(th.info.id);
+				{}
+			} else {
+				// Was not interrupted - complete traverse of all variants
+				add_completed(th.info.id);
+				{}
+			}
+			ret = p.first;
 			switch (ret) {
 				Some(shortened): {
 					atomicRefIntAddition(shortened_theorems, 1);
 					atomicRefIntAddition(shortened_steps, length(th.proof.steps) - length(shortened.proof.steps));
-					{}
 					RuMappedDecl(shortened, false, true);
 				}
 				None(): {
@@ -240,15 +254,21 @@ ruRunShortenProofs(unit : RuUnit) -> Maybe<RuState> {
 					"shorten-proofs", 
 					\decl -> ruTargetPredicate(target)(decl) && ruDeclIsTheorem(decl), 
 					ruProofLengthMeasure, 
-					\ -> "shortened: " + i2s(^shortened_theorems) + " theorems, " + i2s(^shortened_steps) + " steps"
+					\ -> 
+						"shortened: " + i2s(^shortened_theorems) + " theorems, " + i2s(^shortened_steps) + " steps; " +
+						"completed: " + i2s(length(^completed)) + ", interrupted: " + i2s(length(^interrupted))
 				),
 				shorten_fn
 			)
 		);
+		//if (conf.verbose > 1) {
+			env.out.onMessage("Completed theorems: " + i2s(length(^completed)) + ", interrupted theorems: " + i2s(length(^interrupted)));
+		//}
 		Some(RuState(new_state with 
-			vars = setTree(setTree(new_state.vars, 
+			vars = setTree(setTree(setTree(new_state.vars, 
 				"shorten-proofs.shortened-theorems", ValInt(^shortened_theorems)),
-				"shorten-proofs.shortened-steps", ValInt(^shortened_steps)
+				"shorten-proofs.shortened-steps", ValInt(^shortened_steps)),
+				"shorten-proofs.completed", ValArray(map(^completed, \id -> ValInt(id)))
 			)
 		));
 	} else {
