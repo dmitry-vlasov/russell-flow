@@ -9,29 +9,13 @@ export {
 	ruBuildExpProofs(hyp : RuProverExp, proofs : Vector<RuProverProofHyp>, prover_env : RuProverEnv) -> void;
 }
 
-ruCheckTests(test1 : Tree<[RuProverProofHyp], RuProverProofProp>, test2 : Tree<[RuProverProofHyp], RuProverProofProp>) -> bool {
-	ret = ref true;
-	traverseInOrder(test1, \k1, p1 -> {
-		switch (lookupTree(test2, k1)) {
-			None(): ret := false;
-			Some(p2): {
-				switch (ruSubsAreSim(p1.sub, p2.sub)) {
-					Some(__): { }
-					None(): ret := false;
-				}
-			}
-		}
-	});
-	^ret;
-}
-
 ruAddProof(prop : RuProverProp, hypProof : RuProverProofHyp, prover_env : RuProverEnv) -> void {
 	if (sizeVector(prop.children) == ruArity(prop.assertion)) {
 		prod = CartProd(map(vector2array(prop.children), \hyp ->
 			if (hyp == hypProof.node) [hypProof] else vector2array(hyp.proofs)
 		));
 		size = sizeCartProd(prod);
-		new_proofs = if (size == 0) {
+		unified = if (size == 0) {
 			[];
 		} else if (size == 1) {
 			ruAddProofSingle(prod, prop, prover_env);
@@ -59,6 +43,34 @@ ruAddProof(prop : RuProverProp, hypProof : RuProverProofHyp, prover_env : RuProv
 				//println("ruAddProofLarge: size=" + i2s(size));
 			}
 			new_proofs = ruAddProofLarge(prop, hypProof, prover_env);
+			checked = ruCheckAddProofEquals(new_proofs, ruAddProofDirect(prod, prop, prover_env), prover_env);
+			if (!checked.first) {
+				//ruUnifyProdSubs2s(prod : [[RuSubData<?>]], math : RuMath) -> string;
+				subs = map(vector2array(prop.children), \hyp ->
+					if (hyp == hypProof.node) [RuSubData(hypProof.sub, hypProof)] else 
+					map(vector2array(hyp.proofs), \p -> RuSubData(p.sub, p))
+				);
+				if (checked.second != []) {
+					println("ERR HYPS:\n" + 
+						strIndent(strGlue(mapi(checked.second, \i, hyp -> 
+							"hyp_" + i2s(i) + ":\n" + strIndent(ruSubst2s(hyp.sub, prover_env.math))
+						), "\n"))
+					);
+				}
+				debug_unify_subs := true;
+				msub = ruUnifySubs(map(checked.second, \hp -> hp.sub), prover_env.math, prover_env.env);
+				maybeApply(msub, \sub -> println("ruUnifySubs: SUB:\n" + ruSubst2s(sub, prover_env.math)));
+				debug_unify_subs := false;
+
+				println("REPROVING: " + id2s(prover_env.conf.task.info.id) + ", time limit: " + ruTime2s(prover_env.conf.timer.limit) + "\n" +
+					"MATRIX:\n" + ruUnifyProdSubs2s(subs, prover_env.math)
+				);
+				println("ruAddProof: " + id2s(prop.assertion.info.id) + " size=" + i2s(size) + ", added: " + i2s(length(new_proofs)));
+				debug_unify_subs_prod := true;
+				ruAddProofLarge(prop, hypProof, prover_env);
+				fail("ERROR");
+			}
+
 			if (lookupTreeDef(prover_env.env.conf.opts, "reprove-stats", "") == "1") {
 				stats = RuStatsRow("tree " + ruProd2s(prod), 
 					pairs2tree([
@@ -72,6 +84,13 @@ ruAddProof(prop : RuProverProp, hypProof : RuProverProofHyp, prover_env : RuProv
 			}
 			new_proofs;
 		}
+		new_proofs = filtermap(unified, 
+			\unif -> maybeBind(ruCompose(prop.sub, unif.sub), \theta ->
+				if (!ruCheckDisjs(theta, prop.assertion.stat.vars.disjs)) None() else {
+					Some(RuProverProofProp(prop, theta, unif.data));
+				}
+			)
+		);
 		iter(new_proofs, \p -> 
 			if (!ruTimeIsOver(prover_env.conf.timer)) {
 				pushVector(prop.proofs, p)
@@ -80,15 +99,14 @@ ruAddProof(prop : RuProverProp, hypProof : RuProverProofHyp, prover_env : RuProv
 	}
 }
 
-ruAddProofSingle(prod : CartProd<RuProverProofHyp>, prop : RuProverProp, prover_env : RuProverEnv) -> [RuProverProofProp] {
+ruAddProofSingle(prod : CartProd<RuProverProofHyp>, prop : RuProverProp, prover_env : RuProverEnv) -> [RuSubData<[RuProverProofHyp]>] {
 	hypProofs = map(prod.sets, \s -> s[0]);
 	subs = map(hypProofs, \p -> p.sub);
 	t = ruMakeTimer();
-	rets = eitherMap(ruUnifySubs(subs, prover_env.math, prover_env.env),
-		\s -> eitherMap(ruCompose(prop.sub, s), 
-			\theta -> if (!ruCheckDisjs(theta, prop.assertion.stat.vars.disjs)) [] else [RuProverProofProp(prop, theta, hypProofs)],
-			[]
-		), []
+	rets = eitherMap(
+		ruUnifySubs(subs, prover_env.math, prover_env.env),
+		\s -> [RuSubData(s, hypProofs)], 
+		[]
 	);
 	if (lookupTreeDef(prover_env.env.conf.opts, "reprove-stats", "") == "1") {
 			stats = RuStatsRow("prop " + id2s(prop.assertion.info.id), 
@@ -103,52 +121,39 @@ ruAddProofSingle(prod : CartProd<RuProverProofHyp>, prop : RuProverProp, prover_
 	rets;
 }
 
-ruAddProofDirect(prod : CartProd<RuProverProofHyp>, prop : RuProverProp, prover_env : RuProverEnv) -> [RuProverProofProp] {
+ruAddProofDirect(prod : CartProd<RuProverProofHyp>, prop : RuProverProp, prover_env : RuProverEnv) -> [RuSubData<[RuProverProofHyp]>] {
 	if (sizeCartProd(prod) > 100000) {
 		prover_env.env.out.onMessage("too much: ruSizeCart(prod)=" + i2s(sizeCartProd(prod)));
-		[]
-	} else {
-		t = ruMakeTimer();
-		rets = filtermapCartProd(prod, \hypProofs -> 
-			maybeBind(ruUnifySubs(map(hypProofs, \hp -> hp.sub), prover_env.math, prover_env.env),
-				\s ->
-					maybeBind(ruCompose(prop.sub, s), \theta ->
-						if (!ruCheckDisjs(theta, prop.assertion.stat.vars.disjs)) None() else {
-							Some(RuProverProofProp(prop, theta, hypProofs))
-						} 
-					)
-			)
+	} 
+	t = ruMakeTimer();
+	rets = filtermapCartProd(prod, \hypProofs -> 
+		maybeMap(
+			ruUnifySubs(map(hypProofs, \hp -> hp.sub), prover_env.math, prover_env.env),
+			\s -> RuSubData(s, hypProofs)
+		)
+	);
+	if (lookupTreeDef(prover_env.env.conf.opts, "reprove-stats", "") == "1") {
+		stats = RuStatsRow("prop " + id2s(prop.assertion.info.id), 
+			pairs2tree([
+				Pair("size", i2d(sizeCartProd(prod))), 
+				Pair("time", ruTimePassed(t)), 
+				Pair("rets", i2d(length(rets)))
+			])
 		);
-		if (lookupTreeDef(prover_env.env.conf.opts, "reprove-stats", "") == "1") {
-			stats = RuStatsRow("prop " + id2s(prop.assertion.info.id), 
-				pairs2tree([
-					Pair("size", i2d(sizeCartProd(prod))), 
-					Pair("time", ruTimePassed(t)), 
-					Pair("rets", i2d(length(rets)))
-				])
-			);
-			ruAddStats("ruAddProofDirect", stats);
-		}
-		rets
+		ruAddStats("ruAddProofDirect", stats);
 	}
+	rets;
 }
 
-ruAddProofLarge(prop : RuProverProp, hypProof : RuProverProofHyp, prover_env : RuProverEnv) -> [RuProverProofProp] {
+ruAddProofLarge(prop : RuProverProp, hypProof : RuProverProofHyp, prover_env : RuProverEnv) -> [RuSubData<[RuProverProofHyp]>] {
 	subs = map(vector2array(prop.children), \hyp ->
 		if (hyp == hypProof.node) [RuSubData(hypProof.sub, hypProof)] else 
 		map(vector2array(hyp.proofs), \p -> RuSubData(p.sub, p))
 	);
-	filtermap(
-		ruUnifySubsProd(
-			subs, prover_env.fns.admitExp, 
-			RuTaskTimer(prover_env.conf.timer, ref false), 
-			prover_env.math, prover_env.env
-		), 
-		\unif -> maybeBind(ruCompose(prop.sub, unif.sub), \theta ->
-			if (!ruCheckDisjs(theta, prop.assertion.stat.vars.disjs)) None() else {
-				Some(RuProverProofProp(prop, theta, unif.data));
-			}
-		)
+	ruUnifySubsProd(
+		subs, prover_env.fns.admitExp, 
+		RuTaskTimer(prover_env.conf.timer, ref false), 
+		prover_env.math, prover_env.env
 	);
 }
 
@@ -202,3 +207,81 @@ ruBuildRootProofs(root : RuProverRoot, proofs : Vector<RuProverProofHyp>, prover
 		prover_env.fns.onProof(ruMakeProofTree(proof_))
 	);
 }
+
+ruCheckAddProofEquals(proofs1 : [RuSubData<[RuProverProofHyp]>], proofs2 : [RuSubData<[RuProverProofHyp]>], env : RuProverEnv) -> Pair<bool, [RuProverProofHyp]> {
+	ret = ref true;
+	err = ref [];
+	if (length(proofs1) != length(proofs2)) {
+		env.env.out.onMessage("length(proofs1)=" + i2s(length(proofs1)) + " !=  length(proofs2)=" + i2s(length(proofs2)));
+		ret := false;
+	}
+	iter(proofs1, \proof1 -> {
+		switch (find(proofs2, \proof2 -> proof1.data == proof2.data)) {
+			Some(proof2): {
+				/*if (!ruSubsAreEq(proof1.sub, proof2.sub)) {
+					env.env.out.onMessage(
+						"Subs differ:\n" + 
+							strIndent(ruSubsDiff2s(proof1.sub, proof2.sub, env.math))
+					);
+					ret := false;
+				}*/
+				if (ruSubsAreSim(proof1.sub, proof2.sub) == None()) {
+					env.env.out.onMessage(
+						"Subs differ:\n" + 
+							strIndent(ruSubsDiff2s(proof1.sub, proof2.sub, env.math)) + "\n" +
+						"sub1:\n" + strIndent(ruSubst2s(proof1.sub, env.math)) + "\n" + 
+						"sub2:\n" + strIndent(ruSubst2s(proof2.sub, env.math))
+					);
+					ret := false;
+					err := proof1.data;
+				}
+			}
+			None(): {
+				env.env.out.onMessage("is absent(A):\n" + ruRuSubDataRuProverProofHyp2s(proof1, env));
+				ret := false;
+				err := proof1.data;
+			}
+		}
+	});
+	iter(proofs2, \proof2 -> 
+		switch (find(proofs1, \proof1 -> proof1.data == proof2.data)) {
+			Some(__): { }
+			None(): {
+				env.env.out.onMessage("is absent (B):\n" + ruRuSubDataRuProverProofHyp2s(proof2, env));
+				ret := false;
+			}
+		}
+	);
+	Pair(^ret, ^err);
+}
+
+ruCheckAddProofContains(proof1 : RuSubData<[RuProverProofHyp]>, proofs2 : [RuSubData<[RuProverProofHyp]>], env : RuProverEnv) -> bool {
+	find(proofs2, \proof2 -> ruCheckAddProofAreEqual(proof1, proof2, env)) != None();
+}
+
+ruCheckAddProofAreEqual(proof1 : RuSubData<[RuProverProofHyp]>, proof2 : RuSubData<[RuProverProofHyp]>, env : RuProverEnv) -> bool {
+	proof1 == proof2;
+}
+
+ruRuSubDataRuProverProofHyp2s(sub_data: RuSubData<[RuProverProofHyp]>, env : RuProverEnv) -> string {
+	"data:\n" + 
+		strIndent(superglue(sub_data.data, \hyp -> 
+			ruProofTree2s(ruMakeProofTree(hyp), env.math), "\n"
+		)) +
+	"sub:\n" + 
+		strIndent(ruSubst2s(sub_data.sub, env.math));
+}
+
+// ruStringMatrix2s(matrix : [[string]], colHeaders : Maybe<[string]>, rowHeadres : Maybe<[string]>) -> string;
+
+/*ruAddProofProd2s(prop : RuProverProp, prod : CartProd<RuProverProofHyp>, env : RuProverEnv) -> string {
+	matrix = map(prod.sets, \set -> map(set, \hyp -> 
+		ruSubst2s(hyp.sub, env.math)
+	));
+	colHeaders = map(vector2array(prop.children), \hyp -> );
+	rowHeaders = 
+	ruStringMatrix2s(matrix, 
+		Some(colHeaders),
+		Some(rowHeaders)
+	);
+}*/
