@@ -120,7 +120,7 @@ class OntologyProvider implements vscode.TreeDataProvider<OntologyItem> {
 	private roots: OntologyItem[];
 
 	update(data : OntologyItem[]): void {
-		vscode.window.showInformationMessage("ONTOLOGY: " + JSON.stringify(data));
+		//vscode.window.showInformationMessage("ONTOLOGY: " + JSON.stringify(data));
 		this.items = data.reduce((acc, c) => acc.set(c.id, c), new Map());
 		this.roots = data.filter((i) => i.parents.length == 0);
 		this._onDidChangeTreeData.fire(undefined);
