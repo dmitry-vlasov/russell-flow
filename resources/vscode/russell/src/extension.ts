@@ -12,6 +12,7 @@ import * as tools from "./tools";
 import { num2memory } from './tools';
 import * as requests from './requests';
 
+//import isPortReachable from 'is-port-reachable'; // For 'is-port-reachable' 4.0.0. - doesn't work ...
 const isPortReachable = require('is-port-reachable');
 
 let client: LanguageClient = null;
@@ -212,7 +213,7 @@ function startLspClient() {
 }
 
 function checkHttpServerStatus(initial: boolean) {
-	const port = vscode.workspace.getConfiguration("russell").get("portOfHttpServer");
+	const port : number = vscode.workspace.getConfiguration("russell").get("portOfHttpServer");
 	isPortReachable(port, {host: 'localhost'}).then(
 		(reacheable : boolean) => {
 			if (reacheable) {
