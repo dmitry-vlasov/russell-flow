@@ -1,13 +1,14 @@
 import lingo/pegcode/driver;
 import base/util/parse;
 import base/util/str;
-
+import script/types/type_gens;
 
 export {
 	ScScriptWDocs(script : ScScript, docs : string);
 
-	ScScript ::= ScSeq, ScAssign, ScIf, ScIfElse, ScWhile, ScPrint, ScOutput, ScTask, ScStop, ScExit;
+	ScScript ::= ScSeq, ScAssign, ScDefine, ScIf, ScIfElse, ScWhile, ScPrint, ScOutput, ScTask, ScStop, ScExit;
 		ScSeq(seq : [ScScript]);
+		ScDefine(var : string, type : ScType, exp : ScExp);
 		ScAssign(var : string, exp : ScExp);
 		ScIf(cond : ScExp, script : ScScript);
 		ScIfElse(cond : ScExp, pos : ScScript, neg : ScScript);
@@ -18,12 +19,12 @@ export {
 		ScStop();
 		ScExit();
 
-	ScExp ::= ScInfixOp, ScPrefixOp, ScFunc, ScIndex, ScUndefConst,
+	ScExp ::= ScInfixOp, ScPrefixOp, ScCall, ScIndex, ScUndefConst,
 		ScBoolConst, ScIntConst, ScDoubleConst, ScStringConst, ScVar;
 		ScInfixOp(exp : ScExp, args : [ScInfixArg]);
 			ScInfixArg(op : string, exp : ScExp);
 		ScPrefixOp(op : string, exp : ScExp);
-		ScFunc(fn : string, args : [ScExp]);
+		ScCall(fn : string, args : [ScExp]);
 		ScIndex(ex : ScExp, ind : ScExp);
 	
 		ScUndefConst();
@@ -121,7 +122,15 @@ ru_script_actions = SemanticActions(mergeTree(defaultPegActions.t,
 		Pair("makeScTask", ruMakeScTask),
 		Pair("makeScScript", ruMakeScScript),
 		Pair("makeScBoolConst", \s -> ScBoolConst(s[0] == "true")),
-		Pair("makeEmptySeq", \__ -> ScSeq([]))
+		Pair("makeEmptySeq",  \__ -> ScSeq([])),
+		Pair("makeTypeConst", \s -> scConstType(flow2s(s[0]))),
+		Pair("makeTypeArray", \s -> scArrayType(s[0])),
+		Pair("makeTypeFn",    \s -> scFuncType(s[0], s[1])),
+		//Pair("makeTypeInfix", \s -> ScTypeGen(s[0], s[1])),
+		Pair("makeTypeInfix", \s ->
+			ScTypeGen(s[0], concat([s[1], s[2]], cast(s[3] : flow -> [flow])))
+		),
+		Pair("makeTypePrefix", \s -> ScTypeGen(s[0], s[1]))
 	])
 ));
 
@@ -155,6 +164,14 @@ ruScript2Json(j : ScScript) -> Json {
 			JsonObject([
 				Pair("struct", JsonString("ScAssign")),
 				Pair("var", JsonString(var)),
+				Pair("exp", ruScExp2Json(val))
+			]);
+		}
+		ScDefine(var, type, val): {
+			JsonObject([
+				Pair("struct", JsonString("ScDefine")),
+				Pair("var", JsonString(var)),
+				Pair("type", scType2Json(type)),
 				Pair("exp", ruScExp2Json(val))
 			]);
 		}
@@ -238,9 +255,9 @@ ruScExp2Json(e : ScExp) -> Json {
 				Pair("exp", ruScExp2Json(ex))
 			]);
 		}
-		ScFunc(fn, args): {
+		ScCall(fn, args): {
 			JsonObject([
-				Pair("struct", JsonString("ScFunc")),
+				Pair("struct", JsonString("ScCall")),
 				Pair("fn", JsonString(fn)),
 				Pair("args", JsonArray(map(args, ruScExp2Json)))
 			]);
@@ -295,7 +312,7 @@ ruJson2Script(json : Json) -> Maybe<ScScript> {
 	if (struct == "") None() else
 	if (struct == "ScSeq") {
 		json_seq = getJsonArrayField(json, "seq");
-		seq = filtermap(getJsonArrayField(json, "seq"), ruJson2Script);
+		seq = filtermap(json_seq, ruJson2Script);
 		if (length(json_seq) == length(seq)) {
 			Some(ScSeq(seq));
 		} else {
@@ -312,6 +329,17 @@ ruJson2Script(json : Json) -> Maybe<ScScript> {
 			);
 		}
 	} else 
+	if (struct == "ScDefine") {
+		var = getJsonStringField(json, "var", "");
+		if (var == "") None() else {
+			json_type = getJsonFieldValue(json, "type", JsonNull());
+			json_val = getJsonFieldValue(json, "exp", JsonNull());
+			maybeMap2(\type, val -> ScDefine(var, type, val))(
+				ruJson2ScType(json_type),
+				ruJson2ScExp(json_val)
+			);
+		}
+	} else
 	if (struct == "ScIf") {
 		maybeMap2(\cond, script -> ScIf(cond, script))(
 			ruJson2ScExp(getJsonFieldValue(json, "cond", JsonNull())),
@@ -403,14 +431,14 @@ ruJson2ScExp(json : Json) -> Maybe<ScExp> {
 			);
 		} 
 	} else 
-	if (struct == "ScFunc") {
+	if (struct == "ScCall") {
 		fn = getJsonStringField(json, "fn", "");
 		if (fn == "") None() else {
 			if (!jsonObjectHasField(json, "args")) None() else {
 				json_args = getJsonArrayField(json, "args");
 				args = filtermap(json_args, ruJson2ScExp);
 				if (length(args) != length(json_args)) None() else {
-					Some(ScFunc(fn, args));
+					Some(ScCall(fn, args));
 				}
 			}
 		}
@@ -465,8 +493,10 @@ ruScript2s(s : ScScript) -> string {
 	switch (s) {
 		ScSeq(seq): 
 			strGlue(map(seq, ruScript2s), "\n");
+		ScDefine(var, type, val): 
+			var + " : " + scType2s(type) + " = " + ruScExp2s(val) + ";";
 		ScAssign(var, val): 
-			var + " = " + ruScExp2s(val) + ";";
+			var + " := " + ruScExp2s(val) + ";";
 		ScIf(cond, script): 
 			"if " + ruScExp2s(cond) + " {\n" + 
 				strIndent(ruScript2s(script)) + 
@@ -499,7 +529,7 @@ ruScExp2s(e : ScExp) -> string {
 		ScInfixOp(ex, args): 
 			"(" + ruScExp2s(ex) + concatStrings(map(args, \arg -> " " + arg.op + " " + ruScExp2s(arg.exp))) + ")";
 		ScPrefixOp(op, ex): op + ruScExp2s(ex);
-		ScFunc(fn, args): 
+		ScCall(fn, args): 
 			fn + "(" + strGlue(map(args, ruScExp2s),", ") + ")";
 		ScIndex(ex, ind): 
 			ruScExp2s(ex) + "[" + ruScExp2s(ind) + "]";
@@ -520,6 +550,7 @@ ruDoScScriptTasks(acc : [ScTask], s : ScScript) -> [ScTask] {
 	switch (s) {
 		ScSeq(seq):               fold(seq, acc, ruDoScScriptTasks);
 		ScAssign(__,__):          acc;
+		ScDefine(__,__,__):       acc;
 		ScIf(cond, script):       ruDoScScriptTasks(acc, script);
 		ScIfElse(cond, pos, neg): ruDoScScriptTasks(ruDoScScriptTasks(acc, pos), neg);
 		ScWhile(cond, script):    ruDoScScriptTasks(acc, script);
@@ -536,6 +567,7 @@ ruScriptSetTasksFile(script : ScScript, file : string) -> ScScript {
 	switch (script) {
 		ScSeq(seq):               ScSeq(map(seq, set_file));
 		ScAssign(__,__):          script;
+		ScDefine(__,__,__):       script;
 		ScIf(cond, s):            ScIf(cond, set_file(s));
 		ScIfElse(cond, pos, neg): ScIfElse(cond, set_file(pos), set_file(neg));
 		ScWhile(cond, s):         ScWhile(cond, set_file(s));
@@ -588,6 +620,8 @@ ruSetScriptTaskArg(script : ScScript, key : string, val : string) -> ScScript {
 		ScSeq(seq): 
 			ScSeq(map(seq, rec_set));
 		ScAssign(__,__): 
+			script;
+		ScDefine(__,__,__): 
 			script;
 		ScIf(cond, s): 
 			ScIf(cond, rec_set(s));
