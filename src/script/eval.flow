@@ -8,7 +8,7 @@ import script/funcs/time;
 import script/funcs/util;
 
 export {
-	ruEval(ex : ScExp, state : RuState, out : RuOut) -> ScValue;
+	ruEval(ex : ScExp, locals : Tree<string, ScValue>, state : RuState, out : RuOut) -> ScValue;
 }
 
 ru_script_fns : ref Maybe<Tree<string, ScriptFn>> = ref None();
@@ -26,13 +26,13 @@ ruScriptFns() -> Tree<string, ScriptFn> {
 	);
 }
 
-ruEval(ex : ScExp, state : RuState, out : RuOut) -> ScValue {
+ruEval(ex : ScExp, locals : Tree<string, ScValue>, state : RuState, out : RuOut) -> ScValue {
 	conf = state.conf;
 	switch (ex) {
 		ScInfixOp(e, args): {
 			vals = map(
 				concat([e], map(args, \arg -> arg.exp)), 
-				\arg -> ruEval(arg, state, out)
+				\arg -> ruEval(arg, locals, state, out)
 			);
 			func = lookupTreeDef(ruScriptFns(), args[0].op, ruNoScriptFn);
 			errs = concat(
@@ -46,7 +46,7 @@ ruEval(ex : ScExp, state : RuState, out : RuOut) -> ScValue {
 			}
 		}
 		ScPrefixOp(op, e): {
-			val = ruEval(e, state, out);
+			val = ruEval(e, locals, state, out);
 			func = lookupTreeDef(ruScriptFns(), op, ruNoScriptFn);
 			errs = concat(
 				ruErrorArgs([val]),
@@ -59,21 +59,31 @@ ruEval(ex : ScExp, state : RuState, out : RuOut) -> ScValue {
 			}
 		}
 		ScCall(fn, args): {
-			vals = map(args, \arg -> ruEval(arg, state, out));
-			func = lookupTreeDef(ruScriptFns(), fn, ruNoScriptFn);
-			errs = concat(
-				ruErrorArgs(vals),
-				if (func.name != "") [] else ["function: '" + fn + "'' is not found"]
-			);
-			if (length(errs) > 0) {
-				scErrorVal(errs);
+			vals = map(args, \arg -> ruEval(arg, locals, state, out));
+			if (length(ruErrorArgs(vals)) > 0) {
+				scErrorVal(ruErrorArgs(vals));
 			} else {
-				func.fn(vals, state, out);
+				switch (lookupTree(locals, fn)) {
+					Some(v): {
+						func = cast(v.val : flow -> ScriptFn);
+						func.fn(vals, state, out);
+					}
+					None(): {
+						switch (lookupTree(ruScriptFns(), fn)) {
+							Some(func): {
+								func.fn(vals, state, out);
+							}
+							None(): {
+								scUndefVal;
+							}
+						}
+					}
+				}
 			}
 		}
 		ScIndex(e, i): {
-			e_val = ruEval(e, state, out);
-			i_val = ruEval(i, state, out);
+			e_val = ruEval(e, locals, state, out);
+			i_val = ruEval(i, locals, state, out);
 			errs = ruErrorArgs([e_val, i_val]);
 			e_type = scTypeGen(e_val.type);
 			if (e_type == "map") {
@@ -94,107 +104,101 @@ ruEval(ex : ScExp, state : RuState, out : RuOut) -> ScValue {
 				err = "first argument of index operator must be a map or array, got: " + scType2s(e_val.type);
 				ScValue(concat(errs, [err]), scErrorType)
 			}
-			/*switch (e_val) {
-				ScMap(mapping): {
-					switch (lookupTree(mapping, i_val)) {
-						Some(v): v;
-						None():  ScUndef();
-					}
-				}
-				ScArray(arr): {
-					switch (i_val) {
-						ScInt(ind): {
-							if (0 <= ind && ind < length(arr)) {
-								arr[ind];
-							} else {
-								ScUndef();
-							}
-						}
-						default: {
-							 ScError(concat(errs, ["second argument of array index operator must be an integer value, but got: " + ruScValue2s(i_val)]));
-						}
-					}
-				}
-				default: ScError(concat(errs, ["first argument of index operator must be a map or array"]));
-			}*/
 		}
 		ScLambda(args, body): {
 			// ScValue(val : flow, type : ScType);
-			if (length(args) == 0) {
-				func = \ -> ruEval(body, state, out);
-			}
-			vals = map(args, \arg -> ruEval(arg, state, out));
-			func = lookupTreeDef(ruScriptFns(), fn, ruNoScriptFn);
-			errs = concat(
-				ruErrorArgs(vals),
-				if (func.name != "") [] else ["function: '" + fn + "'' is not found"]
+			closure = foldSet(ruScExpVars(makeSet(), ex), makeTree(), \acc, var -> 
+				switch (lookupTree(locals, var)) {
+					Some(val): setTree(acc, var, val);
+					None(): {
+						switch (lookupTree(state.vars, var)) {
+							Some(val): setTree(acc, var, val);
+							None(): {
+								acc;
+							}
+						}
+					}
+				}
 			);
-			if (length(errs) > 0) {
-				scErrorVal(errs);
-			} else {
-				func.fn(vals, state, out);
-			}
+			ScValue(
+				ScriptFn(
+					ruScExp2s(ex),
+					\vs, st, o -> {
+						call_locals = foldi(args, closure, \i, acc, arg -> setTree(acc, arg.var, vs[i]));
+						ruEval(body, call_locals, st, o);
+					}
+				),
+				scFuncType(
+					map(args, \arg -> scAnyType),
+					scAnyType
+				)
+			);
 		}
 		ScUndefConst():     scUndefVal;
 		ScBoolConst(val):   scBoolVal(val);
 		ScIntConst(val):    scIntVal(val);
 		ScDoubleConst(val): scDoubleVal(val);
 		ScStringConst(val): scStringVal(val);
-		ScVar(var):         ruEvalVar(var, state, out);
+		ScVar(var):         ruEvalVar(var, locals, state, out);
 	}
 }
 
-ruEvalVar(var : string, state : RuState, out : RuOut) -> ScValue {
+ruEvalVar(var : string, locals : Tree<string, ScValue>, state : RuState, out : RuOut) -> ScValue {
 	conf = state.conf;
-	switch (lookupTree(state.vars, var)) {
+	switch (lookupTree(locals, var)) {
 		Some(val): val;
 		None(): {
-			if (startsWith(var, "conf.")) {
-				opt = strRight(var, 5);
-				switch (lookupTree(conf.opts, opt)) {
-					Some(val): scStringVal(val);
-					None(): {
-						if (opt == "working-dir") {
-							scStringVal(conf.workingDir);
-						} else if (opt == "verbose") {
-							scIntVal(conf.verbose);
-						} else if (opt == "import-roots") {
-							scStringArrayVal(conf.importRoots);
-						} else if (opt == "project-roots") {
-							scStringArrayVal(conf.projectRoots);
-						} else {
-							scUndefVal;
+			switch (lookupTree(state.vars, var)) {
+				Some(val): val;
+				None(): {
+					if (startsWith(var, "conf.")) {
+						opt = strRight(var, 5);
+						switch (lookupTree(conf.opts, opt)) {
+							Some(val): scStringVal(val);
+							None(): {
+								if (opt == "working-dir") {
+									scStringVal(conf.workingDir);
+								} else if (opt == "verbose") {
+									scIntVal(conf.verbose);
+								} else if (opt == "import-roots") {
+									scStringArrayVal(conf.importRoots);
+								} else if (opt == "project-roots") {
+									scStringArrayVal(conf.projectRoots);
+								} else {
+									scUndefVal;
+								}
+							}
 						}
+					} else if (var == "sources") {
+						ScValue(
+							foldTree(state.ru, makeTree(), \id, src, acc -> 
+								setTree(acc, id2s(id), src)
+							),
+							scMapType(scStringType, scConstType("RuSource"))
+						);
+					} /*else if (var == "math") {
+						math = ruMathFromSources(state.ru, RuEnv(conf, out));
+						ScValue(pairs2tree([
+							Pair(ScString("sources"), ScMap(foldTree(math.sources, makeTree(), \id, src, acc -> 
+								setTree(acc, ScString(id2s(id)), ScData("RuSource", src))
+							))),
+							Pair(ScString("consts"), ScMap(foldTree(math.decls.lang.consts, makeTree(), \id, const, acc -> 
+								setTree(acc, ScString(id2s(id)), ScData("RuConst", const))
+							))),
+							Pair(ScString("types"), ScMap(foldTree(math.decls.lang.types, makeTree(), \id, type, acc -> 
+								setTree(acc, ScString(id2s(id)), ScData("RuType", type))
+							))),
+							Pair(ScString("rules"), ScMap(foldTree(math.decls.lang.rules, makeTree(), \id, rule, acc -> 
+								setTree(acc, ScString(id2s(id)), ScData("RuRule", rule))
+							))),
+							Pair(ScString("assertions"), ScMap(foldTree(math.decls.assertions, makeTree(), \id, assertion, acc -> 
+								setTree(acc, ScString(id2s(id)), ScData("RuAssertion", assertion))
+							))),
+						]));
+					} */ else {
+						scUndefVal;
 					}
 				}
-			} else if (var == "sources") {
-				ScValue(
-					foldTree(state.ru, makeTree(), \id, src, acc -> 
-						setTree(acc, id2s(id), src)
-					),
-					scMapType(scStringType, scConstType("RuSource"))
-				);
-			} /*else if (var == "math") {
-				math = ruMathFromSources(state.ru, RuEnv(conf, out));
-				ScValue(pairs2tree([
-					Pair(ScString("sources"), ScMap(foldTree(math.sources, makeTree(), \id, src, acc -> 
-						setTree(acc, ScString(id2s(id)), ScData("RuSource", src))
-					))),
-					Pair(ScString("consts"), ScMap(foldTree(math.decls.lang.consts, makeTree(), \id, const, acc -> 
-						setTree(acc, ScString(id2s(id)), ScData("RuConst", const))
-					))),
-					Pair(ScString("types"), ScMap(foldTree(math.decls.lang.types, makeTree(), \id, type, acc -> 
-						setTree(acc, ScString(id2s(id)), ScData("RuType", type))
-					))),
-					Pair(ScString("rules"), ScMap(foldTree(math.decls.lang.rules, makeTree(), \id, rule, acc -> 
-						setTree(acc, ScString(id2s(id)), ScData("RuRule", rule))
-					))),
-					Pair(ScString("assertions"), ScMap(foldTree(math.decls.assertions, makeTree(), \id, assertion, acc -> 
-						setTree(acc, ScString(id2s(id)), ScData("RuAssertion", assertion))
-					))),
-				]));
-			} */ else {
-				scUndefVal;
 			}
 		}
 	}
