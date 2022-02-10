@@ -6,12 +6,11 @@ import script/types/type_gens;
 export {
 	ScCommWDocs(comm : ScComm, docs : string);
 
-	ScComm ::= ScSeq, ScAssign, ScDefine, ScIf, ScIfElse, ScWhile, ScPrint, ScOutput, ScTask, ScStop, ScExit;
+	ScComm ::= ScSeq, ScAssign, ScDefine, ScIf, ScWhile, ScPrint, ScOutput, ScTask, ScStop, ScExit;
 		ScSeq(seq : [ScComm]);
 		ScDefine(var : string, type : ScType, exp : ScExp);
 		ScAssign(var : string, exp : ScExp);
-		ScIf(cond : ScExp, script : ScComm);
-		ScIfElse(cond : ScExp, pos : ScComm, neg : ScComm);
+		ScIf(cond : ScExp, pos : ScComm, neg : Maybe<ScComm>);
 		ScWhile(cond : ScExp, script : ScComm);
 		ScPrint(exp : ScExp);
 		ScOutput(exp : ScExp);
@@ -125,12 +124,13 @@ ru_script_actions = SemanticActions(mergeTree(defaultPegActions.t,
 	pairs2tree([
 		Pair("makeScTask", ruMakeScTask),
 		Pair("makeScComm", ruMakeScComm),
+		Pair("makeScIf", \s -> ScIf(s[0], s[1], None())),
+		Pair("makeScIfElse", \s -> ScIf(s[0], s[1], Some(s[2]))),
 		Pair("makeScBoolConst", \s -> ScBoolConst(s[0] == "true")),
 		Pair("makeEmptySeq",  \__ -> ScSeq([])),
 		Pair("makeTypeConst", \s -> scConstType(flow2s(s[0]))),
 		Pair("makeTypeArray", \s -> scArrayType(s[0])),
 		Pair("makeTypeFn",    \s -> scFuncType(s[0], s[1])),
-		//Pair("makeTypeInfix", \s -> ScTypeGen(s[0], s[1])),
 		Pair("makeTypeInfix", \s ->
 			ScTypeGen(s[0], concat([s[1], s[2]], cast(s[3] : flow -> [flow])))
 		),
@@ -180,20 +180,13 @@ ruScript2Json(j : ScComm) -> Json {
 				Pair("exp", ruScExp2Json(val))
 			]);
 		}
-		ScIf(cond, script): {
-			JsonObject([
-				Pair("struct", JsonString("ScIf")),
-				Pair("cond", ruScExp2Json(cond)),
-				Pair("pos", ruScript2Json(script)),
-			]);
-		}
-		ScIfElse(cond, pos, neg): {
-			JsonObject([
-				Pair("struct", JsonString("ScIf")),
-				Pair("cond", ruScExp2Json(cond)),
-				Pair("pos", ruScript2Json(pos)),
-				Pair("neg", ruScript2Json(neg)),
-			]);
+		ScIf(cond, pos, mneg): {
+			JsonObject(filtermap([
+				Some(Pair("struct", JsonString("ScIf"))),
+				Some(Pair("cond", ruScExp2Json(cond))),
+				Some(Pair("pos", ruScript2Json(pos))),
+				maybeMap(mneg, \neg -> Pair("neg", ruScript2Json(neg)))
+			], idfn));
 		}
 		ScWhile(cond, script): {
 			JsonObject([
@@ -361,19 +354,12 @@ ruJson2ScComm(json : Json) -> Maybe<ScComm> {
 		}
 	} else
 	if (struct == "ScIf") {
-		maybeMap2(\cond, script -> ScIf(cond, script))(
+		neg = if (!jsonObjectHasField(json, "neg")) None() else {
+			ruJson2ScComm(getJsonFieldValue(json, "neg", JsonNull()));
+		}
+		maybeMap2(\cond, pos -> ScIf(cond, pos, neg))(
 			ruJson2ScExp(getJsonFieldValue(json, "cond", JsonNull())),
-			ruJson2ScComm(getJsonFieldValue(json, "script", JsonNull()))
-		);
-	} else 
-	if (struct == "ScIfElse") {
-		maybeBind(
-			ruJson2ScExp(getJsonFieldValue(json, "cond", JsonNull())),
-			\cond -> maybeMap2(\pos, neg -> ScIfElse(cond, pos, neg))
-			(
-				ruJson2ScComm(getJsonFieldValue(json, "pos", JsonNull())),
-				ruJson2ScComm(getJsonFieldValue(json, "neg", JsonNull()))
-			)
+			ruJson2ScComm(getJsonFieldValue(json, "pos", JsonNull()))
 		);
 	} else 
 	if (struct == "ScWhile") {
@@ -549,16 +535,22 @@ ruScComm2s(s : ScComm) -> string {
 			var + " : " + scType2s(type) + " = " + ruScExp2s(val) + ";";
 		ScAssign(var, val): 
 			var + " := " + ruScExp2s(val) + ";";
-		ScIf(cond, script): 
-			"if " + ruScExp2s(cond) + " {\n" + 
-				strIndent(ruScComm2s(script)) + 
-			"\n}";
-		ScIfElse(cond, pos, neg): 
-			"if " + ruScExp2s(cond) + " {\n" + 
-				strIndent(ruScComm2s(pos)) + 
-			"\n} else {\n" + 
-				strIndent(ruScComm2s(neg)) + 
-			"\n}";
+		ScIf(cond, pos, mneg): {
+			switch (mneg) {
+				None(): {
+					"if " + ruScExp2s(cond) + " {\n" + 
+						strIndent(ruScComm2s(pos)) + 
+					"\n}";
+				}
+				Some(neg): {
+					"if " + ruScExp2s(cond) + " {\n" + 
+						strIndent(ruScComm2s(pos)) + 
+					"\n} else {\n" + 
+						strIndent(ruScComm2s(neg)) + 
+					"\n}";
+				}
+			}
+		}
 		ScWhile(cond, script): 
 			"while " + ruScExp2s(cond) + " {\n" + 
 				strIndent(ruScComm2s(script)) + 
@@ -607,8 +599,12 @@ ruDoScCommTasks(acc : [ScTask], s : ScComm) -> [ScTask] {
 		ScSeq(seq):               fold(seq, acc, ruDoScCommTasks);
 		ScAssign(__,__):          acc;
 		ScDefine(__,__,__):       acc;
-		ScIf(cond, script):       ruDoScCommTasks(acc, script);
-		ScIfElse(cond, pos, neg): ruDoScCommTasks(ruDoScCommTasks(acc, pos), neg);
+		ScIf(cond, pos, mneg):    {
+			switch (mneg) {
+				None():           ruDoScCommTasks(acc, pos);
+				Some(neg):        ruDoScCommTasks(ruDoScCommTasks(acc, pos), neg);
+			}
+		}
 		ScWhile(cond, script):    ruDoScCommTasks(acc, script);
 		ScPrint(__):              acc;
 		ScOutput(__):             acc;
@@ -624,8 +620,7 @@ ruScCommSetTasksFile(script : ScComm, file : string) -> ScComm {
 		ScSeq(seq):               ScSeq(map(seq, set_file));
 		ScAssign(__,__):          script;
 		ScDefine(__,__,__):       script;
-		ScIf(cond, s):            ScIf(cond, set_file(s));
-		ScIfElse(cond, pos, neg): ScIfElse(cond, set_file(pos), set_file(neg));
+		ScIf(cond, pos, neg):     ScIf(cond, set_file(pos), maybeMap(neg, set_file));
 		ScWhile(cond, s):         ScWhile(cond, set_file(s));
 		ScPrint(__):              script;
 		ScOutput(__):             script;
@@ -679,10 +674,8 @@ ruSetScCommTaskArg(script : ScComm, key : string, val : string) -> ScComm {
 			script;
 		ScDefine(__,__,__): 
 			script;
-		ScIf(cond, s): 
-			ScIf(cond, rec_set(s));
-		ScIfElse(cond, pos, neg): 
-			ScIfElse(cond, rec_set(pos), rec_set(neg));
+		ScIf(cond, pos, neg): 
+			ScIf(cond, rec_set(pos), maybeMap(neg, rec_set));
 		ScWhile(cond, s):
 			ScWhile(cond, rec_set(s));
 		ScPrint(__):
