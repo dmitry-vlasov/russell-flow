@@ -16,16 +16,23 @@ export {
 		ScTask(command : string, args : Tree<string, string>);
 		ScAction(action : string);
 
-	ScExp ::= ScInfixOp, ScPrefixOp, ScCall, ScCond, ScIndex, ScLambda, 
+	ScExp ::= ScInfixOp, ScPrefixOp, ScCall, ScCond, ScIndex, ScLambda, ScArray, ScMap, ScGet,
 		ScUndefConst, ScBoolConst, ScIntConst, ScDoubleConst, ScStringConst, ScVar;
+		// general
 		ScInfixOp(exp : ScExp, args : [ScInfixArg]);
 			ScInfixArg(op : string, exp : ScExp);
 		ScPrefixOp(op : string, exp : ScExp);
-		ScCall(fn : ScExp, args : [ScExp]);
 		ScCond(cond : ScExp, pos : ScExp, neg : ScExp);
-		ScIndex(ex : ScExp, ind : ScExp);
+		// functions: make lambda / call fn
+		ScCall(fn : ScExp, args : [ScExp]);
 		ScLambda(args : [ScVar], body : ScExp);
-	
+		// array: make/access
+		ScArray(arr : [ScExp]);
+		ScIndex(arr : ScExp, ind : ScExp);
+		// maps: make/access
+		ScMap(pairs : [Pair<ScExp, ScExp>]);
+		ScGet(map : ScExp, key : ScExp);
+
 		ScUndefConst();
 		ScBoolConst(val : bool);
 		ScIntConst(val : int);
@@ -122,12 +129,7 @@ ru_script_actions = SemanticActions(mergeTree(defaultPegActions.t,
 	pairs2tree([
 		Pair("makeScTask", ruMakeScTask),
 		Pair("makeScComm", ruMakeScComm),
-		Pair("makeScIf", \s -> ScIf(s[0], s[1], None())),
-		Pair("makeScIfElse", \s -> ScIf(s[0], s[1], Some(s[2]))),
-		Pair("makeScOutput", \s -> ScOutput("output", s[0])),
-		Pair("makeScPrint", \s -> ScOutput("print", s[0])),
 		Pair("makeScBoolConst", \s -> ScBoolConst(s[0] == "true")),
-		Pair("makeEmptySeq",  \__ -> ScSeq([])),
 		Pair("makeTypeConst", \s -> scConstType(flow2s(s[0]))),
 		Pair("makeTypeArray", \s -> scArrayType(s[0])),
 		Pair("makeTypeFn",    \s -> scFuncType(s[0], s[1])),
@@ -271,6 +273,30 @@ ruScExp2Json(e : ScExp) -> Json {
 				Pair("struct", JsonString("ScLambda")),
 				Pair("args", JsonArray(map(args, ruScExp2Json))),
 				Pair("body", ruScExp2Json(body))
+			]);
+		}
+		ScArray(arr): {
+			JsonObject([
+				Pair("struct", JsonString("ScArray")),
+				Pair("arr", JsonArray(map(arr, ruScExp2Json))),
+			]);
+		}
+		ScMap(pairs): {
+			JsonObject([
+				Pair("struct", JsonString("ScMap")),
+				Pair("pairs", JsonArray(map(pairs, \p ->
+					JsonObject([
+						Pair("key", ruScExp2Json(p.first)),
+						Pair("val", ruScExp2Json(p.second))
+					])
+				))),
+			]);
+		}
+		ScGet(map_, key): {
+			JsonObject([
+				Pair("struct", JsonString("ScGet")),
+				Pair("map", ruScExp2Json(map_)),
+				Pair("key", ruScExp2Json(key))
 			]);
 		}
 		ScUndefConst(): {
@@ -479,6 +505,40 @@ ruJson2ScExp(json : Json) -> Maybe<ScExp> {
 			}
 		}
 	} else 
+	if (struct == "ScArray") {
+		if (!jsonObjectHasField(json, "arr")) None() else {
+			arr_json = getJsonArrayField(json, "arr");
+			arr = filtermap(arr_json, ruJson2ScExp);
+			if (length(arr) == length(arr_json)) {
+				Some(ScArray(arr));
+			} else {
+				None();
+			}
+		}
+	} else 
+	if (struct == "ScMap") {
+		if (!jsonObjectHasField(json, "pairs")) None() else {
+			pairs_jsons = getJsonArrayField(json, "pairs");
+			pairs = filtermap(pairs_jsons, \pair_json -> {
+				key_json = getJsonFieldValue(pair_json, "key", JsonNull());
+				val_json = getJsonFieldValue(pair_json, "val", JsonNull());
+				maybeMap2(\key, val -> Pair(key, val))(
+					ruJson2ScExp(key_json),
+					ruJson2ScExp(val_json)
+				)
+			});
+			if (length(pairs) == length(pairs_jsons)) {
+				Some(ScMap(pairs));
+			} else {
+				None();
+			}
+		}
+	} else 
+	if (struct == "ScGet") {
+		map_json = getJsonFieldValue(json, "map", JsonNull());
+		key_json = getJsonFieldValue(json, "key", JsonNull());
+		maybeMap2(\map_, key -> ScGet(map_, key))(ruJson2ScExp(map_json), ruJson2ScExp(key_json));
+	} else 
 	if (struct == "ScUndefConst") {
 		Some(ScUndefConst());
 	} else 
@@ -552,6 +612,12 @@ ruScExp2s(e : ScExp) -> string {
 			ruScExp2s(ex) + "[" + ruScExp2s(ind) + "]";
 		ScLambda(args, body): 
 			"\\" + superglue(args, ruScExp2s, ", ") + "->" + ruScExp2s(body);
+		ScArray(arr):
+			"[" + superglue(arr, ruScExp2s, ", ") + "]";
+		ScGet(map_, key): 
+			ruScExp2s(map_) + "." + ruScExp2s(key);
+		ScMap(pairs): 
+			"{" + superglue(pairs, \p -> ruScExp2s(p.first) + "=" + ruScExp2s(p.second), ", ") + "}";
 		ScUndefConst():     "undef";
 		ScBoolConst(val):   b2s(val);
 		ScIntConst(val):    i2s(val);
@@ -657,9 +723,14 @@ ruScExpVars(acc : Set<string>, e : ScExp) -> Set<string> {
 			fold([cond, pos, neg], acc, ruScExpVars);
 		ScIndex(ex, ind):
 			ruScExpVars(ruScExpVars(acc, ex), ind);
-		ScLambda(args, body): {
+		ScLambda(args, body):
 			filterSet(ruScExpVars(acc, body), \v -> findiDef(args, \arg -> arg.var == v, -1) == -1);
-		}
+		ScArray(arr):
+			fold(arr, acc ,ruScExpVars);
+		ScMap(pairs):
+			fold(pairs, acc, \ac, p -> ruScExpVars(ruScExpVars(ac, p.first), p.second));
+		ScGet(map_, key):
+			ruScExpVars(ruScExpVars(acc, map_), key);
 		ScUndefConst():     acc;
 		ScBoolConst(val):   acc;
 		ScIntConst(val):    acc;
