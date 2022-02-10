@@ -8,7 +8,7 @@ import script/funcs/time;
 import script/funcs/util;
 
 export {
-	ruEval(ex : ScExp, locals : Tree<string, ScValue>, state : RuState, out : RuOut) -> ScValue;
+	ruEval(ex : ScExp, state : RuExecState, out : RuOut) -> ScValue;
 }
 
 ru_script_fns : ref Maybe<Tree<string, ScriptFn>> = ref None();
@@ -26,13 +26,13 @@ ruScriptFns() -> Tree<string, ScriptFn> {
 	);
 }
 
-ruEval(ex : ScExp, locals : Tree<string, ScValue>, state : RuState, out : RuOut) -> ScValue {
-	conf = state.conf;
+ruEval(ex : ScExp, state : RuExecState, out : RuOut) -> ScValue {
+	conf = state.global.conf;
 	switch (ex) {
 		ScInfixOp(e, args): {
 			vals = map(
 				concat([e], map(args, \arg -> arg.exp)), 
-				\arg -> ruEval(arg, locals, state, out)
+				\arg -> ruEval(arg, state, out)
 			);
 			func = lookupTreeDef(ruScriptFns(), args[0].op, ruNoScriptFn);
 			errs = concat(
@@ -46,7 +46,7 @@ ruEval(ex : ScExp, locals : Tree<string, ScValue>, state : RuState, out : RuOut)
 			}
 		}
 		ScPrefixOp(op, e): {
-			val = ruEval(e, locals, state, out);
+			val = ruEval(e, state, out);
 			func = lookupTreeDef(ruScriptFns(), op, ruNoScriptFn);
 			errs = concat(
 				ruErrorArgs([val]),
@@ -59,8 +59,8 @@ ruEval(ex : ScExp, locals : Tree<string, ScValue>, state : RuState, out : RuOut)
 			}
 		}
 		ScCall(fn, args): {
-			fn_val = ruEval(fn, locals, state, out);
-			vals = map(args, \arg -> ruEval(arg, locals, state, out));
+			fn_val = ruEval(fn, state, out);
+			vals = map(args, \arg -> ruEval(arg, state, out));
 			if (length(ruErrorArgs(vals)) > 0) {
 				scErrorVal(ruErrorArgs(vals));
 			} else {
@@ -73,16 +73,16 @@ ruEval(ex : ScExp, locals : Tree<string, ScValue>, state : RuState, out : RuOut)
 			}
 		}
 		ScCond(cond, pos, neg): {
-			cond_val = ruEval(cond, locals, state, out);
+			cond_val = ruEval(cond, state, out);
 			if (cast(cond_val.val : flow -> bool)) {
-				ruEval(pos, locals, state, out)
+				ruEval(pos, state, out)
 			} else {
-				ruEval(neg, locals, state, out)
+				ruEval(neg, state, out)
 			}
 		}
 		ScIndex(e, i): {
-			e_val = ruEval(e, locals, state, out);
-			i_val = ruEval(i, locals, state, out);
+			e_val = ruEval(e, state, out);
+			i_val = ruEval(i, state, out);
 			errs = ruErrorArgs([e_val, i_val]);
 			e_type = scTypeGen(e_val.type);
 			if (e_type == "map") {
@@ -105,12 +105,11 @@ ruEval(ex : ScExp, locals : Tree<string, ScValue>, state : RuState, out : RuOut)
 			}
 		}
 		ScLambda(args, body): {
-			// ScValue(val : flow, type : ScType);
 			closure = foldSet(ruScExpVars(makeSet(), ex), makeTree(), \acc, var -> 
-				switch (lookupTree(locals, var)) {
+				switch (lookupTree(state.local, var)) {
 					Some(val): setTree(acc, var, val);
 					None(): {
-						switch (lookupTree(state.vars, var)) {
+						switch (lookupTree(state.global.vars, var)) {
 							Some(val): setTree(acc, var, val);
 							None(): {
 								acc;
@@ -124,7 +123,7 @@ ruEval(ex : ScExp, locals : Tree<string, ScValue>, state : RuState, out : RuOut)
 					ruScExp2s(ex),
 					\vs, st, o -> {
 						call_locals = foldi(args, closure, \i, acc, arg -> setTree(acc, arg.var, vs[i]));
-						ruEval(body, call_locals, st, o);
+						ruEval(body, RuExecState(st with local = call_locals), o);
 					}
 				),
 				scFuncType(
@@ -138,16 +137,16 @@ ruEval(ex : ScExp, locals : Tree<string, ScValue>, state : RuState, out : RuOut)
 		ScIntConst(val):    scIntVal(val);
 		ScDoubleConst(val): scDoubleVal(val);
 		ScStringConst(val): scStringVal(val);
-		ScVar(var):         ruEvalVar(var, locals, state, out);
+		ScVar(var):         ruEvalVar(var, state, out);
 	}
 }
 
-ruEvalVar(var : string, locals : Tree<string, ScValue>, state : RuState, out : RuOut) -> ScValue {
-	conf = state.conf;
-	switch (lookupTree(locals, var)) {
+ruEvalVar(var : string, state : RuExecState, out : RuOut) -> ScValue {
+	conf = state.global.conf;
+	switch (lookupTree(state.local, var)) {
 		Some(val): val;
 		None(): {
-			switch (lookupTree(state.vars, var)) {
+			switch (lookupTree(state.global.vars, var)) {
 				Some(val): val;
 				None(): {
 					if (startsWith(var, "conf.")) {
@@ -170,7 +169,7 @@ ruEvalVar(var : string, locals : Tree<string, ScValue>, state : RuState, out : R
 						}
 					} else if (var == "sources") {
 						ScValue(
-							foldTree(state.ru, makeTree(), \id, src, acc -> 
+							foldTree(state.global.ru, makeTree(), \id, src, acc -> 
 								setTree(acc, id2s(id), src)
 							),
 							scMapType(scStringType, scConstType("RuSource"))

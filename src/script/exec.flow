@@ -16,25 +16,24 @@ ruExecScript(script : ScComm, commands : Tree<string, RuComm>, state : RuState, 
 	if (log_script) {
 		ruScriptLog("<" + uuid + "> Script started:  " + ruServerEscapeString(script_src), state.conf);
 	}
-	ret = ruDoExecScript(script, RuExecEnv(commands, makeTree(), state, out, ref false));
+	exec_state = ruDoExecScript(script, RuExecEnv(commands, RuExecState(state, makeTree()), out, ref false));
 	if (log_script) {
 		ruScriptLog(
 			"<" + uuid + "> Script finished: " + 
 			"in " + ruTimePassed2s(timer), state.conf
 		);
 	}
-	ret
+	exec_state.global
 }
 
 RuExecEnv(
 	commands : Tree<string, RuComm>,
-	locals : Tree<string, ScValue>,
-	state : RuState, 
+	state : RuExecState, 
 	out : RuOut,
 	stop : ref bool
 );
 
-ruDoExecScript(script : ScComm, env : RuExecEnv) -> RuState {
+ruDoExecScript(script : ScComm, env : RuExecEnv) -> RuExecState {
 	switch (script) {
 		ScSeq(seq):
 			ruExecSeq(seq, env);
@@ -58,7 +57,7 @@ ruDoExecScript(script : ScComm, env : RuExecEnv) -> RuState {
 			} else if (action == "exit") {
 				// Terminate the programm
 				env.stop := true;
-				RuState(env.state with exit = true);
+				RuExecState(env.state with global = RuState(env.state.global with exit = true));
 			} else {
 				env.out.onError("Unknown action: '" + action + "', must be 'stop' or 'exit'", []);
 				env.state;
@@ -67,16 +66,16 @@ ruDoExecScript(script : ScComm, env : RuExecEnv) -> RuState {
 	}
 }
 
-ruExecSeq(seq : [ScComm], env : RuExecEnv) -> RuState {
+ruExecSeq(seq : [ScComm], env : RuExecEnv) -> RuExecState {
 	fold(seq, env.state, \acc, script -> 
 		if (^(env.stop)) acc else 
 		ruDoExecScript(script, RuExecEnv(env with state = acc))
 	);
 }
 
-ruExecAssign(var : string, ex : ScExp, env : RuExecEnv) -> RuState {
+ruExecAssign(var : string, ex : ScExp, env : RuExecEnv) -> RuExecState {
 	if (^(env.stop)) env.state else {
-		val = ruEval(ex, env.locals, env.state, env.out);
+		val = ruEval(ex, env.state, env.out);
 		if (scTypeGen(val.type) == "error") {
 			env.out.onMessage("at assigning '" + ruScExp2s(ex) + "' to '" + var + "' met " + ruScValue2s(val));
 		}
@@ -86,23 +85,37 @@ ruExecAssign(var : string, ex : ScExp, env : RuExecEnv) -> RuState {
 			}
 			default: { }
 		}*/
-		RuState(env.state with vars = setTree(env.state.vars, var, val));
+		if (containsKeyTree(env.state.local, var)) {
+			RuExecState(env.state with 
+				local = setTree(env.state.local, var, val)
+			);
+		} else {
+			RuExecState(env.state with 
+				global = RuState(env.state.global with 
+					vars = setTree(env.state.global.vars, var, val)
+				)
+			);
+		}
 	}
 }
 
-ruExecLet(var : string, ex : ScExp, scope : ScComm, env : RuExecEnv) -> RuState {
+ruExecLet(var : string, ex : ScExp, scope : ScComm, env : RuExecEnv) -> RuExecState {
 	if (^(env.stop)) env.state else {
-		val = ruEval(ex, env.locals, env.state, env.out);
+		val = ruEval(ex, env.state, env.out);
 		if (scTypeGen(val.type) == "error") {
 			env.out.onMessage("at assigning '" + ruScExp2s(ex) + "' to '" + var + "' met " + ruScValue2s(val));
 		}
-		ruDoExecScript(scope, RuExecEnv(env with locals = setTree(env.locals, var, val)));
+		ruDoExecScript(scope, RuExecEnv(env with 
+			state = RuExecState(env.state with 
+				local = setTree(env.state.local, var, val)
+			)
+		));
 	}
 }
 
-ruExecIf(cond : ScExp, pos : ScComm, mneg : Maybe<ScComm>, env : RuExecEnv) -> RuState {
+ruExecIf(cond : ScExp, pos : ScComm, mneg : Maybe<ScComm>, env : RuExecEnv) -> RuExecState {
 	if (^(env.stop)) env.state else {
-		val = ruEval(cond, env.locals, env.state, env.out);
+		val = ruEval(cond, env.state, env.out);
 		val_type = scTypeGen(val.type);
 		if (val_type == "bool") {
 			c = cast(val.val : flow -> bool);
@@ -124,9 +137,9 @@ ruExecIf(cond : ScExp, pos : ScComm, mneg : Maybe<ScComm>, env : RuExecEnv) -> R
 	}
 }
 
-ruExecWhile(cond : ScExp, script : ScComm, env : RuExecEnv) -> RuState {
+ruExecWhile(cond : ScExp, script : ScComm, env : RuExecEnv) -> RuExecState {
 	if (^(env.stop)) env.state else {
-		val = ruEval(cond, env.locals, env.state, env.out);
+		val = ruEval(cond, env.state, env.out);
 		val_type = scTypeGen(val.type);
 		if (val_type == "bool") {
 			c = cast(val.val : flow -> bool);
@@ -146,19 +159,19 @@ ruExecWhile(cond : ScExp, script : ScComm, env : RuExecEnv) -> RuState {
 	}
 }
 
-ruExecPrint(ex : ScExp, env : RuExecEnv) -> RuState {
+ruExecPrint(ex : ScExp, env : RuExecEnv) -> RuExecState {
 	if (^(env.stop)) env.state else {
-		val = ruEval(ex, env.locals, env.state, env.out);
-		msg = ruApplyScriptVars(ruScValue2s(val), env.state.vars, env.state.conf);
+		val = ruEval(ex, env.state, env.out);
+		msg = ruApplyScriptVars(ruScValue2s(val), ruExecStateVars(env.state), env.state.global.conf);
 		env.out.onMessage(strReplaces(msg, ["\\n", "\n", "\\t", "\t"]));
 		env.state;
 	}
 }
 
-ruExecOutput(mode : string, ex : ScExp, env : RuExecEnv) -> RuState {
+ruExecOutput(mode : string, ex : ScExp, env : RuExecEnv) -> RuExecState {
 	if (^(env.stop)) env.state else {
-		val = ruEval(ex, env.locals, env.state, env.out);
-		msg = ruApplyScriptVars(ruScValue2s(val), env.state.vars, env.state.conf);
+		val = ruEval(ex, env.state, env.out);
+		msg = ruApplyScriptVars(ruScValue2s(val), ruExecStateVars(env.state), env.state.global.conf);
 		if (mode == "print") {
 			env.out.onMessage(strReplaces(msg, ["\\n", "\n", "\\t", "\t"]));
 		} else if (mode == "output") {
@@ -170,10 +183,10 @@ ruExecOutput(mode : string, ex : ScExp, env : RuExecEnv) -> RuState {
 	}
 }
 
-ruExecTask(task : ScTask, env : RuExecEnv) -> RuState {
+ruExecTask(task : ScTask, env : RuExecEnv) -> RuExecState {
 	if (^(env.stop)) env.state else {
-		state = env.state;
-		switch (lookupTree(env.commands, task.command)) {
+		state = env.state.global;
+		new_state = switch (lookupTree(env.commands, task.command)) {
 			Some(command): {
 				ruRun(
 					RuUnit(task, state, env.out), 
@@ -182,7 +195,7 @@ ruExecTask(task : ScTask, env : RuExecEnv) -> RuState {
 				);
 			}
 			None(): {
-				switch (ruLoadScript(task.command, RuEnv(env.state.conf, env.out))) {
+				switch (ruLoadScript(task.command, RuEnv(env.state.global.conf, env.out))) {
 					Some(src): {
 						ruRun(
 							RuUnit(task, state, env.out), 
@@ -197,5 +210,6 @@ ruExecTask(task : ScTask, env : RuExecEnv) -> RuState {
 				}
 			}
 		}
+		RuExecState(env.state with global = new_state);
 	}
 }
