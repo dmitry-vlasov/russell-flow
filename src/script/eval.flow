@@ -9,7 +9,7 @@ import script/funcs/util;
 import base/reflect;
 
 export {
-	ruEval(ex : ScExp, state : RuExecState, out : RuOut) -> ScValue;
+	ruEval(ex : ScExp, state : RuExecState, out : RuOut) -> flow;
 }
 
 ru_script_fns : ref Maybe<Tree<string, ScriptFn>> = ref None();
@@ -27,7 +27,7 @@ ruScriptFns() -> Tree<string, ScriptFn> {
 	);
 }
 
-ruEval(ex : ScExp, state : RuExecState, out : RuOut) -> ScValue {
+ruEval(ex : ScExp, state : RuExecState, out : RuOut) -> flow {
 	conf = state.global.conf;
 	switch (ex) {
 		ScInfixOp(e, args): {
@@ -41,7 +41,7 @@ ruEval(ex : ScExp, state : RuExecState, out : RuOut) -> ScValue {
 				if (func.name != "") [] else ["infix operator: '" + args[0].op + "'' is not found"]
 			);
 			if (length(errs) > 0) {
-				scErrorVal(errs);
+				flow(RuRuntimeError(errs));
 			} else {
 				func.fn(vals, state, out);
 			}
@@ -54,7 +54,7 @@ ruEval(ex : ScExp, state : RuExecState, out : RuOut) -> ScValue {
 				if (func.name != "") [] else ["prefix operator: '" + op + "'' is not found"]
 			);
 			if (length(errs) > 0) {
-				scErrorVal(errs);
+				RuRuntimeError(errs);
 			} else {
 				func.fn([val], state, out);
 			}
@@ -63,10 +63,10 @@ ruEval(ex : ScExp, state : RuExecState, out : RuOut) -> ScValue {
 			fn_val = ruEval(fn, state, out);
 			vals = map(args, \arg -> ruEval(arg, state, out));
 			if (length(ruErrorArgs(vals)) > 0) {
-				scErrorVal(ruErrorArgs(vals));
+				RuRuntimeError(ruErrorArgs(vals));
 			} else {
-				if (scTypeGen(fn_val.type) != "func") {
-					scErrorVal(["Calling non-function:\n" + toString(fn_val) + "\nin:\n" + ruScExp2s(ex)]);
+				if (runtimeValueType(fn_val.type) != "func") {
+					RuRuntimeError(["Calling non-function:\n" + toString(fn_val) + "\nin:\n" + ruScExp2s(ex)]);
 				} else {
 					func = cast(fn_val.val : flow -> ScriptFn);
 					func.fn(vals, state, out);
@@ -85,45 +85,39 @@ ruEval(ex : ScExp, state : RuExecState, out : RuOut) -> ScValue {
 			e_val = ruEval(e, state, out);
 			i_val = ruEval(i, state, out);
 			errs = ruErrorArgs([e_val, i_val]);
-			e_type = scTypeGen(e_val.type);
-			if (e_type == "map") {
+			e_type = runtimeValueType(e_val);
+			if (e_type == "Tree") {
 				mapping = cast(e_val.val : flow -> Tree<flow, flow>);
-				switch (lookupTree(mapping, i_val.val)) {
-					Some(v): ScValue(v, scUnwrapMapVal(e_val.type));
-					None():  scUndefVal;
-				}
+				lookupTreeDef(mapping, i_val, RuUndefVal());
 			} else if (e_type == "array") {
-				arr = cast(e_val.val : flow -> [flow]);
-				if (scTypeGen(i_val.type) == "int") {
-					ind = cast(i_val.val : flow -> int);
+				arr = cast(e_val : flow -> [flow]);
+				if (runtimeValueType(i_val) == "int") {
+					ind = cast(i_val : flow -> int);
 					if (0 <= ind && ind < length(arr)) {
-						ScValue(arr[ind], scUnwrapArrayType(e_val.type));
+						arr[ind];
 					} else {
 						err = "index " + i2s(ind) + " " + if (ind < 0) "is negative" else " is out of bounds: " + i2s(length(arr));
-						ScValue(concat(errs, [err]), scErrorType)
+						RuRuntimeError(concat(errs, [err]))
 					}
 				} else {
-					scUndefVal;
+					RuUndefVal();
 				}
 			} else {
 				err = "first argument of index operator must be a map or array, got: " + scType2s(e_val.type);
-				ScValue(concat(errs, [err]), scErrorType)
+				RuRuntimeError(concat(errs, [err]))
 			}
 		}
 		ScGet(m, k): {
 			m_val = ruEval(m, state, out);
 			k_val = ruEval(k, state, out);
 			errs = ruErrorArgs([m_val, k_val]);
-			m_type = scTypeGen(m_val.type);
+			m_type = runtimeValueType(m_val.type);
 			if (m_type == "map") {
 				mapping = cast(m_val.val : flow -> Tree<flow, flow>);
-				switch (lookupTree(mapping, k_val.val)) {
-					Some(v): ScValue(v, scUnwrapMapVal(m_val.type));
-					None():  scUndefVal;
-				}
+				lookupTreeDef(mapping, k_val.val, RuUndefVal());
 			} else {
 				err = "first argument of . operator must be a map, got: " + scType2s(m_val.type);
-				ScValue(concat(errs, [err]), scErrorType)
+				RuRuntimeError(concat(errs, [err]))
 			}
 		}
 		ScLambda(args, body): {
@@ -140,46 +134,33 @@ ruEval(ex : ScExp, state : RuExecState, out : RuOut) -> ScValue {
 					}
 				}
 			);
-			ScValue(
-				ScriptFn(
-					ruScExp2s(ex),
-					\vs, st, o -> {
-						call_locals = foldi(args, closure, \i, acc, arg -> setTree(acc, arg.var, vs[i]));
-						ruEval(body, RuExecState(st with local = call_locals), o);
-					}
-				),
-				scFuncType(
-					map(args, \arg -> scAnyType),
-					scAnyType
-				)
+			ScriptFn(
+				ruScExp2s(ex),
+				\vs, st, o -> {
+					call_locals = foldi(args, closure, \i, acc, arg -> setTree(acc, arg.var, vs[i]));
+					ruEval(body, RuExecState(st with local = call_locals), o);
+				}
 			);
 		}
 		ScArray(arr): {
-			arr_val = map(arr, \x -> ruEval(x, state, out));
-			el_type = if (length(arr_val) == 0) scUndefType else arr_val[0].type;
-			ScValue(map(arr_val, \v -> v.val), ScTypeGen("array", [el_type]));
+			map(arr, \x -> ruEval(x, state, out));
 		}
 		ScMap(pairs): {
 			pairs_vals = map(pairs, \p -> 
 				Pair(ruEval(p.first, state, out), ruEval(p.second, state, out))
 			);
-			key_type = if (length(pairs_vals) == 0) scUndefType else pairs_vals[0].first.type;
-			val_type = if (length(pairs_vals) == 0) scUndefType else pairs_vals[0].second.type;
-			ScValue(
-				pairs2tree(map(pairs_vals, \p -> Pair(p.first.val, p.second.val))), 
-				ScTypeGen("map", [key_type, val_type])
-			);
+			pairs2tree(map(pairs_vals, \p -> Pair(p.first.val, p.second.val)));
 		}
-		ScUndefConst():     scUndefVal;
-		ScBoolConst(val):   scBoolVal(val);
-		ScIntConst(val):    scIntVal(val);
-		ScDoubleConst(val): scDoubleVal(val);
-		ScStringConst(val): scStringVal(val);
+		ScUndefConst():     RuUndefVal();
+		ScBoolConst(val):   val;
+		ScIntConst(val):    val;
+		ScDoubleConst(val): val;
+		ScStringConst(val): val;
 		ScVar(var):         ruEvalVar(var, state, out);
 	}
 }
 
-ruEvalVar(var : string, state : RuExecState, out : RuOut) -> ScValue {
+ruEvalVar(var : string, state : RuExecState, out : RuOut) -> flow {
 	conf = state.global.conf;
 	switch (lookupTree(state.local, var)) {
 		Some(val): val;
@@ -190,27 +171,24 @@ ruEvalVar(var : string, state : RuExecState, out : RuOut) -> ScValue {
 					if (startsWith(var, "conf.")) {
 						opt = strRight(var, 5);
 						switch (lookupTree(conf.opts, opt)) {
-							Some(val): scStringVal(val);
+							Some(val): flow(val);
 							None(): {
 								if (opt == "working-dir") {
-									scStringVal(conf.workingDir);
+									flow(conf.workingDir);
 								} else if (opt == "verbose") {
-									scIntVal(conf.verbose);
+									flow(conf.verbose);
 								} else if (opt == "import-roots") {
-									scStringArrayVal(conf.importRoots);
+									flow(conf.importRoots);
 								} else if (opt == "project-roots") {
-									scStringArrayVal(conf.projectRoots);
+									flow(conf.projectRoots);
 								} else {
-									scUndefVal;
+									RuUndefVal();
 								}
 							}
 						}
 					} else if (var == "sources") {
-						ScValue(
-							foldTree(state.global.ru, makeTree(), \id, src, acc -> 
-								setTree(acc, id2s(id), src)
-							),
-							scMapType(scStringType, scConstType("RuSource"))
+						foldTree(state.global.ru, makeTree(), \id, src, acc -> 
+							setTree(acc, id2s(id), src)
 						);
 					} /*else if (var == "math") {
 						math = ruMathFromSources(state.ru, RuEnv(conf, out));
@@ -234,7 +212,7 @@ ruEvalVar(var : string, state : RuExecState, out : RuOut) -> ScValue {
 					} */ else {
 						switch (lookupTree(ruScriptFns(), var)) {
 							Some(fn): {
-								ScValue(fn, scFuncType([], scAnyType));
+								fn;
 							}
 							None(): {
 								//native hasRuntimeFunction : (string) -> bool = RussellReflection.hasRuntimeFunction;
@@ -244,15 +222,9 @@ ruEvalVar(var : string, state : RuExecState, out : RuOut) -> ScValue {
 								//	fn : ([ScValue], state : RuExecState, out : RuOut) -> ScValue
 								//);
 								if (hasRuntimeFunction(var)) {
-									ScValue(
-										ScriptFn(var, \args, __,__-> {
-											ret = callRuntimeFunction(var, map(args, \arg -> arg.val));
-											ScValue(ret, scUndefType)
-										}), 
-										scFuncType([], scAnyType)
-									);
+									ScriptFn(var, \args, __,__-> callRuntimeFunction(var, args));
 								} else {
-									scUndefVal;
+									flow(RuUndefVal());
 								}
 							}
 						}
