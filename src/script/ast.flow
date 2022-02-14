@@ -9,7 +9,7 @@ export {
 	ScComm ::= ScSeq, ScAssign, ScLet, ScIf, ScWhile, ScOutput, ScTask, ScAction;
 		ScSeq(seq : [ScComm]);
 		ScLet(var : string, exp : ScExp, scope : ScComm);
-		ScAssign(var : string, access : ScAccessLval, exp : ScExp);
+		ScAssign(var : ScVar, exp : ScExp);
 		ScIf(cond : ScExp, pos : ScComm, neg : Maybe<ScComm>);
 		ScWhile(cond : ScExp, script : ScComm);
 		ScOutput(mode : string, exp : ScExp);
@@ -31,7 +31,7 @@ export {
 		ScCond(cond : ScExp, pos : ScExp, neg : ScExp);
 		// functions: make lambda / call fn
 		ScCall(fn : ScExp, args : [ScExp]);
-		ScLambda(args : [ScVar], body : ScExp);
+		ScLambda(args : [string], body : ScExp);
 		// array: make/access
 		ScArray(arr : [ScExp]);
 		ScIndex(arr : ScExp, ind : ScExp);
@@ -45,7 +45,7 @@ export {
 		ScIntConst(val : int);
 		ScDoubleConst(val : double);
 		ScStringConst(val : string);
-		ScVar(var : string);
+		ScVar(var : string, access : ScAccessLval);
 
 	ruParseScComm(str : string) -> Maybe<ScCommWDocs>;
 	ruScComm2Json(script : ScComm) -> Json;
@@ -167,12 +167,11 @@ ruScComm2Json(j : ScComm) -> Json {
 				Pair("seq", JsonArray(map(seq, ruScComm2Json)))
 			]);
 		}
-		ScAssign(var, access, val): {
+		ScAssign(var, ex): {
 			JsonObject([
 				Pair("struct", JsonString("ScAssign")),
-				Pair("var", JsonString(var)),
-				Pair("access", ruScAccessLval2Json(access)),
-				Pair("exp", ruScExp2Json(val))
+				Pair("var", ruScExp2Json(var)),
+				Pair("exp", ruScExp2Json(ex))
 			]);
 		}
 		ScLet(var, ex, scope): {
@@ -297,7 +296,7 @@ ruScExp2Json(e : ScExp) -> Json {
 		ScLambda(args, body): {
 			JsonObject([
 				Pair("struct", JsonString("ScLambda")),
-				Pair("args", JsonArray(map(args, ruScExp2Json))),
+				Pair("args", JsonArray(map(args, \v -> JsonString(v)))),
 				Pair("body", ruScExp2Json(body))
 			]);
 		}
@@ -361,10 +360,11 @@ ruScExp2Json(e : ScExp) -> Json {
 				Pair("val", JsonString(val))
 			]);
 		}
-		ScVar(var): {
+		ScVar(var, access): {
 			JsonObject([
 				Pair("struct", JsonString("ScVar")),
-				Pair("var", JsonString(var))
+				Pair("var", JsonString(var)),
+				Pair("access", ruScAccessLval2Json(access))
 			]);
 		}
 	}
@@ -410,15 +410,17 @@ ruJson2ScComm(json : Json) -> Maybe<ScComm> {
 		}
 	} else 
 	if (struct == "ScAssign") {
-		var = getJsonStringField(json, "var", "");
-		if (var  == "") None() else {
-			json_access = getJsonFieldValue(json, "access", JsonNull());
-			json_val = getJsonFieldValue(json, "exp", JsonNull());
-			maybeMap2(\access, val -> ScAssign(var, access, val))(
-				ruJson2ScAccessLval(json_access),
-				ruJson2ScExp(json_val),
-			);
-		}
+		json_var = getJsonFieldValue(json, "var", JsonNull());
+		maybeBind(ruJson2ScExp(json_var), \var ->
+			switch (var) {
+				ScVar(__,__): {
+					json_exp = getJsonFieldValue(json, "exp", JsonNull());
+					maybeMap(ruJson2ScExp(json_exp), \ex -> ScAssign(var, ex));
+				}
+				default: None();
+			}
+
+		)
 	} else 
 	if (struct == "ScLet") {
 		var = getJsonStringField(json, "var", "");
@@ -557,12 +559,10 @@ ruJson2ScExp(json : Json) -> Maybe<ScExp> {
 			if (!jsonObjectHasField(json, "args")) None() else {
 				args_json = getJsonArrayField(json, "args");
 				args = filtermap(args_json, \arg_json -> 
-					maybeBind(ruJson2ScExp(arg_json), \arg -> 
-						switch (arg) {
-							ScVar(__): Some(arg);
-							default: None();
-						}
-					)
+					switch (arg_json) {
+						JsonString(arg): Some(arg);
+						default: None();
+					}
 				);
 				if (length(args) != length(args_json)) None() else {
 					maybeMap(ruJson2ScExp(body_json), \body -> ScLambda(args, body));
@@ -648,9 +648,12 @@ ruJson2ScExp(json : Json) -> Maybe<ScExp> {
 		} 
 	} else 
 	if (struct == "ScVar") {
-		if (!jsonObjectHasField(json, "var")) None() else {
-			var = getJsonStringField(json, "var", "");
-			Some(ScVar(var));
+		var = getJsonStringField(json, "var", "");
+		if (var == "") None() else {
+			json_access = getJsonFieldValue(json, "access", JsonNull());
+			maybeMap(ruJson2ScAccessLval(json_access), \access ->
+				ScVar(var, access)
+			);
 		} 
 	} else {
 		None();
@@ -663,8 +666,8 @@ ruScComm2s(s : ScComm) -> string {
 			strGlue(map(seq, ruScComm2s), "\n");
 		ScLet(var, val, scope): 
 			"let" + var + " = " + ruScExp2s(val) + ";\n" + ruScComm2s(scope);
-		ScAssign(var, access, val): 
-			var + ruScAccessLval2s(access) + " := " + ruScExp2s(val) + ";";
+		ScAssign(var, val): 
+			ruScExp2s(var) + " := " + ruScExp2s(val) + ";";
 		ScIf(cond, pos, mneg):
 			"if " + ruScExp2s(cond) + " {\n" + strIndent(ruScComm2s(pos)) + "\n}" + 
 			eitherMap(mneg, \neg -> " else {\n" + strIndent(ruScComm2s(neg)) + "\n}", "");
@@ -702,7 +705,7 @@ ruScExp2s(e : ScExp) -> string {
 		ScIndex(ex, ind): 
 			ruScExp2s(ex) + "[" + ruScExp2s(ind) + "]";
 		ScLambda(args, body): 
-			"\\" + superglue(args, ruScExp2s, ", ") + "->" + ruScExp2s(body);
+			"\\" + strGlue(args, ", ") + "->" + ruScExp2s(body);
 		ScArray(arr):
 			"[" + superglue(arr, ruScExp2s, ", ") + "]";
 		ScField(ex, field): 
@@ -716,7 +719,7 @@ ruScExp2s(e : ScExp) -> string {
 		ScIntConst(val):    i2s(val);
 		ScDoubleConst(val): d2s(val);
 		ScStringConst(val): "\"" + val + "\"";
-		ScVar(var):         var;
+		ScVar(var, access): var + ruScAccessLval2s(access);
 	}
 }
 
@@ -727,7 +730,7 @@ ruScCommTasks(s : ScComm) -> [ScTask] {
 ruDoScCommTasks(acc : [ScTask], s : ScComm) -> [ScTask] {
 	switch (s) {
 		ScSeq(seq):               fold(seq, acc, ruDoScCommTasks);
-		ScAssign(__,__,__):       acc;
+		ScAssign(__,__):          acc;
 		ScLet(__,__,__):          acc;
 		ScIf(cond, pos, mneg):    {
 			switch (mneg) {
@@ -746,7 +749,7 @@ ruScCommSetTasksFile(script : ScComm, file : string) -> ScComm {
 	set_file = \s -> ruScCommSetTasksFile(s, file);
 	switch (script) {
 		ScSeq(seq):               ScSeq(map(seq, set_file));
-		ScAssign(__,__,__):       script;
+		ScAssign(__,__):          script;
 		ScLet(__,__,__):          script;
 		ScIf(cond, pos, neg):     ScIf(cond, set_file(pos), maybeMap(neg, set_file));
 		ScWhile(cond, s):         ScWhile(cond, set_file(s));
@@ -795,7 +798,7 @@ ruSetScCommTaskArg(script : ScComm, key : string, val : string) -> ScComm {
 	rec_set = \s -> ruSetScCommTaskArg(s, key, val);
 	switch (script) {
 		ScSeq(seq):            ScSeq(map(seq, rec_set));
-		ScAssign(__,__,__):    script;
+		ScAssign(__,__):       script;
 		ScLet(__,__,__):       script;
 		ScIf(cond, pos, neg):  ScIf(cond, rec_set(pos), maybeMap(neg, rec_set));
 		ScWhile(cond, s):      ScWhile(cond, rec_set(s));
@@ -817,7 +820,7 @@ ruScExpVars(acc : Set<string>, e : ScExp) -> Set<string> {
 		ScIndex(ex, ind):
 			ruScExpVars(ruScExpVars(acc, ex), ind);
 		ScLambda(args, body):
-			filterSet(ruScExpVars(acc, body), \v -> findiDef(args, \arg -> arg.var == v, -1) == -1);
+			filterSet(ruScExpVars(acc, body), \v -> findiDef(args, \arg -> arg == v, -1) == -1);
 		ScArray(arr):
 			fold(arr, acc ,ruScExpVars);
 		ScMap(pairs):
@@ -831,6 +834,6 @@ ruScExpVars(acc : Set<string>, e : ScExp) -> Set<string> {
 		ScIntConst(val):    acc;
 		ScDoubleConst(val): acc;
 		ScStringConst(val): acc;
-		ScVar(var):         insertSet(acc, var);
+		ScVar(var,__):      insertSet(acc, var);
 	}
 }
