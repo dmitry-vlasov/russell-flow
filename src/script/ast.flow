@@ -6,9 +6,8 @@ import base/util/str;
 export {
 	ScCommWDocs(comm : ScComm, docs : string);
 
-	ScComm ::= ScSeq, ScAssign, ScLet, ScIf, ScWhile, ScOutput, ScTask, ScAction;
+	ScComm ::= ScSeq, ScAssign, ScIf, ScWhile, ScOutput, ScTask, ScAction;
 		ScSeq(seq : [ScComm]);
-		ScLet(var : string, exp : ScExp, scope : ScComm);
 		ScAssign(var : ScVar, exp : ScExp);
 		ScIf(cond : ScExp, pos : ScComm, neg : Maybe<ScComm>);
 		ScWhile(cond : ScExp, script : ScComm);
@@ -22,13 +21,14 @@ export {
 		ScDirectLval();
 
 	ScExp ::= 
-		ScInfixOp, ScPrefixOp, ScCall, ScCond, ScIndex, ScLambda, ScArray, ScMap, ScField, ScStruct,
+		ScInfixOp, ScPrefixOp, ScCall, ScCond, ScLet, ScIndex, ScLambda, ScArray, ScMap, ScField, ScStruct,
 		ScUndefConst, ScBoolConst, ScIntConst, ScDoubleConst, ScStringConst, ScVar;
 		// general
 		ScInfixOp(exp : ScExp, args : [ScInfixArg]);
 			ScInfixArg(op : string, exp : ScExp);
 		ScPrefixOp(op : string, exp : ScExp);
 		ScCond(cond : ScExp, pos : ScExp, neg : ScExp);
+		ScLet(var : string, exp : ScExp, scope : ScExp);
 		// functions: make lambda / call fn
 		ScCall(fn : ScExp, args : [ScExp]);
 		ScLambda(args : [string], body : ScExp);
@@ -174,14 +174,6 @@ ruScComm2Json(j : ScComm) -> Json {
 				Pair("exp", ruScExp2Json(ex))
 			]);
 		}
-		ScLet(var, ex, scope): {
-			JsonObject([
-				Pair("struct", JsonString("ScLet")),
-				Pair("var", JsonString(var)),
-				Pair("exp", ruScExp2Json(ex)),
-				Pair("scope", ruScComm2Json(scope))
-			]);
-		}
 		ScIf(cond, pos, mneg): {
 			JsonObject(filtermap([
 				Some(Pair("struct", JsonString("ScIf"))),
@@ -284,6 +276,14 @@ ruScExp2Json(e : ScExp) -> Json {
 				Pair("cond", ruScExp2Json(cond)),
 				Pair("pos", ruScExp2Json(pos)),
 				Pair("neg", ruScExp2Json(neg))
+			]);
+		}
+		ScLet(var, ex, scope): {
+			JsonObject([
+				Pair("struct", JsonString("ScLet")),
+				Pair("var", JsonString(var)),
+				Pair("exp", ruScExp2Json(ex)),
+				Pair("scope", ruScExp2Json(scope))
 			]);
 		}
 		ScIndex(ex, ind): {
@@ -422,17 +422,6 @@ ruJson2ScComm(json : Json) -> Maybe<ScComm> {
 
 		)
 	} else 
-	if (struct == "ScLet") {
-		var = getJsonStringField(json, "var", "");
-		if (var == "") None() else {
-			json_val = getJsonFieldValue(json, "exp", JsonNull());
-			json_scope = getJsonFieldValue(json, "scope", JsonNull());
-			maybeMap2(\val, scope -> ScLet(var, val, scope))(
-				ruJson2ScExp(json_val),
-				ruJson2ScComm(json_scope)
-			);
-		}
-	} else
 	if (struct == "ScIf") {
 		neg = if (!jsonObjectHasField(json, "neg")) None() else {
 			ruJson2ScComm(getJsonFieldValue(json, "neg", JsonNull()));
@@ -544,6 +533,17 @@ ruJson2ScExp(json : Json) -> Maybe<ScExp> {
 			);
 		}
 	} else 
+	if (struct == "ScLet") {
+		var = getJsonStringField(json, "var", "");
+		if (var == "") None() else {
+			json_val = getJsonFieldValue(json, "exp", JsonNull());
+			json_scope = getJsonFieldValue(json, "scope", JsonNull());
+			maybeMap2(\val, scope -> ScLet(var, val, scope))(
+				ruJson2ScExp(json_val),
+				ruJson2ScExp(json_scope)
+			);
+		}
+	} else
 	if (struct == "ScIndex") {
 		ex = getJsonFieldValue(json, "ex", JsonNull());
 		if (ex == JsonNull()) None() else {
@@ -662,12 +662,9 @@ ruJson2ScExp(json : Json) -> Maybe<ScExp> {
 
 ruScComm2s(s : ScComm) -> string {
 	switch (s) {
-		ScSeq(seq): 
+		ScSeq(seq):
 			strGlue(map(seq, ruScComm2s), "\n");
-		ScLet(var, val, scope): 
-			"let" + var + " = " + ruScExp2s(val) + ";\n" + ruScComm2s(scope);
-		ScAssign(var, val): 
-			ruScExp2s(var) + " := " + ruScExp2s(val) + ";";
+		ScAssign(var, val): ruScExp2s(var) + " := " + ruScExp2s(val) + ";";
 		ScIf(cond, pos, mneg):
 			"if " + ruScExp2s(cond) + " {\n" + strIndent(ruScComm2s(pos)) + "\n}" + 
 			eitherMap(mneg, \neg -> " else {\n" + strIndent(ruScComm2s(neg)) + "\n}", "");
@@ -694,26 +691,93 @@ ruScAccessLval2s(a : ScAccessLval) -> string {
 }
 
 ruScExp2s(e : ScExp) -> string {
+	too_long = \s -> strContains(s, "\n") || strlen(s) > 64;
 	switch (e) {
-		ScInfixOp(ex, args): 
-			"(" + ruScExp2s(ex) + concatStrings(map(args, \arg -> " " + arg.op + " " + ruScExp2s(arg.exp))) + ")";
+		ScInfixOp(ex, args): {
+			arg_strs = map(concat([ex], map(args, \arg -> arg.exp)), ruScExp2s);
+			short = strGlue(arg_strs,  " " + args[0].op + " ");
+			if (!too_long(short)) {
+				"(" + short + ")";
+			} else {
+				"(\n" + strIndent(strGlue(arg_strs, args[0].op + "\n")) + "\n)";
+			}
+		}
 		ScPrefixOp(op, ex): op + ruScExp2s(ex);
-		ScCall(fn, args): 
-			ruScExp2s(fn) + "(" + strGlue(map(args, ruScExp2s),", ") + ")";
-		ScCond(cond, pos, neg): 
-			"(" + ruScExp2s(cond) + "?" + ruScExp2s(pos) + ":" + ruScExp2s(neg) + ")";
-		ScIndex(ex, ind): 
+		ScCall(fn, args): {
+			fn_str = ruScExp2s(fn);
+			arg_strs = map(args, ruScExp2s);
+			short_args = strGlue(map(args, ruScExp2s),", ");
+			if (!too_long(short_args)) {
+				fn_str + "(" + short_args + ")";
+			} else {
+				fn_str + "(\n" + strIndent(strGlue(map(args, ruScExp2s),",\n")) + "\n)";
+			}
+		}
+		ScCond(cond, pos, neg): {
+			cond_str = ruScExp2s(cond);
+			pos_str = ruScExp2s(pos);
+			neg_str = ruScExp2s(neg);
+			if (!too_long(cond_str)) {
+				if (!too_long(pos_str) && !too_long(neg_str)) {
+					"(" + ruScExp2s(cond) + "?" + ruScExp2s(pos) + ":" + ruScExp2s(neg) + ")";
+				} else {
+					"(" + ruScExp2s(cond) + "?\n" + strIndent(ruScExp2s(pos)) + ":\n" + strIndent(ruScExp2s(neg)) + "\n)";
+				}
+			} else {
+				if (!too_long(pos_str) && !too_long(neg_str)) {
+					"(\n" + strIndent(ruScExp2s(cond)) + "\n?" + ruScExp2s(pos) + ":" + ruScExp2s(neg) + ")";
+				} else {
+					"(\n" + strIndent(ruScExp2s(cond)) + "\n?\n" + strIndent(ruScExp2s(pos)) + ":\n" + strIndent(ruScExp2s(neg)) + "\n)";
+				}
+			}
+		}
+		ScLet(var, ex, scope): {
+			ex_str = ruScExp2s(ex);
+			if (!too_long(ex_str)) {
+				"let " + var + " = " + ex_str + ";\n" + ruScExp2s(scope);
+			} else {
+				"let " + var + " = \n" + strIndent(ex_str) + "\n;\n" + ruScExp2s(scope);
+			}
+		}
+		ScIndex(ex, ind): {
 			ruScExp2s(ex) + "[" + ruScExp2s(ind) + "]";
-		ScLambda(args, body): 
-			"\\" + strGlue(args, ", ") + "->" + ruScExp2s(body);
-		ScArray(arr):
-			"[" + superglue(arr, ruScExp2s, ", ") + "]";
+		}
+		ScLambda(args, body): {
+			body_str = ruScExp2s(body);
+			if (!too_long(body_str)) {
+				"\\" + strGlue(args, ", ") + " -> " + ruScExp2s(body);
+			} else {
+				"\\" + strGlue(args, ", ") + " ->\n" + strIndent(ruScExp2s(body));
+			}
+		}
+		ScArray(arr): {
+			arr_strs = map(arr, ruScExp2s);
+			short = strGlue(arr_strs,  ", ");
+			if (!too_long(short)) {
+				"[" + superglue(arr, ruScExp2s, ", ") + "]";
+			} else {
+				"[\n" + strIndent(superglue(arr, ruScExp2s, ",\n")) + "\n]";
+			}
+		}
 		ScField(ex, field): 
 			ruScExp2s(ex) + "." + field;
-		ScStruct(name, args): 
-			name + "(" + strGlue(map(args, ruScExp2s),", ") + ")";
-		ScMap(pairs): 
-			"{" + superglue(pairs, \p -> ruScExp2s(p.first) + "=" + ruScExp2s(p.second), ", ") + "}";
+		ScStruct(name, args): {
+			arg_strs = map(args, ruScExp2s);
+			short_args = strGlue(map(args, ruScExp2s),", ");
+			if (!too_long(short_args)) {
+				name + "(" + short_args + ")";
+			} else {
+				name + "(\n" + strIndent(strGlue(map(args, ruScExp2s),",\n")) + "\n)";
+			}
+		}
+		ScMap(pairs): {
+			pairs_str = superglue(pairs, \p -> ruScExp2s(p.first) + "=" + ruScExp2s(p.second), ", ");
+			if (!too_long(pairs_str)) {
+				"{" + pairs_str + "}";
+			} else {
+				"{\n" + strIndent(superglue(pairs, \p -> ruScExp2s(p.first) + "=" + ruScExp2s(p.second), ",\n")) + "\n}";
+			}
+		}
 		ScUndefConst():     "undef";
 		ScBoolConst(val):   b2s(val);
 		ScIntConst(val):    i2s(val);
@@ -731,7 +795,6 @@ ruDoScCommTasks(acc : [ScTask], s : ScComm) -> [ScTask] {
 	switch (s) {
 		ScSeq(seq):               fold(seq, acc, ruDoScCommTasks);
 		ScAssign(__,__):          acc;
-		ScLet(__,__,__):          acc;
 		ScIf(cond, pos, mneg):    {
 			switch (mneg) {
 				None():           ruDoScCommTasks(acc, pos);
@@ -750,7 +813,6 @@ ruScCommSetTasksFile(script : ScComm, file : string) -> ScComm {
 	switch (script) {
 		ScSeq(seq):               ScSeq(map(seq, set_file));
 		ScAssign(__,__):          script;
-		ScLet(__,__,__):          script;
 		ScIf(cond, pos, neg):     ScIf(cond, set_file(pos), maybeMap(neg, set_file));
 		ScWhile(cond, s):         ScWhile(cond, set_file(s));
 		ScOutput(__,__):          script;
@@ -799,7 +861,6 @@ ruSetScCommTaskArg(script : ScComm, key : string, val : string) -> ScComm {
 	switch (script) {
 		ScSeq(seq):            ScSeq(map(seq, rec_set));
 		ScAssign(__,__):       script;
-		ScLet(__,__,__):       script;
 		ScIf(cond, pos, neg):  ScIf(cond, rec_set(pos), maybeMap(neg, rec_set));
 		ScWhile(cond, s):      ScWhile(cond, rec_set(s));
 		ScOutput(__,__):       script;
@@ -817,6 +878,8 @@ ruScExpVars(acc : Set<string>, e : ScExp) -> Set<string> {
 			fold(args, ruScExpVars(acc, fn), ruScExpVars);
 		ScCond(cond, pos, neg): 
 			fold([cond, pos, neg], acc, ruScExpVars);
+		ScLet(var, ex, scope):
+			removeSet(ruScExpVars(acc, scope), var);
 		ScIndex(ex, ind):
 			ruScExpVars(ruScExpVars(acc, ex), ind);
 		ScLambda(args, body):
