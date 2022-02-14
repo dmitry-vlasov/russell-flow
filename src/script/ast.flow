@@ -6,8 +6,8 @@ import base/util/str;
 export {
 	ScCommWDocs(comm : ScComm, docs : string);
 
-	ScComm ::= ScSeq, ScAssign, ScIf, ScWhile, ScOutput, ScTask, ScAction;
-		ScSeq(seq : [ScComm]);
+	ScComm ::= ScCommSeq, ScAssign, ScIf, ScWhile, ScOutput, ScTask, ScAction;
+		ScCommSeq(seq : [ScComm]);
 		ScAssign(var : ScVar, exp : ScExp);
 		ScIf(cond : ScExp, pos : ScComm, neg : Maybe<ScComm>);
 		ScWhile(cond : ScExp, script : ScComm);
@@ -22,7 +22,7 @@ export {
 
 	ScExp ::= 
 		ScInfixOp, ScPrefixOp, ScCall, ScCond, ScLet, ScIndex, ScLambda, ScArray, ScMap, ScField, ScStruct,
-		ScUndefConst, ScBoolConst, ScIntConst, ScDoubleConst, ScStringConst, ScVar;
+		ScUndefConst, ScBoolConst, ScIntConst, ScDoubleConst, ScStringConst, ScVar, ScExpSeq;
 		// general
 		ScInfixOp(exp : ScExp, args : [ScInfixArg]);
 			ScInfixArg(op : string, exp : ScExp);
@@ -46,6 +46,7 @@ export {
 		ScDoubleConst(val : double);
 		ScStringConst(val : string);
 		ScVar(var : string, access : ScAccessLval);
+		ScExpSeq(seq : [ScExp]);
 
 	ruParseScComm(str : string) -> Maybe<ScCommWDocs>;
 	ruScComm2Json(script : ScComm) -> Json;
@@ -127,7 +128,7 @@ ru_script_parser = compilePegGrammar("#include script/script.lingo");
 ru_script_actions = SemanticActions(mergeTree(defaultPegActions.t, 
 	pairs2tree([
 		Pair("makeScTask", ruMakeScTask),
-		Pair("makeScript", \s -> if (length(s[0]) == 1) s[0][0] else ScSeq(s[0]))
+		Pair("makeScript", \s -> if (length(s[0]) == 1) s[0][0] else ScCommSeq(s[0]))
 	])
 ));
 
@@ -152,9 +153,9 @@ ruParseScComm(str : string) -> Maybe<ScCommWDocs> {
 
 ruScComm2Json(j : ScComm) -> Json {
 	switch (j) {
-		ScSeq(seq): {
+		ScCommSeq(seq): {
 			JsonObject([
-				Pair("struct", JsonString("ScSeq")),
+				Pair("struct", JsonString("ScCommSeq")),
 				Pair("seq", JsonArray(map(seq, ruScComm2Json)))
 			]);
 		}
@@ -358,6 +359,12 @@ ruScExp2Json(e : ScExp) -> Json {
 				Pair("access", ruScAccessLval2Json(access))
 			]);
 		}
+		ScExpSeq(seq): {
+			JsonObject([
+				Pair("struct", JsonString("ScExpSeq")),
+				Pair("seq", JsonArray(map(seq, ruScExp2Json))),
+			]);
+		}
 	}
 }
 
@@ -391,11 +398,11 @@ ruJson2ScAccessLval(json : Json) -> Maybe<ScAccessLval> {
 ruJson2ScComm(json : Json) -> Maybe<ScComm> {
 	struct = getJsonStringField(json, "struct", "");
 	if (struct == "") None() else
-	if (struct == "ScSeq") {
+	if (struct == "ScCommSeq") {
 		json_seq = getJsonArrayField(json, "seq");
 		seq = filtermap(json_seq, ruJson2ScComm);
 		if (length(json_seq) == length(seq)) {
-			Some(ScSeq(seq));
+			Some(ScCommSeq(seq));
 		} else {
 			None();
 		}
@@ -646,6 +653,17 @@ ruJson2ScExp(json : Json) -> Maybe<ScExp> {
 				ScVar(var, access)
 			);
 		} 
+	} else 
+	if (struct == "ScExpSeq") {
+		if (!jsonObjectHasField(json, "seq")) None() else {
+			seq_json = getJsonArrayField(json, "seq");
+			seq = filtermap(seq_json, ruJson2ScExp);
+			if (length(seq) == length(seq_json)) {
+				Some(ScExpSeq(seq));
+			} else {
+				None();
+			}
+		}
 	} else {
 		None();
 	}
@@ -653,7 +671,7 @@ ruJson2ScExp(json : Json) -> Maybe<ScExp> {
 
 ruScComm2s(s : ScComm) -> string {
 	switch (s) {
-		ScSeq(seq):
+		ScCommSeq(seq):
 			strGlue(map(seq, ruScComm2s), "\n");
 		ScAssign(var, val): ruScExp2s(var) + " := " + ruScExp2s(val) + ";";
 		ScIf(cond, pos, mneg):
@@ -775,6 +793,9 @@ ruScExp2s(e : ScExp) -> string {
 		ScDoubleConst(val): d2s(val);
 		ScStringConst(val): "\"" + val + "\"";
 		ScVar(var, access): var + ruScAccessLval2s(access);
+		ScExpSeq(seq): {
+			"{\n" + strIndent(strGlue(map(seq, ruScExp2s),";\n")) + "\n}";
+		}
 	}
 }
 
@@ -784,7 +805,7 @@ ruScCommTasks(s : ScComm) -> [ScTask] {
 
 ruDoScCommTasks(acc : [ScTask], s : ScComm) -> [ScTask] {
 	switch (s) {
-		ScSeq(seq):               fold(seq, acc, ruDoScCommTasks);
+		ScCommSeq(seq):               fold(seq, acc, ruDoScCommTasks);
 		ScAssign(__,__):          acc;
 		ScIf(cond, pos, mneg):    {
 			switch (mneg) {
@@ -802,7 +823,7 @@ ruDoScCommTasks(acc : [ScTask], s : ScComm) -> [ScTask] {
 ruScCommSetTasksFile(script : ScComm, file : string) -> ScComm {
 	set_file = \s -> ruScCommSetTasksFile(s, file);
 	switch (script) {
-		ScSeq(seq):               ScSeq(map(seq, set_file));
+		ScCommSeq(seq):               ScCommSeq(map(seq, set_file));
 		ScAssign(__,__):          script;
 		ScIf(cond, pos, neg):     ScIf(cond, set_file(pos), maybeMap(neg, set_file));
 		ScWhile(cond, s):         ScWhile(cond, set_file(s));
@@ -850,7 +871,7 @@ ruSetNoLogging(task : ScTask) -> ScTask {
 ruSetScCommTaskArg(script : ScComm, key : string, val : string) -> ScComm {
 	rec_set = \s -> ruSetScCommTaskArg(s, key, val);
 	switch (script) {
-		ScSeq(seq):            ScSeq(map(seq, rec_set));
+		ScCommSeq(seq):            ScCommSeq(map(seq, rec_set));
 		ScAssign(__,__):       script;
 		ScIf(cond, pos, neg):  ScIf(cond, rec_set(pos), maybeMap(neg, rec_set));
 		ScWhile(cond, s):      ScWhile(cond, rec_set(s));
@@ -889,5 +910,6 @@ ruScExpVars(acc : Set<string>, e : ScExp) -> Set<string> {
 		ScDoubleConst(val): acc;
 		ScStringConst(val): acc;
 		ScVar(var,__):      insertSet(acc, var);
+		ScExpSeq(seq):      fold(seq, acc ,ruScExpVars);
 	}
 }
