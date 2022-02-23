@@ -22,13 +22,15 @@ ruUpdateStateConf(state : RuState, file : string) -> RuState {
 }
 
 ruApplyScriptVars(s : string, vars : Tree<string, flow>, conf : RuConf) -> string {
-	vars_subst = fold(tree2pairs(vars), [], \acc, kv -> 
-		concat(acc, ["$" + kv.first, ruScValue2s(kv.second)])
-	);
-	conf_subst = foldTree(ruConf2Tree(conf), vars_subst, \k, v, acc -> 
-		concat(acc, ["$" + k, v])
-	);
-	strReplaces(s, conf_subst);
+	if (!strContains(s, "$")) s else {
+		vars_subst = fold(tree2pairs(vars), [], \acc, kv -> 
+			concat(acc, ["$" + kv.first, ruScValue2s(kv.second)])
+		);
+		conf_subst = foldTree(ruConf2Tree(conf), vars_subst, \k, v, acc -> 
+			concat(acc, ["$" + k, v])
+		);
+		strReplaces(s, conf_subst);
+	}
 }
 
 ruCheckCommandArgs(task : RuTask, command : RuCommInfo, out : RuOut) -> bool {
@@ -62,23 +64,25 @@ ruAddCommandDefaults(task : RuTask, command : RuCommInfo, conf : RuConf) -> RuTa
 
 ruEvalTaskArgs(task : RuTask, state : RuState) -> RuTask {
 	conf = state.conf;
+	apply = \v, vars -> if (runtimeValueType(v) != "string") v else {
+		ruApplyScriptVars(cast(v : flow -> string), vars, conf);
+	}
 	args_evaled_1 = foldTree(task.args, makeTree(), \name, value, acc -> 
-		setTree(acc,
-			ruApplyScriptVars(name, state.vars, conf), 
-			if (runtimeValueType(value) != "string") value else {
-				ruApplyScriptVars(cast(value : flow -> string), state.vars, conf);
-			}
+		setTree(acc, 
+			ruApplyScriptVars(name, state.vars, conf),	
+			apply(value, state.vars)
 		)
 	);
-	all_vars = mergeTree(state.vars, args_evaled_1);
-	args_evaled_2 = foldTree(args_evaled_1, makeTree(), \name, value, acc -> 
-		setTree(acc,
-			ruApplyScriptVars(name, all_vars, conf), 
-			if (runtimeValueType(value) != "string") value else {
-				ruApplyScriptVars(cast(value : flow -> string), all_vars, conf);
-			}
-		)
-	);
+	all_vars = mergeTree(args_evaled_1, state.vars);
+	args_evaled_2 = foldTree(args_evaled_1, makeTree(), \name, value, acc -> {
+		key = ruApplyScriptVars(name, all_vars, conf);
+		value_str = if (runtimeValueType(value) == "string") cast(value : flow -> string) else "";
+		val = switch(lookupTree(all_vars, value_str)) {
+			Some(v): apply(v, all_vars);
+			None(): apply(value, all_vars);
+		}
+		setTree(acc, key, val);
+	});
 	RuTask(task with args = args_evaled_2);
 }
 
@@ -92,20 +96,49 @@ ruMakeAutofileTasks(task : RuTask, comm : RuCommInfo, conf : RuConf) -> [RuTask]
 	}
 }
 
+debugPrintInfo_total(header : string,  vars : Tree<string, flow>) -> void {
+	switch (lookupTree(vars, "info_total")) {
+		Some(v): {
+			println(header + ") Var info_total: " + ruScValue2s(v) + " of type " + runtimeValueType(v));
+		}
+		None(): {
+			println(header + ") No var: info_total");
+		}
+	}
+}
+
+debugPrintVars(header : string, vars : Tree<string, flow>) -> void {
+	println(header + ":\n" + 
+		strIndent(strGlue(
+			map(tree2pairs(vars), \arg -> arg.first + "=" + ruScValue2s(arg.second)), 
+			"\n")
+		)
+	);
+}
+
 ruRun(unit : RuUnit, run : (RuUnit) -> RuState, info : RuCommInfo) -> RuState {
 	out = if (!info.autoindent) unit.out else ruIndentOut(unit.out);
 	state = unit.state;
 	conf = state.conf;
+	//debugPrintInfo_total("A", state.vars);
+	//println("ruRun: conf:\n" + strIndent(ruConf2s(conf)));
 	t0 = ruAddCommandDefaults(unit.task, info, conf);
 	fold(ruMakeAutofileTasks(t0, info, conf), state,  \s0, t1 -> {
 			t = ruEvalTaskArgs(t1, s0);
+			//debugPrintVars("t.args", t.args);
+			//debugPrintVars("s0.vars", s0.vars);
 			s = RuState(s0 with 
 				vars = mergeTree(s0.vars, 
-					mapTree(t.args, \str -> 
-						ruApplyScriptVars(str, s0.vars, s0.conf)
+					mapTree(t.args, \val ->
+						if (runtimeValueType(val) == "string") {
+							flow(ruApplyScriptVars(cast(val : flow -> string), s0.vars, s0.conf));
+						} else {
+							val;
+						}
 					)
 				)
 			);
+			//debugPrintInfo_total("B", s.vars);
 			if (!ruCheckCommandArgs(t, info, out)) s else {
 				timer = ruMakeTimer();
 				log_task = ruTaskIsLogging(t);
