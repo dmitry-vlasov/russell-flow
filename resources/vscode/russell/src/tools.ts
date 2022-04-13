@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as fs from 'fs';
 import { spawn, ChildProcess, spawnSync } from 'child_process';
 
 export function run_cmd(cmd: string, wd: string, args: string[], on_out: (string) => void): ChildProcess {
@@ -83,4 +84,13 @@ export function num2memory(mem: number): string {
 	if (mem < 1024) {
 		return Math.round(mem) + " Gb";
 	}
+}
+
+// Log file for low-level debugging
+const hard_log_file = '/home/dmitry/dev/russell-flow/log/fuck.txt';
+
+export function hardlog(msg : string): void {
+	const log = fs.readFileSync(hard_log_file,'utf8');
+	const new_log = log + "\n" + msg;
+	fs.writeFileSync(hard_log_file, new_log);
 }

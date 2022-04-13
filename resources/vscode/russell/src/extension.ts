@@ -298,7 +298,7 @@ function showHttpServerIsLaunching() {
 }
 
 // this method is called when your extension is deactivated
-export function deactivate() {
+export function deactivate(): Thenable<void> | undefined {
 	// First, shutdown Russell server, if it is owned by current vscode instance
 	if (httpServer) {
 		tools.shutdownHttpServer().on("exit", (code, msg) => {
@@ -309,16 +309,19 @@ export function deactivate() {
 		});
 	}
     if (client) {
-		client.sendRequest("shutdown").then(
+		return client.sendRequest("shutdown").then(
 			(data : any) => {
 				client.sendNotification("exit");
-				client.stop();
+				return client.stop();
 			},
 			(err : any) => {
 				vscode.window.showErrorMessage("error while shutting down: " + err);
+				return client.stop();
 			}
 		);
-    }
+    } else {
+		return undefined;
+	}
 }
 
 function processRussellFile<T>(uri : vscode.Uri, action : string): Promise<T> {
@@ -354,7 +357,6 @@ function verifyMetamath(uri : vscode.Uri): void {
 	let mm_file = ru_file.substr(0, ru_file.lastIndexOf(".")) + ".mm";
 	client.sendRequest("workspace/executeCommand", verifyMetamath(uri));
 }
-
 
 function generalizeFile(uri : vscode.Uri): void {
 	processRussellFile(uri, "generalize").then(
