@@ -17,6 +17,7 @@ const isPortReachable = require('is-port-reachable');
 
 let client: LanguageClient = null;
 let russellChannel: vscode.OutputChannel = null;
+let lspChannel: vscode.OutputChannel = null;
 let serverChannel: vscode.OutputChannel = null;
 let serverStatusBarItem: vscode.StatusBarItem;
 let httpServer: ChildProcess;
@@ -28,6 +29,7 @@ export function activate(context: vscode.ExtensionContext) {
 	serverStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
 	serverStatusBarItem.command = 'russell.toggleHttpServer';
 	russellChannel = vscode.window.createOutputChannel("Russell output");
+	updateLSPchannel();
 	const reg_comm = (name: string, fn: any) => vscode.commands.registerCommand(name, fn);
 	context.subscriptions.push(
 		serverStatusBarItem,
@@ -49,6 +51,7 @@ export function activate(context: vscode.ExtensionContext) {
 		reg_comm('russell.refreshOntology', mathOntology),
 		reg_comm('russell.prover-expand-prop', (node: prover.NodeEntity) => proverProvider.expandProp(node)),
 		reg_comm('russell.prover-start', () => proverProvider.startProving()),
+		vscode.workspace.onDidChangeConfiguration(handleConfigurationUpdates(context)),
 	);
 	checkHttpServerStatus(true);
 	setInterval(checkHttpServerStatus, 3000, false);
@@ -183,7 +186,7 @@ function startLspClient() {
 	let clientOptions: LanguageClientOptions = {
 		// Register the server for plain text documents
 		documentSelector: [{scheme: 'file', language: 'russell'}],
-		outputChannel: russellChannel,
+		outputChannel: lspChannel,
 		revealOutputChannelOn: RevealOutputChannelOn.Info,
 		uriConverters: {
 			// FIXME: by default the URI sent over the protocol will be percent encoded (see rfc3986#section-2.1)
@@ -210,6 +213,23 @@ function startLspClient() {
 			);
 		}
 	);
+}
+
+function updateLSPchannel() {
+	const trace_server = vscode.workspace.getConfiguration("russell").get("trace.server");
+	if (trace_server != "off") {
+		lspChannel = russellChannel = vscode.window.createOutputChannel("Russell LSP");
+	} else {
+		lspChannel = null;
+	}
+}
+
+function handleConfigurationUpdates(context) {
+    return (e) => {
+        if (e.affectsConfiguration("russell.trace.server")) {
+            updateLSPchannel();
+        }
+    }
 }
 
 function checkHttpServerStatus(initial: boolean) {
