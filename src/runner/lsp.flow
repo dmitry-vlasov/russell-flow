@@ -10,6 +10,7 @@ export {
 
 ruLspServer(env : RuEnv) -> void { 
 	ruLspServerLog("Server started.", env.conf);
+	//ruSetDebugOut();
 	ruRunLspServer(env);
 }
 
@@ -23,46 +24,45 @@ RuLspServerState(
 	mutable clientConf : Json,
 	mutable currId : int,
 	mutable requests : Tree<Json, RuLspServerRequest>,
+	mutable responded : Set<Json>,
 	mutable state : int // 0 - working, 1 - shutdown, 2 - exit
 );
 
-ruLspServerState = RuLspServerState(JsonNull(), 1, makeTree(), 0);
+ruLspServerState = RuLspServerState(JsonNull(), 1, makeTree(), makeSet(), 0);
 
 ruRunLspRequest(uuid : string, id : Json, method : RuLspMethod, params : Json, log_message : bool, env : RuEnv) -> void {
 	script = ruSetScCommTaskArg(method.request2script(params, env), "lsp", "1");
 	timer = ruMakeTimer();
+	conf = env.conf;
 	data = ref "";
 	errs = ref [];
 	out = RuOut(
-		\msg -> if (msg != "") ruLspWriteNotification("console/message", JsonString(msg)),
-		\str -> if (str != "") data := str,
+		\msg -> if (msg != "") ruLspWriteNotification("console/message", JsonString(msg), log_message, env.conf),
+		\str -> if (str != "") data := ^data + str,
 		\err, __ -> refArrayPush(errs, err)
 	);
 	ruProcess(uuid, script, 
 		\code -> {
+			insertSet(ruLspServerState.responded, id);
 			if (method.responses) {
 				if (length(^errs) == 0) {
 					if (^data != "") {
-						ruLspWriteResponse(id, parseJsonSafe(^data));
+						switch (parseJsonSafer(^data)) {
+							Some(json): {
+								ruLspWriteResponse(id, json, log_message, conf);
+							}
+							None(): {
+								ruLspWriteError(id, -1, "error while parsing json: " + ^data, JsonString(^data), conf);
+							}
+						}
 					} else {
-						ruLspWriteResponse(id, JsonNull());
+						ruLspWriteResponse(id, JsonNull(), log_message, conf);
 					}
 				} else {
-					ruLspWriteError(id, code, strGlue(^errs, ", "), JsonArray(map(^errs, \err -> JsonString(err))));
+					ruLspWriteError(id, code, strGlue(^errs, ", "), JsonArray(map(^errs, \err -> JsonString(err))), conf);
 				}
 			}
-			method.callback(uuid);
-			if (log_message) {
-				ruLspServerLog(blueprint("<%uuid%> [%time%] Request completed %state% %data% %errors%", 
-					[
-						"uuid", uuid, 
-						"time", ruTimePassed2s(timer),
-						"state", if (ruLspServerState.state == 0) "" else "shutdown state: " + i2s(ruLspServerState.state),
-						"data", if (^data == "") "" else "data: [" + ruCutLongString(ruServerEscapeString(^data)) + "]",
-						"errors", if (length(^errs) == 0) "" else "errors: [" + strGlue(^errs, ", ") + "]"
-					]
-				), env.conf);
-			}
+			method.callback(uuid, env);
 		},
 		RuEnv(env.conf, out)
 	);
@@ -73,56 +73,36 @@ ruRunLspNotification(uuid : string, method : RuLspMethod, params : Json, log_mes
 	timer = ruMakeTimer();
 	errs = ref [];
 	out = RuOut(
-		\msg -> if (msg != "") ruLspWriteNotification("console/message", JsonString(msg)),
+		\msg -> if (msg != "") ruLspWriteNotification("console/message", JsonString(msg), true, env.conf),
 		nop1,
 		\err, __ -> refArrayPush(errs, err)
 	);
 	ruProcess(uuid, script, 
-		\code -> {
-			method.callback(uuid);
-			if (log_message) {
-				ruLspServerLog(blueprint("<%uuid%> [%time%] Notification completed %state% %errors%", 
-					[
-						"uuid", uuid, 
-						"time", ruTimePassed2s(timer),
-						"state", if (ruLspServerState.state == 0) "" else "shutdown state: " + i2s(ruLspServerState.state),
-						"errors", if (length(^errs) == 0) "" else "errors: [" + strGlue(^errs, ", ") + "]"
-					]
-				), env.conf);
-			}
-		},
+		\code -> method.callback(uuid, env),
 		RuEnv(env.conf, out)
 	);
 }
 
 ruRunLspServer(env : RuEnv) -> void {
 	conf = env.conf;
-	switch (ruLspReadMessage(env)) {
+	switch (ruLspReadMessage(env, conf)) {
 		Some(m): {
 			// Special watermark for non-logging
 			uuid = ruMakeUuid();
 			log_message = !strContains(m.raw, "do_not_log_this");
-			if (log_message) {
-				ruLspServerLog(blueprint("<%uuid%> Received message: %body%", 
-					[
-						"uuid", uuid, 
-						"body", ruCutLongString(ruServerEscapeString(m.raw))
-					]
-				), conf);
-			}
 			message = m.message;
 			switch (message) {
 				LspRequestMessage(__, id, method, params): {
 					if (ruLspServerState.state > 0 && method != "exit") {
-						ruLspServerLog("Error: server is shutdown, but received a request: " + m.raw, env.conf);
+						ruLspServerLog("Error: server is shutdown, but received a request: " + m.raw, conf);
 					}
 					switch (lookupTree(ruLspMethods, method)) {
 						Some(meth): {
 							ruRunLspRequest(uuid, id, meth, params, log_message, env);
 						}
 						None(): {
-							ruLspWriteError(id, 1, "request method '" + method + "' is not found", JsonNull());
-							ruLspServerLog("request method '" + method + "'' is not found", conf);
+							ruLspWriteError(id, 1, "request method '" + method + "' is not found", JsonNull(), conf);
+							//ruLspServerLog("request method '" + method + "'' is not found", conf);
 						}
 					}
 				}
@@ -161,9 +141,7 @@ ruRunLspServer(env : RuEnv) -> void {
 				}
 			}
 		}
-		None(): {
-			ruLspServerLog("Failed to read a request.", conf);
-		}
+		None(): { }
 	}
 	if (ruLspServerState.state < 2) {
 		ruRunLspServer(env);
@@ -180,14 +158,14 @@ ruRunLspServer(env : RuEnv) -> void {
 	}
 }
 
-ruMakeServerRequest(uuid : string, method : string, params : Json, callback : (LspResponseMessage) -> void) -> void {
+ruMakeServerRequest(uuid : string, method : string, params : Json, callback : (LspResponseMessage) -> void, conf : RuConf) -> void {
 	id = JsonDouble(i2d(ruLspServerState.currId));
 	request = LspRequestMessage("2.0", id, method, params);
 	ruLspServerState.requests ::= setTree(ruLspServerState.requests, request.id, 
 		RuLspServerRequest(uuid, request, callback)
 	);
 	ruLspServerState.currId ::= ruLspServerState.currId + 1;
-	ruLspWriteRequest(id, method, params);
+	ruLspWriteRequest(id, method, params, true, conf);
 }
 
 ruExecuteCommandOptions = JsonObject([
@@ -236,21 +214,20 @@ ruLspInitialize(json : Json, env : RuEnv) -> ScComm {
 	)));
 }
 
-ruInitializedCallback(uuid : string) -> void {
+ruInitializedCallback(uuid : string, env : RuEnv) -> void {
 	if (getJsonBoolField(getJsonNestedField(ruLspServerState.clientConf, ["capabilities", "workspace", "didChangeConfiguration"]), "dynamicRegistration", false)) {
 		params = lspRegistrationParams2Json(LspRegistrationParams([
 			LspRegistration(makeUuid(), "textDocument/didChange", 
 				lspTextDocumentChangeRegistrationOptions2Json(
 					LspTextDocumentChangeRegistrationOptions([LspDocumentFilter("flow", "file", "*.{flow}")], 1)
 				)
-			),
-			//LspRegistration(makeUuid(), "workspace/executeCommand", ruExecuteCommandOptions)
+			)
 		]));
-		ruMakeServerRequest(uuid, "client/registerCapability", params, nop1);
+		ruMakeServerRequest(uuid, "client/registerCapability", params, nop1, env.conf);
 	}
 }
 
-ruLspShutdown(uuid : string) -> void {
+ruLspShutdown(uuid : string, env : RuEnv) -> void {
 	ruLspServerState.clientConf ::= JsonNull();
 	ruLspServerState.currId ::= 1;
 	ruLspServerState.requests ::= makeTree();
@@ -258,21 +235,38 @@ ruLspShutdown(uuid : string) -> void {
 	ruLspServerState.state ::= 1;
 }
 
-ruLspExit(uuid : string) -> void {
+ruLspExit(uuid : string, env : RuEnv) -> void {
 	ruLspServerState.state ::= 2;
 }
 
+ruLspCancelRequest(json : Json, env : RuEnv) -> ScComm {
+	switch (json2LspCancelParams(json)) {
+		Some(params): {
+			if (containsSet(ruLspServerState.responded, params.id)) {
+				// do nothing
+			} else {
+				env.out.onError("request with id = '" + json2string(params.id) + "' is canceled", []);
+			}
+		}
+		None(): {
+			ruCrash("expecting the LspCancelParams, got: " + json2string(json));
+		}
+	}
+	ScAction("stop", []);
+}
+
 ruLspInitMethods = pairs2tree([
-	Pair("initialize", RuLspMethod(ruLspInitialize, true, nop1)),
+	Pair("initialize", RuLspMethod(ruLspInitialize, true, nop2, true)),
 	Pair("initialized", RuLspMethod(
-		\__,__ -> ScAction("stop", []), false, ruInitializedCallback
+		\__,__ -> ScAction("stop", []), false, ruInitializedCallback, true
 	)),
 	Pair("shutdown", RuLspMethod(
-		\__,__ -> ScAction("stop", []), true, ruLspShutdown
+		\__,__ -> ScAction("stop", []), true, ruLspShutdown, false
 	)),
 	Pair("exit", RuLspMethod(
-		\__,__ -> ScAction("stop", []), false, ruLspExit
+		\__,__ -> ScAction("stop", []), false, ruLspExit, false
 	)),
+	Pair("$/cancelRequest", RuLspMethod(ruLspCancelRequest, false, nop2, false))
 ]);
 
 ruLspMethods = mergeTree(

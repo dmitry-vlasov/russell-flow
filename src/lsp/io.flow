@@ -1,25 +1,53 @@
 import text/utf8;
-import formats/json/json;
+import formats/json/json_parse;
 import sys/system;
+import base/log;
 
 export {
-	RuLspRawMessage(
-		raw : string,                  // the whole message raw string
-		header : Tree<string, string>, // All key-value pairs from a header of a message
-		json : string                  // the Json description of request as a string
+	RuLspRawHeader(
+		raw : string, // the whole header raw string
+		fields : Tree<string, string> // All key-value pairs from a header of a message
 	);
-	ruLspReadRawMessage() -> Maybe<RuLspRawMessage>;
+	RuLspRaw ::= RuLspRawError, RuLspRawMessage;
+	RuLspRawError(
+		header : string,
+		content : string
+	);
+	RuLspRawMessage(
+		raw : string, // the whole message raw string
+		header : RuLspRawHeader, 
+		content : Json  // the Json description of request as a string
+	);
+	ruLspReadRawMessage(conf : RuConf) -> RuLspRaw;
 
-	ruLspWriteJson(json : Json) -> void;
+	ruLspWriteJson(json : Json, log : bool, conf : RuConf) -> void;
+
+	native ruPrinted : io () -> string = Native.printed;
+	native ruSetDebugOut : io () -> void = Native.setDebugOut;
 }
 
-ruLspReadRawMessage() -> Maybe<RuLspRawMessage> {
-	header = readUntil("\r\n\r\n"); // \r\n\r\n is included into header
-	lines = filtermap(strSplit(header, "\n"), \line -> {
+ruLspReadRawMessage(conf : RuConf) -> RuLspRaw {
+	header = ruLspDecodeRawHeader(readUntil("\r\n\r\n")); // \r\n\r\n is included into header
+	raw = ruLspDecodeRawMessage(header);
+	switch (raw) {
+		RuLspRawError(head, content): {
+			ruLspServerLog("Error while reading:\n" + head + content, conf);
+		}
+		RuLspRawMessage(msg,__, content): {
+			if (!strContains(msg, "do_not_log_this")) {
+				ruLspServerLog("Read: " + ruJson2sketch(content), conf);
+			}
+		}
+	}
+	raw;
+}
+
+ruLspDecodeRawHeader(raw : string) -> RuLspRawHeader {
+	lines = filtermap(strSplit(raw, "\n"), \line -> {
 		trimmed = trim2(line, " \r\n\t");
 		if (trimmed != "") Some(line) else None();
 	});
-	key_value = pairs2tree(map(lines, \line -> {
+	fields = pairs2tree(map(lines, \line -> {
 			key_val = strSplit(line, ":");
 			if (length(key_val) == 1) {
 				Pair(line, line);
@@ -27,23 +55,59 @@ ruLspReadRawMessage() -> Maybe<RuLspRawMessage> {
 				Pair(trim2(key_val[0], " \t\n\r"), trim2(key_val[1], " \t\n\r"));
 			}
 	}));
-	switch (lookupTree(key_value, "Content-Length")) {
+	RuLspRawHeader(raw, fields);
+}
+
+ruLspDecodeRawMessage(header : RuLspRawHeader) -> RuLspRaw {
+	switch (lookupTree(header.fields, "Content-Length")) {
 		Some(len): {
-			json = readBytes(s2i(len));
-			Some(RuLspRawMessage(
-				header + json,
-				//s2i(len), 
-				//lookupTreeDef(key_value, "Content-Type", ""),
-				key_value,
-				json
-			));
+			raw = readBytes(s2i(len));
+			switch (parseJsonSafer(raw)) {
+				Some(json): RuLspRawMessage(raw, header, json);
+				None(): RuLspRawError(header.raw, raw);
+			}
 		}
-		None(): None();
+		None(): {
+			RuLspRawError(header.raw, "");
+		}
 	}
 }
 
-ruLspWriteJson(json : Json) -> void {
+ruLspWriteJson(json : Json, log : bool, conf : RuConf) -> void {
+	if (log) {
+		ruLspServerLog("Sent: " + ruJson2sketch(json), conf);
+	}
 	js_out = json2string(json);
 	js_len = strlen(expandUtf8(js_out));
 	print("Content-Length: " + i2s(js_len) + "\r\n\r\n" + js_out);
+	/*printed = ruPrinted();
+	ruDebugLog("Printed:\n-----------------------\n" + ruCutLongString(printed) + "\n-----------------\n");
+	raw_header = takeBefore(printed, "\r\n\r\n", "");
+	raw_content = substring(printed, strlen(raw_header) + 4, strlen(printed));
+	if (raw_header == "") {
+		ruCrash("raw_header == '':\n--------------------\n\n'" + printed + "'\n-----------------\n\n");
+	}
+	header = ruLspDecodeRawHeader(raw_header);
+	switch (lookupTree(header.fields, "Content-Length")) {
+		Some(len): {
+			//if (s2i(len) != strlen(raw_content)) {
+			//	ruCrash(
+			//		"s2i(len) != strlen(raw_content)\n" + 
+			//		len + " != " + i2s(strlen(raw_content)) + "\n\n" + 
+			//		"printed:\n'" + printed + "'\n-----------------------\n\n" + 
+			//		"raw_header:\n'" + raw_header + "'\n-----------------------\n\n" + 
+			//		"raw_content:\n'" + raw_content + "'\n-----------------------\n\n"
+			//	);
+			//}
+			switch (parseJsonSafer(raw_content)) {
+				Some(__): {}
+				None(): {
+					ruCrash("Broken JSON:\n" + raw_content);
+				}
+			}
+		}
+		None(): {
+			ruCrash("no Content-Length");
+		}
+	}*/
 }
