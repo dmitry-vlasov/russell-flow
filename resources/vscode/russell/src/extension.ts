@@ -178,8 +178,7 @@ function startLspClient() {
 	// If the extension is launched in debug mode then the debug server options are used
 	// Otherwise the run options are used
 	let serverOptions: ServerOptions = {
-		command: process.platform == "win32" ? 'russell.bat' : 'russell',
-		args: ['server=lsp'],
+		command: process.platform == "win32" ? 'russell.bat' : 'russell_lsp',
 		options:  { detached: false }
 	}
 	// Options to control the language client
