@@ -43,23 +43,25 @@ ruRunLspRequest(uuid : string, id : Json, method : RuLspMethod, params : Json, l
 	script = ruSetScCommTaskArg(method.request2script(params, RuEnv(env with out = out)), "lsp", "1");
 	ruProcess(uuid, script, 
 		\code -> {
-			insertSet(ruLspServerState.responded, id);
 			if (method.responses) {
 				if (length(^errs) == 0) {
 					if (^data != "") {
 						switch (parseJsonSafer(^data)) {
 							Some(json): {
-								ruLspWriteResponse(id, json, log_message, conf);
+								if (!containsSet(ruLspServerState.responded, id)) {
+									ruLspServerState.responded ::= insertSet(ruLspServerState.responded, id);
+									ruLspWriteResponse(id, json, log_message, conf);
+								}
 							}
 							None(): {
-								ruLspWriteError(id, -1, "error while parsing json: " + ^data, JsonString(^data), conf);
+								ruLspWriteError(id, lspParseError, "error while parsing json: " + ^data, JsonString(^data), conf);
 							}
 						}
 					} else {
 						ruLspWriteResponse(id, JsonNull(), log_message, conf);
 					}
 				} else {
-					ruLspWriteError(id, code, strGlue(^errs, ", "), JsonArray(map(^errs, \err -> JsonString(err))), conf);
+					ruLspWriteError(id, lspRequestFailed, strGlue(^errs, ", "), JsonArray(map(^errs, \err -> JsonString(err))), conf);
 				}
 			}
 			method.callback(uuid, env);
@@ -101,8 +103,7 @@ ruRunLspServer(env : RuEnv) -> void {
 							ruRunLspRequest(uuid, id, meth, params, log_message, env);
 						}
 						None(): {
-							ruLspWriteError(id, 1, "request method '" + method + "' is not found", JsonNull(), conf);
-							//ruLspServerLog("request method '" + method + "'' is not found", conf);
+							ruLspWriteError(id, lspMethodNotFound, "request method '" + method + "' is not found", JsonNull(), conf);
 						}
 					}
 				}
@@ -239,17 +240,16 @@ ruLspExit(uuid : string, env : RuEnv) -> void {
 	ruLspServerState.state ::= 2;
 }
 
-ruLspCancelRequest(json : Json, env : RuEnv) -> ScComm {
+ruLspCancelNotification(json : Json, env : RuEnv) -> ScComm {
 	switch (json2LspCancelParams(json)) {
 		Some(params): {
-			if (containsSet(ruLspServerState.responded, params.id)) {
-				// do nothing
-			} else {
-				env.out.onError("request with id = '" + json2string(params.id) + "' is canceled", []);
+			if (!containsSet(ruLspServerState.responded, params.id)) {
+				ruLspServerState.responded ::= insertSet(ruLspServerState.responded, params.id);
+				ruLspWriteError(params.id, lspRequestCancelled, "request with id = '" + json2string(params.id) + "' is canceled", JsonNull(), env.conf);
 			}
 		}
 		None(): {
-			ruCrash("expecting the LspCancelParams, got: " + json2string(json));
+			ruLspWriteError(JsonNull(), lspInvalidParams, "expecting the LspCancelParams, got: " + json2string(json), JsonNull(), env.conf);
 		}
 	}
 	ScAction("stop", []);
@@ -266,7 +266,7 @@ ruLspInitMethods = pairs2tree([
 	Pair("exit", RuLspMethod(
 		\__,__ -> ScAction("stop", []), false, ruLspExit, false
 	)),
-	Pair("$/cancelRequest", RuLspMethod(ruLspCancelRequest, false, nop2, false))
+	Pair("$/cancelRequest", RuLspMethod(ruLspCancelNotification, false, nop2, false))
 ]);
 
 ruLspMethods = mergeTree(
