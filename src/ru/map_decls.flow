@@ -15,21 +15,16 @@ export {
 	);
 
 	RuMappedDecl(
-		decl : RuDecl,
-		fail : bool,
-		replace : bool
+		finished : bool,
+		replace  : bool,
+		decl     : RuDecl,
 	);
 
-	// Mapping function: transforms (possibly) a decl. If None is returned, old one is kept.
+	// Mapping function: transforms (possibly) a decl.
+	// None is returned when a mapping is not finished in a given time limit
 	RuMapFn(
 		info : RuMapFnInfo,
 		func : (RuDecl, double, RuEnv) -> RuMappedDecl
-	);
-
-	RuMappedMath(
-		math : RuMath,
-		successes : Set<int>,
-		fails : Set<int>
 	);
 
 	// Map 'f.func' to the decls from 'target' task option. 
@@ -38,6 +33,12 @@ export {
 	// proportionally to the 'fn.info.measure'.
 	ruMapFnComm(unit : RuUnit, f : RuMapFn) -> RuState;
 }
+
+RuMappedMath(
+	math : RuMath,
+	domain : [RuDecl],
+	unfinished : Set<int>
+);
 
 ruDecls2Measures(decls : [RuDecl], f : RuMapFn) -> [double] {
 	map(decls, \d -> f.info.measure(d));
@@ -56,7 +57,7 @@ ruCalcTimeLimit(decls : [RuDecl], f : RuMapFn, task : RuTask, conf : RuConf) -> 
 
 RuMapFnStats(
 	progress    : RuProgress,
-	failed      : ref int,
+	finished    : ref int,
 	replaced    : ref int,
 	max_time    : ref double,
 	max_time_id : ref int
@@ -79,33 +80,32 @@ ruWrapFnWithProgress(f : RuMapFn, stats : RuMapFnStats) -> (RuDecl, double, RuEn
 			env.out.onMessage("\t\tTime limit on decl '" + id2s(decl.info.id) + "': " + ruTime2s(time_limit));
 		}
 		timer = ruMakeTimer();
-		ret = f.func(decl, time_limit, env);
+		mapped = f.func(decl, time_limit, env);
 		atomicRefIntAddition(stats.progress.counter, 1);
-		if (ret.fail) {
-			atomicRefIntAddition(stats.failed, 1); {}
-		} 
-		if (ret.replace) {
-			atomicRefIntAddition(stats.replaced, 1); {}
-		} 
+		if (mapped.finished) {
+			atomicRefIntAddition(stats.finished, 1);
+			if (mapped.replace) {
+				atomicRefIntAddition(stats.replaced, 1); {}
+			}
+		}
 		time = ruTimePassed(timer);
 		if (time > ^(stats.max_time)) {
 			stats.max_time := time;
 			stats.max_time_id := decl.info.id;
 		}
-		ret;
+		mapped;
 	}
 }
 
 ruAddMappedDecl2MappedMath(acc : RuMappedMath, mapped : RuMappedDecl, env : RuEnv) -> RuMappedMath {
-	if (!mapped.fail) {
-		acc1 = RuMappedMath(acc with successes = insertSet(acc.successes, mapped.decl.info.id));
+	if (mapped.finished) {
 		if (mapped.replace) {
-			RuMappedMath(acc1 with math = ruMathReplaceDecl(acc.math, mapped.decl, env));
+			RuMappedMath(acc with math = ruMathReplaceDecl(acc.math, mapped.decl, env));
 		} else {
-			acc1;
+			acc;
 		}
 	} else {
-		RuMappedMath(acc with fails = insertSet(acc.fails, mapped.decl.info.id));
+		RuMappedMath(acc with unfinished = insertSet(acc.unfinished, mapped.decl.info.id));
 	}
 }
 
@@ -131,11 +131,11 @@ ruMapDeclsConcurrently(decls : [RuDecl], f : RuMapFn, time_limit : double, timer
 ruMapDeclsConcurrentlyAll(decls : [RuDecl], f : RuMapFn, time_limit : double, timer : RuTimer, mapped_math : RuMappedMath, env : RuEnv) -> RuMappedMath {
 	measures = ruDecls2Measures(decls, f);
 	sum_measure = ruSumDoublesFromArray(measures);
-	mapped = filtermap(ruConcurrent(mapi(decls, \i, d -> \env1 -> {
-		if (ruTimeLeft(timer) <= 0.0) None() else {
-			Some(f.func(d, time_limit * i2d(availableProcessors()) * measures[i] / sum_measure, env1))
+	mapped = ruConcurrent(mapi(decls, \i, d -> \env1 -> {
+		if (ruTimeLeft(timer) <= 0.0) RuMappedDecl(false, false, d) else {
+			f.func(d, time_limit * i2d(availableProcessors()) * measures[i] / sum_measure, env1)
 		}
-	}), env), idfn);
+	}), env);
 	fold(mapped, mapped_math, \acc, m -> ruAddMappedDecl2MappedMath(acc, m, env));
 }
 
@@ -186,35 +186,36 @@ ruMapFnComm(unit : RuUnit, f : RuMapFn) -> RuState {
 	}
 	timer = ruMakeTimer();
 	initial = ref true;
-	proc_cycle = \mapped_math0 -> {
+	proc_cycle = \mapped_math -> {
 		initial := false;
-		to_proc = filter(decls, \d -> !containsSet(mapped_math0.successes, d.info.id));
-		mapped_math = RuMappedMath(mapped_math0 with fails = makeSet());
-		stats.failed := 0;
+		to_proc = filter(mapped_math.domain, \d -> containsSet(mapped_math.unfinished, d.info.id));
+		out.onMessage("to_proc:  " + i2s(length(to_proc)));
 		new_time_limit = time_limit - ruTimePassed(timer);
+		to_map_math = RuMappedMath(mapped_math with unfinished = makeSet());
 		if (length(to_proc) != length(decls)) {
 			out.onMessage("Another try to process " + i2s(length(to_proc)) + " failed decls, time limit: " + ruTime2s(new_time_limit));
 		}
 		if (!ruTargetIsConcurrent(target) || length(to_proc) == 1) {
-			ruMapDeclsSequentially(to_proc, prog_f, new_time_limit, stats.progress.timer, mapped_math, env);
+			ruMapDeclsSequentially(to_proc, prog_f, new_time_limit, stats.progress.timer, to_map_math, env);
 		} else {
-			ruMapDeclsConcurrently(to_proc, prog_f, new_time_limit, stats.progress.timer, mapped_math, env);
+			ruMapDeclsConcurrently(to_proc, prog_f, new_time_limit, stats.progress.timer, to_map_math, env);
 		}
 	}
 	mapped = for(
-		RuMappedMath(math, makeSet(), makeSet()), 
+		RuMappedMath(math, decls, buildSet(map(decls, \d -> d.info.id))),
 		\mm -> (
-			(time_limit - ruTimePassed(timer)) >= 0.0 && 
-			(sizeSet(mm.fails) > 0 || ^initial)
+			(time_limit - ruTimePassed(timer)) >= 0.0 &&
+			sizeSet(mm.unfinished) > 0 &&
+			(^initial || sizeSet(mm.unfinished) != length(mm.domain))
 		), 
 		proc_cycle
 	);
-	failed = set2array(mapped.fails);
-	if (length(failed) > 0) {
-		head = map(take(failed, 128), id2s);
-		failed_ids = if (length(failed) <= 128) head else concat(head, ["..."]);
-		out.onMessage("Failed " + i2s(length(failed)) + ":\n" + 
-			strIndent(concatStrings(map(failed_ids, \s -> "\t" + s + "\n")))
+	unfinished = set2array(mapped.unfinished);
+	if (length(unfinished) > 0) {
+		head = map(take(unfinished, 128), id2s);
+		unfinished_ids = if (length(unfinished) <= 128) head else concat(head, ["..."]);
+		out.onMessage("Unfinished " + i2s(length(unfinished)) + ":\n" + 
+			strIndent(concatStrings(map(unfinished_ids, \s -> "\t" + s + "\n")))
 		);
 	} else if (conf.verbose > 0) {
 		out.onMessage("All " + i2s(length(decls)) + " declarations are mapped successfully");
@@ -230,7 +231,7 @@ ruMapDeclsResult(state : RuState, mapped : Tree<int, RuSource>, f_name : string,
 		vars = setTree(state.vars, f_name, pairs2tree([
 			Pair(f_name + ".counter", flow(^(stats.progress.counter))),
 			Pair(f_name + ".total", flow(stats.progress.total)),
-			Pair(f_name + ".failed", flow(^(stats.failed))),
+			Pair(f_name + ".finished", flow(^(stats.finished))),
 			Pair(f_name + ".replaced", flow(^(stats.replaced))),
 			Pair(f_name + ".max_time", flow(^(stats.max_time))),
 			Pair(f_name + ".max_time_id", flow(id2s(^(stats.max_time_id)))),
@@ -268,8 +269,8 @@ ruMapDeclsEndMessage(stats : RuMapFnStats, f_name : string, target : string, dec
 				"\n\tavg time:     " + ruTime2s(ruTimePassed(stats.progress.timer) / i2d(length(decls))) +
 				"\n\tmax time:     " + ruTime2s(^(stats.max_time)) +
 				"\n\tmax time id:  " + id2s(^(stats.max_time_id)) +
-				"\n\twas failed:   " + i2s(^(stats.failed)) +
-				"\n\tnot replaced: " + i2s(^(stats.replaced)) + 
+				"\n\twas finished: " + i2s(^(stats.finished)) +
+				"\n\treplaced:     " + i2s(^(stats.replaced)) + 
 				"\n\t%processed:   " + d2st(100.0 * i2d(^(stats.progress.counter)) / i2d(length(decls)), 2);
 		}
 		out.onMessage(msg);
