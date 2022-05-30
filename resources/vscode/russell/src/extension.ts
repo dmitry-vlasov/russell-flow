@@ -33,10 +33,10 @@ export function activate(context: vscode.ExtensionContext) {
 	const reg_comm = (name: string, fn: any) => vscode.commands.registerCommand(name, fn);
 	context.subscriptions.push(
 		serverStatusBarItem,
-		reg_comm('russell.verifyFile', (uri) => processRussellFile(uri, "verify")),
+		reg_comm('russell.verifyFile', (uri: vscode.Uri) => processRussellFile(uri, "verify")),
 		reg_comm('russell.verifyTheorem', () => processRussellTarget("verify")),
-		reg_comm('russell.reproveFile', (uri) => processRussellFile(uri, "reprove-oracle")),
-		reg_comm('russell.metamathFile', (uri) => verifyMetamath(uri)),
+		reg_comm('russell.reproveFile', (uri: vscode.Uri) => processRussellFile(uri, "reprove-oracle")),
+		reg_comm('russell.metamathFile', (uri: vscode.Uri) => verifyMetamath(uri)),
 		reg_comm('russell.reproveTheorem', () => processRussellTarget("reprove-oracle")),
 		reg_comm('russell.generalizeFile', generalizeFile),
 		reg_comm('russell.generalizeTheorem', generalizeTheorem),
@@ -223,8 +223,8 @@ function updateLSPchannel() {
 	}
 }
 
-function handleConfigurationUpdates(context) {
-    return (e) => {
+function handleConfigurationUpdates(_context: vscode.ExtensionContext) {
+    return (e: { affectsConfiguration: (arg0: string) => any; }) => {
         if (e.affectsConfiguration("russell.trace.server")) {
             updateLSPchannel();
         }
@@ -366,20 +366,27 @@ function processRussellPosition<T>(action : string): Promise<T> {
 }
 
 function processRussell<T>(uri : vscode.Uri, target : string, action : string): Promise<T> {
+	if (!uri) {
+		uri = vscode.window.activeTextEditor.document.uri;
+	}
 	russellChannel.show(true);
 	return client.sendRequest("workspace/executeCommand", requests.fileCommand(uri, target, action));
 }
 
 function verifyMetamath(uri : vscode.Uri): void {
+	if (!uri) {
+		uri = vscode.window.activeTextEditor.document.uri;
+	}
 	russellChannel.show(true);
-	let ru_file = uri.fsPath;
-	let mm_file = ru_file.substr(0, ru_file.lastIndexOf(".")) + ".mm";
-	client.sendRequest("workspace/executeCommand", verifyMetamath(uri));
+	client.sendRequest("workspace/executeCommand", requests.verifyMetamath(uri));
 }
 
 function generalizeFile(uri : vscode.Uri): void {
+	if (!uri) {
+		uri = vscode.window.activeTextEditor.document.uri;
+	}
 	processRussellFile(uri, "generalize").then(
-		(data: any) => {
+		(data: any): void => {
 			if (data && data.theorems && data.theorems.length > 0) {
 				vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + data.theorems.join('\n\n')});
 			}

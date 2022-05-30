@@ -27,7 +27,7 @@ export function filePositionCommand(action : string): object {
 
 export function verifyMetamath(uri : vscode.Uri): object {
 	let ru_file = uri.fsPath;
-	let mm_file = ru_file.substr(0, ru_file.lastIndexOf(".")) + ".mm";
+	let mm_file = ru_file.substring(0, ru_file.lastIndexOf(".")) + ".mm";
 	return { 
 		command : "command", 
 		arguments: [
