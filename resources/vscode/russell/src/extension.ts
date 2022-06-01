@@ -11,6 +11,7 @@ import * as prover from "./prover";
 import * as tools from "./tools";
 import { num2memory } from './tools';
 import * as requests from './requests';
+import { doesNotReject } from 'assert';
 
 //import isPortReachable from 'is-port-reachable'; // For 'is-port-reachable' 4.0.0. - doesn't work ...
 const isPortReachable = require('is-port-reachable');
@@ -33,6 +34,7 @@ export function activate(context: vscode.ExtensionContext) {
 	const reg_comm = (name: string, fn: any) => vscode.commands.registerCommand(name, fn);
 	context.subscriptions.push(
 		serverStatusBarItem,
+		reg_comm('russell.saveVerifyFile', saveVerifyFile),
 		reg_comm('russell.verifyFile', (uri: vscode.Uri) => processRussellFile(uri, "verify")),
 		reg_comm('russell.verifyTheorem', () => processRussellTarget("verify")),
 		reg_comm('russell.reproveFile', (uri: vscode.Uri) => processRussellFile(uri, "reprove-oracle")),
@@ -340,6 +342,20 @@ export function deactivate(): Thenable<void> | undefined {
 		);
     } else {
 		return undefined;
+	}
+}
+
+function saveVerifyFile(uri : vscode.Uri): void {
+	if (!uri) {
+		uri = vscode.window.activeTextEditor.document.uri;
+	}
+	if (uri) {
+		let doc = vscode.workspace.textDocuments.find((doc) => doc.uri == uri);
+		if (doc) {
+			doc.save().then(() => processRussellFile(uri, "verify"));
+		} else {
+			vscode.window.showErrorMessage("can't fine document " + uri.fsPath);
+		}
 	}
 }
 
