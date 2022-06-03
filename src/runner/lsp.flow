@@ -21,14 +21,18 @@ RuLspServerRequest(
 );
 
 RuLspServerState(
-	mutable clientConf : Json,
+	mutable clientConf : LspInitializeParams,
 	mutable currId : int,
 	mutable requests : Tree<Json, RuLspServerRequest>,
 	mutable responded : Set<Json>,
 	mutable state : int // 0 - working, 1 - shutdown, 2 - exit
 );
 
-ruLspServerState = RuLspServerState(JsonNull(), 1, makeTree(), makeSet(), 0);
+ruEmptyLspInitializeParams() -> LspInitializeParams {
+	LspInitializeParams("", LspClientInfo("", ""), "", "", "", JsonNull(), JsonNull(), "off", []);
+}
+
+ruLspServerState = RuLspServerState(ruEmptyLspInitializeParams(), 1, makeTree(), makeSet(), 0);
 
 ruRunLspRequest(uuid : string, id : Json, method : RuLspMethod, params : Json, log_message : bool, env : RuEnv) -> void {
 	timer = ruMakeTimer();
@@ -183,41 +187,49 @@ ruExecuteCommandOptions = JsonObject([
 ]);
 
 ruLspInitialize(json : Json, env : RuEnv) -> ScComm {
-	ruLspServerState.clientConf ::= json;
-	ScOutput("output", ScString(json2string(
-		JsonObject([
-			Pair("capabilities", JsonObject([
-					Pair("declarationProvider", JsonBool(true)),
-					Pair("definitionProvider", JsonBool(true)),
-					Pair("referencesProvider", JsonBool(true)),
-					Pair("documentSymbolProvider", JsonBool(true)),
-					Pair("hoverProvider", JsonBool(true)),
-					Pair("renameProvider", JsonBool(true)),
-					Pair("workspaceSymbolProvider", JsonBool(true)),
-					Pair("executeCommandProvider", ruExecuteCommandOptions),
-					/*Pair("codeActionProvider", 
-						JsonObject([
-							Pair("codeActionKinds", JsonArray([
-								JsonString("verify"), JsonString("prove"), JsonString("reprove"), JsonString("generalize")
-							])),
-						])
-					),*/
-					//Pair("codeActionProvider", JsonBool(true)),
-					Pair("textDocumentSync",
-						JsonObject([
-							Pair("openClose", JsonBool(true)),
-							Pair("save", JsonBool(true)),
-							Pair("change", JsonDouble(2.0))
+	switch (json2LspInitializeParams(json)) {
+		Some(params): {
+			ruLspServerState.clientConf ::= params;
+			ScOutput("output", ScString(json2string(
+				JsonObject([
+					Pair("capabilities", JsonObject([
+							Pair("declarationProvider", JsonBool(true)),
+							Pair("definitionProvider", JsonBool(true)),
+							Pair("referencesProvider", JsonBool(true)),
+							Pair("documentSymbolProvider", JsonBool(true)),
+							Pair("hoverProvider", JsonBool(true)),
+							Pair("renameProvider", JsonBool(true)),
+							Pair("workspaceSymbolProvider", JsonBool(true)),
+							Pair("executeCommandProvider", ruExecuteCommandOptions),
+							/*Pair("codeActionProvider", 
+								JsonObject([
+									Pair("codeActionKinds", JsonArray([
+										JsonString("verify"), JsonString("prove"), JsonString("reprove"), JsonString("generalize")
+									])),
+								])
+							),*/
+							//Pair("codeActionProvider", JsonBool(true)),
+							Pair("textDocumentSync",
+								JsonObject([
+									Pair("openClose", JsonBool(true)),
+									Pair("save", JsonBool(true)),
+									Pair("change", JsonDouble(2.0))
+								])
+							)
 						])
 					)
 				])
-			)
-		])
-	)));
+			)));
+		}
+		None(): {
+			env.out.onError("text document item is invalid: " + json2string(json), []);
+			ScAction("stop", []);
+		}
+	}
 }
 
 ruInitializedCallback(uuid : string, env : RuEnv) -> void {
-	if (getJsonBoolField(getJsonNestedField(ruLspServerState.clientConf, ["capabilities", "workspace", "didChangeConfiguration"]), "dynamicRegistration", false)) {
+	if (getJsonBoolField(getJsonNestedField(ruLspServerState.clientConf.capabilities, ["workspace", "didChangeConfiguration"]), "dynamicRegistration", false)) {
 		params = lspRegistrationParams2Json(LspRegistrationParams([
 			LspRegistration(makeUuid(), "textDocument/didChange", 
 				lspTextDocumentChangeRegistrationOptions2Json(
@@ -230,7 +242,7 @@ ruInitializedCallback(uuid : string, env : RuEnv) -> void {
 }
 
 ruLspShutdown(uuid : string, env : RuEnv) -> void {
-	ruLspServerState.clientConf ::= JsonNull();
+	ruLspServerState.clientConf ::= ruEmptyLspInitializeParams();
 	ruLspServerState.currId ::= 1;
 	ruLspServerState.requests ::= makeTree();
 	ruMemCacheClear(); // reset memory cache
@@ -241,7 +253,7 @@ ruLspExit(uuid : string, env : RuEnv) -> void {
 	ruLspServerState.state ::= 2;
 }
 
-ruLspCancelNotification(json : Json, env : RuEnv) -> ScComm {
+ruLspCancelRequest(json : Json, env : RuEnv) -> ScComm {
 	switch (json2LspCancelParams(json)) {
 		Some(params): {
 			if (!containsSet(ruLspServerState.responded, params.id)) {
@@ -251,6 +263,18 @@ ruLspCancelNotification(json : Json, env : RuEnv) -> ScComm {
 		}
 		None(): {
 			ruLspWriteError(JsonNull(), lspInvalidParams, "expecting the LspCancelParams, got: " + json2string(json), JsonNull(), env.conf);
+		}
+	}
+	ScAction("stop", []);
+}
+
+ruLspSetTrace(json : Json, env : RuEnv) -> ScComm {
+	switch (json2LspSetTrace(json)) {
+		Some(params): {
+			ruLspServerState.clientConf ::= LspInitializeParams(ruLspServerState.clientConf with trace = params.value);
+		}
+		None(): {
+			ruLspWriteError(JsonNull(), lspInvalidParams, "expecting the SetTraceParams, got: " + json2string(json), JsonNull(), env.conf);
 		}
 	}
 	ScAction("stop", []);
@@ -267,7 +291,8 @@ ruLspInitMethods = pairs2tree([
 	Pair("exit", RuLspMethod(
 		\__,__ -> ScAction("stop", []), false, ruLspExit, false
 	)),
-	Pair("$/cancelRequest", RuLspMethod(ruLspCancelNotification, false, nop2, false))
+	Pair("$/cancelRequest", RuLspMethod(ruLspCancelRequest, false, nop2, false)),
+	Pair("$/setTrace", RuLspMethod(ruLspSetTrace, false, nop2, false))
 ]);
 
 ruLspMethods = mergeTree(
