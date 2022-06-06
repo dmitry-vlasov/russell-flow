@@ -12,7 +12,7 @@ ruLspServer(env : RuEnv) -> void {
 	ruLspServerLog("Server started.", env.conf);
 	params = LspInitializeParams("", LspClientInfo("", ""), "", "", "", JsonNull(), JsonNull(), "off", []);
 	for(
-		RuLsp(env, params, 1, makeTree(), makeSet(), 0),
+		RuLsp(env, ruMakeLspLog(env.conf), params, 1, makeTree(), makeSet(), 0),
 		\state -> state.exit != 2,
 		ruRunLspServer
 	);
@@ -23,11 +23,13 @@ ruRunLspRequest(id : Json, method : RuLspMethod, params : Json, log_message : bo
 	timer = ruMakeTimer();
 	env = state.env;
 	conf = env.conf;
-	data = ref "";
+	data = ref JsonNull();
 	errs = ref [];
+	log = if (log_message) state.log else ruNoLspLog; 
 	out = RuOut(
-		\msg -> if (msg != "") ruLspWriteNotification("console/message", JsonString(msg), log_message, env.conf),
-		\str -> if (str != "") data := ^data + str,
+		\msg -> if (msg != "") ruLspWriteNotification("console/message", JsonString(msg), log),
+		\json -> data := json,
+		\meth, json -> ruLspWriteNotification(meth, json, log),
 		\err, __ -> refArrayPush(errs, err)
 	);
 	script = ruSetScCommTaskArg(method.script(params, RuEnv(env with out = out)), "lsp", "1");
@@ -35,24 +37,13 @@ ruRunLspRequest(id : Json, method : RuLspMethod, params : Json, log_message : bo
 		\code -> {
 			if (method.responses) {
 				if (length(^errs) == 0) {
-					if (^data != "") {
-						switch (parseJsonSafer(^data)) {
-							Some(json): {
-								if (!containsSet(state.processed, id)) {
-									ruLspWriteResponse(id, json, log_message, conf);
-								} else {
-									ruLspWriteError(id, lspParseError, "Error: server already processed the request: " + json2string(id), JsonNull(), conf);
-								}
-							}
-							None(): {
-								ruLspWriteError(id, lspParseError, "error while parsing json: " + ^data, JsonString(^data), conf);
-							}
-						}
+					if (!containsSet(state.processed, id)) {
+						ruLspWriteResponse(id, ^data, log);
 					} else {
-						ruLspWriteResponse(id, JsonNull(), log_message, conf);
+						ruLspWriteError(id, lspParseError, "Error: server already processed the request: " + json2string(id), JsonNull(), log);
 					}
 				} else {
-					ruLspWriteError(id, lspRequestFailed, strGlue(^errs, ", "), JsonArray(map(^errs, \err -> JsonString(err))), conf);
+					ruLspWriteError(id, lspRequestFailed, strGlue(^errs, ", "), JsonArray(map(^errs, \err -> JsonString(err))), log);
 				}
 			}
 		},
@@ -62,12 +53,13 @@ ruRunLspRequest(id : Json, method : RuLspMethod, params : Json, log_message : bo
 
 ruRunLspNotification(method : RuLspMethod, params : Json, log_message : bool, state : RuLsp) -> void {
 	env = state.env;
+	log = if (log_message) state.log else ruNoLspLog;
 	script = ruSetScCommTaskArg(method.script(params, env), "lsp", "1");
 	timer = ruMakeTimer();
 	errs = ref [];
 	out = RuOut(
-		\msg -> if (msg != "") ruLspWriteNotification("console/message", JsonString(msg), true, env.conf),
-		nop1,
+		\msg -> if (msg != "") ruLspWriteNotification("console/message", JsonString(msg), log),
+		nop1, nop2,
 		\err, __ -> refArrayPush(errs, err)
 	);
 	ruProcess(ruMakeUuid(), script, \code -> {}, RuEnv(env.conf, out));
@@ -76,10 +68,11 @@ ruRunLspNotification(method : RuLspMethod, params : Json, log_message : bool, st
 ruRunLspServer(state : RuLsp) -> RuLsp {
 	env = state.env;
 	conf = env.conf;
-	switch (ruLspReadMessage(env, conf)) {
+	switch (ruLspReadMessage(env, state.log)) {
 		Some(m): {
 			// Special watermark for non-logging
 			log_message = !strContains(m.raw, "do_not_log_this");
+			log = if (log_message) state.log else ruNoLspLog;
 			message = m.message;
 			switch (message) {
 				LspRequestMessage(__, id, method, params): {
@@ -93,7 +86,7 @@ ruRunLspServer(state : RuLsp) -> RuLsp {
 							RuLsp(new_state with processed = insertSet(new_state.processed, id));
 						}
 						None(): {
-							ruLspWriteError(id, lspMethodNotFound, "request method '" + method + "' is not found", JsonNull(), conf);
+							ruLspWriteError(id, lspMethodNotFound, "request method '" + method + "' is not found", JsonNull(), log);
 							state;
 						}
 					}
