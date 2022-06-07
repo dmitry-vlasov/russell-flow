@@ -219,9 +219,12 @@ function startLspClient() {
 function updateLSPchannel() {
 	const trace_server = vscode.workspace.getConfiguration("russell").get("trace.server");
 	if (trace_server != "off") {
-		lspChannel = russellChannel = vscode.window.createOutputChannel("Russell LSP");
+		lspChannel = vscode.window.createOutputChannel("Russell LSP");
 	} else {
-		lspChannel = null;
+		if (lspChannel) {
+			lspChannel.dispose();
+			lspChannel = null;
+		}
 	}
 }
 
