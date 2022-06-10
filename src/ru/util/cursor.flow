@@ -1,0 +1,336 @@
+import ru/cache/cache;
+import ru/parse/parse;
+import ru/parse/exps/lang;
+import ru/parse/exps/exp;
+
+export {
+	// Description of what is under a cursor at some position in source code
+	RuCursor(
+		act  : string, // actual string
+		type : int,    // type of what is under a cursor
+		rule : int,    // grammar rule of construction under a cursor 
+		def  : int,    // definition of what is under a cursor
+		expr : RuTermExp // expression or term, in which scope the cursor lies
+	);
+
+	RuHover(
+		lang : string, // 'russell' or 'latex'
+		message : string
+	);
+
+	ruCursorHover(cursor : RuCursor, env : RuEnv) -> RuHover;
+	ruCursorMostSpecificId(cursor : RuCursor, env : RuEnv) -> int;
+	ruUnderACursor(lc : RuLineCol, env : RuEnv) -> RuCursor;
+	ruFindPositioned(lc : RuLineCol, env : RuEnv) -> Maybe<[RuPositioned]>;
+	ruHover2LspMarkupContent(hover : RuHover) -> LspMarkupContent;
+}
+
+ruCursorHover(cursor : RuCursor, env : RuEnv) -> RuHover {
+	if (cursor.act == "|-" || cursor.act == "#") {
+		expr = cursor.expr;
+		RuHover("markdown", 
+			if (expr == ruNoExp) "" else {
+				switch (expr) {
+					RuExp(__,__): {
+						//"$$\n\\displaystyle\n" + 
+						//ruExp2latex(expr, ruLangCacheGet(), env) + 
+						//"\n$$"
+
+						//"$$\n" + ruExp2latex(expr, ruLangCacheGet(), env) + "\n$";
+
+						"$ " + ruExp2latex(expr, ruLangCacheGet(), env) + " $";
+					}
+					RuTerm(__,__,__): {
+						//"$$\n\\displaystyle\n" +  
+						//ruTerm2latex(expr, ruLangCacheGet(), env) + 
+						//"\n$$";
+
+						//"$$\n" +  ruTerm2latex(expr, ruLangCacheGet(), env) + "\n$";
+						"$ " +  ruTerm2latex(expr, ruLangCacheGet(), env) + " $";
+					}
+				}
+			}
+		)
+	} else if (cursor.def != -1) {
+		RuHover("russell", ruCachedDecl2s(cursor.def, env));
+	} else if (cursor.rule != -1) {
+		RuHover("russell", ruCachedDecl2s(cursor.rule, env));
+	} else if (cursor.type != -1) {
+		RuHover("russell", cursor.act + " : " + id2s(cursor.type));
+	} else {
+		RuHover("russell", ruCachedDecl2s(s2id_(cursor.act), env));
+	}
+}
+
+ruHover2LspMarkupContent(hover : RuHover) -> LspMarkupContent {
+	LspMarkupContent(
+		"markdown",
+		"```" + hover.lang + "\n" +
+		hover.message + "\n" +
+		"```"
+	);
+}
+
+ruCursorMostSpecificId(cursor : RuCursor, env : RuEnv) -> int {
+	if (cursor.def != -1) {
+		cursor.def;
+	} else if (cursor.rule != -1) {
+		cursor.rule;
+	} else {
+		s2id_(cursor.act);
+	}
+}
+
+ruFindPositioned(lc : RuLineCol, env : RuEnv) -> Maybe<[RuPositioned]> {
+	module = ruFileId(lc.path, env.conf);
+	code = ruCodeCacheGet(module, env).code;
+	maybeBind(ruCacheGet(module, true, env), \src -> {
+			resolver = makeLineResolver(code);
+			pos = findLineIndex(resolver, lc.line, lc.col);
+			posTree = ruPositionsTree(src);
+			treeIntervalSearch(posTree, pos);
+		}
+	);
+}
+
+ruUnderACursor(lc : RuLineCol, env : RuEnv) -> RuCursor {
+	module = ruFileId(lc.path, env.conf);
+	code = ruCodeCacheGet(module, env);
+	source = code.code;
+	resolver = makeLineResolver(source);
+	pos0 = findLineIndex(resolver, lc.line, lc.col);
+	act = ruNameByPos(pos0, source);
+	pos = if (!(act == "|-" || act == "#")) pos0 else {
+		// In this case find the first position of a real expression, which follows act:
+		// hyp 1 : wff = |- ( X = ( BaseSet ‘ U ) ) ;;
+		//               ^  ^
+		//             act  pos
+		for(pos0 + 2, 
+			\p -> isSpace(getCharAt(source, p)),
+			\p -> p + 1
+		);
+	}
+	switch (ruCacheGet(module, true, env)) {
+		Some(src): {
+			ruUnderACursorInSource(src, act, source, pos, env);
+		}
+		None(): {
+			parsed_source = ruParseSourceAnyway(ruRawSourceFromCode(code, env), env);
+			ruUnderACursorInParseSource(parsed_source, act, source, pos, env);
+		}
+	}
+}
+
+ruUnderACursorInSource(src : RuSource, act : string, code : string, pos : int, env : RuEnv) -> RuCursor {
+	posTree = ruPositionsTree(src);
+	switch (treeIntervalSearch(posTree, pos)) {
+		Some(path): {
+			if (length(path) == 0) {
+				RuCursor(act, -1, -1, -1, ruNoExp);
+			} else {
+				x = lastElement(path, ruNoAxiom);
+				positions = getTreeKeys(posTree);
+				curr = ruPos(x);
+				ind = elemIndex(positions, curr, -1) + 1;
+				next = if (ind == length(positions)) strlen(code) else positions[ind];
+				expr = substring(code, curr, next - curr);
+				exp_ind = ruIndexOfPosInsideExp(expr, pos - curr);
+				switch (x) {
+					RuExp(nodes, __): {
+						exp_nodes = ruExp2Nodes(x, ruLangCacheGet().rules);
+						if (exp_ind >= length(exp_nodes)) {
+							RuCursor(act, -1, -1, -1, x);
+						} else {
+							switch (exp_nodes[exp_ind]) {
+								RuVar(v, t): RuCursor(act, t, -1, -1, x);
+								RuRuleNode(rule_id, type,__,__): {
+									switch (ruDefCacheRule2Def(rule_id, env)) {
+										Some(cached): RuCursor(act, type, rule_id, cached.def.info.id, x);
+										None(): RuCursor(act, type, rule_id, -1, x);
+									}
+								}
+							}
+						}
+					}
+					RuTerm(type, term_nodes, __): {
+						if (exp_ind >= length(term_nodes)) {
+							RuCursor(act, -1, -1, -1, x);
+						} else {
+							switch (term_nodes[exp_ind]) {
+								RuVar(v, t): RuCursor(act, t, -1, -1, x);
+								RuConstRef(symb_id): {
+									switch (ruDefCacheSymb2Def(symb_id, env)) {
+										Some(cached): RuCursor(act, type, cached.rule, cached.def.info.id, x);
+										None(): RuCursor(act, -1, -1, -1, x);
+									}
+								}
+							}
+						}
+					}
+					default: RuCursor(act, -1, -1, -1, ruNoExp);
+				}
+			}
+		}
+		None(): RuCursor(act, -1, -1, -1, ruNoExp);
+	}
+}
+
+ruUnderACursorInParseSource(src : RuParseSource, act : string, code : string, pos : int, env : RuEnv) -> RuCursor {
+	posTree = ruParsePositionsTree(src);
+	switch (treeIntervalSearch(posTree, pos)) {
+		Some(path): {
+			if (length(path) == 0) {
+				RuCursor(act, -1, -1, -1, ruNoExp);
+			} else {
+				x = lastElement(path, ruParseNoComment);
+				positions = getTreeKeys(posTree);
+				curr = x.pos;
+				ind = elemIndex(positions, curr, -1) + 1;
+				next = if (ind == length(positions)) strlen(code) else positions[ind];
+				switch (x) {
+					RuParseExp(tp, symbs, ex_pos): {
+						vars = ruCreateVars(fold(path, [], \acc, y -> concat(acc, ruParsePositionedVars(y))));
+						term = ruCreateTerm(x, vars, env);
+						lang = ruLangCacheGet();
+						expr = substring(code, curr, next - curr);
+						exp_ind = ruIndexOfPosInsideExp(expr, pos - curr);
+						switch (ruParseExp(term, lang, RuPlace(src.info.path, ex_pos), env)) {
+							Some(ex): {
+								nodes = ex.nodes;
+								exp_nodes = ruExp2Nodes(ex, lang.rules);
+								if (exp_ind >= length(exp_nodes)) {
+									RuCursor(act, -1, -1, -1, ex);
+								} else {
+									switch (exp_nodes[exp_ind]) {
+										RuVar(v, t): {
+											RuCursor(act, t, -1, -1, ex);
+										}
+										RuRuleNode(rule, type,__,__): {
+											switch (ruDefCacheRule2Def(rule, env)) {
+												Some(cached): RuCursor(act, type, rule, cached.def.info.id, ex);
+												None(): RuCursor(act, type, rule, -1, ex);
+											}
+										}
+									}
+								}
+							}
+							None(): {
+								if (exp_ind >= length(symbs)) {
+									RuCursor(act, -1, -1, -1, ruNoExp);
+								} else {
+									symb = symbs[exp_ind];
+									switch (lookupTree(vars, symb)) {
+										Some(v): {
+											RuCursor(act, v.type, -1, -1, ruNoExp);
+										}
+										None(): {
+											switch (ruDefCacheSymb2Def(symb, env)) {
+												Some(d): {
+													RuCursor(act, tp, d.rule, d.def.info.id, ruNoExp);
+												}
+												None(): {
+													switch (ruLangCacheRuleGet(symb)) {
+														Some(r): {
+															RuCursor(act, tp, r.info.id, -1, ruNoExp);
+														}
+														None(): {
+															RuCursor(act, -1, -1, -1, ruNoExp);
+														}
+													}
+												}
+											}
+										}
+									}
+								}
+								RuCursor(act, -1, -1, -1, ruNoExp);
+							}
+						}
+					}
+					default: RuCursor(act, -1, -1, -1, ruNoExp);
+				}
+			}
+		}
+		None(): RuCursor(act, -1, -1, -1, ruNoExp);
+	}
+}
+
+ruIndexOfPosInsideExp(expr : string, pos : int) -> int {
+	ruDoIndexOfPosInsideExp(expr, pos, false, 0, 0);
+}
+
+ruDoIndexOfPosInsideExp(expr : string, pos : int, ws : bool, curr : int, acc : int) -> int {
+	if (curr == pos) acc else {
+		ch = getCharAt(expr, curr);
+		ws1 = (ch == " " || ch == "\n" || ch == "\t" || ch == "\r");
+		ruDoIndexOfPosInsideExp(
+			expr, pos, ws1, curr + 1, 
+			acc + (if (!ws && ws1) 1 else 0)
+		);
+	}
+}
+
+/*
+ruParsePositioned2Positioned(positioned : RuParsePositioned, src_info : RuFileInfo, env : RuEnv) -> RuPositioned {
+	make_info = \id, comms, pos -> {
+		RuDeclInfo(id, ruCreateComments(comms, src_info, env), pos);
+	}
+	switch (positioned) {
+		RuParseHyp(ind, expr, pos): {
+			RuHyp(ind, ruParsePositioned2Positioned(expr, src_info, env), pos);
+		}
+		RuParseRule(id, comms, vars, term, pos): {
+			ru_vars = ruCreateVars(vars);
+			RuRule(
+				make_info(id, comms, pos),	
+				ru_vars,
+				ruCreateTerm(term, ru_vars, env)
+			);
+		}
+		RuParseStep(ind, assertion, refs, expr, proof, pos): {
+			acc2 = ruDoParsePositionsTree(expr, path1, acc1);
+			if (proof.steps == []) acc2 else {
+				ruDoParsePositionsTree(proof, path1, acc1);
+			}
+			RuStep(ind, assertion, map(refs, ruCreateRef), 
+
+			);
+		}
+		RuParseProof(vars, disjs, steps, pos): {
+			acc2 = add_many(acc1, concat(vars, disjs));
+			fold(steps, acc2, \ac, step -> ruDoParsePositionsTree(step, path1, ac));
+		}
+		RuParseAxiom(__, comms, vars, disjs, hyps, prop,__ ): {
+			add_many(acc1, concatA([vars, disjs, hyps, [prop]]));
+		}
+		RuParseDef(__, comms, vars, disjs, hyps, defm, defs, prop, __): {
+			acc2 = add_many(acc1, concatA([vars, disjs, hyps, [prop]]));
+			acc3 = ruDoParsePositionsTree(defm, path1, acc2);
+			ruDoParsePositionsTree(defs, path1, acc3);
+		}
+		RuParseTheorem(__, comms, vars, disjs, meta, hyps, prop, proof, pos): {
+			acc2 = add_many(acc1, concatA([vars, disjs, hyps, [prop]]));
+			ruDoParsePositionsTree(proof, path1, acc2);
+		}
+		RuParseMeta(__,__):           acc1;
+		RuParseImport(__,__):         acc1;
+		RuParseComment(__,__,_):      acc1;
+		RuParseConst(__,__,__,__,__): acc1;
+		RuParseType(__,__,__,__):     acc1;
+		RuParseExp(__,__,__):         acc1;
+		RuParseVar(id, type, pos):    acc1;
+		RuParseDisj(vars, pos):       acc1;
+	}
+}
+
+//ruParseExp2Term(term : RuParseExp) -> RuTerm {
+//	ruCreateTerm(term : RuParseExp, vars : Tree<int, RuVar>, env : RuEnv) -> RuTerm;
+//}
+
+ruParseExp2Exp(ex : RuParseExp, vars : Tree<int, RuVar>, src_info : RuFileInfo, env : RuEnv) -> RuExp {
+	silent_env = RuEnv(env with out = ruSilentOut);
+	switch (ruParseExp(ruCreateTerm(ex, vars, silent_env), lang, RuPlace(src_info.path, ex.pos), silent_env)) {
+		Some(e): e;
+		None():  ruNoExp;
+	}
+}
+*/

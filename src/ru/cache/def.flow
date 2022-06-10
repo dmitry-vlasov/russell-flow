@@ -1,63 +1,155 @@
 import ru/util/src;
+import ru/cache/lang;
 
 export {
 	ruDefCacheClear() -> void;
+	ruInitDefCache(env : RuEnv) -> void;
 	ruDefCacheAdd(src : RuSource, env : RuEnv) -> void;
 	ruDefCacheRemove(src : RuSource, env : RuEnv) -> void;
 
-	ruDefCacheGet(id : int) -> Maybe<RuDef>;
-	ruDefCacheGetName(id : int) -> Maybe<int>;
+	RuCachedDef(
+		symbs : [int], // Unique symbols, which distingishes the definition from all others
+		rule : int,    // The toplevel rule of defiendum
+		def : RuDef
+	);
+
+	ruDefCacheRule2Def(rule_id : int, env : RuEnv) -> Maybe<RuCachedDef>;
+	ruDefCacheSymb2Def(symb_id : int, env : RuEnv) -> Maybe<RuCachedDef>;
 	ruDefCacheInfo(full : bool) -> string;
 }
 
-ruDefCache = initConcurrentHashMap();  // Definitions
+ruId2Def = initConcurrentHashMap(); // Raw Definitions - a queue to be later added properly
+ruId2CachedDef = initConcurrentHashMap();  // Cached definitions
+ruRule2CachedDef = initConcurrentHashMap(); 
+ruSymb2CachedDef = initConcurrentHashMap(); 
 
 ruDefCacheClear() -> void {
-	clearConcurrentHashMap(ruDefCache);
+	clearConcurrentHashMap(ruId2Def);
+	clearConcurrentHashMap(ruId2CachedDef);
+	clearConcurrentHashMap(ruRule2CachedDef);
+	clearConcurrentHashMap(ruSymb2CachedDef);
 }
 
-ruDefCacheGet(id : int) -> Maybe<RuDef> {
-	getConcurrentHashMap(ruDefCache, id, None());
+ruInitDefCache(env : RuEnv) -> void {
+	if (sizeConcurrentHashMap(ruId2Def) > 0) {
+		defs = valuesConcurrentHashMap(ruId2Def);
+		clearConcurrentHashMap(ruId2Def);
+		iter(filtermap(defs, idfn), \d -> ruDefCacheAddDef(d, env));
+	}
 }
 
-ruDefCacheGetName(id : int) -> Maybe<int> {
-	maybeMap(ruDefCacheGet(id), \def -> def.info.id);
+ruDefCacheRule2Def(rule_id : int, env : RuEnv) -> Maybe<RuCachedDef> {
+	ruInitDefCache(env);
+	getConcurrentHashMap(ruRule2CachedDef, rule_id, None());
 }
 
-RuCachedDef(
-	rule : int,
-	def : RuDef
-);
+ruDefCacheSymb2Def(symb_id : int, env : RuEnv) -> Maybe<RuCachedDef> {
+	ruInitDefCache(env);
+	getConcurrentHashMap(ruSymb2CachedDef, symb_id, None());
+}
 
-ruSourceDefs(src : RuSource, env : RuEnv) -> [RuCachedDef] {
-	fold(src.decls, [], \acc, decl -> 
+ruDefCacheAdd(src : RuSource, env : RuEnv) -> void {
+	iter(src.decls, \decl -> 
 		switch (decl) {
-			RuDef(__,__,defm, __): {
-				switch (defm.nodes[0]) {
-					RuRuleNode(rule,__,__,__): concat(acc, [RuCachedDef(rule, decl)]);
-					default: { 
-						ruCrash("defiendum must not be a variable: '" + ruExpRPN2s(defm) + "'");
-						acc
-					}
-				}
-			}
-			default: acc;
+			RuDef(info,__,__,__): setConcurrentHashMap(ruId2Def, info.id, Some(decl));
+			default: {}
 		}
 	);
 }
 
-ruDefCacheAdd(src : RuSource, env : RuEnv) -> void {
-	iter(ruSourceDefs(src, env), \d -> 
-		setConcurrentHashMap(ruDefCache, d.rule, Some(d.def))	
-	);
+ru_def_ignored_ids : ref [int] = ref []; 
+
+ruDefIgnoreId(id : int) -> bool {
+	if (contains(^ru_def_ignored_ids, id)) true else {
+		is_ignored = contains(["(", ")", ",", ":"], id2s(id));
+		if (is_ignored) {
+			ru_def_ignored_ids := concat(^ru_def_ignored_ids, [id]);
+		}
+		is_ignored;
+	}
 }
 
+ruDefCacheAddDef(d : RuDef, env : RuEnv) -> void {
+	switch (d.defm.nodes[0]) {
+		RuRuleNode(rule_id,__,__,__): {
+			switch (ruLangCacheRuleGet(rule_id)) {
+				Some(rule): {
+					all_symbs = filtermap(rule.term.nodes, \n ->
+						switch (n) {
+							RuConstRef(symb_id): 
+								if (ruDefIgnoreId(symb_id)) None() else Some(symb_id);
+							RuVar(__,__): None(); 
+						}
+					);
+					symbs = filter(uniq(all_symbs), \symb_id -> !containsConcurrentHashMap(ruSymb2CachedDef, symb_id));
+					cached = RuCachedDef(symbs, rule_id, d);
+
+					setConcurrentHashMap(ruId2CachedDef, d.info.id, Some(cached));
+					setConcurrentHashMap(ruRule2CachedDef, rule_id, Some(cached));
+					if (length(symbs) > 0) {
+						iter(symbs, \symb ->
+							setConcurrentHashMap(ruSymb2CachedDef, symb, Some(cached))
+						);
+					} else {
+						env.out.println("definition " + id2s(d.info.id) + " has no unique symbols");
+						//ruDefCacheFixNoSymbs(d, rule, all_symbs);
+					}
+				}
+				None(): {
+					ruCrash("Rule '" + id2s(rule_id) + "' is not found in rule cache");
+				}
+			}
+		}
+		default: {
+			ruCrash("defiendum must not be a variable: '" + ruExpRPN2s(d.defm) + "'");
+		}
+	}
+}
+
+/*
+ruDefCacheFixNoSymbs(d : RuDef, all_symbs : [int]) ->  [int] {
+	affected = filtermap(all_symbs, \symb -> getConcurrentHashMap(ruSymb2CachedDef, symb, None()), idfn);
+	if (length(affected) != length(all_symbs)) {
+		ruCrash("length(affected_rules) != length(all_symbs)");
+	}
+	symbs_removed = map(affected, \cached -> differenceSets(buildSet(cached.symbs), buildSet(all_symbs)));
+	switch (findi(symbs_removed, \s -> !isEmptySet(s))) {
+		Some(i): {
+			new_symbs = symbs_removed[i];
+		}
+		None(): {
+
+		}
+	}
+}
+*/
+
 ruDefCacheRemove(src : RuSource, env : RuEnv) -> void {
-	iter(ruSourceDefs(src, env), \d -> 
-		removeConcurrentHashMap(ruDefCache, d.rule)	
+	iter(src.decls, \d ->
+		switch (d) {
+			RuDef(info,__,__, __): {
+				switch (getConcurrentHashMap(ruId2CachedDef, info.id, None())) {
+					Some(cached): {
+						removeConcurrentHashMap(ruId2CachedDef, info.id);
+						removeConcurrentHashMap(ruRule2CachedDef, cached.rule);
+						iter(cached.symbs, \symb ->
+							removeConcurrentHashMap(ruSymb2CachedDef, symb)
+						);
+					}
+					None(): {
+						if (containsConcurrentHashMap(ruId2Def, info.id)) {
+							removeConcurrentHashMap(ruId2Def, info.id);
+						} else {
+							ruCrash("Def '" + id2s(info.id) + "' is not cached");
+						}
+					}
+				}
+			}
+			default: {}
+		}
 	);
 }
 
 ruDefCacheInfo(full : bool) -> string {
-	"definitions cache: " + i2s(sizeConcurrentHashMap(ruDefCache));
+	"definitions cache: " + i2s(sizeConcurrentHashMap(ruId2CachedDef));
 }
