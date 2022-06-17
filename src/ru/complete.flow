@@ -1,6 +1,8 @@
 import text/blueprint;
 import comm;
 import base/util/lsp;
+import base/util/substr;
+import base/path;
 import lsp/util;
 import ru/util/vol;
 import ru/util/cursor;
@@ -32,29 +34,102 @@ ruRunComplete(unit : RuUnit) -> Maybe<RuState> {
 	conf = state.conf;
 	lsp = ruTaskBoolArg(task, "lsp", false);
 	maybeApply(ruTask2LineCol(task), \lc -> {
-		cursor = ruUnderACursor(lc, env);
-		id = ruCursorMostSpecificId(cursor, env);
-		if (id != -1) {
-			maybeApply(ruDeclCacheGet(id), \decl ->
-				maybeApply(ruCacheGet(decl.info.src, false, env), \src -> {
-					range = ruCodeCacheDeclRange(decl, src, env);
-					code = ruCodeCacheGet(decl.info.src, env).code;
-					if (lsp) {
-						loc = ruRangeCode2LspLocation(range, src.info.path, code);
-						env.out.respond(JsonArray([lspLocation2Json(loc)]));
-					} else {
-						env.out.println(
-							ruRange2s(
-								range, 
-								"declaration of " + cursor.act, 
-								src.info.path, 
-								code
-							)
-						)
-					}
-				})
-			);
+		module = ruFileId(lc.path, env.conf);
+		cached = ruCodeCacheGet(module, env);
+		resolver = makeLineResolver(cached.code);
+		pos = findLineIndex(resolver, lc.line, lc.col);
+		line_ss = ruRTrimSubstr(ruSubstrLine(cached.code, pos));
+		line = ruSubstr2s(line_ss);
+		col0 = pos - line_ss.beg;
+		col = if (col0 >= strlen(line)) strlen(line) - 1 else col0;
+		word_ss = ruSubstrWord(line, col);
+		word = ruSubstr2s(word_ss);
+		/*ruDebugLog(
+			"ruRunComplete:\n" +
+			"line: '" + line + "'\n" + 
+			"line_ss.len: " + i2s(line_ss.len) + "\n" +
+			"col: " + i2s(col) + "\n" +
+			"word: '" + word + "'\n" +
+			"word_ss.len: " + i2s(word_ss.len) + "\n" + 
+			"word_ss.beg: " + i2s(word_ss.beg) + "\n"
+		);*/
+		if (startsWith(trim2(line, " \t\r"), "import")) {
+			edit = ruMakeImportLspEdit(lc);
+			completions = list2array(fold(conf.importRoots, makeList(), \acc, inc ->
+				ruCompleteImport(conf, inc, word, edit, acc)
+			));
+			if (lsp) {
+				env.out.respond(lspCompletionList2Json(LspCompletionList(false, completions)));
+			} else {
+				// TODO
+			}
+		} else if (startsWith(word, "\\")) {
+			// TODO: latex
+		} else {
+			// TODO: name
 		}
 	});
 	Some(state);
+}
+
+ruMakeImportLspEdit(lc : RuLineCol) -> LspTextEdit {
+	LspTextEdit(
+		LspRange(
+			LspPosition(lc.line, lc.col),
+			LspPosition(lc.line, lc.col),
+		),
+		""
+	);
+}
+
+ruMakeImportCompletion(label : string, kind : int, detail : string, edit : LspTextEdit) -> LspCompletionItem {
+	LspCompletionItem(
+		label, //: string,
+		kind, // : int,
+		[], //tags: [int], // Values: Deprecated=1
+		detail, //: string,
+		"", // documentation: string,
+		false, //deprecated: bool,
+		false, //preselect: bool,
+		"", //sortText: string,
+		"", //filterText: string,
+		"", //insertText: string,
+		1, //insertTextFormat: int, // Value: PlainText=1, Snippet=2
+		Some(edit), //textEdit: Maybe<LspTextEdit>,
+		[], //additionalTextEdits: [LspTextEdit],
+		[], //commitCharacters: [string],
+		None(), // command: Maybe<LspCommand>,
+		JsonNull(), //data: Json
+	);
+}
+
+ruCompleteImport(conf : RuConf, inc : string, prefix : string, edit : LspTextEdit, acc : List<LspCompletionItem>) -> List<LspCompletionItem> {
+	pref_path = ruSplitPath(prefix);
+	dir = pathCombineMany(concat([inc], pref_path.dirs));
+	if (!isDirectory(dir)) acc else {
+		fold(readDirectory(dir), acc, \ac, nm ->
+			if (!startsWith(nm, pref_path.file)) ac else {
+				name = pathCombine(dir, nm);
+				path = pathCombineMany(concat(pref_path.dirs, [nm]));
+				insertion = strRight(path, strlen(prefix));
+				if (ruDirContainsRuSources(name)) {
+					Cons(
+						ruMakeImportCompletion(nm, lspCompletionItemFolder, "directory",
+							LspTextEdit(edit with newText = insertion + "/")
+						),
+						ac
+					);
+				} else if (fileExists(name) && endsWith(name, ".ru")) {
+					Cons(
+						ruMakeImportCompletion(changeFileExt(nm, ""), lspCompletionItemModule, "module",
+							LspTextEdit(edit with newText = changeFileExt(insertion, "") + ";;")
+						),
+						ac
+					);
+				} else {
+					ac;
+				}
+			}
+		);
+	} 
 }
