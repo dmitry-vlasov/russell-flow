@@ -50,25 +50,39 @@ ruRunInfoDecl(unit : RuUnit) -> Maybe<RuState> {
 		cursor = ruUnderACursor(lc, env);
 		id = ruCursorMostSpecificId(cursor, env);
 		if (id != -1) {
-			maybeApply(ruDeclCacheGet(id), \decl ->
-				maybeApply(ruCacheGet(decl.info.src, false, env), \src -> {
-					range = ruCodeCacheDeclRange(decl, src, env);
-					code = ruCodeCacheGet(decl.info.src, env).code;
+			switch (ruDeclCacheGet(id)) {
+				Some(decl): {
+					maybeApply(ruCacheGet(decl.info.src, false, env), \src -> {
+						range = ruCodeCacheDeclRange(decl, src, env);
+						code = ruCodeCacheGet(decl.info.src, env).code;
+						if (lsp) {
+							loc = ruRangeCode2LspLocation(range, src.info.path, code);
+							env.out.respond(JsonArray([lspLocation2Json(loc)]));
+						} else {
+							env.out.println(
+								ruRange2s(
+									range, 
+									"declaration of " + cursor.strs.name, 
+									src.info.path, 
+									code
+								)
+							)
+						}
+					});
+				}
+				None(): {
+					code = ruCodeCacheGet(id, env);
+					range = RuRange(0, ruFirstNLinesPos(code.code, 32));
 					if (lsp) {
-						loc = ruRangeCode2LspLocation(range, src.info.path, code);
+						loc = ruRangeCode2LspLocation(range, code.path, code.code);
 						env.out.respond(JsonArray([lspLocation2Json(loc)]));
 					} else {
 						env.out.println(
-							ruRange2s(
-								range, 
-								"declaration of " + cursor.strs.name, 
-								src.info.path, 
-								code
-							)
-						)
+							ruRange2s(range, cursor.strs.line, code.path, code.code)
+						);
 					}
-				})
-			);
+				}
+			}
 		}
 	});
 	Some(state);
@@ -132,24 +146,38 @@ ruRunInfoFind(unit : RuUnit) -> Maybe<RuState> {
 			)
 		)
 	);
-
-	switch (ruDeclCacheGet(s2id_(name))) {
+	id = s2id_(name);
+	switch (ruDeclCacheGet(id)) {
 		Some(decl): {
 			decl_info(decl);
 		}
 		None(): {
-			lang = ruLangCacheGet();
-			normalize = \s -> strReplaces(s, [" ", "", "\t", ""]);
-			nm = normalize(name);
-			mconst = findInOrder(lang.consts, \id, const -> 
-				if (normalize(const.latex) == nm || id2s(const.ascii) == nm) Some(const) else None()
-			);
-			switch (mconst) {
-				Some(const): {
-					decl_info(const);
-				}
-				None(): {
-					env.out.println("Declaration '" + name + "' is not found");
+			code = ruCodeCacheGet(id, env);
+			if (code.path != "") {
+				range = RuRange(0, ruFirstNLinesPos(code.code, 32));
+				/*if (lsp) {
+					loc = ruRangeCode2LspLocation(range, code.path, code.code);
+					env.out.respond(JsonArray([lspLocation2Json(loc)]));
+				} else {*/
+					env.out.println(
+						code.path + ":\n\n" + 
+						ruTakeFirstNLines(code.code, 32)
+					);
+				//}
+			} else {
+				lang = ruLangCacheGet();
+				normalize = \s -> strReplaces(s, [" ", "", "\t", ""]);
+				nm = normalize(name);
+				mconst = findInOrder(lang.consts, \__, const -> 
+					if (normalize(const.latex) == nm || id2s(const.ascii) == nm) Some(const) else None()
+				);
+				switch (mconst) {
+					Some(const): {
+						decl_info(const);
+					}
+					None(): {
+						env.out.println("Declaration '" + name + "' is not found");
+					}
 				}
 			}
 		}
@@ -172,8 +200,25 @@ ruRunInfoSymbol(unit : RuUnit) -> Maybe<RuState> {
 	conf = state.conf;
 	name = ruTaskStringArg(task, "name", "");
 	lsp = ruTaskBoolArg(task, "lsp", false);
+	id = s2id_(name);
 	if (lsp) {
-		maybeApply(ruCachedDecl2LspSymbolInfo(s2id_(name), env), \info -> {
+		switch (ruCachedDecl2LspSymbolInfo(id, env)) {
+			Some(info): {
+				json = JsonArray([lspSymbolInformation2Json(info)]);
+				env.out.respond(json);
+			}
+			None(): {
+				code = ruCodeCacheGet(id, env);
+				if (code.path != "") {
+					range = RuRange(0, ruFirstNLinesPos(code.code, 32));
+					loc = ruRangeCode2LspLocation(range, code.path, code.code);
+					env.out.respond(JsonArray([lspLocation2Json(loc)]));
+				} else {
+					// ??
+				}
+			}
+		}
+		maybeApply(ruCachedDecl2LspSymbolInfo(id, env), \info -> {
 			json = JsonArray([lspSymbolInformation2Json(info)]);
 			env.out.respond(json);
 		});
@@ -181,6 +226,17 @@ ruRunInfoSymbol(unit : RuUnit) -> Maybe<RuState> {
 		info = ruCachedDecl2s(s2id_(name), env);
 		if (info != "") {
 			env.out.println(info);
+		} else {
+			code = ruCodeCacheGet(id, env);
+			if (code.path != "") {
+				range = RuRange(0, ruFirstNLinesPos(code.code, 32));
+				env.out.println(
+					code.path + ":\n\n" + 
+					ruTakeFirstNLines(code.code, 32)
+				);
+			} else {
+				// ??
+			}
 		}
 	}
 	Some(state);
@@ -228,12 +284,22 @@ ruRunInfoShow(unit : RuUnit) -> Maybe<RuState> {
 	conf = state.conf;
 	math = ruMathFromSources(state.ru, env);
 	name = ruTaskStringArg(task, "name", "");
-	switch (ruFindDecl(s2id_(name), math.decls, env)) {
+	id = s2id_(name);
+	switch (ruFindDecl(id, math.decls, env)) {
 		Some(decl): {
 			env.out.println(ru2s(decl, math));
 		}
 		None(): {
-			env.out.println("Declaration '" + name + "' is not found");
+			code = ruCodeCacheGet(id, env);
+			if (code.path != "") {
+				range = RuRange(0, ruFirstNLinesPos(code.code, 32));
+				env.out.println(
+					code.path + ":\n\n" + 
+					ruTakeFirstNLines(code.code, 32)
+				);
+			} else {
+				env.out.println("Declaration '" + name + "' is not found");
+			}
 		}
 	}
 	Some(state);
