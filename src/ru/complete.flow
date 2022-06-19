@@ -33,6 +33,7 @@ ruRunComplete(unit : RuUnit) -> Maybe<RuState> {
 	state = unit.state;
 	conf = state.conf;
 	lsp = ruTaskBoolArg(task, "lsp", false);
+	char = ruTaskStringArg(task, "character", "");
 	maybeApply(ruTask2LineCol(task), \lc -> {
 		module = ruFileId(lc.path, env.conf);
 		cached = ruCodeCacheGet(module, env);
@@ -53,12 +54,13 @@ ruRunComplete(unit : RuUnit) -> Maybe<RuState> {
 			"word_ss.len: " + i2s(word_ss.len) + "\n" + 
 			"word_ss.beg: " + i2s(word_ss.beg) + "\n"
 		);
-		edit = ruMakeImportLspEdit(lc);
+		edit = ruMakeInsertLspEdit(lc);
 		completions = if (startsWith(trim2(line, " \t\r"), "import")) {
 			ruCompleteImports(conf, word, edit);
-		} else if (startsWith(word, "\\")) {
-			// TODO: latex
-			[]
+		} else if (char == "\\" && ruPosInExpression(cached.code, pos)) {
+			ruCompleteSymbols(conf, word, edit);
+		} else if (ruPosInExpression(cached.code, pos)) {
+			ruCompleteSymbols(conf, word, edit);
 		} else {
 			// TODO: name
 			[]
@@ -72,7 +74,19 @@ ruRunComplete(unit : RuUnit) -> Maybe<RuState> {
 	Some(state);
 }
 
-ruMakeImportLspEdit(lc : RuLineCol) -> LspTextEdit {
+ruPosInExpression(code : string, pos : int) -> bool {
+	exp_end_after = ruFirstAfterPos(code, pos, ";;");
+	exp_beg_after = ruMinPos(ruFirstAfterPos(code, pos, "|-"), ruFirstAfterPos(code, pos, "#"));
+
+	exp_end_before = ruLastBeforePos(code, pos, ";;");
+	exp_beg_before = ruMaxPos(ruLastBeforePos(code, pos, "|-"), ruLastBeforePos(code, pos, "#"));
+
+	(exp_end_after != -1) && (exp_beg_before != -1) &&
+	ruPosPreceeds(exp_end_after, exp_beg_after) &&
+	ruPosPreceeds(exp_end_before, exp_beg_before);
+}
+
+ruMakeInsertLspEdit(lc : RuLineCol) -> LspTextEdit {
 	LspTextEdit(
 		LspRange(
 			LspPosition(lc.line, lc.col),
@@ -82,7 +96,7 @@ ruMakeImportLspEdit(lc : RuLineCol) -> LspTextEdit {
 	);
 }
 
-ruMakeImportCompletion(label : string, kind : int, detail : string, edit : LspTextEdit) -> LspCompletionItem {
+ruMakeInsertCompletion(label : string, kind : int, detail : string, edit : LspTextEdit) -> LspCompletionItem {
 	LspCompletionItem(
 		label, //: string,
 		kind, // : int,
@@ -120,14 +134,14 @@ ruCompleteImport(imp : string, prefix : string, edit : LspTextEdit, acc : List<L
 				insertion = strRight(path, strlen(prefix));
 				if (ruDirContainsRuSources(name)) {
 					Cons(
-						ruMakeImportCompletion(nm, lspCompletionItemFolder, "directory",
+						ruMakeInsertCompletion(nm, lspCompletionItemFolder, "directory",
 							LspTextEdit(edit with newText = insertion + "/")
 						),
 						ac
 					);
 				} else if (fileExists(name) && endsWith(name, ".ru")) {
 					Cons(
-						ruMakeImportCompletion(changeFileExt(nm, ""), lspCompletionItemModule, "module",
+						ruMakeInsertCompletion(changeFileExt(nm, ""), lspCompletionItemModule, "module",
 							LspTextEdit(edit with newText = changeFileExt(insertion, "") + ";;")
 						),
 						ac
@@ -138,4 +152,19 @@ ruCompleteImport(imp : string, prefix : string, edit : LspTextEdit, acc : List<L
 			}
 		);
 	} 
+}
+
+ruCompleteSymbols(conf : RuConf, prefix : string, edit : LspTextEdit) -> [LspCompletionItem] {
+	list2array(foldTree(ruLangConstCache(), makeList(), \id, const, acc -> {
+		symb = id2s(const.info.id);
+		if (!(startsWith(symb, prefix) || startsWith(const.latex, prefix))) acc else {
+			edit1 = LspTextEdit(edit with
+				newText = symb,
+				range = LspRange(edit.range with
+					start = LspPosition(edit.range.start with character = edit.range.start.character - strlen(prefix)),
+				)
+			);
+			Cons(ruMakeInsertCompletion(symb, lspCompletionItemConstant, "const", edit1), acc);
+		}
+	}));
 }
