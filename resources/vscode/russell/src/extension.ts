@@ -195,6 +195,9 @@ function startLspClient() {
 			//        is implemented properly in clangd
 			code2Protocol: (uri: vscode.Uri) : string => uri.toString(true),
 			protocol2Code: (uri: string) : vscode.Uri => vscode.Uri.parse(uri)
+		},
+		initializationOptions: {
+			tabSize: vscode.workspace.getConfiguration("editor").get("tabSize")
 		}
 	}
 
@@ -229,11 +232,15 @@ function updateLSPchannel() {
 }
 
 function handleConfigurationUpdates(_context: vscode.ExtensionContext) {
-    return (e: { affectsConfiguration: (arg0: string) => any; }) => {
-        if (e.affectsConfiguration("russell.trace.server")) {
-            updateLSPchannel();
-        }
-    }
+	return (e: { affectsConfiguration: (arg0: string) => any; }) => {
+		if (e.affectsConfiguration("russell.trace.server")) {
+			updateLSPchannel();
+		}
+		if (e.affectsConfiguration("editor")) {
+			const tabSize = vscode.workspace.getConfiguration("editor").get("tabSize");
+			client.sendNotification("config/editor.tabSize", tabSize);
+		}
+	}
 }
 
 function checkHttpServerStatus(initial: boolean) {
