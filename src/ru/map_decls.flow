@@ -57,20 +57,35 @@ ruCalcTimeLimit(decls : [RuDecl], f : RuMapFn, task : RuTask, conf : RuConf) -> 
 
 RuMapFnStats(
 	progress    : RuProgress,
-	finished    : ref int,
-	replaced    : ref int,
+	processing  : native,
+	finished    : native,
+	unfinished  : native,
+	replaced    : native,
 	max_time    : ref double,
 	max_time_id : ref int
 );
 
 ruMakeMapFnStats(time_limit : double, total : int, delta, info : RuMapFnInfo, out : RuOut) -> RuMapFnStats {
 	progress = ruMakeProgress(time_limit, total, delta);
+	processing = initConcurrentHashMap();
+	finished = initConcurrentHashMap();
+	unfinished = initConcurrentHashMap();
 	RuMapFnStats(
 		RuProgress(progress with inform = \-> {
 			msg = info.message();
-			out.println("\t" + ruProgressMessage(progress) + if (msg == "") "" else " " + msg);
+			out.println(
+				"\t" + ruProgressMessage(progress) + 
+				" processing: " + i2s(sizeConcurrentHashMap(processing)) + "," +
+				" unfinished: " + i2s(sizeConcurrentHashMap(unfinished)) + "," +
+				" finished: " + i2s(sizeConcurrentHashMap(finished)) +
+				if (msg == "") "" else ", " + msg
+			);
 		}),
-		ref 0, ref 0, ref 0.0, ref -1
+		processing,
+		finished,
+		unfinished,
+		initConcurrentHashMap(),
+		ref 0.0, ref -1
 	);
 }
 
@@ -80,15 +95,26 @@ ruWrapFnWithProgress(f : RuMapFn, stats : RuMapFnStats) -> (RuDecl, double, RuEn
 			env.out.println("\t\tTime limit on decl '" + id2s(decl.info.id) + "': " + ruTime2s(time_limit));
 		}
 		timer = ruMakeTimer();
-		mapped = f.func(decl, time_limit, env);
-		atomicRefIntAddition(stats.progress.counter, 1);
-		if (mapped.finished) {
-			atomicRefIntAddition(stats.finished, 1);
-			if (mapped.replace) {
-				atomicRefIntAddition(stats.replaced, 1); {}
+		id = decl.info.id;
+		// markup the decl id as started
+		setConcurrentHashMap(stats.processing, id, Pair(id, ruTime()));
+		mp = ruEvalTimed3(\d, t, e -> Some(f.func(d,t,e)), decl, time_limit, env, None(), time_limit);
+		removeConcurrentHashMap(stats.processing, id);
+		time = ruTimePassed(timer);
+		mapped = switch (mp) {
+			Some(rt): {
+				setConcurrentHashMap(stats.finished, id, time);
+				rt;
+			}
+			None(): {
+				setConcurrentHashMap(stats.unfinished, id, time);
+				RuMappedDecl(false, false, decl);
 			}
 		}
-		time = ruTimePassed(timer);
+		atomicRefIntAddition(stats.progress.counter, 1);
+		if (mapped.replace) {
+			setConcurrentHashMap(stats.replaced, id, id);
+		}
 		if (time > ^(stats.max_time)) {
 			stats.max_time := time;
 			stats.max_time_id := decl.info.id;
@@ -246,8 +272,8 @@ ruMapDeclsResult(state : RuState, mapped : Tree<int, RuSource>, f_name : string,
 		vars = setTree(state.vars, f_name, pairs2tree([
 			Pair(f_name + ".counter", flow(^(stats.progress.counter))),
 			Pair(f_name + ".total", flow(stats.progress.total)),
-			Pair(f_name + ".finished", flow(^(stats.finished))),
-			Pair(f_name + ".replaced", flow(^(stats.replaced))),
+			Pair(f_name + ".finished", flow(sizeConcurrentHashMap(stats.finished))),
+			Pair(f_name + ".replaced", flow(sizeConcurrentHashMap(stats.replaced))),
 			Pair(f_name + ".max_time", flow(^(stats.max_time))),
 			Pair(f_name + ".max_time_id", flow(id2s(^(stats.max_time_id)))),
 			Pair(f_name + ".time", flow(ruTimePassed(stats.progress.timer)))
@@ -285,8 +311,8 @@ ruMapDeclsEndMessage(stats : RuMapFnStats, f_name : string, target : string, dec
 				"\n\tavg time:     " + ruTime2s(ruTimePassed(stats.progress.timer) / i2d(length(decls))) +
 				"\n\tmax time:     " + ruTime2s(^(stats.max_time)) +
 				"\n\tmax time id:  " + id2s(^(stats.max_time_id)) +
-				"\n\twas finished: " + i2s(^(stats.finished)) +
-				"\n\treplaced:     " + i2s(^(stats.replaced)) + 
+				"\n\twas finished: " + i2s(sizeConcurrentHashMap(stats.finished)) +
+				"\n\treplaced:     " + i2s(sizeConcurrentHashMap(stats.replaced)) + 
 				"\n\t%processed:   " + d2st(100.0 * i2d(^(stats.progress.counter)) / i2d(length(decls)), 2);
 		}
 		out.println(msg);
