@@ -51,22 +51,27 @@ ru2mm(math : RuMath, uniq_turnstile : bool, env : RuEnv) -> Tree<int, MmSource> 
 	var_renames = if (env.conf.project == "") makeTree() else {
 		renamed_json = ruGetDbItem(env.conf.project, ["renamed_vars"]);
 		renamed_array = map(getJsonObjectValue(renamed_json, []), \p -> 
-			Pair(s2id(p.first), s2id(getJsonStringValue(p.second, "")))
+			Pair(s2id(getJsonStringValue(p.second, "")), s2id(p.first))
 		);
-		fold(renamed_array, makeTree(), \acc, p -> 
-			setTree(acc, p.second, p.first)
-		);
+		pairs2tree(renamed_array);
 	}
-	super_renames = if (env.conf.project == "") makeTree() else {
+	var_typesetting = if (env.conf.project == "") makeTree() else {
+		typesetting_json = ruGetDbItem(env.conf.project, ["vars_typesetting"]);
+		typesetting_array = map(getJsonArrayValue(typesetting_json, []), \var -> {
+			id = getJsonStringField(var, "unicode", "");
+			ascii = getJsonStringField(var, "ascii", "");
+			Pair(s2id(id), s2id(ascii));
+		});
+		pairs2tree(typesetting_array);
+	}
+	sup_renames = if (env.conf.project == "") makeTree() else {
 		super_json = ruGetDbItem(env.conf.project, ["super_rules"]);
 		super_array = map(getJsonObjectValue(super_json, []), \p -> 
-			Pair(s2id(p.first), s2id(getJsonStringValue(p.second, "")))
+			Pair(s2id(getJsonStringValue(p.second, "")), s2id(p.first))
 		);
-		fold(super_array, makeTree(), \acc, p -> 
-			setTree(acc, p.second, p.first)
-		);
+		pairs2tree(super_array);
 	}
-	srcs = mapTree(math.sources, \src -> ruSource2mm(src, turnstile, math, env, var_renames, super_renames));
+	srcs = mapTree(math.sources, \src -> ruSource2mm(src, turnstile, math, env, var_renames, sup_renames, var_typesetting));
 	mm = ruAddTurnstile(turnstile, math, srcs, env);
 	if (ruVerbose(env.conf) > 0) {
 		env.out.println("ru translated " + i2s(sizeTree(math.decls.assertions)) + " assertions in " + ruTimePassed2s(timer));
@@ -107,11 +112,18 @@ ruDoMakeTurnstile(turnstile : int, consts : Set<int>) -> int {
 	}
 }
 
-ruSource2mm(src : RuSource, turnstile : int, math : RuMath, env : RuEnv, var_renames : Tree<int, int>, sup_renames : Tree<int, int>) -> MmSource {
+ruSource2mm(
+	src : RuSource, turnstile : int, math : RuMath, env : RuEnv, 
+	var_renames : Tree<int, int>, 
+	sup_renames : Tree<int, int>,
+	var_typesetting : Tree<int, int>
+) -> MmSource {
 	timer = ruMakeTimer();
 	ret = MmSource(
 		map(src.imports, \imp -> MmImport(imp.id)),
-		concatA(ruConcurrent(map(src.decls, \decl -> \env1 -> ruDecl2mm(decl, turnstile, math, env1, var_renames, sup_renames)), env)),
+		concatA(ruConcurrent(map(src.decls, \decl -> \env1 -> 
+			ruDecl2mm(decl, turnstile, math, env1, var_renames, sup_renames, var_typesetting)
+		), env)),
 		ruNewFileInfo(src.info.module, env.conf, ".mm")
 	);
 	if (ruVerbose(env.conf) > 1) {
@@ -126,7 +138,39 @@ ruVar2mm(th : int, var : int) -> int {
 	s2id(id2s(th) + "_" + ruMakeValidMmId(id2s(var)));
 }
 
-ruDecl2mm(decl : RuDecl, turnstile : int, math : RuMath, env : RuEnv, var_renames : Tree<int, int>, sup_renames : Tree<int, int>) -> [MmDecl] {
+ruComment2mm(comm : RuComment, var_typesetting : Tree<int, int>, math : RuMath) -> MmComment {
+	comm2mm = \t -> {
+		t0 = trim2(t, " \t\n\r");
+		t1 = if (startsWith(t0, "/*") || startsWith(t0, "//")) strRight(t0, 2) else t0;
+		if (endsWith(t1, "*/")) strLeft(t1, strlen(t1) - 2) else t1;
+	}
+	text = ruTransformTokensInQuoted(comm.text, "`", \t -> {
+		id = s2id_(t);
+		if (id == -1) t else {
+			switch (lookupTree(math.decls.lang.consts, id)) {
+				Some(const): if (const.ascii != -1) id2s(const.ascii) else t;
+				None(): switch (lookupTree(var_typesetting, id)) {
+					Some(v): id2s(v);
+					None(): t;
+				}
+			}
+		}
+	});
+	MmComment(comm2mm(
+		if (length(comm.annotation.members) == 0) {
+			text 
+		} else {
+			json2string(comm.annotation) + "\n-----\n" + text
+		}
+	));
+}
+
+ruDecl2mm(
+	decl : RuDecl, turnstile : int, math : RuMath, env : RuEnv, 
+	var_renames : Tree<int, int>, 
+	sup_renames : Tree<int, int>,
+	var_typesetting : Tree<int, int>
+) -> [MmDecl] {
 	const2mm = \c -> if (c.ascii != -1) c.ascii else c.info.id;
 	term2mm = \t -> map(t.nodes, 
 		\s -> switch (s) {
@@ -144,29 +188,17 @@ ruDecl2mm(decl : RuDecl, turnstile : int, math : RuMath, env : RuEnv, var_rename
 				acc;
 		}
 	);
-	expr2mm = \ex -> MmExp(concat([MmSymb(turnstile, false)], term2mm(ruExp2Term(ex, math.decls.lang.rules))));
+	expr2mm = \ex -> MmExp(concat([MmSymb(turnstile, false)], term2mm(ruExp2Term(ruExp(ex), math.decls.lang.rules))));
 	disj2mm = \disjs -> map(ruDisjs2Array(disjs), \ds -> MmDisj(map(ds, \d -> lookupTreeDef(var_renames, d.id, d.id))));
 	vars2mm = \n, vs -> map(getTreeValues(vs), \v -> MmFloating(ruVar2mm(n, v.id), v.type, lookupTreeDef(var_renames, v.id, v.id)));
 	hyps2mm = \n, hs -> mapi(hs, \i, h -> MmEssential(s2id(id2s(n) + "_" + i2s(i)), expr2mm(h.expr)));
-	comm2mm = \t -> {
-		t0 = trim2(t, " \t\n\r");
-		t1 = if (startsWith(t0, "/*") || startsWith(t0, "//")) strRight(t0, 2) else t0;
-		if (endsWith(t1, "*/")) strLeft(t1, strlen(t1) - 2) else t1;
-	}
+	
 	add_comments = \info, arr -> {
-		concat(map(take(info.comments, length(info.comments) - 1), \comm -> 
-			MmComment(comm2mm(
-				if (length(comm.annotation.members) == 0) {
-					comm.text 
-				} else {
-					json2string(comm.annotation) + "\n-----\n" + comm.text
-				}
-			))
-		), arr);
+		concat(map(take(info.comments, length(info.comments) - 1), \c -> ruComment2mm(c, var_typesetting, math)), arr);
 	}
 	last_comment = \info -> {
 		if (length(info.comments) == 0) MmComment("") else 
-		MmComment(info.comments[length(info.comments) - 1].text);
+		ruComment2mm(info.comments[length(info.comments) - 1], var_typesetting, math);
 	}
 	switch (decl) {
 		RuConst(info, ascii,__): 
@@ -182,7 +214,7 @@ ruDecl2mm(decl : RuDecl, turnstile : int, math : RuMath, env : RuEnv, var_rename
 				concatA(filtermap(supers, \super -> 
 					maybeMap(
 						lookupTree(math.decls.lang.rules, ruSuperTypeName(super, info.id)),
-						\r -> ruDecl2mm(r, turnstile, math, env, var_renames, sup_renames)
+						\r -> ruDecl2mm(r, turnstile, math, env, var_renames, sup_renames, var_typesetting)
 					)
 				))
 			));
