@@ -1,24 +1,30 @@
 import lingo/pegcode/driver;
 import lingo/pegcode/parsic;
 import base/db;
+import base/util/str;
+import string_utils;
 
 export {
-	HtmlElement ::= HtmlTag, HtmlText, HtmlEntity;
+	HtmlElement ::= HtmlTag, HtmlText, HtmlEntity, HtmlComment;
 		HtmlTag(
-			title: string,
+			open: string,
 			attribs: [HtmlAttrib],
-			body: [HtmlElement]
+			body: [HtmlElement],
+			close: string
 		);
 		HtmlAttrib(key: string, val: string);
 		HtmlText(text: string);
+		HtmlComment(text: string);
 		HtmlEntity ::= HtmlDecEntity, HtmlHexEntity, HtmlCodeEntity;
 			HtmlDecEntity(dec: string);   // like &#8828,  dec = 8828
 			HtmlHexEntity(hex: string);   // like &#x22A4; hex = 22A4
 			HtmlCodeEntity(code: string); // like &forall; code = forall
 
-	parseHtml(text: string) -> Maybe<[HtmlElement]>;
+	parseHtml(text: string) -> Pair<[HtmlElement], string>;
 	html2s(html : [HtmlElement]) -> string;
 	htmlElement2s(elem : HtmlElement) -> string;
+	html2sFormatted(html : [HtmlElement]) -> string;
+	htmlElement2sFormatted(elem : HtmlElement) -> string;
 
 	// Decodes pairs like: igrave -> 236, (&igrave -> &#236).
 	htmlEntity2UnicodeId(entity: HtmlEntity) -> int;
@@ -32,15 +38,188 @@ htmlParser() -> [PegOp] {
 	);
 }
 
-parseHtml(text: string) -> Maybe<[HtmlElement]> {
+parseHtml(text: string) -> Pair<[HtmlElement], string> {
 	triple = parsic3(htmlParser(), text, SemanticActions(
 		mergeTree(defaultPegActions.t, pairs2tree([
-			Pair("makeHtmlSingleTag", \s -> HtmlTag(s[0], s[1], [])),
-			Pair("makeHtmlBodyTag", \s -> HtmlTag(s[0], s[1], s[2]))
+			Pair("makeAttrib1", \s : [flow] -> 
+				HtmlAttrib(
+					toLowerCase(s[0]), 
+					"1"
+				)
+			),
+			Pair("makeAttrib2", \s : [flow] -> 
+				HtmlAttrib(
+					toLowerCase(s[0]), 
+					toLowerCase(s[1])
+				)
+			),
+			Pair("makeHtmlClopenTag", \s : [flow] -> {
+				tag = toLowerCase(s[0]);
+				HtmlTag(tag, cast(s[1] : flow -> [HtmlAttrib]), [], tag);
+			}),
+			Pair("makeHtmlOpenTag", \s : [flow] -> {
+				tag = toLowerCase(s[0]);
+				HtmlTag(tag, cast(s[1] : flow -> [HtmlAttrib]), [], "");
+			}),
+			Pair("makeHtmlCloseTag", \s : [flow] -> {
+				tag = toLowerCase(s[0]);
+				HtmlTag("", [], [], tag);
+			}),
 		]))),
 		[]
 	);
-	if (triple.third == "") Some(triple.first) else None();
+	err1 = if (triple.second == strlen(text)) triple.third else {
+		"html parsed not to the end: " + i2s(triple.second) + " < " + i2s(strlen(text)) + 
+		(if (triple.third == "") "" else "\n" + triple.third);
+	}
+	err2 = ref err1;
+	elements = structHtml(
+		triple.first, 
+		\s -> err2 := ^err2 + (if (^err2 == "") "" else "\n") + "html parsing error: " + s
+	);
+	Pair(elements, ^err2);
+}
+
+structHtml(elems : [HtmlElement], err : (string) -> void) -> [HtmlElement] {
+	stack = structHtmlElem(elems, 0, err, ParseHtmlStack(HtmlTag("html", [], [], "html"), makeList(), None()));
+	if  (stack.parent != None()) {
+		err("non-empty stack at the end of html parsing:\n" + parseHtmlStack2s(stack));
+	}
+	list2array(stack.elems);
+}
+
+ParseHtmlStack(
+	tag : HtmlTag,
+	elems : List<HtmlElement>,
+	parent : Maybe<ParseHtmlStack>
+);
+
+parseHtmlStackDepth(stack : ParseHtmlStack) -> int {
+	switch (stack.parent) {
+		Some(parent): 1 + parseHtmlStackDepth(parent);
+		None(): 0;
+	}
+}
+
+strIndentN(s : string, n : int) -> string {
+	ruIndentWith(s, strRepeat("\t", n));
+}
+
+parseHtmlStack2s(stack : ParseHtmlStack) -> string {
+	s = strIndentN(
+		htmlElement2s(stack.tag) + "[\n" + rtrim2(strIndent(html2sFormatted(list2array(stack.elems))), "\t\n") + "\n]",
+		parseHtmlStackDepth(stack)
+	);
+	switch (stack.parent) {
+		Some(parent): {
+			parseHtmlStack2s(parent) + "\n------------------------\n" + s
+		}
+		None(): {
+			s;
+		}
+	}
+}
+
+closeHtmlTag(depth : int, stack : ParseHtmlStack, err : (string) -> void) -> ParseHtmlStack {
+	if (depth == 0) stack else {
+		switch (stack.parent) {
+			Some(parent): {
+				new_stack = ParseHtmlStack(parent with
+					elems = Cons(
+						HtmlTag(stack.tag with 
+							body = list2array(stack.elems),
+							close = parent.tag.open
+						),
+						parent.elems
+					),
+				);
+				closeHtmlTag(depth - 1, new_stack, err);
+			}
+			None(): {
+				err("no parent of: " + htmlElement2s(stack.tag));
+				stack;
+			}
+		}
+	}
+}
+
+closeAllHtmlTags(stack : ParseHtmlStack) -> ParseHtmlStack {
+	switch (stack.parent) {
+		Some(parent): {
+			new_stack = ParseHtmlStack(parent with
+				elems = Cons(
+					HtmlTag(stack.tag with 
+						body = list2array(stack.elems),
+						close = parent.tag.open
+					),
+					parent.elems
+				),
+			);
+			closeAllHtmlTags(new_stack);
+		}
+		None(): {
+			stack;
+		}
+	}
+}
+
+structHtmlElem(elems : [HtmlElement], i : int, err : (string) -> void, stack : ParseHtmlStack) -> ParseHtmlStack {
+	if (i == length(elems)) {
+		closeAllHtmlTags(stack); 
+	} else {
+		elem = elems[i];
+		stack1 = switch (elem) {
+			HtmlTag(open, attribs, __, close): {
+				if (open != "" && close != "") {
+					ParseHtmlStack(stack with elems = Cons(elem, stack.elems));
+				} else if (open != "") {
+					if (open == "br" || open == "p") {
+						ParseHtmlStack(stack with elems = Cons(HtmlTag(open, [], [], open), stack.elems));
+					} else {
+						depth = if (open == "li") {
+							if (stack.tag.open == "li") 1 else 0;
+						} else if (open == "tr") {
+							if (stack.tag.open == "tr") 1 else
+							if (stack.tag.open == "td") 2 else 0;
+						} else if (open == "td") {
+							if (stack.tag.open == "td") 1 else 0;
+						} else {
+							0;
+						}
+						ParseHtmlStack(elem, makeList(), Some(closeHtmlTag(depth, stack, err)));
+					}
+				} else if (close != "") {
+					if (close == "br" || close == "p") {
+						stack;
+					} else {
+						if (stack.tag.open != close) {
+							depth = if (close == "tr") {
+								if (stack.tag.open == "table") 0 else 
+								if (stack.tag.open == "td") 2 else 0;
+							} else if (close == "ul" || close == "ol") {
+								if (stack.tag.open == "li") 2 else 0;
+							} else if (close == "table") {
+								if (stack.tag.open == "tr") 2 else
+								if (stack.tag.open == "td") 3 else 0;
+							} else {
+								0;
+							}
+							closeHtmlTag(depth, stack, err);
+						} else {
+							closeHtmlTag(1, stack, err);
+						}
+					}
+				} else {
+					err("empty tag");
+					stack;
+				}
+			}
+			default: {
+				ParseHtmlStack(stack with elems = Cons(elem, stack.elems));
+			}
+		}
+		structHtmlElem(elems, i + 1, err, stack1);
+	}
 }
 
 html2s(html : [HtmlElement]) -> string {
@@ -49,18 +228,61 @@ html2s(html : [HtmlElement]) -> string {
 
 htmlElement2s(elem : HtmlElement) -> string {
 	switch (elem) {
-		HtmlTag(title, attribs, body): {
-			attribs_s = concatStrings(map(attribs, \attr -> attr.key + "='" + attr.val + "' "));
-			if (body == []) {
-				"<" + title + (if (length(attribs) == 0) "" else " ") + attribs_s + "/>";
+		HtmlTag(open, attribs, body, close): {
+			attribs_s = concatStrings(
+				mapi(attribs, \i, attr -> 
+					attr.key + "='" + attr.val + "'" + if (i + 1 != length(attribs)) " " else ""
+				)
+			);
+			if (length(body) > 0) {
+				open_tag = if (open == "") "" else {
+					"<" + open + (if (length(attribs) == 0) "" else " ") + attribs_s + ">"
+				}; 
+				close_tag = if (close == "") "" else {
+					"</" + close + ">"
+				};
+				open_tag + html2s(body) + close_tag;
 			} else {
-				"<" + title + (if (length(attribs) == 0) "" else " ") + attribs_s + ">" + html2s(body) + "</" + title + ">";
+				"<" + (if (open != "") open else close) + (if (length(attribs) == 0) "" else " ") + attribs_s + "/>"
 			}
 		}
-		HtmlText(text): text;
-		HtmlDecEntity(dec): "&#" + dec + ";";  // like &#8828
-		HtmlHexEntity(hex): "&#x" + hex + ";"; // like &#x22A4;
-		HtmlCodeEntity(code): "&" + code + ";" // like &forall;
+		HtmlText(text):       text;
+		HtmlComment(text):    "<!--" + text + "-->";
+		HtmlDecEntity(dec):   "&#"  + dec  + ";"; // like &#8828
+		HtmlHexEntity(hex):   "&#x" + hex  + ";"; // like &#x22A4;
+		HtmlCodeEntity(code): "&"   + code + ";"  // like &forall;
+	}
+}
+
+html2sFormatted(html : [HtmlElement]) -> string {
+	concatStrings(map(html, htmlElement2sFormatted));
+}
+
+htmlElement2sFormatted(elem : HtmlElement) -> string {
+	switch (elem) {
+		HtmlTag(open, attribs, body, close): {
+			attribs_s = concatStrings(
+				mapi(attribs, \i, attr -> 
+					attr.key + "='" + attr.val + "'" + if (i + 1 != length(attribs)) " " else ""
+				)
+			);
+			if (body == []) {
+				"<" + open + (if (length(attribs) == 0) "" else " ") + attribs_s + "/>\n";
+			} else {
+				open_tag = if (open == "") "" else {
+					"<" + open + (if (length(attribs) == 0) "" else " ") + attribs_s + ">"
+				}; 
+				close_tag = if (close == "") "</" + open + ">" else {
+					"</" + close + ">"
+				};
+				open_tag + "\n" + rtrim2(strIndent(html2sFormatted(body)), "\n\t") + "\n" + close_tag + "\n";
+			}
+		}
+		HtmlText(text):       "\"" + escapeStr(text) + "\"\n";
+		HtmlComment(text):    "<!--" + escapeStr(text) + "-->\n";
+		HtmlDecEntity(dec):   "&#"  + dec  + ";\n"; // like &#8828
+		HtmlHexEntity(hex):   "&#x" + hex  + ";\n"; // like &#x22A4;
+		HtmlCodeEntity(code): "&"   + code + ";\n"  // like &forall;
 	}
 }
 
