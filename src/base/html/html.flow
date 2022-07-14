@@ -1,5 +1,6 @@
 import lingo/pegcode/driver;
 import lingo/pegcode/parsic;
+import lingo/compiler/syntaxtree_util;
 import base/db;
 import base/util/str;
 import base/html/parser;
@@ -31,54 +32,14 @@ export {
 	htmlEntity2UnicodeId(entity: HtmlEntity) -> int;
 }
 
-html_parser : ref Maybe<[PegOp]> = ref None();
-
-htmlParser() -> [PegOp] {
-	onlyOnce(html_parser, \ -> 
-		compilePegGrammar("#include base/html/html.lingo")
-	);
-}
-
 parseHtml(text: string) -> Pair<[HtmlElement], string> {
-	triple = parsic3(htmlParser(), text, SemanticActions(
-		mergeTree(defaultPegActions.t, pairs2tree([
-			Pair("makeAttrib1", \s : [flow] -> 
-				HtmlAttrib(
-					toLowerCase(s[0]), 
-					"1"
-				)
-			),
-			Pair("makeAttrib2", \s : [flow] -> 
-				HtmlAttrib(
-					toLowerCase(s[0]), 
-					toLowerCase(s[1])
-				)
-			),
-			Pair("makeHtmlClopenTag", \s : [flow] -> {
-				tag = toLowerCase(s[0]);
-				HtmlTag(tag, cast(s[1] : flow -> [HtmlAttrib]), [], tag);
-			}),
-			Pair("makeHtmlOpenTag", \s : [flow] -> {
-				tag = toLowerCase(s[0]);
-				HtmlTag(tag, cast(s[1] : flow -> [HtmlAttrib]), [], "");
-			}),
-			Pair("makeHtmlCloseTag", \s : [flow] -> {
-				tag = toLowerCase(s[0]);
-				HtmlTag("", [], [], tag);
-			}),
-		]))),
-		[]
-	);
-	err1 = if (triple.second == strlen(text)) triple.third else {
-		"html parsed not to the end: " + i2s(triple.second) + " < " + i2s(strlen(text)) + 
-		(if (triple.third == "") "" else "\n" + triple.third);
-	}
-	err2 = ref err1;
+	pair = parseHtmlPlain(text);
+	err = ref pair.second;
 	elements = structHtml(
-		triple.first, 
-		\s -> err2 := ^err2 + (if (^err2 == "") "" else "\n") + "html parsing error: " + s
+		pair.first, 
+		\s -> err := ^err + (if (^err == "") "" else "\n") + "html parsing error: " + s
 	);
-	Pair(elements, ^err2);
+	Pair(elements, ^err);
 }
 
 structHtml(elems : [HtmlElement], err : (string) -> void) -> [HtmlElement] {
@@ -316,61 +277,73 @@ make_html2code_table() -> Tree<string, string> {
 	pairs2tree(table);
 }
 
-// parse_html_source(t : string) -> Pair<SyntaxTree, ExpectError>;
-
-/*
-parseHtmlFast(src : string) -> Pair<[HtmlElement], string> {
-	pr1 = parse_html_source(t);
-	ast = pr1.first;
-	err = pr1.second;
-	if (st.end != strlen(loaded.src)) {
+parseHtmlPlain(src : string) -> Pair<[HtmlElement], string> {
+	pr1 = parse_html_source(src);
+	st = pr1.first;
+	if (st.end != strlen(src)) {
+		err = "met: '" + pr1.second.met + "', while expected: '" + strGlue(pr1.second.expected, ", ") + "'";
 		Pair([],
-			"Syntax error:\n" + 
-				"\t" + ruExpectError2s(err) + "\n" +
-			"html source:\n" +
-				strIndent(str)
+			"Syntax error: " + err + ", html source:\n" + 
+				strIndent(src)
 		);
 	} else {
-		parsed = htmlMakeSrc(st, env);
-		if (ruVerbose(env.conf) > 1) {
-			infos.source(loaded.info.module, ruTimePassed2s(timer));
-			//env.out.println("\tmm parsed: '" + loaded.info.module + "' in " + ruTimePassed2s(timer));
-		}
-		Some(parsed);
+		Pair(htmlMakeElements(st, src), "");
 	}
 }
-*/
 
-/*
-htmlMakeElements(ast : SyntaxTree) -> Pair<[HtmlElement], string> {
+htmlMakeElements(st : SyntaxTree, src : string) -> [HtmlElement] {
 	synt_trees = get_html_source_html_element_s(st);
-	toplevel = map(synt_trees,
+	map(synt_trees,
 		\elem -> {
 			if (elem.rule == st_html_text) {
-				htmlMakeText(elem);
+				HtmlText(grabSTText(elem, src));
 			} else if (elem.rule == st_html_comment) {
-				htmlMakeComment(elem);
-			} else if (elem.rule == st_html_dec_entity) {
-				htmlMakeDec(elem);
-			} else if (elem.rule == st_mm_vars) {
-				htmlMakeVars(elem);
-			} else if (elem.rule == st_mm_disj) {
-				htmlMakeDisj(elem);
-			} else if (elem.rule == st_mm_floating) {
-				htmlMakeFloating(elem);
-			} else if (elem.rule == st_mm_essential) {
-				htmlMakeEssential(elem);
-			} else if (elem.rule == st_mm_axiomatic) {
-				htmlMakeAxiomatic(elem);
-			} else if (elem.rule == st_mm_provable) {
-				htmlMakeProvable(elem);
-			} else if (elem.rule == st_mm_block) {
-				htmlMakeBlock(elem);
+				comment = grabSTText(get_html_source_html_comment_text(elem), src);
+				HtmlComment(comment);
+			} else if (elem.rule == st_html_entity) {
+				prefix = grabSTText(get_html_source_html_entity_prefix(elem), src);
+				body = grabSTText(get_html_source_html_entity_body(elem), src);
+				HtmlEntity(prefix, body);
+			} else if (elem.rule == st_html_tag) {
+				open = grabSTText(get_html_source_html_tag_open(elem), src);
+				close = grabSTText(get_html_source_html_tag_close(elem), src);
+				tag = toLowerCase(grabSTText(get_html_source_html_id(elem), src));
+				attribs = htmlMakeAttribs(get_html_source_html_attrib_s(elem), src);
+				if (open == "<" && close == "/>") {
+					HtmlTag(tag, attribs, [], tag);
+				} else if (open == "<") {
+					HtmlTag(tag, attribs, [], "");
+				} else {
+					HtmlTag("", attribs, [], tag);
+				}
 			} else {
 				// Shouldn't happen
-				MmComment("");
+				HtmlComment("");
 			}
 		}
 	);
 }
-*/
+
+htmlMakeAttribs(sts : [SyntaxTree], src : string) -> [HtmlAttrib] {
+	map(sts,
+		\elem -> {
+			make_attrib = \v -> {
+				key = toLowerCase(grabSTText(get_html_source_html_id(elem), src));
+				val = toLowerCase(v);
+				HtmlAttrib(key, val);
+			}
+			if (elem.rule == st_html_attrib1) {
+				make_attrib(grabSTText(get_html_source_html_attrib1_val(elem), src));
+			} else if (elem.rule == st_html_attrib2) {
+				make_attrib(grabSTText(get_html_source_html_attrib2_val(elem), src));
+			} else if (elem.rule == st_html_attrib3) {
+				make_attrib(grabSTText(get_html_source_html_attrib1_val(elem), src));
+			} else if (elem.rule == st_html_attrib4) {
+				make_attrib("1");
+			} else {
+				// Shouldn't happen
+				HtmlAttrib("", "");
+			}
+		}
+	);
+}
