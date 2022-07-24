@@ -22,7 +22,7 @@ public class RussellReflection extends NativeHost {
 		if (meth_name.startsWith("f_")) {
 			return meth_name.substring(2, meth_name.length());
 		} else {
-			return "";
+			return meth_name;
 		}
 	}
 
@@ -42,10 +42,8 @@ public class RussellReflection extends NativeHost {
 			for (Method meth : module_class.getMethods()) {
 				String fn_name = stripFuncName(meth);
 				if (fn_name != "") {
-					//System.out.println("REGISTERING FUNC: " + fn_name);
 					Function func = method2func(fn_name, meth);
 					if (func != null) {
-						name2method.put(fn_name, meth);
 						name2func.put(fn_name, method2func(fn_name, meth));
 					}
 				}
@@ -59,8 +57,25 @@ public class RussellReflection extends NativeHost {
 		return null;
 	}
 
-	private static final HashMap<String, Method> name2method = new HashMap<String, Method>();
 	private static final HashMap<String, Function> name2func = new HashMap<String, Function>();
+
+	public static final void clearRuntimeFunctions() {
+		name2func.clear();
+	}
+
+	public static final int countRuntimeFunctions() {
+		return name2func.size();
+	}
+
+	public static final String[] runtimeFunctionNames() {
+		java.util.Set<String> key_set = name2func.keySet();
+		Object[] key_arr = key_set.toArray();
+		String[] keys = new String[key_arr.length];
+		for (int i = 0; i < key_arr.length; ++i) {
+			keys[i] = (String)key_arr[i];
+		}
+		return keys;
+	}
 
 	public static final boolean hasRuntimeFunction(String fn) {
 		return (name2func.get(fn) != null);
@@ -70,15 +85,44 @@ public class RussellReflection extends NativeHost {
 		return name2func.get(fn);
 	}
 
+	@SuppressWarnings("unchecked")
 	public static final Object callRuntimeFunction(String fn, Object[] args) {
-		Method meth = name2method.get(fn);
-		if (meth == null) {
+		Function func = name2func.get(fn);
+		if (func == null) {
 			System.out.println("Function " + fn + " is not registered");
 			System.exit(-1);
 			return null;
 		} else {
 			try {
-				return meth.invoke(null, args);
+				if (func instanceof Func0) {
+					return ((Func0)func).invoke();
+				} else if (func instanceof Func1) {
+					return ((Func1)func).invoke(args[0]);
+				} else if (func instanceof Func2) {
+					return ((Func2)func).invoke(args[0], args[1]);
+				} else if (func instanceof Func3) {
+					return ((Func3)func).invoke(args[0], args[1], args[2]);
+				} else if (func instanceof Func4) {
+					return ((Func4)func).invoke(args[0], args[1], args[2], args[3]);
+				} else if (func instanceof Func5) {
+					return ((Func5)func).invoke(args[0], args[1], args[2], args[3], args[4]);
+				} else if (func instanceof Func6) {
+					return ((Func6)func).invoke(args[0], args[1], args[2], args[3], args[4], args[5]);
+				} else if (func instanceof Func7) {
+					return ((Func7)func).invoke(args[0], args[1], args[2], args[3], args[4], args[5], args[6]);
+				} else if (func instanceof Func8) {
+					return ((Func8)func).invoke(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
+				} else if (func instanceof Func9) {
+					return ((Func9)func).invoke(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8]);
+				} else if (func instanceof Func10) {
+					return ((Func10)func).invoke(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9]);
+				} else if (func instanceof Func11) {
+					return ((Func11)func).invoke(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10]);
+				} else if (func instanceof Func12) {
+					return ((Func12)func).invoke(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11]);
+				} else {
+					throw new Exception("function arity " + args.length + " is not supported");
+				}
 			} catch (Exception e) {
 				System.out.println("Function " + fn + " is not found");
 				System.out.println(e.getMessage());
