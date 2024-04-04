@@ -58,7 +58,7 @@ public class RussellTimed extends NativeHost {
 			0, 100, TimeUnit.MILLISECONDS
 		);
 	}
-
+/*
 	public static final <R> R evalTimed0(Func0<R> fn, R defval, double time_limit) {
         try {
             return getExecutor().submit(() -> {
@@ -91,7 +91,7 @@ public class RussellTimed extends NativeHost {
 			return defval;
 		}
 	}
-
+*/
 	public static final <R, T1, T2, T3> R evalTimed3(Func3<R,T1,T2,T3> fn, T1 arg1, T2 arg2, T3 arg3, R defval, double time_limit) {
 		try {
             return getExecutor().submit(() -> {
@@ -102,7 +102,7 @@ public class RussellTimed extends NativeHost {
 			return defval;
 		}
 	}
-
+/*
 	public static final <R, T1, T2, T3, T4> R evalTimed4(Func4<R,T1,T2,T3,T4> fn, T1 arg1, T2 arg2, T3 arg3, T4 arg4, R defval, double time_limit) {
         try {
             return getExecutor().submit(() -> {
@@ -124,7 +124,7 @@ public class RussellTimed extends NativeHost {
 			return defval;
 		}
 	}
-
+*/
 	@SuppressWarnings("unchecked")
 	public static final Object[] concurrentTimeout(Object[] tasks, double global_limeout) {
 
