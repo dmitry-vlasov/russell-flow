@@ -10,69 +10,76 @@ export {
 	mmCollectSources(parsed : Tree<int, MmParseSource>, env : RuEnv) -> Maybe<Tree<int, MmSource>>;
 }
 
-mmCollectSources(parsed : Tree<int, MmParseSource>, env0 : RuEnv) -> Maybe<Tree<int, MmSource>> {
-	err_count = ref 0;
-	env = ruAddErrCounter2Env(env0, err_count);
-	timer = ruMakeTimer();
-	collected = mmDoCollectSources(parsed, env, makeTree());
-	mmCollectFloatings(parsed, collected, env);
-	if (ruVerbose(env.conf) > 0) {
-		env.out.println("mm collected: " +i2s(sizeTree(collected)) + " files in " + ruTimePassed2s(timer));
-	}
-	if (^err_count == 0) {
-		Some(collected);
-	} else {
-		None();
-	}
-}
-
-mmDoCollectSources(left : Tree<int, MmParseSource>, env : RuEnv, acc : Tree<int, MmSource>) -> Tree<int, MmSource> {
-	if (sizeTree(left) == 0) acc else {
-		ready = filter(
-			getTreeValues(left), 
-			\src -> forall(src.imports, \imp -> !containsKeyTree(left, imp.module))
-		);
-		if (ready == []) {
-			env.out.error("cyclic import detected", []);
-			acc
-		} else {
-			srcs = map(ready, \s -> mmCollectSource(s, env));
-			add_hyps = \ac, hs -> fold(hs, ac, \a, h : MmHyp -> setTree(a, h.label, h));
-			new_acc = fold(srcs, acc, \ac, src -> setTree(ac, src.info.id, src));
-			new_left = fold(ready, left, \ac, src -> removeFromTree(ac, src.info.id));
-			mmDoCollectSources(new_left, env, new_acc);
-		}
-	}
-}
-
 MmCollectAcc(
 	vars  : Set<int>,
 	disjs : List<MmDisj>,
 	hyps  : List<MmHyp>,
 	arities : Tree<int, int>,
-	toplevel : Vector<MmDecl>
+	toplevel : Vector<MmDecl>,
+	result: Tree<int, MmSource>,
 );
 
-mmCollectSource(src : MmParseSource, env : RuEnv) -> MmSource {
-	collect_timer = ruMakeTimer();
-	acc = mmCollectElements(src.toplevel, 
-		MmCollectAcc(makeSet(), makeList(), makeList(), makeTree(), makeVector(length(src.toplevel)))
+mmCollectSources(parsed : Tree<int, MmParseSource>, env0 : RuEnv) -> Maybe<Tree<int, MmSource>> {
+	err_count = ref 0;
+	env = ruAddErrCounter2Env(env0, err_count);
+	timer = ruMakeTimer();
+	collected = mmDoCollectSources(parsed, env,
+		MmCollectAcc(makeSet(), makeList(), makeList(), makeTree(), makeVector(0), makeTree())
 	);
+	mmCollectFloatings(parsed, collected.result, env);
+	if (ruVerbose(env.conf) > 0) {
+		env.out.println("mm collected: " +i2s(sizeTree(collected.result)) + " files in " + ruTimePassed2s(timer));
+	}
+	if (^err_count == 0) {
+		Some(collected.result);
+	} else {
+		None();
+	}
+}
+
+mmDoCollectSources(left : Tree<int, MmParseSource>, env : RuEnv, acc : MmCollectAcc) -> MmCollectAcc {
+	if (sizeTree(left) == 0) acc else {
+		resolve_import = \imp -> s2id(changeFileExt(ruFindPath(id2s(imp.module), env.conf, "mm"), ""));
+		ready = filter(
+			getTreeValues(left), 
+			\src -> forall(src.imports, \imp -> containsKeyTree(acc.result, resolve_import(imp)))
+		);
+		if (ready == []) {
+			env.out.error(
+				"cyclic import detected:\n" +
+				"left:\n" + strIndent(superglue(getTreeValues(left), \src -> src.info.module, "\n")),
+				[]
+			);
+			acc
+		} else {
+			mmDoCollectSources(
+				fold(ready, left, \ac, src -> removeFromTree(ac, src.info.id)),
+				env,
+				fold(ready, acc, \ac, s -> mmCollectSource(s, env, ac))
+			);
+		}
+	}
+}
+
+mmCollectSource(src : MmParseSource, env : RuEnv, acc: MmCollectAcc) -> MmCollectAcc {
+	collect_timer = ruMakeTimer();
+	new_acc = mmCollectElements(src.toplevel, MmCollectAcc(acc with toplevel = makeVector(length(src.toplevel))));
 	if (ruVerbose(env.conf) > 1) {
 		env.out.println("\tmm collected: '" + src.info.module + "' in " + ruTimePassed2s(collect_timer));
 	}
-	if (lookupTreeDef(env.conf.opts, "mm-decompress-proofs", "1") != "0") {
+	ret = if (lookupTreeDef(env.conf.opts, "mm-decompress-proofs", "1") != "0") {
 		decompress_timer = ruMakeTimer();
-		mm_decls = ruConcurrent(map(vector2array(acc.toplevel), \decl -> 
-			\env1 -> mmDecompressDecl(decl, acc.arities)
+		mm_decls = ruConcurrent(map(vector2array(new_acc.toplevel), \decl -> 
+			\env1 -> mmDecompressDecl(decl, new_acc.arities)
 		), env);
 		if (ruVerbose(env.conf) > 1) {
-			env.out.println("\tmm decompresed: " + i2s(sizeVector(acc.toplevel)) + " declarations in " + ruTimePassed2s(decompress_timer));
+			env.out.println("\tmm decompresed: " + i2s(sizeVector(new_acc.toplevel)) + " declarations in " + ruTimePassed2s(decompress_timer));
 		}
 		MmSource(src.imports, mm_decls, src.info);
 	} else {
-		MmSource(src.imports, vector2array(acc.toplevel), src.info);
+		MmSource(src.imports, vector2array(new_acc.toplevel), src.info);
 	}
+	MmCollectAcc(new_acc with result = setTree(new_acc.result, ret.info.id, ret));
 }
 
 mmCollectElements(els : [MmElement], acc : MmCollectAcc) -> MmCollectAcc {

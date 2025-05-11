@@ -3,6 +3,7 @@ import base/util/util;
 import base/util/fileinfo;
 import base/id_consts;
 import base/split;
+import base/env;
 import mm/src;
 
 export {
@@ -17,7 +18,11 @@ export {
 	mmAssertionFlos(hyps : [MmHyp]) -> [MmFloating];
 	mmStripComments(src : MmSource) -> MmSource;
 
-	mmStatIsRule(stat : MmStat) -> bool;
+	mmStatIsRule(conf : RuConf) -> (MmStat) -> bool;
+	mmStatIsDef(conf : RuConf) -> (MmStat) -> bool;
+	mmFactorDefEqInd(ex : MmExp) -> int;
+	mmFactorDefNotationInd(ex : MmExp) -> int;
+
 	mmJavaMmVol(any : MmAny) -> double;
 
 	mmSources2structs(sources : Tree<int, MmSource>) -> MmStructs;
@@ -28,13 +33,14 @@ export {
 	mmAxiomatic(sources : Tree<int, MmSource>) -> [MmAssertion];
 	mmProvable(sources : Tree<int, MmSource>) -> [MmAssertion];
 	mmStats(sources : Tree<int, MmSource>) -> string;
-	mmOrderSources(sources : Tree<int, MmSource>, out : RuOut) -> [MmSource];
+	mmOrderSources(sources : Tree<int, MmSource>, env : RuEnv) -> [MmSource];
 	mmDeclLabel(decl : MmDecl) -> int;
 	mmAssertionProofLength(ass : MmAssertion) -> int;
-	mmSources2AssertionsArities(sources : Tree<int, MmSource>, out : RuOut) -> Tree<int, int>;
+	mmSources2AssertionsArities(sources : Tree<int, MmSource>, env : RuEnv) -> Tree<int, int>;
 
 	mmExprStack2s(stack : List<MmExp>, num : int) -> string;
 	mmHyps2s(hyps : [MmHyp]) -> string;
+	mmAssertion2s(ass : MmAssertion) -> string;
 	mmIsTrivialSource(src : MmSource) -> bool;
 
 	mmGatherAllFloatings(srcs : Tree<int, MmSource>) -> Set<MmFloating>;
@@ -259,8 +265,55 @@ mmStripComments(src : MmSource) -> MmSource {
 	))
 }
 
-mmStatIsRule(stat : MmStat) -> bool {
-	mmSymbLiteral(stat.expr.symbs[0]) != ruIdTurnstile();
+mmStatIsRule(conf : RuConf) -> (MmStat) -> bool {
+	stmts = mergeSets(
+		makeSet1(ruIdTurnstile()),
+		buildSet(filtermap(strSplit(lookupTreeDef(conf.opts, "mm-stmts", ""), ","),
+			\x -> if (isSpace(x)) None() else Some(s2id(x))
+		))
+	);
+	\stat -> length(stat.expr.symbs) > 0 && !containsSet(stmts, mmSymbLiteral(stat.expr.symbs[0]));
+}
+
+mmStatIsDef(conf : RuConf) -> (MmStat) -> bool {
+	\stat -> 
+		   (startsWith(id2s(stat.label), "df-") && mmFactorDefEqInd(stat.expr) > -1)
+		|| (length(stat.expr.symbs) > 0 && mmSymbLiteral(stat.expr.symbs[0]) == ruIdNotation())
+}
+
+MmFactorDefEqAcc(
+	braces : int,
+	brackets : int,
+	eq : int
+);
+
+mmFactorDefEqInd(ex : MmExp) -> int {
+	is_eq = mmSymbLiteral(ex.symbs[1]) != ruIdLeftBracket();
+	factor = \strict -> {
+		foldi(ex.symbs, MmFactorDefEqAcc(0, 0, -1), \i, ac, s -> {
+			literal = mmSymbLiteral(s);
+			if (ac.eq != -1) ac else
+			if (literal == ruIdLeftBracket())  MmFactorDefEqAcc(ac with brackets = ac.brackets + 1) else 
+			if (literal == ruIdLeftBrace())    MmFactorDefEqAcc(ac with braces   = ac.braces + 1) else
+			if (literal == ruIdRightBracket()) MmFactorDefEqAcc(ac with brackets = ac.brackets - 1) else
+			if (literal == ruIdRightBrace())   MmFactorDefEqAcc(ac with braces   = ac.braces - 1) else
+			if (literal == ruIdEquality()    && (is_eq || !strict)  && ac.braces == 0)   MmFactorDefEqAcc(ac with eq = i) else
+			if (literal == ruIdEquivalence() && (!is_eq || !strict) && ac.brackets == 1) MmFactorDefEqAcc(ac with eq = i) else ac
+		}).eq
+	}
+	ind1 = factor(true);
+	if (ind1 != -1) ind1 else factor(false);
+}
+
+mmFactorDefNotationInd(ex : MmExp) -> int {
+	foldi(ex.symbs, MmFactorDefEqAcc(0, 0, -1), \i, ac, s -> if (i == 0 || ac.eq != -1) ac else {
+		literal = mmSymbLiteral(s);
+		ac1 = if (literal == ruIdLeftBracket())  MmFactorDefEqAcc(ac with brackets = ac.brackets + 1) else 
+		if (literal == ruIdLeftBrace())    MmFactorDefEqAcc(ac with braces   = ac.braces + 1) else
+		if (literal == ruIdRightBracket()) MmFactorDefEqAcc(ac with brackets = ac.brackets - 1) else
+		if (literal == ruIdRightBrace())   MmFactorDefEqAcc(ac with braces   = ac.braces - 1) else ac;
+		if (ac1.brackets == 0 && ac1.braces == 0) MmFactorDefEqAcc(ac1 with eq = i) else ac1;
+	}).eq
 }
 
 mmJavaMmVol(any : MmAny) -> double {
@@ -268,7 +321,7 @@ mmJavaMmVol(any : MmAny) -> double {
 		ruJavaObjectHeader() +
 		switch (any) {
 			MmComment(text):      ruJavaStringVol(text);
-			MmImport(module):     ruJavaIntVol();
+			MmImport(__):         ruJavaIntVol();
 			MmDisj(vars):         ruJavaArrayVol(vars, \__-> ruJavaIntVol());
 			MmConst(symbs):       ruJavaArrayVol(symbs, \__-> ruJavaIntVol());
 			MmVars(vars):         ruJavaArrayVol(vars, \__-> ruJavaIntVol());
@@ -395,21 +448,37 @@ mmStats(sources : Tree<int, MmSource>) -> string {
 	], "\n")
 }
 
-mmOrderSources(sources : Tree<int, MmSource>, out : RuOut) -> [MmSource] {
-	mmDoOrderSources(getTreeValues(sources), [], makeSet(), out);
+mmOrderSources(sources : Tree<int, MmSource>, env : RuEnv) -> [MmSource] {
+	mmDoOrderSources(getTreeValues(sources), [], makeSet(), env);
 }
 
-mmDoOrderSources(srcs : [MmSource], acc : [MmSource], visited: Set<int>, out : RuOut) -> [MmSource] {
-	new_level = filter(srcs, \src -> forall(src.imports, \imp -> containsSet(visited, imp.module)));
-	level_names = buildSet(map(new_level, \src -> src.info.id));
+mmDoOrderSources(srcs : [MmSource], acc : [MmSource], visited: Set<int>, env : RuEnv) -> [MmSource] {
+	resolve_import = \imp -> s2id(changeFileExt(ruFindPath(id2s(imp.module), env.conf, "mm"), ""));
+	new_level = filter(srcs, \src ->
+		forall(src.imports, \imp ->
+			containsSet(visited, resolve_import(imp))
+		)
+	);
+	level_names = buildSet(map(new_level, \src -> s2id(src.info.module)));
 	if (new_level == []) {
 		if (length(srcs) == 0) acc else {
-			out.error("Cycilc imports detected:\n" + strIndent(strGlue(map(srcs, \src -> id2s(src.info.id)), "\n")), []);
+			err_msg = "Cycilc imports detected, sources:\n" +
+				strIndent(strGlue(map(srcs, \src -> src.info.module), "\n")) + "\n" +
+				"visited:\n" +
+				strIndent(strGlue(map(set2array(visited), id2s), "\n")) + "\n" +
+				"source imports:\n" +
+				strIndent(strGlue(map(srcs, \src ->
+					id2s(src.info.id) + " imports:\n" +
+						strIndent(strGlue(map(src.imports, \imp ->
+							"'" + id2s(imp.module) + "' ==? '" + id2s(resolve_import(imp)) + "'"
+						), "\n")) + "\n"
+				), "\n"));
+			env.out.error(err_msg, []);
 			[]
 		};
 	} else {
-		new_srcs = filter(srcs, \src -> !containsSet(level_names, src.info.id));
-		mmDoOrderSources(new_srcs, concat(acc, new_level), mergeSets(visited, level_names), out);
+		new_srcs = filter(srcs, \src -> !containsSet(level_names, s2id(src.info.module)));
+		mmDoOrderSources(new_srcs, concat(acc, new_level), mergeSets(visited, level_names), env);
 	}
 }
 
@@ -434,8 +503,8 @@ mmAssertionProofLength(ass : MmAssertion) -> int {
 	}
 }
 
-mmSources2AssertionsArities(sources : Tree<int, MmSource>, out : RuOut) -> Tree<int, int> {
-	fold(mmOrderSources(sources, out), makeTree(), \acc, src ->
+mmSources2AssertionsArities(sources : Tree<int, MmSource>, env : RuEnv) -> Tree<int, int> {
+	fold(mmOrderSources(sources, env), makeTree(), \acc, src ->
 		fold(src.decls, acc, \ac, decl ->
 			switch (decl) {
 				MmAssertion(__,__,__, hyps, __, stat): {
@@ -455,6 +524,21 @@ mmExprStack2s(stack : List<MmExp>, num : int) -> string {
 
 mmHyps2s(hyps : [MmHyp]) -> string {
 	concatStrings(map(hyps, \hyp -> mm2s(hyp) + "\n"));
+}
+
+mmAssertion2s(ass : MmAssertion) -> string {
+	vars = MmVars(filtermap(concat(ass.hyps, ass.inner), \hyp -> switch (hyp) {
+		MmFloating(lab, type, var): Some(var);
+		default: None();
+	}));
+	vars_str = if (length(vars.symbs) == 0) "" else "    " + mmMm2s(vars) + "\n    ";
+	disjs_str = if (length(ass.disjs) == 0) "" else strGlue(map(ass.disjs, mmMm2s), " ") + "\n    ";
+	hyps_str = if (ass.hyps == []) "" else concatStrings(map(ass.hyps, \h -> mmMm2s(h) + "\n    "));
+	inner_str = if (ass.inner == []) "" else concatStrings(map(ass.inner, \h -> mmMm2s(h) + "\n    "));
+	comm_str = if (ass.comment.text == "") "" else mmMm2s(ass.comment) + "\n    ";
+	"${\n" + 
+		vars_str + disjs_str + hyps_str + inner_str + comm_str + mmMm2s(ass.stat) + 
+	"\n$}";
 }
 
 mmIsTrivialSource(src : MmSource) -> bool {
