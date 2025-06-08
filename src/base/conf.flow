@@ -9,9 +9,11 @@ export {
 		projectRoots : [string],
 		workingDir : string,
         verbose : int,
-		opts : Tree<string, string>
+		opts : Tree<string, Json>
 	);
 	ruEmptyConf = RuConf("", [], [], "", -1, makeTree());
+
+	ruOptsString(opts: Tree<string, Json>, opt: string, defval: string) -> string;
 
 	ruTrimPath(file : string, conf : RuConf, ext : string) -> string;
 	ruFindPath(file : string, conf : RuConf, ext : string) -> string;
@@ -22,15 +24,20 @@ export {
 	ruDecVerboseConf(conf : RuConf) -> RuConf;
 	ruFindConfDir(dir : string) -> string;
 
-	ruParams2s(params : [[string]]) -> string;
 	ruParams2Tree(params : [[string]]) -> Tree<string, string>;
+	ruParams2Json(params : [[string]]) -> Tree<string, Json>;
+
 	ruMakeConf(dir_ : string, params : [[string]]) -> RuConf;
 	ruMakeConfDef() -> RuConf;
-	ruMergeOpts(opts1 : Tree<string, string>, opts2 : Tree<string, string>) -> Tree<string, string>;
 
-	ruReadConfFromDir(dir : string) -> Tree<string, string>;
+	ruReadConfFromDir(dir : string) -> RuConf;
+
 	ruConf2Tree(conf : RuConf) -> Tree<string, string>;
 	ruTree2Conf(opts : Tree<string, string>) -> RuConf;
+
+	ruConf2Json(conf: RuConf) -> Json;
+	ruJson2Conf(json: Json) -> RuConf;
+
 	ruMergeConfs(conf1 : RuConf, conf2 : RuConf) -> RuConf;
 	ruSetConf(conf1 : RuConf, opts : Tree<string, string>) -> RuConf;
 	ruSetConfOpt(conf : RuConf, opt : string, val : string) -> RuConf;
@@ -39,6 +46,18 @@ export {
 	ruVerbose(conf : RuConf) -> int;
 
 	ru_conf_fields = ["project", "import-roots", "project-roots", "working-dir", "verbose", "verb"];
+}
+
+ruOptsString(opts: Tree<string, Json>, opt: string, defval: string) -> string {
+	switch (lookupTree(opts, opt)) {
+		Some(val): {
+			switch (val) {
+				JsonString(str): str;
+				default: defval;
+			}
+		}
+		None(): defval;
+	}
 }
 
 ruTrimPath(file : string, conf : RuConf, ext0 : string) -> string {
@@ -140,26 +159,58 @@ ruFindConfDir(dir : string) -> string {
 	}
 }
 
-ruMergeOpts(opts1 : Tree<string, string>, opts2 : Tree<string, string>) -> Tree<string, string> {
-	mergeTreeCustom(opts1, opts2, \opt, val1, val2 -> if (val1 == "") val2 else val1 + "," + val2);
+// In case merging fails the second value overwrites the first one
+ruMergeJsons(val1: Json, val2: Json) -> Json {
+	switch (val1) {
+		JsonString(str1): {
+			switch (val2) {
+				JsonString(str2): if (str1 == "") val2 else JsonString(str1 + "," + str2);
+				default: val2;
+			}
+		}
+		JsonArray(arr1): {
+			switch (val2) {
+				JsonArray(arr2): JsonArray(concat(arr1, arr2));
+				default: val2;
+			}
+		}
+		JsonObject(obj1): {
+			switch (val2) {
+				JsonObject(obj2): {
+					JsonObject(tree2pairs(ruMergeOpts(
+						pairs2tree(obj1),
+						pairs2tree(obj2),
+					)));
+				}
+				default: val2;
+			}
+		}
+		default: val2;
+	}
+}
+
+ruMergeOpts(opts1 : Tree<string, Json>, opts2 : Tree<string, Json>) -> Tree<string, Json> {
+	mergeTreeCustom(opts1, opts2, \opt, val1, val2 -> ruMergeJsons(val1, val2));
 }
 
 ruMakeConf(dir_ : string, params : [[string]]) -> RuConf {
 	dir = rtrim2(strReplace(resolveRelativePath(dir_), "\\", "/"), "/");
-	conf_dir = ruFindConfDir(dir);
-	opts = ruMergeOpts(
-		ruReadConfFromDir(conf_dir), 
-		ruParams2Tree(params)
+	ruMergeConfs(
+		ruReadConfFromDir(ruFindConfDir(dir)), 
+		ruJson2Conf(JsonObject(tree2pairs(ruParams2Json(params))))
 	);
-	ruTree2Conf(opts);
 }
 
 ruMakeConfDef() -> RuConf {
 	ruMakeConf(resolveRelativePath("."), []);
 }
 
-ruParams2s(params : [[string]]) -> string {
-	strGlue(map(params, \param -> strGlue(map(param, \p -> "'" + p + "'"), "=")), "\n");
+ruIsJsonStirng(val: string) -> bool {
+	!strContains(val, "{") && !strContains(val, "\"") && !strContains(val, "[")
+}
+
+ruTree2JsonTree(tree: Tree<string, string>) -> Tree<string, Json> {
+	mapTree(tree, \val -> if (ruIsJsonStirng(val)) JsonString(val) else parseJson(val));
 }
 
 ruParams2Tree(params : [[string]]) -> Tree<string, string> {
@@ -176,26 +227,36 @@ ruParams2Tree(params : [[string]]) -> Tree<string, string> {
 	);
 }
 
-ruReadConfFromDir(dir : string) -> Tree<string, string> {
+ruParams2Json(params : [[string]]) -> Tree<string, Json> {
+	ruTree2JsonTree(ruParams2Tree(params));
+}
+
+ruReadConfFromDir(dir : string) -> RuConf {
 	path = dir + "/russell.conf";
-	if (!fileExists(path)) makeTree() else {
+	if (!fileExists(path)) ruMakeConfDef() else {
 		config = getFileContent(path);
-		lines = strSplit(config, "\n");
-		fold(lines, makeTree(), \acc, l -> {
-			// Skip comment and empty lines in russell.conf
-			line = trim2(l, " \t\r");
-			if (line != "" && !startsWith(line, "#") && !startsWith(line, "//")) {
-				opts = strSplit(line, "=");
-				if (length(opts) == 1) {
-					opt = trim2(opts[0], " \t\r");
-					if (opt == "") acc else setTree(acc, opt, "");
-				} else if (length(opts) == 2) {
-					opt = trim2(opts[0], " \t\r");
-					val = trim2(opts[1], " \t\r");
-					setTree(acc, opt, val)
+		if (startsWith(config, "{")) {
+			// JSON format of config
+			ruJson2Conf(parseJson(config));
+		} else {
+			// ini format of conig
+			lines = strSplit(config, "\n");
+			ruTree2Conf(fold(lines, makeTree(), \acc, l -> {
+				// Skip comment and empty lines in russell.conf
+				line = trim2(l, " \t\r");
+				if (line != "" && !startsWith(line, "#") && !startsWith(line, "//")) {
+					opts = strSplit(line, "=");
+					if (length(opts) == 1) {
+						opt = trim2(opts[0], " \t\r");
+						if (opt == "") acc else setTree(acc, opt, "");
+					} else if (length(opts) == 2) {
+						opt = trim2(opts[0], " \t\r");
+						val = trim2(opts[1], " \t\r");
+						setTree(acc, opt, val)
+					} else acc;
 				} else acc;
-			} else acc;
-		});
+			}));
+		}
 	}
 }
 
@@ -206,29 +267,26 @@ ruConf2Json(conf : RuConf) -> Json {
 		Pair("projectRoots", JsonArray(map(conf.projectRoots, \root -> JsonString(root)))),
 		Pair("workingDir", JsonString(conf.workingDir)),
 		Pair("verbose", JsonString(i2s(conf.verbose))),
-		Pair("opts", JsonArray(map(tree2pairs(conf.opts), 
-			\opt -> JsonObject([
-				Pair("key", JsonString(opt.first)),
-				Pair("value", JsonString(opt.second))
-			])
-		)))
+		Pair("opts", JsonObject(tree2pairs(conf.opts)))
 	]);
 }
 
 ru_conf_json_fields = ["project", "importRoots", "projectRoots", "workingDir", "verbose", "opts"];
 
-ruJson2Conf(json : Json) -> Maybe<RuConf> {
-	if (exists(ru_conf_json_fields, \field -> !jsonObjectHasField(json, field))) None() else {
-		opts = pairs2tree(map(getJsonArrayField(json, "opts"), 
-			\opt -> Pair(getJsonStringField(opt, "key", ""), getJsonStringField(opt, "value", ""))
-		));
-		Some(ruTree2Conf(opts));
-	}
+ruJson2Conf(json : Json) -> RuConf {
+	RuConf(
+		getJsonStringField(json, "project", ""),
+		filtermap(getJsonArrayField(json, "importRoots"), getJsonStringValueM),
+		filtermap(getJsonArrayField(json, "projectRoots"), getJsonStringValueM),
+		getJsonStringField(json, "workingDir", ""),
+		getJsonIntField(json, "verbose", -1),
+		pairs2tree(getJsonObjectField(json, "opts").members),
+	);
 }
 
 ruConf2Tree(conf : RuConf) -> Tree<string, string> {
 	mergeTree(
-		conf.opts,
+		mapTree(conf.opts, \val -> json2string(val)),
 		pairs2tree(filtermap([
 			if (conf.project == "") None() else Some(Pair("project", conf.project)),
 			if (conf.importRoots == []) None() else Some(Pair("import-roots", strGlue(conf.importRoots, ","))),
@@ -265,13 +323,16 @@ ruMergeConfs(conf1 : RuConf, conf2 : RuConf) -> RuConf {
 		uniq(concat(conf1.projectRoots, conf2.projectRoots)),
 		if (conf2.workingDir != "") conf2.workingDir else conf1.workingDir,
 		if (conf2.verbose != -1) conf2.verbose else conf1.verbose,
-		mergeTree(conf1.opts, conf2.opts)
+		ruMergeOpts(conf1.opts, conf2.opts)
 	);
 }
 
 ruTrimOpts(opts : Tree<string, string>) -> Tree<string, string> {
 	foldTree(opts, makeTree(), \key, val, acc ->
-		setTree(acc, trim2(key, "\t\n\r "), trim2(val, " \t\n\r"))
+		setTree(acc,
+			trim2(key, "\t\n\r "),
+			trim2(val, " \t\n\r")
+		)
 	);
 }
 
@@ -283,7 +344,7 @@ ruSetConf(conf : RuConf, opts0 : Tree<string, string>) -> RuConf {
 		if (!containsKeyTree(opts, "project-roots")) conf.projectRoots else ruMakePaths(opts, "project-roots"),
 		lookupTreeDef(opts, "working-dir", conf.workingDir),
 		s2i(lookupTreeDef(opts, "verbose", lookupTreeDef(opts, "verb", i2s(conf.verbose)))),
-		mergeTree(conf.opts, filterTree(opts, \opt,__ -> !contains(ru_conf_fields, opt)))
+		ruMergeOpts(conf.opts, ruTree2JsonTree(filterTree(opts, \opt, __ -> !contains(ru_conf_json_fields, opt))))
 	);
 }
 
@@ -303,6 +364,7 @@ ruUnsetConf(conf : RuConf, opts0 : Tree<string, string>) -> RuConf {
 	);
 }
 
+
 ruConf2s(conf : RuConf) -> string {
 	(if (conf.project == "")       "" else "project=" + conf.project + "\n") +
 	(if (conf.importRoots == [])   "" else "import-roots=" + strGlue(conf.importRoots, ",") + "\n") +
@@ -312,7 +374,7 @@ ruConf2s(conf : RuConf) -> string {
 	(if (sizeTree(conf.opts) == 0) "" else 
 		strGlue(filtermap(tree2pairs(conf.opts), \p -> 
 			if (contains(ru_conf_fields, p.first)) None() else
-			Some(if (p.second == "") p.first else p.first + "=" + p.second)
+			Some(if (p.second == JsonNull()) p.first else p.first + "=" +  json2string(p.second))
 		), "\n")
 	);
 }
