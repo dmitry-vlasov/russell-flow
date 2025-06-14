@@ -3,16 +3,15 @@ import ru/parse/exps/parser;
 import ru/src;
 
 export {
-	ruParseExp(term : RuTerm, lang : RuLang, place : RuPlace, env : RuEnv) -> Maybe<RuExp>;
-	ruCreateTypeParsers(term : RuTerm, lang : RuLang, env : RuEnv) -> Tree<int, RuTypeParser>;
+	ruParseExps(types: [int], nodes : [RuTermNode], lang : RuLang, place : RuPlace, env : RuEnv) -> Maybe<[RuExp]>;
 }
 
-ruCreateTypeParsers(term : RuTerm, lang : RuLang, env : RuEnv) -> Tree<int, RuTypeParser> {
+ruCreateTypeParsers(nodes : [RuTermNode], lang : RuLang, env : RuEnv) -> Tree<int, RuTypeParser> {
 	types = foldTree(lang.types, 
 		makeTree(), 
 		\id, type, acc -> setTree(acc, id, ruMakeTypeParser(type, env))
 	);
-	symbs = fold(term.nodes, makeSet(), \acc, node -> 
+	symbs = fold(nodes, makeSet(), \acc, node -> 
 		switch (node) {
 			RuVar(__, type): acc;
 			RuConstRef(c): insertSet(acc, c);
@@ -33,45 +32,61 @@ ruCreateTypeParsers(term : RuTerm, lang : RuLang, env : RuEnv) -> Tree<int, RuTy
 	);
 }
 
-ruParseExp(term : RuTerm, lang : RuLang, place : RuPlace, env : RuEnv) -> Maybe<RuExp> {
-	if (length(term.nodes) == 0) {
+RuParseAcc(
+	exps : [RuExp],
+	pos : int,
+);
+
+ruParseExps(tps: [int], nodes : [RuTermNode], lang : RuLang, place : RuPlace, env : RuEnv) -> Maybe<[RuExp]> {
+	if (length(nodes) == 0) {
 		env.out.error("empty expression is met", []);
 		None()
 	} else {
-		types = ruCreateTypeParsers(term, lang, env);
-		switch (lookupTree(types, term.type)) {
-			Some(tenv): {
-				ret = maybeMap(
-					ruParseExpr(RuParseEnv(term.nodes, types, lang, env), 0, RuParseStack(None(), 0, 0, term.type, tenv.trie, [])),
-					\nodes -> RuExp(map(nodes, \n -> switch (n) {
-						RuVar(__,__): n;
-						RuParsedRule(a, b): RuRuleNode(a, b);
-					}), term.pos)
-				);
-				if (ret == None()) {
-					term_symbs = set2array(fold(term.nodes, makeSet(),
-						\acc, node -> 
-							switch (node) {
-								RuVar(__, type): acc;
-								RuConstRef(c): insertSet(acc, c);
+		types = ruCreateTypeParsers(nodes, lang, env);
+		maybeBind(
+			fold(tps,
+				Some(RuParseAcc([], 0)),
+				\macc, type -> maybeBind(macc,
+					\acc -> switch (lookupTree(types, type)) {
+						Some(tenv): {
+							ret = maybeMap(
+								ruParseExpr(
+									RuParseEnv(nodes, types, lang, env),
+									acc.pos,
+									RuParseStack(None(), acc.pos, acc.pos, type, tenv.trie, [])
+								),
+								\ns -> RuParseAcc(arrayPush(acc.exps, RuExp(ns, acc.pos)), )
+							);
+							if (ret == None()) {
+								term_symbs = set2array(fold(nodes, makeSet(),
+									\ac, node -> 
+										switch (node) {
+											RuVar(__,__): ac;
+											RuConstRef(c): insertSet(ac, c);
+										}
+								));
+								err = "expr: '" + ruTypedTermNodes2s(nodes) + "' was not parsed" +
+									(if (env.conf.verbose <= 1) "" else 
+									"\n" + ruTypeParserTree2s(types) + "\n" +
+									"term symbs: " + strGlue(map(term_symbs, id2s), ", ") + "\n" + 
+									"all rules:\n" + concatStrings(map(getTreeValues(lang.rules), \r -> "\t" + ruTerm2s(r.term) + "\n")));
+								env.out.error(err, [place]);
+								//ruCrash("parser failure:\n" + err + "\n\n");
 							}
-					));
-					err = "expr: '" + ruTypedTerm2s(term) + "' was not parsed" +
-						(if (env.conf.verbose <= 1) "" else 
-						 "\n" + ruTypeParserTree2s(types) + "\n" +
-						"term symbs: " + strGlue(map(term_symbs, id2s), ", ") + "\n" + 
-						"all rules:\n" + concatStrings(map(getTreeValues(lang.rules), \r -> "\t" + ruTerm2s(r.term) + "\n")));
-					env.out.error(err, [place]);
-					//ruCrash("parser failure:\n" + err + "\n\n");
-				}
-				ret
-			}
-			None(): {
-				env.out.error("unknown type: '" + id2s(term.type) + "', term: " + ruTypedTerm2s(term), [place]);
-				fail("AAA");
+							ret
+						}
+						None(): {
+							env.out.error("unknown type: '" + id2s(type) + "', term: " + ruTypedTermNodes2s(nodes), [place]);
+							fail("AAA");
+							None();
+						}
+					}
+				)
+			), \acc: RuParseAcc -> if (acc.pos == length(nodes)) Some(acc.exps) else {
+				env.out.error("some extra expressinn leftover is not parsed, term: " + ruTypedTermNodes2s(nodes), [place]);
 				None();
 			}
-		}
+		)
 	}
 }
 
@@ -87,8 +102,8 @@ RuParseStack(
 	start : int,
 	curr : int,
 	type_id : int,
-	trie : RuTrie2<int, RuParsedRule>,
-	expr : [[RuParsedNode]],
+	trie : RuTrie2<int, RuRuleNode>,
+	expr : [[RuExpNode]],
 );
 
 ruPopExprStack(env : RuParseEnv, pos : int, stack : RuParseStack) -> RuParseStack {
@@ -102,8 +117,8 @@ ruPopExprStack(env : RuParseEnv, pos : int, stack : RuParseStack) -> RuParseStac
 							expr = concat(
 								[
 									concat(
-										[RuParsedRule(
-											rf.ruleType,
+										[RuRuleNode(
+											rf.idType,
 											ruMakeArityLen(ruArityLen2Arity(rf.arityLen), length(subexpr))
 										)], 
 										subexpr
@@ -121,14 +136,14 @@ ruPopExprStack(env : RuParseEnv, pos : int, stack : RuParseStack) -> RuParseStac
 	}
 }
 
-ruParseExpr(env : RuParseEnv, pos : int, stack0 : RuParseStack) -> Maybe<[RuParsedNode]> {
+ruParseExpr(env : RuParseEnv, pos : int, stack0 : RuParseStack) -> Maybe<[RuExpNode]> {
 	stack = RuParseStack(stack0 with curr = pos);
 	if (pos == length(env.nodes)) {
 		expr = concatA(reverseA(stack.expr));
 		switch (stack.trie.data) {
 			Some(rf): Some(concat(
-				[RuParsedRule(
-					rf.ruleType, 
+				[RuRuleNode(
+					rf.idType, 
 					ruMakeArityLen(ruArityLen2Arity(rf.arityLen), length(expr))
 				)], 
 				expr
