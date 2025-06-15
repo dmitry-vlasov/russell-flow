@@ -55,7 +55,7 @@ ruParseExps(tps: [int], nodes : [RuTermNode], lang : RuLang, place : RuPlace, en
 									acc.pos,
 									RuParseStack(None(), acc.pos, acc.pos, type, tenv.trie, [])
 								),
-								\ns -> RuParseAcc(arrayPush(acc.exps, RuExp(ns, acc.pos)), )
+								\pair -> RuParseAcc(arrayPush(acc.exps, RuExp(reverseA(pair.first), acc.pos)), pair.second)
 							);
 							if (ret == None()) {
 								term_symbs = set2array(fold(nodes, makeSet(),
@@ -106,145 +106,109 @@ RuParseStack(
 	expr : [[RuExpNode]],
 );
 
+ruDoConcatAReversed(i: int, expr : [[RuExpNode]], acc: [RuExpNode]) -> [RuExpNode] {
+	if (i == -1) acc else {
+		ruDoConcatAReversed(i - 1, expr, concat(acc, expr[i]))
+	}
+}
+
+ruConcatAReversed(expr : [[RuExpNode]]) -> [RuExpNode] {
+	ruDoConcatAReversed(length(expr) - 1, expr, [])
+}
+
 ruPopExprStack(env : RuParseEnv, pos : int, stack : RuParseStack) -> RuParseStack {
 	switch (stack.trie.data) {
 		Some(rf): {
+			subexpr = ruConcatAReversed(stack.expr);
+			full_expr = arrayPush(subexpr,
+				RuRuleNode(
+					rf.idType,
+					ruMakeArityLen(ruArityLen2Arity(rf.arityLen), length(subexpr))
+				),
+			);
 			switch (stack.parent) {
 				Some(parent): {
-					subexpr = concatA(reverseA(stack.expr));
 					ruPopExprStack(env, pos, 
-						RuParseStack(parent with
-							expr = concat(
-								[
-									concat(
-										[RuRuleNode(
-											rf.idType,
-											ruMakeArityLen(ruArityLen2Arity(rf.arityLen), length(subexpr))
-										)], 
-										subexpr
-									)
-								], 
-								parent.expr
-							)
-						)
+						RuParseStack(parent with expr = arrayPush(parent.expr, full_expr))
 					);
 				}
-				None(): stack;
+				None(): 
+					RuParseStack(stack with expr = [full_expr]);
 			}
 		}
 		None(): stack;
 	}
 }
 
-ruParseExpr(env : RuParseEnv, pos : int, stack0 : RuParseStack) -> Maybe<[RuExpNode]> {
+ruParseExpr(env : RuParseEnv, pos : int, stack0 : RuParseStack) -> Maybe<Pair<[RuExpNode], int>> {
 	stack = RuParseStack(stack0 with curr = pos);
-	if (pos == length(env.nodes)) {
-		expr = concatA(reverseA(stack.expr));
-		switch (stack.trie.data) {
-			Some(rf): Some(concat(
-				[RuRuleNode(
-					rf.idType, 
-					ruMakeArityLen(ruArityLen2Arity(rf.arityLen), length(expr))
-				)], 
-				expr
-			));
-			None(): Some(expr);
-		}
-	} else {
-		do_step = \st, n -> {
-			poped = ruPopExprStack(env, pos, RuParseStack(st with trie = n));
+	do_step = \st, n -> {
+		poped = ruPopExprStack(env, pos, RuParseStack(st with trie = n));
+		if (ruTrie2IsEnd(poped.trie) && isNone(poped.parent)) {
+			Some(Pair(poped.expr[0], pos + 1));
+		} else {
 			ruParseExpr(env, pos + 1, poped);
 		}
-		try_var = \t, n -> {
-			switch (lookupTree(env.types, t)) {
-				Some(tenv): {
-					if (t == stack.type_id && stack.curr == stack.start) None() else {
-						ruParseExpr(env, pos, 
-							RuParseStack(
-								Some(RuParseStack(stack with trie = n)), 
-								pos, pos, t, tenv.trie, []
-							)
-						)
-					}
-				}
-				None(): None();
-			}
-		}
-		try_supers1 = \v, t -> {
-			foldTree(stack.trie.map1, None(), \tp, m, ac -> 
-				if (ac != None()) ac else {
-					x = try_var(tp, m);
-					if (isSome(x)) x else {
-						switch (m.data) {
-							Some(r): {
-								do_step(RuParseStack(stack with expr = concat([[r, RuVar(v, t)]], stack.expr)), m);
-							}
-							None(): None();
-						}
-					}
-				}
-			);
-		}
-		try_supers = \v, t -> {
-			supers = lookupTreeDef(env.types, t, ruNoTypeParser).supers;
-			foldTree(stack.trie.map1, None(), \tp, m, ac -> 
-				if (ac != None()) ac else {
-					//x = try_var(tp, m);
-					//if (isSome(x)) x else {
-						switch (lookupTree(supers, tp)) {
-							Some(r): {
-								ret = do_step(RuParseStack(stack with 
-									expr = concat(
-										[[
-											ruMakeParsedRule(r.info.id, r.term.type, 1, 1), 
-											RuVar(v, t)
-										]], 
-										stack.expr
-									)
-								), m);
-								if (isSome(ret)) ret else 
-									//ac;
-									try_var(tp, m);
-									//None();
-							}
-							None(): 
-								//ac;
-								try_var(tp, m);
-								//None();
-						}
-					//}
-				}
-			);
-		}
-		try_vars = \-> {
-			foldTree(stack.trie.map1, None(), \t, n, ac ->
-				if (ac != None()) ac else {
-					try_var(t, n);
-				}
+	}
+	try_var = \t, n -> maybeBind(lookupTree(env.types, t),
+		\tenv -> if (t == stack.type_id && stack.curr == stack.start) None() else {
+			ruParseExpr(env, pos,
+				RuParseStack(
+					Some(RuParseStack(stack with trie = n)), 
+					pos, pos, t, tenv.trie, []
+				)
 			)
 		}
-		switch (env.nodes[pos]) {
-			RuVar(v, t_id): {
-				switch (lookupTree(stack.trie.map1, t_id)) {
-					Some(n): {
-						switch (do_step(RuParseStack(stack with expr = concat([[RuVar(v, t_id)]], stack.expr)), n)) {
+	);
+	try_supers = \v, t -> {
+		supers = lookupTreeDef(env.types, t, ruNoTypeParser).supers;
+		foldTree(stack.trie.map1, None(), \tp, m, ac -> 
+			if (isSome(ac)) ac else {
+				switch (lookupTree(supers, tp)) {
+					Some(r): {
+						switch (do_step(RuParseStack(stack with 
+							expr = arrayPush(
+								stack.expr,
+								[
+									RuVar(v, t),
+									ruMakeParsedRule(r.info.id, r.term.type, 1, 1),
+								], 
+							)
+						), m)) {
 							Some(ret): Some(ret);
-							None(): try_supers(v, t_id);
+							None(): try_var(tp, m);
 						}
 					}
-					None(): try_supers(v, t_id);
+					None(): try_var(tp, m);
 				}
 			}
-			RuConstRef(id): {
-				switch (lookupTree(stack.trie.map2, id)) {
-					Some(n): {
-						switch (do_step(stack, n)) {
-							Some(ret): Some(ret);
-							None(): try_vars();
-						}
+		);
+	}
+	switch (env.nodes[pos]) {
+		RuVar(v, t_id): {
+			switch (lookupTree(stack.trie.map1, t_id)) {
+				Some(n): {
+					switch (do_step(RuParseStack(stack with expr = arrayPush(stack.expr, [RuVar(v, t_id)])), n)) {
+						Some(ret): Some(ret);
+						None(): try_supers(v, t_id);
 					}
-					None(): try_vars();
 				}
+				None(): try_supers(v, t_id);
+			}
+		}
+		RuConstRef(id): {
+			switch (lookupTree(stack.trie.map2, id)) {
+				Some(n): {
+					switch (do_step(stack, n)) {
+						Some(ret): Some(ret);
+						None(): foldTree(stack.trie.map1, None(), \t, v, ac ->
+							if (isSome(ac)) ac else try_var(t, v)
+						);
+					}
+				}
+				None(): foldTree(stack.trie.map1, None(), \t, v, ac ->
+					if (isSome(ac)) ac else try_var(t, v)
+				);
 			}
 		}
 	}
