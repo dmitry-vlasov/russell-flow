@@ -57,6 +57,7 @@ ruParseExps(tps: [int], nodes : [RuTermNode], lang : RuLang, place : RuPlace, en
 		//debug := ^counter == 40;
 		//println("COUNTER: " + i2s(^counter) + " EXP: " + ruTerm2s(RuTerm(tps[0], nodes, -1)));
 		types = ruCreateTypeParsers(nodes, lang, env);
+		subs = ruBuildSubtypes(lang);
 		maybeBind(
 			fold(tps,
 				Some(RuParseAcc([], 0)),
@@ -65,7 +66,7 @@ ruParseExps(tps: [int], nodes : [RuTermNode], lang : RuLang, place : RuPlace, en
 						Some(tenv): {
 							ret = maybeMap(
 								ruParseExpr(
-									RuParseEnv(nodes, types, lang, env),
+									RuParseEnv(nodes, types, subs, lang, env),
 									acc.pos,
 									RuParseStack(None(), acc.pos, acc.pos, type, tenv.trie, [])
 								),
@@ -116,9 +117,19 @@ ruParseExps(tps: [int], nodes : [RuTermNode], lang : RuLang, place : RuPlace, en
 RuParseEnv(
 	nodes : [RuTermNode],
 	types : Tree<int, RuTypeParser>,
+	subs : Tree<int, [int]>,  // type -> list of immediate subtypes
 	lang : RuLang,
 	env : RuEnv,
 );
+
+// Build subtype mapping: for each type, which types have it as a super
+ruBuildSubtypes(lang : RuLang) -> Tree<int, [int]> {
+	foldTree(lang.types, makeTree(), \typeId, type, acc ->
+		fold(type.supers, acc, \ac, superId ->
+			setTree(ac, superId, arrayPush(lookupTreeDef(ac, superId, []), typeId))
+		)
+	)
+}
 
 RuParseStack(
 	parent : Maybe<RuParseStack>,
@@ -186,6 +197,23 @@ ruParseExprTryVar(pos : int, type: int, n: RuTrie2<int, RuRuleNode>, stack : RuP
 	)
 }
 
+// Try parsing with subtypes of the expected type, wrapping result with super rule
+ruParseExprTrySubtypes(pos : int, expectedType: int, n: RuTrie2<int, RuRuleNode>, stack : RuParseStack, env : RuParseEnv) -> Maybe<Pair<[RuExpNode], int>> {
+	subtypes = lookupTreeDef(env.subs, expectedType, []);
+	fold(subtypes, None(), \acc, subtype ->
+		if (isSome(acc)) acc else {
+			// Try parsing as subtype
+			switch (ruParseExprTryVar(pos, subtype, n, stack, env)) {
+				Some(ret): Some(ret);  // subtype parsed successfully, super rule already applied via supers
+				None(): {
+					// Recursively try subtypes of subtype
+					ruParseExprTrySubtypes(pos, subtype, n, stack, env)
+				}
+			}
+		}
+	)
+}
+
 ruParseExprTrySupers(pos : int, var: int, type: int, stack : RuParseStack, env : RuParseEnv) -> Maybe<Pair<[RuExpNode], int>> {
 	supers = lookupTreeDef(env.types, type, ruNoTypeParser).supers;
 	foldTree(stack.trie.map1, None(), \tp, m, acc -> 
@@ -238,12 +266,22 @@ ruParseExpr(env : RuParseEnv, pos : int, stack0 : RuParseStack) -> Maybe<Pair<[R
 					switch (ruParseExprStep(pos, n, stack, env)) {
 						Some(ret): Some(ret);
 						None(): foldTree(stack.trie.map1, None(), \t, v, ac ->
-							if (isSome(ac)) ac else ruParseExprTryVar(pos, t, v, stack, env)
+							if (isSome(ac)) ac else {
+								switch (ruParseExprTryVar(pos, t, v, stack, env)) {
+									Some(ret2): Some(ret2);
+									None(): ruParseExprTrySubtypes(pos, t, v, stack, env);
+								}
+							}
 						);
 					}
 				}
 				None(): foldTree(stack.trie.map1, None(), \t, v, ac ->
-					if (isSome(ac)) ac else ruParseExprTryVar(pos, t, v, stack, env)
+					if (isSome(ac)) ac else {
+						switch (ruParseExprTryVar(pos, t, v, stack, env)) {
+							Some(ret): Some(ret);
+							None(): ruParseExprTrySubtypes(pos, t, v, stack, env);
+						}
+					}
 				);
 			}
 		}
