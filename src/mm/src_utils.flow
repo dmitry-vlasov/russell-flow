@@ -19,6 +19,7 @@ export {
 	mmStripComments(src : MmSource) -> MmSource;
 
 	mmStatIsRule(conf : RuConf) -> (MmStat) -> bool;
+	mmStatType(conf : RuConf) -> (MmExp) -> Maybe<[int]>;
 	mmStatIsDef(conf : RuConf) -> (MmStat) -> bool;
 	mmFactorDefEqInd(ex : MmExp) -> int;
 	mmFactorDefNotationInd(ex : MmExp) -> int;
@@ -266,19 +267,69 @@ mmStripComments(src : MmSource) -> MmSource {
 }
 
 mmStatIsRule(conf : RuConf) -> (MmStat) -> bool {
-	stmts = mergeSets(
-		makeSet1(ruIdTurnstile()),
-		buildSet(filtermap(strSplit(lookupTreeDef(conf.opts, "mm-stmts", ""), ","),
-			\x -> if (isSpace(x)) None() else Some(s2id(x))
-		))
+	stmts = foldTree(
+		ruOptsTreeJson(conf.opts, "mm-stmts", makeTree()),
+		makeSet(),
+		\k,__, acc -> insertSet(acc, s2id(k))
 	);
+	/*println("stmts: " +
+		strIndent(superglue(set2array(stmts), id2s, ", "))
+	);*/
 	\stat -> length(stat.expr.symbs) > 0 && !containsSet(stmts, mmSymbLiteral(stat.expr.symbs[0]));
 }
 
+mmStatType(conf : RuConf) -> (MmExp) -> Maybe<[int]> {
+	stmts = foldTree(
+		ruOptsTreeJson(conf.opts, "mm-stmts", makeTree()),
+		makeTree(),
+		\class, ts, acc -> {
+			switch (ts) {
+				JsonArray(types): setTree(acc,
+					s2id(class),
+					map(types, \type ->
+						s2id(getJsonStringValue(type, "???"))
+					)
+				);
+				default: fail0("must be JSON array");
+			}
+		}
+	);
+	/*println("mm-stmts:\n" +
+		strIndent(superglue(tree2pairs(stmts),
+			\p -> id2s(p.first) + " => [" + superglue(p.second, id2s, ", ") + "]",
+			"\n"
+		))
+	);*/
+	\expr -> if (length(expr.symbs) == 0) None() else lookupTree(stmts, mmSymbLiteral(expr.symbs[0]));
+}
+
 mmStatIsDef(conf : RuConf) -> (MmStat) -> bool {
+	forbidden = buildSet(map(["notation-reflexivity", "notation-symmetry", "notation-transitivity"], s2id));
+	detect_congruence = \nodes -> {
+		/*
+		${
+			notation-app.0 $e #Notation ph0 ph2 $.
+			notation-app.1 $e #Notation ph1 ph3 $.
+			notation-app $a #Notation ( \app ph0 ph1 ) ( \app ph2 ph3 ) $.
+		$}*/
+		(length(nodes) % 2 == 0) && {
+			n1 = subrange(nodes, 0, length(nodes) / 2);
+			n2 = subrange(nodes, length(nodes) / 2, length(nodes) / 2);
+			mmSymbLiteral(n1[0]) == ruIdLeftBracket() &&
+			mmSymbLiteral(n2[0]) == ruIdLeftBracket() &&
+			mmSymbLiteral(n1[length(n1) - 1]) == ruIdRightBracket() &&
+			mmSymbLiteral(n2[length(n2) - 1]) == ruIdRightBracket() &&
+			n1[1] == n2[1] &&
+			forall(subrange(n1, 2, length(n1) - 3), mmSymbIsVar) &&
+			forall(subrange(n2, 2, length(n2) - 3), mmSymbIsVar);
+		}
+	}
 	\stat -> 
 		   (startsWith(id2s(stat.label), "df-") && mmFactorDefEqInd(stat.expr) > -1)
-		|| (length(stat.expr.symbs) > 0 && mmSymbLiteral(stat.expr.symbs[0]) == ruIdNotation())
+		|| (length(stat.expr.symbs) > 0
+			&& mmSymbLiteral(stat.expr.symbs[0]) == ruIdNotation())
+			&& !containsSet(forbidden, stat.label)
+			&& !detect_congruence(tail(stat.expr.symbs))
 }
 
 MmFactorDefEqAcc(
@@ -453,16 +504,12 @@ mmOrderSources(sources : Tree<int, MmSource>, env : RuEnv) -> [MmSource] {
 }
 
 mmDoOrderSources(srcs : [MmSource], acc : [MmSource], visited: Set<int>, env : RuEnv) -> [MmSource] {
-	resolve_import = \imp -> s2id(changeFileExt(ruFindPath(id2s(imp.module), env.conf, "mm"), ""));
-	new_level = filter(srcs, \src ->
-		forall(src.imports, \imp ->
-			containsSet(visited, resolve_import(imp))
-		)
-	);
+	new_level = filter(srcs, \src -> forall(src.imports, \imp -> containsSet(visited, imp.module)));
 	level_names = buildSet(map(new_level, \src -> s2id(src.info.module)));
 	if (new_level == []) {
 		if (length(srcs) == 0) acc else {
-			err_msg = "Cycilc imports detected, sources:\n" +
+			resolve_import = \imp -> s2id(changeFileExt(ruFindPath(id2s(imp.module), env.conf, "mm"), ""));
+			err_msg = "Cycilc imports detected while doing toposort on sources:\n" +
 				strIndent(strGlue(map(srcs, \src -> src.info.module), "\n")) + "\n" +
 				"visited:\n" +
 				strIndent(strGlue(map(set2array(visited), id2s), "\n")) + "\n" +
@@ -470,7 +517,7 @@ mmDoOrderSources(srcs : [MmSource], acc : [MmSource], visited: Set<int>, env : R
 				strIndent(strGlue(map(srcs, \src ->
 					id2s(src.info.id) + " imports:\n" +
 						strIndent(strGlue(map(src.imports, \imp ->
-							"'" + id2s(imp.module) + "' ==? '" + id2s(resolve_import(imp)) + "'"
+							"'" + id2s(imp.module) + "' (full path: '" + id2s(resolve_import(imp)) + "')"
 						), "\n")) + "\n"
 				), "\n"));
 			env.out.error(err_msg, []);
