@@ -323,23 +323,79 @@ ruUnsafeCompose(s1 : RuSubst, s2 : RuSubst) -> RuSubst {
 	RuSubst(m);
 }
 
+// Peel coercion wrapper nodes from `exp` until inner expression has type `target`.
+// Only peels nodes that are recognized coercion rules (via ruSuperRule).
+// Returns None() if `exp` cannot be peeled to `target` type.
+ruPeelToType(exp : RuExp, target : int, lang : RuLang, env : RuEnv) -> Maybe<RuExp> {
+	if (length(exp.nodes) == 0) None()
+	else {
+		switch (exp.nodes[0]) {
+			RuVar(__, t): if (t == target) Some(exp) else None();
+			RuRuleNode(rt, al): {
+				outer_type = ruIdType2Type(rt);
+				r = ruIdType2Id(rt);
+				if (outer_type == target) Some(exp)
+				else {
+					arity = ruArityLen2Arity(al);
+					len = ruArityLen2Len(al);
+					if (arity == 1 && len > 0) {
+						inner = RuExp(subrange(exp.nodes, 1, len), exp.pos);
+						inner_type = switch (inner.nodes[0]) {
+							RuRuleNode(irt,__): ruIdType2Type(irt);
+							RuVar(__,t): t;
+						};
+						maybeBind(ruSuperRule(inner_type, outer_type, lang, env), \super_rule ->
+							if (super_rule.info.id == r) {
+								if (inner_type == target) Some(inner)
+								else ruPeelToType(inner, target, lang, env)
+							} else None()
+						)
+					} else None()
+				}
+			}
+		}
+	}
+}
+
+// Apply coercion chain from `from` to `to`, building full intermediate steps.
+// For EV → Pattern, generates [VP-node, EV-V-node, exp] (full chain, not shortcut).
+ruApplyCoercions(exp : RuExp, from : int, to : int, lang : RuLang, env : RuEnv) -> Maybe<RuExp> {
+	if (from == to) {
+		Some(exp)
+	} else {
+		switch (ruSuperRule(from, to, lang, env)) {
+			Some(rule): {
+				Some(RuExp(
+					concat([ruMakeRuleNode(rule.info.id, to, 1, length(exp.nodes))], exp.nodes),
+					exp.pos
+				))
+			}
+			None(): {
+				from_type = lookupTreeDef(lang.types, from, ruNoType);
+				fold(from_type.supers, None(), \acc, intermediate ->
+					if (isSome(acc)) acc else {
+						maybeBind(ruApplyCoercions(exp, from, intermediate, lang, env), \inner ->
+							ruApplyCoercions(inner, intermediate, to, lang, env)
+						)
+					}
+				)
+			}
+		}
+	}
+}
+
 ruMatchExp(e : RuExp, pattern : RuExp, math : RuMath, env : RuEnv) -> Maybe<RuSubst> {
 	add2s = \i, p : Pair<Tree<RuVar, RuExp>, int>, v, ex ->
 		switch (lookupTree(p.first, v)) {
 			Some(e1): if (ex.nodes == e1.nodes) Some(Pair(p.first, p.second + i)) else None();
 			None(): Some(Pair(setTree(p.first, v, ex), p.second + i));
 		}
-	addVar = \i, t1, t2, n1, p, ec -> 
-		if (t1 == t2) { 
+	addVar = \i, t1, t2, n1, p, ec ->
+		if (t1 == t2) {
 			add2s(i, p, n1, ec());
 		} else {
-			maybeBind(ruSuperRule(t2, t1, math.decls.lang, env), \super ->
-				add2s(i, p, n1, 
-					RuExp(
-						concat([ruMakeRuleNode(super.info.id, t1, 1, 1)], ec().nodes),
-						e.pos
-					)
-				)
+			maybeBind(ruApplyCoercions(ec(), t2, t1, math.decls.lang, env), \coerced ->
+				add2s(i, p, n1, coerced)
 			)
 		}
 	maybeMap(fold(pattern.nodes, Some(Pair(makeTree(), 0)), \acc, n1 ->
@@ -359,10 +415,18 @@ ruMatchExp(e : RuExp, pattern : RuExp, math : RuMath, env : RuEnv) -> Maybe<RuSu
 					n2 = e.nodes[p.second];
 					switch (n2) {
 						RuRuleNode(rt2, al2): {
-							r2 = ruIdType2Id(rt2);
 							t2 = ruIdType2Type(rt2);
 							len = ruArityLen2Len(al2);
-							addVar(len + 1, t1, t2, n1, p, \-> RuExp(subrange(e.nodes, p.second, len + 1), e.pos));
+							full_exp = RuExp(subrange(e.nodes, p.second, len + 1), e.pos);
+							result = addVar(len + 1, t1, t2, n1, p, \-> full_exp);
+							// If normal matching failed, try peeling coercion wrappers.
+							// Handles the case where the expression has been over-coerced (e.g.,
+							// Symbol parsed in Pattern context) but the pattern expects the original type.
+							if (isSome(result)) result else {
+								maybeBind(ruPeelToType(full_exp, t1, math.decls.lang, env), \peeled ->
+									add2s(len + 1, p, n1, peeled)
+								)
+							}
 						}
 						RuVar(__,t2):
 							addVar(1, t1, t2, n1, p, \-> RuExp([n2], e.pos));
