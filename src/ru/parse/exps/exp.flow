@@ -15,11 +15,11 @@ ruParseExp(term: RuTerm, lang : RuLang, place : RuPlace, env : RuEnv) -> Maybe<R
 }
 
 ruCreateTypeParsers(nodes : [RuTermNode], lang : RuLang, env : RuEnv) -> Tree<int, RuTypeParser> {
-	types = foldTree(lang.types, 
-		makeTree(), 
+	types = foldTree(lang.types,
+		makeTree(),
 		\id, type, acc -> setTree(acc, id, ruMakeTypeParser(type, env))
 	);
-	symbs = fold(nodes, makeSet(), \acc, node -> 
+	symbs = fold(nodes, makeSet(), \acc, node ->
 		switch (node) {
 			RuVar(__, type): acc;
 			RuConstRef(c): insertSet(acc, c);
@@ -34,10 +34,62 @@ ruCreateTypeParsers(nodes : [RuTermNode], lang : RuLang, env : RuEnv) -> Tree<in
 					default: true;
 				}
 			)
-		), 
+		),
 		types,
 		\acc, rule -> ruAddRule2TypeParserTree(rule, acc, env)
 	);
+}
+
+// Global cache: FIRST sets computed once from the full lang.
+// Key: sizeTree(lang.rules) — used to detect lang changes between calls.
+// Value: type_id -> set of constants that can appear as first token of any expression of that type.
+ruLangFirstConstsCache : ref Pair<int, Tree<int, Set<int>>> = ref Pair(-1, makeTree());
+
+ruGetLangFirstConsts(lang : RuLang) -> Tree<int, Set<int>> {
+	cached = ^ruLangFirstConstsCache;
+	sz = sizeTree(lang.rules);
+	if (cached.first == sz) cached.second
+	else {
+		fc = ruComputeLangFirstConsts(lang);
+		ruLangFirstConstsCache := Pair(sz, fc);
+		fc
+	}
+}
+
+// Compute for each type the set of constants that can appear as the first token of any expression of that type.
+// Uses the FULL lang (not filtered per-expression) so it can be cached.
+// FIRST(t) = { c | rule for t starts with c } ∪ { c | rule for t starts with var of type t', c ∈ FIRST(t') }
+ruComputeLangFirstConsts(lang : RuLang) -> Tree<int, Set<int>> {
+	// Initialize all types with empty sets
+	init = foldTree(lang.types, makeTree(), \id, __, acc -> setTree(acc, id, makeSet()));
+	// Add direct first constants from rules starting with a constant
+	with_direct = foldTree(lang.rules, init, \id, rule, acc ->
+		if (length(rule.term.nodes) == 0) acc else
+		switch (rule.term.nodes[0]) {
+			RuConstRef(c): setTree(acc, rule.term.type, insertSet(lookupTreeDef(acc, rule.term.type, makeSet()), c));
+			default: acc;
+		}
+	);
+	// Propagate: rules starting with a variable of type t' contribute FIRST(t') to FIRST(rule.type)
+	ruPropagateFirstConsts(with_direct, lang.rules)
+}
+
+ruPropagateFirstConsts(sets : Tree<int, Set<int>>, rules : Tree<int, RuRule>) -> Tree<int, Set<int>> {
+	result = foldTree(rules, Pair(sets, false), \id, rule, acc ->
+		if (length(rule.term.nodes) == 0) acc else
+		switch (rule.term.nodes[0]) {
+			RuVar(__, sub_type): {
+				sub_first = lookupTreeDef(acc.first, sub_type, makeSet());
+				curr = lookupTreeDef(acc.first, rule.term.type, makeSet());
+				merged = mergeSets(curr, sub_first);
+				if (sizeSet(merged) == sizeSet(curr)) acc
+				else Pair(setTree(acc.first, rule.term.type, merged), true)
+			}
+			default: acc;
+		}
+	);
+	if (!result.second) result.first
+	else ruPropagateFirstConsts(result.first, rules)
 }
 
 RuParseAcc(
@@ -57,6 +109,7 @@ ruParseExps(tps: [int], nodes : [RuTermNode], lang : RuLang, place : RuPlace, en
 		//debug := ^counter == 40;
 		//println("COUNTER: " + i2s(^counter) + " EXP: " + ruTerm2s(RuTerm(tps[0], nodes, -1)));
 		types = ruCreateTypeParsers(nodes, lang, env);
+		first_consts = ruGetLangFirstConsts(lang);
 		maybeBind(
 			fold(tps,
 				Some(RuParseAcc([], 0)),
@@ -65,7 +118,7 @@ ruParseExps(tps: [int], nodes : [RuTermNode], lang : RuLang, place : RuPlace, en
 						Some(tenv): {
 							ret = maybeMap(
 								ruParseExpr(
-									RuParseEnv(nodes, types, lang, env),
+									RuParseEnv(nodes, types, first_consts, lang, env),
 									acc.pos,
 									RuParseStack(None(), acc.pos, acc.pos, type, tenv.trie, [])
 								),
@@ -80,7 +133,7 @@ ruParseExps(tps: [int], nodes : [RuTermNode], lang : RuLang, place : RuPlace, en
 							);
 							if (ret == None()) {
 								term_symbs = set2array(fold(nodes, makeSet(),
-									\ac, node -> 
+									\ac, node ->
 										switch (node) {
 											RuVar(__,__): ac;
 											RuConstRef(c): insertSet(ac, c);
@@ -91,7 +144,7 @@ ruParseExps(tps: [int], nodes : [RuTermNode], lang : RuLang, place : RuPlace, en
 									"pos: " + i2s(acc.pos) + "\n" +
 									"parsed:\n" + strIndent(superglue(acc.exps, ruExpRPN2s, "\n")) + "\n" +
 									"types:\n" + ruTypeParserTree2s(types) + "\n" +
-									"term symbs: " + strGlue(map(term_symbs, id2s), ", ") + "\n" + 
+									"term symbs: " + strGlue(map(term_symbs, id2s), ", ") + "\n" +
 									"all rules:\n" + concatStrings(map(getTreeValues(lang.rules), \r -> "\t" + ruTerm2s(r.term) + "\n")));
 								env.out.error(err, [place]);
 								//ruCrash("parser failure:\n" + err + "\n\n");
@@ -116,6 +169,7 @@ ruParseExps(tps: [int], nodes : [RuTermNode], lang : RuLang, place : RuPlace, en
 RuParseEnv(
 	nodes : [RuTermNode],
 	types : Tree<int, RuTypeParser>,
+	first_consts : Tree<int, Set<int>>,
 	lang : RuLang,
 	env : RuEnv,
 );
@@ -151,11 +205,11 @@ ruPopExprStack(env : RuParseEnv, pos : int, stack : RuParseStack) -> RuParseStac
 			);
 			switch (stack.parent) {
 				Some(parent): {
-					ruPopExprStack(env, pos, 
+					ruPopExprStack(env, pos,
 						RuParseStack(parent with expr = arrayPush(parent.expr, full_expr))
 					);
 				}
-				None(): 
+				None():
 					RuParseStack(stack with expr = [full_expr]);
 			}
 		}
@@ -178,7 +232,7 @@ ruParseExprTryVar(pos : int, type: int, n: RuTrie2<int, RuRuleNode>, stack : RuP
 		\tenv -> if (type == stack.type_id && stack.curr == stack.start) None() else {
 			ruParseExpr(env, pos,
 				RuParseStack(
-					Some(RuParseStack(stack with trie = n)), 
+					Some(RuParseStack(stack with trie = n)),
 					pos, pos, type, tenv.trie, []
 				)
 			)
@@ -239,18 +293,24 @@ ruParseExpr(env : RuParseEnv, pos : int, stack0 : RuParseStack) -> Maybe<Pair<[R
 			}
 		}
 		RuConstRef(const): {
+			// Only call ruParseExprTryVar(t, ...) if const can be the first token of any expression of type t.
+			// Uses globally cached lang FIRST sets (O(1) per lookup).
+			tryVarIfConstKnown = \t, v, ac ->
+				if (isSome(ac)) ac else {
+					switch (lookupTree(env.first_consts, t)) {
+						None(): ac;
+						Some(first): if (!containsSet(first, const)) ac
+									 else ruParseExprTryVar(pos, t, v, stack, env)
+					}
+				};
 			switch (lookupTree(stack.trie.map2, const)) {
 				Some(n): {
 					switch (ruParseExprStep(pos, n, stack, env)) {
 						Some(ret): Some(ret);
-						None(): foldTree(stack.trie.map1, None(), \t, v, ac ->
-							if (isSome(ac)) ac else ruParseExprTryVar(pos, t, v, stack, env)
-						);
+						None(): foldTree(stack.trie.map1, None(), tryVarIfConstKnown);
 					}
 				}
-				None(): foldTree(stack.trie.map1, None(), \t, v, ac ->
-					if (isSome(ac)) ac else ruParseExprTryVar(pos, t, v, stack, env)
-				);
+				None(): foldTree(stack.trie.map1, None(), tryVarIfConstKnown);
 			}
 		}
 	}
