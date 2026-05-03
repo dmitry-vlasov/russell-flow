@@ -1,0 +1,239 @@
+import ru/util/src;
+import ru/proof_tree;
+import ru/index;
+import ru/subst;
+
+export {
+	RuProofFragment(
+		axiom : RuAxiom,
+		tree  : RuProofTree
+	);
+
+	// Build fragment index (keyed by prop expression, for unification) and
+	// fragment trees map (keyed by synthetic axiom id, for inlining).
+	ruBuildFragments(
+		math      : RuMath,
+		max_depth : int,
+		env       : RuEnv
+	) -> Pair<RuIndex<RuAssertion>, Tree<int, RuProofFragment>>;
+
+	// Post-process a proof tree to replace synthetic fragment steps with
+	// their actual sub-proof trees.
+	ruInlineFragments(
+		tree  : RuProofTree,
+		frags : Tree<int, RuProofFragment>,
+		math  : RuMath,
+		env   : RuEnv
+	) -> RuProofTree;
+}
+
+ruBuildFragments(math : RuMath, max_depth : int, env : RuEnv) -> Pair<RuIndex<RuAssertion>, Tree<int, RuProofFragment>> {
+	if (max_depth <= 0) Pair(ruMakeIndex(), makeTree()) else {
+		id_counter = ref (-10000);
+		next_id = \-> {
+			ret = ^id_counter;
+			id_counter := ^id_counter - 1;
+			ret
+		};
+		all_frags : ref [RuProofFragment] = ref [];
+		traverseInOrder(math.decls.assertions, \__, ass ->
+			switch (ass) {
+				RuTheorem(__,__,__,__): {
+					frags = ruExtractFragments(ass, max_depth, next_id);
+					all_frags := concat(^all_frags, frags);
+				}
+				default: { }
+			}
+		);
+		frags_arr = ^all_frags;
+		frag_index : RuIndex<RuAssertion> = fold(frags_arr, ruMakeIndex(), \acc, frag -> {
+			ass : RuAssertion = frag.axiom;
+			ruSetIndex(ruExp(frag.axiom.infer.prop.exps[0]), ass, acc)
+		});
+		frag_trees = fold(frags_arr, makeTree(), \acc, frag ->
+			setTree(acc, frag.axiom.info.id, frag)
+		);
+		Pair(frag_index, frag_trees)
+	}
+}
+
+ruExtractFragments(th : RuTheorem, max_depth : int, next_id : () -> int) -> [RuProofFragment] {
+	steps = th.proof.steps;
+	n = length(steps);
+	if (n <= 1) [] else {
+		concatA(mapi(steps, \i, __ ->
+			if (i >= n - 1) [] else
+			eitherMap(ruExtractFragment(th, i, max_depth, next_id), \f -> [f], [])
+		))
+	}
+}
+
+ruExtractFragment(th : RuTheorem, root_ind : int, max_depth : int, next_id : () -> int) -> Maybe<RuProofFragment> {
+	steps = th.proof.steps;
+	included = ruCollectFragmentSteps(steps, root_ind, max_depth);
+	if (sizeSet(included) <= 1) None() else {
+		leaf_stmts : ref [RuStmt] = ref [];
+		leaf_keys  : ref Tree<int, int> = ref makeTree();
+		ruDoCollectLeaves(th, root_ind, included, leaf_stmts, leaf_keys);
+		tree = ruBuildFragmentTree(th, root_ind, included, ^leaf_keys);
+		all_vars = fold(^leaf_stmts,
+			ruStmt2Vars(steps[root_ind].stmt),
+			\acc, s -> mergeSets(acc, ruStmt2Vars(s))
+		);
+		frag_var_ids = foldSet(all_vars, makeSet(), \acc, v -> insertSet(acc, v.id));
+		frag_disjs = foldSet(th.infer.vars.disjs, makeSet(), \acc, disj ->
+			if (containsSet(frag_var_ids, disj.v1.id) && containsSet(frag_var_ids, disj.v2.id))
+				insertSet(acc, disj)
+			else acc
+		);
+		vars_tree = foldSet(all_vars, makeTree(), \acc, v -> setTree(acc, v.id, v));
+		leaf_hyps = mapi(^leaf_stmts, \i, s -> RuHyp(i, s, -1));
+		axiom = RuAxiom(
+			RuDeclInfo(next_id(), th.info.src, [], steps[root_ind].pos),
+			RuInference(RuVarsDisjs(vars_tree, frag_disjs), leaf_hyps, steps[root_ind].stmt)
+		);
+		Some(RuProofFragment(axiom, tree))
+	}
+}
+
+// BFS from root_ind collecting step indices up to max_depth.
+ruCollectFragmentSteps(steps : [RuStep], root_ind : int, max_depth : int) -> Set<int> {
+	ruDoCollectFragmentSteps(steps, [Pair(root_ind, 0)], makeSet(), max_depth)
+}
+
+ruDoCollectFragmentSteps(steps : [RuStep], queue : [Pair<int,int>], visited : Set<int>, max_depth : int) -> Set<int> {
+	if (queue == []) visited else {
+		pair    = queue[0];
+		rest    = tail(queue);
+		ind     = pair.first;
+		depth   = pair.second;
+		if (containsSet(visited, ind)) {
+			ruDoCollectFragmentSteps(steps, rest, visited, max_depth)
+		} else {
+			new_visited = insertSet(visited, ind);
+			new_queue = if (depth >= max_depth) rest else
+				fold(steps[ind].refs, rest, \acc, rf ->
+					switch (rf) {
+						RuStepRef(j): arrayPush(acc, Pair(j, depth + 1));
+						RuHypRef(__): acc;
+					}
+				);
+			ruDoCollectFragmentSteps(steps, new_queue, new_visited, max_depth)
+		}
+	}
+}
+
+// Collect leaf stmts in DFS order (left-to-right).
+// Key encoding: hyp h -> -(h+1), step j -> j  (no clash since step indices >= 0).
+ruDoCollectLeaves(
+	th        : RuTheorem,
+	ind       : int,
+	included  : Set<int>,
+	leaf_stmts : ref [RuStmt],
+	leaf_keys  : ref Tree<int, int>
+) -> void {
+	iter(th.proof.steps[ind].refs, \rf ->
+		switch (rf) {
+			RuHypRef(h): {
+				key = -(h + 1);
+				switch (lookupTree(^leaf_keys, key)) {
+					Some(__): { }
+					None(): {
+						leaf_idx = length(^leaf_stmts);
+						leaf_keys  := setTree(^leaf_keys, key, leaf_idx);
+						leaf_stmts := arrayPush(^leaf_stmts, th.infer.hyps[h].stmt)
+					}
+				}
+			}
+			RuStepRef(j): {
+				if (containsSet(included, j)) {
+					ruDoCollectLeaves(th, j, included, leaf_stmts, leaf_keys)
+				} else {
+					key = j;
+					switch (lookupTree(^leaf_keys, key)) {
+						Some(__): { }
+						None(): {
+							leaf_idx = length(^leaf_stmts);
+							leaf_keys  := setTree(^leaf_keys, key, leaf_idx);
+							leaf_stmts := arrayPush(^leaf_stmts, th.proof.steps[j].stmt)
+						}
+					}
+				}
+			}
+		}
+	)
+}
+
+// Build proof tree for the fragment rooted at ind.
+// Leaves become RuProofHyp(leaf_idx, stmt) where leaf_idx is the position
+// in the leaf_stmts array (i.e., the hyp index in the synthetic axiom).
+ruBuildFragmentTree(
+	th       : RuTheorem,
+	ind      : int,
+	included : Set<int>,
+	leaf_keys : Tree<int, int>
+) -> RuProofTree {
+	step = th.proof.steps[ind];
+	children = map(step.refs, \rf ->
+		switch (rf) {
+			RuHypRef(h): {
+				leaf_idx = lookupTreeDef(leaf_keys, -(h + 1), -1);
+				RuProofHyp(leaf_idx, th.infer.hyps[h].stmt)
+			}
+			RuStepRef(j): {
+				if (containsSet(included, j)) {
+					ruBuildFragmentTree(th, j, included, leaf_keys)
+				} else {
+					leaf_idx = lookupTreeDef(leaf_keys, j, -1);
+					RuProofHyp(leaf_idx, th.proof.steps[j].stmt)
+				}
+			}
+		}
+	);
+	RuProofStep(step.assertion, children, step.stmt)
+}
+
+// Replace synthetic fragment steps in a proof tree with their actual sub-trees.
+ruInlineFragments(tree : RuProofTree, frags : Tree<int, RuProofFragment>, math : RuMath, env : RuEnv) -> RuProofTree {
+	switch (tree) {
+		RuProofHyp(__,__): tree;
+		RuProofStep(ass_id, children, stmt): {
+			inlined = map(children, \ch -> ruInlineFragments(ch, frags, math, env));
+			switch (lookupTree(frags, ass_id)) {
+				None(): RuProofStep(ass_id, inlined, stmt);
+				Some(frag): {
+					switch (ruMatchExp(ruExp(stmt.exps[0]), frag.axiom.infer.prop.exps[0], math, env)) {
+						None(): {
+							env.out.println("ruInlineFragments: match failed for fragment " + id2s(frag.axiom.info.id));
+							RuProofStep(ass_id, inlined, stmt)
+						}
+						Some(theta): {
+							ruReplaceFragHyps(ruApplySubst2FragTree(theta, frag.tree), inlined)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+ruApplySubst2FragTree(s : RuSubst, n : RuProofTree) -> RuProofTree {
+	switch (n) {
+		RuProofStep(ass, children, stmt):
+			RuProofStep(ass,
+				map(children, \ch -> ruApplySubst2FragTree(s, ch)),
+				RuStmt(stmt with exps = map(stmt.exps, \ex -> ruApplySubst(ruExp(ex), s)))
+			);
+		RuProofHyp(h, stmt):
+			RuProofHyp(h, RuStmt(stmt with exps = map(stmt.exps, \ex -> ruApplySubst(ruExp(ex), s))));
+	}
+}
+
+ruReplaceFragHyps(tree : RuProofTree, children : [RuProofTree]) -> RuProofTree {
+	switch (tree) {
+		RuProofHyp(ind, __):
+			if (ind >= 0 && ind < length(children)) children[ind] else tree;
+		RuProofStep(ass, sub_ch, stmt):
+			RuProofStep(ass, map(sub_ch, \ch -> ruReplaceFragHyps(ch, children)), stmt);
+	}
+}
