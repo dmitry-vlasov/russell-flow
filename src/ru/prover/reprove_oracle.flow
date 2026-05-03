@@ -24,7 +24,7 @@ ruCommReproveOracle = RuComm(
 );
 
 ruReproveOracleTactic(
-	theorem : RuTheorem, math : RuMath, mapping : ref Tree<RuProverProp, RuProofStep>, 
+	theorem : RuTheorem, math : RuMath, mapping : ref Tree<RuProverProp, RuProofStep>,
 	max_true_nodes : int, max_false_nodes : int, env : RuEnv
 ) -> RuProverTactic {
 	proof = ruTheoremProofTree(theorem, math);
@@ -53,6 +53,9 @@ ruReproveOracleTactic(
 					if (length(s.children) <= i) {
 						ruCrash("length(s.children) <= i: " + i2s(length(s.children)) + " <= " + i2s(i) + "\n" +
 							"s.assertion.info.id: " + id2s(s.assertion) + "\n" +
+							"ruArity(n.assertion)=" + i2s(ruArity(n.assertion)) + " n.ass.id=" + id2s(n.assertion.info.id) + "\n" +
+							"child.ind=" + i2s(child.ind) + "\n" +
+							"n.children inds: " + strGlue(map(vector2array(n.children), \c -> i2s(c.ind)), ",") + "\n" +
 							"n:\n" + strIndent(ruProverNode2s(n, math)));
 					} else {
 						step_child = s.children[i];
@@ -71,8 +74,9 @@ ruReproveOracleTactic(
 			}
 		}
 		if (length(^queue) > 0) {
-			out = take(^queue, max_true_nodes);
-			queue := removeRange(^queue, 0, max_true_nodes);
+			take_true = if (max_true_nodes < 0) length(^queue) else max_true_nodes;
+			out = take(^queue, take_true);
+			queue := removeRange(^queue, 0, take_true);
 			true_nodes = map(out, \x -> {
 				n = x.first;
 				s = x.second;
@@ -82,8 +86,18 @@ ruReproveOracleTactic(
 				mapping := setTree(^mapping, n, s);
 				n
 			});
-			curr_leafs = filter(getTreeValues(tree.leafs), \prop -> forall(out, \x -> prop != x.first));
-			false_nodes = take(curr_leafs, max_false_nodes);
+			// Exclude from false nodes any prop whose parent-prop is already oracle-mapped.
+			// Those will be processed as true nodes in a later cycle; expanding them early
+			// (without mapping) creates orphan hyps that break ruAddProof's arity check.
+			curr_leafs = filter(getTreeValues(tree.leafs), \prop ->
+				forall(out, \x -> prop != x.first) &&
+				switch (prop.parent) {
+					RuProverExp(__, __, __, __, parent_prop): !containsKeyTree(^mapping, parent_prop)
+					RuProverRoot(__, __, __): true
+				}
+			);
+			take_false = if (max_false_nodes < 0) length(curr_leafs) else max_false_nodes;
+			false_nodes = take(curr_leafs, take_false);
 			iter(out, \x -> {
 				i = findiDef(^queue, \s -> s.first == x.first, -1);
 				if (i != -1) {
@@ -99,99 +113,218 @@ ruReproveOracleTactic(
 }
 
 ruReproveOracleUnifyPremise(
-	th : RuTheorem, 
-	unify : (RuProverHyp) -> [RuUnified<RuPremise>], 
-	mapping : ref Tree<RuProverProp, RuProofStep>, 
-	math : RuMath, 
+	th : RuTheorem,
+	unify : (RuProverHyp) -> [RuUnified<RuPremise>],
+	mapping : ref Tree<RuProverProp, RuProofStep>,
+	math : RuMath,
 	env : RuEnv,
 	max_proofs : int,
 	max_true_nodes : int,
 	max_false_nodes : int,
 ) -> (RuProverHyp) -> [RuUnified<RuPremise>] {
-	if (ruOptsString(env.conf.opts, "reprove-singleton", "") == "1") {
-		\hyp : RuProverHyp ->  {
-			unif = unify(hyp);
-			switch (hyp) {
-				RuProverExp(i, __,__,__, parent): {
-					switch (lookupTree(^mapping, parent)) {
-						Some(step): {
-							switch (step.children[i]) {
-								RuProofStep(__,__,__): [];
-								RuProofHyp(ind,__): {
-									p1 = filter(unif, \un -> un.data.ind == ind);
-									if (max_proofs <= 1) p1 else {
-										concat(p1, take(unif, max_proofs - 1));
-									}
+	\hyp : RuProverHyp ->  {
+		unif = unify(hyp);
+		switch (hyp) {
+			RuProverExp(i, __,__,__, parent): {
+				switch (lookupTree(^mapping, parent)) {
+					Some(step): {
+						switch (step.children[i]) {
+							RuProofStep(__,__,__): [];
+							RuProofHyp(ind,__): {
+								p1 = filter(unif, \un -> un.data.ind == ind);
+								// If the standard unifier missed the premise (e.g. due to coercion
+								// wrappers in the prover hyp expr that aren't in the premise index),
+								// fall back to using the theorem's hypothesis at ind directly.
+								fallback = if (length(p1) > 0 || ind < 0 || ind >= length(th.infer.hyps)) [] else
+									[RuUnified(ruEmptySubst, th.infer.hyps[ind], ruExp(hyp.stmt.exps[0]))];
+								result = if (length(p1) > 0) p1 else fallback;
+								if (max_proofs <= 1) result else {
+									concat(result, take(unif, max_proofs - 1));
 								}
 							}
 						}
-						None(): {
-							if (max_true_nodes <= 1 && max_false_nodes == 0) {
-								ruCrash("must not happen");
-							}
-							[];
+					}
+					None(): {
+						if (max_true_nodes <= 1 && max_false_nodes == 0) {
+							ruCrash("must not happen");
 						}
+						[];
 					}
 				}
-				RuProverRoot(__,__,__): unif;
 			}
+			RuProverRoot(__,__,__): unif;
 		}
-	} else unify;
+	}
 }
 
 ruReproveOracleUnifyAssertion(
-	unify : (RuProverHyp) -> [RuUnified<RuAssertion>], 
-	mapping : ref Tree<RuProverProp, RuProofStep>, 
+	th : RuTheorem,
+	unify : (RuProverHyp) -> [RuUnified<RuAssertion>],
+	mapping : ref Tree<RuProverProp, RuProofStep>,
 	root : RuAssertion,
-	math : RuMath, 
+	math : RuMath,
 	env : RuEnv,
 	max_variants : int,
 	max_true_nodes : int,
 	max_false_nodes : int,
 ) -> (RuProverHyp) -> [RuUnified<RuAssertion>] {
-	if (ruOptsString(env.conf.opts, "reprove-singleton", "") == "1") {
-		\hyp : RuProverHyp ->  {
-			switch (hyp) {
-				RuProverExp(i, __,__,__, parent): {
-					switch (lookupTree(^mapping, parent)) {
-						Some(step): {
-							switch (step.children[i]) {
-								RuProofStep(ass, children, expr): {
-									e1 = ruExp(hyp.stmt.exps[0]);
-									assertion = lookupTreeDef(math.decls.assertions, ass, ruNoAxiom);
-									e2 = ruExp(assertion.infer.prop.exps[0]);
-									v1 = eitherMap(
-										ruUnifyExps([e1, e2], ruEmptySubst, math, env),
-										\sub -> [RuUnified(sub, assertion, ruApplySubst(e1, sub))], []
-									);
-									if (max_variants <= 1) v1 else {
-										v2 = unify(hyp);
-										concat(v1, take(v2, max_variants - 1));
-									}
+	// Build doconst for oracle expressions: replace theorem/proof vars (ph0, ph1, ...) with consts (_ph0, _ph1, ...)
+	// so that assertion vars sharing the same IDs don't cause occurs-check failures in Phase 2.
+	th_all_vars = set2array(mergeSets(ruAssertion2Vars(th), ruProof2Vars(th.proof)));
+	th_vars = filter(th_all_vars, \v -> !containsSet(th.meta, v.id));
+	cv_map = keys2tree(th_vars, \cv -> ruMakeRuleNode(s2id("_" + id2s(cv.id)), cv.type, 0, 0));
+	doconst_oracle = \e : RuExp -> RuExp(map(e.nodes, \n -> lookupTreeDef(cv_map, n, n)), e.pos);
+	dbg = ruOptsString(env.conf.opts, "proving-trace", "0") != "0";
+	\hyp : RuProverHyp ->  {
+		switch (hyp) {
+			RuProverExp(i, __,__,__, parent): {
+				switch (lookupTree(^mapping, parent)) {
+					Some(step): {
+						switch (step.children[i]) {
+							RuProofStep(ass, children, expr): {
+								assertion = lookupTreeDef(math.decls.assertions, ass, ruNoAxiom);
+								// Phase 1: bind prover vars in hyp.stmt to oracle const expressions.
+								// Oracle steps store expressions in their native (un-coerced) type, while
+								// the prover tree holds them in the type declared by the assertion's prop.
+								// Apply coercions to e2j to match e1j's type so that ruUnifyExps succeeds
+								// even when the only difference is implicit coercion wrappers.
+								msub_12 = foldi(hyp.stmt.exps, Some(ruEmptySubst), \j, macc, e1j_term -> {
+									maybeBind(macc, \s -> {
+										e1j = ruApplySubst(ruExp(e1j_term), s);
+										e2j_raw = ruApplySubst(doconst_oracle(ruExp(expr.exps[j])), s);
+										e1j_type = ruExpType(e1j);
+										e2j_type = ruExpType(e2j_raw);
+										e2j = if (e1j_type == e2j_type) e2j_raw else {
+											// Oracle steps store exprs in native type; prover tree may differ.
+											// Try coercing e2j UP (sub-type to super-type) first, then DOWN.
+											either(
+												ruApplyCoercions(e2j_raw, e2j_type, e1j_type, math.decls.lang, env),
+												either(
+													ruPeelToType(e2j_raw, e1j_type, math.decls.lang, env),
+													e2j_raw
+												)
+											)
+										};
+										ruUnifyExps([e1j, e2j], s, math, env)
+									})
+								});
+								// Phase 2: bind assertion vars by matching oracle expressions against the
+								// assertion's prop template. Each slot is matched independently via
+								// ruMatchExp so that repeated assertion vars (e.g. ph0 appearing twice in
+								// notation-reflexivity) receive consistent coercion-wrapped bindings without
+								// the accumulation conflict that ruUnifyExps would produce.
+								// Strip the outer coercion node when the oracle type is wider than the
+								// assertion's expected type (e.g. Pattern oracle vs Symbol assertion var).
+								a_var_ids = foldSet(ruAssertion2Vars(assertion), makeSet(), \acc, v -> insertSet(acc, v.id));
+								sub_12_no_assn = eitherMap(msub_12, \sub_12 -> ruFilterSub(sub_12, \v, __ -> !containsSet(a_var_ids, v.id)), ruEmptySubst);
+								msub_all = maybeBind(msub_12, \sub_12 ->
+									maybeBind(
+										foldi(assertion.infer.prop.exps, Some(ruEmptySubst), \j, macc, e3j_term -> {
+											maybeBind(macc, \s -> {
+												e3j = ruExp(e3j_term);
+												e3j_type = ruExpType(e3j);
+												e2j_raw = ruApplySubst(doconst_oracle(ruExp(expr.exps[j])), sub_12);
+												e2j_type = ruExpType(e2j_raw);
+												e2j = if (e2j_type == e3j_type) e2j_raw else {
+													switch (ruSuperRule(e3j_type, e2j_type, math.decls.lang, env)) {
+														Some(__): RuExp(subrange(e2j_raw.nodes, 1, length(e2j_raw.nodes) - 1), e2j_raw.pos)
+														None(): e2j_raw
+													}
+												};
+												// Use ruMatchExp (pattern matching) for each slot independently.
+												// ruMatchExp handles multi-step coercions (EV→Variable→Pattern)
+												// and each call produces a fresh sub that is then merged, so
+												// repeated assertion vars get identical coerced bindings.
+												maybeBind(ruMatchExp(e2j, e3j, math, env), \fresh_sub ->
+													ruMergeSubst(s, fresh_sub)
+												)
+											})
+										}),
+										\sub_23 -> Some(ruMergeSubsUnsafe(sub_12_no_assn, sub_23))
+									)
+								);
+								if (dbg && msub_12 == None()) {
+									env.out.println("ORACLE-UNIFY-DBG: Phase1 FAIL: ass=" + id2s(ass) + " th=" + id2s(th.info.id));
+									iteri(hyp.stmt.exps, \j, e1j_term -> {
+										e1j = ruExp(e1j_term);
+										e2j = doconst_oracle(ruExp(expr.exps[j]));
+										env.out.println("  Phase1 j=" + i2s(j) +
+											" e1j=" + ruExpRPN2s(e1j) +
+											" e2j_const=" + ruExpRPN2s(e2j));
+									});
 								}
-								RuProofHyp(h,__): [];
+								if (dbg && isSome(msub_12) && msub_all == None()) {
+									env.out.println("ORACLE-UNIFY-DBG: Phase2 FAIL: ass=" + id2s(ass) + " th=" + id2s(th.info.id));
+									dbg_sub_12 = either(msub_12, ruEmptySubst);
+									iteri(assertion.infer.prop.exps, \j, e3j_term -> {
+										e3j = ruExp(e3j_term);
+										e2j_raw = ruApplySubst(doconst_oracle(ruExp(expr.exps[j])), dbg_sub_12);
+										e2j_type = ruExpType(e2j_raw);
+										e3j_type = ruExpType(e3j);
+										e2j = if (e2j_type == e3j_type) e2j_raw else {
+											switch (ruSuperRule(e3j_type, e2j_type, math.decls.lang, env)) {
+												Some(__): RuExp(subrange(e2j_raw.nodes, 1, length(e2j_raw.nodes) - 1), e2j_raw.pos)
+												None(): e2j_raw
+											}
+										};
+										match_result = ruMatchExp(e2j, e3j, math, env);
+										env.out.println("  j=" + i2s(j) +
+											" e2j=" + ruExpRPN2s(e2j) +
+											" e3j=" + ruExpRPN2s(e3j) +
+											" match=" + (if (isSome(match_result)) "Some" else "None"));
+									});
+								}
+								v1 = eitherMap(msub_all, \sub -> [RuUnified(sub, assertion, ruApplySubst(ruExp(hyp.stmt.exps[0]), sub))], []);
+								if (dbg && length(v1) > 0) {
+									env.out.println("ORACLE-UNIFY-DBG: OK hyp-ind=" + i2s(i) + " ass=" + id2s(ass) + " th=" + id2s(th.info.id));
+								}
+								if (max_variants <= 1) v1 else {
+									v2 = unify(hyp);
+									concat(v1, take(v2, max_variants - 1));
+								}
 							}
-						}
-						None(): {
-							if (max_true_nodes <= 1 && max_false_nodes == 0) {
-								ruCrash("must not happen");
+							RuProofHyp(h,__): {
+								if (dbg) {
+									env.out.println("ORACLE-UNIFY-DBG: hyp-ind=" + i2s(i) + " -> RuProofHyp(ind=" + i2s(h) + ") th=" + id2s(th.info.id) + " hyp=" + ruExpRPN2s(ruExp(hyp.stmt.exps[0])));
+								}
+								[];
 							}
-							[];
 						}
 					}
-				}
-				RuProverRoot(__,s1,__): {
-					e1 = ruExp(s1.exps[0]);
-					e2 = ruExp(root.infer.prop.exps[0]);
-					eitherMap(
-						ruUnifyExps([e1, e2], ruEmptySubst, math, env),
-						\sub -> [RuUnified(sub, root, ruApplySubst(e1, sub))], []
-					);
+					None(): {
+						if (dbg) {
+							env.out.println("ORACLE-UNIFY-DBG: mapping-None for hyp-ind=" + i2s(i) + " th=" + id2s(th.info.id) + " hyp=" + ruExpRPN2s(ruExp(hyp.stmt.exps[0])));
+						}
+						if (max_true_nodes <= 1 && max_false_nodes == 0) {
+							ruCrash("must not happen");
+						}
+						[];
+					}
 				}
 			}
+			RuProverRoot(__,s1,__): {
+				// Bind all assertion vars by matching each const-goal expr against each
+				// prop template expr. This ensures all vars (not just the first) are bound.
+				msub = foldi(root.infer.prop.exps, Some(ruEmptySubst), \j, macc, e3j_term -> {
+					maybeBind(macc, \s -> {
+						e3j = ruExp(e3j_term);
+						e3j_type = ruExpType(e3j);
+						e2j_raw = ruExp(s1.exps[j]);
+						e2j_type = ruExpType(e2j_raw);
+						e2j = if (e2j_type == e3j_type) e2j_raw else {
+							switch (ruSuperRule(e3j_type, e2j_type, math.decls.lang, env)) {
+								Some(__): RuExp(subrange(e2j_raw.nodes, 1, length(e2j_raw.nodes) - 1), e2j_raw.pos)
+								None(): e2j_raw
+							}
+						};
+						maybeBind(ruMatchExp(e2j, e3j, math, env), \fresh_sub ->
+							ruMergeSubst(s, fresh_sub)
+						)
+					})
+				});
+				eitherMap(msub, \sub -> [RuUnified(sub, root, ruApplySubst(ruExp(s1.exps[0]), sub))], []);
+			}
 		}
-	} else {
-		unify;
 	}
 }
 
@@ -221,7 +354,7 @@ ruReproveOracleTheorem(
 	penv1 = RuProverEnv(penv0 with
 		fns = RuProverFuncs(penv0.fns with
 			unifyAssertion = ruReproveOracleUnifyAssertion(
-				penv0.fns.unifyAssertion, mapping, root, math, env, conf.max_variants, conf.max_true_nodes, conf.max_false_nodes
+				th, penv0.fns.unifyAssertion, mapping, root, math, env, conf.max_variants, conf.max_true_nodes, conf.max_false_nodes
 			),
 			unifyPremise = ruReproveOracleUnifyPremise(
 				th, penv0.fns.unifyPremise, mapping, math, env, conf.max_proofs, conf.max_true_nodes, conf.max_false_nodes
@@ -313,8 +446,8 @@ ruRunReproveOracle(unit : RuUnit) -> Maybe<RuState> {
 			ruMakeIndexForTarget(target, math, env),
 			ruTaskIntArg(task, "max-proofs", -1),
 			ruTaskIntArg(task, "max-variants", -1), 
-			ruTaskIntArg(task, "max-true-nodes", 1),
-			ruTaskIntArg(task, "max-false-nodes", 0),
+			ruTaskIntArg(task, "max-true-props", 1),
+			ruTaskIntArg(task, "max-false-props", 0),
 			false // debug
 		);
 		reprove_fn = \decl, time_limit, env1 -> {
