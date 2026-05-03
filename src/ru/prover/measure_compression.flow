@@ -1,0 +1,150 @@
+import base/util/progress;
+import ru/prover/prove;
+import ru/prover/stats;
+import ru/map_decls;
+import comm;
+
+export {
+	ruCommMeasureCompression : RuComm;
+}
+
+ruCommMeasureCompression = RuComm(
+	RuCommInfo(
+		"measure-compression", "prover", "measure auto-provability rate: what fraction of proof steps can be re-derived automatically", "target", true, false,
+		[
+			RuCommArg("target", true, "the target: a theorem, file or all", "all"),
+			RuCommArg("step-time-limit", true, "time limit per step in seconds", "1.0"),
+			RuCommArg("max-depth", true, "max prover search depth", "3"),
+			RuCommArg("max-size", true, "max prover tree size", "4096"),
+		], []
+	),
+	ruRunMeasureCompression
+);
+
+RuCompressionResult(
+	theorem_id  : int,
+	total_steps : int,
+	auto_steps  : int
+);
+
+ruMeasureProofCompression(
+	th         : RuTheorem,
+	index      : RuIndex<RuAssertion>,
+	step_limit : double,
+	args       : Tree<string, string>,
+	math       : RuMath,
+	conf       : RuConf,
+	env        : RuEnv
+) -> RuCompressionResult {
+	steps = th.proof.steps;
+	n = length(steps);
+	if (n <= 1) RuCompressionResult(th.info.id, 0, 0) else {
+		// test each step except the final QED step independently
+		auto_count = fold(subrange(steps, 0, n - 1), 0, \acc, step ->
+			acc + (if (ruCanProveStep(step, th, index, step_limit, args, math, conf, env)) 1 else 0)
+		);
+		RuCompressionResult(th.info.id, n - 1, auto_count)
+	}
+}
+
+ruCanProveStep(
+	step  : RuStep,
+	th    : RuTheorem,
+	index : RuIndex<RuAssertion>,
+	limit : double,
+	args  : Tree<string, string>,
+	math  : RuMath,
+	conf  : RuConf,
+	env   : RuEnv
+) -> bool {
+	step_ind = step.ind;
+	max_size = s2i(lookupTreeDef(args, "max-size", "4096"));
+	tactic = ruLimitTactic(ruBreadthFirstTactic, -1.0, max_size, max_size * 100);
+	goal = RuStep(step with assertion = ruStepProblem, refs = [], proof = ruNoProof);
+	task = RuProverTask(
+		th.info,
+		ruSingleTacticStrategy(tactic),
+		"measure step " + i2s(step_ind + 1) + " of " + id2s(th.info.id),
+		args,
+		concat(th.infer.hyps, subrange(th.proof.steps, 0, step_ind)),
+		goal
+	);
+	penv1 = ruInitProver(task, math, env, index, limit);
+	penv2 = ruProve(penv1);
+	length(^(penv2.tree.proofs)) > 0
+}
+
+ruRunMeasureCompression(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	task = unit.task;
+	state = unit.state;
+	conf = state.conf;
+	math = ruMathFromSources(state.ru, env);
+	timer = ruMakeTimer();
+	target = ruDetermineTarget(unit.task, math, env);
+	if (target != RuTargetNone()) {
+		total_steps = ref 0;
+		auto_steps  = ref 0;
+		processed   = ref 0;
+		inc_total     = ruAtomicIntAdd(total_steps);
+		inc_auto      = ruAtomicIntAdd(auto_steps);
+		inc_processed = ruAtomicIntAdd(processed);
+		index = ruMakeIndexForTarget(target, math, env);
+		args  = ruTaskArgs2Tree(task.args);
+		step_limit = ruTaskDoubleArg(task, "step-time-limit", 1.0);
+
+		measure_fn = \decl, __, env1 -> {
+			th = cast(decl : RuDecl -> RuTheorem);
+			n = inc_processed(1);
+			result = ruMeasureProofCompression(th, index, step_limit, args, math, conf, env1);
+			inc_total(result.total_steps);
+			inc_auto(result.auto_steps);
+			percent = if (result.total_steps == 0) 0 else 100 * result.auto_steps / result.total_steps;
+			if (conf.verbose > 1) {
+				env.out.println(
+					i2s(n) + " theorem '" + id2s(th.info.id) + "': " +
+					i2s(result.auto_steps) + "/" + i2s(result.total_steps) +
+					" = " + i2s(percent) + "% auto-provable"
+				);
+			}
+			RuMappedDecl(true, false, decl)
+		};
+
+		new_state = ruMapFnComm(
+			RuUnit(unit.task, state, env.out),
+			RuMapFn(
+				RuMapFnInfo(
+					"measure-compression",
+					\decl -> ruTargetPredicate(target)(decl) && ruDeclIsTheorem(decl),
+					ruProofLengthMeasure,
+					\ -> {
+						total   = ^total_steps;
+						auto    = ^auto_steps;
+						percent = if (total == 0) 0 else 100 * auto / total;
+						"auto-provable: " + i2s(auto) + "/" + i2s(total) + " steps = " + i2s(percent) + "%"
+					}
+				),
+				measure_fn
+			)
+		);
+		total   = ^total_steps;
+		auto    = ^auto_steps;
+		percent = if (total == 0) 0 else 100 * auto / total;
+		if (ruVerbose(env.conf) > 0) {
+			env.out.println(
+				"Compression measurement done in " + ruTimePassed2s(timer) + ": " +
+				i2s(auto) + "/" + i2s(total) + " steps auto-provable = " + i2s(percent) + "%"
+			);
+		}
+		Some(RuState(new_state with
+			vars = setTree(new_state.vars, "measure-compression", pairs2tree([
+				Pair("total-steps", flow(total)),
+				Pair("auto-steps",  flow(auto)),
+				Pair("rate",        flow(if (total == 0) 0.0 else i2d(auto) / i2d(total)))
+			]))
+		));
+	} else {
+		env.out.println("no target for compression measurement");
+		Some(state);
+	}
+}
