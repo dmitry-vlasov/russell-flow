@@ -1,5 +1,7 @@
 #!/bin/bash
 
+git rev-parse --short HEAD > russell.commit
+
 cd src
 
 flowc1 \
