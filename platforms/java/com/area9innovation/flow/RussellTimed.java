@@ -5,23 +5,29 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeoutException;
 
 
 public class RussellTimed extends NativeHost {
 	static private class TaskTimer implements Runnable {
 		private long time_limit;
 		private Thread controlled;
+		private volatile boolean cancelled = false;
 		private TaskTimer(long time_limit, Thread controlled) {
 			this.time_limit = time_limit;
 			this.controlled = controlled;
 		}
+		public void cancel() {
+			cancelled = true;
+		}
 		@Override
 		public void run() {
-			if (System.currentTimeMillis() > time_limit) {
+			if (!cancelled && System.currentTimeMillis() > time_limit) {
 				controlled.interrupt();
 			}
 		}
@@ -52,11 +58,12 @@ public class RussellTimed extends NativeHost {
 	private static final int NTHREDS = Runtime.getRuntime().availableProcessors();
 	private static ExecutorService threadpool = Executors.newFixedThreadPool(NTHREDS);
 
-	private static final void startInterruptTimer(long time_limit) {
-		getTimer().scheduleAtFixedRate(
-			new TaskTimer(System.currentTimeMillis() + time_limit, Thread.currentThread()), 
-			0, 100, TimeUnit.MILLISECONDS
-		);
+	private static final ScheduledFuture<?> startInterruptTimer(TaskTimer task) {
+		return getTimer().scheduleAtFixedRate(task, 0, 100, TimeUnit.MILLISECONDS);
+	}
+
+	private static final ScheduledFuture<?> startInterruptTimer(long time_limit) {
+		return startInterruptTimer(new TaskTimer(System.currentTimeMillis() + time_limit, Thread.currentThread()));
 	}
 /*
 	public static final <R> R evalTimed0(Func0<R> fn, R defval, double time_limit) {
@@ -93,12 +100,24 @@ public class RussellTimed extends NativeHost {
 	}
 */
 	public static final <R, T1, T2, T3> R evalTimed3(Func3<R,T1,T2,T3> fn, T1 arg1, T2 arg2, T3 arg3, R defval, double time_limit) {
-		try {
-            return getExecutor().submit(() -> {
-				startInterruptTimer((long)time_limit);
+		Future<R> future = getExecutor().submit(() -> {
+			Thread.interrupted(); // clear stale interrupt flag from a previous timed task on this thread
+			TaskTimer task = new TaskTimer(System.currentTimeMillis() + (long)time_limit, Thread.currentThread());
+			ScheduledFuture<?> timer = startInterruptTimer(task);
+			try {
 				return fn.invoke(arg1, arg2, arg3);
-			}).get((long)time_limit, TimeUnit.MILLISECONDS);
-        } catch (Exception e) {
+			} finally {
+				task.cancel();        // prevent any in-flight timer firing from interrupting
+				timer.cancel(false);  // stop future firings
+				Thread.interrupted(); // clear any interrupt that slipped through before cancel
+			}
+		});
+		try {
+			return future.get((long)time_limit, TimeUnit.MILLISECONDS);
+		} catch (TimeoutException e) {
+			future.cancel(true);  // interrupt the lambda so its finally block runs and stops the timer
+			return defval;
+		} catch (Exception e) {
 			return defval;
 		}
 	}
