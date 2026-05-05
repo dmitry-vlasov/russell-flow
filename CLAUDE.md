@@ -12,7 +12,7 @@
 - Verify: `bin/russellj verify afile=set-50000`
 - Reprove: `bin/russellj reprove-with-oracle afile=set-50000`
 - REPL: `bin/russellj server=console`
-- Memory override: `bin/russellj mem=8g ...` (default 16g)
+- Memory override: `bin/russellj mem=16g ...` (default 10g)
 
 ## Mathematics Libraries
 Math libraries live in `~/dev/math` (`set/`, `mm-theory/`, `set-3000.mm` … `set-100000.mm`).
