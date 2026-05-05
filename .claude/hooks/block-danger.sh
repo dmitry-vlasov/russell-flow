@@ -13,7 +13,7 @@ fi
 
 # Protect the math library and theorem caches
 if printf '%s' "$CMD" | grep -Eq \
-    'rm.*dev/math|rm.*russell\.jar|rm.*db/set'; then
+    '\brm\b.*dev/math|\brm\b.*russell\.jar|\brm\b.*db/set'; then
   echo "BLOCKED: attempt to delete protected Russell data: $CMD" >&2
   exit 2
 fi
