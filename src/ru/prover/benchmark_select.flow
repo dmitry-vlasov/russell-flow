@@ -1,0 +1,114 @@
+import formats/json/json;
+import ru/util/decls;
+import ru/map_decls;
+import comm;
+
+export {
+	ruCommBenchmarkSelect : RuComm;
+}
+
+RuBenchmarkBucket(
+	name  : string,
+	min   : int,
+	max   : int,    // -1 = unbounded
+	share : double
+);
+
+ruBenchmarkBuckets : [RuBenchmarkBucket] = [
+	RuBenchmarkBucket("small",  2,  5,  0.25),
+	RuBenchmarkBucket("medium", 6,  15, 0.35),
+	RuBenchmarkBucket("large",  16, 30, 0.25),
+	RuBenchmarkBucket("huge",   31, -1, 0.15),
+];
+
+ruCommBenchmarkSelect = RuComm(
+	RuCommInfo(
+		"benchmark-select", "prover",
+		"select a stratified benchmark set of theorems for proof compression evaluation",
+		"file", false, false,
+		[
+			RuCommArg("file", true, "output JSON file for the benchmark set", "benchmark.json"),
+			RuCommArg("size", true, "total number of theorems to select", "200"),
+			RuCommArg("seed", true, "random seed for reproducibility", "42"),
+		], []
+	),
+	ruRunBenchmarkSelect
+);
+
+ruRunBenchmarkSelect(unit : RuUnit) -> Maybe<RuState> {
+	env   = ruUnitEnv(unit);
+	task  = unit.task;
+	state = unit.state;
+	conf  = state.conf;
+	math  = ruMathFromSources(state.ru, env);
+	timer = ruMakeTimer();
+
+	file = ruTaskStringArg(task, "file", "benchmark.json");
+	size = ruTaskIntArg(task, "size", 200);
+	seed = ruTaskIntArg(task, "seed", 42);
+
+	all_theorems = getTreeValues(ruDeclsTheorems(math.decls));
+	// exclude trivial 1-step proofs: they cannot be compressed
+	non_trivial = filter(all_theorems, \th -> length(th.proof.steps) >= 2);
+
+	selected = ruStratifiedSample(non_trivial, size, seed);
+
+	if (ruVerbose(conf) > 0) {
+		env.out.println(
+			"benchmark-select: " + i2s(length(non_trivial)) + " eligible theorems, " +
+			"selected " + i2s(length(selected)) + " across " + i2s(length(ruBenchmarkBuckets)) + " buckets"
+		);
+		if (ruVerbose(conf) > 1) {
+			iter(ruBenchmarkBuckets, \b -> {
+				n = length(filter(selected, \th -> ruInBucket(th, b)));
+				env.out.println("\t" + b.name + " (" + i2s(b.min) + ".." +
+					(if (b.max < 0) "∞" else i2s(b.max)) + " steps): " + i2s(n));
+			});
+		}
+	}
+
+	ru_root = ruOptsString(conf.opts, "ru-root", ".");
+	names   = map(selected, \th -> id2s(th.info.id));
+
+	json_val = JsonObject([
+		Pair("source",   JsonString(ru_root)),
+		Pair("seed",     JsonDouble(i2d(seed))),
+		Pair("size",     JsonDouble(i2d(length(selected)))),
+		Pair("theorems", JsonArray(map(names, \s -> JsonString(s))))
+	]);
+
+	path = if (isAbsolutePath(file)) file else pathCombine(ru_root, file);
+	if (!setFileContent(path, json2stringFormatted(json_val))) {
+		env.out.println("benchmark-select: failed to write to " + path);
+	} else if (ruVerbose(conf) > 0) {
+		env.out.println("benchmark-select: saved to " + path + " in " + ruTimePassed2s(timer));
+	}
+
+	Some(RuState(state with
+		vars = setTree(state.vars, "benchmark-select", pairs2tree([
+			Pair("file",     flow(path)),
+			Pair("size",     flow(length(selected))),
+			Pair("theorems", flow(names))
+		]))
+	));
+}
+
+ruInBucket(th : RuTheorem, b : RuBenchmarkBucket) -> bool {
+	n = length(th.proof.steps);
+	n >= b.min && (b.max < 0 || n <= b.max)
+}
+
+ruStratifiedSample(theorems : [RuTheorem], size : int, seed : int) -> [RuTheorem] {
+	rng = randomGenerator(seed);
+	concatA(mapi(ruBenchmarkBuckets, \i, b -> {
+		bucket  = filter(theorems, \th -> ruInBucket(th, b));
+		desired = round(i2d(size) * b.share);
+		n       = min(desired, length(bucket));
+		take(ruSeededShuffle(bucket, rng), n)
+	}))
+}
+
+ruSeededShuffle(arr : [?], rng : () -> double) -> [?] {
+	keyed = map(arr, \x -> Pair(rng(), x));
+	map(sortCustom(keyed, \p -> p.first, false), \p -> p.second)
+}
