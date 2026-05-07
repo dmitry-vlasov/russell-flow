@@ -29,13 +29,24 @@ The implementation is written in [Flow9](https://github.com/area9innovation/flow
 
 ## Quick start
 
-Add the `bin/` directory to your `PATH`:
+Add the following to your `~/.bashrc` (adjust paths to match your installation):
 
 ```bash
-export PATH="$PATH:/path/to/russell-flow/bin"
+export RUSSELL_HOME=/path/to/russell-flow
+export RUSSELL_MATH=/path/to/math          # directory containing set.mm, set-*.ru, etc.
+
+export PATH=$PATH:$RUSSELL_HOME/bin
 ```
 
-The main executable is `russellj` (Java-backed). A native binary `russell` is also available if compiled.
+Then reload your shell:
+
+```bash
+source ~/.bashrc
+```
+
+The main executables are `russellj` (the JAR runner) and `russell_lsp` (the LSP server for the VSCode extension). Both must be on `PATH` for the VSCode extension to work, including when VSCode is launched from a desktop icon rather than a terminal.
+
+`RUSSELL_MATH` tells `russellj` where to find the math library files. It is passed automatically as `import-roots` — you do not need to add it to `russell.conf`.
 
 ---
 
@@ -86,6 +97,8 @@ A VSCode extension for Russell syntax highlighting and language server features 
 ```
 Extensions → ··· → Install from VSIX → resources/russell.vsix
 ```
+
+The extension starts `russell_lsp` automatically when you open a `.ru` file. It uses a bash login shell internally, so `RUSSELL_HOME/bin` must be on `PATH` in `~/.bashrc` (see [Quick start](#quick-start)). No additional extension settings are required.
 
 ---
 

@@ -11,7 +11,6 @@ import * as prover from "./prover";
 import * as tools from "./tools";
 import { num2memory } from './tools';
 import * as requests from './requests';
-import { doesNotReject } from 'assert';
 
 //import isPortReachable from 'is-port-reachable'; // For 'is-port-reachable' 4.0.0. - doesn't work ...
 const isPortReachable = require('is-port-reachable');
@@ -179,10 +178,9 @@ function startLspClient() {
 	serverStatusBarItem.show();
 	// If the extension is launched in debug mode then the debug server options are used
 	// Otherwise the run options are used
-	let serverOptions: ServerOptions = {
-		command: process.platform == "win32" ? 'russell.bat' : 'russell_lsp',
-		options:  { detached: false }
-	}
+	let serverOptions: ServerOptions = process.platform == "win32"
+		? { command: 'russell.bat', options: { detached: false } }
+		: { command: '/bin/bash', args: ['-l', '-c', 'russell_lsp'], options: { detached: false } };
 	// Options to control the language client
 	let clientOptions: LanguageClientOptions = {
 		// Register the server for plain text documents
