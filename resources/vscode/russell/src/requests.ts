@@ -15,13 +15,26 @@ export function fileCommand(uri : vscode.Uri, target : string, action : string):
 export function filePositionCommand(action : string): object {
 	let uri = vscode.window.activeTextEditor.document.uri;
 	let pos = vscode.window.activeTextEditor.selection.active;
-	return { 
-		command : "command", 
+	return {
+		command : "command",
 		arguments: [
 			"read file=" + uri.fsPath + ";\n" +
-			"conf verbose=1;\n" + 
+			"conf verbose=1;\n" +
 			action + " file=" + uri.fsPath + " line=" + pos.line + " col=" + pos.character + ";"
-		] 
+		]
+	};
+}
+
+// Like filePositionCommand but without verbose — avoids println-induced double-respond in HTTP server.
+export function proverPositionCommand(action : string): object {
+	let uri = vscode.window.activeTextEditor.document.uri;
+	let pos = vscode.window.activeTextEditor.selection.active;
+	return {
+		command : "command",
+		arguments: [
+			"read file=" + uri.fsPath + ";\n" +
+			action + " file=" + uri.fsPath + " line=" + pos.line + " col=" + pos.character + ";"
+		]
 	};
 }
 

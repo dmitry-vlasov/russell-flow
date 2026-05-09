@@ -72,29 +72,24 @@ export class ProverProvider {
 		}
 		if (!tree) {
 			vscode.window.showErrorMessage("update of a prover tree failed:\n" + JSON.stringify(data));
-			return null;	
+			return null;
 		} else {
 			//vscode.window.showInformationMessage("A prover tree:\n" + JSON.stringify(tree));
-			this.provider.update(tree);
+			return this.provider.update(tree);
 		}
 	}
 	public clear(): void {
-		this.provider.update({nodes: [], root: null});
+		this.provider.clear();
 	}
 	public startProving(): void {
 		this.clear();
-		this.client.onNotification("prover/proved", (proved : any) => {
-			if (proved) {
-				vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + proved});
-			}
-			this.client.onNotification("prover/proved", () => {});
-		});
-		this.client.sendRequest("workspace/executeCommand", requests.filePositionCommand("prove-start")).then(
+		this.client.sendRequest("workspace/executeCommand", requests.proverPositionCommand("prove-start")).then(
 			(data : any) => {
 				if (data) {
 					const proof = this.update(data);
 					if (proof) {
-						vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + proof});
+						vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + proof})
+							.then(doc => vscode.window.showTextDocument(doc, {preview: false}));
 					}
 				}
 			},
@@ -103,6 +98,53 @@ export class ProverProvider {
 	}
 	public expandProp(node : NodeEntity): void {
 		this.provider.expandProp(node);
+	}
+	public forbidAssertion(node: NodeEntity): void {
+		if (node.kind !== 'prop') return;
+		const assertion = node.label;
+		const cmd = { command: "command", arguments: ["prove-forbid assertions=" + assertion] };
+		this.client.sendRequest("workspace/executeCommand", cmd).then(
+			() => vscode.window.showInformationMessage("Blocked assertion: " + assertion),
+			vscode.window.showErrorMessage
+		);
+	}
+	public showCandidates(node: NodeEntity): void {
+		const nodeId = node.kind === 'root' ? -1 : node.id;
+		const cmd = { command: "command", arguments: ["prove-candidates node=" + nodeId] };
+		this.client.sendRequest("workspace/executeCommand", cmd).then(
+			(data: any) => {
+				if (!data || !Array.isArray(data)) return;
+				const items: vscode.QuickPickItem[] = data.map((c: any) => ({
+					label: c.assertion,
+					description: "arity " + c.arity
+				}));
+				vscode.window.showQuickPick(items, {
+					placeHolder: "Choose an action",
+					canPickMany: false,
+				}).then((picked) => {
+					if (!picked) return;
+					vscode.window.showQuickPick(
+						[
+							{ label: "Block this assertion", action: "forbid" },
+							{ label: "Expand with only this assertion", action: "expand" },
+						],
+						{ placeHolder: "What to do with '" + picked.label + "'?" }
+					).then((action: any) => {
+						if (!action) return;
+						if (action.action === "forbid") {
+							const forbidCmd = { command: "command", arguments: ["prove-forbid assertions=" + picked.label] };
+							this.client.sendRequest("workspace/executeCommand", forbidCmd).then(
+								() => vscode.window.showInformationMessage("Blocked: " + picked.label),
+								vscode.window.showErrorMessage
+							);
+						} else {
+							this.provider.expandPropWith(node, picked.label);
+						}
+					});
+				});
+			},
+			vscode.window.showErrorMessage
+		);
 	}
 }
 
@@ -114,29 +156,86 @@ class ProofVariantProvider implements vscode.TreeDataProvider<NodeEntity> {
 	private client: LanguageClient = null;
 	private props: Map<number, PropEntity> = new Map();
 	private root: RootEntity;
+	private expanding: Set<number> = new Set();
+	private log: vscode.OutputChannel;
 
-	constructor() { }
+	constructor() {
+		this.log = vscode.window.createOutputChannel("Russell Prover Debug");
+		this.log.show(true);
+		this.log.appendLine("[ProofVariantProvider] initialized");
+	}
 	public setClient(client: LanguageClient) {
 		this.client = client;
 	}
-	public update(tree : ProofVariantTree): void {
+	public clear(): void {
+		this.props.clear();
+		this.expanding.clear();
+		this.root = null;
+		this._onDidChangeTreeData.fire();
+	}
+	public update(tree : ProofVariantTree): string | null {
 		if (tree.root) {
 			this.root = tree.root;
 			this._onDidChangeTreeData.fire(rootEntity2Node(this.root));
 		}
 		tree.nodes.forEach(prop => this.props.set(prop.id, prop));
 		this._onDidChangeTreeData.fire();
+		// Only return a proof when this diff explicitly includes a root with proofs,
+		// meaning a new proof was found in this expansion.
+		if (tree.root && tree.root.proofs && tree.root.proofs.length > 0) {
+			return tree.root.proofs[0];
+		}
+		return null;
 	}
 	public async expandProp(node : NodeEntity): Promise<void> {
-		const expand_command = { command: "command", arguments: ["conf verb=1; prove-expand nodes=" + node.id] };
-		return this.client.sendRequest("workspace/executeCommand",expand_command).then((data: any) => {
-			const update = <ProofVariantTree>data;
-			if (!update) {
-				vscode.window.showErrorMessage("update of a prover tree failed:\n" + JSON.stringify(data));
+		const expand_command = { command: "command", arguments: ["prove-expand nodes=" + node.id] };
+		console.error("[prover] expandProp called for node " + node.id);
+		this.log.appendLine("[expandProp] called for node " + node.id);
+		return this.client.sendRequest("workspace/executeCommand", expand_command).then(
+			(data: any) => {
+				try {
+					const dataStr = JSON.stringify(data);
+					const hasRoot = data && data.root;
+					const rootProofsLen = (hasRoot && data.root.proofs) ? data.root.proofs.length : -1;
+					const msg = "expand: type=" + typeof data +
+						" hasRoot=" + !!hasRoot +
+						" rootProofs=" + rootProofsLen +
+						" | " + dataStr.substring(0, 120);
+					console.error("[prover] " + msg);
+					this.log.appendLine("[expandProp] response: " + msg);
+					const proof = this.update(data);
+					if (proof) {
+						this.log.appendLine("[expandProp] proof found (" + proof.length + " chars)");
+						vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + proof})
+							.then(doc => vscode.window.showTextDocument(doc, {preview: false}));
+					} else {
+						this.log.appendLine("[expandProp] proof is null/empty after update");
+					}
+				} catch(e) {
+					this.log.appendLine("[expandProp] ERROR: " + e);
+					console.error("[prover] expand error: " + e);
+				}
+				return Promise.resolve();
+			},
+			(err: any) => {
+				this.log.appendLine("[expandProp] request FAILED: " + JSON.stringify(err));
+				console.error("[prover] expandProp request failed: " + JSON.stringify(err));
+				return Promise.reject(err);
+			}
+		);
+	}
+	public async expandPropWith(node: NodeEntity, assertion: string): Promise<void> {
+		const cmd = { command: "command", arguments: ["prove-expand nodes=" + node.id + " assertion=" + assertion] };
+		return this.client.sendRequest("workspace/executeCommand", cmd).then((data: any) => {
+			if (!data) {
+				vscode.window.showErrorMessage("expand-with failed:\n" + JSON.stringify(data));
 				return Promise.reject();
 			} else {
-				//vscode.window.showInformationMessage("A prover tree update:\n" + JSON.stringify(data));
-				this.update(data);
+				const proof = this.update(data);
+				if (proof) {
+					vscode.workspace.openTextDocument({'language': 'russell', 'content': '\n' + proof})
+						.then(doc => vscode.window.showTextDocument(doc, {preview: false}));
+				}
 				return Promise.resolve();
 			}
 		});
@@ -167,7 +266,14 @@ class ProofVariantProvider implements vscode.TreeDataProvider<NodeEntity> {
 				if (prop.expanded) {
 					return prop_children();
 				} else {
-					return this.expandProp(item).then(prop_children);
+					// Fire expansion without awaiting it; return [] now.
+					// When expandProp resolves it fires _onDidChangeTreeData and VSCode
+					// re-calls getChildren, which will then see expanded=true.
+					if (!this.expanding.has(item.id)) {
+						this.expanding.add(item.id);
+						this.expandProp(item).finally(() => this.expanding.delete(item.id));
+					}
+					return Promise.resolve([]);
 				}
 			} else {
 				return Promise.resolve([]);
@@ -220,10 +326,11 @@ class ProofVariantProvider implements vscode.TreeDataProvider<NodeEntity> {
 			//vscode.window.showInformationMessage("getTreeItem of: " + JSON.stringify(item));
 			if (item.kind == 'root') {
 				let treeItem: vscode.TreeItem = new vscode.TreeItem(
-					item.label, 
+					item.label,
 					vscode.TreeItemCollapsibleState.Collapsed
 				);
 				treeItem.tooltip = item.tooltip;
+				treeItem.contextValue = 'russell-prover-root';
 				return treeItem;
 			} else if (item.kind == 'prop') {
 				if (this.props.has(item.id)) {
@@ -233,9 +340,9 @@ class ProofVariantProvider implements vscode.TreeDataProvider<NodeEntity> {
 						vscode.TreeItemCollapsibleState.Collapsed
 					);
 					treeItem.command = {
-						command: 'russell.proverExpand', 
+						command: 'russell.prover-expand-prop',
 						title: 'expand the node',
-						arguments: [item.id]
+						arguments: [item]
 					};
 					treeItem.tooltip = item.tooltip;
 					treeItem.contextValue = 'russell-prover-prop';
@@ -243,10 +350,11 @@ class ProofVariantProvider implements vscode.TreeDataProvider<NodeEntity> {
 				} 
 			} else {
 				let treeItem: vscode.TreeItem = new vscode.TreeItem(
-					item.label, 
+					item.label,
 					vscode.TreeItemCollapsibleState.Collapsed
 				);
 				treeItem.tooltip = item.tooltip;
+				treeItem.contextValue = 'russell-prover-hyp';
 				return treeItem;
 			}
 		}

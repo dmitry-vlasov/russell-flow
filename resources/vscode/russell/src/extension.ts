@@ -52,6 +52,8 @@ export function activate(context: vscode.ExtensionContext) {
 		reg_comm('russell.refreshOntology', mathOntology),
 		reg_comm('russell.prover-expand-prop', (node: prover.NodeEntity) => proverProvider.expandProp(node)),
 		reg_comm('russell.prover-start', () => proverProvider.startProving()),
+		reg_comm('russell.prover-forbid', (node: prover.NodeEntity) => proverProvider.forbidAssertion(node)),
+		reg_comm('russell.prover-candidates', (node: prover.NodeEntity) => proverProvider.showCandidates(node)),
 		vscode.workspace.onDidChangeConfiguration(handleConfigurationUpdates(context)),
 	);
 	checkHttpServerStatus(true);

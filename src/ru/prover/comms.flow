@@ -28,8 +28,8 @@ export {
 		ruCommProveSort,
 		//ruCommProveConfirmProof,
 		ruCommProveTry,
-		//ruCommProveTacticExpandLeafs,
-		//ruCommProveTacticForbid
+		ruCommProveForbid,
+		ruCommProveCandidates,
 	]
 }
 
@@ -188,9 +188,10 @@ ruRunProveTheoremStart(unit : RuUnit, th_name : string) -> Maybe<RuState> {
 
 ruCommProveExpand = RuComm(
 	RuCommInfo(
-		"prove-expand", "prover", "expand given proof variant tree nodes", "nodes", true, false, 
+		"prove-expand", "prover", "expand given proof variant tree nodes", "nodes", true, false,
 		[
 			RuCommArg("nodes", false, "CSV list of node ids, which should be expanded", ""),
+			RuCommArg("assertion", true, "if given, only expand using this assertion", ""),
 		], []
 	),
 	ruRunProveExpand
@@ -211,31 +212,74 @@ ruRunProveExpand(unit : RuUnit) -> Maybe<RuState> {
 	switch (state.prover) {
 		Some(prover_state): {
 			penv0 = prover_state.env;
+			assertion_arg = ruTaskStringArg(task, "assertion", "");
 			if (ruVerbose(conf) > 0) {
-				env.out.println("setting nodes to expand: '" + nodes_arg + "'");
+				env.out.println("setting nodes to expand: '" + nodes_arg + "'" +
+					(if (assertion_arg != "") ", assertion: " + assertion_arg else ""));
 			}
-			curr_tactic = ^(prover_state.env.tactic);
-			penv0.tactic := Some(RuProverTactic(
-				"prove-expand",
-				\tree -> filtermap(nodes, \id -> lookupTree(tree.leafs, id)),
-				\tree -> true
-			));
+			if (assertion_arg != "") {
+				penv0.whitelist := [s2id_(assertion_arg)];
+			}
 			snapshot = ruProverTree2Snapshot(penv0.tree);
-			penv1 = ruProve(penv0);
-			if (length(^(penv1.tree.proofs)) > 0) {
-				proofs = "// Proved:\n" + 
-				concatStrings(map(^(penv1.tree.proofs), \proof -> ru2s(proof, math) + "\n"));
-				if (ruTaskBoolArg(task, "lsp", false)) {
-					env.out.notify("prover/proved", JsonString(proofs))	
-				} else {
-					env.out.println("Proofs found:\n" + proofs);
+			// Expand the requested leaf nodes directly, bypassing ruProve's
+			// tactic loop (which skips expansion when finished=true).
+			penv1 = fold(nodes, penv0, \acc, id -> {
+				switch (lookupTree(acc.tree.leafs, id)) {
+					Some(prop): {
+						if (ruVerbose(conf) > 0) {
+							env.out.println("  expanding prop id=" + i2s(id) +
+								" ass=" + id2s(prop.assertion.info.id) +
+								" arity=" + i2s(ruArity(prop.assertion)) +
+								" children_before=" + i2s(sizeVector(prop.children)) +
+								" proofs_before=" + i2s(sizeVector(prop.proofs)));
+						}
+						result = ruProveProp(prop, acc);
+						if (ruVerbose(conf) > 0) {
+							env.out.println("  after expand: prop.proofs=" + i2s(sizeVector(prop.proofs)) +
+								" children=" + i2s(sizeVector(prop.children)) +
+								" root.proofs=" + i2s(sizeVector(result.tree.root.proofs)) +
+								" tree.proofs=" + i2s(length(^(result.tree.proofs))));
+						}
+						result;
+					}
+					None(): {
+						if (ruVerbose(conf) > 0) {
+							env.out.println("  node id=" + i2s(id) + " NOT found in leafs");
+						}
+						acc;
+					}
 				}
+			});
+			penv0.whitelist := [];
+			if (ruVerbose(conf) > 0) {
+				env.out.println("after expand fold: root.proofs=" + i2s(sizeVector(penv1.tree.root.proofs)) +
+					" tree.proofs=" + i2s(length(^(penv1.tree.proofs))));
 			}
-			penv1.tactic := curr_tactic;
 			diff = ruProverTreeDiff(snapshot, penv1.tree);
+			proof_strings = map(^(penv1.tree.proofs), \proof -> JsonString(ru2s(proof, math)));
+			if (ruVerbose(conf) > 0 && length(proof_strings) > 0) {
+				env.out.println("Proofs found: " + i2s(length(proof_strings)));
+			}
 			json_diff = ruProverTreeDiff2json(diff, penv1.math, conf);
-			//ruDebugLog("JSON DIFF:\n" + json_diff, conf);
-			env.out.respond(json_diff);
+			// Always override root.proofs with validated proofs (may be empty).
+			// This prevents showing unvalidated constified proofs from the raw prover tree.
+			final_json = switch (json_diff) {
+				JsonObject(pairs): JsonObject(map(pairs, \pair ->
+					if (pair.first == "root") {
+						Pair("root", switch (pair.second) {
+							JsonObject(root_pairs): JsonObject(
+								map(root_pairs, \rp ->
+									if (rp.first == "proofs") Pair("proofs", JsonArray(proof_strings))
+									else rp
+								)
+							);
+							default: pair.second;
+						})
+					} else pair
+				));
+				default: json_diff;
+			};
+			env.out.respond(final_json);
 			Some(RuState(state with 
 				prover = Some(RuProverState(prover_state with 
 					env = penv1
@@ -308,6 +352,88 @@ ruRunProveSort(unit : RuUnit) -> Maybe<RuState> {
 		}
 		state;
 	});
+}
+
+ruCommProveForbid = RuComm(
+	RuCommInfo(
+		"prove-forbid", "prover", "forbid assertions from proof search", "assertions", true, false,
+		[
+			RuCommArg("assertions", false, "comma-separated assertion names to forbid", ""),
+		], []
+	),
+	ruRunProveForbid
+);
+
+ruRunProveForbid(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	state = unit.state;
+	task = unit.task;
+	conf = state.conf;
+	assertions_arg = ruTaskStringArg(task, "assertions", "");
+	ids = filtermap(strSplit(assertions_arg, ","), \a ->
+		if (trim(a) == "") None() else Some(s2id_(trim(a)))
+	);
+	switch (state.prover) {
+		Some(prover_state): {
+			penv = prover_state.env;
+			iter(ids, \id -> penv.forbidden := insertSet(^(penv.forbidden), id));
+			if (ruVerbose(conf) > 0) {
+				env.out.println("forbidden assertions: " + strGlue(map(ids, id2s), ", "));
+			}
+			Some(state);
+		}
+		None(): {
+			env.out.error("Prover is not started", []);
+			None();
+		}
+	}
+}
+
+ruCommProveCandidates = RuComm(
+	RuCommInfo(
+		"prove-candidates", "prover", "list candidate assertions for a prop node's parent hyp", "node", true, false,
+		[
+			RuCommArg("node", false, "prop node id (-1 for root)", "-1"),
+		], []
+	),
+	ruRunProveCandidates
+);
+
+ruRunProveCandidates(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	state = unit.state;
+	task = unit.task;
+	conf = state.conf;
+	node_id = ruTaskIntArg(task, "node", -1);
+	switch (state.prover) {
+		Some(prover_state): {
+			penv = prover_state.env;
+			hyp = if (node_id < 0) {
+				Some(penv.tree.root);
+			} else {
+				maybeMap(lookupTree(penv.tree.nodes, node_id), \prop -> prop.parent);
+			};
+			switch (hyp) {
+				Some(h): {
+					candidates = penv.fns.unifyAssertion(h);
+					json = JsonArray(map(candidates, \c -> JsonObject([
+						Pair("assertion", JsonString(id2s(c.data.info.id))),
+						Pair("arity", JsonDouble(i2d(ruArity(c.data))))
+					])));
+					env.out.respond(json);
+					Some(state);
+				}
+				None(): {
+					env.out.error("node " + i2s(node_id) + " not found", []);
+					None();
+				}
+			}
+		}
+		None(): {
+			env.out.error("Prover is not started", []);
+			None();
+		}
+	}
 }
 
 ruSortMethod(method : string, penv : RuProverEnv) -> Maybe<(RuProverProp) -> double> {
