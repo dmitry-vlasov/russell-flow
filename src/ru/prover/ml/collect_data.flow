@@ -1,4 +1,6 @@
+import formats/json/json;
 import ru/prover/ml/learning_data;
+import ru/prover/ml/assertion_model;
 import ds/vector;
 import base/util/progress;
 import ru/prover/prove;
@@ -9,6 +11,17 @@ import ru/map_decls;
 export {
     ruRunCollectLearningData(unit : RuUnit) -> Maybe<RuState>;
     ruCommCollectLearningData : RuComm;
+
+    // JSON serialization for the collected learning data.
+    // Only sign + goal RuExp parts are stored (premises are not needed for centroid learning).
+    ruAssertionUsages2json(data : Tree<int, RuAssertionUsage>) -> Json;
+    ruJson2AssertionUsages(json : Json) -> Tree<int, RuAssertionUsage>;
+
+    // Standard path for the persisted data file.
+    ruCollectedDataPath(conf : RuConf) -> string;
+
+    // Load previously collected data from disk; empty tree if file not found.
+    ruLoadCollectedData(conf : RuConf) -> Tree<int, RuAssertionUsage>;
 }
 
 ruCommCollectLearningData = RuComm(
@@ -50,24 +63,34 @@ ruRunCollectLearningData(unit : RuUnit) -> Maybe<RuState> {
             }
             RuMappedDecl(true, false, decl);
 		}
-        collected = fold(keysConcurHashMap(collected_map), makeTree(), \acc, id -> {
-            data = getConcurHashMap(collected_map, id, makeTree());
-            ruMergeLearningData(acc, data);
-        });
-		//print ln("Learning data:\n" + ruLearningData2s(collected, ))
 		new_state = ruMapFnComm(
 			RuUnit(unit.task, state, env.out),
 			RuMapFn(
 				RuMapFnInfo(
-					"collect-learning-data", 
-					\decl -> ruTargetPredicate(target)(decl) && ruDeclIsTheorem(decl), 
-					ruProofLengthMeasure, 
-					//\ -> "collected: " + i2s(^collected_count) + " theorems, failed: " + strGlue(map(^failed_theorems, id2s), ", ")
+					"collect-learning-data",
+					\decl -> ruTargetPredicate(target)(decl) && ruDeclIsTheorem(decl),
+					ruProofLengthMeasure,
 					\ -> "collected: " + i2s(^collected_count) + " theorems"
 				),
 				collect_learning_data_fn
 			)
 		);
+		// Merge per-theorem maps after parallel collection completes.
+		collected = fold(keysConcurHashMap(collected_map), makeTree(), \acc, id -> {
+			data = getConcurHashMap(collected_map, id, makeTree());
+			ruMergeLearningData(acc, data);
+		});
+		// Persist to disk for use by learn-* commands.
+		out_path = ruCollectedDataPath(conf);
+		out_dir = dirName(out_path);
+		dir_err = ensureDirectoryExists(out_dir);
+		if (dir_err != "") {
+			env.out.println("collect-learning-data: failed to create directory " + out_dir + ": " + dir_err);
+		} else if (!setFileContent(out_path, json2stringFormatted(ruAssertionUsages2json(collected)))) {
+			env.out.println("collect-learning-data: failed to write to " + out_path);
+		} else if (ruVerbose(conf) > 0) {
+			env.out.println("collect-learning-data: saved " + i2s(sizeTree(collected)) + " assertion usages to " + out_path);
+		}
 		if (ruVerbose(env.conf) > 0) {
 			env.out.println("collected: " + i2s(^collected_count) + " theorems");
 		}
@@ -78,7 +101,7 @@ ruRunCollectLearningData(unit : RuUnit) -> Maybe<RuState> {
 				env.out.println("Failed to collect_learning_data theorems:\n" + strIndent(strGlue(map(^failed_theorems, id2s), "\n")));
 			}
 		}
-		Some(RuState(new_state with 
+		Some(RuState(new_state with
 			vars = setTree(new_state.vars, "collect-learning-data", pairs2tree([
 				Pair("failed-count", flow(length(^failed_theorems))),
 				Pair("failed-theorems", flow(map(^failed_theorems, id2s))),
@@ -190,14 +213,7 @@ ruCollectLearningDataFromTheorem(
 		)
 	);
 	penv2 = ruExpandHyp(penv1.tree.root, penv1);
-	t = ruMakeTimer();
-	penv3 = ruProve(penv2);
-	//prover_env3.env.out.println("<<<! PROVING FINISHED !>>>");
-	prove_time = ruTimePassed(t);
-
-	usages = getTreeValues(^collected);
-	iter(usages, \usage -> env.out.println(ruAssertionUsage2s(usage, penv3.math, true)));
-	//print ln("TREE:\n" + ruProverTree2s(penv3.tree.root, penv3.math));
+	ruProveSequential(penv2);
 
     ^collected;
 }
@@ -207,4 +223,109 @@ ruLearningData2s(data : Tree<int, RuAssertionUsage>, math : RuMath) -> string {
 		Cons(ruAssertionUsage2s(usage, math, true), acc)
 	);
 	concatStrings(list2array(list));
+}
+
+// --- JSON serialization of collected learning data ---
+// Format: [{"assertion": int, "contexts": [{"sign": bool, "goal_exps": [[kind,v1,v2],...]},...]}]
+// Premises are omitted — only sign + goal RuExp parts are needed for centroid learning.
+
+ruUsageContext2json(ctx : RuUsageContext) -> Json {
+	goal_exps = filtermap(ctx.goal, \te ->
+		switch (te) {
+			RuExp(__,__): Some(ruExpToJson(te));
+			default: None();
+		}
+	);
+	JsonObject([
+		Pair("sign",      JsonBool(ctx.sign)),
+		Pair("goal_exps", JsonArray(goal_exps))
+	]);
+}
+
+ruJson2UsageContext(json : Json) -> Maybe<RuUsageContext> {
+	sign     = getJsonBoolField(json, "sign", false);
+	exps_arr = getJsonArrayField(json, "goal_exps");
+	exps     = filtermap(exps_arr, ruJson2Exp);
+	if (length(exps) == 0) None()
+	else Some(RuUsageContext(sign, [], map(exps, \e -> e)));
+}
+
+ruAssertionUsage2json(usage : RuAssertionUsage) -> Json {
+	JsonObject([
+		Pair("assertion", JsonDouble(i2d(usage.assertion))),
+		Pair("contexts",  JsonArray(map(usage.contexts, ruUsageContext2json)))
+	]);
+}
+
+ruJson2AssertionUsageItem(json : Json) -> Maybe<RuAssertionUsage> {
+	assertion = getJsonIntField(json, "assertion", -1);
+	if (assertion < 0) None()
+	else {
+		ctxs = filtermap(getJsonArrayField(json, "contexts"), ruJson2UsageContext);
+		if (length(ctxs) == 0) None()
+		else Some(RuAssertionUsage(assertion, ctxs));
+	}
+}
+
+ruAssertionUsages2json(data : Tree<int, RuAssertionUsage>) -> Json {
+	JsonArray(map(getTreeValues(data), ruAssertionUsage2json));
+}
+
+ruJson2AssertionUsages(json : Json) -> Tree<int, RuAssertionUsage> {
+	fold(filtermap(getJsonArrayValue(json, []), ruJson2AssertionUsageItem), makeTree(), \acc, u ->
+		setTree(acc, u.assertion, u)
+	);
+}
+
+// Sequential (non-concurrent) version of ruProve for use inside already-parallel per-theorem tasks.
+// Avoids nested concurrency which causes InterruptedException spam.
+ruProveSequential(prover_env : RuProverEnv) -> RuProverEnv {
+	switch (^(prover_env.tactic)) {
+		Some(tactic): {
+			to_expand0 = filtermap(^(prover_env.toExpand), \ind ->
+				lookupTree(prover_env.tree.leafs, ind)
+			);
+			prover_env.toExpand := [];
+			to_expand = if (length(to_expand0) > 0) to_expand0 else tactic.expand(prover_env.tree);
+			if (to_expand == [] || tactic.finished(prover_env.tree)) {
+				prover_env.tactic := prover_env.conf.task.strategy.nextTactic(prover_env.tree);
+				ruProveSequential(prover_env);
+			} else {
+				to_expand_removed = fold(to_expand, prover_env.tree.leafs, \acc, prop ->
+					removeFromTree(acc, prop.id)
+				);
+				env1 = RuProverEnv(prover_env with
+					tree = RuProverTree(prover_env.tree with leafs = to_expand_removed)
+				);
+				env1_expanded = ruSequential(
+					map(to_expand, \prop -> \env2 ->
+						if (tactic.finished(env1.tree)) env1
+						else ruProveProp(prop, RuProverEnv(env1 with env = env2))
+					),
+					env1.env
+				);
+				new_env = fold(env1_expanded, env1, \acc, e ->
+					RuProverEnv(acc with
+						tree = RuProverTree(acc.tree with
+							leafs = mergeTree(acc.tree.leafs, e.tree.leafs),
+							nodes = mergeTree(acc.tree.nodes, e.tree.leafs)
+						)
+					)
+				);
+				ruProveSequential(new_env);
+			}
+		}
+		None(): prover_env;
+	}
+}
+
+ruCollectedDataPath(conf : RuConf) -> string {
+	ru_root = ruOptsString(conf.opts, "ru-root", ".");
+	pathCombine(ru_root, "db/collected-learning-data.json");
+}
+
+ruLoadCollectedData(conf : RuConf) -> Tree<int, RuAssertionUsage> {
+	path = ruCollectedDataPath(conf);
+	if (!fileExists(path)) makeTree()
+	else ruJson2AssertionUsages(parseJsonSafe(getFileContent(path)));
 }

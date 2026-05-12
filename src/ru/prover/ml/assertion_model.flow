@@ -1,0 +1,265 @@
+import formats/json/json;
+import ru/prover/ml/lgg;
+import ru/util/src2s;
+
+export {
+	// Per-assertion learned models (one per method).
+
+	RuAssertionModelMedoid(
+		assertion  : int,
+		pos_medoid : RuExp,
+		neg_medoid : RuExp,
+		pos_count  : int,
+		neg_count  : int
+	);
+
+	RuAssertionModelIteratedLgg(
+		assertion : int,
+		pos_lgg   : RuExp,
+		neg_lgg   : RuExp,
+		pos_count : int,
+		neg_count : int
+	);
+
+	// Feature centroid stored as sparse Tree<feature_key, weight>.
+	RuAssertionModelFeatures(
+		assertion    : int,
+		pos_centroid : Tree<string, double>,
+		neg_centroid : Tree<string, double>,
+		pos_count    : int,
+		neg_count    : int
+	);
+
+	// RuExp <-> JSON (shared by medoid + iterated-lgg models).
+	ruExpToJson(e : RuExp) -> Json;
+	ruJson2Exp(json : Json) -> Maybe<RuExp>;
+
+	// Feature vector <-> JSON.
+	ruFeatureTree2json(t : Tree<string, double>) -> Json;
+	ruJson2FeatureTree(json : Json) -> Tree<string, double>;
+
+	// Collection serialization: Tree<int, model> -> JsonArray.
+	ruMedoidModels2json(models : Tree<int, RuAssertionModelMedoid>) -> Json;
+	ruJson2MedoidModels(json : Json) -> Tree<int, RuAssertionModelMedoid>;
+
+	ruIteratedLggModels2json(models : Tree<int, RuAssertionModelIteratedLgg>) -> Json;
+	ruJson2IteratedLggModels(json : Json) -> Tree<int, RuAssertionModelIteratedLgg>;
+
+	ruFeaturesModels2json(models : Tree<int, RuAssertionModelFeatures>) -> Json;
+	ruJson2FeaturesModels(json : Json) -> Tree<int, RuAssertionModelFeatures>;
+
+	// Human-readable summaries.
+	ruMedoidModel2s(m : RuAssertionModelMedoid, math : RuMath) -> string;
+	ruIteratedLggModel2s(m : RuAssertionModelIteratedLgg, math : RuMath) -> string;
+	ruFeaturesModel2s(m : RuAssertionModelFeatures, top_k : int) -> string;
+}
+
+// --- RuExp <-> JSON ---
+
+ruExpNode2json(n : RuExpNode) -> Json {
+	switch (n) {
+		RuRuleNode(idType, arityLen):
+			JsonArray([JsonDouble(0.0), JsonDouble(i2d(idType)), JsonDouble(i2d(arityLen))]);
+		RuVar(id, tp):
+			JsonArray([JsonDouble(1.0), JsonDouble(i2d(id)), JsonDouble(i2d(tp))]);
+	}
+}
+
+ruJson2ExpNode(json : Json) -> Maybe<RuExpNode> {
+	arr  = getJsonArrayValue(json, []);
+	if (length(arr) != 3) None()
+	else {
+		kind = getJsonIntValue(arr[0], -1);
+		v1   = getJsonIntValue(arr[1], 0);
+		v2   = getJsonIntValue(arr[2], 0);
+		if (kind == 0) Some(RuRuleNode(v1, v2))
+		else if (kind == 1) Some(RuVar(v1, v2))
+		else None();
+	}
+}
+
+ruExpToJson(e : RuExp) -> Json {
+	JsonObject([
+		Pair("nodes", JsonArray(map(e.nodes, ruExpNode2json))),
+		Pair("pos",   JsonDouble(i2d(e.pos)))
+	]);
+}
+
+ruJson2Exp(json : Json) -> Maybe<RuExp> {
+	nodes_json = getJsonArrayField(json, "nodes");
+	pos        = getJsonIntField(json, "pos", -1);
+	nodes      = filtermap(nodes_json, ruJson2ExpNode);
+	if (length(nodes) == length(nodes_json)) Some(RuExp(nodes, pos))
+	else None();
+}
+
+// --- Feature vector <-> JSON ---
+
+ruFeatureTree2json(t : Tree<string, double>) -> Json {
+	entries = foldTree(t, [], \k, v, acc ->
+		arrayPush(acc, JsonArray([JsonString(k), JsonDouble(v)]))
+	);
+	JsonArray(entries);
+}
+
+ruJson2FeatureTree(json : Json) -> Tree<string, double> {
+	fold(getJsonArrayValue(json, []), makeTree(), \acc, item -> {
+		arr = getJsonArrayValue(item, []);
+		if (length(arr) != 2) acc
+		else {
+			k = getJsonStringValue(arr[0], "");
+			v = getJsonDoubleValue(arr[1], 0.0);
+			if (k == "") acc else setTree(acc, k, v);
+		}
+	});
+}
+
+// --- Medoid model ---
+
+ruMedoidModel2json(m : RuAssertionModelMedoid) -> Json {
+	JsonObject([
+		Pair("assertion",  JsonDouble(i2d(m.assertion))),
+		Pair("pos_medoid", ruExpToJson(m.pos_medoid)),
+		Pair("neg_medoid", ruExpToJson(m.neg_medoid)),
+		Pair("pos_count",  JsonDouble(i2d(m.pos_count))),
+		Pair("neg_count",  JsonDouble(i2d(m.neg_count)))
+	]);
+}
+
+ruJson2MedoidModel(json : Json) -> Maybe<RuAssertionModelMedoid> {
+	assertion = getJsonIntField(json, "assertion", -1);
+	pm_opt    = ruJson2Exp(getJsonFieldValue(json, "pos_medoid", JsonNull()));
+	nm_opt    = ruJson2Exp(getJsonFieldValue(json, "neg_medoid", JsonNull()));
+	pc        = getJsonIntField(json, "pos_count", 0);
+	nc        = getJsonIntField(json, "neg_count", 0);
+	if (assertion < 0) None()
+	else switch (pm_opt) {
+		Some(pm): switch (nm_opt) {
+			Some(nm): Some(RuAssertionModelMedoid(assertion, pm, nm, pc, nc));
+			None(): None();
+		}
+		None(): None();
+	}
+}
+
+ruMedoidModels2json(models : Tree<int, RuAssertionModelMedoid>) -> Json {
+	JsonArray(map(getTreeValues(models), ruMedoidModel2json));
+}
+
+ruJson2MedoidModels(json : Json) -> Tree<int, RuAssertionModelMedoid> {
+	fold(filtermap(getJsonArrayValue(json, []), ruJson2MedoidModel), makeTree(), \acc, m ->
+		setTree(acc, m.assertion, m)
+	);
+}
+
+// --- Iterated-LGG model ---
+
+ruIteratedLggModel2json(m : RuAssertionModelIteratedLgg) -> Json {
+	JsonObject([
+		Pair("assertion", JsonDouble(i2d(m.assertion))),
+		Pair("pos_lgg",   ruExpToJson(m.pos_lgg)),
+		Pair("neg_lgg",   ruExpToJson(m.neg_lgg)),
+		Pair("pos_count", JsonDouble(i2d(m.pos_count))),
+		Pair("neg_count", JsonDouble(i2d(m.neg_count)))
+	]);
+}
+
+ruJson2IteratedLggModel(json : Json) -> Maybe<RuAssertionModelIteratedLgg> {
+	assertion = getJsonIntField(json, "assertion", -1);
+	pl_opt    = ruJson2Exp(getJsonFieldValue(json, "pos_lgg", JsonNull()));
+	nl_opt    = ruJson2Exp(getJsonFieldValue(json, "neg_lgg", JsonNull()));
+	pc        = getJsonIntField(json, "pos_count", 0);
+	nc        = getJsonIntField(json, "neg_count", 0);
+	if (assertion < 0) None()
+	else switch (pl_opt) {
+		Some(pl): switch (nl_opt) {
+			Some(nl): Some(RuAssertionModelIteratedLgg(assertion, pl, nl, pc, nc));
+			None(): None();
+		}
+		None(): None();
+	}
+}
+
+ruIteratedLggModels2json(models : Tree<int, RuAssertionModelIteratedLgg>) -> Json {
+	JsonArray(map(getTreeValues(models), ruIteratedLggModel2json));
+}
+
+ruJson2IteratedLggModels(json : Json) -> Tree<int, RuAssertionModelIteratedLgg> {
+	fold(filtermap(getJsonArrayValue(json, []), ruJson2IteratedLggModel), makeTree(), \acc, m ->
+		setTree(acc, m.assertion, m)
+	);
+}
+
+// --- Features model ---
+
+ruFeaturesModel2json(m : RuAssertionModelFeatures) -> Json {
+	JsonObject([
+		Pair("assertion",    JsonDouble(i2d(m.assertion))),
+		Pair("pos_centroid", ruFeatureTree2json(m.pos_centroid)),
+		Pair("neg_centroid", ruFeatureTree2json(m.neg_centroid)),
+		Pair("pos_count",    JsonDouble(i2d(m.pos_count))),
+		Pair("neg_count",    JsonDouble(i2d(m.neg_count)))
+	]);
+}
+
+ruJson2FeaturesModel(json : Json) -> Maybe<RuAssertionModelFeatures> {
+	assertion = getJsonIntField(json, "assertion", -1);
+	if (assertion < 0) None()
+	else Some(RuAssertionModelFeatures(
+		assertion,
+		ruJson2FeatureTree(getJsonFieldValue(json, "pos_centroid", JsonNull())),
+		ruJson2FeatureTree(getJsonFieldValue(json, "neg_centroid", JsonNull())),
+		getJsonIntField(json, "pos_count", 0),
+		getJsonIntField(json, "neg_count", 0)
+	));
+}
+
+ruFeaturesModels2json(models : Tree<int, RuAssertionModelFeatures>) -> Json {
+	JsonArray(map(getTreeValues(models), ruFeaturesModel2json));
+}
+
+ruJson2FeaturesModels(json : Json) -> Tree<int, RuAssertionModelFeatures> {
+	fold(filtermap(getJsonArrayValue(json, []), ruJson2FeaturesModel), makeTree(), \acc, m ->
+		setTree(acc, m.assertion, m)
+	);
+}
+
+// --- Human-readable output ---
+
+ruMedoidModel2s(m : RuAssertionModelMedoid, math : RuMath) -> string {
+	"[medoid] " + id2s(m.assertion) +
+	" (P=" + i2s(m.pos_count) + ", N=" + i2s(m.neg_count) + ")\n" +
+	"  pos: " + ru2s(m.pos_medoid, math) + "\n" +
+	"  neg: " + ru2s(m.neg_medoid, math) + "\n";
+}
+
+ruIteratedLggModel2s(m : RuAssertionModelIteratedLgg, math : RuMath) -> string {
+	p_vars = fold(m.pos_lgg.nodes, 0, \acc, n -> switch (n) { RuVar(__,__): acc + 1; default: acc; });
+	n_vars = fold(m.neg_lgg.nodes, 0, \acc, n -> switch (n) { RuVar(__,__): acc + 1; default: acc; });
+	"[iterated-lgg] " + id2s(m.assertion) +
+	" (P=" + i2s(m.pos_count) + ", N=" + i2s(m.neg_count) + ")\n" +
+	"  pos: " + ru2s(m.pos_lgg, math) +
+	"  [" + i2s(ruExpRuleNodeCount(m.pos_lgg)) + " rules, " + i2s(p_vars) + " vars]\n" +
+	"  neg: " + ru2s(m.neg_lgg, math) +
+	"  [" + i2s(ruExpRuleNodeCount(m.neg_lgg)) + " rules, " + i2s(n_vars) + " vars]\n";
+}
+
+ruFeaturesModel2s(m : RuAssertionModelFeatures, top_k : int) -> string {
+	all_keys = mergeSets(
+		buildSet(getTreeKeys(m.pos_centroid)),
+		buildSet(getTreeKeys(m.neg_centroid))
+	);
+	scored = map(set2array(all_keys), \k ->
+		Pair(k, abs(lookupTreeDef(m.pos_centroid, k, 0.0) - lookupTreeDef(m.neg_centroid, k, 0.0)))
+	);
+	top = take(sortCustom(scored, \p -> p.second, false), top_k);
+	lines = strGlue(map(top, \p ->
+		"    " + p.first +
+		": pos=" + d2s(lookupTreeDef(m.pos_centroid, p.first, 0.0)) +
+		" neg=" + d2s(lookupTreeDef(m.neg_centroid, p.first, 0.0)) +
+		" diff=" + d2s(p.second)
+	), "\n");
+	"[features] " + id2s(m.assertion) +
+	" (P=" + i2s(m.pos_count) + ", N=" + i2s(m.neg_count) + ")\n" +
+	"  top-" + i2s(top_k) + " discriminative features:\n" + lines + "\n";
+}

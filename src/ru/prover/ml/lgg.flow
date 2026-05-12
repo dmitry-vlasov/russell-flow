@@ -1,0 +1,198 @@
+import ru/src;
+import base/util/math;
+
+export {
+	// Least General Generalization of two expressions.
+	// Returns the most specific expression that generalizes both e1 and e2.
+	// Variables are treated as atomic: two vars are "same" only if their ids match.
+	// Fresh vars introduced at mismatch positions have id "_lgg_N" for counter N.
+	ruLggExps(e1 : RuExp, e2 : RuExp) -> RuExp;
+
+	// Iterated LGG of a non-empty list: fold ruLggExps left to right.
+	ruLggExpSet(exps : [RuExp]) -> RuExp;
+
+	// Distance in [0,1]: 0 = identical structure, 1 = nothing in common.
+	// d(e1,e2) = 1 - |rule-nodes in lgg(e1,e2)| / max(|rule-nodes in e1|, |rule-nodes in e2|)
+	ruLggDistance(e1 : RuExp, e2 : RuExp) -> double;
+
+	// Count RuRuleNode nodes (ignores RuVar nodes).
+	ruExpRuleNodeCount(e : RuExp) -> int;
+
+	// Sparse feature vector: 1-grams and 2-grams of rule-node IDs in DFS order.
+	// Keys are "R" (1-gram) or "R1:R2" (2-gram) where R is the rule int as string.
+	// Values are normalized frequencies (sum = 1.0, or 0 if expression has no rule nodes).
+	ruExpFeatureVec(e : RuExp) -> Tree<string, double>;
+
+	// Arithmetic mean of feature vectors.
+	ruFeatureVecMean(vecs : [Tree<string, double>]) -> Tree<string, double>;
+
+	// Cosine distance in [0,1]: 0 = identical, 1 = orthogonal.
+	ruFeatureVecDist(v1 : Tree<string, double>, v2 : Tree<string, double>) -> double;
+}
+
+// Internal: (result nodes, advance in e1, advance in e2)
+RuLggStep(nodes : [RuExpNode], adv1 : int, adv2 : int);
+
+ruLggFreshVar(counter : ref int, type : int) -> RuVar {
+	id = ^counter;
+	counter := ^counter + 1;
+	RuVar(s2id("_lgg_" + i2s(id)), type);
+}
+
+ruExpNodeType(n : RuExpNode) -> int {
+	switch (n) {
+		RuRuleNode(idType, __): ruIdType2Type(idType);
+		RuVar(__, type):        type;
+	}
+}
+
+ruExpNodeSpan(n : RuExpNode) -> int {
+	switch (n) {
+		RuRuleNode(__, arityLen): ruArityLen2Len(arityLen) + 1;
+		RuVar(__, __):            1;
+	}
+}
+
+ruDoLggAt(
+	nodes1 : [RuExpNode], i1 : int,
+	nodes2 : [RuExpNode], i2 : int,
+	counter : ref int
+) -> RuLggStep {
+	n1 = nodes1[i1];
+	n2 = nodes2[i2];
+	switch (n1) {
+		RuRuleNode(rt1, al1): {
+			rule1  = ruIdType2Id(rt1);
+			type1  = ruIdType2Type(rt1);
+			arity1 = ruArityLen2Arity(al1);
+			len1   = ruArityLen2Len(al1);
+			switch (n2) {
+				RuRuleNode(rt2, al2): {
+					rule2  = ruIdType2Id(rt2);
+					arity2 = ruArityLen2Arity(al2);
+					len2   = ruArityLen2Len(al2);
+					if (rule1 == rule2 && arity1 == arity2) {
+						children = ruDoLggChildren(nodes1, i1 + 1, nodes2, i2 + 1, arity1, counter);
+						root_node = ruMakeRuleNode(rule1, type1, arity1, length(children));
+						RuLggStep(concat([root_node], children), len1 + 1, len2 + 1);
+					} else {
+						fresh = ruLggFreshVar(counter, type1);
+						RuLggStep([fresh], len1 + 1, ruArityLen2Len(al2) + 1);
+					}
+				}
+				RuVar(__, __): {
+					fresh = ruLggFreshVar(counter, type1);
+					RuLggStep([fresh], len1 + 1, 1);
+				}
+			}
+		}
+		RuVar(id1, type1): {
+			switch (n2) {
+				RuVar(id2, __): {
+					if (id1 == id2) {
+						RuLggStep([n1], 1, 1);
+					} else {
+						fresh = ruLggFreshVar(counter, type1);
+						RuLggStep([fresh], 1, 1);
+					}
+				}
+				RuRuleNode(__, al2): {
+					fresh = ruLggFreshVar(counter, type1);
+					RuLggStep([fresh], 1, ruArityLen2Len(al2) + 1);
+				}
+			}
+		}
+	}
+}
+
+ruDoLggChildren(
+	nodes1 : [RuExpNode], i1 : int,
+	nodes2 : [RuExpNode], i2 : int,
+	arity  : int,
+	counter : ref int
+) -> [RuExpNode] {
+	if (arity == 0) [] else {
+		step = ruDoLggAt(nodes1, i1, nodes2, i2, counter);
+		rest = ruDoLggChildren(nodes1, i1 + step.adv1, nodes2, i2 + step.adv2, arity - 1, counter);
+		concat(step.nodes, rest);
+	}
+}
+
+ruLggExps(e1 : RuExp, e2 : RuExp) -> RuExp {
+	if (length(e1.nodes) == 0 || length(e2.nodes) == 0) ruNoExp else {
+		counter = ref 0;
+		step = ruDoLggAt(e1.nodes, 0, e2.nodes, 0, counter);
+		RuExp(step.nodes, -1);
+	}
+}
+
+ruLggExpSet(exps : [RuExp]) -> RuExp {
+	n = length(exps);
+	if (n == 0) ruNoExp else {
+		fold(tail(exps), exps[0], \acc, e -> ruLggExps(acc, e));
+	}
+}
+
+ruLggDistance(e1 : RuExp, e2 : RuExp) -> double {
+	lgg   = ruLggExps(e1, e2);
+	lgg_n = ruExpRuleNodeCount(lgg);
+	e1_n  = ruExpRuleNodeCount(e1);
+	e2_n  = ruExpRuleNodeCount(e2);
+	denom = max(e1_n, e2_n);
+	if (denom == 0) 0.0 else 1.0 - i2d(lgg_n) / i2d(denom);
+}
+
+ruExpRuleNodeCount(e : RuExp) -> int {
+	fold(e.nodes, 0, \acc, n ->
+		switch (n) {
+			RuRuleNode(__, __): acc + 1;
+			RuVar(__, __):      acc;
+		}
+	);
+}
+
+ruExpFeatureVec(e : RuExp) -> Tree<string, double> {
+	n = length(e.nodes);
+	raw = foldi(e.nodes, makeTree(), \i, acc, node ->
+		switch (node) {
+			RuRuleNode(rt, __): {
+				r1  = ruIdType2Id(rt);
+				k1  = i2s(r1);
+				a1  = setTree(acc, k1, lookupTreeDef(acc, k1, 0.0) + 1.0);
+				if (i + 1 < n) {
+					switch (e.nodes[i + 1]) {
+						RuRuleNode(rt2, __): {
+							r2  = ruIdType2Id(rt2);
+							k2  = k1 + ":" + i2s(r2);
+							setTree(a1, k2, lookupTreeDef(a1, k2, 0.0) + 1.0);
+						}
+						RuVar(__, __): a1;
+					}
+				} else a1;
+			}
+			RuVar(__, __): acc;
+		}
+	);
+	total = fold(getTreeValues(raw), 0.0, \acc, v -> acc + v);
+	if (total == 0.0) raw else mapTree(raw, \v -> v / total);
+}
+
+ruFeatureVecMean(vecs : [Tree<string, double>]) -> Tree<string, double> {
+	n = length(vecs);
+	if (n == 0) makeTree() else {
+		summed = fold(vecs, makeTree(), \acc, vec ->
+			foldTree(vec, acc, \k, v, a ->
+				setTree(a, k, lookupTreeDef(a, k, 0.0) + v)
+			)
+		);
+		mapTree(summed, \v -> v / i2d(n));
+	}
+}
+
+ruFeatureVecDist(v1 : Tree<string, double>, v2 : Tree<string, double>) -> double {
+	dot   = foldTree(v1, 0.0, \k, w1, acc -> acc + w1 * lookupTreeDef(v2, k, 0.0));
+	norm1 = sqrt(fold(getTreeValues(v1), 0.0, \acc, v -> acc + v * v));
+	norm2 = sqrt(fold(getTreeValues(v2), 0.0, \acc, v -> acc + v * v));
+	denom = norm1 * norm2;
+	if (denom == 0.0) 1.0 else 1.0 - dot / denom;
+}

@@ -1,0 +1,95 @@
+import ru/prover/ml/assertion_model;
+import ru/prover/ml/collect_data;
+import comm;
+
+export {
+	ruCommLearnAssertionMedoid : RuComm;
+	ruExtractGoalExps(ctxs : [RuUsageContext]) -> [RuExp];
+}
+
+ruCommLearnAssertionMedoid = RuComm(
+	RuCommInfo(
+		"learn-assertion-medoid", "prover",
+		"learn per-assertion medoid models from collected learning data",
+		"", false, false,
+		[
+			RuCommArg("max-neg", true, "max negative contexts per assertion (0 = unlimited)", "1000"),
+		], []
+	),
+	ruRunLearnAssertionMedoid
+);
+
+ruRunLearnAssertionMedoid(unit : RuUnit) -> Maybe<RuState> {
+	env   = ruUnitEnv(unit);
+	task  = unit.task;
+	state = unit.state;
+	conf  = state.conf;
+	timer = ruMakeTimer();
+	max_neg = ruTaskIntArg(task, "max-neg", 1000);
+
+	data = ruLoadCollectedData(conf);
+	if (sizeTree(data) == 0) {
+		env.out.println("learn-assertion-medoid: no collected data found, run collect-learning-data first");
+		Some(state);
+	} else {
+		models = foldTree(data, makeTree(), \id, usage, acc ->
+			switch (ruComputeMedoidModel(id, usage, max_neg)) {
+				Some(m): setTree(acc, id, m);
+				None():  acc;
+			}
+		);
+		ru_root = ruOptsString(conf.opts, "ru-root", ".");
+		out_path = pathCombine(ru_root, "db/assertion-models-medoid.json");
+		if (!setFileContent(out_path, json2stringFormatted(ruMedoidModels2json(models)))) {
+			env.out.println("learn-assertion-medoid: failed to write to " + out_path);
+		} else if (ruVerbose(conf) > 0) {
+			env.out.println("learn-assertion-medoid: learned " + i2s(sizeTree(models)) + " models in " + ruTimePassed2s(timer));
+			env.out.println("learn-assertion-medoid: saved to " + out_path);
+		}
+		Some(RuState(state with
+			vars = setTree(state.vars, "learn-assertion-medoid", pairs2tree([
+				Pair("count", flow(sizeTree(models))),
+				Pair("file",  flow(out_path))
+			]))
+		));
+	}
+}
+
+ruComputeMedoidModel(id : int, usage : RuAssertionUsage, max_neg : int) -> Maybe<RuAssertionModelMedoid> {
+	pos_exps = ruExtractGoalExps(filter(usage.contexts, \ctx -> ctx.sign));
+	neg_exps0 = ruExtractGoalExps(filter(usage.contexts, \ctx -> !ctx.sign));
+	neg_exps = if (max_neg > 0 && length(neg_exps0) > max_neg) take(neg_exps0, max_neg) else neg_exps0;
+	if (length(pos_exps) == 0 || length(neg_exps) == 0) None()
+	else {
+		pos_medoid = ruFindMedoid(pos_exps);
+		neg_medoid = ruFindMedoid(neg_exps);
+		Some(RuAssertionModelMedoid(id, pos_medoid, neg_medoid, length(pos_exps), length(neg_exps)));
+	}
+}
+
+ruFindMedoid(exps : [RuExp]) -> RuExp {
+	n = length(exps);
+	if (n == 1) exps[0]
+	else {
+		best = foldi(exps, Pair(0, doubleMax), \i, acc, e ->
+			switch (acc) { Pair(bi, bd): {
+				total = fold(exps, 0.0, \s, e2 -> s + ruLggDistance(e, e2));
+				if (total < bd) Pair(i, total) else acc;
+			}}
+		);
+		switch (best) { Pair(bi, __): exps[bi]; }
+	}
+}
+
+// Extract the first RuExp from each context's goal list; skip contexts with no RuExp.
+ruExtractGoalExps(ctxs : [RuUsageContext]) -> [RuExp] {
+	filtermap(ctxs, \ctx ->
+		fold(ctx.goal, None(), \acc, te ->
+			if (isSome(acc)) acc
+			else switch (te) {
+				RuExp(__,__): Some(te);
+				default: None();
+			}
+		)
+	)
+}
