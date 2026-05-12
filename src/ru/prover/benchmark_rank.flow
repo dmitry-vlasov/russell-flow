@@ -1,0 +1,210 @@
+import ru/prover/reprove_oracle;
+import ru/prover/prove;
+import ru/prover/strategies/default;
+import ru/map_decls;
+import comm;
+
+export {
+	ruCommBenchmarkRank : RuComm;
+}
+
+RuTheoremRankResult(
+	total            : int,
+	covered          : int,
+	top1             : int,
+	top2             : int,
+	top3             : int,
+	top5             : int,
+	top10            : int,
+	mrr_sum          : double,
+	baseline_mrr_sum : double,
+	candidates       : int
+);
+
+ruCommBenchmarkRank = RuComm(
+	RuCommInfo(
+		"benchmark-rank", "prover",
+		"measure premise-selection ranking quality by replaying proofs with the unifier",
+		"target", true, false,
+		[
+			RuCommArg("target", true, "the target: a theorem, file or all", "all"),
+			RuCommArg("shuffle", true, "shuffle candidate list before ranking to get a true random baseline", "0"),
+		], []
+	),
+	ruRunBenchmarkRank
+);
+
+ruRunBenchmarkRank(unit : RuUnit) -> Maybe<RuState> {
+	env   = ruUnitEnv(unit);
+	state = unit.state;
+	math  = ruMathFromSources(state.ru, env);
+	timer = ruMakeTimer();
+	target = ruDetermineTarget(unit.task, math, env);
+	if (target != RuTargetNone()) {
+		processed_count = ref 0;
+		inc_processed   = ruAtomicIntInc(processed_count);
+		index   = ruMakeIndexForTarget(target, math, env);
+		results : ConcurHashMap<int, RuTheoremRankResult> = makeConcurHashMap(idfn);
+		do_shuffle = ruTaskBoolArg(unit.task, "shuffle", false);
+		rank_fn = \decl : RuDecl, time_limit : double, env1 : RuEnv -> {
+			th = cast(decl : RuDecl -> RuTheorem);
+			if (ruTheoremIsProved(th)) {
+				r = ruBenchmarkRankTheorem(th, index, do_shuffle, time_limit, math, env1);
+				setConcurHashMap(results, th.info.id, r);
+				inc_processed(1);
+				if (ruVerbose(env1.conf) > 2) {
+					mrr = if (r.covered > 0) r.mrr_sum / i2d(r.covered) else 0.0;
+					env1.out.println(
+						i2s(^processed_count) + " ranked '" + id2s(th.info.id) +
+						"': steps=" + i2s(r.total) +
+						" top1=" + i2s(r.top1) + "/" + i2s(r.covered) +
+						" mrr=" + d2s(mrr)
+					);
+				}
+			}
+			RuMappedDecl(true, false, decl);
+		}
+		new_state = ruMapFnComm(
+			RuUnit(unit.task, state, env.out),
+			RuMapFn(
+				RuMapFnInfo(
+					"benchmark-rank",
+					\decl -> ruTargetPredicate(target)(decl) && ruDeclIsTheorem(decl),
+					ruProofLengthMeasure,
+					\ -> "ranked: " + i2s(^processed_count) + " theorems"
+				),
+				rank_fn
+			)
+		);
+		zero = RuTheoremRankResult(0, 0, 0, 0, 0, 0, 0, 0.0, 0.0, 0);
+		totals = fold(keysConcurHashMap(results), zero, \acc, id -> {
+			r = getConcurHashMap(results, id, zero);
+			RuTheoremRankResult(
+				acc.total + r.total,
+				acc.covered + r.covered,
+				acc.top1 + r.top1,
+				acc.top2 + r.top2,
+				acc.top3 + r.top3,
+				acc.top5 + r.top5,
+				acc.top10 + r.top10,
+				acc.mrr_sum + r.mrr_sum,
+				acc.baseline_mrr_sum + r.baseline_mrr_sum,
+				acc.candidates + r.candidates
+			)
+		});
+		n  = totals.total;
+		nc = totals.covered;
+		if (ruVerbose(env.conf) > 0 && n > 0) {
+			pct = \num : int, den : int -> if (den == 0) "n/a" else d2s(100.0 * i2d(num) / i2d(den)) + "%";
+			env.out.println("benchmark-rank: " + i2s(^processed_count) + " theorems, " + i2s(n) + " steps in " + ruTimePassed2s(timer));
+			env.out.println("  coverage:  " + pct(nc, n) + " (" + i2s(nc) + "/" + i2s(n) + " oracle assertions found in candidate list)");
+			if (nc > 0) {
+				mrr          = totals.mrr_sum / i2d(nc);
+				baseline_mrr = totals.baseline_mrr_sum / i2d(n);
+				env.out.println("  top-1:     " + pct(totals.top1, nc));
+				env.out.println("  top-2:     " + pct(totals.top2, nc));
+				env.out.println("  top-3:     " + pct(totals.top3, nc));
+				env.out.println("  top-5:     " + pct(totals.top5, nc));
+				env.out.println("  top-10:    " + pct(totals.top10, nc));
+				env.out.println("  MRR:       " + d2s(mrr) + "  (baseline: " + d2s(baseline_mrr) + ",  ratio: " + d2s(mrr / baseline_mrr) + "x)");
+				env.out.println("  avg cands: " + d2s(i2d(totals.candidates) / i2d(n)));
+			}
+		}
+		Some(RuState(new_state with
+			vars = setTree(new_state.vars, "benchmark-rank", pairs2tree([
+				Pair("theorems",      flow(^processed_count)),
+				Pair("total-steps",   flow(n)),
+				Pair("covered-steps", flow(nc)),
+				Pair("top1",          flow(totals.top1)),
+				Pair("top2",          flow(totals.top2)),
+				Pair("top3",          flow(totals.top3)),
+				Pair("top5",          flow(totals.top5)),
+				Pair("top10",         flow(totals.top10)),
+				Pair("top1-pct",      flow(if (nc > 0) 100.0 * i2d(totals.top1)  / i2d(nc) else 0.0)),
+				Pair("top2-pct",      flow(if (nc > 0) 100.0 * i2d(totals.top2)  / i2d(nc) else 0.0)),
+				Pair("top3-pct",      flow(if (nc > 0) 100.0 * i2d(totals.top3)  / i2d(nc) else 0.0)),
+				Pair("top5-pct",      flow(if (nc > 0) 100.0 * i2d(totals.top5)  / i2d(nc) else 0.0)),
+				Pair("top10-pct",     flow(if (nc > 0) 100.0 * i2d(totals.top10) / i2d(nc) else 0.0)),
+				Pair("mrr",           flow(if (nc > 0) totals.mrr_sum / i2d(nc) else 0.0)),
+				Pair("baseline-mrr",  flow(if (n > 0) totals.baseline_mrr_sum / i2d(n) else 0.0)),
+				Pair("mrr-ratio",     flow(if (totals.baseline_mrr_sum > 0.0) totals.mrr_sum / totals.baseline_mrr_sum else 0.0))
+			]))
+		));
+	} else {
+		env.out.println("no target for benchmark-rank");
+		Some(state);
+	}
+}
+
+ruBenchmarkRankTheorem(
+	th         : RuTheorem,
+	index      : RuIndex<RuAssertion>,
+	do_shuffle : bool,
+	time_limit : double,
+	math       : RuMath,
+	env        : RuEnv,
+) -> RuTheoremRankResult {
+	rng            = randomGenerator(round(timestamp()));
+	shuffle        = \arr -> {
+		tagged = mapi(arr, \__, x -> Pair(rng(), x));
+		map(sortCustom(tagged, \p -> p.first, true), \p -> p.second);
+	};
+	mapping        = ref makeTree();
+	root_assertion = lookupTreeDef(math.decls.assertions, ruProofQedStep(th.proof).assertion, ruNoAxiom);
+	oracle_tactic  = ruReproveOracleTactic(th, math, mapping, 1, 0, env);
+	prover_task    = RuProverTask(
+		th.info, ruSingleTacticStrategy(oracle_tactic),
+		id2s(th.info.id), makeTree(), th.infer.hyps, ruProofQedStep(th.proof)
+	);
+	penv0          = ruInitProverEnv(prover_task, math, env, index, time_limit);
+	original_unify = penv0.fns.unifyAssertion;
+	oracle_unify   = ruReproveOracleUnifyAssertion(
+		th, original_unify, mapping, root_assertion, math, env, 1, 1, 0
+	);
+
+	total            = ref 0;
+	covered          = ref 0;
+	top1             = ref 0;
+	top2             = ref 0;
+	top3             = ref 0;
+	top5             = ref 0;
+	top10            = ref 0;
+	mrr_sum          = ref 0.0;
+	baseline_mrr_sum = ref 0.0;
+	candidates       = ref 0;
+
+	ranking_unify = \hyp : RuProverHyp -> {
+		all0 = original_unify(hyp);
+		all = if (do_shuffle) shuffle(all0) else all0;
+		oracle_result = oracle_unify(hyp);
+		if (length(oracle_result) > 0) {
+			oracle_id = oracle_result[0].data.info.id;
+			n = length(all);
+			rank = findiDef(all, \c -> c.data.info.id == oracle_id, -1);
+			total      := ^total + 1;
+			candidates := ^candidates + n;
+			// expected MRR for uniform random ranking over n candidates: H(n)/n
+			hn = fold(enumFromTo(1, n), 0.0, \acc, k -> acc + 1.0 / i2d(k));
+			baseline_mrr_sum := ^baseline_mrr_sum + hn / i2d(n);
+			if (rank >= 0) {
+				covered := ^covered + 1;
+				if (rank == 0) top1  := ^top1  + 1;
+				if (rank < 2)  top2  := ^top2  + 1;
+				if (rank < 3)  top3  := ^top3  + 1;
+				if (rank < 5)  top5  := ^top5  + 1;
+				if (rank < 10) top10 := ^top10 + 1;
+				mrr_sum := ^mrr_sum + 1.0 / i2d(rank + 1);
+			}
+		}
+		oracle_result
+	};
+
+	penv1 = RuProverEnv(penv0 with
+		fns = RuProverFuncs(penv0.fns with
+			unifyAssertion = ranking_unify
+		)
+	);
+	penv2 = ruExpandHyp(penv1.tree.root, penv1);
+	ruProve(penv2);
+	RuTheoremRankResult(^total, ^covered, ^top1, ^top2, ^top3, ^top5, ^top10, ^mrr_sum, ^baseline_mrr_sum, ^candidates)
+}
