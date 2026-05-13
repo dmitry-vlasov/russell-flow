@@ -10,6 +10,9 @@ export {
 	) -> RuProverEnv;
 
 	ruProve(prover_env : RuProverEnv) -> RuProverEnv;
+	// Sequential variant: avoids nested-concurrency issues when called inside
+	// an already-parallel context (e.g. ruMapFnComm per-theorem workers).
+	ruProveSequential(prover_env : RuProverEnv) -> RuProverEnv;
 	ruProveProp(prop : RuProverProp, prover_env : RuProverEnv) -> RuProverEnv;
 }
 
@@ -118,5 +121,45 @@ ruProve(prover_env : RuProverEnv) -> RuProverEnv {
 			//print ln("tactic is None");
 			prover_env;
 		}
+	}
+}
+
+ruProveSequential(prover_env : RuProverEnv) -> RuProverEnv {
+	switch (^(prover_env.tactic)) {
+		Some(tactic): {
+			to_expand0 = filtermap(^(prover_env.toExpand), \ind ->
+				lookupTree(prover_env.tree.leafs, ind)
+			);
+			prover_env.toExpand := [];
+			to_expand = if (length(to_expand0) > 0) to_expand0 else tactic.expand(prover_env.tree);
+			if (to_expand == [] || tactic.finished(prover_env.tree)) {
+				prover_env.tactic := prover_env.conf.task.strategy.nextTactic(prover_env.tree);
+				ruProveSequential(prover_env);
+			} else {
+				to_expand_removed = fold(to_expand, prover_env.tree.leafs, \acc, prop ->
+					removeFromTree(acc, prop.id)
+				);
+				env1 = RuProverEnv(prover_env with
+					tree = RuProverTree(prover_env.tree with leafs = to_expand_removed)
+				);
+				env1_expanded = ruSequential(
+					map(to_expand, \prop -> \env2 ->
+						if (tactic.finished(env1.tree)) env1
+						else ruProveProp(prop, RuProverEnv(env1 with env = env2))
+					),
+					env1.env
+				);
+				new_env = fold(env1_expanded, env1, \acc, e ->
+					RuProverEnv(acc with
+						tree = RuProverTree(acc.tree with
+							leafs = mergeTree(acc.tree.leafs, e.tree.leafs),
+							nodes = mergeTree(acc.tree.nodes, e.tree.leafs)
+						)
+					)
+				);
+				ruProveSequential(new_env);
+			}
+		}
+		None(): prover_env;
 	}
 }

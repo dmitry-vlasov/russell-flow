@@ -1,0 +1,173 @@
+import ru/prover/reprove_oracle;
+import ru/prover/prove;
+import ru/prover/strategies/default;
+import ru/prover/tactics/breadth_first;
+import ru/prover/ml/premise_selector;
+import ru/map_decls;
+import comm;
+
+export {
+	ruCommBenchmarkTactic : RuComm;
+}
+
+RuTacticBenchmarkResult(
+	steps_total   : int,
+	steps_covered : int,
+	output_total  : int
+);
+
+ruCommBenchmarkTactic = RuComm(
+	RuCommInfo(
+		"benchmark-tactic", "prover",
+		"measure tactic recall: fraction of proof steps where oracle prop appears in tactic output",
+		"target", true, false,
+		[
+			RuCommArg("target",    true, "the target: a theorem, file or all", "all"),
+			RuCommArg("tactic",    true, "tactic name: bfs, bfs-top, ml", "bfs-top"),
+			RuCommArg("top-k",     true, "beam width for bfs-top or ml tactics", "5"),
+			RuCommArg("max-depth", true, "max proof search depth limit for tactic", "7"),
+			RuCommArg("max-size",  true, "max prover tree size limit for tactic", "10000"),
+		], []
+	),
+	ruRunBenchmarkTactic
+);
+
+ruRunBenchmarkTactic(unit : RuUnit) -> Maybe<RuState> {
+	env    = ruUnitEnv(unit);
+	state  = unit.state;
+	math   = ruMathFromSources(state.ru, env);
+	timer  = ruMakeTimer();
+	target = ruDetermineTarget(unit.task, math, env);
+	if (target != RuTargetNone()) {
+		top_k     = ruTaskIntArg(unit.task, "top-k",     5);
+		max_depth = ruTaskIntArg(unit.task, "max-depth", 7);
+		max_size  = ruTaskIntArg(unit.task, "max-size",  10000);
+		tactic_name = ruTaskStringArg(unit.task, "tactic", "bfs-top");
+
+		candidate_tactic =
+			if (tactic_name == "bfs") {
+				ruBoundedBFSTactic(max_depth, max_size);
+			} else if (tactic_name == "ml") {
+				sel = ruLoadMlSelector(state.conf);
+				if (sizeTree(sel.features) == 0) {
+					env.out.println("benchmark-tactic: no ML models found, run learn-assertions first")
+				};
+				ruMlTactic(sel, top_k, max_depth, max_size);
+			} else {
+				ruTopNBFSTactic(top_k, max_depth, max_size);
+			};
+
+		processed_count = ref 0;
+		inc_processed   = ruAtomicIntInc(processed_count);
+		index   = ruMakeIndexForTarget(target, math, env);
+		results : ConcurHashMap<int, RuTacticBenchmarkResult> = makeConcurHashMap(idfn);
+
+		bench_fn = \decl : RuDecl, time_limit : double, env1 : RuEnv -> {
+			th = cast(decl : RuDecl -> RuTheorem);
+			if (ruTheoremIsProved(th)) {
+				r = ruBenchmarkTacticTheorem(th, index, candidate_tactic, time_limit, math, env1);
+				setConcurHashMap(results, th.info.id, r);
+				inc_processed(1);
+				if (ruVerbose(env1.conf) > 2) {
+					cov = if (r.steps_total > 0) d2s(100.0 * i2d(r.steps_covered) / i2d(r.steps_total)) + "%" else "n/a";
+					env1.out.println(
+						i2s(^processed_count) + " tactic-bench '" + id2s(th.info.id) +
+						"': steps=" + i2s(r.steps_total) +
+						" covered=" + i2s(r.steps_covered) +
+						" (" + cov + ")"
+					);
+				}
+			}
+			RuMappedDecl(true, false, decl);
+		}
+
+		new_state = ruMapFnComm(
+			RuUnit(unit.task, state, env.out),
+			RuMapFn(
+				RuMapFnInfo(
+					"benchmark-tactic",
+					\decl -> ruTargetPredicate(target)(decl) && ruDeclIsTheorem(decl),
+					ruProofLengthMeasure,
+					\ -> "benchmarked: " + i2s(^processed_count) + " theorems"
+				),
+				bench_fn
+			)
+		);
+
+		zero = RuTacticBenchmarkResult(0, 0, 0);
+		totals = fold(keysConcurHashMap(results), zero, \acc, id -> {
+			r = getConcurHashMap(results, id, zero);
+			RuTacticBenchmarkResult(
+				acc.steps_total   + r.steps_total,
+				acc.steps_covered + r.steps_covered,
+				acc.output_total  + r.output_total
+			)
+		});
+		n  = totals.steps_total;
+		nc = totals.steps_covered;
+		if (ruVerbose(env.conf) > 0 && n > 0) {
+			pct = \num, den -> if (den == 0) "n/a" else d2s(100.0 * i2d(num) / i2d(den)) + "%";
+			env.out.println(
+				"benchmark-tactic [" + tactic_name +
+				(if (tactic_name != "bfs") " top-k=" + i2s(top_k) else "") +
+				"]: " + i2s(^processed_count) + " theorems, " + i2s(n) + " steps in " + ruTimePassed2s(timer)
+			);
+			env.out.println("  coverage:      " + pct(nc, n) + " (" + i2s(nc) + "/" + i2s(n) + " steps where oracle is in tactic output)");
+			env.out.println("  avg output sz: " + d2s(i2d(totals.output_total) / i2d(n)));
+		}
+		Some(RuState(new_state with
+			vars = setTree(new_state.vars, "benchmark-tactic", pairs2tree([
+				Pair("theorems",      flow(^processed_count)),
+				Pair("total-steps",   flow(n)),
+				Pair("covered-steps", flow(nc)),
+				Pair("coverage-pct",  flow(if (n > 0) 100.0 * i2d(nc) / i2d(n) else 0.0)),
+				Pair("avg-output-sz", flow(if (n > 0) i2d(totals.output_total) / i2d(n) else 0.0))
+			]))
+		));
+	} else {
+		env.out.println("benchmark-tactic: no target");
+		Some(state);
+	}
+}
+
+ruBenchmarkTacticTheorem(
+	th               : RuTheorem,
+	index            : RuIndex<RuAssertion>,
+	candidate_tactic : RuProverTactic,
+	time_limit       : double,
+	math             : RuMath,
+	env              : RuEnv
+) -> RuTacticBenchmarkResult {
+	mapping      = ref makeTree();
+	oracle_tactic = ruReproveOracleTactic(th, math, mapping, 1, 0, env);
+
+	steps_covered = ref 0;
+	steps_total   = ref 0;
+	output_total  = ref 0;
+
+	wrapped_tactic = RuProverTactic(oracle_tactic.description,
+		\tree -> {
+			oracle_props = oracle_tactic.expand(tree);
+			if (length(oracle_props) > 0) {
+				oracle_id    = oracle_props[0].id;
+				tactic_props = candidate_tactic.expand(tree);
+				steps_total  := ^steps_total  + 1;
+				output_total := ^output_total + length(tactic_props);
+				if (exists(tactic_props, \p -> p.id == oracle_id)) {
+					steps_covered := ^steps_covered + 1;
+				}
+			}
+			oracle_props;
+		},
+		oracle_tactic.finished
+	);
+
+	prover_task = RuProverTask(
+		th.info, ruSingleTacticStrategy(wrapped_tactic),
+		id2s(th.info.id), makeTree(), th.infer.hyps, ruProofQedStep(th.proof)
+	);
+	penv0 = ruInitProverEnv(prover_task, math, env, index, time_limit);
+	penv1 = ruExpandHyp(penv0.tree.root, penv0);
+	ruProveSequential(penv1);
+	RuTacticBenchmarkResult(^steps_total, ^steps_covered, ^output_total)
+}

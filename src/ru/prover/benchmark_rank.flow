@@ -1,6 +1,7 @@
 import ru/prover/reprove_oracle;
 import ru/prover/prove;
 import ru/prover/strategies/default;
+import ru/prover/ml/premise_selector;
 import ru/map_decls;
 import comm;
 
@@ -27,8 +28,8 @@ ruCommBenchmarkRank = RuComm(
 		"measure premise-selection ranking quality by replaying proofs with the unifier",
 		"target", true, false,
 		[
-			RuCommArg("target", true, "the target: a theorem, file or all", "all"),
-			RuCommArg("shuffle", true, "shuffle candidate list before ranking to get a true random baseline", "0"),
+			RuCommArg("target",  true, "the target: a theorem, file or all", "all"),
+			RuCommArg("mode",    true, "ranking mode: default (unifier order), shuffle (random baseline), ml (ML-guided)", "default"),
 		], []
 	),
 	ruRunBenchmarkRank
@@ -45,11 +46,15 @@ ruRunBenchmarkRank(unit : RuUnit) -> Maybe<RuState> {
 		inc_processed   = ruAtomicIntInc(processed_count);
 		index   = ruMakeIndexForTarget(target, math, env);
 		results : ConcurHashMap<int, RuTheoremRankResult> = makeConcurHashMap(idfn);
-		do_shuffle = ruTaskBoolArg(unit.task, "shuffle", false);
+		mode   = ruTaskStringArg(unit.task, "mode", "default");
+		ml_sel = ruLoadMlSelector(state.conf);
+		if (mode == "ml" && sizeTree(ml_sel.features) == 0) {
+			env.out.println("benchmark-rank: no ML models found, run learn-assertions first")
+		};
 		rank_fn = \decl : RuDecl, time_limit : double, env1 : RuEnv -> {
 			th = cast(decl : RuDecl -> RuTheorem);
 			if (ruTheoremIsProved(th)) {
-				r = ruBenchmarkRankTheorem(th, index, do_shuffle, time_limit, math, env1);
+				r = ruBenchmarkRankTheorem(th, index, mode, ml_sel, time_limit, math, env1);
 				setConcurHashMap(results, th.info.id, r);
 				inc_processed(1);
 				if (ruVerbose(env1.conf) > 2) {
@@ -139,16 +144,13 @@ ruRunBenchmarkRank(unit : RuUnit) -> Maybe<RuState> {
 ruBenchmarkRankTheorem(
 	th         : RuTheorem,
 	index      : RuIndex<RuAssertion>,
-	do_shuffle : bool,
+	mode       : string,
+	ml_sel     : RuMlSelector,
 	time_limit : double,
 	math       : RuMath,
-	env        : RuEnv,
+	env        : RuEnv
 ) -> RuTheoremRankResult {
 	rng            = randomGenerator(round(timestamp()));
-	shuffle        = \arr -> {
-		tagged = mapi(arr, \__, x -> Pair(rng(), x));
-		map(sortCustom(tagged, \p -> p.first, true), \p -> p.second);
-	};
 	mapping        = ref makeTree();
 	root_assertion = lookupTreeDef(math.decls.assertions, ruProofQedStep(th.proof).assertion, ruNoAxiom);
 	oracle_tactic  = ruReproveOracleTactic(th, math, mapping, 1, 0, env);
@@ -175,7 +177,16 @@ ruBenchmarkRankTheorem(
 
 	ranking_unify = \hyp : RuProverHyp -> {
 		all0 = original_unify(hyp);
-		all = if (do_shuffle) shuffle(all0) else all0;
+		all =
+			if (mode == "shuffle") {
+				tagged = mapi(all0, \__, x -> Pair(rng(), x));
+				map(sortCustom(tagged, \p -> p.first, true), \p -> p.second);
+			} else if (mode == "ml") {
+				scored = map(all0, \u -> Pair(ruMlScoreUnified(u, hyp, ml_sel), u));
+				map(sortCustom(scored, \p -> p.first, true), \p -> p.second);
+			} else {
+				all0
+			};
 		oracle_result = oracle_unify(hyp);
 		if (length(oracle_result) > 0) {
 			oracle_id = oracle_result[0].data.info.id;
