@@ -1,0 +1,143 @@
+import ds/vector;
+import base/util/progress;
+import ru/prover/prove;
+import ru/prover/strategies/default;
+import ru/prover/stats;
+import ru/prover/ml/premise_selector;
+import ru/map_decls;
+import comm;
+
+export {
+	ruCommReproveMl : RuComm;
+}
+
+ruCommReproveMl = RuComm(
+	RuCommInfo(
+		"reprove-ml", "prover",
+		"reprove theorems guided by learned per-assertion ML models",
+		"target", true, false,
+		[
+			RuCommArg("target",    true, "the target: a theorem, file or all", "all"),
+			RuCommArg("top-k",     true, "candidates expanded per step (0 = all, ranked)", "5"),
+			RuCommArg("max-depth", true, "max proof search depth", "7"),
+			RuCommArg("max-size",  true, "max prover tree size", "10000"),
+		], []
+	),
+	ruRunReproveMl
+);
+
+ruReproveMlTheorem(
+	th         : RuTheorem,
+	args       : Tree<string, flow>,
+	index      : RuIndex<RuAssertion>,
+	sel        : RuMlSelector,
+	top_k      : int,
+	max_depth  : int,
+	max_size   : int,
+	time_limit : double,
+	math       : RuMath,
+	env        : RuEnv
+) -> RuProverEnv {
+	tactic      = ruMlTactic(sel, top_k, max_depth, max_size);
+	prover_task = RuProverTask(th.info, ruSingleTacticStrategy(tactic), id2s(th.info.id), args, th.infer.hyps, ruProofQedStep(th.proof));
+	penv1       = ruInitProverEnv(prover_task, math, env, index, time_limit);
+	penv2       = ruExpandHyp(penv1.tree.root, penv1);
+	ruProve(penv2);
+}
+
+ruRunReproveMl(unit : RuUnit) -> Maybe<RuState> {
+	env   = ruUnitEnv(unit);
+	task  = unit.task;
+	state = unit.state;
+	conf  = state.conf;
+	math  = ruMathFromSources(state.ru, env);
+	timer = ruMakeTimer();
+	target = ruDetermineTarget(unit.task, math, env);
+	if (target != RuTargetNone()) {
+		top_k     = ruTaskIntArg(task, "top-k",     5);
+		max_depth = ruTaskIntArg(task, "max-depth", 7);
+		max_size  = ruTaskIntArg(task, "max-size",  10000);
+
+		sel = ruLoadMlSelector(conf);
+		if (sizeTree(sel.features) == 0) {
+			env.out.println("reprove-ml: no feature models found, run learn-assertions first");
+			Some(state);
+		} else {
+			if (ruVerbose(conf) > 0) {
+				env.out.println("reprove-ml: loaded " + i2s(sizeTree(sel.features)) + " feature models, " +
+					i2s(sizeTree(sel.medoids)) + " medoid models, " +
+					i2s(sizeTree(sel.lgg_tmpls)) + " lgg models"
+				);
+			}
+
+			processed_count = ref 0;
+			reproved_count  = ref 0;
+			failed_theorems = ref [];
+			inc_reproved    = ruAtomicIntInc(reproved_count);
+			inc_processed   = ruAtomicIntInc(processed_count);
+			th_fail         = ruAtomicRefArrayPush(failed_theorems);
+			index           = ruMakeIndexForTarget(target, math, env);
+
+			reprove_fn = \decl, time_limit, env1 -> {
+				th = cast(decl : RuDecl -> RuTheorem);
+				if (ruTheoremIsProved(th)) {
+					inc_processed(1);
+					if (ruVerbose(env1.conf) > 1) {
+						env1.out.println(i2s(^processed_count) + ": reprove-ml '" + id2s(th.info.id) + "' ...");
+					}
+					th_timer = ruMakeTimer();
+					ret = ruReproveMlTheorem(th, task.args, index, sel, top_k, max_depth, max_size, time_limit, math, env1);
+					if (length(^(ret.tree.proofs)) > 0) {
+						inc_reproved(1);
+						if (ruVerbose(env1.conf) > 0) {
+							env1.out.println(i2s(^processed_count) + " '" + id2s(th.info.id) + "' REPROVED in " +
+								ruTimePassed2s(th_timer) + ", tree size: " + i2s(ruProverTreeSize(ret.tree)));
+						}
+					} else {
+						th_fail(th.info.id);
+						if (ruVerbose(env1.conf) > 0) {
+							env1.out.println(i2s(^processed_count) + " '" + id2s(th.info.id) + "' NOT reproved in " +
+								ruTimePassed2s(th_timer));
+						}
+					}
+				}
+				RuMappedDecl(true, false, decl);
+			}
+
+			new_state = ruMapFnComm(
+				RuUnit(unit.task, state, env.out),
+				RuMapFn(
+					RuMapFnInfo(
+						"reprove-ml",
+						\decl -> ruTargetPredicate(target)(decl) && ruDeclIsTheorem(decl),
+						ruProofLengthMeasure,
+						\ -> "reproved: " + i2s(^reproved_count) + " theorems"
+					),
+					reprove_fn
+				)
+			);
+
+			if (ruVerbose(conf) > 0) {
+				env.out.println("reprove-ml: reproved " + i2s(^reproved_count) + " theorems");
+			}
+			if (length(^failed_theorems) > 0 && ruVerbose(conf) > 0) {
+				ids = if (length(^failed_theorems) <= 10)
+					strGlue(map(^failed_theorems, id2s), ", ")
+				else
+					strGlue(map(take(^failed_theorems, 10), id2s), ", ") + ", ...";
+				env.out.println("reprove-ml: not reproved: " + ids);
+			}
+
+			Some(RuState(new_state with
+				vars = setTree(new_state.vars, "reprove-ml", pairs2tree([
+					Pair("reproved-count", flow(^reproved_count)),
+					Pair("failed-count",   flow(length(^failed_theorems))),
+					Pair("failed-theorems", flow(map(^failed_theorems, id2s)))
+				]))
+			));
+		}
+	} else {
+		env.out.println("reprove-ml: no target");
+		Some(state);
+	}
+}

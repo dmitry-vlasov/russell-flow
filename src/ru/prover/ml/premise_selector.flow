@@ -1,0 +1,95 @@
+import ru/prover/ml/assertion_model;
+import ru/prover/ml/lgg;
+import ru/prover/tree;
+import ru/prover/controls;
+
+export {
+	RuMlSelector(
+		features : Tree<int, RuAssertionModelFeatures>,
+		medoids  : Tree<int, RuAssertionModelMedoid>,
+		lgg_tmpls : Tree<int, RuAssertionModelIteratedLgg>
+	);
+
+	ruLoadMlSelector(conf : RuConf) -> RuMlSelector;
+
+	// Score a candidate prop: lower = more likely the right choice.
+	// Returns 0.0 when no model exists for the assertion (neutral).
+	ruMlScoreProp(prop : RuProverProp, sel : RuMlSelector) -> double;
+
+	// Tactic that ranks all leaf candidates by ML score each step,
+	// returning up to top_k best. Stops on proof found or tree limits.
+	ruMlTactic(sel : RuMlSelector, top_k : int, max_depth : int, max_size : int) -> RuProverTactic;
+}
+
+ruLoadMlSelector(conf : RuConf) -> RuMlSelector {
+	ru_root = ruOptsString(conf.opts, "ru-root", ".");
+	load = \name -> parseJsonSafe(getFileContent(pathCombine(ru_root, "db/" + name)));
+	RuMlSelector(
+		ruJson2FeaturesModels(load("assertion-models-features.json")),
+		ruJson2MedoidModels(load("assertion-models-medoid.json")),
+		ruJson2IteratedLggModels(load("assertion-models-iterated-lgg.json"))
+	)
+}
+
+ruFirstGoalExp(prop : RuProverProp) -> RuExp {
+	fold(prop.parent.stmt.exps, ruNoExp, \acc, te ->
+		if (length(acc.nodes) > 0) acc
+		else switch (te) { RuExp(__,__): te; default: ruNoExp; }
+	)
+}
+
+ruFeatureScore(id : int, goal : RuExp, models : Tree<int, RuAssertionModelFeatures>) -> double {
+	switch (lookupTree(models, id)) {
+		None(): 0.0;
+		Some(m): {
+			v = ruExpFeatureVec(goal);
+			ruFeatureVecDist(v, m.pos_centroid) - ruFeatureVecDist(v, m.neg_centroid);
+		}
+	}
+}
+
+ruMedoidScore(id : int, goal : RuExp, models : Tree<int, RuAssertionModelMedoid>) -> double {
+	switch (lookupTree(models, id)) {
+		None(): 0.0;
+		Some(m): ruLggDistance(goal, m.pos_medoid) - ruLggDistance(goal, m.neg_medoid);
+	}
+}
+
+ruLggTemplateScore(id : int, goal : RuExp, models : Tree<int, RuAssertionModelIteratedLgg>) -> double {
+	switch (lookupTree(models, id)) {
+		None(): 0.0;
+		Some(m): {
+			// Only use template if at least one side has non-trivial structure.
+			pos_rules = ruExpRuleNodeCount(m.pos_lgg);
+			neg_rules = ruExpRuleNodeCount(m.neg_lgg);
+			if (pos_rules == 0 && neg_rules == 0) 0.0
+			else ruLggDistance(goal, m.pos_lgg) - ruLggDistance(goal, m.neg_lgg);
+		}
+	}
+}
+
+ruMlScoreProp(prop : RuProverProp, sel : RuMlSelector) -> double {
+	id   = prop.assertion.info.id;
+	goal = ruFirstGoalExp(prop);
+	if (length(goal.nodes) == 0) 0.0
+	else
+		ruFeatureScore(id, goal, sel.features) +
+		ruMedoidScore(id, goal, sel.medoids) +
+		ruLggTemplateScore(id, goal, sel.lgg_tmpls);
+}
+
+ruMlTactic(sel : RuMlSelector, top_k : int, max_depth : int, max_size : int) -> RuProverTactic {
+	RuProverTactic("ml-premise",
+		\tree -> {
+			all_leafs = getTreeValues(tree.leafs);
+			scored = map(all_leafs, \prop -> Pair(ruMlScoreProp(prop, sel), prop));
+			sorted = sortCustom(scored, \p -> p.first, true);
+			candidates = if (top_k > 0 && top_k < length(sorted)) take(sorted, top_k) else sorted;
+			map(candidates, \p -> p.second);
+		},
+		\tree ->
+			length(^(tree.proofs)) > 0 ||
+			ruProverTreeDepth(tree) > max_depth ||
+			ruProverTreeSize(tree) > max_size
+	);
+}
