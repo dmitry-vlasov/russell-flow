@@ -1,4 +1,5 @@
 import ru/prover/ml/assertion_model;
+import ru/prover/ml/learn_knn;
 import ru/prover/ml/lgg;
 import ru/prover/tree;
 import ru/prover/controls;
@@ -9,9 +10,11 @@ export {
 		features  : Tree<int, RuAssertionModelFeatures>,
 		medoids   : Tree<int, RuAssertionModelMedoid>,
 		lgg_tmpls : Tree<int, RuAssertionModelIteratedLgg>,
+		knn       : Tree<int, RuAssertionModelKnn>,
 		w_feat    : double,
 		w_medoid  : double,
 		w_lgg     : double,
+		w_knn     : double,
 		normalize : bool
 	);
 
@@ -37,7 +40,8 @@ ruLoadMlSelector(conf : RuConf) -> RuMlSelector {
 		ruJson2FeaturesModels(load("assertion-models-features.json")),
 		ruJson2MedoidModels(load("assertion-models-medoid.json")),
 		ruJson2IteratedLggModels(load("assertion-models-iterated-lgg.json")),
-		1.0, 0.0, 0.0, true
+		ruJson2KnnModels(load("assertion-models-knn.json")),
+		1.0, 0.0, 0.0, 0.0, true
 	)
 }
 
@@ -65,6 +69,26 @@ ruMedoidScore(id : int, goal : RuExp, models : Tree<int, RuAssertionModelMedoid>
 	}
 }
 
+ruKnnScore(id : int, goal : RuExp, models : Tree<int, RuAssertionModelKnn>) -> double {
+	switch (lookupTree(models, id)) {
+		None(): 0.0;
+		Some(m): {
+			if (length(m.pos_examples) == 0 || length(m.neg_examples) == 0) 0.0
+			else {
+				v = ruExpFeatureVec(goal);
+				if (length(v) == 0) 0.0
+				else {
+					pos_nn = fold(tail(m.pos_examples), ruFeatureVecDist(v, m.pos_examples[0]),
+						\acc, e -> min(acc, ruFeatureVecDist(v, e)));
+					neg_nn = fold(tail(m.neg_examples), ruFeatureVecDist(v, m.neg_examples[0]),
+						\acc, e -> min(acc, ruFeatureVecDist(v, e)));
+					pos_nn - neg_nn
+				}
+			}
+		}
+	}
+}
+
 ruLggTemplateScore(id : int, goal : RuExp, models : Tree<int, RuAssertionModelIteratedLgg>) -> double {
 	switch (lookupTree(models, id)) {
 		None(): 0.0;
@@ -85,7 +109,8 @@ ruMlScoreProp(prop : RuProverProp, sel : RuMlSelector) -> double {
 	else
 		sel.w_feat   * ruFeatureScore(id, goal, sel.features) +
 		sel.w_medoid * ruMedoidScore(id, goal, sel.medoids) +
-		sel.w_lgg    * ruLggTemplateScore(id, goal, sel.lgg_tmpls);
+		sel.w_lgg    * ruLggTemplateScore(id, goal, sel.lgg_tmpls) +
+		sel.w_knn    * ruKnnScore(id, goal, sel.knn);
 }
 
 ruMlScoreUnified(u : RuUnified<RuAssertion>, hyp : RuProverHyp, sel : RuMlSelector) -> double {
@@ -98,7 +123,16 @@ ruMlScoreUnified(u : RuUnified<RuAssertion>, hyp : RuProverHyp, sel : RuMlSelect
 	else
 		sel.w_feat   * ruFeatureScore(id, goal, sel.features) +
 		sel.w_medoid * ruMedoidScore(id, goal, sel.medoids) +
-		sel.w_lgg    * ruLggTemplateScore(id, goal, sel.lgg_tmpls);
+		sel.w_lgg    * ruLggTemplateScore(id, goal, sel.lgg_tmpls) +
+		sel.w_knn    * ruKnnScore(id, goal, sel.knn);
+}
+
+ruZscore(raw : [double], normalize : bool) -> [double] {
+	n = max(length(raw), 1);
+	mean = fold(raw, 0.0, \a, x -> a + x) / i2d(n);
+	std  = sqrt(fold(raw, 0.0, \a, x -> a + x * x) / i2d(n) - mean * mean);
+	if (!normalize || std < 0.000000001) raw
+	else map(raw, \x -> (x - mean) / std);
 }
 
 ruMlTactic(sel : RuMlSelector, top_k : int, max_depth : int, max_size : int) -> RuProverTactic {
@@ -117,18 +151,16 @@ ruMlTactic(sel : RuMlSelector, top_k : int, max_depth : int, max_size : int) -> 
 				id = prop.assertion.info.id; goal = ruFirstGoalExp(prop);
 				if (length(goal.nodes) == 0) 0.0 else ruLggTemplateScore(id, goal, sel.lgg_tmpls)
 			});
-			n = max(length(all_leafs), 1);
-			feat_mean   = fold(feat_raw,   0.0, \a, x -> a + x) / i2d(n);
-			medoid_mean = fold(medoid_raw, 0.0, \a, x -> a + x) / i2d(n);
-			lgg_mean    = fold(lgg_raw,    0.0, \a, x -> a + x) / i2d(n);
-			feat_std    = sqrt(fold(feat_raw,   0.0, \a, x -> a + x * x) / i2d(n) - feat_mean   * feat_mean);
-			medoid_std  = sqrt(fold(medoid_raw, 0.0, \a, x -> a + x * x) / i2d(n) - medoid_mean * medoid_mean);
-			lgg_std     = sqrt(fold(lgg_raw,    0.0, \a, x -> a + x * x) / i2d(n) - lgg_mean    * lgg_mean);
-			feat_s   = if (!sel.normalize || feat_std   < 0.000000001) feat_raw   else map(feat_raw,   \x -> (x - feat_mean)   / feat_std);
-			medoid_s = if (!sel.normalize || medoid_std < 0.000000001) medoid_raw else map(medoid_raw, \x -> (x - medoid_mean) / medoid_std);
-			lgg_s    = if (!sel.normalize || lgg_std    < 0.000000001) lgg_raw    else map(lgg_raw,    \x -> (x - lgg_mean)    / lgg_std);
+			knn_raw    = map(all_leafs, \prop -> {
+				id = prop.assertion.info.id; goal = ruFirstGoalExp(prop);
+				if (length(goal.nodes) == 0) 0.0 else ruKnnScore(id, goal, sel.knn)
+			});
+			feat_s   = ruZscore(feat_raw,   sel.normalize);
+			medoid_s = ruZscore(medoid_raw, sel.normalize);
+			lgg_s    = ruZscore(lgg_raw,    sel.normalize);
+			knn_s    = ruZscore(knn_raw,    sel.normalize);
 			scored = mapi(all_leafs, \i, prop ->
-				Pair(sel.w_feat * feat_s[i] + sel.w_medoid * medoid_s[i] + sel.w_lgg * lgg_s[i], prop)
+				Pair(sel.w_feat * feat_s[i] + sel.w_medoid * medoid_s[i] + sel.w_lgg * lgg_s[i] + sel.w_knn * knn_s[i], prop)
 			);
 			sorted = sortCustom(scored, \p -> p.first, true);
 			candidates = if (top_k > 0 && top_k < length(sorted)) take(sorted, top_k) else sorted;

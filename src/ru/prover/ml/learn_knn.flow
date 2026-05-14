@@ -1,0 +1,77 @@
+import ru/prover/ml/assertion_model;
+import ru/prover/ml/collect_data;
+import ru/prover/ml/learn_medoid;
+import comm;
+
+export {
+	ruCommLearnAssertionKnn : RuComm;
+}
+
+ruCommLearnAssertionKnn = RuComm(
+	RuCommInfo(
+		"learn-assertion-knn", "prover",
+		"learn per-assertion k-NN models (stored training examples) from collected learning data",
+		"", false, false,
+		[
+			RuCommArg("max-k", true, "max training examples stored per assertion per class (default 100)", "100"),
+		], []
+	),
+	ruRunLearnAssertionKnn
+);
+
+ruRunLearnAssertionKnn(unit : RuUnit) -> Maybe<RuState> {
+	env   = ruUnitEnv(unit);
+	task  = unit.task;
+	state = unit.state;
+	conf  = state.conf;
+	timer = ruMakeTimer();
+	max_k = ruTaskIntArg(task, "max-k", 100);
+
+	data = ruLoadCollectedData(conf);
+	if (sizeTree(data) == 0) {
+		env.out.println("learn-assertion-knn: no collected data found, run collect-learning-data first");
+		Some(state);
+	} else {
+		models = foldTree(data, makeTree(), \id, usage, acc ->
+			switch (ruComputeKnnModel(id, usage, max_k)) {
+				Some(m): setTree(acc, id, m);
+				None():  acc;
+			}
+		);
+		ru_root = ruOptsString(conf.opts, "ru-root", ".");
+		out_path = pathCombine(ru_root, "db/assertion-models-knn.json");
+		if (!setFileContent(out_path, json2string(ruKnnModels2json(models)))) {
+			env.out.println("learn-assertion-knn: failed to write to " + out_path);
+		} else if (ruVerbose(conf) > 0) {
+			env.out.println("learn-assertion-knn: learned " + i2s(sizeTree(models)) + " models in " + ruTimePassed2s(timer));
+			env.out.println("learn-assertion-knn: saved to " + out_path);
+		}
+		Some(RuState(state with
+			vars = setTree(state.vars, "learn-assertion-knn", pairs2tree([
+				Pair("count", flow(sizeTree(models))),
+				Pair("file",  flow(out_path))
+			]))
+		));
+	}
+}
+
+ruComputeKnnModel(id : int, usage : RuAssertionUsage, max_k : int) -> Maybe<RuAssertionModelKnn> {
+	pos_exps  = ruExtractGoalExps(filter(usage.contexts, \ctx -> ctx.sign));
+	neg_exps0 = ruExtractGoalExps(filter(usage.contexts, \ctx -> !ctx.sign));
+	neg_exps  = if (length(neg_exps0) > length(pos_exps)) take(neg_exps0, length(pos_exps)) else neg_exps0;
+	if (length(pos_exps) == 0 || length(neg_exps) == 0) None()
+	else {
+		pos_cap = if (max_k > 0 && max_k < length(pos_exps)) take(pos_exps, max_k) else pos_exps;
+		neg_cap = if (max_k > 0 && max_k < length(neg_exps)) take(neg_exps, max_k) else neg_exps;
+		pos_vecs = filter(map(pos_cap, ruExpFeatureVec), \v -> length(v) > 0);
+		neg_vecs = filter(map(neg_cap, ruExpFeatureVec), \v -> length(v) > 0);
+		if (length(pos_vecs) == 0 || length(neg_vecs) == 0) None()
+		else Some(RuAssertionModelKnn(
+			id,
+			pos_vecs,
+			neg_vecs,
+			length(pos_exps),
+			length(neg_exps)
+		))
+	}
+}
