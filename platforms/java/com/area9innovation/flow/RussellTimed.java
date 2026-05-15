@@ -27,7 +27,7 @@ public class RussellTimed extends NativeHost {
 		}
 		@Override
 		public void run() {
-			if (!cancelled && System.currentTimeMillis() > time_limit) {
+			if (!cancelled && time_limit > 0 && System.currentTimeMillis() > time_limit) {
 				controlled.interrupt();
 			}
 		}
