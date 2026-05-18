@@ -1,0 +1,163 @@
+import ru/prover/core/env;
+import ru/prover/core/tactics/follow_proof;
+import ru/prover/core/tactics/breadth_first;
+import ru/unify/index;
+import ru/proof_tree;
+
+export {
+	// Build an index of every proof step across all theorems, keyed by the
+	// step's conclusion expression.  Steps whose conclusion has fewer than
+	// min_rule_nodes rule nodes are omitted to avoid bare-variable explosion.
+	ruBuildStepIndex(math : RuMath, min_rule_nodes : int) -> RuIndex<Pair<int,int>>;
+
+	// Strategy that, for each open leaf, looks up matching proof steps in the
+	// step index and replays each matching sub-proof via ruFollowProofTactic.
+	// A match is accepted only when len(leaf_exp) >= sum of lengths of all
+	// substitution values — ensuring the substitution is "shallow" relative to
+	// the pattern, i.e. the matched expression is structurally close to the leaf.
+	ruSubproofReplayStrategy(
+		step_index : RuIndex<Pair<int,int>>,
+		max_depth  : int,
+		max_size   : int,
+		attempts   : int,
+		math       : RuMath,
+		env        : RuEnv
+	) -> RuProverStrategy;
+}
+
+ruSprRuleNodeCount(e : RuExp) -> int {
+	fold(e.nodes, 0, \acc, n -> switch (n) {
+		RuRuleNode(__,__): acc + 1;
+		RuVar(__,__):      acc;
+	})
+}
+
+// Set of assertion IDs that appear as applied assertions in any indexed proof step.
+// Used to restrict the BFS fallback to assertions seen in real proofs.
+ruBuildIndexedAssertionSet(math : RuMath, min_rule_nodes : int) -> Set<int> {
+	s : ref Set<int> = ref makeSet();
+	traverseInOrder(math.decls.assertions, \__, ass ->
+		switch (ass) {
+			RuTheorem(__,__,__,__): {
+				iter(ass.proof.steps, \step -> {
+					e = ruExp(step.stmt.exps[0]);
+					if (ruSprRuleNodeCount(e) >= min_rule_nodes)
+						s := insertSet(^s, step.assertion)
+				})
+			}
+			default: { }
+		}
+	);
+	^s
+}
+
+ruBuildStepIndex(math : RuMath, min_rule_nodes : int) -> RuIndex<Pair<int,int>> {
+	index : ref RuIndex<Pair<int,int>> = ref ruMakeIndex();
+	traverseInOrder(math.decls.assertions, \__, ass ->
+		switch (ass) {
+			RuTheorem(__,__,__,__): {
+				iteri(ass.proof.steps, \i, step -> {
+					e = ruExp(step.stmt.exps[0]);
+					if (ruSprRuleNodeCount(e) >= min_rule_nodes)
+						index := ruSetIndex(e, Pair(ass.info.id, i), ^index)
+				})
+			}
+			default: { }
+		}
+	);
+	^index
+}
+
+ruSprPropDepth(prop : RuProverProp) -> int {
+	switch (prop.parent) {
+		RuProverRoot(__,__,__): 1;
+		RuProverExp(__,__,__,__,grand): 1 + ruSprPropDepth(grand);
+	}
+}
+
+ruSprDeepestLeaf(leafs : Tree<int, RuProverProp>) -> Maybe<RuProverProp> {
+	leaves = getTreeValues(leafs);
+	if (leaves == []) None()
+	else Some(fold(tail(leaves), leaves[0], \acc, leaf ->
+		if (ruSprPropDepth(leaf) >= ruSprPropDepth(acc)) leaf else acc
+	))
+}
+
+ruStepsForLeaf(
+	prop       : RuProverProp,
+	step_index : RuIndex<Pair<int,int>>,
+	attempts   : int,
+	math       : RuMath,
+	env        : RuEnv
+) -> [RuProofStep] {
+	leaf_exp   = ruExp(prop.parent.stmt.exps[0]);
+	leaf_len   = length(leaf_exp.nodes);
+	// Skip if leaf is too generic (too few rule nodes) or too complex (too many
+	// rule nodes, generating huge match sets on large indices).
+	leaf_rules = ruSprRuleNodeCount(leaf_exp);
+	if (leaf_rules < 3 || leaf_rules > 12) [] else {
+		matched = ruUnifyIndex(leaf_exp, step_index, ruEmptySubst, math, env);
+		// Accept only matches where leaf_len >= total length of all substitution
+		// values.  This is the user's "shallow substitution" criterion: the pattern
+		// itself explains at least as much structure as the unifier introduces.
+		candidates = filter(matched, \unif -> {
+			subst_len = foldHashMap(unif.sub.map, 0, \__, se, acc -> acc + length(se.exp.nodes));
+			leaf_len >= subst_len
+		});
+		// Take candidates before building sub-proof trees (expensive).
+		filtermap(take(candidates, attempts), \unif ->
+			switch (lookupTree(math.decls.assertions, unif.data.first)) {
+				Some(ass): switch (ass) {
+					RuTheorem(__,__,__,__): {
+						i = unif.data.second;
+						switch (ruSubproofTree(ass, i)) {
+							RuProofStep(assertion, children, stmt): Some(RuProofStep(assertion, children, stmt));
+							RuProofHyp(__,__): None()
+						}
+					}
+					default: None()
+				}
+				None(): None()
+			}
+		)
+	}
+}
+
+ruSubproofReplayStrategy(
+	step_index  : RuIndex<Pair<int,int>>,
+	max_depth   : int,
+	max_size    : int,
+	attempts    : int,
+	math        : RuMath,
+	env         : RuEnv
+) -> RuProverStrategy {
+	pending_steps      : ref [RuProofStep] = ref [];
+	attempts_remaining : ref int           = ref attempts;
+
+	makeNextTactic = \tree -> {
+		if (ruTreeIsProved(tree)) None()
+		else if (length(^pending_steps) > 0) {
+			s = (^pending_steps)[0];
+			pending_steps := tail(^pending_steps);
+			Some(ruFollowProofTactic(s))
+		} else if (^attempts_remaining > 0) {
+			attempts_remaining := ^attempts_remaining - 1;
+			switch (ruSprDeepestLeaf(tree.leafs)) {
+				None(): None()
+				Some(leaf): {
+					steps = ruStepsForLeaf(leaf, step_index, attempts, math, env);
+					if (steps == []) None()
+					else {
+						pending_steps := tail(steps);
+						Some(ruFollowProofTactic(steps[0]))
+					}
+				}
+			}
+		} else None()
+	};
+
+	RuProverStrategy("subproof-replay",
+		\ -> RuProverTactic("spr-init", \__ -> [], \__ -> true),
+		makeNextTactic
+	)
+}

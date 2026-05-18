@@ -1,0 +1,164 @@
+import ru/proof_tree;
+import ru/prover/core/tree;
+
+export {
+	// Which tactic (if any) covered this proof step.
+	RuCoveredBy ::= RuNotCovered, RuCoveredGreen, RuCoveredYellowReplay, RuCoveredYellowBfs;
+		RuNotCovered();         // never matched by any tactic
+		RuCoveredGreen();       // matched in the initial (iter=0) replay pass
+		RuCoveredYellowReplay();// matched by replay in a later outer iteration
+		RuCoveredYellowBfs();   // matched by BFS pass
+
+	// Alignment of an original proof tree against an explored prover variant tree.
+	RuProofCoverage ::= RuProofCoverageStep, RuProofCoverageHyp;
+		// A proof step: coveredBy records which tactic (if any) covered this position.
+		// stmt is the goal expression for this step (needed for frontier re-proving).
+		RuProofCoverageStep(
+			assertion : int,
+			stmt      : RuStmt,
+			coveredBy : RuCoveredBy,
+			children  : [RuProofCoverage]
+		);
+		// A hypothesis leaf: always implicitly reachable, not counted as a step.
+		RuProofCoverageHyp(ind : int);
+
+	ruIsCovered(cb : RuCoveredBy) -> bool;
+
+	// Align original proof tree against variant tree candidates at each level.
+	// candidates = vector2array(root.children) at the top call.
+	// Covered nodes are tagged RuCoveredGreen (initial pass).
+	ruAlignProofWithTree(node : RuProofTree, candidates : [RuProverProp]) -> RuProofCoverage;
+
+	ruCoverageStepCount(cov : RuProofCoverage) -> int;
+	ruCoveredStepCount(cov  : RuProofCoverage) -> int;
+	ruCoverageRatio(cov     : RuProofCoverage) -> double;
+
+	// Frontier seeds: uncovered steps immediately below a covered step (or the root).
+	// The root itself is a frontier seed if its top step is uncovered.
+	ruFrontierSeeds(cov : RuProofCoverage) -> [RuProofCoverageStep];
+
+	ruCoverage2s(cov : RuProofCoverage, indent : string) -> string;
+
+	// Like ruAlignProofWithTree but takes an existing RuProofCoverage as the structural template.
+	// Used to re-align children of a newly-covered frontier seed.
+	// coveredBy is the tag to assign to newly-covered nodes.
+	ruAlignCoverageWithCands(cov : RuProofCoverage, candidates : [RuProverProp], coveredBy : RuCoveredBy) -> RuProofCoverage;
+}
+
+ruIsCovered(cb : RuCoveredBy) -> bool {
+	switch (cb) { RuNotCovered(): false; default: true; }
+}
+
+ruAlignProofWithTree(node : RuProofTree, candidates : [RuProverProp]) -> RuProofCoverage {
+	switch (node) {
+		RuProofHyp(ind, __): RuProofCoverageHyp(ind);
+		RuProofStep(ass_id, children, stmt): {
+			// Find the first prop in the variant tree that tried this assertion.
+			matched = find(candidates, \prop -> prop.assertion.info.id == ass_id);
+			switch (matched) {
+				Some(prop): {
+					// Covered: recursively align children against this prop's subgoal candidates.
+					prop_exps = vector2array(prop.children); // [RuProverExp]
+					child_covs = mapi(children, \i, child -> {
+						if (i < length(prop_exps)) {
+							ruAlignProofWithTree(child, vector2array(prop_exps[i].children))
+						} else {
+							ruAlignProofWithTree(child, [])
+						}
+					});
+					RuProofCoverageStep(ass_id, stmt, RuCoveredGreen(), child_covs)
+				}
+				None(): {
+					// Uncovered: pass empty candidates all the way down.
+					RuProofCoverageStep(ass_id, stmt, RuNotCovered(),
+						map(children, \child -> ruAlignProofWithTree(child, []))
+					)
+				}
+			}
+		}
+	}
+}
+
+ruCoverageStepCount(cov : RuProofCoverage) -> int {
+	switch (cov) {
+		RuProofCoverageHyp(__): 0;
+		RuProofCoverageStep(__, __, __, children):
+			1 + fold(children, 0, \acc, ch -> acc + ruCoverageStepCount(ch));
+	}
+}
+
+ruCoveredStepCount(cov : RuProofCoverage) -> int {
+	switch (cov) {
+		RuProofCoverageHyp(__): 0;
+		RuProofCoverageStep(__, __, coveredBy, children):
+			(if (ruIsCovered(coveredBy)) 1 else 0) +
+			fold(children, 0, \acc, ch -> acc + ruCoveredStepCount(ch));
+	}
+}
+
+ruCoverageRatio(cov : RuProofCoverage) -> double {
+	total = ruCoverageStepCount(cov);
+	if (total == 0) 0.0 else i2d(ruCoveredStepCount(cov)) / i2d(total)
+}
+
+ruFrontierSeeds(cov : RuProofCoverage) -> [RuProofCoverageStep] {
+	// Root is always considered to have a "covered parent".
+	ruFrontierSeedsHelper(cov, true)
+}
+
+ruFrontierSeedsHelper(cov : RuProofCoverage, parent_covered : bool) -> [RuProofCoverageStep] {
+	switch (cov) {
+		RuProofCoverageHyp(__): [];
+		RuProofCoverageStep(ass, stmt, coveredBy, children): {
+			covered = ruIsCovered(coveredBy);
+			if (!covered && parent_covered) {
+				[RuProofCoverageStep(ass, stmt, coveredBy, children)]
+			} else {
+				concatA(map(children, \ch -> ruFrontierSeedsHelper(ch, covered)))
+			}
+		}
+	}
+}
+
+ruAlignCoverageWithCands(cov : RuProofCoverage, candidates : [RuProverProp], coveredBy : RuCoveredBy) -> RuProofCoverage {
+	switch (cov) {
+		RuProofCoverageHyp(__): cov;
+		RuProofCoverageStep(ass, stmt, existingCov, children): {
+			if (ruIsCovered(existingCov)) {
+				// Already covered: recurse with the same coveredBy tag for any
+				// newly discovered children (shouldn't normally happen, but safe).
+				RuProofCoverageStep(ass, stmt, existingCov,
+					map(children, \ch -> ruAlignCoverageWithCands(ch, [], coveredBy))
+				)
+			} else {
+				matched = find(candidates, \prop -> prop.assertion.info.id == ass);
+				switch (matched) {
+					Some(prop): {
+						prop_exps = vector2array(prop.children);
+						new_children = mapi(children, \i, child ->
+							if (i < length(prop_exps))
+								ruAlignCoverageWithCands(child, vector2array(prop_exps[i].children), coveredBy)
+							else
+								ruAlignCoverageWithCands(child, [], coveredBy)
+						);
+						RuProofCoverageStep(ass, stmt, coveredBy, new_children)
+					}
+					None(): {
+						RuProofCoverageStep(ass, stmt, RuNotCovered(),
+							map(children, \ch -> ruAlignCoverageWithCands(ch, [], coveredBy))
+						)
+					}
+				}
+			}
+		}
+	}
+}
+
+ruCoverage2s(cov : RuProofCoverage, indent : string) -> string {
+	switch (cov) {
+		RuProofCoverageHyp(ind): indent + "hyp[" + i2s(ind) + "]\n";
+		RuProofCoverageStep(ass, __, coveredBy, children):
+			indent + (if (ruIsCovered(coveredBy)) "+" else "-") + " " + id2s(ass) + "\n" +
+			concatStrings(map(children, \ch -> ruCoverage2s(ch, indent + "  ")));
+	}
+}

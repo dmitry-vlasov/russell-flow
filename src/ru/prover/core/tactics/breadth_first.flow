@@ -9,6 +9,14 @@ export {
 	// BFS limited to at most n leaf expansions per step (beam search over BFS order).
 	ruTopNBFSTactic(n : int, max_depth : int, max_size : int) -> RuProverTactic;
 	ruLimitTactic(tactic : RuProverTactic, time_limit : double, applied_limit : int, produced_limit : int) -> RuProverTactic;
+	// BFS focused on the subtree rooted at a single leaf (identified by prop id).
+	// Expands only descendants of that leaf up to max_depth prop levels below it,
+	// with an independent size budget tracking nodes added since this tactic started.
+	ruPerLeafBFSTactic(target_id : int, max_depth : int, max_size : int) -> RuProverTactic;
+	// Like ruPerLeafBFSTactic but only expands props whose assertion appears in
+	// indexed_asserts.  This restricts the search to assertions that were actually
+	// used as proof steps in the indexed corpus, keeping the fanout small.
+	ruIndexGuidedBFSTactic(indexed_asserts : Set<int>, target_id : int, max_depth : int, max_size : int) -> RuProverTactic;
 }
 
 ruBreadthFirstTactic = RuProverTactic("breadth-first-search",
@@ -33,6 +41,53 @@ ruTopNBFSTactic(n : int, max_depth : int, max_size : int) -> RuProverTactic {
 		\tree -> take(getTreeValues(tree.leafs), n),
 		\tree -> ruProverTreeDepth(tree) > max_depth || ruProverTreeSize(tree) > max_size || length(^(tree.proofs)) > 0
 	);
+}
+
+ruPlbDepthFromAncestor(prop : RuProverProp, ancestor_id : int) -> int {
+	if (prop.id == ancestor_id) 0
+	else switch (prop.parent) {
+		RuProverRoot(__, __, __): -1;
+		RuProverExp(__, __, __, __, grand): {
+			d = ruPlbDepthFromAncestor(grand, ancestor_id);
+			if (d < 0) -1 else d + 1
+		}
+	}
+}
+
+ruPerLeafBFSTactic(target_id : int, max_depth : int, max_size : int) -> RuProverTactic {
+	// Track nodes added since this tactic started using a counter updated only
+	// in expand (called once per BFS round), so finished stays O(1).
+	nodes_added : ref int = ref 0;
+	last_size   : ref int = ref (-1);
+	RuProverTactic("per-leaf-bfs-" + i2s(target_id),
+		\tree -> {
+			sz = sizeTree(tree.nodes);
+			if (^last_size >= 0) nodes_added := ^nodes_added + (sz - ^last_size);
+			last_size := sz;
+			filter(getTreeValues(tree.leafs), \lf -> {
+				d = ruPlbDepthFromAncestor(lf, target_id);
+				d >= 0 && d < max_depth
+			})
+		},
+		\tree -> ^nodes_added > max_size || length(^(tree.proofs)) > 0
+	)
+}
+
+ruIndexGuidedBFSTactic(indexed_asserts : Set<int>, target_id : int, max_depth : int, max_size : int) -> RuProverTactic {
+	nodes_added : ref int = ref 0;
+	last_size   : ref int = ref (-1);
+	RuProverTactic("index-guided-bfs-" + i2s(target_id),
+		\tree -> {
+			sz = sizeTree(tree.nodes);
+			if (^last_size >= 0) nodes_added := ^nodes_added + (sz - ^last_size);
+			last_size := sz;
+			filter(getTreeValues(tree.leafs), \lf -> {
+				d = ruPlbDepthFromAncestor(lf, target_id);
+				d >= 0 && d < max_depth && containsSet(indexed_asserts, lf.assertion.info.id)
+			})
+		},
+		\tree -> ^nodes_added > max_size || length(^(tree.proofs)) > 0
+	)
 }
 
 ruLimitTactic(tactic : RuProverTactic, time_limit : double, applied_limit : int, produced_limit : int) -> RuProverTactic {

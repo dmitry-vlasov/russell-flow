@@ -1,0 +1,152 @@
+import formats/json/json;
+import base/conf;
+import comm;
+
+export {
+	ruCommLearnCoverageModel : RuComm;
+}
+
+ruCommLearnCoverageModel = RuComm(
+	RuCommInfo(
+		"learn-coverage-model", "prover",
+		"aggregate per-assertion green/yellow/red rates from collected coverage data; save coverage model",
+		"target", true, false,
+		[
+			RuCommArg("input",  true, "db key of collected coverage data", "coverage-training-data"),
+			RuCommArg("output", true, "db key for saved model",            "coverage-model"),
+		], []
+	),
+	ruRunLearnCoverageModel
+);
+
+// Per-assertion coverage statistics learned from training data.
+RuAssertionCoverageStats(
+	assertion    : string,
+	green_count  : int,
+	yellow_count : int,
+	red_count    : int,
+	green_rate   : double  // green / (green + yellow + red); reliability score
+);
+
+ruRunLearnCoverageModel(unit : RuUnit) -> Maybe<RuState> {
+	env   = ruUnitEnv(unit);
+	task  = unit.task;
+	state = unit.state;
+	conf  = state.conf;
+
+	input_key  = ruTaskStringArg(task, "input",  "coverage-training-data");
+	output_key = ruTaskStringArg(task, "output", "coverage-model");
+
+	ru_root    = ruOptsString(conf.opts, "ru-root", ".");
+	input_path = pathCombine(ru_root, "db/" + input_key + ".json");
+
+	if (!fileExists(input_path)) {
+		env.out.println("learn-coverage-model: input file not found: " + input_path +
+			"\nRun collect-coverage-data first.");
+		Some(state);
+	} else {
+		json_str = getFileContent(input_path);
+		examples = parseJson(json_str);
+
+		switch (examples) {
+			JsonArray(items): {
+				// Aggregate counts per assertion.
+				// counts: Tree<string, Triple<int,int,int>> — (green, yellow, red)
+				counts = fold(items, makeTree(), \acc, item -> {
+					switch (item) {
+						JsonObject(fields): {
+							fields_tree = pairs2tree(fields);
+							assertion = switch (lookupTree(fields_tree, "assertion")) {
+								Some(j): switch (j) { JsonString(s): s; default: ""; };
+								None(): "";
+							};
+							color = switch (lookupTree(fields_tree, "color")) {
+								Some(j): switch (j) { JsonString(s): s; default: ""; };
+								None(): "";
+							};
+							if (assertion == "" || color == "") acc else {
+								prev = lookupTreeDef(acc, assertion, Triple(0, 0, 0));
+								updated = if (color == "green")
+										Triple(prev.first + 1, prev.second, prev.third)
+									else if (color == "yellow")
+										Triple(prev.first, prev.second + 1, prev.third)
+									else
+										Triple(prev.first, prev.second, prev.third + 1);
+								setTree(acc, assertion, updated)
+							}
+						}
+						default: acc;
+					}
+				});
+
+				// Build stats records.
+				stats = map(getTreeValues(mapTree2(counts, \assertion, triple -> {
+					g = triple.first;
+					y = triple.second;
+					r = triple.third;
+					total = g + y + r;
+					rate  = if (total == 0) 0.0 else i2d(g) / i2d(total);
+					RuAssertionCoverageStats(assertion, g, y, r, rate)
+				})), \s -> s);
+
+				n_assertions = length(stats);
+				total_ex     = fold(stats, 0, \acc, s -> acc + s.green_count + s.yellow_count + s.red_count);
+				avg_green    = if (n_assertions == 0) 0.0 else
+					fold(stats, 0.0, \acc, s -> acc + s.green_rate) / i2d(n_assertions);
+
+				if (ruVerbose(conf) > 0) {
+					// Show top-10 by green_rate (most reliable assertions).
+					sorted = sortCustom(stats, \s -> -s.green_rate, true);
+					top10  = subrange(sorted, 0, min(10, length(sorted)));
+					env.out.println("Top assertions by green rate:");
+					iter(top10, \s -> {
+						tot = s.green_count + s.yellow_count + s.red_count;
+						env.out.println(
+							"  " + s.assertion +
+							": green_rate=" + d2s(s.green_rate * 100.0) + "%" +
+							" (G=" + i2s(s.green_count) +
+							" Y=" + i2s(s.yellow_count) +
+							" R=" + i2s(s.red_count) +
+							" total=" + i2s(tot) + ")"
+						);
+					});
+				}
+
+				env.out.println(
+					"=== learn-coverage-model results ===\n" +
+					"assertions: " + i2s(n_assertions) + "\n" +
+					"examples:   " + i2s(total_ex) + "\n" +
+					"avg green%: " + d2s(avg_green * 100.0) + "%"
+				);
+
+				// Serialize model.
+				model_json = JsonArray(map(stats, \s -> JsonObject([
+					Pair("assertion",    JsonString(s.assertion)),
+					Pair("green_count",  JsonDouble(i2d(s.green_count))),
+					Pair("yellow_count", JsonDouble(i2d(s.yellow_count))),
+					Pair("red_count",    JsonDouble(i2d(s.red_count))),
+					Pair("green_rate",   JsonDouble(s.green_rate))
+				])));
+
+				output_path = pathCombine(ru_root, "db/" + output_key + ".json");
+				if (!setFileContent(output_path, json2stringFormatted(model_json))) {
+					env.out.println("learn-coverage-model: failed to write " + output_path);
+				} else {
+					env.out.println("saved model to " + output_path);
+				};
+
+				Some(RuState(state with
+					vars = setTree(state.vars, "learn-coverage-model", pairs2tree([
+						Pair("assertion-count", flow(n_assertions)),
+						Pair("example-count",   flow(total_ex)),
+						Pair("avg-green-pct",   flow(avg_green * 100.0))
+					]))
+				))
+			}
+			default: {
+				env.out.println("learn-coverage-model: failed to parse JSON from " + input_path);
+				Some(state);
+			}
+		}
+	}
+}

@@ -1,0 +1,147 @@
+import ru/benchmark/reprove_coverage;
+import ru/prover/core/strategies/subproof_replay;
+import ru/util/target;
+import base/util/timed;
+import comm;
+
+export {
+	ruCommCollectCoverageData : RuComm;
+}
+
+ruCommCollectCoverageData = RuComm(
+	RuCommInfo(
+		"collect-coverage-data", "prover",
+		"run iterative reprove-coverage and collect labeled training data (green/yellow/red) per proof step",
+		"target", true, false,
+		[
+			RuCommArg("target",         true, "the target: a theorem, file or all",          "all"),
+			RuCommArg("max-depth",      true, "max proof tree depth",                        "5"),
+			RuCommArg("max-size",       true, "max proof tree size",                         "4096"),
+			RuCommArg("attempts",       true, "number of replay attempts",                   "3"),
+			RuCommArg("time-limit",     true, "per-theorem wall-clock limit",                "60s"),
+			RuCommArg("max-iterations", true, "max frontier iterations",                     "5"),
+			RuCommArg("bfs-depth",      true, "BFS depth for post-saturation pass (0=skip)", "1"),
+			RuCommArg("bfs-size",       true, "BFS size budget for post-saturation pass",    "1024"),
+			RuCommArg("output",         true, "output file name (in db/ dir)",               "coverage-training-data"),
+		], []
+	),
+	ruRunCollectCoverageData
+);
+
+ruCollectColoredExamples(
+	colored   : [RuColoredCoverage],
+	theorem   : string,
+	parent    : string,
+	depth     : int
+) -> [Json] {
+	concatA(map(colored, \node -> {
+		color_s = switch (node.color) {
+			RuGreen():        "green";
+			RuYellowReplay(): "yellow-replay";
+			RuYellowBfs():    "yellow-bfs";
+			RuRed():          "red";
+		};
+		child_jsons = ruCollectColoredExamples(node.children, theorem, id2s(node.assertion), depth + 1);
+		arrayPush(child_jsons, JsonObject([
+			Pair("theorem",   JsonString(theorem)),
+			Pair("assertion", JsonString(id2s(node.assertion))),
+			Pair("parent",    JsonString(parent)),
+			Pair("depth",     JsonDouble(i2d(depth))),
+			Pair("color",     JsonString(color_s))
+		]))
+	}))
+}
+
+ruRunCollectCoverageData(unit : RuUnit) -> Maybe<RuState> {
+	env   = ruUnitEnv(unit);
+	task  = unit.task;
+	state = unit.state;
+	conf  = state.conf;
+	math  = ruMathFromSources(state.ru, env);
+	target = ruDetermineTarget(task, math, env);
+	if (target == RuTargetNone()) {
+		env.out.println("no target for collect-coverage-data");
+		Some(state);
+	} else {
+		max_depth   = ruTaskIntArg(task, "max-depth",      5);
+		max_size    = ruTaskIntArg(task, "max-size",       4096);
+		attempts    = ruTaskIntArg(task, "attempts",       3);
+		max_iters   = ruTaskIntArg(task, "max-iterations", 5);
+		bfs_depth   = ruTaskIntArg(task, "bfs-depth",      1);
+		bfs_size    = ruTaskIntArg(task, "bfs-size",       1024);
+		output_key  = ruTaskStringArg(task, "output", "coverage-training-data");
+		time_limit  = ruParseTime(ruTaskStringArg(task, "time-limit", "60s"));
+		index       = ruMakeIndexForTarget(target, math, env);
+		step_index  = ruBuildStepIndex(math, 3);
+
+		// Get theorems to process.
+		pred = ruTargetPredicate(target);
+		theorems = filter(
+			getTreeValues(ruDeclsTheorems(math.decls)),
+			\th -> pred(th) && ruTheoremIsProved(th)
+		);
+
+		env.out.println("\tgoing to process " + i2s(length(theorems)) + " theorems");
+		env.out.println("\ttime limit: " + ruTime2s(time_limit));
+
+		// Zero-result sentinel for timed-out theorems.
+		empty_res = RuCoverageIterResult(0, 0, 0, 0, false, 0, []);
+
+		// Sequential fold with a hard per-theorem time limit via ruEvalTimed3.
+		result = fold(theorems, Pair([], Pair(0, 0)), \acc, th -> {
+			th_name = id2s(th.info.id);
+			res = ruEvalTimed3(
+				\th1, tl, dummy -> ruReproveCoverageTheorem(
+					th1, task.args, index, tl,
+					max_depth, max_size, attempts, max_iters, bfs_depth, bfs_size, math, env, step_index
+				),
+				th, time_limit, 0,
+				empty_res, time_limit
+			);
+			examples = ruCollectColoredExamples(res.colored, th_name, "", 0);
+			proved_delta = if (res.proved) 1 else 0;
+			if (ruVerbose(conf) > 0) {
+				env.out.println(
+					th_name + ": " +
+					"green=" + i2s(res.green) +
+					" yellow-replay=" + i2s(res.yellow_replay) +
+					" yellow-bfs=" + i2s(res.yellow_bfs) +
+					" red=" + i2s(res.red) +
+					" iters=" + i2s(res.iters) +
+					" examples=" + i2s(length(examples))
+				);
+			}
+			Pair(concat(acc.first, examples), Pair(acc.second.first + 1, acc.second.second + proved_delta))
+		});
+
+		all_examples = result.first;
+		n_th    = result.second.first;
+		n_proved = result.second.second;
+		n_ex    = length(all_examples);
+
+		env.out.println(
+			"=== collect-coverage-data results ===\n" +
+			"theorems:  " + i2s(n_th) + "\n" +
+			"proved:    " + i2s(n_proved) + " / " + i2s(n_th) + "\n" +
+			"examples:  " + i2s(n_ex)
+		);
+
+		// Save to db/<output_key>.json.
+		json_val = JsonArray(all_examples);
+		ru_root  = ruOptsString(conf.opts, "ru-root", ".");
+		out_path = pathCombine(ru_root, "db/" + output_key + ".json");
+		if (!setFileContent(out_path, json2stringFormatted(json_val))) {
+			env.out.println("collect-coverage-data: failed to write " + out_path);
+		} else {
+			env.out.println("saved " + i2s(n_ex) + " examples to " + out_path);
+		};
+
+		Some(RuState(state with
+			vars = setTree(state.vars, "collect-coverage-data", pairs2tree([
+				Pair("theorem-count", flow(n_th)),
+				Pair("proved-count",  flow(n_proved)),
+				Pair("example-count", flow(n_ex))
+			]))
+		))
+	}
+}
