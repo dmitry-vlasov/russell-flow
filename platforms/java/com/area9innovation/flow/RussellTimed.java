@@ -186,7 +186,7 @@ public class RussellTimed extends NativeHost {
 			}
 			resArr = res.toArray();
 		} catch (InterruptedException e) {
-			e.printStackTrace();
+			Thread.currentThread().interrupt(); // propagate interrupt; caller (evalTimed3) will clear it
 		} catch (Exception e) {
 			System.out.println("General exception in concurrentTimeout: " + e.getMessage());
 			e.printStackTrace();
@@ -239,7 +239,7 @@ public class RussellTimed extends NativeHost {
 			}
 			resArr = res.toArray();
 		} catch (InterruptedException e) {
-			e.printStackTrace();
+			Thread.currentThread().interrupt();
 		} catch (Exception e) {
 			e.printStackTrace();
 		}
