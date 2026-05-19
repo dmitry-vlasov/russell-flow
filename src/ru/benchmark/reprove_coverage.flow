@@ -4,10 +4,16 @@ import ru/prover/core/tactics/breadth_first;
 import ru/prover/core/strategies/subproof_replay;
 import ru/map_decls;
 import ru/util/target;
+import ru/util/exp2s;
+import base/concurrent;
+import formats/json/json;
 import comm;
 
 export {
 	ruCommReproveCoverage : RuComm;
+
+	ruStmtFeatures(stmt : RuStmt, lang : RuLang) -> [Pair<string, Json>];
+	ruCollectColoredExamples(colored : [RuColoredCoverage], theorem : string, parent : string, depth : int, lang : RuLang) -> [Json];
 
 	// Node color: GREEN = initial-alignment interior (all GREEN children), YELLOW = frontier, RED = uncovered.
 	// Color is sticky: once yellow or red, never upgraded to green by later tactic passes.
@@ -65,10 +71,66 @@ ruCommReproveCoverage = RuComm(
 			RuCommArg("max-iterations", true, "max replay iterations per inner phase",       "5"),
 			RuCommArg("bfs-depth",      true, "BFS depth for post-saturation pass (0=skip)", "3"),
 			RuCommArg("bfs-size",       true, "BFS size budget for post-saturation pass",    "4096"),
+			RuCommArg("output",         true, "save training examples to db/<name>.json (empty = skip)", ""),
 		], []
 	),
 	ruRunReproveCoverage
 );
+
+ruStmtFeatures(stmt : RuStmt, lang : RuLang) -> [Pair<string, Json>] {
+	if (length(stmt.exps) == 0) [] else {
+		switch (stmt.exps[0]) {
+			RuTerm(__, __, __): [];
+			RuExp(nodes, __): {
+				exp = cast(stmt.exps[0] : RuTermExp -> RuExp);
+				rule_count = fold(nodes, 0, \acc, n -> switch (n) {
+					RuRuleNode(__, __): acc + 1;
+					default: acc;
+				});
+				top_rule = if (length(nodes) > 0) {
+					switch (nodes[0]) {
+						RuRuleNode(ruleType, __): id2s(ruIdType2Id(ruleType));
+						RuVar(__, __): "";
+					}
+				} else "";
+				[
+					Pair("stmt_size", JsonDouble(i2d(rule_count))),
+					Pair("stmt_top",  JsonString(top_rule)),
+					Pair("stmt_str",  JsonString(ruSafeExp2s(exp, lang)))
+				]
+			}
+		}
+	}
+}
+
+ruCollectColoredExamples(
+	colored  : [RuColoredCoverage],
+	theorem  : string,
+	parent   : string,
+	depth    : int,
+	lang     : RuLang
+) -> [Json] {
+	concatA(map(colored, \node -> {
+		color_s = switch (node.color) {
+			RuGreen():        "green";
+			RuYellowReplay(): "yellow-replay";
+			RuYellowBfs():    "yellow-bfs";
+			RuRed():          "red";
+		};
+		children_json = JsonArray(map(node.children, \ch -> JsonString(id2s(ch.assertion))));
+		stmt_feats = ruStmtFeatures(node.stmt, lang);
+		child_jsons = ruCollectColoredExamples(node.children, theorem, id2s(node.assertion), depth + 1, lang);
+		example = JsonObject(concat([
+			Pair("theorem",   JsonString(theorem)),
+			Pair("assertion", JsonString(id2s(node.assertion))),
+			Pair("parent",    JsonString(parent)),
+			Pair("depth",     JsonDouble(i2d(depth))),
+			Pair("children",  children_json),
+			Pair("color",     JsonString(color_s))
+		], stmt_feats));
+		arrayPush(child_jsons, example)
+	}))
+}
 
 // Run the fragment-replay prover for a single step goal.
 ruProveStep(
@@ -395,18 +457,23 @@ ruRunReproveCoverage(unit : RuUnit) -> Maybe<RuState> {
 		index       = ruMakeIndexForTarget(target, math, env);
 		step_index  = ruBuildStepIndex(math, 3);
 
+		output_key  = ruTaskStringArg(task, "output", "");
+		lang        = math.decls.lang;
+
 		total_green  = ref 0;
 		total_yr     = ref 0;
 		total_yb     = ref 0;
 		total_red    = ref 0;
 		theorem_count = ref 0;
 		proved_count  = ref 0;
-		inc_th   = ruAtomicIntInc(theorem_count);
-		inc_prov = ruAtomicIntInc(proved_count);
-		add_green = ruAtomicIntInc(total_green);
-		add_yr    = ruAtomicIntInc(total_yr);
-		add_yb    = ruAtomicIntInc(total_yb);
-		add_red   = ruAtomicIntInc(total_red);
+		all_examples  = ref [];
+		inc_th        = ruAtomicIntInc(theorem_count);
+		inc_prov      = ruAtomicIntInc(proved_count);
+		add_green     = ruAtomicIntInc(total_green);
+		add_yr        = ruAtomicIntInc(total_yr);
+		add_yb        = ruAtomicIntInc(total_yb);
+		add_red       = ruAtomicIntInc(total_red);
+		push_example  = ruAtomicRefArrayPush(all_examples);
 
 		cover_fn = \decl, time_limit, env1 -> {
 			th = cast(decl : RuDecl -> RuTheorem);
@@ -421,16 +488,34 @@ ruRunReproveCoverage(unit : RuUnit) -> Maybe<RuState> {
 				add_yb(res.yellow_bfs);
 				add_red(res.red);
 				if (res.proved) inc_prov(1);
-				if (ruVerbose(env1.conf) > 0) {
-					env1.out.println(
-						id2s(th.info.id) + ": " +
-						"green=" + i2s(res.green) +
-						" yellow-replay=" + i2s(res.yellow_replay) +
-						" yellow-bfs=" + i2s(res.yellow_bfs) +
-						" red=" + i2s(res.red) +
-						" iters=" + i2s(res.iters) +
-						(if (res.proved) " PROVED" else "")
-					);
+				if (output_key != "") {
+					th_name  = id2s(th.info.id);
+					examples = ruCollectColoredExamples(res.colored, th_name, "", 0, lang);
+					iter(examples, \ex -> push_example(ex));
+					if (ruVerbose(env1.conf) > 0) {
+						env1.out.println(
+							th_name + ": " +
+							"green=" + i2s(res.green) +
+							" yellow-replay=" + i2s(res.yellow_replay) +
+							" yellow-bfs=" + i2s(res.yellow_bfs) +
+							" red=" + i2s(res.red) +
+							" iters=" + i2s(res.iters) +
+							" examples=" + i2s(length(examples)) +
+							(if (res.proved) " PROVED" else "")
+						);
+					}
+				} else {
+					if (ruVerbose(env1.conf) > 0) {
+						env1.out.println(
+							id2s(th.info.id) + ": " +
+							"green=" + i2s(res.green) +
+							" yellow-replay=" + i2s(res.yellow_replay) +
+							" yellow-bfs=" + i2s(res.yellow_bfs) +
+							" red=" + i2s(res.red) +
+							" iters=" + i2s(res.iters) +
+							(if (res.proved) " PROVED" else "")
+						);
+					}
 				}
 			}
 			RuMappedDecl(true, false, decl)
@@ -464,6 +549,19 @@ ruRunReproveCoverage(unit : RuUnit) -> Maybe<RuState> {
 			"red:           " + i2s(r)  + (if (tot > 0) " (" + d2s(i2d(r) /i2d(tot)*100.0) + "%)" else "")
 		);
 
+		n_ex = if (output_key != "") {
+			examples = ^all_examples;
+			n = length(examples);
+			ru_root = ruOptsString(conf.opts, "ru-root", ".");
+			out_path = pathCombine(ru_root, "db/" + output_key + ".json");
+			if (!setFileContent(out_path, json2stringFormatted(JsonArray(examples)))) {
+				env.out.println("reprove-coverage: failed to write " + out_path);
+			} else {
+				env.out.println("saved " + i2s(n) + " examples to " + out_path);
+			};
+			n
+		} else 0;
+
 		Some(RuState(new_state with
 			vars = setTree(new_state.vars, "reprove-coverage", pairs2tree([
 				Pair("theorem-count",  flow(^theorem_count)),
@@ -471,7 +569,8 @@ ruRunReproveCoverage(unit : RuUnit) -> Maybe<RuState> {
 				Pair("green",          flow(g)),
 				Pair("yellow-replay",  flow(yr)),
 				Pair("yellow-bfs",     flow(yb)),
-				Pair("red",            flow(r))
+				Pair("red",            flow(r)),
+				Pair("example-count",  flow(n_ex))
 			]))
 		))
 	}
