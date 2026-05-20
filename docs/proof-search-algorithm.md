@@ -93,40 +93,85 @@ This operation is what allows the PVT to propagate constraints *upward* through 
 
 ---
 
-## Search strategy
+## Search tactics
 
-The search is controlled by a **strategy** object that determines:
+The search is controlled by a **tactic** — a small object that on each step tells the engine:
 
-- **Expansion order**: which nodes to expand next (breadth-first, depth-first, heuristic)
-- **Termination conditions**: limits on tree size, depth, or time
-- **Pruning rules**: when to abandon a branch
+- which leaves to expand next (`RuTacticExpand([…])`);
+- when to hand off to a different tactic (`RuTacticSwitch(next)`);
+- when to stop entirely (`RuTacticDone`).
 
-The default strategy for `reprove-oracle` uses the existing proof as an **oracle**: it expands nodes in the order suggested by the known proof, dramatically reducing the search space.
+```flow
+RuProverTactic(
+    description    : string,
+    step           : (RuProverTree) -> RuProverTacticStep,
+    keep_expanding : (RuProverTree) -> bool   // pure predicate
+)
+```
+
+The unified type subsumes what was earlier split into `RuProverTactic` (single-step) and `RuProverStrategy` (sequencer over tactics). Tactic transitions are explicit and visible — `Switch` makes the next tactic obvious in the description chain — and combinators are pure functions over tactics.
+
+The companion `keep_expanding` predicate is checked **per-prop during parallel batch expansion** so a tactic's budget (tree size, depth, time, proved) can short-circuit a large batch the moment it's exceeded, without waiting for the next `step` call.
+
+### Primitives
+
+The tactic library in [`src/ru/prover/tactics/`](../src/ru/prover/tactics/) contains a flat catalogue of building blocks: breadth-first search (`bfs`, `bounded-bfs`, `top-n-bfs`, `unif-quality`), follow-proof replay (`follow_proof`), corpus-guided fragment lookup (`subproof_replay`, `fragment_replay`), oracle-guided search (`oracle`), ML-guided premise selection (`ml`), and linear-guided search over fragment-backed completions (`linear-guided`).
+
+### Combinators
+
+Three combinators ([`combinators.flow`](../src/ru/prover/tactics/combinators.flow)) compose tactics into larger strategies:
+
+- `ruSequenceTactic([t1, t2, …])` — runs each tactic in turn; advances on `Done`, swaps in place on `Switch`.
+- `ruIterateTactic(driver)` — calls `driver(tree)` to produce a fresh sub-tactic on every iteration; re-enters when the sub-tactic finishes, which is how SPR and fragment-replay properly exhaust their attempts/pending queues.
+- `ruLoopWhileProgressTactic(builder, max_iters)` — rebuilds the inner tactic on each iteration (so state-carrying tactics reset) and re-runs while the proof tree keeps growing.
+
+A `ruLimitedTactic(inner, time, applied, produced)` wrapper attaches per-tactic budget limits.
+
+### DSL
+
+The full tactic library is also exposed through a small string DSL — see [`tactics-language.md`](tactics-language.md) for the grammar, atoms and combinators. The universal `reprove` command takes a `tactic="…"` argument that the DSL parser turns into a `RuProverTactic` for the search.
 
 ### Oracle-guided reproof
 
-The `reprove-oracle` task takes an existing proof tree and uses it as a guide:
+The `oracle` tactic uses the existing proof tree as a guide:
 
-1. For each step in the existing proof, the oracle suggests which assertion to try first
-2. The prover tries the oracle's suggestion; if it succeeds, it proceeds to the next step
-3. If the oracle's suggestion fails (e.g., because an assertion was renamed or its statement changed), the prover falls back to general search
+1. For each step in the existing proof, the oracle suggests which assertion to try first.
+2. The prover tries the oracle's suggestion; if it succeeds, it proceeds to the next step.
+3. If the oracle's suggestion fails (e.g. because an assertion was renamed or its statement changed), the prover falls back to general search.
 
-This is used to re-verify proofs after refactoring, or after translating from Metamath.
+This is used to re-verify proofs after refactoring, or after translating from Metamath. The roundtrip test invokes `reprove strict-fail=1 tactic="oracle(-1, -1)"`.
 
 ---
 
 ## Implementation
 
-The prover is implemented across several files:
+The prover is split between the engine (in [`src/ru/prover/core/`](../src/ru/prover/core/)) and the tactic library (in [`src/ru/prover/tactics/`](../src/ru/prover/tactics/)).
+
+### Engine
 
 | File | Role |
 |------|------|
-| `src/ru/prover/task.flow` | `RuProverTask` — the proof goal and premises |
-| `src/ru/prover/tree.flow` | `RuProverTree`, PVT nodes, proof linearization |
-| `src/ru/prover/env.flow` | `RuProverEnv` — prover configuration and callback functions |
-| `src/ru/prover/expand.flow` | Node expansion: assertion and premise unification |
-| `src/ru/prover/conf.flow` | `RuProverConf` — time limits and search parameters |
-| `src/ru/prover/reprove_oracle.flow` | Oracle-guided reprover |
+| `src/ru/prover/core/controls.flow` | `RuProverTactic`, `RuProverTacticStep` ADT, `ruDoneTactic` sentinel |
+| `src/ru/prover/core/task.flow` | `RuProverTask` — the proof goal and premises |
+| `src/ru/prover/core/tree.flow` | `RuProverTree`, PVT nodes, proof linearisation |
+| `src/ru/prover/core/env.flow` | `RuProverEnv` — prover state, callback functions, fragment trees |
+| `src/ru/prover/core/expand.flow` | Node expansion: assertion and premise unification |
+| `src/ru/prover/core/conf.flow` | `RuProverConf` — time limits and search parameters |
+| `src/ru/prover/core/prove.flow` | The search loop: polls the active tactic, applies its decision |
+
+### Tactic library
+
+| File | Role |
+|------|------|
+| `src/ru/prover/tactics/breadth_first.flow` | BFS and its bounded / top-N / unif-quality variants |
+| `src/ru/prover/tactics/follow_proof.flow` | Replay a known proof sub-tree |
+| `src/ru/prover/tactics/linear_guided.flow` | Fragment-completion linear search |
+| `src/ru/prover/tactics/subproof_replay.flow` | Corpus-guided proof-step replay (SPR) |
+| `src/ru/prover/tactics/fragment_replay.flow` | Corpus-guided fragment replay |
+| `src/ru/prover/tactics/oracle.flow` | Oracle-guided reprover; overrides `penv.fns` on init |
+| `src/ru/prover/tactics/combinators.flow` | `seq`, `iterate`, `loop`, `limited` |
+| `src/ru/prover/tactics/combined.flow` | Convenience composition of unif-quality + SPR + BFS |
+| `src/ru/prover/tactics/dsl.flow` | Parser and builder for the [tactics DSL](tactics-language.md) |
 
 ### Key types
 
@@ -134,19 +179,26 @@ The prover is implemented across several files:
 // The goal: prove `goal` given `premises`
 RuProverTask(
     info     : RuDeclInfo,
-    strategy : RuProverStrategy,
+    tactic   : RuProverTactic,         // placeholder; the real one is installed
+                                       // by the DSL builder after env init
     header   : string,
-    args     : Tree<string, string>,
+    args     : Tree<string, flow>,
     premises : [RuPremise],
     goal     : RuStep
 );
 
+// A tactic's per-step decision
+RuProverTacticStep ::= RuTacticExpand, RuTacticSwitch, RuTacticDone;
+RuTacticExpand(leafs : [RuProverProp]);
+RuTacticSwitch(next : RuProverTactic);
+RuTacticDone();
+
 // A node in the PVT
 RuProverExp(
     id       : int,
-    stmt     : RuStmt,           // the goal expression
-    parent   : RuProverParent,   // parent a-node or root
-    children : Vector<RuProverProp>, // candidate a-nodes
+    stmt     : RuStmt,                   // the goal expression
+    parent   : RuProverParent,           // parent a-node or root
+    children : Vector<RuProverProp>,     // candidate a-nodes
     proven   : ref [RuProverProof]
 );
 
@@ -154,7 +206,7 @@ RuProverExp(
 RuProverProp(
     id        : int,
     assertion : RuAssertion,
-    outer     : RuSubst,         // unifier: assertion conclusion → goal
+    outer     : RuSubst,                 // unifier: assertion conclusion → goal
     parent    : RuProverExp,
     children  : Vector<RuProverHyp>
 );

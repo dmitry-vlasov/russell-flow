@@ -105,14 +105,31 @@ print ("mm read: " + read-mm.size + " files in " + time2s(read-mm.time));
 
 | Task | Description |
 |------|-------------|
-| `reprove-oracle [target=...] [time-limit=...]` | Re-prove theorems using proof tree as oracle guide |
-| `autoprove [target=...]` | Attempt fully automated proof search |
+| `reprove [target=...] [tactic="..."] [...]` | Universal reprove command — runs a tactic supplied via the DSL (default: bounded BFS). See [tactics-language.md](tactics-language.md). |
+| `reprove-compress [target=...] [...]` | Per-step proof compression (replaces a step's proof with a shorter one when found). |
+| `autoprove [target=...]` | Attempt fully automated proof search. |
 
 The `target` parameter can be:
 - `all` — all theorems in the project
 - `all-seq` — all theorems, sequentially (no parallelism)
+- `stride-N` — every Nth theorem (stratified sample)
+- `file:<name>` — theorems listed in `<name>` (e.g. a benchmark JSON)
 - A specific theorem name
 - A source file name
+
+Common `reprove` arguments:
+
+| Argument | Default | Effect |
+|----------|---------|--------|
+| `tactic` | `""` (bounded-bfs) | Tactic DSL expression. See [tactics-language.md](tactics-language.md). |
+| `max-depth`, `max-size` | `5`, `4096` | Bounds for the default tactic. |
+| `time-limit` | `60s` | Per-theorem wall-clock limit. |
+| `job-time-limit` | `""` | Total wall-clock cap (default: `n*time-limit/p`). |
+| `fragment-depth` | `0` | If `>0`, build the fragment index — enables `fragment-replay` and `linear-guided` atoms. |
+| `load-ml` | `0` | If `1`, load the ML selector — enables the `ml` atom. |
+| `strict-fail` | `0` | If `1`, crash if any theorem failed to reprove (CI mode). |
+
+The earlier `reprove-dumb`, `reprove-fragments`, `reprove-ml`, `reprove-linear`, and `reprove-oracle` commands have been removed; each is now a one-line `reprove tactic="…"` invocation (see [tactics-language.md](tactics-language.md) for the mapping).
 
 ### Optimization
 
