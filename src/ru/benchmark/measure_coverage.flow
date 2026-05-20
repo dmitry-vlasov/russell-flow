@@ -1,8 +1,6 @@
 import ru/benchmark/coverage;
 import ru/prover/core/prove;
 import ru/prover/core/strategies/subproof_replay;
-import ru/prover/core/strategies/default;
-import ru/prover/core/tactics/breadth_first;
 import ru/map_decls;
 import ru/util/target;
 import comm;
@@ -10,6 +8,10 @@ import comm;
 export {
 	ruCommMeasureCoverage : RuComm;
 }
+
+// Module-level cache so ruBuildStepIndex is called at most once per process.
+// The pair stores (theorem-count, index) so a reload invalidates it correctly.
+ruStepIndexCache : ref Pair<int, RuIndex<Pair<int,int>>> = ref Pair(-1, ruMakeIndex());
 
 ruCommMeasureCoverage = RuComm(
 	RuCommInfo(
@@ -20,9 +22,11 @@ ruCommMeasureCoverage = RuComm(
 			RuCommArg("target",    true, "the target: a theorem, file or all", "all"),
 			RuCommArg("max-depth", true, "max proof tree depth",               "5"),
 			RuCommArg("max-size",  true, "max proof tree size",                "4096"),
-			RuCommArg("attempts",  true, "number of replay attempts per leaf", "3"),
-			RuCommArg("time-limit", true, "per-theorem wall-clock limit",                "60s"),
-			RuCommArg("unif-rank",  true, "beam width for unif-quality BFS (0=subproof-replay, default)", "0"),
+			RuCommArg("attempts",       true, "number of replay attempts per leaf",                                      "3"),
+			RuCommArg("time-limit",     true, "per-theorem wall-clock limit",                                            "60s"),
+			RuCommArg("job-time-limit", true, "total wall-clock cap for the whole job (empty = n*time-limit/p)",         ""),
+			RuCommArg("unif-rank",      true, "beam width for phase-0 unif-quality BFS (0=skip)",                       "0"),
+			RuCommArg("max-iterations", true, "outer loop iterations over phases 1+2",                                  "3"),
 		], []
 	),
 	ruRunMeasureCoverage
@@ -40,11 +44,9 @@ ruMeasureCoverageTheorem(
 	env        : RuEnv,
 	step_index : RuIndex<Pair<int,int>>
 ) -> RuProofCoverage {
-	unif_rank = ruTaskIntArg(task, "unif-rank", 0);
-	strategy  = if (unif_rank > 0)
-		ruSingleTacticStrategy(ruUnifQualityTactic(unif_rank, max_depth, max_size))
-	else
-		ruSubproofReplayStrategy(step_index, max_depth, max_size, attempts, math, env);
+	unif_rank  = ruTaskIntArg(task, "unif-rank",      0);
+	max_iters  = ruTaskIntArg(task, "max-iterations", 3);
+	strategy   = ruCombinedStrategy(step_index, unif_rank, max_depth, max_size, attempts, max_iters, math, env);
 	prover_task = RuProverTask(
 		th.info,
 		strategy,
@@ -71,11 +73,40 @@ ruRunMeasureCoverage(unit : RuUnit) -> Maybe<RuState> {
 		env.out.println("no target for measure-coverage");
 		Some(state);
 	} else {
-		max_depth  = ruTaskIntArg(task, "max-depth", 5);
-		max_size   = ruTaskIntArg(task, "max-size",  4096);
-		attempts   = ruTaskIntArg(task, "attempts",  3);
+		max_depth  = ruTaskIntArg(task, "max-depth",  5);
+		max_size   = ruTaskIntArg(task, "max-size",   4096);
+		attempts   = ruTaskIntArg(task, "attempts",   3);
 		index      = ruMakeIndexForTarget(target, math, env);
-		step_index = ruBuildStepIndex(math, 3);
+		// Cache the step index in a module-level ref keyed by theorem count.
+		// Avoids rebuilding a ~7s / ~6 GB index on every single-theorem call.
+		n_all = sizeTree(math.decls.assertions);
+		step_index : RuIndex<Pair<int,int>> =
+			if ((^ruStepIndexCache).first == n_all) (^ruStepIndexCache).second
+			else {
+				idx = ruBuildStepIndex(math, 3);
+				ruStepIndexCache := Pair(n_all, idx);
+				idx
+			};
+
+		// Compute total job budget so ruMapFnComm's outer timer covers n*th_time/p.
+		// ruParseTime returns milliseconds; convert back to whole seconds for the string.
+		th_time_ms  = ruParseTime(ruTaskStringArg(task, "time-limit", "60s"));
+		n_theorems  = i2d(length(filter(
+			getTreeValues(ruDeclsTheorems(math.decls)),
+			\th -> ruTargetPredicate(target)(th) && ruTheoremIsProved(th)
+		)));
+		p_count     = max(1.0, i2d(availableProcessors()));
+		// When N <= P all theorems run fully in parallel, so wall time = th_time.
+		// When N > P, total wall time = N*th/P.  Take the max to ensure each
+		// theorem always gets its full budget even when N is small.
+		map_time_ms = max(th_time_ms, n_theorems * th_time_ms / p_count);
+		job_time_str = ruTaskStringArg(task, "job-time-limit", "");
+		map_time_capped = if (job_time_str != "")
+			min(map_time_ms, ruParseTime(job_time_str))
+		else map_time_ms;
+		map_task = RuTask(task with args = setTree(task.args, "time-limit",
+			flow(i2s(round(map_time_capped / 1000.0)) + "s")
+		));
 
 		total_steps   = ref 0;
 		covered_steps = ref 0;
@@ -123,7 +154,7 @@ ruRunMeasureCoverage(unit : RuUnit) -> Maybe<RuState> {
 		};
 
 		new_state = ruMapFnComm(
-			RuUnit(unit.task, state, env.out),
+			RuUnit(map_task, state, env.out),
 			RuMapFn(
 				RuMapFnInfo(
 					"measure-coverage",

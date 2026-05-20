@@ -10,19 +10,45 @@ export {
 	// min_rule_nodes rule nodes are omitted to avoid bare-variable explosion.
 	ruBuildStepIndex(math : RuMath, min_rule_nodes : int) -> RuIndex<Pair<int,int>>;
 
-	// Strategy that, for each open leaf, looks up matching proof steps in the
-	// step index and replays each matching sub-proof via ruFollowProofTactic.
-	// A match is accepted only when len(leaf_exp) >= sum of lengths of all
-	// substitution values — ensuring the substitution is "shallow" relative to
-	// the pattern, i.e. the matched expression is structurally close to the leaf.
-	ruSubproofReplayStrategy(
+	// Set of assertion IDs that appear in any indexed proof step.
+	ruBuildIndexedAssertionSet(math : RuMath, min_rule_nodes : int) -> Set<int>;
+
+	// Subproof-replay tactic: for each open leaf, look up matching proof steps
+	// in the step index and replay each matching sub-proof.  Scans leaves
+	// deepest-first, skipping leaves with no corpus match, until `attempts`
+	// leaves have been tried.  Each replay is bounded by `max_size`.
+	ruSubproofReplayTactic(
 		step_index : RuIndex<Pair<int,int>>,
-		max_depth  : int,
 		max_size   : int,
 		attempts   : int,
 		math       : RuMath,
 		env        : RuEnv
-	) -> RuProverStrategy;
+	) -> RuProverTactic;
+
+	// Sequence combinator: runs tactics in order, advancing to the next when
+	// the current one returns RuTacticDone.  When all are done, terminates.
+	ruSequenceTactic(tactics : [RuProverTactic]) -> RuProverTactic;
+
+	// Loop-while-progress combinator: runs `builder()` to completion; if the
+	// tree grew, builds a fresh inner and runs it again, up to max_iters.
+	// Stops on no progress, or when iters are exhausted, or when a proof is found.
+	ruLoopWhileProgressTactic(builder : () -> RuProverTactic, max_iters : int) -> RuProverTactic;
+
+	// Three-phase combined tactic with outer loop:
+	//   Phase 0 (once): unif-quality BFS — fast beam search by specificity
+	//                   (skipped when unif_rank=0)
+	//   Loop body:      subproof-replay → bounded BFS
+	//   Outer loop:     repeat the body up to max_iters times while progress is made.
+	ruCombinedStrategy(
+		step_index : RuIndex<Pair<int,int>>,
+		unif_rank  : int,
+		max_depth  : int,
+		max_size   : int,
+		attempts   : int,
+		max_iters  : int,
+		math       : RuMath,
+		env        : RuEnv
+	) -> RuProverTactic;
 }
 
 ruSprRuleNodeCount(e : RuExp) -> int {
@@ -32,8 +58,6 @@ ruSprRuleNodeCount(e : RuExp) -> int {
 	})
 }
 
-// Set of assertion IDs that appear as applied assertions in any indexed proof step.
-// Used to restrict the BFS fallback to assertions seen in real proofs.
 ruBuildIndexedAssertionSet(math : RuMath, min_rule_nodes : int) -> Set<int> {
 	s : ref Set<int> = ref makeSet();
 	traverseInOrder(math.decls.assertions, \__, ass ->
@@ -75,14 +99,6 @@ ruSprPropDepth(prop : RuProverProp) -> int {
 	}
 }
 
-ruSprDeepestLeaf(leafs : Tree<int, RuProverProp>) -> Maybe<RuProverProp> {
-	leaves = getTreeValues(leafs);
-	if (leaves == []) None()
-	else Some(fold(tail(leaves), leaves[0], \acc, leaf ->
-		if (ruSprPropDepth(leaf) >= ruSprPropDepth(acc)) leaf else acc
-	))
-}
-
 ruStepsForLeaf(
 	prop       : RuProverProp,
 	step_index : RuIndex<Pair<int,int>>,
@@ -92,19 +108,17 @@ ruStepsForLeaf(
 ) -> [RuProofStep] {
 	leaf_exp   = ruExp(prop.parent.stmt.exps[0]);
 	leaf_len   = length(leaf_exp.nodes);
-	// Skip if leaf is too generic (too few rule nodes) or too complex (too many
-	// rule nodes, generating huge match sets on large indices).
+	// Skip leaves that are too generic (few rule nodes) or too complex (huge
+	// match sets on large indices).
 	leaf_rules = ruSprRuleNodeCount(leaf_exp);
 	if (leaf_rules < 3 || leaf_rules > 12) [] else {
 		matched = ruUnifyIndex(leaf_exp, step_index, ruEmptySubst, math, env);
-		// Accept only matches where leaf_len >= total length of all substitution
-		// values.  This is the user's "shallow substitution" criterion: the pattern
-		// itself explains at least as much structure as the unifier introduces.
+		// "Shallow substitution" criterion: pattern explains at least as much
+		// structure as the unifier introduces.
 		candidates = filter(matched, \unif -> {
 			subst_len = foldHashMap(unif.sub.map, 0, \__, se, acc -> acc + length(se.exp.nodes));
 			leaf_len >= subst_len
 		});
-		// Take candidates before building sub-proof trees (expensive).
 		filtermap(take(candidates, attempts), \unif ->
 			switch (lookupTree(math.decls.assertions, unif.data.first)) {
 				Some(ass): switch (ass) {
@@ -123,41 +137,119 @@ ruStepsForLeaf(
 	}
 }
 
-ruSubproofReplayStrategy(
-	step_index  : RuIndex<Pair<int,int>>,
-	max_depth   : int,
-	max_size    : int,
-	attempts    : int,
-	math        : RuMath,
-	env         : RuEnv
-) -> RuProverStrategy {
+// ---------- Combinators ----------
+
+ruSequenceTactic(tactics : [RuProverTactic]) -> RuProverTactic {
+	if (tactics == []) ruDoneTactic
+	else RuProverTactic("seq[" + tactics[0].description + "]",
+		\tree -> switch (tactics[0].step(tree)) {
+			RuTacticExpand(leafs): RuTacticExpand(leafs);
+			RuTacticSwitch(next): RuTacticSwitch(ruSequenceTactic(concat([next], tail(tactics))));
+			RuTacticDone(): {
+				rest = tail(tactics);
+				if (rest == []) RuTacticDone()
+				else RuTacticSwitch(ruSequenceTactic(rest))
+			}
+		}
+	)
+}
+
+ruLoopHelper(
+	builder : () -> RuProverTactic,
+	current : RuProverTactic,
+	iters_left : int,
+	prev_size : int
+) -> RuProverTactic {
+	RuProverTactic("loop[" + i2s(iters_left) + "/" + current.description + "]",
+		\tree -> switch (current.step(tree)) {
+			RuTacticExpand(leafs): RuTacticExpand(leafs);
+			RuTacticSwitch(next): RuTacticSwitch(ruLoopHelper(builder, next, iters_left, prev_size));
+			RuTacticDone(): {
+				cur_size = sizeTree(tree.nodes);
+				if (iters_left > 1 && cur_size > prev_size)
+					RuTacticSwitch(ruLoopHelper(builder, builder(), iters_left - 1, cur_size))
+				else RuTacticDone()
+			}
+		}
+	)
+}
+
+ruLoopWhileProgressTactic(builder : () -> RuProverTactic, max_iters : int) -> RuProverTactic {
+	if (max_iters <= 0) ruDoneTactic
+	else ruLoopHelper(builder, builder(), max_iters, -1)
+}
+
+// ---------- SPR tactic ----------
+
+ruSubproofReplayTactic(
+	step_index : RuIndex<Pair<int,int>>,
+	max_size   : int,
+	attempts   : int,
+	math       : RuMath,
+	env        : RuEnv
+) -> RuProverTactic {
+	// SPR is allowed at most half the node budget so a following BFS phase
+	// always has room to run.  (The remaining budget is enforced by whoever
+	// composes the BFS phase after SPR.)
+	spr_max_size = max_size / 2;
 	pending_steps      : ref [RuProofStep] = ref [];
 	attempts_remaining : ref int           = ref attempts;
 
-	makeNextTactic = \tree -> {
-		if (ruTreeIsProved(tree)) None()
-		else if (length(^pending_steps) > 0) {
-			s = (^pending_steps)[0];
-			pending_steps := tail(^pending_steps);
-			Some(ruFollowProofTactic(s))
-		} else if (^attempts_remaining > 0) {
-			attempts_remaining := ^attempts_remaining - 1;
-			switch (ruSprDeepestLeaf(tree.leafs)) {
-				None(): None()
-				Some(leaf): {
-					steps = ruStepsForLeaf(leaf, step_index, attempts, math, env);
-					if (steps == []) None()
-					else {
-						pending_steps := tail(steps);
-						Some(ruFollowProofTactic(steps[0]))
+	RuProverTactic("subproof-replay",
+		\tree ->
+			if (length(^(tree.proofs)) > 0) RuTacticDone()
+			else if (length(^pending_steps) > 0) {
+				s = (^pending_steps)[0];
+				pending_steps := tail(^pending_steps);
+				RuTacticSwitch(ruBoundedFollowProofTactic(s, spr_max_size))
+			} else if (^attempts_remaining <= 0) RuTacticDone()
+			else {
+				// Scan leaves deepest-first; skip any that yield no corpus match.
+				leaves = sortCustom(getTreeValues(tree.leafs), \leaf -> ruSprPropDepth(leaf), false);
+				found : Maybe<RuProofStep> = fold(leaves, None(), \acc, leaf ->
+					switch (acc) {
+						Some(__): acc;
+						None(): if (^attempts_remaining <= 0) acc else {
+							attempts_remaining := ^attempts_remaining - 1;
+							steps = ruStepsForLeaf(leaf, step_index, attempts, math, env);
+							if (steps != []) {
+								pending_steps := tail(steps);
+								Some(steps[0])
+							} else None()
+						}
 					}
+				);
+				switch (found) {
+					Some(first_step): RuTacticSwitch(ruBoundedFollowProofTactic(first_step, spr_max_size));
+					None(): { attempts_remaining := 0; RuTacticDone() }
 				}
 			}
-		} else None()
-	};
-
-	RuProverStrategy("subproof-replay",
-		\ -> RuProverTactic("spr-init", \__ -> [], \__ -> true),
-		makeNextTactic
 	)
+}
+
+// ---------- Combined ----------
+
+ruCombinedStrategy(
+	step_index : RuIndex<Pair<int,int>>,
+	unif_rank  : int,
+	max_depth  : int,
+	max_size   : int,
+	attempts   : int,
+	max_iters  : int,
+	math       : RuMath,
+	env        : RuEnv
+) -> RuProverTactic {
+	body_builder = \ -> ruSequenceTactic([
+		ruSubproofReplayTactic(step_index, max_size, attempts, math, env),
+		ruBoundedBFSTactic(max_depth, max_size)
+	]);
+	loop = ruLoopWhileProgressTactic(body_builder, max_iters);
+	if (unif_rank > 0)
+		// One-shot phase 0: tiny-budget unif-quality pass for theorems provable
+		// in 1-2 steps; then the SPR+BFS loop on whatever's left.
+		ruSequenceTactic([
+			ruUnifQualityTactic(unif_rank, 2, 32),
+			loop
+		])
+	else loop
 }

@@ -23,26 +23,30 @@ export {
 }
 
 ruBreadthFirstTactic = RuProverTactic("breadth-first-search",
-	\tree -> getTreeValues(tree.leafs),
-	\tree -> length(^(tree.proofs)) > 0
+	\tree ->
+		if (length(^(tree.proofs)) > 0) RuTacticDone()
+		else RuTacticExpand(getTreeValues(tree.leafs))
 );
 
-ruGiveupTactic = RuProverTactic("giveup",
-	\tree -> [],
-	\tree -> true
-);
+ruGiveupTactic = ruDoneTactic;
 
 ruBoundedBFSTactic(max_depth : int, max_size : int) -> RuProverTactic {
 	RuProverTactic("bounded-bfs",
-		\tree -> getTreeValues(tree.leafs),
-		\tree -> ruProverTreeDepth(tree) > max_depth || ruProverTreeSize(tree) > max_size || length(^(tree.proofs)) > 0
+		\tree ->
+			if (length(^(tree.proofs)) > 0
+				|| ruProverTreeDepth(tree) > max_depth
+				|| ruProverTreeSize(tree) > max_size) RuTacticDone()
+			else RuTacticExpand(getTreeValues(tree.leafs))
 	);
 }
 
 ruTopNBFSTactic(n : int, max_depth : int, max_size : int) -> RuProverTactic {
 	RuProverTactic("bfs-top-" + i2s(n),
-		\tree -> take(getTreeValues(tree.leafs), n),
-		\tree -> ruProverTreeDepth(tree) > max_depth || ruProverTreeSize(tree) > max_size || length(^(tree.proofs)) > 0
+		\tree ->
+			if (length(^(tree.proofs)) > 0
+				|| ruProverTreeDepth(tree) > max_depth
+				|| ruProverTreeSize(tree) > max_size) RuTacticDone()
+			else RuTacticExpand(take(getTreeValues(tree.leafs), n))
 	);
 }
 
@@ -59,7 +63,7 @@ ruPlbDepthFromAncestor(prop : RuProverProp, ancestor_id : int) -> int {
 
 ruPerLeafBFSTactic(target_id : int, max_depth : int, max_size : int) -> RuProverTactic {
 	// Track nodes added since this tactic started using a counter updated only
-	// in expand (called once per BFS round), so finished stays O(1).
+	// in the step body (called once per BFS round).
 	nodes_added : ref int = ref 0;
 	last_size   : ref int = ref (-1);
 	RuProverTactic("per-leaf-bfs-" + i2s(target_id),
@@ -67,12 +71,12 @@ ruPerLeafBFSTactic(target_id : int, max_depth : int, max_size : int) -> RuProver
 			sz = sizeTree(tree.nodes);
 			if (^last_size >= 0) nodes_added := ^nodes_added + (sz - ^last_size);
 			last_size := sz;
-			filter(getTreeValues(tree.leafs), \lf -> {
+			if (length(^(tree.proofs)) > 0 || ^nodes_added > max_size) RuTacticDone()
+			else RuTacticExpand(filter(getTreeValues(tree.leafs), \lf -> {
 				d = ruPlbDepthFromAncestor(lf, target_id);
 				d >= 0 && d < max_depth
-			})
-		},
-		\tree -> ^nodes_added > max_size || length(^(tree.proofs)) > 0
+			}))
+		}
 	)
 }
 
@@ -84,19 +88,22 @@ ruIndexGuidedBFSTactic(indexed_asserts : Set<int>, target_id : int, max_depth : 
 			sz = sizeTree(tree.nodes);
 			if (^last_size >= 0) nodes_added := ^nodes_added + (sz - ^last_size);
 			last_size := sz;
-			filter(getTreeValues(tree.leafs), \lf -> {
+			if (length(^(tree.proofs)) > 0 || ^nodes_added > max_size) RuTacticDone()
+			else RuTacticExpand(filter(getTreeValues(tree.leafs), \lf -> {
 				d = ruPlbDepthFromAncestor(lf, target_id);
 				d >= 0 && d < max_depth && containsSet(indexed_asserts, lf.assertion.info.id)
-			})
-		},
-		\tree -> ^nodes_added > max_size || length(^(tree.proofs)) > 0
+			}))
+		}
 	)
 }
 
 ruUnifQualityTactic(n : int, max_depth : int, max_size : int) -> RuProverTactic {
 	RuProverTactic("unif-quality-bfs-" + i2s(n),
-		\tree -> take(getTreeValues(tree.leafs), n),
-		\tree -> ruProverTreeDepth(tree) > max_depth || ruProverTreeSize(tree) > max_size || length(^(tree.proofs)) > 0
+		\tree ->
+			if (length(^(tree.proofs)) > 0
+				|| ruProverTreeDepth(tree) > max_depth
+				|| ruProverTreeSize(tree) > max_size) RuTacticDone()
+			else RuTacticExpand(take(getTreeValues(tree.leafs), n))
 	)
 }
 
@@ -104,17 +111,24 @@ ruLimitTactic(tactic : RuProverTactic, time_limit : double, applied_limit : int,
 	applied = ref 0;
 	produced = ref 0;
 	timer = ruMakeLimitedTimer(time_limit);
-	RuProverTactic("limits: ",
+	RuProverTactic("limit(" + tactic.description + ")",
 		\tree -> {
-			applied := ^applied + 1;
-			expanded = tactic.expand(tree);
-			produced := ^produced + length(expanded);
-			expanded;
-		},
-		\tree ->
-			(time_limit > 0.0 && ruTimeIsOver(timer)) ||
-			(applied_limit > 0 && ^applied > applied_limit) ||
-			(produced_limit > 0 && ^produced > produced_limit) ||
-			tactic.finished(tree)
+			over_time_or_count =
+				(time_limit > 0.0 && ruTimeIsOver(timer)) ||
+				(applied_limit > 0 && ^applied > applied_limit) ||
+				(produced_limit > 0 && ^produced > produced_limit);
+			if (over_time_or_count) RuTacticDone()
+			else {
+				applied := ^applied + 1;
+				switch (tactic.step(tree)) {
+					RuTacticDone(): RuTacticDone();
+					RuTacticSwitch(next): RuTacticSwitch(ruLimitTactic(next, time_limit, applied_limit, produced_limit));
+					RuTacticExpand(leafs): {
+						produced := ^produced + length(leafs);
+						RuTacticExpand(leafs);
+					}
+				}
+			}
+		}
 	);
 }

@@ -1,13 +1,15 @@
 import ru/prover/core/env;
 import ru/prover/core/tactics/breadth_first;
 import ru/prover/core/tactics/follow_proof;
+import ru/prover/core/strategies/subproof_replay;
 import ru/unify/index;
 
 export {
-	// Strategy that replays proof fragments from other theorems to guide proof search.
-	// On each attempt, selects the deepest open leaf, finds all fragments whose root
-	// expression unifies with that leaf's goal, and tries them one by one via
-	// ruFollowProofTactic. After all attempts, falls back to bounded BFS.
+	// Tactic that replays proof fragments from other theorems to guide proof
+	// search.  On each step, picks the deepest open leaf, finds fragments
+	// whose root expression unifies with that leaf's goal, and tries them via
+	// ruFollowProofTactic.  After `attempts` are exhausted, hands off to a
+	// bounded BFS via the standard sequence combinator.
 	ruFragmentReplayStrategy(
 		frag_pair  : Pair<RuIndex<RuAssertion>, Tree<int, RuProofFragment>>,
 		max_depth  : int,
@@ -15,7 +17,7 @@ export {
 		attempts   : int,
 		math       : RuMath,
 		env        : RuEnv
-	) -> RuProverStrategy;
+	) -> RuProverTactic;
 }
 
 ruFrsPropDepth(prop : RuProverProp) -> int {
@@ -23,14 +25,6 @@ ruFrsPropDepth(prop : RuProverProp) -> int {
 		RuProverRoot(__,__,__): 1;
 		RuProverExp(__,__,__,__,grand): 1 + ruFrsPropDepth(grand);
 	}
-}
-
-ruFrsDeepestLeaf(leafs : Tree<int, RuProverProp>) -> Maybe<RuProverProp> {
-	leaves = getTreeValues(leafs);
-	if (leaves == []) None()
-	else Some(fold(tail(leaves), leaves[0], \acc, leaf ->
-		if (ruFrsPropDepth(leaf) >= ruFrsPropDepth(acc)) leaf else acc
-	))
 }
 
 ruFrsFragsForLeaf(
@@ -52,6 +46,46 @@ ruFrsFragsForLeaf(
 	)
 }
 
+ruFragmentReplayBody(
+	frag_pair  : Pair<RuIndex<RuAssertion>, Tree<int, RuProofFragment>>,
+	max_size   : int,
+	attempts   : int,
+	math       : RuMath,
+	env        : RuEnv
+) -> RuProverTactic {
+	pending_frags      : ref [RuProofStep] = ref [];
+	attempts_remaining : ref int           = ref attempts;
+
+	RuProverTactic("fragment-replay",
+		\tree ->
+			if (length(^(tree.proofs)) > 0) RuTacticDone()
+			else if (length(^pending_frags) > 0) {
+				f = (^pending_frags)[0];
+				pending_frags := tail(^pending_frags);
+				RuTacticSwitch(ruBoundedFollowProofTactic(f, max_size))
+			} else if (^attempts_remaining <= 0) RuTacticDone()
+			else {
+				attempts_remaining := ^attempts_remaining - 1;
+				leaves = getTreeValues(tree.leafs);
+				deepest = if (leaves == []) None()
+					else Some(fold(tail(leaves), leaves[0], \acc, leaf ->
+						if (ruFrsPropDepth(leaf) >= ruFrsPropDepth(acc)) leaf else acc
+					));
+				switch (deepest) {
+					None(): RuTacticDone();
+					Some(leaf): {
+						frags = ruFrsFragsForLeaf(leaf, frag_pair, math, env);
+						if (frags == []) RuTacticDone()
+						else {
+							pending_frags := tail(frags);
+							RuTacticSwitch(ruBoundedFollowProofTactic(frags[0], max_size))
+						}
+					}
+				}
+			}
+	)
+}
+
 ruFragmentReplayStrategy(
 	frag_pair  : Pair<RuIndex<RuAssertion>, Tree<int, RuProofFragment>>,
 	max_depth  : int,
@@ -59,43 +93,9 @@ ruFragmentReplayStrategy(
 	attempts   : int,
 	math       : RuMath,
 	env        : RuEnv
-) -> RuProverStrategy {
-	pending_frags      : ref [RuProofStep] = ref [];
-	attempts_remaining : ref int           = ref attempts;
-	bfs_done           : ref bool          = ref false;
-
-	makeNextTactic = \tree -> {
-		if (ruTreeIsProved(tree) || ^bfs_done) None()
-		else if (length(^pending_frags) > 0) {
-			f = (^pending_frags)[0];
-			pending_frags := tail(^pending_frags);
-			Some(ruFollowProofTactic(f))
-		} else if (^attempts_remaining <= 0) {
-			bfs_done := true;
-			Some(ruBoundedBFSTactic(max_depth, max_size))
-		} else {
-			attempts_remaining := ^attempts_remaining - 1;
-			switch (ruFrsDeepestLeaf(tree.leafs)) {
-				None(): {
-					bfs_done := true;
-					Some(ruBoundedBFSTactic(max_depth, max_size))
-				}
-				Some(leaf): {
-					frags = ruFrsFragsForLeaf(leaf, frag_pair, math, env);
-					if (frags == []) {
-						bfs_done := true;
-						Some(ruBoundedBFSTactic(max_depth, max_size))
-					} else {
-						pending_frags := tail(frags);
-						Some(ruFollowProofTactic(frags[0]))
-					}
-				}
-			}
-		}
-	};
-
-	RuProverStrategy("fragment-replay",
-		\ -> RuProverTactic("frs-init", \__ -> [], \__ -> true),
-		makeNextTactic
-	)
+) -> RuProverTactic {
+	ruSequenceTactic([
+		ruFragmentReplayBody(frag_pair, max_size, attempts, math, env),
+		ruBoundedBFSTactic(max_depth, max_size)
+	])
 }

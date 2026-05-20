@@ -18,13 +18,13 @@ export {
 
 ruInitProver(
 	task : RuProverTask,
-	math : RuMath, 
-	env : RuEnv, 
-	asses : RuIndex<RuAssertion>, 
+	math : RuMath,
+	env : RuEnv,
+	asses : RuIndex<RuAssertion>,
 	ms_time_limit : double
 ) -> RuProverEnv {
 	prover_env = ruInitProverEnv(task, math, env, asses, ms_time_limit);
-	prover_env.tactic := Some(prover_env.conf.task.strategy.initTactic());
+	prover_env.tactic := Some(prover_env.conf.task.tactic);
 	ruExpandHyp(prover_env.tree.root, prover_env);
 }
 
@@ -32,9 +32,9 @@ ruProveProp(prop : RuProverProp, prover_env : RuProverEnv) -> RuProverEnv {
 	t1 = ruMakeTimer();
 	env1 = ruExpandProp(prop, prover_env);
 	if (ruOptsString(prover_env.env.conf.opts, "reprove-stats", "") == "1") {
-		ruAddStats("ruExpandProp", RuStatsRow("expanding " + id2s(prop.assertion.info.id), 
+		ruAddStats("ruExpandProp", RuStatsRow("expanding " + id2s(prop.assertion.info.id),
 			pairs2tree([
-				Pair("time", ruTimePassed(t1)), 
+				Pair("time", ruTimePassed(t1)),
 				Pair("count", 1.0)
 			])
 		));
@@ -42,9 +42,9 @@ ruProveProp(prop : RuProverProp, prover_env : RuProverEnv) -> RuProverEnv {
 	t2 = ruMakeTimer();
 	ruBuildPropProofs(prop, prop.proofs, env1);
 	if (ruOptsString(prover_env.env.conf.opts, "reprove-stats", "") == "1") {
-		ruAddStats("ruBuildPropProofs", RuStatsRow("building proofs for " + id2s(prop.assertion.info.id), 
+		ruAddStats("ruBuildPropProofs", RuStatsRow("building proofs for " + id2s(prop.assertion.info.id),
 			pairs2tree([
-				Pair("time", ruTimePassed(t2)), 
+				Pair("time", ruTimePassed(t2)),
 				Pair("count", 1.0)
 			])
 		));
@@ -52,114 +52,99 @@ ruProveProp(prop : RuProverProp, prover_env : RuProverEnv) -> RuProverEnv {
 	env1;
 }
 
-//counter = ref 0;
-
-ruProve(prover_env : RuProverEnv) -> RuProverEnv {
+// Pulls the next batch of leafs to expand from the current tactic, applying
+// the tactic's step protocol: Done terminates, Switch swaps the tactic and
+// retries, Expand returns the leafs.  Returns Pair(updated env, leafs).
+// If leafs is [] the caller should treat the env's tactic as None and stop.
+ruRunTacticStep(prover_env : RuProverEnv) -> Pair<RuProverEnv, [RuProverProp]> {
 	switch (^(prover_env.tactic)) {
 		Some(tactic): {
-			to_expand0 = filtermap(^(prover_env.toExpand), \ind -> 
-				lookupTree(prover_env.tree.leafs, ind)
-			);
-			prover_env.toExpand := [];
-			to_expand = if (length(to_expand0) > 0) {
-				to_expand0;
-			} else {
-				tactic.expand(prover_env.tree);
-			}
-			/*if (^counter % 10000 == 0) {
-				print ln(i2s(^counter) + " to expand: " + i2s(length(to_expand)) + " = " +
-					strGlue(map(to_expand, \n -> id2s(n.assertion.info.id)), ", ")
-				);
-			}
-			counter := ^counter + 1;
-			if (^counter == 10000) {
-				quit(0);
-			}*/
-			if (to_expand == [] || tactic.finished(prover_env.tree)) {
-				prover_env.tactic := prover_env.conf.task.strategy.nextTactic(prover_env.tree);
-				ruProve(prover_env);
-			} else {
-				to_expand_removed = fold(to_expand, prover_env.tree.leafs, \acc, prop -> 
-					removeFromTree(acc, prop.id)
-				);
-				env1 = RuProverEnv(prover_env with 
-					tree = RuProverTree(prover_env.tree with 
-						leafs = to_expand_removed
-					)
-				);
-				env1_expanded = ruConcurrent(
-				//env1_expanded = ruSequential(
-					map(to_expand, 
-						\prop -> \env2 -> 
-							if (tactic.finished(env1.tree)) env1 else
-							ruProveProp(prop, RuProverEnv(env1 with env = env2))
-					), 
-					env1.env
-				);
-				new_env = fold(env1_expanded, env1, \acc, e -> 
-					RuProverEnv(acc with 
-						tree = RuProverTree(acc.tree with 
-							leafs = mergeTree(acc.tree.leafs, e.tree.leafs), 
-							nodes = mergeTree(acc.tree.nodes, e.tree.leafs)
-						)
-					)
-				);
-				/*if (tactic.finished(new_env.tree)) {
-					if (prover_env.conf.task.strategy.finished(new_env.tree)) {
-						new_env;
-					} else {
-						prover_env.tactic := prover_env.conf.task.strategy.nextTactic(prover_env.tree);
-						ruProve(new_env);
-					}
-				} else {
-					ruProve(new_env);
-				}*/
-				ruProve(new_env);
+			switch (tactic.step(prover_env.tree)) {
+				RuTacticDone(): {
+					prover_env.tactic := None();
+					Pair(prover_env, []);
+				}
+				RuTacticSwitch(next): {
+					prover_env.tactic := Some(next);
+					ruRunTacticStep(prover_env);
+				}
+				RuTacticExpand(leafs): Pair(prover_env, leafs);
 			}
 		}
-		None(): {
-			//print ln("tactic is None");
-			prover_env;
-		}
+		None(): Pair(prover_env, []);
+	}
+}
+
+ruProve(prover_env : RuProverEnv) -> RuProverEnv {
+	to_expand0 = filtermap(^(prover_env.toExpand), \ind ->
+		lookupTree(prover_env.tree.leafs, ind)
+	);
+	prover_env.toExpand := [];
+	to_expand_and_env =
+		if (length(to_expand0) > 0) Pair(prover_env, to_expand0)
+		else ruRunTacticStep(prover_env);
+	env_after_step = to_expand_and_env.first;
+	to_expand = to_expand_and_env.second;
+	if (to_expand == []) env_after_step
+	else {
+		to_expand_removed = fold(to_expand, env_after_step.tree.leafs, \acc, prop ->
+			removeFromTree(acc, prop.id)
+		);
+		env1 = RuProverEnv(env_after_step with
+			tree = RuProverTree(env_after_step.tree with leafs = to_expand_removed)
+		);
+		env1_expanded = ruConcurrent(
+			map(to_expand, \prop -> \env2 ->
+				if (isNone(^(env1.tactic))) env1
+				else ruProveProp(prop, RuProverEnv(env1 with env = env2))
+			),
+			env1.env
+		);
+		new_env = fold(env1_expanded, env1, \acc, e ->
+			RuProverEnv(acc with
+				tree = RuProverTree(acc.tree with
+					leafs = mergeTree(acc.tree.leafs, e.tree.leafs),
+					nodes = mergeTree(acc.tree.nodes, e.tree.leafs)
+				)
+			)
+		);
+		ruProve(new_env);
 	}
 }
 
 ruProveSequential(prover_env : RuProverEnv) -> RuProverEnv {
-	switch (^(prover_env.tactic)) {
-		Some(tactic): {
-			to_expand0 = filtermap(^(prover_env.toExpand), \ind ->
-				lookupTree(prover_env.tree.leafs, ind)
-			);
-			prover_env.toExpand := [];
-			to_expand = if (length(to_expand0) > 0) to_expand0 else tactic.expand(prover_env.tree);
-			if (to_expand == [] || tactic.finished(prover_env.tree)) {
-				prover_env.tactic := prover_env.conf.task.strategy.nextTactic(prover_env.tree);
-				ruProveSequential(prover_env);
-			} else {
-				to_expand_removed = fold(to_expand, prover_env.tree.leafs, \acc, prop ->
-					removeFromTree(acc, prop.id)
-				);
-				env1 = RuProverEnv(prover_env with
-					tree = RuProverTree(prover_env.tree with leafs = to_expand_removed)
-				);
-				env1_expanded = ruSequential(
-					map(to_expand, \prop -> \env2 ->
-						if (tactic.finished(env1.tree)) env1
-						else ruProveProp(prop, RuProverEnv(env1 with env = env2))
-					),
-					env1.env
-				);
-				new_env = fold(env1_expanded, env1, \acc, e ->
-					RuProverEnv(acc with
-						tree = RuProverTree(acc.tree with
-							leafs = mergeTree(acc.tree.leafs, e.tree.leafs),
-							nodes = mergeTree(acc.tree.nodes, e.tree.leafs)
-						)
-					)
-				);
-				ruProveSequential(new_env);
-			}
-		}
-		None(): prover_env;
+	to_expand0 = filtermap(^(prover_env.toExpand), \ind ->
+		lookupTree(prover_env.tree.leafs, ind)
+	);
+	prover_env.toExpand := [];
+	to_expand_and_env =
+		if (length(to_expand0) > 0) Pair(prover_env, to_expand0)
+		else ruRunTacticStep(prover_env);
+	env_after_step = to_expand_and_env.first;
+	to_expand = to_expand_and_env.second;
+	if (to_expand == []) env_after_step
+	else {
+		to_expand_removed = fold(to_expand, env_after_step.tree.leafs, \acc, prop ->
+			removeFromTree(acc, prop.id)
+		);
+		env1 = RuProverEnv(env_after_step with
+			tree = RuProverTree(env_after_step.tree with leafs = to_expand_removed)
+		);
+		env1_expanded = ruSequential(
+			map(to_expand, \prop -> \env2 ->
+				if (isNone(^(env1.tactic))) env1
+				else ruProveProp(prop, RuProverEnv(env1 with env = env2))
+			),
+			env1.env
+		);
+		new_env = fold(env1_expanded, env1, \acc, e ->
+			RuProverEnv(acc with
+				tree = RuProverTree(acc.tree with
+					leafs = mergeTree(acc.tree.leafs, e.tree.leafs),
+					nodes = mergeTree(acc.tree.nodes, e.tree.leafs)
+				)
+			)
+		);
+		ruProveSequential(new_env);
 	}
 }
