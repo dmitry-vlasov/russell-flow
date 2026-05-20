@@ -1,11 +1,15 @@
+import ru/prover/core/env;
 import ru/prover/core/strategies/subproof_replay;
 import ru/prover/core/strategies/fragment_replay;
 import ru/prover/core/strategies/combined;
 import ru/prover/core/tactics/breadth_first;
 import ru/prover/core/tactics/combinators;
+import ru/prover/core/tactics/follow_proof;
+import ru/prover/core/tactics/linear_guided;
 import ru/prover/ml/premise_selector;
 import ru/unify/index;
 import ru/verify/math;
+import ru/proof_tree;
 
 export {
 	// Context passed to atomic-tactic builders that need access to the math
@@ -19,6 +23,16 @@ export {
 		frag_pair  : Maybe<Pair<RuIndex<RuAssertion>, Tree<int, RuProofFragment>>>,
 		selector   : Maybe<RuMlSelector>
 	);
+
+	// The DSL produces a "tactic builder": a closure invoked once the
+	// prover env exists, returning the actual tactic.  Most atoms ignore
+	// the env (use ruStaticTacticBuilder), but ones like linear-guided
+	// need penv.fns / penv.fragmentTrees populated by ruInitProverEnv.
+	//
+	// Engine flow: build env with a placeholder tactic, then immediately
+	// call builder.build(penv) and store the result in penv.tactic.
+	RuTacticBuilder(build : (RuProverEnv) -> RuProverTactic);
+	ruStaticTacticBuilder(t : RuProverTactic) -> RuTacticBuilder;
 
 	// Parsed AST node.  A tactic expression is a function call: a name and
 	// a list of arguments.  Arguments are either positional or named.
@@ -36,13 +50,15 @@ export {
 	// error returns None and prints a diagnostic to env.out.
 	ruParseTacticDsl(src : string, env : RuEnv) -> Maybe<RuTacticAst>;
 
-	// Build a concrete tactic from an AST.  On unknown atoms or bad args
+	// Build a tactic builder from an AST.  On unknown atoms or bad args
 	// returns None and prints a diagnostic.
-	ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuProverTactic>;
+	ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder>;
 
 	// Parse + build in one call.
-	ruParseAndBuildTactic(src : string, ctx : RuTacticContext) -> Maybe<RuProverTactic>;
+	ruParseAndBuildTactic(src : string, ctx : RuTacticContext) -> Maybe<RuTacticBuilder>;
 }
+
+ruStaticTacticBuilder(t : RuProverTactic) -> RuTacticBuilder { RuTacticBuilder(\__ -> t) }
 
 // ---------------- parser state ----------------
 
@@ -112,10 +128,8 @@ ruDslReadLiteral(st : RuDslState) -> string {
 	else {
 		start = ^(st.pos);
 		ruDslReadDigits(st);
-		// optional suffix
 		c2 = ruDslPeek(st);
 		if (c2 == 115 || c2 == 109 || c2 == 104) {
-			// 's' (115), 'm' (109) — m may be 'ms'; 'h' (104)
 			if (c2 == 109) {
 				ruDslAdvance(st);
 				c3 = ruDslPeek(st);
@@ -147,11 +161,11 @@ ruDslParseExpr(st : RuDslState) -> Maybe<RuTacticAst> {
 		None()
 	} else {
 		ruDslSkipWs(st);
-		if (ruDslPeek(st) == 40) {  // '('
+		if (ruDslPeek(st) == 40) {
 			ruDslAdvance(st);
 			args = ruDslParseArgList(st);
 			ruDslSkipWs(st);
-			if (ruDslPeek(st) == 41) {  // ')'
+			if (ruDslPeek(st) == 41) {
 				ruDslAdvance(st);
 				Some(RuTacticAst(name, args))
 			} else {
@@ -166,11 +180,11 @@ ruDslParseExpr(st : RuDslState) -> Maybe<RuTacticAst> {
 
 ruDslParseArgList(st : RuDslState) -> [RuTacticArg] {
 	ruDslSkipWs(st);
-	if (ruDslPeek(st) == 41 || ruDslPeek(st) == -1) []  // ')' or EOF
+	if (ruDslPeek(st) == 41 || ruDslPeek(st) == -1) []
 	else {
 		arg = ruDslParseArg(st);
 		ruDslSkipWs(st);
-		if (ruDslPeek(st) == 44) {  // ','
+		if (ruDslPeek(st) == 44) {
 			ruDslAdvance(st);
 			rest = ruDslParseArgList(st);
 			switch (arg) {
@@ -186,26 +200,20 @@ ruDslParseArgList(st : RuDslState) -> [RuTacticArg] {
 	}
 }
 
-// arg := IDENT '=' value | value
 ruDslParseArg(st : RuDslState) -> Maybe<RuTacticArg> {
 	ruDslSkipWs(st);
 	saved = ^(st.pos);
-	// Tentatively read an identifier; if followed by '=' it's a named arg,
-	// otherwise rewind and parse as a value (which may be a nested call).
 	c = ruDslPeek(st);
 	if (ruDslIsLetter(c)) {
 		name = ruDslReadIdent(st);
-		after_ident = ^(st.pos);
 		ruDslSkipWs(st);
-		if (ruDslPeek(st) == 61) {  // '='
+		if (ruDslPeek(st) == 61) {
 			ruDslAdvance(st);
 			switch (ruDslParseValue(st)) {
 				Some(v): Some(RuTacticArgNamed(name, v));
 				None(): None();
 			}
 		} else {
-			// Not a named arg — back up and parse as a value (handles bare
-			// ident, ident with args, etc).
 			st.pos := saved;
 			switch (ruDslParseValue(st)) {
 				Some(v): Some(RuTacticArgPos(v));
@@ -220,7 +228,6 @@ ruDslParseArg(st : RuDslState) -> Maybe<RuTacticArg> {
 	}
 }
 
-// value := numeric-literal | expr
 ruDslParseValue(st : RuDslState) -> Maybe<RuTacticVal> {
 	ruDslSkipWs(st);
 	c = ruDslPeek(st);
@@ -240,7 +247,6 @@ ruDslParseValue(st : RuDslState) -> Maybe<RuTacticVal> {
 }
 
 ruParseTacticDsl(src : string, env : RuEnv) -> Maybe<RuTacticAst> {
-	// Strip optional surrounding quotes carried in from the script DSL.
 	trimmed = if (strlen(src) >= 2 && getCharCodeAt(src, 0) == 34 && getCharCodeAt(src, strlen(src) - 1) == 34)
 		substring(src, 1, strlen(src) - 2)
 	else src;
@@ -263,7 +269,6 @@ ruParseTacticDsl(src : string, env : RuEnv) -> Maybe<RuTacticAst> {
 
 // ---------------- builder ----------------
 
-// Extract positional args (preserving order).
 ruDslPositional(ast : RuTacticAst) -> [RuTacticVal] {
 	filtermap(ast.args, \arg ->
 		switch (arg) {
@@ -273,7 +278,6 @@ ruDslPositional(ast : RuTacticAst) -> [RuTacticVal] {
 	)
 }
 
-// Look up a named arg, falling back to positional by index.
 ruDslGetArg(ast : RuTacticAst, name : string, pos_idx : int) -> Maybe<RuTacticVal> {
 	named = filtermap(ast.args, \arg ->
 		switch (arg) {
@@ -298,6 +302,16 @@ ruDslGetInt(ast : RuTacticAst, name : string, pos_idx : int, dflt : int) -> int 
 	}
 }
 
+ruDslGetString(ast : RuTacticAst, name : string, pos_idx : int, dflt : string) -> string {
+	switch (ruDslGetArg(ast, name, pos_idx)) {
+		Some(v): switch (v) {
+			RuTacticValAst(sub): sub.name;  // bare ident becomes a 0-arg ast — use its name as string
+			RuTacticValLit(s): s;
+		}
+		None(): dflt;
+	}
+}
+
 ruDslGetDuration(ast : RuTacticAst, name : string, pos_idx : int, dflt_ms : double) -> double {
 	switch (ruDslGetArg(ast, name, pos_idx)) {
 		Some(v): switch (v) {
@@ -308,7 +322,7 @@ ruDslGetDuration(ast : RuTacticAst, name : string, pos_idx : int, dflt_ms : doub
 	}
 }
 
-ruDslGetTactic(ast : RuTacticAst, pos_idx : int, ctx : RuTacticContext) -> Maybe<RuProverTactic> {
+ruDslGetTacticBuilder(ast : RuTacticAst, pos_idx : int, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
 	poss = ruDslPositional(ast);
 	if (pos_idx >= length(poss)) None()
 	else switch (poss[pos_idx]) {
@@ -320,9 +334,7 @@ ruDslGetTactic(ast : RuTacticAst, pos_idx : int, ctx : RuTacticContext) -> Maybe
 	}
 }
 
-// Build a list of tactics from positional args.  Returns None if any
-// child fails to build (already reported its own error).
-ruDslBuildTacticList(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<[RuProverTactic]> {
+ruDslBuildBuilderList(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<[RuTacticBuilder]> {
 	poss = ruDslPositional(ast);
 	results = map(poss, \v ->
 		switch (v) {
@@ -334,29 +346,31 @@ ruDslBuildTacticList(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<[RuProve
 		}
 	);
 	if (exists(results, isNone)) None()
-	else Some(map(results, \r -> switch (r) { Some(t): t; None(): ruDoneTactic; }))
+	else Some(map(results, \r -> switch (r) { Some(b): b; None(): ruStaticTacticBuilder(ruDoneTactic); }))
 }
 
-ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuProverTactic> {
+ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
 	n = ast.name;
-	if (n == "bfs")              Some(ruBreadthFirstTactic)
-	else if (n == "done")        Some(ruDoneTactic)
-	else if (n == "giveup")      Some(ruDoneTactic)
+	if (n == "bfs")              Some(ruStaticTacticBuilder(ruBreadthFirstTactic))
+	else if (n == "done")        Some(ruStaticTacticBuilder(ruDoneTactic))
+	else if (n == "giveup")      Some(ruStaticTacticBuilder(ruDoneTactic))
 	else if (n == "bounded-bfs") {
 		md = ruDslGetInt(ast, "max-depth", 0, 5);
 		ms = ruDslGetInt(ast, "max-size",  1, 4096);
-		Some(ruBoundedBFSTactic(md, ms));
+		Some(ruStaticTacticBuilder(ruBoundedBFSTactic(md, ms)));
 	}
 	else if (n == "top-n-bfs") {
 		nn = ruDslGetInt(ast, "n",         0, 10);
 		md = ruDslGetInt(ast, "max-depth", 1, 5);
 		ms = ruDslGetInt(ast, "max-size",  2, 4096);
-		Some(ruTopNBFSTactic(nn, md, ms));
+		Some(ruStaticTacticBuilder(ruTopNBFSTactic(nn, md, ms)));
 	}
 	else if (n == "unif-quality" || n == "uq") ruDslBuildUnifQuality(ast)
 	else if (n == "spr")             ruDslBuildSpr(ast, ctx)
 	else if (n == "fragment-replay") ruDslBuildFragReplay(ast, ctx)
 	else if (n == "ml")              ruDslBuildMl(ast, ctx)
+	else if (n == "linear-guided")   ruDslBuildLinearGuided(ast)
+	else if (n == "follow-proof")    ruDslBuildFollowProof(ast, ctx)
 	else if (n == "seq")             ruDslBuildSeq(ast, ctx)
 	else if (n == "loop")            ruDslBuildLoop(ast, ctx)
 	else if (n == "limited")         ruDslBuildLimited(ast, ctx)
@@ -366,59 +380,89 @@ ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuProver
 	}
 }
 
-ruDslBuildUnifQuality(ast : RuTacticAst) -> Maybe<RuProverTactic> {
+ruDslBuildUnifQuality(ast : RuTacticAst) -> Maybe<RuTacticBuilder> {
 	n  = ruDslGetInt(ast, "rank",      0, 10);
 	md = ruDslGetInt(ast, "max-depth", 1, 2);
 	ms = ruDslGetInt(ast, "max-size",  2, 32);
-	Some(ruUnifQualityTactic(n, md, ms))
+	Some(ruStaticTacticBuilder(ruUnifQualityTactic(n, md, ms)))
 }
 
-ruDslBuildSpr(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuProverTactic> {
+ruDslBuildSpr(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
 	switch (ctx.step_index) {
 		None(): { ctx.env.out.println("tactic DSL: spr needs step_index in context"); None() }
 		Some(idx): {
 			attempts = ruDslGetInt(ast, "attempts", 0, 3);
 			max_size = ruDslGetInt(ast, "max-size", 1, 4096);
-			Some(ruSubproofReplayTactic(idx, max_size, attempts, ctx.math, ctx.env));
+			Some(ruStaticTacticBuilder(ruSubproofReplayTactic(idx, max_size, attempts, ctx.math, ctx.env)));
 		}
 	}
 }
 
-ruDslBuildFragReplay(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuProverTactic> {
+ruDslBuildFragReplay(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
 	switch (ctx.frag_pair) {
 		None(): { ctx.env.out.println("tactic DSL: fragment-replay needs frag_pair in context (set fragment-depth > 0)"); None() }
 		Some(fp): {
 			max_depth = ruDslGetInt(ast, "max-depth", 0, 5);
 			max_size  = ruDslGetInt(ast, "max-size",  1, 4096);
 			attempts  = ruDslGetInt(ast, "attempts",  2, 3);
-			Some(ruFragmentReplayStrategy(fp, max_depth, max_size, attempts, ctx.math, ctx.env));
+			Some(ruStaticTacticBuilder(ruFragmentReplayStrategy(fp, max_depth, max_size, attempts, ctx.math, ctx.env)));
 		}
 	}
 }
 
-ruDslBuildMl(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuProverTactic> {
+ruDslBuildMl(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
 	switch (ctx.selector) {
 		None(): { ctx.env.out.println("tactic DSL: ml needs an ML selector in context (load-ml=1 or run learn-assertions first)"); None() }
 		Some(sel): {
 			top_k     = ruDslGetInt(ast, "top-k",     0, 5);
 			max_depth = ruDslGetInt(ast, "max-depth", 1, 7);
 			max_size  = ruDslGetInt(ast, "max-size",  2, 10000);
-			Some(ruMlTactic(sel, top_k, max_depth, max_size));
+			Some(ruStaticTacticBuilder(ruMlTactic(sel, top_k, max_depth, max_size)));
 		}
 	}
 }
 
-ruDslBuildSeq(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuProverTactic> {
-	switch (ruDslBuildTacticList(ast, ctx)) {
-		None(): None();
-		Some(ts): Some(ruSequenceTactic(ts));
+ruDslBuildLinearGuided(ast : RuTacticAst) -> Maybe<RuTacticBuilder> {
+	md = ruDslGetInt(ast, "max-depth", 0, 5);
+	ms = ruDslGetInt(ast, "max-size",  1, 4096);
+	// Deferred: needs the fully-built env for matchesPremise and fragmentTrees.
+	Some(RuTacticBuilder(\penv -> ruLinearGuidedTactic(md, ms, penv)))
+}
+
+ruDslBuildFollowProof(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+	// follow-proof(theorem-name) — looks up the named theorem and follows its
+	// QED step's sub-proof.  Useful for diagnostics ("can the engine replay
+	// X's existing proof?") rather than for routine proving.
+	switch (ruDslGetArg(ast, "theorem", 0)) {
+		None(): { ctx.env.out.println("tactic DSL: follow-proof needs a theorem name"); None() }
+		Some(v): {
+			name = switch (v) {
+				RuTacticValAst(sub): sub.name;
+				RuTacticValLit(s): s;
+			};
+			th_id = s2id_(name);
+			switch (lookupTree(ctx.math.decls.assertions, th_id)) {
+				None(): { ctx.env.out.println("tactic DSL: follow-proof: theorem '" + name + "' not found"); None() }
+				Some(ass): switch (ass) {
+					RuTheorem(__,__,__,__): {
+						proof_step = ruTheoremProofTree(ass, ctx.math);
+						Some(ruStaticTacticBuilder(ruFollowProofTactic(proof_step)));
+					}
+					default: { ctx.env.out.println("tactic DSL: follow-proof: '" + name + "' is not a theorem"); None() }
+				}
+			}
+		}
 	}
 }
 
-ruDslBuildLoop(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuProverTactic> {
-	// loop takes one positional tactic (the body) and an optional
-	// max-iters argument.  The body is rebuilt fresh on each iteration so
-	// state-carrying tactics (e.g. SPR) start over.
+ruDslBuildSeq(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+	switch (ruDslBuildBuilderList(ast, ctx)) {
+		None(): None();
+		Some(builders): Some(RuTacticBuilder(\penv -> ruSequenceTactic(map(builders, \b -> b.build(penv)))));
+	}
+}
+
+ruDslBuildLoop(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
 	max_iters = ruDslGetInt(ast, "max-iters", 1, 3);
 	poss = ruDslPositional(ast);
 	if (poss == []) {
@@ -426,11 +470,14 @@ ruDslBuildLoop(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuProverTactic
 		None()
 	} else switch (poss[0]) {
 		RuTacticValAst(body_ast): {
-			builder = \ -> switch (ruBuildTacticFromAst(body_ast, ctx)) {
-				Some(t): t;
-				None():  ruDoneTactic;
-			};
-			Some(ruLoopWhileProgressTactic(builder, max_iters));
+			Some(RuTacticBuilder(\penv -> {
+				// Fresh body each iteration so state-carrying tactics reset.
+				body_builder = \ -> switch (ruBuildTacticFromAst(body_ast, ctx)) {
+					Some(b): b.build(penv);
+					None():  ruDoneTactic;
+				};
+				ruLoopWhileProgressTactic(body_builder, max_iters)
+			}));
 		}
 		RuTacticValLit(s): {
 			ctx.env.out.println("tactic DSL: loop body must be a tactic, got literal: " + s);
@@ -439,19 +486,19 @@ ruDslBuildLoop(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuProverTactic
 	}
 }
 
-ruDslBuildLimited(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuProverTactic> {
-	switch (ruDslGetTactic(ast, 0, ctx)) {
+ruDslBuildLimited(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+	switch (ruDslGetTacticBuilder(ast, 0, ctx)) {
 		None(): None();
-		Some(inner): {
+		Some(inner_builder): {
 			time_ms  = ruDslGetDuration(ast, "time",     1, 0.0);
 			applied  = ruDslGetInt(ast,      "applied",  2, 0);
 			produced = ruDslGetInt(ast,      "produced", 3, 0);
-			Some(ruLimitedTactic(inner, time_ms, applied, produced));
+			Some(RuTacticBuilder(\penv -> ruLimitedTactic(inner_builder.build(penv), time_ms, applied, produced)));
 		}
 	}
 }
 
-ruParseAndBuildTactic(src : string, ctx : RuTacticContext) -> Maybe<RuProverTactic> {
+ruParseAndBuildTactic(src : string, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
 	switch (ruParseTacticDsl(src, ctx.env)) {
 		Some(ast): ruBuildTacticFromAst(ast, ctx);
 		None(): None();
