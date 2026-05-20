@@ -1,0 +1,159 @@
+import ru/prover/core/prove;
+import ru/prover/core/tactics/breadth_first;
+import ru/prover/core/tactic_dsl;
+import ru/prover/core/strategies/subproof_replay;
+import ru/prover/core/strategies/default;
+import ru/prover/core/stats;
+import ru/prover/core/fragment;
+import ru/prover/ml/premise_selector;
+import ru/map_decls;
+import comm;
+
+export {
+	// Options the wrapper supplies to ruRunReproveCore: whether to build
+	// the fragment index (cheap for depth=0), whether to load the ML
+	// selector (expensive — only when an ml atom is used), and a
+	// default-tactic builder for when the user did not supply `tactic="..."`.
+	RuReproveOptions(
+		cmd_name        : string,
+		need_step_index : bool,
+		need_frags      : bool,
+		need_ml         : bool,
+		default_tactic  : (RuTask, RuTacticContext) -> RuProverTactic
+	);
+
+	// Shared core for reprove-* commands.  Handles target lookup, index
+	// construction, optional ML/fragment loading, parsing the DSL `tactic`
+	// arg (overriding the default tactic when supplied), and the standard
+	// proved/failed accounting via ruMapFnComm.
+	ruRunReproveCore(unit : RuUnit, opts : RuReproveOptions) -> Maybe<RuState>;
+
+	// Common args shared by every reprove-* variant.  Wrappers extend with
+	// their own args.
+	ruReproveCoreArgs : [RuCommArg];
+}
+
+ruReproveCoreArgs = [
+	RuCommArg("target",         true, "the target: a theorem, file or all", "all"),
+	RuCommArg("max-depth",      true, "max proof tree depth",               "5"),
+	RuCommArg("max-size",       true, "max proof tree size",                "4096"),
+	RuCommArg("time-limit",     true, "per-theorem wall-clock limit (e.g. 60s, 5m)", "60s"),
+	RuCommArg("job-time-limit", true, "total wall-clock cap for the whole job (empty = n*time-limit/p)", ""),
+	RuCommArg("fragment-depth", true, "fragment extraction depth (>0 builds fragment index)", "0"),
+	RuCommArg("attempts",       true, "replay attempts (SPR/fragment-replay default)", "3"),
+	RuCommArg("tactic",         true, "tactic DSL expression that overrides the wrapper's default tactic", ""),
+];
+
+ruRunReproveCore(unit : RuUnit, opts : RuReproveOptions) -> Maybe<RuState> {
+	env   = ruUnitEnv(unit);
+	task  = unit.task;
+	state = unit.state;
+	conf  = state.conf;
+	math  = ruMathFromSources(state.ru, env);
+	target = ruDetermineTarget(task, math, env);
+	if (target == RuTargetNone()) {
+		env.out.println(opts.cmd_name + ": no target");
+		Some(state);
+	} else {
+		index          = ruMakeIndexForTarget(target, math, env);
+		max_frag_depth = ruTaskIntArg(task, "fragment-depth", 0);
+		frag_pair      = if (opts.need_frags || max_frag_depth > 0)
+			Some(ruBuildFragments(math, max_frag_depth, env))
+		else None();
+		step_index     = if (opts.need_step_index)
+			Some(ruBuildStepIndex(math, 3))
+		else None();
+		selector       = if (opts.need_ml) {
+			s = ruLoadMlSelector(conf);
+			if (sizeTree(s.features) == 0) {
+				env.out.println(opts.cmd_name + ": no ML models found, run learn-assertions first");
+				None()
+			} else Some(s)
+		} else None();
+
+		// Cancel here if ML was needed but not available.
+		if (opts.need_ml && selector == None()) Some(state)
+		else {
+			ctx = RuTacticContext(math, env, step_index, frag_pair, selector);
+			tactic_str = ruTaskStringArg(task, "tactic", "");
+			tactic = if (tactic_str != "") {
+				switch (ruParseAndBuildTactic(tactic_str, ctx)) {
+					Some(t): t;
+					None():  opts.default_tactic(task, ctx);
+				}
+			} else opts.default_tactic(task, ctx);
+
+			processed_count = ref 0;
+			reproved_count  = ref 0;
+			failed_theorems : ref [int] = ref [];
+			inc_reproved    = ruAtomicIntInc(reproved_count);
+			inc_processed   = ruAtomicIntInc(processed_count);
+			th_fail         = ruAtomicRefArrayPush(failed_theorems);
+
+			reprove_fn = \decl, time_limit, env1 -> {
+				th = cast(decl : RuDecl -> RuTheorem);
+				if (ruTheoremIsProved(th)) {
+					inc_processed(1);
+					if (ruVerbose(env1.conf) > 1) {
+						env1.out.println(i2s(^processed_count) + ": " + opts.cmd_name + " '" + id2s(th.info.id) + "' ...");
+					}
+					th_timer = ruMakeTimer();
+					prover_task = RuProverTask(th.info, tactic, id2s(th.info.id), task.args, th.infer.hyps, ruProofQedStep(th.proof));
+					penv0 = switch (frag_pair) {
+						Some(fp): ruInitProverEnvWithFrags(prover_task, math, env1, index, time_limit, fp);
+						None():   ruInitProverEnv(prover_task, math, env1, index, time_limit);
+					};
+					penv1 = ruExpandHyp(penv0.tree.root, penv0);
+					penv2 = ruProve(penv1);
+					if (length(^(penv2.tree.proofs)) > 0) {
+						inc_reproved(1);
+						if (ruVerbose(env1.conf) > 0) {
+							env1.out.println(i2s(^processed_count) + " '" + id2s(th.info.id) +
+								"' REPROVED in " + ruTimePassed2s(th_timer) +
+								", tree size: " + i2s(ruProverTreeSize(penv2.tree)));
+						}
+					} else {
+						th_fail(th.info.id);
+						if (ruVerbose(env1.conf) > 0) {
+							env1.out.println(i2s(^processed_count) + " '" + id2s(th.info.id) +
+								"' NOT reproved in " + ruTimePassed2s(th_timer));
+						}
+					}
+				}
+				RuMappedDecl(true, false, decl);
+			};
+
+			new_state = ruMapFnComm(
+				RuUnit(task, state, env.out),
+				RuMapFn(
+					RuMapFnInfo(
+						opts.cmd_name,
+						\decl -> ruTargetPredicate(target)(decl) && ruDeclIsTheorem(decl),
+						\__ -> 1.0,
+						\ -> "reproved: " + i2s(^reproved_count) + " theorems"
+					),
+					reprove_fn
+				)
+			);
+
+			if (ruVerbose(env.conf) > 0) {
+				env.out.println(opts.cmd_name + ": reproved " + i2s(^reproved_count) + " theorems");
+			}
+			if (length(^failed_theorems) > 0 && ruVerbose(env.conf) > 0) {
+				ids = if (length(^failed_theorems) <= 10)
+					strGlue(map(^failed_theorems, id2s), ", ")
+				else
+					strGlue(map(take(^failed_theorems, 10), id2s), ", ") + ", ...";
+				env.out.println(opts.cmd_name + ": not reproved: " + ids);
+			}
+
+			Some(RuState(new_state with
+				vars = setTree(new_state.vars, opts.cmd_name, pairs2tree([
+					Pair("reproved-count",  flow(^reproved_count)),
+					Pair("failed-count",    flow(length(^failed_theorems))),
+					Pair("failed-theorems", flow(map(^failed_theorems, id2s)))
+				]))
+			))
+		}
+	}
+}
