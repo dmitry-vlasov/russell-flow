@@ -1,0 +1,123 @@
+import ru/prover/core/controls;
+import ru/prover/core/tree;
+
+export {
+	// Sequence: runs tactics in order.  When the current one returns
+	// RuTacticDone, advances to the next.  When all are exhausted, terminates.
+	ruSequenceTactic(tactics : [RuProverTactic]) -> RuProverTactic;
+
+	// Iterate: on each step, call the driver.  None means terminate; Some(t)
+	// means "run t to completion, then come back and ask me again."  Driver
+	// state (typically in refs closed over by `driver`) is shared across
+	// iterations.
+	ruIterateTactic(driver : (RuProverTree) -> Maybe<RuProverTactic>) -> RuProverTactic;
+
+	// Loop-while-progress: each iteration, call `builder()` to get a fresh
+	// inner tactic and run it to completion.  If the tree grew, repeat — up
+	// to max_iters times.  Stops on no progress, exhaustion of iters, or
+	// when a proof is found.
+	ruLoopWhileProgressTactic(builder : () -> RuProverTactic, max_iters : int) -> RuProverTactic;
+
+	// Limit wrapper: terminates the inner tactic when any of the limits are
+	// exceeded (time in ms, applied = number of steps, produced = number of
+	// leafs emitted).  A limit of 0 disables that check.
+	ruLimitedTactic(
+		inner          : RuProverTactic,
+		time_limit     : double,
+		applied_limit  : int,
+		produced_limit : int
+	) -> RuProverTactic;
+}
+
+ruSequenceTactic(tactics : [RuProverTactic]) -> RuProverTactic {
+	if (tactics == []) ruDoneTactic
+	else RuProverTactic("seq[" + tactics[0].description + "]",
+		\tree ->
+			if (length(^(tree.proofs)) > 0) RuTacticDone()
+			else switch (tactics[0].step(tree)) {
+				RuTacticExpand(leafs): RuTacticExpand(leafs);
+				RuTacticSwitch(next): RuTacticSwitch(ruSequenceTactic(concat([next], tail(tactics))));
+				RuTacticDone(): {
+					rest = tail(tactics);
+					if (rest == []) RuTacticDone()
+					else RuTacticSwitch(ruSequenceTactic(rest))
+				}
+			},
+		// Delegate per-prop check to the active sub-tactic.
+		tactics[0].keep_expanding
+	)
+}
+
+ruIterateTactic(driver : (RuProverTree) -> Maybe<RuProverTactic>) -> RuProverTactic {
+	RuProverTactic("iterate",
+		\tree ->
+			if (length(^(tree.proofs)) > 0) RuTacticDone()
+			else switch (driver(tree)) {
+				None(): RuTacticDone();
+				Some(body): RuTacticSwitch(ruSequenceTactic([body, ruIterateTactic(driver)]));
+			},
+		// Iterate itself only stops on proved; the body's own keep_expanding
+		// kicks in once we Switch into it.
+		ruTreeNotProved
+	)
+}
+
+ruLoopHelper(
+	builder    : () -> RuProverTactic,
+	current    : RuProverTactic,
+	iters_left : int,
+	prev_size  : int
+) -> RuProverTactic {
+	RuProverTactic("loop[" + i2s(iters_left) + "/" + current.description + "]",
+		\tree ->
+			if (length(^(tree.proofs)) > 0) RuTacticDone()
+			else switch (current.step(tree)) {
+				RuTacticExpand(leafs): RuTacticExpand(leafs);
+				RuTacticSwitch(next): RuTacticSwitch(ruLoopHelper(builder, next, iters_left, prev_size));
+				RuTacticDone(): {
+					cur_size = sizeTree(tree.nodes);
+					if (iters_left > 1 && cur_size > prev_size)
+						RuTacticSwitch(ruLoopHelper(builder, builder(), iters_left - 1, cur_size))
+					else RuTacticDone()
+				}
+			},
+		current.keep_expanding
+	)
+}
+
+ruLoopWhileProgressTactic(builder : () -> RuProverTactic, max_iters : int) -> RuProverTactic {
+	if (max_iters <= 0) ruDoneTactic
+	else ruLoopHelper(builder, builder(), max_iters, -1)
+}
+
+ruLimitedTactic(
+	inner          : RuProverTactic,
+	time_limit     : double,
+	applied_limit  : int,
+	produced_limit : int
+) -> RuProverTactic {
+	applied  : ref int = ref 0;
+	produced : ref int = ref 0;
+	timer = ruMakeLimitedTimer(time_limit);
+	over_limit = \ ->
+		(time_limit > 0.0 && ruTimeIsOver(timer)) ||
+		(applied_limit > 0 && ^applied > applied_limit) ||
+		(produced_limit > 0 && ^produced > produced_limit);
+	RuProverTactic("limited(" + inner.description + ")",
+		\tree -> {
+			if (over_limit()) RuTacticDone()
+			else {
+				applied := ^applied + 1;
+				switch (inner.step(tree)) {
+					RuTacticDone(): RuTacticDone();
+					RuTacticSwitch(next): RuTacticSwitch(ruLimitedTactic(next, time_limit, applied_limit, produced_limit));
+					RuTacticExpand(leafs): {
+						produced := ^produced + length(leafs);
+						RuTacticExpand(leafs);
+					}
+				}
+			}
+		},
+		\tree -> !over_limit() && inner.keep_expanding(tree)
+	);
+}
