@@ -1,7 +1,8 @@
 import ru/benchmark/coverage;
 import ru/prover/core/prove;
-import ru/prover/tactics/breadth_first;
 import ru/prover/tactics/subproof_replay;
+import ru/prover/tactics/combined;
+import ru/prover/tactics/dsl;
 import ru/map_decls;
 import ru/util/target;
 import ru/util/exp2s;
@@ -15,64 +16,37 @@ export {
 	ruStmtFeatures(stmt : RuStmt, lang : RuLang) -> [Pair<string, Json>];
 	ruCollectColoredExamples(colored : [RuColoredCoverage], theorem : string, parent : string, depth : int, lang : RuLang) -> [Json];
 
-	// Node color: GREEN = initial-alignment interior (all GREEN children), YELLOW = frontier, RED = uncovered.
-	// Color is sticky: once yellow or red, never upgraded to green by later tactic passes.
-	RuNodeColor ::= RuGreen, RuYellowReplay, RuYellowBfs, RuRed;
-		RuGreen();        // covered initially AND all direct children are also GREEN (pure interior)
-		RuYellowReplay(); // covered initially but at the frontier, OR covered by a later replay pass
-		RuYellowBfs();    // covered by a BFS pass (always frontier by definition)
-		RuRed();          // never covered by any tactic
-
+	// One node of the original proof tree after a single DSL-tactic reproval.
+	// `color` is the tag of the DSL atom that covered this step ("" = covered
+	// by no tactic, i.e. red).
 	RuColoredCoverage(
 		assertion : int,
 		stmt      : RuStmt,
-		color     : RuNodeColor,
+		color     : string,
 		children  : [RuColoredCoverage]
 	);
 
-	RuCoverageIterResult(
-		green         : int,
-		yellow_replay : int,
-		yellow_bfs    : int,
-		red           : int,
-		proved        : bool,
-		iters         : int,       // number of completed outer iterations
-		colored       : [RuColoredCoverage]
-	);
-
-	ruReproveCoverageTheorem(
-		th          : RuTheorem,
-		args        : Tree<string, flow>,
-		index       : RuIndex<RuAssertion>,
-		time_limit  : double,
-		max_depth   : int,
-		max_size    : int,
-		attempts    : int,
-		max_iters   : int,
-		bfs_depth   : int,
-		bfs_size    : int,
-		math        : RuMath,
-		env         : RuEnv,
-		step_index  : RuIndex<Pair<int,int>>
-	) -> RuCoverageIterResult;
+	// Flatten a RuProofCoverage tree into nested RuColoredCoverage, dropping
+	// hypothesis leaves (they are always reachable and not proof steps).
+	ruColorCoverage(cov : RuProofCoverage) -> [RuColoredCoverage];
 }
 
 ruCommReproveCoverage = RuComm(
 	RuCommInfo(
 		"reprove-coverage", "prover",
-		"outer loop: replay-saturation then BFS pass, repeat; tracks green/yellow-replay/yellow-bfs/red coloring",
+		"reprove each theorem with a DSL tactic and colour every original proof step by the atom that covered it; optionally emit ML training data",
 		"target", true, false,
 		[
-			RuCommArg("target",         true, "the target: a theorem, file or all",          "all"),
-			RuCommArg("max-depth",      true, "max proof tree depth",                        "5"),
-			RuCommArg("max-size",       true, "max proof tree size",                         "4096"),
-			RuCommArg("attempts",       true, "number of replay attempts per leaf",          "3"),
-			RuCommArg("time-limit",     true, "per-theorem wall-clock limit",                "60s"),
-			RuCommArg("job-time-limit", true, "total wall-clock limit for the whole job (empty = unlimited)", ""),
-			RuCommArg("max-iterations", true, "max replay iterations per inner phase",       "5"),
-			RuCommArg("bfs-depth",      true, "BFS depth for post-saturation pass (0=skip)", "3"),
-			RuCommArg("bfs-size",       true, "BFS size budget for post-saturation pass",    "4096"),
-			RuCommArg("output",         true, "save training examples to db/<name>.json (empty = skip)", ""),
+			RuCommArg("target",         true, "the target: a theorem, file or all",                              "all"),
+			RuCommArg("max-depth",      true, "max proof tree depth (default combined strategy)",                 "5"),
+			RuCommArg("max-size",       true, "max proof tree size (default combined strategy)",                  "4096"),
+			RuCommArg("attempts",       true, "number of replay attempts per leaf (default combined strategy)",   "3"),
+			RuCommArg("time-limit",     true, "per-theorem wall-clock limit",                                     "60s"),
+			RuCommArg("job-time-limit", true, "total wall-clock cap for the whole job (empty = n*time-limit/p)",  ""),
+			RuCommArg("unif-rank",      true, "beam width for phase-0 unif-quality BFS (default combined strategy)", "0"),
+			RuCommArg("max-iterations", true, "outer loop iterations (default combined strategy)",                "3"),
+			RuCommArg("tactic",         true, "tactic DSL expression that overrides the default combined strategy", ""),
+			RuCommArg("output",         true, "save training examples to db/<name>.json (empty = skip)",          ""),
 		], []
 	),
 	ruRunReproveCoverage
@@ -112,12 +86,8 @@ ruCollectColoredExamples(
 	lang     : RuLang
 ) -> [Json] {
 	concatA(map(colored, \node -> {
-		color_s = switch (node.color) {
-			RuGreen():        "green";
-			RuYellowReplay(): "yellow-replay";
-			RuYellowBfs():    "yellow-bfs";
-			RuRed():          "red";
-		};
+		// "" tag → "red" (covered by no tactic).
+		color_s = if (node.color == "") "red" else node.color;
 		children_json = JsonArray(map(node.children, \ch -> JsonString(id2s(ch.assertion))));
 		stmt_feats = ruStmtFeatures(node.stmt, lang);
 		child_jsons = ruCollectColoredExamples(node.children, theorem, id2s(node.assertion), depth + 1, lang);
@@ -133,12 +103,42 @@ ruCollectColoredExamples(
 	}))
 }
 
-// Run the fragment-replay prover for a single step goal.
-ruProveStep(
+ruColorCoverage(cov : RuProofCoverage) -> [RuColoredCoverage] {
+	switch (cov) {
+		RuProofCoverageHyp(__): [];
+		RuProofCoverageStep(ass, stmt, coveredBy, children): {
+			child_colored = concatA(map(children, \ch -> ruColorCoverage(ch)));
+			[RuColoredCoverage(ass, stmt, coveredBy, child_colored)]
+		}
+	}
+}
+
+// Per-atom node counts of a colored coverage forest.  Key "" counts red nodes.
+ruCountColors(colored : [RuColoredCoverage]) -> Tree<string, int> {
+	fold(colored, makeTree(), \acc, node -> {
+		with_self  = setTree(acc, node.color, lookupTreeDef(acc, node.color, 0) + 1);
+		with_kids  = ruCountColors(node.children);
+		mergeTreeCustom(with_self, with_kids, \__, a, b -> a + b)
+	})
+}
+
+ruMergeCountTrees(a : Tree<string, int>, b : Tree<string, int>) -> Tree<string, int> {
+	mergeTreeCustom(a, b, \__, x, y -> x + y)
+}
+
+RuReproveCoverageResult(
+	colored : [RuColoredCoverage],
+	total   : int,
+	covered : int,
+	proved  : bool
+);
+
+// Reprove one theorem with the DSL tactic (or the default combined strategy),
+// then align the original proof tree and colour every step by the atom that
+// expanded the matching prop.
+ruReproveCoverageTheorem(
 	th         : RuTheorem,
-	step_stmt  : RuStmt,
-	step_ass   : int,
-	args       : Tree<string, flow>,
+	task       : RuTask,
 	index      : RuIndex<RuAssertion>,
 	time_limit : double,
 	max_depth  : int,
@@ -147,292 +147,38 @@ ruProveStep(
 	math       : RuMath,
 	env        : RuEnv,
 	step_index : RuIndex<Pair<int,int>>
-) -> [RuProverProp] {
-	goal_step = RuStep(-1, step_ass, [], step_stmt, ruNoProof, -1);
-	tactic = ruSubproofReplayTactic(step_index, max_size, attempts, th.info.id, math, env);
+) -> RuReproveCoverageResult {
+	unif_rank = ruTaskIntArg(task, "unif-rank",      0);
+	max_iters = ruTaskIntArg(task, "max-iterations", 3);
+	dsl_src   = ruTaskStringArg(task, "tactic", "");
+	default_builder = ruStaticTacticBuilder(
+		ruCombinedStrategy(step_index, unif_rank, max_depth, max_size, attempts, max_iters, th.info.id, math, env)
+	);
+	builder : RuTacticBuilder = if (dsl_src != "") {
+		ctx = RuTacticContext(math, env, Some(step_index), None(), None());
+		switch (ruParseAndBuildTactic(dsl_src, ctx)) {
+			Some(b): b;
+			None():  default_builder;
+		}
+	} else default_builder;
 	prover_task = RuProverTask(
-		th.info, tactic,
-		id2s(th.info.id) + "/" + id2s(step_ass),
-		args, th.infer.hyps, goal_step
+		th.info, ruDoneTactic, id2s(th.info.id),
+		task.args, th.infer.hyps, ruProofQedStep(th.proof)
 	);
-	prover_env1 = ruInitProverEnv(prover_task, math, env, index, time_limit);
-	prover_env2 = ruExpandHyp(prover_env1.tree.root, prover_env1);
-	prover_env3 = ruProve(prover_env2);
-	vector2array(prover_env3.tree.root.children)
-}
-
-// BFS-based single-step prover for post-saturation frontier seeds.
-ruBfsProveStep(
-	th         : RuTheorem,
-	step_stmt  : RuStmt,
-	step_ass   : int,
-	args       : Tree<string, flow>,
-	index      : RuIndex<RuAssertion>,
-	time_limit : double,
-	bfs_depth  : int,
-	bfs_size   : int,
-	math       : RuMath,
-	env        : RuEnv
-) -> [RuProverProp] {
-	goal_step = RuStep(-1, step_ass, [], step_stmt, ruNoProof, -1);
-	tactic = ruBoundedBFSTactic(bfs_depth, bfs_size);
-	prover_task = RuProverTask(
-		th.info, tactic,
-		id2s(th.info.id) + "/" + id2s(step_ass) + "/bfs",
-		args, th.infer.hyps, goal_step
-	);
-	prover_env1 = ruInitProverEnv(prover_task, math, env, index, time_limit);
-	prover_env2 = ruExpandHyp(prover_env1.tree.root, prover_env1);
-	// Keep only the seed assertion's props in the frontier so BFS starts from step_ass.
-	// Without this filter, an arity-0 axiom fires first, a proof is found, and BFS
-	// stops before expanding the seed (leaving it with expanded=false and no children).
-	filtered_leafs = filterTree(prover_env2.tree.leafs, \__, prop -> prop.assertion.info.id == step_ass);
-	prover_env2b = RuProverEnv(prover_env2 with
-		tree = RuProverTree(prover_env2.tree with leafs = filtered_leafs)
-	);
-	prover_env3 = ruProveSequential(prover_env2b);
-	vector2array(prover_env3.tree.root.children)
-}
-
-// Merge new candidates into the coverage tree at frontier-seed positions.
-// Newly covered nodes are tagged with newCoveredBy.
-ruMergeCoverageUpdate(
-	cov          : RuProofCoverage,
-	new_cands    : Tree<int, [RuProverProp]>,
-	parent_cov   : bool,
-	newCoveredBy : RuCoveredBy
-) -> RuProofCoverage {
-	switch (cov) {
-		RuProofCoverageHyp(__): cov;
-		RuProofCoverageStep(ass, stmt, coveredBy, children): {
-			covered = ruIsCovered(coveredBy);
-			if (!covered && parent_cov) {
-				// Frontier seed: check if new candidates cover it.
-				new_props = lookupTreeDef(new_cands, ass, []);
-				now_covered = exists(new_props, \prop -> prop.assertion.info.id == ass);
-				if (now_covered) {
-					matched_prop = either(find(new_props, \p -> p.assertion.info.id == ass), ruNoProverProp);
-					prop_exps = vector2array(matched_prop.children);
-					// Seed node gets newCoveredBy (RuCoveredByReplay/Bfs → sticky YELLOW).
-					// Its children covered in the same call get RuCoveredInitial() so they
-					// can still be classified GREEN if their own subtrees are fully interior.
-					new_children = mapi(children, \i, child ->
-						if (i < length(prop_exps))
-							ruAlignCoverageWithCands(child, vector2array(prop_exps[i].children), RuCoveredInitial(), RuCoveredInitial())
-						else
-							ruAlignCoverageWithCands(child, [], RuCoveredInitial(), RuCoveredInitial())
-					);
-					RuProofCoverageStep(ass, stmt, newCoveredBy, new_children)
-				} else {
-					cov
-				}
-			} else if (covered) {
-				RuProofCoverageStep(ass, stmt, coveredBy,
-					map(children, \ch -> ruMergeCoverageUpdate(ch, new_cands, true, newCoveredBy))
-				)
-			} else {
-				cov
-			}
-		}
-	}
-}
-
-// Single BFS pass on all current frontier seeds. Tags new nodes RuCoveredYellowBfs.
-ruBfsFrontierPass(
-	cov        : RuProofCoverage,
-	th         : RuTheorem,
-	args       : Tree<string, flow>,
-	index      : RuIndex<RuAssertion>,
-	time_limit : double,
-	bfs_depth  : int,
-	bfs_size   : int,
-	math       : RuMath,
-	env        : RuEnv
-) -> RuProofCoverage {
-	if (bfs_depth <= 0) cov else {
-		seeds = ruFrontierSeeds(cov);
-		if (seeds == []) cov else {
-			new_cands = fold(seeds, makeTree(), \acc, seed -> {
-				props = ruBfsProveStep(th, seed.stmt, seed.assertion, args, index, time_limit,
-					bfs_depth, bfs_size, math, env);
-				setTree(acc, seed.assertion, props)
-			});
-			ruMergeCoverageUpdate(cov, new_cands, true, RuCoveredByBfs())
-		}
-	}
-}
-
-// Replay phase: iterate sub-proof replay until saturation or max_iters reached.
-// Tags newly covered nodes RuCoveredYellowReplay.
-ruReplayPhase(
-	cov        : RuProofCoverage,
-	th         : RuTheorem,
-	args       : Tree<string, flow>,
-	index      : RuIndex<RuAssertion>,
-	time_limit : double,
-	max_depth  : int,
-	max_size   : int,
-	attempts   : int,
-	max_iters  : int,
-	math       : RuMath,
-	env        : RuEnv,
-	step_index : RuIndex<Pair<int,int>>,
-	iter       : int
-) -> RuProofCoverage {
-	seeds   = ruFrontierSeeds(cov);
-	covered = ruCoveredStepCount(cov);
-	if (seeds == [] || iter >= max_iters) cov
-	else {
-		new_cands = fold(seeds, makeTree(), \acc, seed -> {
-			props = ruProveStep(
-				th, seed.stmt, seed.assertion, args, index, time_limit,
-				max_depth, max_size, attempts, math, env, step_index
-			);
-			setTree(acc, seed.assertion, props)
-		});
-		cov1 = ruMergeCoverageUpdate(cov, new_cands, true, RuCoveredByReplay());
-		if (ruCoveredStepCount(cov1) == covered) cov1
-		else ruReplayPhase(cov1, th, args, index, time_limit, max_depth, max_size, attempts,
-			max_iters, math, env, step_index, iter + 1)
-	}
-}
-
-// Bottom-up: compute the color of a single coverage node.
-// GREEN only for RuCoveredInitial nodes whose ALL direct children are also GREEN.
-// Color is sticky: RuCoveredByReplay → always YellowReplay, RuCoveredByBfs → always YellowBfs.
-ruNodeColor(cov : RuProofCoverage) -> RuNodeColor {
-	switch (cov) {
-		RuProofCoverageHyp(__): RuGreen(); // hyps are always available
-		RuProofCoverageStep(__, __, coveredBy, children): {
-			switch (coveredBy) {
-				RuNotCovered():      RuRed();
-				RuCoveredByReplay(): RuYellowReplay();
-				RuCoveredByBfs():    RuYellowBfs();
-				RuCoveredInitial():
-					if (forall(children, \ch -> ruNodeColor(ch) == RuGreen())) RuGreen()
-					else RuYellowReplay();
-			}
-		}
-	}
-}
-
-// Convert coverage tree to flat colored list (for counting and training data).
-ruColorCoverage(cov : RuProofCoverage) -> [RuColoredCoverage] {
-	switch (cov) {
-		RuProofCoverageHyp(__): [];
-		RuProofCoverageStep(ass, stmt, __, children): {
-			color = ruNodeColor(cov);
-			child_colored = concatA(map(children, \ch -> ruColorCoverage(ch)));
-			[RuColoredCoverage(ass, stmt, color, child_colored)]
-		}
-	}
-}
-
-RuCoverageIterResult(
-	green         : int,
-	yellow_replay : int,
-	yellow_bfs    : int,
-	red           : int,
-	proved        : bool,
-	iters         : int,
-	colored       : [RuColoredCoverage]
-);
-
-// Quadruple: (green, yellow_replay, yellow_bfs, red)
-ruCountColors(colored : [RuColoredCoverage]) -> Quadruple<int, int, int, int> {
-	fold(colored, Quadruple(0, 0, 0, 0), \acc, node -> {
-		own = switch (node.color) {
-			RuGreen():        Quadruple(acc.first + 1, acc.second, acc.third, acc.fourth);
-			RuYellowReplay(): Quadruple(acc.first, acc.second + 1, acc.third, acc.fourth);
-			RuYellowBfs():    Quadruple(acc.first, acc.second, acc.third + 1, acc.fourth);
-			RuRed():          Quadruple(acc.first, acc.second, acc.third, acc.fourth + 1);
-		};
-		child_counts = ruCountColors(node.children);
-		Quadruple(
-			own.first  + child_counts.first,
-			own.second + child_counts.second,
-			own.third  + child_counts.third,
-			own.fourth + child_counts.fourth
-		)
-	})
-}
-
-ruFinalizeCoverage(cov : RuProofCoverage, total : int, iters : int) -> RuCoverageIterResult {
-	colored = ruColorCoverage(cov);
-	counts  = ruCountColors(colored);
-	proved  = ruCoveredStepCount(cov) == total && total > 0;
-	RuCoverageIterResult(counts.first, counts.second, counts.third, counts.fourth, proved, iters, colored)
-}
-
-// Outer loop: replay phase then BFS pass, repeat until no progress or no seeds.
-ruOuterLoop(
-	cov        : RuProofCoverage,
-	th         : RuTheorem,
-	args       : Tree<string, flow>,
-	index      : RuIndex<RuAssertion>,
-	time_limit : double,
-	max_depth  : int,
-	max_size   : int,
-	attempts   : int,
-	max_iters  : int,
-	bfs_depth  : int,
-	bfs_size   : int,
-	math       : RuMath,
-	env        : RuEnv,
-	step_index : RuIndex<Pair<int,int>>,
-	total      : int,
-	outer_iter : int
-) -> RuCoverageIterResult {
-	// Phase 1: replay until saturation.
-	cov1 = ruReplayPhase(cov, th, args, index, time_limit, max_depth, max_size, attempts,
-		max_iters, math, env, step_index, 0);
-
-	if (bfs_depth <= 0 || ruFrontierSeeds(cov1) == []) {
-		ruFinalizeCoverage(cov1, total, outer_iter)
-	} else {
-		// Phase 2: single BFS pass.
-		cov2     = ruBfsFrontierPass(cov1, th, args, index, time_limit, bfs_depth, bfs_size, math, env);
-		progress = ruCoveredStepCount(cov2) > ruCoveredStepCount(cov1);
-		if (!progress) {
-			ruFinalizeCoverage(cov2, total, outer_iter)
-		} else {
-			// BFS uncovered new nodes; go back to replay with them as new seeds.
-			ruOuterLoop(cov2, th, args, index, time_limit, max_depth, max_size, attempts,
-				max_iters, bfs_depth, bfs_size, math, env, step_index, total, outer_iter + 1)
-		}
-	}
-}
-
-ruReproveCoverageTheorem(
-	th          : RuTheorem,
-	args        : Tree<string, flow>,
-	index       : RuIndex<RuAssertion>,
-	time_limit  : double,
-	max_depth   : int,
-	max_size    : int,
-	attempts    : int,
-	max_iters   : int,
-	bfs_depth   : int,
-	bfs_size    : int,
-	math        : RuMath,
-	env         : RuEnv,
-	step_index  : RuIndex<Pair<int,int>>
-) -> RuCoverageIterResult {
-	// Initial replay run: produces Green nodes.
-	tactic      = ruSubproofReplayTactic(step_index, max_size, attempts, th.info.id, math, env);
-	prover_task = RuProverTask(
-		th.info, tactic, id2s(th.info.id),
-		args, th.infer.hyps, ruProofQedStep(th.proof)
-	);
-	prover_env1 = ruInitProverEnv(prover_task, math, env, index, time_limit);
+	prover_env_pre = ruInitProverEnv(prover_task, math, env, index, time_limit);
+	built = builder.build(prover_env_pre);
+	prover_env1 = built.first;
+	prover_env1.tactic := Some(built.second);
 	prover_env2 = ruExpandHyp(prover_env1.tree.root, prover_env1);
 	prover_env3 = ruProve(prover_env2);
 	orig_tree   = ruTheoremProofTree(th, math);
-	cov0        = ruAlignProofWithTree(orig_tree, vector2array(prover_env3.tree.root.children));
-	total       = ruCoverageStepCount(cov0);
-
-	ruOuterLoop(cov0, th, args, index, time_limit, max_depth, max_size, attempts,
-		max_iters, bfs_depth, bfs_size, math, env, step_index, total, 0)
+	coverage    = ruAlignProofWithTree(orig_tree, vector2array(prover_env3.tree.root.children));
+	RuReproveCoverageResult(
+		ruColorCoverage(coverage),
+		ruCoverageStepCount(coverage),
+		ruCoveredStepCount(coverage),
+		length(^(prover_env3.tree.proofs)) > 0
+	)
 }
 
 ruRunReproveCoverage(unit : RuUnit) -> Maybe<RuState> {
@@ -446,126 +192,89 @@ ruRunReproveCoverage(unit : RuUnit) -> Maybe<RuState> {
 		env.out.println("no target for reprove-coverage");
 		Some(state);
 	} else {
-		max_depth   = ruTaskIntArg(task, "max-depth",      5);
-		max_size    = ruTaskIntArg(task, "max-size",       4096);
-		attempts    = ruTaskIntArg(task, "attempts",       3);
-		max_iters   = ruTaskIntArg(task, "max-iterations", 5);
-		bfs_depth   = ruTaskIntArg(task, "bfs-depth",      3);
-		bfs_size    = ruTaskIntArg(task, "bfs-size",       4096);
-		// Per-theorem wall-clock budget — read directly so ruMapFnComm cannot
-		// divide it across theorems.
-		th_time_limit = ruParseTime(ruTaskStringArg(task, "time-limit", "60s"));
-		// Compute how many theorems match the target so we can set the map-level
-		// time budget to th_time_limit * N / P, ensuring each theorem gets its
-		// full per-theorem budget from ruMapFnComm's outer ruEvalTimed3.
+		max_depth = ruTaskIntArg(task, "max-depth", 5);
+		max_size  = ruTaskIntArg(task, "max-size",  4096);
+		attempts  = ruTaskIntArg(task, "attempts",  3);
+		index       = ruMakeIndexForTarget(target, math, env);
+		step_index  = ruBuildStepIndex(math, 3);
+		output_key  = ruTaskStringArg(task, "output", "");
+		lang        = math.decls.lang;
+
+		// Job budget: ruMapFnComm's outer timer must cover n*th_time/p.
+		th_time_ms = ruParseTime(ruTaskStringArg(task, "time-limit", "60s"));
 		n_theorems = i2d(length(filter(
 			getTreeValues(ruDeclsTheorems(math.decls)),
 			\th -> ruTargetPredicate(target)(th) && ruTheoremIsProved(th)
 		)));
-		p_count = max(1.0, i2d(availableProcessors()));
-		map_time_s = n_theorems * th_time_limit / p_count;
-		// If job-time-limit is set, cap total time but keep per-theorem budget intact
-		// by taking the max (so the outer timer never fires before th_time_limit).
+		p_count    = max(1.0, i2d(availableProcessors()));
+		map_time_ms = max(th_time_ms, n_theorems * th_time_ms / p_count);
 		job_time_str = ruTaskStringArg(task, "job-time-limit", "");
 		map_time_capped = if (job_time_str != "")
-			max(map_time_s, ruParseTime(job_time_str))
-		else
-			map_time_s;
-		// map_time_capped is in ms (ruParseTime units); convert to whole seconds for the string.
-		job_task = RuTask(task with args = setTree(task.args, "time-limit", flow(i2s(round(map_time_capped / 1000.0)) + "s")));
-		index       = ruMakeIndexForTarget(target, math, env);
-		step_index  = ruBuildStepIndex(math, 3);
+			min(map_time_ms, ruParseTime(job_time_str))
+		else map_time_ms;
+		map_task = RuTask(task with args = setTree(task.args, "time-limit",
+			flow(i2s(round(map_time_capped / 1000.0)) + "s")
+		));
 
-		output_key  = ruTaskStringArg(task, "output", "");
-		lang        = math.decls.lang;
-
-		total_green  = ref 0;
-		total_yr     = ref 0;
-		total_yb     = ref 0;
-		total_red    = ref 0;
 		theorem_count = ref 0;
 		proved_count  = ref 0;
-		all_examples  = ref [];
+		all_counts    : ref [Tree<string, int>] = ref [];
+		all_examples  : ref [Json] = ref [];
 		inc_th        = ruAtomicIntInc(theorem_count);
 		inc_prov      = ruAtomicIntInc(proved_count);
-		add_green     = ruAtomicIntInc(total_green);
-		add_yr        = ruAtomicIntInc(total_yr);
-		add_yb        = ruAtomicIntInc(total_yb);
-		add_red       = ruAtomicIntInc(total_red);
+		push_counts   = ruAtomicRefArrayPush(all_counts);
 		push_example  = ruAtomicRefArrayPush(all_examples);
 
-		cover_fn = \decl, __, env1 -> {
+		cover_fn = \decl, time_limit, env1 -> {
 			th = cast(decl : RuDecl -> RuTheorem);
 			if (ruTheoremIsProved(th)) {
 				res = ruReproveCoverageTheorem(
-					th, task.args, index, th_time_limit,
-					max_depth, max_size, attempts, max_iters, bfs_depth, bfs_size, math, env1, step_index
+					th, task, index, time_limit,
+					max_depth, max_size, attempts, math, env1, step_index
 				);
+				counts = ruCountColors(res.colored);
 				inc_th(1);
-				add_green(res.green);
-				add_yr(res.yellow_replay);
-				add_yb(res.yellow_bfs);
-				add_red(res.red);
+				push_counts(counts);
 				if (res.proved) inc_prov(1);
 				if (output_key != "") {
-					th_name  = id2s(th.info.id);
-					examples = ruCollectColoredExamples(res.colored, th_name, "", 0, lang);
+					examples = ruCollectColoredExamples(res.colored, id2s(th.info.id), "", 0, lang);
 					iter(examples, \ex -> push_example(ex));
-					if (ruVerbose(env1.conf) > 0) {
-						env1.out.println(
-							th_name + ": " +
-							"green=" + i2s(res.green) +
-							" yellow-replay=" + i2s(res.yellow_replay) +
-							" yellow-bfs=" + i2s(res.yellow_bfs) +
-							" red=" + i2s(res.red) +
-							" iters=" + i2s(res.iters) +
-							" examples=" + i2s(length(examples)) +
-							(if (res.proved) " PROVED" else "")
-						);
-					}
-				} else {
-					if (ruVerbose(env1.conf) > 0) {
-						env1.out.println(
-							id2s(th.info.id) + ": " +
-							"green=" + i2s(res.green) +
-							" yellow-replay=" + i2s(res.yellow_replay) +
-							" yellow-bfs=" + i2s(res.yellow_bfs) +
-							" red=" + i2s(res.red) +
-							" iters=" + i2s(res.iters) +
-							(if (res.proved) " PROVED" else "")
-						);
-					}
+				}
+				if (ruVerbose(env1.conf) > 0) {
+					env1.out.println(
+						id2s(th.info.id) + ": " + i2s(res.covered) + "/" + i2s(res.total) +
+						" covered  [" + ruCounts2s(counts) + "]" +
+						(if (res.proved) " PROVED" else "")
+					);
 				}
 			}
 			RuMappedDecl(true, false, decl)
 		};
 
 		new_state = ruMapFnComm(
-			RuUnit(job_task, state, env.out),
+			RuUnit(map_task, state, env.out),
 			RuMapFn(
 				RuMapFnInfo(
 					"reprove-coverage",
 					\decl -> ruTargetPredicate(target)(decl) && ruDeclIsTheorem(decl),
 					\__ -> 1.0,
-					\ -> "green=" + i2s(^total_green) +
-						" yellow-replay=" + i2s(^total_yr) +
-						" yellow-bfs=" + i2s(^total_yb) +
-						" red=" + i2s(^total_red)
+					\ -> i2s(^proved_count) + "/" + i2s(^theorem_count) + " proved"
 				),
 				cover_fn
 			)
 		);
 
-		g = ^total_green; yr = ^total_yr; yb = ^total_yb; r = ^total_red;
-		tot = g + yr + yb + r;
+		totals = fold(^all_counts, makeTree(), ruMergeCountTrees);
+		grand  = foldTree(totals, 0, \__, c, acc -> acc + c);
 		env.out.println(
 			"=== reprove-coverage results ===\n" +
-			"theorems:      " + i2s(^theorem_count) + "\n" +
-			"proved:        " + i2s(^proved_count) + " / " + i2s(^theorem_count) + "\n" +
-			"green:         " + i2s(g)  + (if (tot > 0) " (" + d2s(i2d(g) /i2d(tot)*100.0) + "%)" else "") + "\n" +
-			"yellow-replay: " + i2s(yr) + (if (tot > 0) " (" + d2s(i2d(yr)/i2d(tot)*100.0) + "%)" else "") + "\n" +
-			"yellow-bfs:    " + i2s(yb) + (if (tot > 0) " (" + d2s(i2d(yb)/i2d(tot)*100.0) + "%)" else "") + "\n" +
-			"red:           " + i2s(r)  + (if (tot > 0) " (" + d2s(i2d(r) /i2d(tot)*100.0) + "%)" else "")
+			"theorems: " + i2s(^theorem_count) + "\n" +
+			"proved:   " + i2s(^proved_count) + " / " + i2s(^theorem_count) + "\n" +
+			"steps by covering atom:\n" +
+			concatStrings(map(ruSortCountPairs(totals), \p ->
+				"  " + (if (p.first == "") "red (uncovered)" else p.first) + ": " + i2s(p.second) +
+				(if (grand > 0) " (" + d2s(i2d(p.second) / i2d(grand) * 100.0) + "%)" else "") + "\n"
+			))
 		);
 
 		n_ex = if (output_key != "") {
@@ -581,16 +290,27 @@ ruRunReproveCoverage(unit : RuUnit) -> Maybe<RuState> {
 			n
 		} else 0;
 
+		red = lookupTreeDef(totals, "", 0);
 		Some(RuState(new_state with
 			vars = setTree(new_state.vars, "reprove-coverage", pairs2tree([
-				Pair("theorem-count",  flow(^theorem_count)),
-				Pair("proved-count",   flow(^proved_count)),
-				Pair("green",          flow(g)),
-				Pair("yellow-replay",  flow(yr)),
-				Pair("yellow-bfs",     flow(yb)),
-				Pair("red",            flow(r)),
-				Pair("example-count",  flow(n_ex))
+				Pair("theorem-count", flow(^theorem_count)),
+				Pair("proved-count",  flow(^proved_count)),
+				Pair("step-count",    flow(grand)),
+				Pair("red-count",     flow(red)),
+				Pair("example-count", flow(n_ex))
 			]))
 		))
 	}
+}
+
+// Sort per-atom counts by descending count for stable, readable output.
+ruSortCountPairs(t : Tree<string, int>) -> [Pair<string, int>] {
+	pairs = map(tree2pairs(t), \p -> Pair(p.first, p.second));
+	sortCustom(pairs, \p -> p.second, false)
+}
+
+ruCounts2s(t : Tree<string, int>) -> string {
+	strGlue(map(ruSortCountPairs(t), \p ->
+		(if (p.first == "") "red" else p.first) + "=" + i2s(p.second)
+	), " ")
 }
