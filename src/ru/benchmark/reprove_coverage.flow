@@ -1,7 +1,6 @@
 import ru/benchmark/coverage;
 import ru/prover/core/prove;
 import ru/prover/tactics/subproof_replay;
-import ru/prover/tactics/combined;
 import ru/prover/tactics/dsl;
 import ru/map_decls;
 import ru/util/target;
@@ -38,14 +37,12 @@ ruCommReproveCoverage = RuComm(
 		"target", true, false,
 		[
 			RuCommArg("target",         true, "the target: a theorem, file or all",                              "all"),
-			RuCommArg("max-depth",      true, "max proof tree depth (default combined strategy)",                 "5"),
-			RuCommArg("max-size",       true, "max proof tree size (default combined strategy)",                  "4096"),
-			RuCommArg("attempts",       true, "number of replay attempts per leaf (default combined strategy)",   "3"),
+			RuCommArg("max-size",       true, "max proof tree size (default tactic)",                             "4096"),
+			RuCommArg("attempts",       true, "SPR replay attempts per leaf (default tactic)",                    "3"),
 			RuCommArg("time-limit",     true, "per-theorem wall-clock limit",                                     "60s"),
 			RuCommArg("job-time-limit", true, "total wall-clock cap for the whole job (empty = n*time-limit/p)",  ""),
-			RuCommArg("unif-rank",      true, "beam width for phase-0 unif-quality BFS (default combined strategy)", "0"),
-			RuCommArg("max-iterations", true, "outer loop iterations (default combined strategy)",                "3"),
-			RuCommArg("tactic",         true, "tactic DSL expression that overrides the default combined strategy", ""),
+			RuCommArg("max-iterations", true, "frontier loop iterations (default tactic)",                        "3"),
+			RuCommArg("tactic",         true, "tactic DSL expression that overrides the default frontier loop",   ""),
 			RuCommArg("output",         true, "save training examples to db/<name>.json (empty = skip)",          ""),
 		], []
 	),
@@ -133,7 +130,7 @@ RuReproveCoverageResult(
 	proved  : bool
 );
 
-// Reprove one theorem with the DSL tactic (or the default combined strategy),
+// Reprove one theorem with the DSL tactic (or the default frontier loop),
 // then align the original proof tree and colour every step by the atom that
 // expanded the matching prop.
 ruReproveCoverageTheorem(
@@ -141,26 +138,25 @@ ruReproveCoverageTheorem(
 	task       : RuTask,
 	index      : RuIndex<RuAssertion>,
 	time_limit : double,
-	max_depth  : int,
 	max_size   : int,
 	attempts   : int,
 	math       : RuMath,
 	env        : RuEnv,
 	step_index : RuIndex<Pair<int,int>>
 ) -> RuReproveCoverageResult {
-	unif_rank = ruTaskIntArg(task, "unif-rank",      0);
 	max_iters = ruTaskIntArg(task, "max-iterations", 3);
 	dsl_src   = ruTaskStringArg(task, "tactic", "");
-	default_builder = ruStaticTacticBuilder(
-		ruCombinedStrategy(step_index, unif_rank, max_depth, max_size, attempts, max_iters, th.info.id, math, env)
-	);
-	builder : RuTacticBuilder = if (dsl_src != "") {
-		ctx = RuTacticContext(math, env, Some(step_index), None(), None());
-		switch (ruParseAndBuildTactic(dsl_src, ctx)) {
-			Some(b): b;
-			None():  default_builder;
-		}
-	} else default_builder;
+	// Default: proof-guided loop — each iteration re-aims spr+BFS at the
+	// current real-proof frontier.  bounded-bfs uses a huge depth cap because
+	// under focus the tree is already deep; max-size is the real budget.
+	effective_dsl = if (dsl_src != "") dsl_src else
+		"loop(focus(frontier, seq(spr(" + i2s(attempts) + ", " + i2s(max_size) +
+		"), bounded-bfs(1000000, " + i2s(max_size) + "))), " + i2s(max_iters) + ")";
+	ctx = RuTacticContext(math, env, Some(step_index), None(), None());
+	builder : RuTacticBuilder = switch (ruParseAndBuildTactic(effective_dsl, ctx)) {
+		Some(b): b;
+		None():  ruStaticTacticBuilder(ruDoneTactic);
+	};
 	prover_task = RuProverTask(
 		th.info, ruDoneTactic, id2s(th.info.id),
 		task.args, th.infer.hyps, ruProofQedStep(th.proof)
@@ -192,7 +188,6 @@ ruRunReproveCoverage(unit : RuUnit) -> Maybe<RuState> {
 		env.out.println("no target for reprove-coverage");
 		Some(state);
 	} else {
-		max_depth = ruTaskIntArg(task, "max-depth", 5);
 		max_size  = ruTaskIntArg(task, "max-size",  4096);
 		attempts  = ruTaskIntArg(task, "attempts",  3);
 		index       = ruMakeIndexForTarget(target, math, env);
@@ -230,7 +225,7 @@ ruRunReproveCoverage(unit : RuUnit) -> Maybe<RuState> {
 			if (ruTheoremIsProved(th)) {
 				res = ruReproveCoverageTheorem(
 					th, task, index, time_limit,
-					max_depth, max_size, attempts, math, env1, step_index
+					max_size, attempts, math, env1, step_index
 				);
 				counts = ruCountColors(res.colored);
 				inc_th(1);

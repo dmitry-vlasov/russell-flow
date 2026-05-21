@@ -1,0 +1,100 @@
+import ru/prover/core/controls;
+import ru/prover/core/tree;
+import ru/proof_tree;
+
+export {
+	// A node selector picks "seed" props from the current PVT.  ruFocusTactic
+	// restricts a tactic to the subtrees rooted at those seeds, so an outside
+	// party (a colorizer, the proof-guided loop) can aim a tactic at a region
+	// without the tactic itself knowing how to be targeted.
+	RuNodeSelector(
+		description : string,
+		seeds : (RuProverTree) -> [RuProverProp]
+	);
+
+	// Restrict `inner` to expand only props that are seeds (per `selector`) or
+	// descendants of seeds.  `inner` is handed a tree whose `leafs` is filtered
+	// to that region; everything else is shared, so `inner` operates normally
+	// and never learns it was focused.  The seed set is computed once, on the
+	// first step, and stays fixed for the whole pass — a fresh ruFocusTactic
+	// (e.g. one per loop iteration) re-selects against the grown tree.
+	ruFocusTactic(selector : RuNodeSelector, inner : RuProverTactic) -> RuProverTactic;
+
+	// True if `prop` is a seed or lies in the subtree under one.
+	ruIsUnderSeed(prop : RuProverProp, seeds : Set<int>) -> bool;
+
+	// Trivial selector: no restriction (every current leaf is a seed).
+	ruAllSelector : RuNodeSelector;
+
+	// Proof-guided selector: seeds are the candidate props at every position
+	// where the real proof `orig` diverges from the current PVT — an original
+	// proof step with no expanded matching prop.  Focusing search on these
+	// re-aims it exactly at the frontier of what has been covered so far.
+	// (At a cold start nothing is covered, so the seeds are the root-level
+	// candidates — the first focused pass is then an unrestricted search.)
+	ruFrontierSelector(orig : RuProofTree) -> RuNodeSelector;
+}
+
+ruIsUnderSeed(prop : RuProverProp, seeds : Set<int>) -> bool {
+	if (containsSet(seeds, prop.id)) true
+	else switch (prop.parent) {
+		RuProverRoot(__, __, __): false;
+		RuProverExp(__, __, __, __, grand): ruIsUnderSeed(grand, seeds);
+	}
+}
+
+ruAllSelector = RuNodeSelector("all", \tree -> getTreeValues(tree.leafs));
+
+ruFrontierProps(node : RuProofTree, candidates : [RuProverProp]) -> [RuProverProp] {
+	switch (node) {
+		RuProofHyp(__, __): [];
+		RuProofStep(ass_id, children, __): {
+			matched = find(candidates, \p -> p.assertion.info.id == ass_id && ^(p.expanded) != "");
+			switch (matched) {
+				// Divergence point: focus on the candidate props sitting here.
+				None(): candidates;
+				// Covered here — descend into each child position.
+				Some(prop): {
+					prop_exps = vector2array(prop.children);
+					concatA(mapi(children, \i, child ->
+						ruFrontierProps(child, if (i < length(prop_exps)) vector2array(prop_exps[i].children) else [])
+					))
+				}
+			}
+		}
+	}
+}
+
+ruFrontierSelector(orig : RuProofTree) -> RuNodeSelector {
+	RuNodeSelector("frontier", \tree -> ruFrontierProps(orig, vector2array(tree.root.children)))
+}
+
+ruFocusTactic(selector : RuNodeSelector, inner : RuProverTactic) -> RuProverTactic {
+	ruFocusWith(selector, inner, ref None())
+}
+
+// `seed_ids` is shared across the re-wraps below so the seed set, computed
+// lazily on the first step, survives every internal RuTacticSwitch of `inner`.
+ruFocusWith(selector : RuNodeSelector, inner : RuProverTactic, seed_ids : ref Maybe<Set<int>>) -> RuProverTactic {
+	RuProverTactic("focus[" + selector.description + "/" + inner.description + "]", inner.tag,
+		\tree -> {
+			seeds = switch (^seed_ids) {
+				Some(s): s;
+				None(): {
+					s = buildSet(map(selector.seeds(tree), \p -> p.id));
+					seed_ids := Some(s);
+					s
+				}
+			};
+			restricted = RuProverTree(tree with
+				leafs = filterTree(tree.leafs, \__, prop -> ruIsUnderSeed(prop, seeds))
+			);
+			switch (inner.step(restricted)) {
+				RuTacticExpand(leafs): RuTacticExpand(leafs);
+				RuTacticSwitch(next):  RuTacticSwitch(ruFocusWith(selector, next, seed_ids));
+				RuTacticDone():        RuTacticDone();
+			}
+		},
+		inner.keep_expanding
+	)
+}
