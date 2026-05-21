@@ -35,6 +35,11 @@ ruCommMeasureCoverage = RuComm(
 	ruRunMeasureCoverage
 );
 
+// Result of measuring one theorem: the structural coverage annotation, plus
+// whether the engine actually extracted a complete, substitution-consistent
+// proof (length(tree.proofs) > 0) — the genuine "reproved" criterion.
+RuCoverageResult(coverage : RuProofCoverage, really_proved : bool);
+
 ruMeasureCoverageTheorem(
 	th         : RuTheorem,
 	task       : RuTask,
@@ -46,7 +51,7 @@ ruMeasureCoverageTheorem(
 	math       : RuMath,
 	env        : RuEnv,
 	step_index : RuIndex<Pair<int,int>>
-) -> RuProofCoverage {
+) -> RuCoverageResult {
 	unif_rank  = ruTaskIntArg(task, "unif-rank",      0);
 	max_iters  = ruTaskIntArg(task, "max-iterations", 3);
 	dsl_src    = ruTaskStringArg(task, "tactic", "");
@@ -75,7 +80,8 @@ ruMeasureCoverageTheorem(
 	prover_env2 = ruExpandHyp(prover_env1.tree.root, prover_env1);
 	prover_env3 = ruProve(prover_env2);
 	orig_tree = ruTheoremProofTree(th, math);
-	ruAlignProofWithTree(orig_tree, vector2array(prover_env3.tree.root.children))
+	coverage = ruAlignProofWithTree(orig_tree, vector2array(prover_env3.tree.root.children));
+	RuCoverageResult(coverage, length(^(prover_env3.tree.proofs)) > 0)
 }
 
 ruRunMeasureCoverage(unit : RuUnit) -> Maybe<RuState> {
@@ -124,31 +130,41 @@ ruRunMeasureCoverage(unit : RuUnit) -> Maybe<RuState> {
 			flow(i2s(round(map_time_capped / 1000.0)) + "s")
 		));
 
-		total_steps   = ref 0;
-		covered_steps = ref 0;
-		theorem_count = ref 0;
-		proved_count  = ref 0;
-		inc_theorems  = ruAtomicIntInc(theorem_count);
-		inc_proved    = ruAtomicIntInc(proved_count);
-		add_total     = ruAtomicIntInc(total_steps);
-		add_covered   = ruAtomicIntInc(covered_steps);
+		total_steps    = ref 0;
+		covered_steps  = ref 0;
+		theorem_count  = ref 0;
+		full_cov_count = ref 0;   // theorems with 100% step coverage
+		proved_count   = ref 0;   // theorems where the engine extracted a real proof
+		gap_count      = ref 0;   // 100% covered but NOT really proved — engine-bug signal
+		inc_theorems   = ruAtomicIntInc(theorem_count);
+		inc_full_cov   = ruAtomicIntInc(full_cov_count);
+		inc_proved     = ruAtomicIntInc(proved_count);
+		inc_gap        = ruAtomicIntInc(gap_count);
+		add_total      = ruAtomicIntInc(total_steps);
+		add_covered    = ruAtomicIntInc(covered_steps);
 
 		measure_fn = \decl, time_limit, env1 -> {
 			th = cast(decl : RuDecl -> RuTheorem);
 			if (ruTheoremIsProved(th)) {
-				cov = ruMeasureCoverageTheorem(
+				result  = ruMeasureCoverageTheorem(
 					th, task, index, time_limit,
 					max_depth, max_size, attempts, math, env1, step_index
 				);
+				cov     = result.coverage;
 				total   = ruCoverageStepCount(cov);
 				covered = ruCoveredStepCount(cov);
 				ratio   = ruCoverageRatio(cov);
-				proved  = total > 0 && covered == total;
+				full_covered  = total > 0 && covered == total;
+				really_proved = result.really_proved;
 
 				inc_theorems(1);
 				add_total(total);
 				add_covered(covered);
-				if (proved) inc_proved(1);
+				if (full_covered)  inc_full_cov(1);
+				if (really_proved) inc_proved(1);
+				// 100% structural coverage MUST imply a real proof; if not, the
+				// engine found the proof skeleton but failed to extract it.
+				if (full_covered && !really_proved) inc_gap(1);
 
 				if (ruVerbose(env1.conf) > 0) {
 					frontier = ruFrontierSeeds(cov);
@@ -156,7 +172,9 @@ ruRunMeasureCoverage(unit : RuUnit) -> Maybe<RuState> {
 						id2s(th.info.id) + ": " +
 						i2s(covered) + "/" + i2s(total) + " steps covered (" +
 						d2s(ratio * 100.0) + "%)" +
-						(if (proved) " PROVED" else "") +
+						(if (full_covered) " FULLY-COVERED" else "") +
+						(if (really_proved) " PROVED" else " NOT-PROVED") +
+						(if (full_covered && !really_proved) "  <<< COVERAGE/PROOF GAP" else "") +
 						(if (length(frontier) > 0)
 							", frontier: " + strGlue(map(frontier, \s -> id2s(s.assertion)), ", ")
 						else "")
@@ -187,24 +205,36 @@ ruRunMeasureCoverage(unit : RuUnit) -> Maybe<RuState> {
 			)
 		);
 
-		n_th    = ^theorem_count;
-		n_cov   = ^covered_steps;
-		n_tot   = ^total_steps;
-		n_proved = ^proved_count;
+		n_th       = ^theorem_count;
+		n_cov      = ^covered_steps;
+		n_tot      = ^total_steps;
+		n_proved   = ^proved_count;
+		n_full_cov = ^full_cov_count;
+		n_gap      = ^gap_count;
 		avg_pct = if (n_tot > 0) i2d(n_cov) / i2d(n_tot) * 100.0 else 0.0;
 
 		env.out.println(
 			"=== measure-coverage results ===\n" +
-			"theorems:      " + i2s(n_th) + "\n" +
-			"proved:        " + i2s(n_proved) + " / " + i2s(n_th) + "\n" +
-			"steps covered: " + i2s(n_cov) + " / " + i2s(n_tot) +
-				" (" + d2s(avg_pct) + "% avg)"
+			"theorems:        " + i2s(n_th) + "\n" +
+			"reproved (real): " + i2s(n_proved) + " / " + i2s(n_th) +
+				"   (engine extracted a complete proof)\n" +
+			"fully covered:   " + i2s(n_full_cov) + " / " + i2s(n_th) +
+				"   (100% of original proof steps explored)\n" +
+			"steps covered:   " + i2s(n_cov) + " / " + i2s(n_tot) +
+				" (" + d2s(avg_pct) + "% avg)\n" +
+			"coverage/proof gap: " + i2s(n_gap) +
+				(if (n_gap > 0)
+					"   <<< BUG: theorems fully covered but NOT reproved"
+				else
+					"   (none — full coverage always yielded a real proof)")
 		);
 
 		Some(RuState(new_state with
 			vars = setTree(new_state.vars, "measure-coverage", pairs2tree([
 				Pair("theorem-count",  flow(n_th)),
 				Pair("proved-count",   flow(n_proved)),
+				Pair("full-cov-count", flow(n_full_cov)),
+				Pair("gap-count",      flow(n_gap)),
 				Pair("covered-steps",  flow(n_cov)),
 				Pair("total-steps",    flow(n_tot)),
 				Pair("coverage-pct",   flow(avg_pct))
