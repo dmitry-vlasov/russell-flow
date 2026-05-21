@@ -20,6 +20,13 @@ export {
 	// (e.g. one per loop iteration) re-selects against the grown tree.
 	ruFocusTactic(selector : RuNodeSelector, inner : RuProverTactic) -> RuProverTactic;
 
+	// Like ruFocusTactic but tighter: the selector is re-evaluated on EVERY
+	// step and `inner` is restricted to EXACTLY the selected props (not their
+	// subtrees).  As the tree grows the selection moves with it — so a `replay`
+	// selector makes `track` walk the original proof level by level.  Returns
+	// Done when the selection is empty.
+	ruTrackTactic(selector : RuNodeSelector, inner : RuProverTactic) -> RuProverTactic;
+
 	// True if `prop` is a seed or lies in the subtree under one.
 	ruIsUnderSeed(prop : RuProverProp, seeds : Set<int>) -> bool;
 
@@ -33,6 +40,12 @@ export {
 	// (At a cold start nothing is covered, so the seeds are the root-level
 	// candidates — the first focused pass is then an unrestricted search.)
 	ruFrontierSelector(orig : RuProofTree) -> RuNodeSelector;
+
+	// Proof-replay selector: seeds are every prop matching a step of the real
+	// proof `orig` (matched by assertion id).  Paired with ruTrackTactic this
+	// replays the original proof level by level — the basis of the `oracle`
+	// tactic.
+	ruReplaySelector(orig : RuProofTree) -> RuNodeSelector;
 }
 
 ruIsUnderSeed(prop : RuProverProp, seeds : Set<int>) -> bool {
@@ -67,6 +80,47 @@ ruFrontierProps(node : RuProofTree, candidates : [RuProverProp]) -> [RuProverPro
 
 ruFrontierSelector(orig : RuProofTree) -> RuNodeSelector {
 	RuNodeSelector("frontier", \tree -> ruFrontierProps(orig, vector2array(tree.root.children)))
+}
+
+ruTrackTactic(selector : RuNodeSelector, inner : RuProverTactic) -> RuProverTactic {
+	RuProverTactic("track[" + selector.description + "/" + inner.description + "]", inner.tag,
+		\tree -> {
+			selected = buildSet(map(selector.seeds(tree), \p -> p.id));
+			restricted = RuProverTree(tree with
+				leafs = filterTree(tree.leafs, \id, __ -> containsSet(selected, id))
+			);
+			if (sizeTree(restricted.leafs) == 0) RuTacticDone()
+			else switch (inner.step(restricted)) {
+				RuTacticExpand(leafs): RuTacticExpand(leafs);
+				RuTacticSwitch(next):  RuTacticSwitch(ruTrackTactic(selector, next));
+				RuTacticDone():        RuTacticDone();
+			}
+		},
+		inner.keep_expanding
+	)
+}
+
+// Every prop matching a real-proof step, found by walking `orig` against the
+// PVT and matching by assertion id.  Deep matches appear only after their
+// ancestors are expanded, so under ruTrackTactic the set grows level by level.
+ruReplayProps(node : RuProofTree, candidates : [RuProverProp]) -> [RuProverProp] {
+	switch (node) {
+		RuProofHyp(__, __): [];
+		RuProofStep(ass_id, children, __): {
+			matches = filter(candidates, \p -> p.assertion.info.id == ass_id);
+			if (matches == []) []
+			else concat(matches, concatA(map(matches, \prop -> {
+				prop_exps = vector2array(prop.children);
+				concatA(mapi(children, \i, child ->
+					ruReplayProps(child, if (i < length(prop_exps)) vector2array(prop_exps[i].children) else [])
+				))
+			})))
+		}
+	}
+}
+
+ruReplaySelector(orig : RuProofTree) -> RuNodeSelector {
+	RuNodeSelector("replay", \tree -> ruReplayProps(orig, vector2array(tree.root.children)))
 }
 
 ruFocusTactic(selector : RuNodeSelector, inner : RuProverTactic) -> RuProverTactic {
