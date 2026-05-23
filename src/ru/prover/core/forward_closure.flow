@@ -1,0 +1,295 @@
+import ru/src;
+import ru/subst;
+import ru/index;
+import ru/unify/index;
+import ru/unify/exps;
+import ru/util/src;
+import ru/proof_tree;
+import base/stats;
+
+// Forward closure: starting from the task's premises, apply single-hypothesis
+// assertions to derive new expressions, up to a bounded depth and total size.
+// The resulting index is queried during backward expansion: when an open leaf
+// unifies with a forward fact, the fact's witness is spliced in as a complete
+// sub-proof, closing the leaf in (k+1) total steps instead of needing the
+// prover to discover all k steps via backward search.
+
+export {
+	// Witness of how a forward fact was derived from premises. Encodes the same
+	// structure a Russell proof has — recursively, each level records the
+	// assertion used and the substitutions needed to reproduce the step. At
+	// splice time, we walk this and emit an isomorphic RuProofTree, with the
+	// caller's σ_match composed throughout.
+	RuFwWitness ::= RuFwPremise, RuFwApply;
+		// Theorem hypothesis index. Bottoms out the witness chain.
+		RuFwPremise(index : int);
+		// One assertion application. fresh_sub renames the assertion's vars to
+		// globally-unique ids (so different applications don't clash); step_sub
+		// is the unifier that bound the now-fresh assertion vars to subterms of
+		// the deeper fact's expression.
+		RuFwApply(
+			assertion : int,
+			fresh_sub : RuSubst,
+			step_sub  : RuSubst,
+			hyps      : [RuFwWitness]
+		);
+
+	RuForwardFact(
+		exp     : RuExp,
+		depth   : int,
+		witness : RuFwWitness
+	);
+
+	// Build an index of expressions reachable from the task premises by applying
+	// single-hypothesis assertions, up to depth_limit forward steps.
+	// premises_with_idx pairs each premise expression with its theorem-hyp
+	// index (the value RuProofHyp's first field expects).
+	// depth_limit = 0  →  only the premises themselves (matches old matchesPremise).
+	// depth_limit = 1  →  + one step of single-hyp assertion applications.
+	// depth_limit = 2+ →  iteratively extend the frontier.
+	// size_limit caps total facts to bound build time and memory.
+	ruBuildForwardClosure(
+		premises_with_idx : [Pair<RuExp, int>],
+		assertions        : RuIndex<RuAssertion>,
+		fresher           : (RuVar) -> RuVar,
+		math              : RuMath,
+		env               : RuEnv,
+		depth_limit       : int,
+		size_limit        : int
+	) -> RuIndex<RuForwardFact>;
+
+	// Splice a forward witness into a concrete RuProofTree subtree.
+	// leaf_stmt is the closing leaf's intended statement (post-σ_match).
+	// match_sub is σ_match: the unifier from the splice point.
+	// math is needed to look up assertions by id.
+	ruSpliceForwardWitness(
+		witness   : RuFwWitness,
+		leaf_stmt : RuStmt,
+		match_sub : RuSubst,
+		math      : RuMath
+	) -> RuProofTree;
+}
+
+ruBuildForwardClosure(
+	premises_with_idx : [Pair<RuExp, int>],
+	assertions        : RuIndex<RuAssertion>,
+	fresher           : (RuVar) -> RuVar,
+	math              : RuMath,
+	env               : RuEnv,
+	depth_limit       : int,
+	size_limit        : int
+) -> RuIndex<RuForwardFact> {
+	t = ruMakeTimer();
+
+	// Seed: every premise becomes a depth-0 fact with witness pointing at its
+	// theorem-hyp index.
+	seed_facts = map(premises_with_idx, \p ->
+		RuForwardFact(p.first, 0, RuFwPremise(p.second))
+	);
+	seen0 = fold(seed_facts, makeSet(), \acc, f -> insertSet(acc, ruExpKey(f.exp)));
+	idx0  = fold(seed_facts, ruMakeIndex(), \acc, f -> ruSetIndex(f.exp, f, acc));
+
+	result = if (depth_limit <= 0 || length(seed_facts) == 0) {
+		idx0;
+	} else {
+		// Phase 1: only single-hypothesis assertions. Build a secondary index
+		// keyed by the hypothesis expression so ruUnifyIndex gives a head-symbol
+		// pre-filter for free.
+		one_hyp_asses = filter(ruIndexValues(assertions), \ass ->
+			length(ruAssertionHyps(ass)) == 1
+		);
+		hyp_index = fold(one_hyp_asses, ruMakeIndex(), \acc, ass -> {
+			h = ruAssertionHyps(ass)[0];
+			ruSetIndex(ruExp(h.stmt.exps[0]), ass, acc);
+		});
+
+		ruDoForwardClosure(
+			seed_facts, seen0, idx0, hyp_index, fresher,
+			math, env, depth_limit, size_limit, 1
+		);
+	}
+
+	stats = RuStatsRow(
+		"forward closure: depth=" + i2s(depth_limit) + " size=" + i2s(ruIndexDataCount(result)),
+		pairs2tree([
+			Pair("size",        i2d(ruIndexDataCount(result))),
+			Pair("seed_size",   i2d(length(seed_facts))),
+			Pair("depth_limit", i2d(depth_limit)),
+			Pair("time",        ruTimePassed(t))
+		])
+	);
+	ruAddStats("forward_closure", stats);
+
+	result;
+}
+
+// Frontier loop: at each depth, expand every fact in the frontier by every
+// matching single-hypothesis assertion. New facts are added to the index and
+// become the next frontier.
+ruDoForwardClosure(
+	frontier    : [RuForwardFact],
+	seen        : Set<string>,
+	idx         : RuIndex<RuForwardFact>,
+	hyp_index   : RuIndex<RuAssertion>,
+	fresher     : (RuVar) -> RuVar,
+	math        : RuMath,
+	env         : RuEnv,
+	depth_limit : int,
+	size_limit  : int,
+	cur_depth   : int
+) -> RuIndex<RuForwardFact> {
+	if (cur_depth > depth_limit || length(frontier) == 0 || ruIndexDataCount(idx) >= size_limit) {
+		idx;
+	} else {
+		new_state = fold(frontier, RuForwardAcc(idx, seen, []), \st, fact -> {
+			if (ruIndexDataCount(st.idx) >= size_limit) st
+			else ruExpandFact(fact, st, hyp_index, fresher, math, env, cur_depth);
+		});
+		ruDoForwardClosure(
+			new_state.frontier, new_state.seen, new_state.idx,
+			hyp_index, fresher, math, env, depth_limit, size_limit, cur_depth + 1
+		);
+	}
+}
+
+RuForwardAcc(
+	idx      : RuIndex<RuForwardFact>,
+	seen     : Set<string>,
+	frontier : [RuForwardFact]
+);
+
+// Apply every matching single-hypothesis assertion to one fact, emitting new
+// facts where the application succeeds. Each application freshens the
+// assertion's vars to globally-unique ids first, so multiple applications of
+// the same assertion don't share var ids.
+ruExpandFact(
+	fact      : RuForwardFact,
+	st        : RuForwardAcc,
+	hyp_index : RuIndex<RuAssertion>,
+	fresher   : (RuVar) -> RuVar,
+	math      : RuMath,
+	env       : RuEnv,
+	new_depth : int
+) -> RuForwardAcc {
+	fold(ruIterAssertionsForFact(fact.exp, hyp_index, fresher, math, env), st, \st2, app -> {
+		if (ruIndexDataCount(st2.idx) >= 100000000) st2 else {
+			key = ruExpKey(app.new_exp);
+			if (containsSet(st2.seen, key)) st2 else {
+				new_fact = RuForwardFact(
+					app.new_exp,
+					new_depth,
+					RuFwApply(app.assertion_id, app.fresh_sub, app.step_sub, [fact.witness])
+				);
+				RuForwardAcc(
+					ruSetIndex(app.new_exp, new_fact, st2.idx),
+					insertSet(st2.seen, key),
+					arrayPush(st2.frontier, new_fact)
+				);
+			}
+		}
+	});
+}
+
+RuFwAppResult(
+	assertion_id : int,
+	fresh_sub    : RuSubst,
+	step_sub     : RuSubst,
+	new_exp      : RuExp
+);
+
+// For one fact, return every (assertion, fresh_sub, step_sub, new_conclusion)
+// from a successful unification. Freshening happens per-application so the
+// returned new_exp uses globally-unique var ids that won't clash with the rest
+// of the closure.
+ruIterAssertionsForFact(
+	fact_exp  : RuExp,
+	hyp_index : RuIndex<RuAssertion>,
+	fresher   : (RuVar) -> RuVar,
+	math      : RuMath,
+	env       : RuEnv
+) -> [RuFwAppResult] {
+	// First, head-symbol filter via the hyp_index trie. This returns
+	// (sub, assertion, hyp_exp) triples where the assertion's hyp unifies with
+	// the fact's exp under the returned sub. But that sub uses the assertion's
+	// original var ids — to give each application a fresh var namespace we
+	// redo unification with a freshened copy of the assertion.
+	candidates = ruUnifyIndex(fact_exp, hyp_index, ruEmptySubst, math, env);
+	filtermap(candidates, \u -> {
+		ass = u.data;
+		a_vars = set2array(ruAssertion2Vars(ass));
+		fresh_sub = ruMakeFresherSubst(a_vars, fresher);
+		fresh_hyp = ruApplySubst(ruExp(ruAssertionHyps(ass)[0].stmt.exps[0]), fresh_sub);
+		switch (ruUnifyExps([fresh_hyp, fact_exp], ruEmptySubst, math, env)) {
+			None(): None();
+			Some(step_sub): {
+				fresh_conc = ruApplySubst(ruExp(ruAssertionProp(ass).exps[0]), fresh_sub);
+				new_exp = ruApplySubst(fresh_conc, step_sub);
+				Some(RuFwAppResult(ass.info.id, fresh_sub, step_sub, new_exp));
+			}
+		}
+	});
+}
+
+// Spec for splicing: walk the witness, emit RuProofStep / RuProofHyp nodes,
+// composing σ_match with each level's fresh_sub and step_sub.
+ruSpliceForwardWitness(
+	witness   : RuFwWitness,
+	leaf_stmt : RuStmt,
+	match_sub : RuSubst,
+	math      : RuMath
+) -> RuProofTree {
+	switch (witness) {
+		RuFwPremise(idx):
+			RuProofHyp(idx, leaf_stmt);
+		RuFwApply(assertion_id, fresh_sub, step_sub, hyp_witnesses): {
+			switch (lookupTree(math.decls.assertions, assertion_id)) {
+				None(): {
+					// Assertion missing — splice as an unverifiable hyp ref.
+					// Should not happen in well-formed inputs.
+					RuProofHyp(-1, leaf_stmt);
+				}
+				Some(ass): {
+					hyps = ruAssertionHyps(ass);
+					child_proofs = mapi(hyp_witnesses, \i, child_w -> {
+						hyp_i = if (i < length(hyps)) hyps[i] else ruNoHyp;
+						raw = ruExp(hyp_i.stmt.exps[0]);
+						// Each level composes: fresh_sub binds A's original vars to
+						// per-application fresh ids; step_sub binds those fresh ids to
+						// subterms of the deeper fact; match_sub binds whatever
+						// remains free in the closure's final fact exp.
+						with_fresh = ruApplySubst(raw, fresh_sub);
+						with_step  = ruApplySubst(with_fresh, step_sub);
+						with_match = ruApplySubst(with_step, match_sub);
+						child_stmt = RuStmt(hyp_i.stmt with exps = [with_match]);
+						ruSpliceForwardWitness(child_w, child_stmt, match_sub, math);
+					});
+					RuProofStep(assertion_id, child_proofs, leaf_stmt);
+				}
+			}
+		}
+	}
+}
+
+ruAssertionHyps(ass : RuAssertion) -> [RuHyp] {
+	switch (ass) {
+		RuAxiom(__, infer):           infer.hyps;
+		RuTheorem(__, infer, __, __): infer.hyps;
+		RuDef(__, infer, __, __):     infer.hyps;
+	}
+}
+
+ruAssertionProp(ass : RuAssertion) -> RuStmt {
+	switch (ass) {
+		RuAxiom(__, infer):           infer.prop;
+		RuTheorem(__, infer, __, __): infer.prop;
+		RuDef(__, infer, __, __):     infer.prop;
+	}
+}
+
+// Deterministic structural key for dedup. O(|nodes|).
+ruExpKey(e : RuExp) -> string {
+	strGlue(map(e.nodes, \n -> switch (n) {
+		RuRuleNode(idType, arityLen): "r" + i2s(idType) + ":" + i2s(arityLen);
+		RuVar(id, type):              "v" + i2s(id) + ":" + i2s(type);
+	}), " ");
+}

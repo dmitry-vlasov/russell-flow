@@ -1,4 +1,5 @@
 import ru/prover/core/proofs;
+import ru/prover/core/forward_closure;
 
 export {
 	ruExpandHyp(hyp : RuProverHyp, prover_env : RuProverEnv) -> RuProverEnv;
@@ -131,6 +132,42 @@ ruExpandProp(prop : RuProverProp, prover_env : RuProverEnv) -> RuProverEnv {
 					ruAddProof(prop, hypProof, acc);
 				});
 				appendVector(hyp.proofs, top_proofs);
+				// Forward-closure splice: any leaf that unifies with a fact in the
+				// shallow forward closure can be closed here, without further
+				// backward expansion, by splicing the cached witness.
+				//
+				// Skip depth-0 matches: those are literal premise hits, already
+				// covered by unifyPremise above. Adding both would double-count
+				// in the proof cartesian product (ruAddProof) and burn time.
+				//
+				// Cap the number of splices per leaf so the per-prop cartesian
+				// product in ruAddProof stays bounded. Each splice creates one
+				// more proof for the leaf; with many splices and many siblings,
+				// the cartprod size explodes quickly.
+				fwd_unified_all = filter(prover_env.fns.unifyClosure(hyp), \u -> {
+					switch (u.data.witness) {
+						RuFwPremise(__):           false;
+						RuFwApply(__,__,__,__):    true;
+					}
+				});
+				// Prefer shallowest splices first: they produce the smallest proof
+				// subtrees, keeping ruAddProof's cartesian product manageable. The
+				// cap then trims the long tail without dropping the best candidates.
+				fwd_sorted = sortCustom(fwd_unified_all, \u -> u.data.depth, true);
+				fwd_cap = 4;
+				fwd_unified = if (length(fwd_sorted) > fwd_cap) take(fwd_sorted, fwd_cap) else fwd_sorted;
+				if (fwd_unified != []) {
+					fwd_proofs = makeVector(length(fwd_unified));
+					iter(fwd_unified, \unif -> {
+						all_exps = mapi(exs, \j, ex_j -> if (j == 0) unif.expr else ruApplySubst(ex_j, unif.sub));
+						closing_stmt = RuStmt(h.stmt with exps = all_exps);
+						spliced = ruSpliceForwardWitness(unif.data.witness, closing_stmt, unif.sub, prover_env.math);
+						fwdProof = RuProverProofForward(hyp, closing_stmt, unif.sub, spliced);
+						pushVector(fwd_proofs, fwdProof);
+						ruAddProof(prop, fwdProof, acc);
+					});
+					appendVector(hyp.proofs, fwd_proofs);
+				}
 				t2 = ruMakeTimer();
 				ret = ruExpandHyp(hyp, acc);
 				if (ruOptsString(prover_env.env.conf.opts, "reprove-stats", "") == "1") {
