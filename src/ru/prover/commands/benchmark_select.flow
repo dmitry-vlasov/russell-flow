@@ -27,9 +27,10 @@ ruCommBenchmarkSelect = RuComm(
 		"select a stratified benchmark set of theorems for proof compression evaluation",
 		"file", false, false,
 		[
-			RuCommArg("file", true, "output JSON file for the benchmark set", "benchmark.json"),
-			RuCommArg("size", true, "total number of theorems to select", "200"),
-			RuCommArg("seed", true, "random seed for reproducibility", "42"),
+			RuCommArg("file",    true, "output JSON file for the benchmark set", "benchmark.json"),
+			RuCommArg("size",    true, "total number of theorems to select", "200"),
+			RuCommArg("seed",    true, "random seed for reproducibility", "42"),
+			RuCommArg("dataset", true, "named dataset within the file (empty string = 'default')", ""),
 		], []
 	),
 	ruRunBenchmarkSelect
@@ -43,9 +44,11 @@ ruRunBenchmarkSelect(unit : RuUnit) -> Maybe<RuState> {
 	math  = ruMathFromSources(state.ru, env);
 	timer = ruMakeTimer();
 
-	file = ruTaskStringArg(task, "file", "benchmark.json");
-	size = ruTaskIntArg(task, "size", 200);
-	seed = ruTaskIntArg(task, "seed", 42);
+	file    = ruTaskStringArg(task, "file", "benchmark.json");
+	size    = ruTaskIntArg(task, "size", 200);
+	seed    = ruTaskIntArg(task, "seed", 42);
+	ds_arg  = ruTaskStringArg(task, "dataset", "");
+	ds_name = if (ds_arg == "") "default" else ds_arg;
 
 	all_theorems = getTreeValues(ruDeclsTheorems(math.decls));
 	// exclude trivial 1-step proofs: they cannot be compressed
@@ -56,7 +59,8 @@ ruRunBenchmarkSelect(unit : RuUnit) -> Maybe<RuState> {
 	if (ruVerbose(conf) > 0) {
 		env.out.println(
 			"benchmark-select: " + i2s(length(non_trivial)) + " eligible theorems, " +
-			"selected " + i2s(length(selected)) + " across " + i2s(length(ruBenchmarkBuckets)) + " buckets"
+			"selected " + i2s(length(selected)) + " across " + i2s(length(ruBenchmarkBuckets)) + " buckets" +
+			" into dataset '" + ds_name + "'"
 		);
 		if (ruVerbose(conf) > 1) {
 			iter(ruBenchmarkBuckets, \b -> {
@@ -69,24 +73,45 @@ ruRunBenchmarkSelect(unit : RuUnit) -> Maybe<RuState> {
 
 	ru_root = ruOptsString(conf.opts, "ru-root", ".");
 	names   = map(selected, \th -> id2s(th.info.id));
+	path    = if (isAbsolutePath(file)) file else pathCombine(ru_root, file);
 
-	json_val = JsonObject([
-		Pair("source",   JsonString(ru_root)),
+	// Read existing datasets from file (if any) so we can merge rather than overwrite.
+	existing_datasets : Tree<string, Json> = {
+		if (fileExists(path)) {
+			existing = parseJsonSafe(getFileContent(path));
+			ds_root = getJsonFieldValue(existing, "datasets", JsonNull());
+			if (ds_root != JsonNull()) {
+				switch (ds_root) {
+					JsonObject(fields): fold(fields, makeTree(), \acc, p -> setTree(acc, p.first, p.second));
+					default: makeTree();
+				}
+			} else makeTree();
+		} else makeTree();
+	};
+
+	new_dataset = JsonObject([
 		Pair("seed",     JsonDouble(i2d(seed))),
 		Pair("size",     JsonDouble(i2d(length(selected)))),
 		Pair("theorems", JsonArray(map(names, \s -> JsonString(s))))
 	]);
+	merged_datasets = setTree(existing_datasets, ds_name, new_dataset);
+	datasets_json   = JsonObject(map(tree2pairs(merged_datasets), \p -> Pair(p.first, p.second)));
 
-	path = if (isAbsolutePath(file)) file else pathCombine(ru_root, file);
+	json_val = JsonObject([
+		Pair("source",   JsonString(ru_root)),
+		Pair("datasets", datasets_json)
+	]);
+
 	if (!setFileContent(path, json2stringFormatted(json_val))) {
 		env.out.println("benchmark-select: failed to write to " + path);
 	} else if (ruVerbose(conf) > 0) {
-		env.out.println("benchmark-select: saved to " + path + " in " + ruTimePassed2s(timer));
+		env.out.println("benchmark-select: saved dataset '" + ds_name + "' to " + path + " in " + ruTimePassed2s(timer));
 	}
 
 	Some(RuState(state with
 		vars = setTree(state.vars, "benchmark-select", pairs2tree([
 			Pair("file",     flow(path)),
+			Pair("dataset",  flow(ds_name)),
 			Pair("size",     flow(length(selected))),
 			Pair("theorems", flow(names))
 		]))
