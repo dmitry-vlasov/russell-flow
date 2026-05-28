@@ -1,1 +1,1 @@
-vsce package -o '../russell.vsix'
+npx @vscode/vsce package -o '../russell.vsix'
