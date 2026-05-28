@@ -92,11 +92,15 @@ Uses `clang++` with mimalloc; requires Flow9's C++ backend.
 
 ## VSCode extension
 
-A VSCode extension for Russell syntax highlighting and language server features is in `resources/vscode/`. Install the `.vsix` file directly in VSCode:
+A VSCode extension for Russell syntax highlighting and language server features is in `resources/vscode/`. Build and install it:
 
+```bash
+cd resources/vscode/russell && npm install && bash build.sh
+# produces resources/vscode/russell.vsix
+code --install-extension resources/vscode/russell.vsix
 ```
-Extensions → ··· → Install from VSIX → resources/russell.vsix
-```
+
+Or from the VSCode UI: Extensions → ··· → Install from VSIX → `resources/vscode/russell.vsix`.
 
 The extension starts `russell_lsp` automatically when you open a `.ru` file. It uses a bash login shell internally, so `RUSSELL_HOME/bin` must be on `PATH` in `~/.bashrc` (see [Quick start](#quick-start)). No additional extension settings are required.
 
