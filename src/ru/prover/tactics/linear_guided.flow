@@ -1,49 +1,183 @@
-import ru/prover/core/controls;
-import ru/prover/core/tree;
 import ru/prover/core/env;
-import ru/subst;
+import ru/prover/tactics/subproof_replay;
+import ru/prover/tactics/follow_proof;
+import ru/prover/tactics/combinators;
+import ru/unify/index;
 
 export {
-	// A tactic that prioritizes expanding fragment-matched propositions whose
-	// every hypothesis expression directly unifies with a current theorem premise
-	// ("complete" fragment applications). These correspond to the user's concept
-	// of a "linear chain from goal to premises": the fragment is a path in an
-	// existing proof, and all its leaves are already available as premises of the
-	// theorem being proved, so the chain closes the subgoal in one shot.
+	// Linear-guided tactic: finds corpus proofs that linearly connect the
+	// current goal to one of the theorem's premises and replays the spine.
 	//
-	// When no complete fragment is found, falls back to expanding all leaves (BFS).
+	// Algorithm:
+	//   R  = corpus steps whose conclusion unifies with the current goal G
+	//   L  = corpus steps whose conclusion unifies with any theorem premise p
+	//        (precomputed once at tactic-construction time)
+	//   For each (a, b) in R x L with the same theorem and a.idx > b.idx:
+	//     extract the spine from a to b (off-spine refs become open goals),
+	//     then replay it via bounded follow-proof.
 	//
-	// penv must already be fully initialised (ruInitProverEnvWithFrags called).
-	ruLinearGuidedTactic(max_depth : int, max_size : int, penv : RuProverEnv) -> RuProverTactic;
+	// The spine from a to b is unique (proof is a tree); at least one branch
+	// of the replay is guaranteed to close (it reaches b whose conclusion
+	// matches premise p).  Remaining open goals are handled by the outer
+	// combinator (typically a BFS fallback).
+	//
+	// `prem_exprs` — expressions of the theorem's premises (th.infer.hyps),
+	//               extracted from penv.conf.task.premises by the DSL builder.
+	ruLinearGuidedTactic(
+		step_index : RuIndex<Pair<int,int>>,
+		max_size   : int,
+		attempts   : int,
+		exclude    : int,
+		prem_exprs : [RuExp],
+		math       : RuMath,
+		env        : RuEnv
+	) -> RuProverTactic;
 }
 
-ruLinearGuidedTactic(max_depth : int, max_size : int, penv : RuProverEnv) -> RuProverTactic {
-	fns       = penv.fns;
-	frag_trees = penv.fragmentTrees;
+// Extract the spine of the proof tree from step i_a (root, matches goal) to
+// step i_b (leaf, matches premise).  Off-spine step refs become
+// RuProofHyp(-1, stmt) open goals; hyp refs keep their original index.
+// Returns None() when i_b is not reachable from i_a.
+ruExtractSpine(th : RuTheorem, i_a : int, i_b : int) -> Maybe<RuProofTree> {
+	if (i_a == i_b) None()
+	else {
+		step   = th.proof.steps[i_a];
+		result : ref Maybe<RuProofTree> = ref None();
+		iteri(step.refs, \k, rf -> {
+			if (^result != None()) {}
+			else switch (rf) {
+				RuHypRef(__): {};
+				RuStepRef(j): {
+					if (j >= i_b) {
+						spine_child_opt : Maybe<RuProofTree> =
+							if (j == i_b)
+								Some(RuProofHyp(-1, th.proof.steps[j].stmt))
+							else
+								ruExtractSpine(th, j, i_b);
+						switch (spine_child_opt) {
+							None(): {};
+							Some(spine_child): {
+								children = mapi(step.refs, \k2, rf2 ->
+									if (k2 == k) spine_child
+									else switch (rf2) {
+										RuHypRef(h): RuProofHyp(h, th.infer.hyps[h].stmt);
+										RuStepRef(j2): RuProofHyp(-1, th.proof.steps[j2].stmt);
+									}
+								);
+								result := Some(RuProofStep(step.assertion, children, step.stmt))
+							}
+						}
+					}
+				}
+			}
+		});
+		^result
+	}
+}
 
-	// Returns true when prop is a fragment-backed proposition AND every one of
-	// its instantiated hypothesis expressions matches a current theorem premise.
-	is_complete_frag = \prop : RuProverProp -> {
-		switch (lookupTree(frag_trees, prop.assertion.info.id)) {
-			None(): false;
-			Some(__):
-				forall(prop.assertion.infer.hyps, \h -> {
-					// Instantiate the hypothesis expression the same way ruExpandProp does.
-					exp = ruApplySubst(ruApplySubst(ruExp(h.stmt.exps[0]), prop.sub), prop.outer);
-					fns.matchesPremise(exp)
-				})
+// Find spine candidates for a given leaf goal expression.
+// Applies the shallow-substitution filter on R (same as SPR) and returns
+// up to max_spines valid RuProofStep spines.
+ruFindLinearSpines(
+	leaf_exp   : RuExp,
+	l_pairs    : [Pair<int,int>],
+	step_index : RuIndex<Pair<int,int>>,
+	exclude    : int,
+	max_spines : int,
+	math       : RuMath,
+	env        : RuEnv
+) -> [RuProofStep] {
+	leaf_len = length(leaf_exp.nodes);
+	r_all    = ruUnifyIndex(leaf_exp, step_index, ruEmptySubst, math, env);
+	// Shallow-substitution filter + self-exclusion, same as SPR.
+	r_cands  = filter(r_all, \unif -> {
+		subst_len = foldHashMap(unif.sub.map, 0, \__, se, acc -> acc + length(se.exp.nodes));
+		leaf_len >= subst_len && unif.data.first != exclude
+	});
+	take(filtermap(r_cands, \r_unif -> {
+		r_th_id = r_unif.data.first;
+		r_idx   = r_unif.data.second;
+		// Find a premise match in the same theorem with a lower step index
+		// (topological order: i_b < i_a means b is in a's subtree).
+		switch (find(l_pairs, \b -> b.first == r_th_id && b.second < r_idx)) {
+			None(): None();
+			Some(b): switch (lookupTree(math.decls.assertions, r_th_id)) {
+				None(): None();
+				Some(ass): switch (ass) {
+					RuTheorem(__,__,__,__): switch (ruExtractSpine(ass, r_idx, b.second)) {
+						None(): None();
+						Some(spine): switch (spine) {
+							RuProofStep(assertion, children, stmt):
+								Some(RuProofStep(assertion, children, stmt));
+							RuProofHyp(__,__): None();
+						}
+					}
+					default: None()
+				}
+			}
+		}
+	}), max_spines)
+}
+
+ruLinearGuidedTactic(
+	step_index : RuIndex<Pair<int,int>>,
+	max_size   : int,
+	attempts   : int,
+	exclude    : int,
+	prem_exprs : [RuExp],
+	math       : RuMath,
+	env        : RuEnv
+) -> RuProverTactic {
+	lgt_max_size = max_size / 2;
+
+	// Precompute L once: all (th_id, step_idx) pairs from the corpus whose
+	// conclusion matches any theorem premise, filtered by shallow substitution.
+	l_pairs : [Pair<int,int>] = concatA(map(prem_exprs, \pe -> {
+		prem_len = length(pe.nodes);
+		if (prem_len == 0) []
+		else {
+			matches = ruUnifyIndex(pe, step_index, ruEmptySubst, math, env);
+			filtermap(matches, \unif -> {
+				subst_len = foldHashMap(unif.sub.map, 0, \__, se, acc -> acc + length(se.exp.nodes));
+				if (prem_len >= subst_len && unif.data.first != exclude)
+					Some(unif.data)
+				else None()
+			})
+		}
+	}));
+
+	pending_spines     : ref [RuProofStep] = ref [];
+	attempts_remaining : ref int           = ref attempts;
+
+	driver = \tree -> {
+		if (length(^(tree.proofs)) > 0) None()
+		else if (length(^pending_spines) > 0) {
+			s = (^pending_spines)[0];
+			pending_spines := tail(^pending_spines);
+			Some(ruBoundedFollowProofTactic(s, lgt_max_size))
+		} else if (^attempts_remaining <= 0 || l_pairs == []) None()
+		else {
+			// Scan leaves deepest-first; try each until we find a spine.
+			leaves = sortCustom(getTreeValues(tree.leafs), \leaf -> ruSprPropDepth(leaf), false);
+			found  : ref Maybe<RuProofStep> = ref None();
+			iter(leaves, \leaf -> {
+				if (^found != None() || ^attempts_remaining <= 0) {}
+				else {
+					attempts_remaining := ^attempts_remaining - 1;
+					leaf_exp = ruExp(leaf.parent.stmt.exps[0]);
+					spines   = ruFindLinearSpines(leaf_exp, l_pairs, step_index, exclude, attempts, math, env);
+					if (spines != []) {
+						pending_spines := tail(spines);
+						found := Some(spines[0])
+					}
+				}
+			});
+			switch (^found) {
+				Some(spine): Some(ruBoundedFollowProofTactic(spine, lgt_max_size));
+				None(): { attempts_remaining := 0; None() }
+			}
 		}
 	};
 
-	keep = ruDeltaKeepExpanding(max_depth, max_size);
-	RuProverTactic("linear-guided", "linear-guided",
-		\tree ->
-			if (!keep(tree)) RuTacticDone()
-			else {
-				leaves = getTreeValues(tree.leafs);
-				complete = filter(leaves, is_complete_frag);
-				RuTacticExpand(if (complete != []) complete else leaves)
-			},
-		keep
-	)
+	ruIterateTactic(driver)
 }
