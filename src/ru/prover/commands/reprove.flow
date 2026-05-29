@@ -32,6 +32,7 @@ ruCommReprove = RuComm(
 			RuCommArg("tactic",         true, "tactic DSL expression; if empty, bounded-bfs(max-depth, max-size) is used",     ""),
 			RuCommArg("strict-fail",    true, "set to 1 to crash if any theorem could not be reproved (CI / regression mode)", "0"),
 			RuCommArg("coverage",       true, "set to 1 to measure proof-step coverage from the search tree inline",           "0"),
+			RuCommArg("parallel",       true, "set to 1 to run theorems in parallel (faster for oracle/replay tactics that do not use the internal concurrent prover)", "0"),
 		], []
 	),
 	ruRunReprove
@@ -140,25 +141,31 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 				RuMappedDecl(true, false, decl);
 			};
 
-			// Proving is internally concurrent (ruProve uses ruConcurrent); running
-			// multiple theorems concurrently at the outer level causes nested
-			// thread-pool contention. Force sequential outer traversal via -seq.
-			// Scale the total budget by min(n, nProc) so that each theorem gets
-			// per_th_ms * min(n, nProc) / n ≈ per_th_ms / density — the same budget
-			// the old concurrent dispatch provided (time * nProc / n), without OOM.
-			n_theorems     = length(filter(ruTargetDecls(target, math, env), ruDeclIsTheorem));
-			n_par          = availableProcessors();
-			computed_total = per_th_ms * i2d(min(max(1, n_theorems), n_par));
-			job_limit_str  = ruTaskStringArg(task, "job-time-limit", "");
-			total_ms       = if (job_limit_str != "" && job_limit_str != "no") min(computed_total, ruParseTime(job_limit_str)) else computed_total;
-			seq_task = RuTask(task with args =
-				setTree(
-					setTree(task.args, "target", ruTaskStringArg(task, "target", "all") + "-seq"),
-					"time-limit", ruTime2s(total_ms)
+			// parallel=1: lightweight tactics (oracle, replay) that do not use the
+			// internal concurrent prover can safely run theorems in parallel — just
+			// pass the task through unchanged.
+			//
+			// parallel=0 (default): ruProve uses ruConcurrent internally; running
+			// multiple theorems concurrently causes nested thread-pool contention.
+			// Force sequential outer traversal via -seq and scale the total budget
+			// so each theorem gets per_th_ms * min(n, nProc) / n ≈ per_th_ms at
+			// full parallelism — the same throughput without OOM.
+			run_parallel  = ruTaskIntArg(task, "parallel", 0) > 0;
+			dispatch_task = if (run_parallel) task else {
+				n_theorems     = length(filter(ruTargetDecls(target, math, env), ruDeclIsTheorem));
+				n_par          = availableProcessors();
+				computed_total = per_th_ms * i2d(min(max(1, n_theorems), n_par));
+				job_limit_str  = ruTaskStringArg(task, "job-time-limit", "");
+				total_ms       = if (job_limit_str != "" && job_limit_str != "no") min(computed_total, ruParseTime(job_limit_str)) else computed_total;
+				RuTask(task with args =
+					setTree(
+						setTree(task.args, "target", ruTaskStringArg(task, "target", "all") + "-seq"),
+						"time-limit", ruTime2s(total_ms)
+					)
 				)
-			);
+			};
 			new_state = ruMapFnComm(
-				RuUnit(seq_task, state, env.out),
+				RuUnit(dispatch_task, state, env.out),
 				RuMapFn(
 					RuMapFnInfo(
 						"reprove",
