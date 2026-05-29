@@ -32,6 +32,10 @@ export {
 		math       : RuMath,
 		env        : RuEnv
 	) -> RuProverTactic;
+
+	// Static analysis helpers — used by the find-linear-examples command.
+	ruExtractSpine(th : RuTheorem, i_a : int, i_b : int) -> Maybe<RuProofTree>;
+	ruSpineDepth(spine : RuProofTree) -> int;
 }
 
 // Extract the spine of the proof tree from step i_a (root, matches goal) to
@@ -75,9 +79,20 @@ ruExtractSpine(th : RuTheorem, i_a : int, i_b : int) -> Maybe<RuProofTree> {
 	}
 }
 
+// Count steps in the spine chain from root to the RuProofHyp(-1,...) leaf.
+ruSpineDepth(spine : RuProofTree) -> int {
+	switch (spine) {
+		RuProofHyp(__,__): 0;
+		RuProofStep(__,children,__): {
+			1 + fold(children, 0, \acc, ch -> max(acc, ruSpineDepth(ch)))
+		}
+	}
+}
+
 // Find spine candidates for a given leaf goal expression.
 // Applies the shallow-substitution filter on R (same as SPR) and returns
 // up to max_spines valid RuProofStep spines.
+// When env.conf.verbose >= 2, logs each discovered spine with its depth.
 ruFindLinearSpines(
 	leaf_exp   : RuExp,
 	l_pairs    : [Pair<int,int>],
@@ -94,26 +109,37 @@ ruFindLinearSpines(
 		subst_len = foldHashMap(unif.sub.map, 0, \__, se, acc -> acc + length(se.exp.nodes));
 		leaf_len >= subst_len && unif.data.first != exclude
 	});
+	verbose = ruVerbose(env.conf) >= 2;
 	take(filtermap(r_cands, \r_unif -> {
 		r_th_id = r_unif.data.first;
 		r_idx   = r_unif.data.second;
-		// Find a premise match in the same theorem with a lower step index
-		// (topological order: i_b < i_a means b is in a's subtree).
-		switch (find(l_pairs, \b -> b.first == r_th_id && b.second < r_idx)) {
+		// Try ALL matching L's for this R (not just the first) — only some will be
+		// structurally reachable via ruExtractSpine.
+		l_for_r = filter(l_pairs, \b -> b.first == r_th_id && b.second < r_idx);
+		switch (lookupTree(math.decls.assertions, r_th_id)) {
 			None(): None();
-			Some(b): switch (lookupTree(math.decls.assertions, r_th_id)) {
-				None(): None();
-				Some(ass): switch (ass) {
-					RuTheorem(__,__,__,__): switch (ruExtractSpine(ass, r_idx, b.second)) {
+			Some(ass): switch (ass) {
+				RuTheorem(__,__,__,__): {
+					spines = filtermap(l_for_r, \b -> switch (ruExtractSpine(ass, r_idx, b.second)) {
 						None(): None();
 						Some(spine): switch (spine) {
-							RuProofStep(assertion, children, stmt):
-								Some(RuProofStep(assertion, children, stmt));
+							RuProofStep(assertion, children, stmt): Some(RuProofStep(assertion, children, stmt));
 							RuProofHyp(__,__): None();
 						}
+					});
+					if (spines == []) None()
+					else {
+						if (verbose) {
+							d = ruSpineDepth(spines[0]);
+							env.out.println(
+								"  linear-guided: spine in '" + id2s(ass.info.id) +
+								"' r_idx=" + i2s(r_idx) + " depth=" + i2s(d)
+							);
+						}
+						Some(spines[0])
 					}
-					default: None()
 				}
+				default: None()
 			}
 		}
 	}), max_spines)
