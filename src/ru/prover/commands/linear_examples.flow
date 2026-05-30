@@ -1,0 +1,172 @@
+import ru/prover/tactics/linear_guided;
+import ru/util/src;
+import ru/util/utils;
+import ru/util/target;
+import comm;
+
+export {
+	ruCommFindLinearExamples : RuComm;
+}
+
+ruCommFindLinearExamples = RuComm(
+	RuCommInfo(
+		"find-linear-examples", "prover",
+		"find theorems where a corpus spine of given depth connects goal to a premise (offline analysis)",
+		"target", true, false,
+		[
+			RuCommArg("target",               true,  "the target: a theorem, file or all",                                "all"),
+			RuCommArg("min-depth",            true,  "minimum spine depth to report",                                    "6"),
+			RuCommArg("max-depth",            true,  "maximum spine depth to report",                                    "9"),
+			RuCommArg("max-results",          true,  "stop after this many candidate theorems",                          "10"),
+			RuCommArg("max-chains-per-th",    true,  "max chains to collect per theorem",                                "3"),
+			RuCommArg("min-target-steps",     true,  "only report targets whose own proof has >= this many steps",       "1"),
+			RuCommArg("min-goal-nodes",       true,  "skip targets whose goal expression has < this many nodes (avoids trivially-general goals)", "1"),
+			RuCommArg("min-index-rule-nodes", true,  "min rule-node count for step index entries (1 = index all steps)", "1"),
+		], []
+	),
+	ruRunFindLinearExamples
+);
+
+ruRunFindLinearExamples(unit : RuUnit) -> Maybe<RuState> {
+	env   = ruUnitEnv(unit);
+	task  = unit.task;
+	state = unit.state;
+	math  = ruMathFromSources(state.ru, env);
+	target = ruDetermineTarget(task, math, env);
+	if (target == RuTargetNone()) {
+		env.out.println("find-linear-examples: no target");
+		Some(state);
+	} else {
+		min_depth      = ruTaskIntArg(task, "min-depth",            6);
+		max_depth      = ruTaskIntArg(task, "max-depth",            9);
+		max_results    = ruTaskIntArg(task, "max-results",          10);
+		max_chains     = ruTaskIntArg(task, "max-chains-per-th",    3);
+		min_tgt_steps  = ruTaskIntArg(task, "min-target-steps",     1);
+		min_goal_nodes = ruTaskIntArg(task, "min-goal-nodes",       1);
+		min_rule_nodes = ruTaskIntArg(task, "min-index-rule-nodes", 1);
+
+		env.out.println("find-linear-examples: building step index (min-rule-nodes=" + i2s(min_rule_nodes) + ")...");
+		step_index = ruBuildStepIndex(math, min_rule_nodes);
+		env.out.println("find-linear-examples: scanning theorems for depth-" +
+			i2s(min_depth) + ".." + i2s(max_depth) + " chains...");
+
+		theorems = filter(
+			getTreeValues(ruDeclsTheorems(math.decls)),
+			\th -> ruTargetPredicate(target)(th) && ruTheoremIsProved(th)
+		);
+		found_count : ref int = ref 0;
+		scanned     : ref int = ref 0;
+
+		iter(theorems, \th -> {
+			if (^found_count >= max_results) {}
+			else {
+				scanned := ^scanned + 1;
+				tgt_steps  = length(th.proof.steps);
+				goal_nodes = length(ruExp(ruProofQedStep(th.proof).stmt.exps[0]).nodes);
+				// Filter trivially-general goals and too-small targets before the expensive scan.
+				if (tgt_steps < min_tgt_steps || goal_nodes < min_goal_nodes) {}
+				else {
+					chains = ruLinearChainsForTh(th, step_index, min_depth, max_depth, max_chains, math, env);
+					if (chains != []) {
+						found_count := ^found_count + 1;
+						env.out.println("\n=== " + id2s(th.info.id) +
+							"  (own proof: " + i2s(tgt_steps) + " steps, goal_nodes=" + i2s(goal_nodes) + ") ===");
+						iter(chains, \c -> {
+							corpus_name = switch (lookupTree(math.decls.assertions, c.corpus_th_id)) {
+								Some(ass): switch (ass) { RuTheorem(info,__,__,__): id2s(info.id); default: i2s(c.corpus_th_id); };
+								None(): i2s(c.corpus_th_id);
+							};
+							env.out.println(
+								"  corpus=" + corpus_name +
+								"  r_idx=" + i2s(c.corpus_r_idx) +
+								"  l_idx=" + i2s(c.corpus_l_idx) +
+								"  depth=" + i2s(c.depth)
+							);
+						})
+					}
+				}
+			}
+		});
+		env.out.println("\nScanned " + i2s(^scanned) + " theorems, found " +
+			i2s(^found_count) + " with depth-" + i2s(min_depth) + ".." + i2s(max_depth) + " chains.");
+		Some(state)
+	}
+}
+
+RuLinearChainDesc(
+	corpus_th_id : int,
+	corpus_r_idx : int,
+	corpus_l_idx : int,
+	prem_idx     : int,
+	depth        : int
+);
+
+ruLinearChainsForTh(
+	th         : RuTheorem,
+	step_index : RuIndex<Pair<int,int>>,
+	min_depth  : int,
+	max_depth  : int,
+	max_chains : int,
+	math       : RuMath,
+	env        : RuEnv
+) -> [RuLinearChainDesc] {
+	exclude  = th.info.id;
+	qed      = ruProofQedStep(th.proof);
+	goal_exp = ruExp(qed.stmt.exps[0]);
+	goal_len = length(goal_exp.nodes);
+	if (goal_len == 0) []
+	else {
+		r_all   = ruUnifyIndex(goal_exp, step_index, ruEmptySubst, math, env);
+		r_cands = filter(r_all, \u -> {
+			subst_len = foldHashMap(u.sub.map, 0, \__, se, acc -> acc + length(se.exp.nodes));
+			goal_len >= subst_len && u.data.first != exclude
+		});
+		l_total : [RuUnified<Pair<int,int>>] = concatA(mapi(th.infer.hyps, \pi, hyp -> {
+			pe      = ruExp(hyp.stmt.exps[0]);
+			pem_len = length(pe.nodes);
+			if (pem_len == 0) []
+			else {
+				matches = ruUnifyIndex(pe, step_index, ruEmptySubst, math, env);
+				filter(matches, \u -> {
+					subst_len = foldHashMap(u.sub.map, 0, \__, se, acc -> acc + length(se.exp.nodes));
+					pem_len >= subst_len && u.data.first != exclude
+				})
+			}
+		}));
+		if (l_total == []) []
+		else {
+			chains : ref [RuLinearChainDesc] = ref [];
+			iter(r_cands, \r -> {
+				if (length(^chains) >= max_chains) {}
+				else {
+					l_for_r = filter(l_total, \l ->
+						l.data.first == r.data.first && l.data.second < r.data.second
+					);
+					switch (lookupTree(math.decls.assertions, r.data.first)) {
+						None(): {};
+						Some(ass): switch (ass) {
+							RuTheorem(__,__,__,__): {
+								iter(l_for_r, \l -> {
+									if (length(^chains) >= max_chains) {}
+									else switch (ruExtractSpine(ass, r.data.second, l.data.second)) {
+										None(): {};
+										Some(spine): {
+											d = ruSpineDepth(spine);
+											if (d >= min_depth && d <= max_depth)
+												chains := arrayPush(^chains,
+													RuLinearChainDesc(
+														r.data.first, r.data.second,
+														l.data.second, 0, d))
+										}
+									}
+								})
+							}
+							default: {}
+						}
+					}
+				}
+			});
+			^chains
+		}
+	}
+}
