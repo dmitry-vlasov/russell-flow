@@ -106,7 +106,7 @@ print ("mm read: " + read-mm.size + " files in " + time2s(read-mm.time));
 | Task | Description |
 |------|-------------|
 | `reprove [target=...] [tactic="..."] [...]` | Universal reprove command — runs a tactic supplied via the DSL (default: bounded BFS). See [tactics-language.md](tactics-language.md). |
-| `reprove-compress [target=...] [...]` | Per-step proof compression (replaces a step's proof with a shorter one when found). |
+| `compress [target=...] [...]` | Per-step proof compression (replaces a step's proof with a shorter one when found). |
 | `autoprove [target=...]` | Attempt fully automated proof search. |
 
 The `target` parameter can be:

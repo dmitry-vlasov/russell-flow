@@ -93,6 +93,8 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 			reproved_ids    : ref [int] = ref [];
 			total_steps     : ref int = ref 0;
 			covered_steps   : ref int = ref 0;
+			full_cov_count  : ref int = ref 0;   // theorems whose original proof is 100% covered
+			gap_count       : ref int = ref 0;   // 100% covered but NOT reproved — engine-gap signal
 			// Outer traversal is sequential (-seq target), so a plain ref Set is safe.
 			// Count each theorem's coverage only on its first attempt; retries are skipped
 			// to avoid inflating the denominator when fast-failing theorems get many retries.
@@ -104,6 +106,8 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 			push_reproved   = ruAtomicRefArrayPush(reproved_ids);
 			add_total       = ruAtomicIntInc(total_steps);
 			add_covered     = ruAtomicIntInc(covered_steps);
+			inc_full_cov    = ruAtomicIntInc(full_cov_count);
+			inc_gap         = ruAtomicIntInc(gap_count);
 
 			reprove_fn = \decl, time_limit, env1 -> {
 				th = cast(decl : RuDecl -> RuTheorem);
@@ -143,8 +147,17 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 						covered_th_ids := insertSet(^covered_th_ids, th.info.id);
 						orig_tree = ruTheoremProofTree(th, math);
 						cov = ruAlignProofWithTree(orig_tree, vector2array(penv.tree.root.children));
-						add_total(ruCoverageStepCount(cov));
-						add_covered(ruCoveredStepCount(cov));
+						tot = ruCoverageStepCount(cov);
+						covd = ruCoveredStepCount(cov);
+						add_total(tot);
+						add_covered(covd);
+						// full-covered = every original step explored; gap = fully
+						// covered yet not reproved (the engine found the skeleton but
+						// could not assemble a proof — an engine-gap signal, formerly
+						// measure-coverage's distinguishing output).
+						full_covered = tot > 0 && covd == tot;
+						if (full_covered) inc_full_cov(1);
+						if (full_covered && !reproved) inc_gap(1);
 					}
 				}
 				RuMappedDecl(true, false, decl);
@@ -206,7 +219,10 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 				n_tot = ^total_steps;
 				n_cov = ^covered_steps;
 				pct = if (n_tot > 0) d2s(i2d(n_cov) / i2d(n_tot) * 100.0) else "0.0";
-				env.out.println("reprove: coverage: " + i2s(n_cov) + "/" + i2s(n_tot) + " steps (" + pct + "%)");
+				env.out.println("reprove: coverage: " + i2s(n_cov) + "/" + i2s(n_tot) + " steps (" + pct + "%)" +
+					", fully covered: " + i2s(^full_cov_count) +
+					", coverage/proof gap: " + i2s(^gap_count) +
+					(if (^gap_count > 0) "  <<< fully covered but NOT reproved (engine gap)" else ""));
 			}
 			if (ruTaskIntArg(task, "strict-fail", 0) > 0 && not_reproved != []) {
 				ruCrash("reprove: strict-fail: " + i2s(length(not_reproved)) + " theorem(s) failed to reprove");
@@ -216,9 +232,11 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 				n_tot = ^total_steps;
 				n_cov = ^covered_steps;
 				[
-					Pair("covered-steps", flow(n_cov)),
-					Pair("total-steps",   flow(n_tot)),
-					Pair("coverage-pct",  flow(if (n_tot > 0) i2d(n_cov) / i2d(n_tot) * 100.0 else 0.0))
+					Pair("covered-steps",  flow(n_cov)),
+					Pair("total-steps",    flow(n_tot)),
+					Pair("coverage-pct",   flow(if (n_tot > 0) i2d(n_cov) / i2d(n_tot) * 100.0 else 0.0)),
+					Pair("full-cov-count", flow(^full_cov_count)),
+					Pair("gap-count",      flow(^gap_count))
 				]
 			} else [];
 
