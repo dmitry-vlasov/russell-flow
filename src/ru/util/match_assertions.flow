@@ -1,6 +1,7 @@
 import ru/unify/index;
 import ru/prover/core/util;
 import ru/unify/prod;
+import ru/verify/theorem;
 
 export {
 	RuAssertionMatch(
@@ -12,7 +13,12 @@ export {
 	ruMatchAssertions(a1 : RuAssertion, a2 : RuAssertion, math : RuMath, env : RuEnv) -> Maybe<RuAssertionMatch>;
 
 	// Replace all occurrences of less with more general
-	ruReplaceMatch(match : RuAssertionMatch, math : RuMath, name2thms : Tree<int, Set<int>>, env : RuEnv) -> RuMath;
+	// Rewrite every theorem that uses `match.less` to call the more-general
+	// `match.more` instead. Returns Some(math) only if EVERY rewritten user still
+	// verifies; None if any rewrite would be unsound (e.g. `match.more` needs
+	// disjoint-variable conditions the user lacks), so the caller can keep
+	// `match.less` rather than produce a disproved corpus.
+	ruReplaceMatch(match : RuAssertionMatch, math : RuMath, name2thms : Tree<int, Set<int>>, env : RuEnv) -> Maybe<RuMath>;
 	ruAssertionsMatch2s(match : RuAssertionMatch, math : RuMath) -> string;
 }
 
@@ -95,33 +101,51 @@ ruCheckAssertionsMatch(match : RuAssertionMatch, math : RuMath, env : RuEnv) -> 
 	);
 }
 
-ruReplaceMatch(match : RuAssertionMatch, math : RuMath, name2uses : Tree<int, Set<int>>, env : RuEnv) -> RuMath {
+ruReplaceMatch(match : RuAssertionMatch, math : RuMath, name2uses : Tree<int, Set<int>>, env : RuEnv) -> Maybe<RuMath> {
+	// The more-general target must still exist: in a chain of removals an earlier
+	// step may already have removed it, and rewriting to a removed assertion would
+	// dangle. Refuse in that case (caller keeps `match.less`).
+	if (!containsKeyTree(math.decls.assertions, match.more.info.id)) None() else {
 	uses = filtermap(
 		set2array(lookupTreeDef(name2uses, match.less.info.id, makeSet())),
 		\id -> maybeBind(lookupTree(math.decls.assertions, id), ruDecl2Theorem)
 	);
-	fold(uses, math, \acc, th -> {
-		if (ruVerbose(env.conf) > 2) {
-			env.out.println("\t\treplacing less general '" + id2s(match.less.info.id) + "' in theorem '" + id2s(th.info.id) + "'");
-		}
-		new_proof = RuProof(th.proof with 
-			steps = map(th.proof.steps, \step ->
-				if (step.assertion != match.less.info.id) step else {
-					if (ruVerbose(env.conf) > 3) {
-						env.out.println("\t\t\treplacing step " + i2s(step.ind + 1) + " from '" + id2s(step.assertion) + "' to '" + id2s(match.more.info.id) + "'");
+	// Thread Maybe<RuMath>: as soon as one user cannot be soundly rewritten the
+	// whole replacement fails (None), so the caller keeps `match.less` and no
+	// partial rewrite leaks out.
+	fold(uses, Some(math), \acc_m : Maybe<RuMath>, th ->
+		maybeBind(acc_m, \acc -> {
+			if (ruVerbose(env.conf) > 2) {
+				env.out.println("\t\treplacing less general '" + id2s(match.less.info.id) + "' in theorem '" + id2s(th.info.id) + "'");
+			}
+			new_proof = RuProof(th.proof with
+				steps = map(th.proof.steps, \step ->
+					if (step.assertion != match.less.info.id) step else {
+						if (ruVerbose(env.conf) > 3) {
+							env.out.println("\t\t\treplacing step " + i2s(step.ind + 1) + " from '" + id2s(step.assertion) + "' to '" + id2s(match.more.info.id) + "'");
+						}
+						RuStep(step with
+							assertion = match.more.info.id,
+							refs = map(match.hypsMap, \i -> step.refs[i])
+						);
 					}
-					RuStep(step with 
-						assertion = match.more.info.id,
-						refs = map(match.hypsMap, \i -> step.refs[i])
-					);
-				}
-			)
-		);
-		if (ruVerbose(env.conf) > 2) {
-			env.out.println("\t\tnew proof for '" + id2s(th.info.id) + "':\n" + 
-				strIndent(strIndent(ru2s(new_proof, math)))
+				)
 			);
-		}
-		ruMathReplaceDecl(acc, ruUpdateTheoremVars(RuTheorem(th with proof = new_proof)), env);
-	});
+			new_th = ruUpdateTheoremVars(RuTheorem(th with proof = new_proof));
+			candidate = ruMathReplaceDecl(acc, new_th, env);
+			// Soundness gate: the rewritten proof must not require more disjoint-
+			// variable conditions than the theorem declares. ruVerifyTheorem
+			// recomputes the required $d and checks ruSubsetDisjs.
+			if (ruIsVerified(ruVerifyTheorem(new_th, candidate, env))) {
+				Some(candidate);
+			} else {
+				if (ruVerbose(env.conf) > 1) {
+					env.out.println("\t\tcannot replace '" + id2s(match.less.info.id) + "' in '" + id2s(th.info.id) +
+						"': '" + id2s(match.more.info.id) + "' needs disjoint-variable conditions the theorem lacks");
+				}
+				None();
+			}
+		})
+	);
+	}
 }
