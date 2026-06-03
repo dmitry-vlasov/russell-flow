@@ -112,6 +112,28 @@ read-mm set.mm;
 print ("mm read: " + read-mm.size + " files in " + time2s(read-mm.time));
 ```
 
+### Command output convention
+
+Commands are **silent on success**. They do not print results or progress
+themselves; instead:
+
+- **Results** go into the state under the command's name (`verify.success`,
+  `read-mm.size`, `mm-to-ru.time`, `reprove.reproved-count`, …). Scripts read
+  these and print whatever they want.
+- **Errors** are the *only* thing a command emits directly, via `out.error`
+  (a failed verify, a missing target, a write failure, a tactic-DSL error).
+- **Progress / streaming info** is delivered through optional lambda callbacks
+  the script passes in (e.g. `read-mm … info-total=… info-source=…`); with no
+  lambda the command is silent.
+- **Output-intent commands** (stats, config, version, cache/volume info, …)
+  store their rendered report as `<command>.text` and are fronted by a thin
+  wrapper under `scripts/info/` that prints it — e.g. `info/verify`,
+  `info/stats`, `info/conf`, `info/version`, `info/mem-stats`, `info/cache`.
+
+So a one-off `russellj verify afile=set` prints nothing on success; use
+`russellj info/verify afile=set` to see a summary. This keeps machine-readable
+state separate from human-readable formatting (which lives in scripts).
+
 ### I/O operations
 
 | Task | Description |
