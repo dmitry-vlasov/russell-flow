@@ -6,6 +6,8 @@ export {
 	RuLoaded ::= RuRawSource, RuSource;
 
 	ruLoadAll(env : RuEnv, module : int, from_cache : (int) -> Maybe<RuSource>) -> Maybe<Tree<int, RuLoaded>>;
+	// Like ruLoadAll, but reports progress: info_source per loaded module, info_total at completion.
+	ruLoadAllInfo(env : RuEnv, module : int, from_cache : (int) -> Maybe<RuSource>, info_source : (string, string) -> void, info_total : (string, string) -> void) -> Maybe<Tree<int, RuLoaded>>;
 	ruLoadOne(env : RuEnv, module : int, from_cache : (int) -> Maybe<RuSource>) -> Maybe<RuLoaded>;
 
 	ruLoader = RuLoader(
@@ -26,9 +28,16 @@ ruCacheCodeLoader(module : int, env : RuEnv) -> Maybe<RuCode> {
 }
 
 ruLoadAll(env : RuEnv, module : int, from_cache : (int) -> Maybe<RuSource>) -> Maybe<Tree<int, RuLoaded>> {
+	ruLoadAllInfo(env, module, from_cache, nop2, nop2);
+}
+
+ruLoadAllInfo(env : RuEnv, module : int, from_cache : (int) -> Maybe<RuSource>, info_source : (string, string) -> void, info_total : (string, string) -> void) -> Maybe<Tree<int, RuLoaded>> {
 	err_count = ref 0;
-	loaded = ruLoadImports([module], ruAddErrCounter2Env(env, err_count), from_cache, makeTree());
+	timer = ruMakeTimer();
+	loaded = ruLoadImports([module], ruAddErrCounter2Env(env, err_count), from_cache, makeTree(), info_source);
 	if (^err_count == 0) {
+		// Always invoke the callback; it is a nop unless the script supplied a lambda.
+		info_total(i2s(sizeTree(loaded)), ruTimePassed2s(timer));
 		Some(loaded);
 	} else {
 		env.out.error(strRight(ruLoader.ext, 1) + " failed to load: '" + id2s(module) + "'", []);
@@ -47,18 +56,20 @@ ruLoadOne(env : RuEnv, module : int, from_cache : (int) -> Maybe<RuSource>) -> M
 	}
 }
 
-ruLoadImports(imports : [int], env : RuEnv, from_cache : (int) -> Maybe<RuSource>, acc : Tree<int, RuLoaded>) -> Tree<int, RuLoaded> {
+ruLoadImports(imports : [int], env : RuEnv, from_cache : (int) -> Maybe<RuSource>, acc : Tree<int, RuLoaded>, info_source : (string, string) -> void) -> Tree<int, RuLoaded> {
 	if (imports == []) acc else {
 		timer = ruMakeTimer();
 		loaded : [RuLoaded]  = filtermap(ruConcurrent(map(imports, \imp -> \env1 -> ruLoadOne(env1, imp, from_cache)), env), idfn);
+		// Per-source progress; nop unless the script supplied an info-source lambda.
+		iter(loaded, \l -> info_source(id2s(ruSourceModule(l)), ruTimePassed2s(timer)));
 		acc1 = fold(loaded, acc, \ac, l -> setTree(ac, ruSourceModule(l), l));
-		new_imports = fold(loaded, makeSet(), \ac, l -> 
+		new_imports = fold(loaded, makeSet(), \ac, l ->
 			fold(ruSourceImports(l), ac, \a, p -> {
 				imp = s2id(ruTrimPath(id2s(p), env.conf, ruLoader.ext));
 				if (containsKeyTree(acc1, imp)) a else insertSet(a, imp);
 			})
 		);
-		ruLoadImports(set2array(new_imports), env, from_cache, acc1)
+		ruLoadImports(set2array(new_imports), env, from_cache, acc1, info_source)
 	}
 }
 

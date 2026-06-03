@@ -31,9 +31,12 @@ ruRunWrite(unit : RuUnit) -> Maybe<RuState> {
 	test = ruTaskBoolArg(task, "test-write", false);
 	conf = if (!test) state.conf else RuConf(state.conf with opts = setTree(state.conf.opts, "test-write", JsonString("1")));
 	math = ruMathFromSources(state.ru, env);
+	info_source = ruTaskInfoFn2(env, task.args, "info-source");
+	info_total  = ruTaskInfoFn2(env, task.args, "info-total");
 	write_module = \module -> {
 		switch (lookupTree(math.sources, module)) {
 			Some(src): {
+				wtimer = ruMakeTimer();
 				monolith = ruTaskStringArg(task, "monolithic", "");
 				if (monolith == "") {
 					ruWriteSource(src, math, env);
@@ -44,6 +47,8 @@ ruRunWrite(unit : RuUnit) -> Maybe<RuState> {
 						ruWriteSource(ruSources2SingleSource(math.sources, src.info.path, env), math, env);
 					}
 				}
+				// Per-source progress; nop unless the script supplied an info-source lambda.
+				info_source(src.info.module, ruTimePassed2s(wtimer));
 			}
 			None(): env.out.error("module: '" + id2s(module) + "' is not found", []);
 		}
@@ -65,9 +70,16 @@ ruRunWrite(unit : RuUnit) -> Maybe<RuState> {
 					env.out.error("while creating directory: '" + dir + "': " + err, []);
 				}
 			});
-			executor(map(getTreeValues(math.sources), 
-				\src -> \env1 -> ruWriteSource(src, math, env1)
+			executor(map(getTreeValues(math.sources),
+				\src -> \env1 -> {
+					wtimer = ruMakeTimer();
+					ruWriteSource(src, math, env1);
+					// Per-source progress; nop unless the script supplied an info-source lambda.
+					info_source(src.info.module, ruTimePassed2s(wtimer));
+				}
 			), env);
+			// Always invoke the callback; it is a nop unless the script supplied a lambda.
+			info_total(i2s(sizeTree(math.sources)), ruTimePassed2s(timer));
 			Some(RuState(state with
 				vars = setTree(state.vars, "write-ru", pairs2tree([
 					Pair("time", flow(ruTimePassed(timer))),
@@ -96,6 +108,8 @@ ruRunWrite(unit : RuUnit) -> Maybe<RuState> {
 					}
 				}
 			}
+			// Always invoke the callback; it is a nop unless the script supplied a lambda.
+			info_total(i2s(1), ruTimePassed2s(timer));
 			Some(RuState(state with
 				vars = setTree(state.vars, "write-ru", pairs2tree([
 					Pair("time", flow(ruTimePassed(timer))),
@@ -138,9 +152,12 @@ ruRunRead(unit : RuUnit) -> Maybe<RuState> {
 			module = ruTrimPath(path, conf, getFileExt(file));
 			module_id = s2id(module);
 			skip_proofs = ruTaskStringArg(task, "proofless", "") == "1";
+			info_source = ruTaskInfoFn2(env, task.args, "info-source");
+			info_total  = ruTaskInfoFn2(env, task.args, "info-total");
 			timer = ruMakeTimer();
-			loaded = ruLoadAll(env, s2id(module),
-				\id -> if (id == module_id) ruCacheGet(id, true, env) else ruCacheGet(id, !skip_proofs, env)
+			loaded = ruLoadAllInfo(env, s2id(module),
+				\id -> if (id == module_id) ruCacheGet(id, true, env) else ruCacheGet(id, !skip_proofs, env),
+				info_source, info_total
 			);
 			ru = maybeBind(loaded, \srcs -> ruCollectMathFast(srcs, env));
 			maybeMap(ru, \math ->

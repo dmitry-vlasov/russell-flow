@@ -123,12 +123,41 @@ themselves; instead:
 - **Errors** are the *only* thing a command emits directly, via `out.error`
   (a failed verify, a missing target, a write failure, a tactic-DSL error).
 - **Progress / streaming info** is delivered through optional lambda callbacks
-  the script passes in (e.g. `read-mm … info-total=… info-source=…`); with no
-  lambda the command is silent.
-- **Output-intent commands** (stats, config, version, cache/volume info, …)
-  store their rendered report as `<command>.text` and are fronted by a thin
-  wrapper under `scripts/info/` that prints it — e.g. `info/verify`,
-  `info/stats`, `info/conf`, `info/version`, `info/mem-stats`, `info/cache`.
+  the script passes in. A command reads each callback with
+  `ruTaskInfoFn2(env, task.args, "<name>")` (in [src/comm.flow](../src/comm.flow)),
+  which returns the supplied `(string, string) -> void` lambda or `nop2` when
+  absent. The command then calls it **unconditionally** on each event; the
+  script chooses the granularity by which callbacks it provides. Commands with
+  `info-source` (per file/source) and `info-total` (at completion) callbacks:
+  `read-ru`, `read-mm`, `write-ru`, `mm-verify`, `mm-to-ru`, `ru-to-mm`. Example:
+  ```
+  src_cb := \m, t -> println(("  translated: '" + m + "' in " + t));
+  ru-to-mm info-source=src_cb;
+  ```
+  With no lambda the command is silent. (Note: a lambda body that is a call
+  must parenthesise its argument expression — `println((a + b))`, not
+  `println(a + b)` — see Gotchas.)
+- **Output-intent commands** store their data in state and are fronted by a
+  thin wrapper under `scripts/info/` that renders it. There are two shapes:
+  - **Structured data** — a command that produces a labelled, fixed-field
+    report stores a *mapping* of field → value (numbers/strings), and the
+    wrapper assembles the human text. Preferred for tabular/numeric summaries.
+    Examples: `stats-math`/`stats-math-1` (`.sources`, `.steps`, …), `info-volume`
+    (`.ru_sources`, `.ru_sources_pct`, `.total`, …; wrapper `info/volume`),
+    `info-axiomatics` (`.groups`, `.distrib`, `.max_axioms`, …; wrapper
+    `info/axiomatics`).
+  - **Text** — a command whose output is free-form *content* (source code,
+    locations, variable-length listings) that scripts cannot reassemble field
+    by field stores it as `<command>.text`. Examples: `conf-show`, `stats-all`,
+    `cache-info`, and the lookup wrappers `info/find`, `info/symbol`,
+    `info/source`, `info/show`, `info/outline`, `info/math`, `info/vars`,
+    `info/latex`, `info/order-sources`. Other wrappers: `info/verify`,
+    `info/stats`, `info/conf`, `info/version`, `info/mem-stats`, `info/cache`.
+
+  Note the script language can only evaluate string concatenation (`+`) in
+  expressions — the arithmetic operators `*`, `-`, `/` break statement parsing
+  — so any derived numbers (e.g. percentages) must be computed in the command
+  and stored as fields.
 
 So a one-off `russellj verify afile=set` prints nothing on success; use
 `russellj info/verify afile=set` to see a summary. This keeps machine-readable
