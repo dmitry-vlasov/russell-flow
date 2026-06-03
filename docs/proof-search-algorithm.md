@@ -122,7 +122,7 @@ The tactic library in [`src/ru/prover/tactics/`](../src/ru/prover/tactics/) cont
 Three combinators ([`combinators.flow`](../src/ru/prover/tactics/combinators.flow)) compose tactics into larger strategies:
 
 - `ruSequenceTactic([t1, t2, …])` — runs each tactic in turn; advances on `Done`, swaps in place on `Switch`.
-- `ruIterateTactic(driver)` — calls `driver(tree)` to produce a fresh sub-tactic on every iteration; re-enters when the sub-tactic finishes, which is how SPR and fragment-replay properly exhaust their attempts/pending queues.
+- `ruIterateTactic(driver)` — calls `driver(tree)` to produce a fresh sub-tactic on every iteration; re-enters when the sub-tactic finishes, which is how SPR properly exhausts its attempts/pending queue.
 - `ruLoopWhileProgressTactic(builder, max_iters)` — rebuilds the inner tactic on each iteration (so state-carrying tactics reset) and re-runs while the proof tree keeps growing.
 
 A `ruLimitedTactic(inner, time, applied, produced)` wrapper attaches per-tactic budget limits.

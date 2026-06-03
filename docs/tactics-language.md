@@ -70,8 +70,8 @@ These are the leaves of any tactic expression. Each lists positional parameters 
 
 | Atom | Positional params | Needs in context |
 |------|-------------------|------------------|
-| `spr(attempts, max-size)` | attempts per leaf, follow-proof budget | Step index (built automatically by `reprove` when the tactic string mentions `spr`). |
-| `fragment-replay(max-depth, max-size, attempts)` | depth, size, attempts | Fragment index — enabled with `fragment-depth=N` on the command. |
+| `spr(attempts, max-size)` | attempts per leaf, follow-proof budget | Step index (built automatically by `reprove` when the tactic string mentions `spr`). Subsumes the removed `fragment-replay` atom. |
+| `linear-guided(max-size, attempts)` | follow-proof budget, attempts | Step index (built automatically when the tactic string mentions `linear-guided`). Replays corpus goal→premise spines. |
 | `follow-proof(theorem)` | theorem name | The named theorem must exist in the corpus and its proof tree must not introduce new hyps (so this is mostly useful for SPR-style sub-proofs). |
 
 ### Heuristic / specialised
@@ -79,7 +79,6 @@ These are the leaves of any tactic expression. Each lists positional parameters 
 | Atom | Positional params | Needs in context |
 |------|-------------------|------------------|
 | `ml(top-k, max-depth, max-size)` | top-k, depth, size | The ML selector — enabled with `load-ml=1` on the command. |
-| `linear-guided(max-depth, max-size)` | depth, size | Built lazily after `ruInitProverEnv`; uses `penv.fns.matchesPremise` and `penv.fragmentTrees`. |
 | `oracle(max-true, max-false, max-variants, max-proofs)` | as named | Mutates `penv.fns` to install oracle-aware unifiers, then drives the search by the original proof tree of the theorem being proved. Used by the round-trip reprovability test. |
 
 ---
@@ -112,7 +111,7 @@ The universal `reprove` command:
 
 Atoms that need state from the env (`linear-guided`, `oracle`) close over the result of step 2 inside their builder; atoms that don't (everything else) are produced statically. The combinators (`seq`, `loop`, `limited`) thread builders so env modifications propagate correctly through chains.
 
-The `step_index` (used by `spr`) is built lazily — only when the substring `spr` appears in the tactic string — because on the full `set` corpus it takes seconds and gigabytes of RAM.
+The `step_index` (used by `spr` and `linear-guided`) is built lazily — only when the substring `spr` or `linear-guided` appears in the tactic string — because on the full `set` corpus it takes seconds and gigabytes of RAM.
 
 ### Default
 
@@ -124,11 +123,10 @@ These `reprove` arguments enable atoms that need extra data:
 
 | Argument | Effect |
 |----------|--------|
-| `fragment-depth=N` (N > 0) | Build the fragment index → enables `fragment-replay`. |
 | `load-ml=1` | Load the per-assertion ML selector → enables `ml`. |
 | `strict-fail=1` | After the run, `ruCrash` if any theorem was not reproved. Used by the CI round-trip test. |
 
-The `step_index` for `spr` is detected automatically by substring; nothing else is needed.
+The `step_index` for `spr`/`linear-guided` is detected automatically by substring; nothing else is needed.
 
 ---
 
@@ -139,9 +137,9 @@ The `step_index` for `spr` is detected automatically by substring; nothing else 
 | Removed command | Equivalent `reprove` invocation |
 |-----------------|--------------------------------|
 | `reprove-dumb` | `reprove tactic="bounded-bfs(5, 4096)"` (or just omit `tactic=`) |
-| `reprove-fragments` | `reprove fragment-depth=2 tactic="fragment-replay(5, 4096, 3)"` |
+| `reprove-fragments` | `reprove tactic="spr(3, 4096)"` |
 | `reprove-ml` | `reprove load-ml=1 tactic="ml(5, 7, 10000)"` |
-| `reprove-linear` | `reprove fragment-depth=2 tactic="linear-guided(5, 4096)"` |
+| `reprove-linear` | `reprove tactic="linear-guided(4096, 3)"` |
 | `reprove-oracle` | `reprove strict-fail=1 tactic="oracle(-1, -1)"` |
 
 ### Combined SPR + BFS
@@ -186,4 +184,4 @@ The DSL atom registry is the `if/else` chain in `ruBuildTacticFromAst` (in `src/
 3. Build either a static tactic (`ruStaticTacticBuilder(t)`) or, if you need the env, a deferred builder (`RuTacticBuilder(\penv -> Pair(penv, t))`).
 4. Add `else if (n == "myatom") ruDslBuildMyAtom(ast, ctx)` to the dispatch chain.
 
-If the atom needs ambient data not already in `RuTacticContext`, extend that record (and update the call sites in `reprove.flow` and `measure_coverage.flow`).
+If the atom needs ambient data not already in `RuTacticContext`, extend that record (and update the call sites in `reprove.flow` and the other prover commands that build a `RuTacticContext`, e.g. `prove.flow` / `annotate_proof.flow`).

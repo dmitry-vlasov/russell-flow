@@ -1,10 +1,20 @@
 # The Russell Scripting Language
 
-Russell includes an embedded scripting language used to compose and automate multi-step operations on a theorem base. Scripts are stored in files with the `.rus` extension and are run with:
+Russell includes an embedded scripting language used to compose and automate multi-step operations on a theorem base. Scripts are stored in files with the `.rus` extension under `scripts/`, organized into subdirectories, and are run by name (the `.rus` extension is optional):
 
 ```
-russellj <script>.rus [arg=value ...]
+russellj <script> [arg=value ...]
 ```
+
+Scripts live in a hierarchy and are invoked by their **slash path** (which maps to the file under `scripts/`):
+
+```
+russellj translate/mm2ru2mm afile=set-100000   # -> scripts/translate/mm2ru2mm.rus
+russellj test/smoke afile=set-3000             # -> scripts/test/smoke.rus
+russellj reprove/oracle afile=set-50000        # -> scripts/reprove/oracle.rus
+```
+
+The current groups are: `translate/`, `reprove/`, `benchmark/`, `eval/`, `learn/`, `refactor/`, `info/`, `test/`. Run `russellj help scripts` for the full list. Scripts may call other scripts by the same slash path.
 
 ---
 
@@ -94,10 +104,11 @@ print ("mm read: " + read-mm.size + " files in " + time2s(read-mm.time));
 
 | Task | Description |
 |------|-------------|
-| `mm2ru afile=<name>` | Translate Metamath → Russell |
-| `ru2mm` | Translate Russell → Metamath |
-| `mm-to-ru <file>` | Core MM→RU translation step |
-| `ru-to-mm` | Core RU→MM translation step |
+| `mm-to-ru <file>` | Core MM→RU translation step (command) |
+| `ru-to-mm` | Core RU→MM translation step (command) |
+| `translate/mm2ru afile=<name>` | Script: full Metamath → Russell translation (wraps `mm-to-ru`) |
+| `translate/ru2mm afile=<name>` | Script: full Russell → Metamath translation (wraps `ru-to-mm`) |
+| `translate/mm2ru2mm afile=<name>` | Script: MM → RU → MM round-trip with re-verification |
 | `mm-decompress-proofs` | Decompress compact Metamath proof format |
 | `mm-compress-proofs` | Compress proofs to compact Metamath format |
 
@@ -107,7 +118,6 @@ print ("mm read: " + read-mm.size + " files in " + time2s(read-mm.time));
 |------|-------------|
 | `reprove [target=...] [tactic="..."] [...]` | Universal reprove command — runs a tactic supplied via the DSL (default: bounded BFS). See [tactics-language.md](tactics-language.md). |
 | `compress [target=...] [...]` | Per-step proof compression (replaces a step's proof with a shorter one when found). |
-| `autoprove [target=...]` | Attempt fully automated proof search. |
 
 The `target` parameter can be:
 - `all` — all theorems in the project
@@ -125,8 +135,8 @@ Common `reprove` arguments:
 | `max-depth`, `max-size` | `5`, `4096` | Bounds for the default tactic. |
 | `time-limit` | `60s` | Per-theorem wall-clock limit. |
 | `job-time-limit` | `""` | Total wall-clock cap (default: `n*time-limit/p`). |
-| `fragment-depth` | `0` | If `>0`, build the fragment index — enables `fragment-replay` and `linear-guided` atoms. |
 | `load-ml` | `0` | If `1`, load the ML selector — enables the `ml` atom. |
+| `min-index-rule-nodes` | `1` | Min rule-node count for step-index entries (only used when the tactic mentions `spr`/`linear-guided`). |
 | `strict-fail` | `0` | If `1`, crash if any theorem failed to reprove (CI mode). |
 
 The earlier `reprove-dumb`, `reprove-fragments`, `reprove-ml`, `reprove-linear`, and `reprove-oracle` commands have been removed; each is now a one-line `reprove tactic="…"` invocation (see [tactics-language.md](tactics-language.md) for the mapping).
@@ -135,11 +145,13 @@ The earlier `reprove-dumb`, `reprove-fragments`, `reprove-ml`, `reprove-linear`,
 
 | Task | Description |
 |------|-------------|
-| `optimize-imports-ru` | Remove redundant imports |
-| `optimize_hyps` | Minimize the hypotheses of each theorem |
-| `optimize_shorten` | Find shorter proofs |
-| `remove-trivial-theorems` | Remove theorems that are trivial reformulations |
-| `ru-remove-trivial-sources` | Remove source files with no content |
+| `optimize-imports-ru` | Remove redundant imports (command) |
+| `remove-trivial-theorems` | Remove theorems that are trivial reformulations (command) |
+| `ru-remove-trivial-sources` | Remove source files with no content (command) |
+| `shorten-proofs` | Find shorter proofs (command) |
+| `refactor/optimize-hyps` | Script: iterate remove-duplicate/unused steps + hyps to a fixpoint |
+| `refactor/optimize-shorten` | Script: shorten proofs globally and write the result |
+| `refactor/optimize` | Script: full optimization loop (hyps + shorten + remove-trivial) |
 
 ### Configuration
 
@@ -168,9 +180,10 @@ Common configuration keys:
 |------|-------------|
 | `stats-all` | Print all statistics |
 | `stats-mem` | Print memory usage |
-| `output_math_stats` | Print theorem base size statistics |
 | `info-volume` | Print volume information |
 | `run-gc` | Run garbage collection |
+| `info/math-stats` | Script: print theorem-base size statistics |
+| `info/mem-stats` | Script: print memory statistics |
 
 ---
 
@@ -244,14 +257,14 @@ conf-push;
 conf-set working-dir=$wd project=$afile;
 conf-set gc-after-task=1;
 
-mm2ru afile=$afile;
+translate/mm2ru afile=$afile;
 
 conf-clear;
 clear-math;
 cache-clear;
 conf-set working-dir=$wd;
 
-ru2mm afile=$afile;
+translate/ru2mm afile=$afile;
 
 conf-pop;
 conf-clear;
@@ -274,8 +287,8 @@ optimized := 1;
 iteration := 1;
 
 while ((optimized > 0) && (iteration <= a2i(iter_limit))) {
-    optimize_hyps;
-    optimize_shorten time_limit=$time_limit;
+    refactor/optimize-hyps;
+    refactor/optimize-shorten time_limit=$time_limit;
     remove-trivial-theorems;
     verify;
     stats-math-1;

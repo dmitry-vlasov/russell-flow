@@ -8,9 +8,9 @@
 
 ## Commands
 - Build: `./build_java.sh`
-- Roundtrip test (CI): `bin/russellj mm2ru2mm set`
+- Roundtrip test (CI): `bin/russellj translate/mm2ru2mm set`
 - Verify: `bin/russellj verify afile=set-50000`
-- Reprove: `bin/russellj reprove-with-oracle afile=set-50000`
+- Reprove: `bin/russellj reprove/oracle afile=set-50000`
 - REPL: `bin/russellj server=console`
 - Memory override: `bin/russellj mem=16g ...` (default 10g)
 

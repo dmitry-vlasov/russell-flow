@@ -58,14 +58,15 @@ The canonical demo: translate a fragment of the Metamath set theory library to R
 # Download set.mm (the main Metamath theorem base)
 wget https://us.metamath.org/downloads/set.mm
 
-# Take a manageable fragment (~100k lines)
-head -n 100000 set.mm > set-100000.mm
-# Make sure the fragment ends at a complete theorem boundary (ends with $.)
+# Take a manageable fragment (~100k lines). A raw `head -n` is usually NOT valid
+# Metamath (it can cut inside a `${ ... $}` scope); tools/mm-prefix.sh cuts at a
+# clean statement/scope boundary so the result parses and verifies.
+tools/mm-prefix.sh set.mm 100000 set-100000.mm
 
 cd /directory/containing/set-100000.mm
 
 # Translate MM → RU → MM and verify
-russellj mm2ru2mm afile=set-100000
+russellj translate/mm2ru2mm afile=set-100000
 ```
 
 ---
@@ -113,13 +114,13 @@ The extension starts `russell_lsp` automatically when you open a `.ru` file. It 
 russellj verify
 
 # Re-prove all theorems using oracle guidance
-russellj reprove-with-oracle afile=set-50000
+russellj reprove/oracle afile=set-50000
 
 # Optimize a theorem base (shorten proofs, minimize hypotheses)
-russellj optimize
+russellj refactor/optimize
 
 # Run an arbitrary script
-russellj scripts/mm2ru.rus afile=set-100000
+russellj scripts/translate/mm2ru.rus afile=set-100000
 ```
 
 ---
