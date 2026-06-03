@@ -62,30 +62,42 @@ RuMapFnStats(
 	unfinished  : ConcurHashMap<int, double>,
 	replaced    : ConcurHashMap<int, int>,
 	max_time    : ref double,
-	max_time_id : ref int
+	max_time_id : ref int,
+	// Synchronous per-decl progress callback, fired as each decl finishes mapping
+	// (works in CLI, unlike the timer-based `progress.inform`). nop2 by default;
+	// a script supplies it via the `info-decl` task arg.
+	info_decl   : (string, string) -> void
 );
 
-ruMakeMapFnStats(time_limit : double, total : int, delta, info : RuMapFnInfo, out : RuOut) -> RuMapFnStats {
+ruMakeMapFnStats(time_limit : double, total : int, delta, info : RuMapFnInfo, out : RuOut, info_progress : (string, string) -> void, has_progress : bool, info_decl : (string, string) -> void) -> RuMapFnStats {
 	progress = ruMakeProgress(time_limit, total, delta);
 	processing = makeConcurHashMap(idfn);
 	finished = makeConcurHashMap(idfn);
 	unfinished = makeConcurHashMap(idfn);
 	RuMapFnStats(
+		// The progress emitter is stored in the struct's `inform` field. A script
+		// can supply an `info-progress` lambda to receive periodic progress; with
+		// none, fall back to the default println (only reached when verbose>0, since
+		// ruMapFnComm only starts tracking then). Script picks the formatting.
 		RuProgress(progress with inform = \-> {
 			msg = info.message();
-			out.println(
-				"\t" + ruProgressMessage(progress) + 
-				" processing: " + i2s(sizeConcurHashMap(processing)) + "," +
+			counts =
+				"processing: " + i2s(sizeConcurHashMap(processing)) + "," +
 				" unfinished: " + i2s(sizeConcurHashMap(unfinished)) + "," +
 				" finished: " + i2s(sizeConcurHashMap(finished)) +
-				if (msg == "") "" else ", " + msg
-			);
+				if (msg == "") "" else ", " + msg;
+			if (has_progress) {
+				info_progress(ruProgressMessage(progress), counts);
+			} else {
+				out.println("\t" + ruProgressMessage(progress) + " " + counts);
+			}
 		}),
 		processing,
 		finished,
 		unfinished,
 		makeConcurHashMap(idfn),
-		ref 0.0, ref -1
+		ref 0.0, ref -1,
+		info_decl
 	);
 }
 
@@ -120,6 +132,8 @@ ruWrapFnWithProgress(f : RuMapFn, stats : RuMapFnStats) -> (RuDecl, double, RuEn
 			stats.max_time := time;
 			stats.max_time_id := decl.info.id;
 		}
+		// Synchronous per-decl progress; nop unless the script supplied an info-decl lambda.
+		stats.info_decl(id2s(id), ruTime2s(time));
 		mapped;
 	}
 }
@@ -218,10 +232,15 @@ ruMapFnComm(unit : RuUnit, f : RuMapFn) -> RuState {
 		target = ruDetermineTarget(task, math, env);
 	decls = filter(ruTargetDecls(target, math, env), f.info.pred);
 	time_limit = ruCalcTimeLimit(decls, f, task, conf);
-	stats = ruMakeMapFnStats(time_limit, length(decls), ruProgressUpdateMs(task, conf), f.info, out);
+	// Periodic progress callback, read from the task args and stored in the stats
+	// struct (its `inform` field). The script chooses the granularity/formatting.
+	info_progress = ruTaskInfoFn2(env, task.args, "info-progress");
+	has_progress  = containsKeyTree(task.args, "info-progress");
+	info_decl     = ruTaskInfoFn2(env, task.args, "info-decl");
+	stats = ruMakeMapFnStats(time_limit, length(decls), ruProgressUpdateMs(task, conf), f.info, out, info_progress, has_progress, info_decl);
 	prog_f = RuMapFn(f with func = ruWrapFnWithProgress(f, stats));
 	ruMapDeclsStartMessage(decls, time_limit, env);
-	if (ruVerbose(conf) > 0) {
+	if (has_progress || ruVerbose(conf) > 0) {
 		ruTrackProgress(stats.progress);
 	}
 	timer = ruMakeTimer();
