@@ -45,6 +45,40 @@ Variables defined in the script header via `@arg` become command-line arguments.
 
 ---
 
+## Types and operators
+
+Values are one of: **int**, **double**, **bool**, **string**, **array** `[a, b, …]`, **map** `{k = v, …}`, **struct** `Name(a, b, …)`, **lambda** `\x -> e`, or **undef**.
+
+| Group | Operators | Notes |
+|-------|-----------|-------|
+| Arithmetic | `+` `-` `*` `/` `%` | int and double; `-` is also unary negation |
+| Overloaded `+` | `+` | string concatenation (coerces operands to string), array concatenation, map merge |
+| Comparison | `<` `<=` `>` `>=` | int, double, string |
+| Equality | `==` `!=` | int, double, bool, string, array, map |
+| Boolean | `&&` `\|\|` `!` | `!` is unary |
+| Conversion | `a2i(x)` `a2d(x)` `a2s(x)` `a2b(x)` | to int / double / string / bool, from any scalar |
+
+Access and construction:
+
+```rust
+arr[2]            // array index
+m["key"]   m.key  // map lookup (index or field)
+p.first           // struct field
+(c ? a : b)       // conditional expression
+let x = e; body   // local binding (an expression)
+{ e1; e2; e3; }   // sequence — evaluates to the last expression
+eval(quote(e))    // defer / re-evaluate an expression
+```
+
+> **Infix grouping gotcha.** An infix expression `( … )` applies the **first**
+> operator to *all* operands, so a single group must use one operator:
+> `(1 + 2 + 3)` is fine, but `(1 + 2 * 3)` is **not** `7` — parenthesize mixed
+> operators explicitly: `(1 + (2 * 3))`.
+
+These are exhaustively exercised by `test/script-lang` (see [scripts/test/script-lang.rus](../scripts/test/script-lang.rus)).
+
+---
+
 ## Control flow
 
 ### If / else
@@ -226,6 +260,29 @@ Scripts have access to built-in functions usable in expressions:
 | `a2i(s)` | Parse string to integer |
 | `i2s(n)` | Convert integer to string |
 
+### Calling Flow9 library functions
+
+Beyond the built-ins above, scripts can call **Flow9 runtime library functions
+directly**, passing script lambdas as the higher-order arguments:
+
+```rust
+squares  := map([1, 2, 3], \x -> (x * x));            // [1, 4, 9]
+total    := fold([1, 2, 3, 4], 0, \acc, x -> (acc + x)); // 10
+evens    := filter(xs, \x -> ((x % 2) == 0));
+hit      := find(xs, \x -> (x > 2));                   // a Maybe — use hit.value
+iter(xs, \x -> println(x));                           // (inside an expression)
+```
+
+Verified working with script lambdas: `map`, `mapi`, `fold`, `foldi`, `filter`,
+`filtermap`, `exists`, `forall`, `find`, `iter`, `iteri`, plus non-higher-order
+helpers like `length`, `concat`, `enumFromTo`, `arrayPush`, `strlen`. (Not every
+runtime symbol is exposed — an unavailable one yields `undefined var`.)
+
+> **`print` vs `println`.** `print` is a *statement* keyword and cannot appear
+> inside an expression (e.g. a lambda body); use the `println(...)` host function
+> there. Also note a bare call in statement position is parsed as a task — call
+> void functions like `iter` from inside an expression (e.g. an assignment).
+
 ---
 
 ## Lambda expressions
@@ -238,6 +295,28 @@ info_source := \src, time -> println(("\tmm read: " + src + " file in " + time))
 
 read-mm $afile.mm info-total=info_total info-source=info_source;
 ```
+
+Lambdas are real **closures**: they capture the variables in scope at the point
+of definition (including enclosing lambda parameters), so currying, nesting, and
+higher-order use all work:
+
+```rust
+curry_add := \a -> \b -> (a + b);
+add5      := curry_add(5);
+println(add5(10));                 // 15
+
+compose := \f, g -> (\x -> f(g(x)));
+twice   := \g, v -> g(g(v));
+```
+
+A closure captures a **snapshot** of the scope at definition time. A lambda can
+therefore call any variable/lambda already defined above it, but **not itself**
+— a self-recursive lambda (`fact := \n -> … fact(n - 1) …`) sees no `fact` yet
+and fails with `undefined var`. Use a `while` loop for iteration instead.
+
+The full lambda surface (currying, multi-level nested closures, capture inside
+call/index arguments, lambdas in arrays/maps, host higher-order calls) is
+exercised by `test/script-lang`.
 
 ---
 
