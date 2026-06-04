@@ -1,0 +1,121 @@
+import ru/src;
+import ru/util/exp;
+
+export {
+	// Deep id-rewrite of a source for the self-describing cache. Two mappings:
+	//   * rm  — every general symbol id (rule/const/var/assertion id, RuVar.type,
+	//           RuStmt.class, RuTerm.type, supers, …). Negative sentinels (-1) must
+	//           be returned unchanged.
+	//   * trm — the COMPACT type index packed in RuRuleNode.idType (high bits). It
+	//           is session-local (see base/ids type compaction), so it is remapped
+	//           separately, NOT through rm.
+	// `pos`/`ind`/`arityLen`/comments/strings carry no ids and are preserved.
+	//
+	// One traversal serves both directions:
+	//   * collect: rm/trm record and return their argument (ruSourceCollectIds);
+	//   * remap:   rm/trm map cached-session ids -> current-session ids.
+	ruRemapSourceIds(src : RuSource, rm : (int) -> int, trm : (int) -> int) -> RuSource;
+
+	// (general symbol ids, packed-type compact indices) occurring in a source —
+	// for the cache's id->name and compact->name tables.
+	ruSourceCollectIds(src : RuSource) -> Pair<Set<int>, Set<int>>;
+}
+
+ruSourceCollectIds(src : RuSource) -> Pair<Set<int>, Set<int>> {
+	ids = ref makeSet();
+	compacts = ref makeSet();
+	ruRemapSourceIds(src,
+		\id -> { if (id >= 0) ids := insertSet(^ids, id); id; },
+		\c  -> { compacts := insertSet(^compacts, c); c; }
+	);
+	Pair(^ids, ^compacts);
+}
+
+ruRemapVar(v : RuVar, rm : (int) -> int) -> RuVar {
+	RuVar(rm(v.id), rm(v.type));
+}
+
+ruRemapVarsDisjs(vd : RuVarsDisjs, rm : (int) -> int) -> RuVarsDisjs {
+	RuVarsDisjs(
+		foldTree(vd.vars, makeTree(), \k, v, acc -> setTree(acc, rm(k), ruRemapVar(v, rm))),
+		mapSet(vd.disjs, \d -> RuDisj(ruRemapVar(d.v1, rm), ruRemapVar(d.v2, rm)))
+	);
+}
+
+ruRemapTerm(t : RuTerm, rm : (int) -> int) -> RuTerm {
+	RuTerm(rm(t.type), map(t.nodes, \n ->
+		switch (n) {
+			RuConstRef(id): RuConstRef(rm(id));
+			RuVar(__,__):   ruRemapVar(n, rm);
+		}
+	), t.pos);
+}
+
+ruRemapExp(e : RuExp, rm : (int) -> int, trm : (int) -> int) -> RuExp {
+	RuExp(map(e.nodes, \n ->
+		switch (n) {
+			// idType = general rule id (low 20) + COMPACT type index (high). The rule
+			// id is a general symbol (rm); the type index is compact (trm).
+			RuRuleNode(idType, arityLen):
+				RuRuleNode(ruMakeIdTypeCompact(rm(ruIdType2Id(idType)), trm(ruIdType2TypeInd(idType))), arityLen);
+			RuVar(__,__): ruRemapVar(n, rm);
+		}
+	), e.pos);
+}
+
+ruRemapTermExp(te : RuTermExp, rm : (int) -> int, trm : (int) -> int) -> RuTermExp {
+	switch (te) {
+		RuTerm(__,__,__): ruRemapTerm(te, rm);
+		RuExp(__,__):     ruRemapExp(te, rm, trm);
+	}
+}
+
+ruRemapStmt(s : RuStmt, rm : (int) -> int, trm : (int) -> int) -> RuStmt {
+	RuStmt(rm(s.class), map(s.exps, \e -> ruRemapTermExp(e, rm, trm)), s.pos);
+}
+
+ruRemapInference(inf : RuInference, rm : (int) -> int, trm : (int) -> int) -> RuInference {
+	RuInference(
+		ruRemapVarsDisjs(inf.vars, rm),
+		map(inf.hyps, \h -> RuHyp(h.ind, ruRemapStmt(h.stmt, rm, trm), h.pos)),
+		ruRemapStmt(inf.prop, rm, trm)
+	);
+}
+
+ruRemapProof(p : RuProof, rm : (int) -> int, trm : (int) -> int) -> RuProof {
+	RuProof(
+		ruRemapVarsDisjs(p.vars, rm),
+		map(p.steps, \st ->
+			// refs are HypRef/StepRef indices, not ids — preserved.
+			RuStep(st.ind, rm(st.assertion), st.refs, ruRemapStmt(st.stmt, rm, trm), ruRemapProof(st.proof, rm, trm), st.pos)
+		),
+		p.pos
+	);
+}
+
+ruRemapDeclInfo(di : RuDeclInfo, rm : (int) -> int) -> RuDeclInfo {
+	RuDeclInfo(rm(di.id), rm(di.src), di.comments, di.pos);
+}
+
+ruRemapDecl(d : RuDecl, rm : (int) -> int, trm : (int) -> int) -> RuDecl {
+	switch (d) {
+		RuConst(info, ascii, latex):           RuConst(ruRemapDeclInfo(info, rm), rm(ascii), latex);
+		RuType(info, supers):                  RuType(ruRemapDeclInfo(info, rm), map(supers, rm));
+		RuRule(info, vars, term):              RuRule(ruRemapDeclInfo(info, rm),
+			foldTree(vars, makeTree(), \k, v, acc -> setTree(acc, rm(k), ruRemapVar(v, rm))),
+			ruRemapTerm(term, rm)
+		);
+		RuAxiom(info, infer):                  RuAxiom(ruRemapDeclInfo(info, rm), ruRemapInference(infer, rm, trm));
+		RuTheorem(info, infer, meta, proof):   RuTheorem(ruRemapDeclInfo(info, rm), ruRemapInference(infer, rm, trm), mapSet(meta, rm), ruRemapProof(proof, rm, trm));
+		RuDef(info, infer, defm, defs):        RuDef(ruRemapDeclInfo(info, rm), ruRemapInference(infer, rm, trm), ruRemapTermExp(defm, rm, trm), ruRemapTermExp(defs, rm, trm));
+	}
+}
+
+ruRemapSourceIds(src : RuSource, rm : (int) -> int, trm : (int) -> int) -> RuSource {
+	RuSource(
+		map(src.imports, \imp -> RuImport(rm(imp.id), imp.pos)),
+		map(src.decls, \d -> ruRemapDecl(d, rm, trm)),
+		src.comments,
+		RuFileInfo(src.info with id = rm(src.info.id))
+	);
+}
