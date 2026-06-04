@@ -3,12 +3,47 @@ import ru/parse/parse;
 import ru/verify/math;
 import ru/parse/exps/lang;
 import ru/parse/exps/assertions;
+import ru/parse/load;
 
 export {
 	ruCreateMath(sources : [RuAnySource], env : RuEnv) -> Maybe<RuMath>;
 	ruCollectMathFast(sources : Tree<int, RuAnySource>, env : RuEnv) -> Maybe<RuMath>;
 	ruParseFast(module : int, env : RuEnv) -> Maybe<RuSource>;
 	ruParseSource2RuSource(parsed : RuParseSource, env : RuEnv) -> RuSource;
+	// Ensure the project's global language cache is built before anything parses
+	// against it. If the lang cache is empty (cold/deleted disk cache), read the
+	// project roots once to populate it. SERIALIZED so that, under the server's
+	// concurrent request handling, only ONE build runs and every other request
+	// blocks on the lock until it finishes — instead of parsing against a
+	// half-built language and flooding "unknown type: 'wff'". Idempotent + cheap
+	// once loaded (the inner re-check returns immediately).
+	ruEnsureProjectLoaded(env : RuEnv) -> void;
+}
+
+ru_project_load_lock = ref 0;
+
+// The serialized worker (only one runs at a time; see ruEnsureProjectLoaded).
+ruDoEnsureProjectLoaded = synchronizedUnaryFn(ru_project_load_lock, \env : RuEnv -> {
+	if (sizeTree(ruLangCacheGet().rules) == 0) {
+		iter(env.conf.projectRoots, \root -> {
+			root_path = ruResolveRelativePath(root, env.conf.workingDir);
+			if (fileExists(root_path)) {
+				module = ruTrimPath(root_path, env.conf, ".ru");
+				maybeApply(
+					ruLoadAll(env, s2id(module), \id -> ruCacheGet(id, false, env)),
+					\srcs -> { ruCollectMathFast(srcs, env); {} }
+				);
+			}
+		});
+		// Persist the id-table so the disk cache we just (re)built is reloadable:
+		// the .cache files store absolute ids that are meaningless without __ids.txt,
+		// so without this every restart re-runs this full rebuild.
+		ruSaveIds(env);
+	}
+});
+
+ruEnsureProjectLoaded(env : RuEnv) -> void {
+	ruDoEnsureProjectLoaded(env);
 }
 
 ruCollectMathFast(sources : Tree<int, RuAnySource>, env : RuEnv) -> Maybe<RuMath> {
@@ -32,6 +67,10 @@ ruParseFast(module : int, env0 : RuEnv) -> Maybe<RuSource> {
 }
 
 ruParseSource2RuSource(parsed : RuParseSource, env : RuEnv) -> RuSource {
+	// Block until the project language is built, so we never parse against a
+	// half-built lang during the initial (cold-cache) load. Cheap outer check
+	// keeps the already-loaded case lock-free.
+	if (sizeTree(ruLangCacheGet().rules) == 0) ruEnsureProjectLoaded(env);
 	lang = ruLangCacheGet();
 	decls : [RuDeclAux] = ruSources2AnyDecls([parsed]);
 	assertions = ruCreateAssertions(decls, lang, env);
