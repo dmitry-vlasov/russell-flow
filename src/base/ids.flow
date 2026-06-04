@@ -1,4 +1,5 @@
 import ds/concur_hashmap;
+import ds/vector;
 import math/hash;
 import text/binary;
 import base/log;
@@ -24,7 +25,21 @@ export {
 	ruIds() -> [string];
 	ruIdsVersion() -> double;
 	ruClearIds() -> void;
+
+	// --- Type-id compaction (see ru/util/exp ruMakeIdType) ---
+	// The packed idType reserves only ~12 bits for the type field, so a type id
+	// stored there must be < 4096. General symbol ids (s2id) can exceed that
+	// (parse order, or re-interning), so each general TYPE id is mapped to a dense
+	// compact index in [0, 4096) used ONLY inside the packing. Grammar types are
+	// few (≈3 in set.mm), so 4096 is ample; the rule field keeps the full 20 bits.
+	// The mapping is append-only and persisted next to __ids.txt, so cached
+	// (compact-encoded) expressions stay valid across sessions.
+	ruTypeCompact(type_id : int) -> int;   // general type id -> compact (lazy, registers)
+	ruTypeGeneral(compact : int) -> int;   // compact -> general type id (-1 if unknown)
+	ruClearTypeIndex() -> void;
 }
+
+RU_MAX_TYPES = 4096;
 
 RuIds(
 	s2id : ConcurHashMap<string, int>,
@@ -58,6 +73,59 @@ ruClearIds() -> void {
 	ru_ids.was_modified := false;
 	ru_ids.id_counter := 0;
 	ru_ids_cleared := true;
+	ruClearTypeIndex();
+}
+
+// general type id -> compact, and the inverse dense list (compact -> general).
+RuTypeIndex(g2c : ConcurHashMap<int, int>, c2g : Vector<int>, count : ref int);
+ru_type_index = RuTypeIndex(makeConcurHashMap(idfn), makeVector(64), ref 0);
+
+ruClearTypeIndex() -> void {
+	clearConcurHashMap(ru_type_index.g2c);
+	clearVector(ru_type_index.c2g);
+	ru_type_index.count := 0;
+}
+
+do_type_compact = synchronizedUnaryFn(ru_type_index,
+	\g ->
+	if (containsKeyConcurHashMap(ru_type_index.g2c, g)) {
+		getConcurHashMap(ru_type_index.g2c, g, -1);
+	} else {
+		c = ^(ru_type_index.count);
+		if (c >= RU_MAX_TYPES) {
+			ruCrash("too many grammar types (>= " + i2s(RU_MAX_TYPES) + "): packed idType type-field overflow");
+		}
+		setConcurHashMap(ru_type_index.g2c, g, c);
+		pushVector(ru_type_index.c2g, g);
+		ru_type_index.count := c + 1;
+		c;
+	}
+);
+
+ruTypeCompact(type_id : int) -> int {
+	if (containsKeyConcurHashMap(ru_type_index.g2c, type_id)) {
+		getConcurHashMap(ru_type_index.g2c, type_id, -1);
+	} else {
+		do_type_compact(type_id);
+	}
+}
+
+ruTypeGeneral(compact : int) -> int {
+	getVectorDef(ru_type_index.c2g, compact, -1);
+}
+
+// Persistence: the compact->general list (general type ids in compact order),
+// restored so cached compact-encoded expressions decode to the same types.
+ruTypeIndexList() -> [int] {
+	vector2array(ru_type_index.c2g);
+}
+ruSetTypeIndexList(gids : [int]) -> void {
+	ruClearTypeIndex();
+	iter(gids, \g -> {
+		setConcurHashMap(ru_type_index.g2c, g, ^(ru_type_index.count));
+		pushVector(ru_type_index.c2g, g);
+		ru_type_index.count := ^(ru_type_index.count) + 1;
+	});
 }
 
 do_s2id = synchronizedUnaryFn(ru_ids, 
@@ -142,6 +210,9 @@ ruSaveIds(env : RuEnv) -> void {
 			mapi(arr, \i, s -> s + if (i + 1 < length(arr)) "\n" else "")
 		));
 		setFileContent(file, lines);
+		// Persist the type-compact list (general type ids in compact order) so the
+		// compact ids baked into cached expressions decode to the same types.
+		setFileContent(cache_dir + "/__type_ids.txt", strGlue(map(ruTypeIndexList(), i2s), "\n"));
 		ru_ids.was_modified := false;
 	}
 }
@@ -158,6 +229,11 @@ ruReadIds(env : RuEnv) -> void {
 		ru_ids.id_counter := length(strings);
 		ru_ids.was_modified := false;
 		ru_ids.version := version;
+		type_file = cache_dir + "/__type_ids.txt";
+		if (fileExists(type_file)) {
+			tcontent = trim2(getFileContent(type_file), " \n\r\t");
+			if (tcontent != "") ruSetTypeIndexList(map(strSplit(tcontent, "\n"), s2i));
+		}
 	} else {
 		ru_ids.version := timestamp();
 	}
