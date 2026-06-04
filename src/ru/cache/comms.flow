@@ -9,6 +9,29 @@ export {
 	ruCacheCommands : [RuComm];
 }
 
+// Serialized, double-checked project read used by cache-load to repopulate the
+// global language cache when the disk cache is empty/stale. synchronizedUnaryFn
+// ensures only ONE full-project read runs at a time: concurrent LSP requests that
+// all observed an empty lang queue on the lock, and the inner re-check makes the
+// later ones no-op once the first has populated the caches (so we never launch N
+// parallel full reads).
+ru_cache_heal_lock = ref 0;
+ruCacheSelfHeal : (RuEnv) -> void = synchronizedUnaryFn(ru_cache_heal_lock, \env -> {
+	conf = env.conf;
+	if (sizeTree(ruLangCacheGet().rules) == 0) {
+		iter(conf.projectRoots, \root -> {
+			root_path = ruResolveRelativePath(root, conf.workingDir);
+			if (fileExists(root_path)) {
+				module = ruTrimPath(root_path, conf, ".ru");
+				maybeApply(
+					ruLoadAll(env, s2id(module), \id -> ruCacheGet(id, false, env)),
+					\srcs -> { ruCollectMathFast(srcs, env); {} }
+				);
+			}
+		});
+	}
+});
+
 ruCacheCommands = [
 	RuComm(
 		RuCommInfo(
@@ -35,6 +58,17 @@ ruCacheCommands = [
 				ruCacheLoad(ruFileId(file, env.conf), mode, imports, env);
 			} else {
 				ruCacheLoadAllInfo(mode, env, info_source, info_total);
+			}
+			// Self-heal a missing/empty disk cache: if after the disk pass the global
+			// language cache is still empty (e.g. the user deleted `.cache`, or every
+			// entry was stale), a later parse (sync-file-source on the LSP didOpen) would
+			// fail with "unknown type: 'wff'" because the prelude declaring the types was
+			// never loaded. Read the project roots ONCE to populate the global lang cache
+			// and rebuild the disk cache (via ruCreateSource). Gated on the lang cache being
+			// empty, so a populated cache (the normal case) skips it; runs at most once per
+			// server session.
+			if (file == "" && sizeTree(ruLangCacheGet().rules) == 0) {
+				ruCacheSelfHeal(env);
 			}
 			Some(RuState(unit.state with vars = setTree(unit.state.vars, "cache-load", pairs2tree([Pair("time", flow(ruTimePassed(timer)))]))));
 		}
