@@ -145,11 +145,14 @@ themselves; instead:
     Examples: `stats-math`/`stats-math-1` (`.sources`, `.steps`, …), `info-volume`
     (`.ru_sources`, `.ru_sources_pct`, `.total`, …; wrapper `info/volume`),
     `info-axiomatics` (`.groups`, `.distrib`, `.max_axioms`, …; wrapper
-    `info/axiomatics`).
+    `info/axiomatics`), `cache-info` (a NESTED tree read as
+    `cache-info.<cache>.size` / `.<cache>.vals`, e.g. `cache-info.lang.types.size`;
+    wrapper `info/cache`). Member access nests (`a.b.c`) and a `vals` array prints
+    as `[x, y, …]`.
   - **Text** — a command whose output is free-form *content* (source code,
     locations, variable-length listings) that scripts cannot reassemble field
     by field stores it as `<command>.text`. Examples: `conf-show`, `stats-all`,
-    `cache-info`, and the lookup wrappers `info/find`, `info/symbol`,
+    and the lookup wrappers `info/find`, `info/symbol`,
     `info/source`, `info/show`, `info/outline`, `info/math`, `info/vars`,
     `info/latex`, `info/order-sources`. Other wrappers: `info/verify`,
     `info/stats`, `info/conf`, `info/version`, `info/mem-stats`, `info/cache`.
