@@ -1,6 +1,5 @@
 import text/binary;
 import ru/util/src;
-import ru/cache/remap;
 import base/util/fileinfo;
 import base/ids;
 
@@ -16,20 +15,11 @@ export {
 	ruDiskCacheStats(full : bool, env : RuEnv) -> Tree<string, flow>;
 }
 
-ruCacheVersion = 11;
+ruCacheVersion = 9;
 
-// Self-describing cache entry. Symbol *names* are the canonical identity; the
-// numeric ids in `source` are a runtime interning detail re-mapped on load:
-//   names      — cached general symbol id -> name (every id in `source`);
-//   type_names — cached COMPACT type index -> type name (the packed idType high
-//                field is a session-local compact index, see base/ids).
-// On load both are re-interned against the current session, so an entry is
-// portable across projects and id-table / type-compaction generations.
 RuCachedFileSource(
 	source : RuSource,
-	version : int,
-	names : [Pair<int, string>],
-	type_names : [Pair<int, string>]
+	version : int
 );
 
 ruDiskCacheMakeDir(env : RuEnv) -> void {
@@ -62,17 +52,17 @@ ruDiskCacheClear(env : RuEnv) -> void {
 
 ruDiskCacheSave(s : RuSource, env : RuEnv) -> void {
 	src = RuSource(s with info = ruUpdateFileInfo(s.info, env.conf.workingDir));
-	ruDiskCacheDoSave(ruSerializeCached(src), src.info.module, "exact", env);
-	ruDiskCacheDoSave(ruSerializeCached(ruClearSourceProofs(src)), src.info.module, "proofless", env);
-}
-
-// Serialize a source together with its id->name and compact-type->name tables,
-// so its ids can be re-interned against any future session on load.
-ruSerializeCached(src : RuSource) -> string {
-	collected = ruSourceCollectIds(src);
-	names = map(set2array(collected.first), \i -> Pair(i, id2s_(i)));
-	type_names = map(set2array(collected.second), \c -> Pair(c, id2s_(ruTypeGeneral(c))));
-	toBinary(RuCachedFileSource(src, ruCacheVersion, names, type_names));
+	ruDiskCacheDoSave(
+		toBinary(RuCachedFileSource(src, ruCacheVersion)), 
+		src.info.module, "exact", env
+	);
+	ruDiskCacheDoSave(
+		toBinary(RuCachedFileSource(
+			ruClearSourceProofs(src), 
+			ruCacheVersion
+		)), 
+		src.info.module, "proofless", env
+	);
 }
 
 ruDiskCacheDoSave(binary : string, module: string, mode : string, env : RuEnv) -> void {
@@ -104,49 +94,62 @@ ruDiskCacheLoad(id : int, mode : string, env : RuEnv) -> Pair<Maybe<RuSource>, s
 				cached = cast(deserialized : flow -> RuCachedFileSource);
 				file_path = ruFindPath(file, conf, ".ru");
 				if (cached.version == ruCacheVersion) {
-					// Re-intern against the CURRENT session by NAME: general symbol ids via
-					// s2id(name); the packed compact type field via ruTypeCompact(s2id(name)).
-					// After the remap every id is valid in this session regardless of which
-					// generation/project produced the cache — so no ids_ver / own-id /
-					// import-id staleness guards are needed.
-					remap = fold(cached.names, makeTree(), \acc, p ->
-						if (p.second == "") acc else setTree(acc, p.first, s2id(p.second))
-					);
-					type_remap = fold(cached.type_names, makeTree(), \acc, p ->
-						if (p.second == "") acc else setTree(acc, p.first, ruTypeCompact(s2id(p.second)))
-					);
-					src = ruRemapSourceIds(cached.source,
-						\i -> if (i < 0) i else lookupTreeDef(remap, i, i),
-						\c -> lookupTreeDef(type_remap, c, c)
-					);
+					src = cached.source;
 					changed = ruFileChangedMessage(src.info, file_path);
 					if (changed != "") {
 						ruDiskCacheDelete(id, env);
 						env.out.trace("disk-cache", \-> changed);
 						Pair(None(), changed);
-					} else if (file_path != src.info.path) {
-						message = "Cached file " + file + " has different full path:\n" +
-							"\t" + src.info.path + "\n\t!=\n\t" + file_path + "\n";
-						ruDiskCacheDelete(id, env);
-						env.out.trace("disk-cache", \-> message);
-						Pair(None(), message);
 					} else {
-						// Guard: every imported module must still resolve to an existing source
-						// file (a re-translation can drop whole modules). Import ids are
-						// re-interned above, so id2s is safe here.
-						missing_imports = filter(src.imports, \imp ->
-							!fileExists(ruFindPath(id2s(imp.id), conf, ".ru"))
-						);
-						if (length(missing_imports) > 0) {
-							message = "Cached file " + file + " imports module(s) whose source no longer exists (" +
-								strGlue(map(take(missing_imports, 5), \imp -> id2s(imp.id)), ", ") +
-								(if (length(missing_imports) > 5) ", ..." else "") + "); cache deleted.";
+						if (src.info.ids_ver != ruIdsVersion()) {
+							message = "Cached file " + file + " has outdated version of ids map: " + time2stringUtc(src.info.ids_ver) + 
+									" while current ids version is: " + time2stringUtc(ruIdsVersion()) + ". Cache file is deleted.";
 							ruDiskCacheDelete(id, env);
 							env.out.trace("disk-cache", \-> message);
 							Pair(None(), message);
 						} else {
-							// Successfully loaded cached file
-							Pair(Some(src), "");
+							if (file_path != src.info.path) {
+								message = "Cached file " + file + " has different full path:\n" + 
+									"\t" + src.info.path + "\n\t!=\n\t" + file_path + "\n";
+								ruDiskCacheDelete(id, env);
+								env.out.trace("disk-cache", \-> message);
+								Pair(None(), message);
+							} else {
+								// Guard: the source's OWN id AND all import IDs must exist in the
+								// current session's ID map. If not, the cache predates a __ids.txt
+								// that was rebuilt with fewer/different entries. (Without the self-id
+								// check, a stale source whose own id is unregistered loads fine here
+								// but later crashes at id2s(src.info.id) in source ordering.)
+								self_stale = !ruIdRegistered(src.info.id);
+								stale = filter(src.imports, \imp -> !ruIdRegistered(imp.id));
+								// Guard: every imported module must still resolve to an existing
+								// source file. A re-translation that removed theorems can drop
+								// whole modules while their IDs stay registered in __ids.txt; a
+								// stale cache then still imports them, causing "file not found"
+								// at load time. Detect that here and invalidate the cache.
+								// Only inspect REGISTERED ids: id2s crashes on unregistered ids,
+								// and those are already handled by the `stale` check below.
+								missing_imports = filter(src.imports, \imp ->
+									ruIdRegistered(imp.id) && !fileExists(ruFindPath(id2s(imp.id), conf, ".ru"))
+								);
+								if (self_stale || length(stale) > 0) {
+									message = "Cached file " + file + (if (self_stale) " has an unregistered own id" else " has stale import IDs") + "; cache deleted.";
+									ruDiskCacheDelete(id, env);
+									env.out.trace("disk-cache", \-> message);
+									Pair(None(), message);
+								} else if (length(missing_imports) > 0) {
+									message = "Cached file " + file + " imports module(s) whose source no longer exists (" +
+										strGlue(map(take(missing_imports, 5), \imp -> id2s(imp.id)), ", ") +
+										(if (length(missing_imports) > 5) ", ..." else "") + "); cache deleted.";
+									ruDiskCacheDelete(id, env);
+									env.out.trace("disk-cache", \-> message);
+									Pair(None(), message);
+								} else {
+									// Successfull cached file loaded
+									//env.out.trace("disk-cache", \-> "successfully loaded: " + file);
+									Pair(Some(src), "");
+								}
+							}
 						}
 					}
 				} else {
