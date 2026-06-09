@@ -1,5 +1,6 @@
 import ru/util/src;
 import ru/cache/lang;
+import base/concurrent;
 
 export {
 	ruDefCacheClear() -> void;
@@ -31,13 +32,27 @@ ruDefCacheClear() -> void {
 	clearConcurHashMap(ruSymb2CachedDef);
 }
 
+// SERIALIZED: the server processes requests concurrently, so a hover/ontology
+// request can call this while a cache-load is still populating ruId2Def and the
+// lang cache. Without the lock two callers race on the snapshot+clear of ruId2Def
+// and defs get lost. With it, only one builder runs at a time.
 ruInitDefCache(env : RuEnv) -> void {
+	ruDoInitDefCache(env);
+}
+
+ru_def_cache_lock = ref 0;
+
+ruDoInitDefCache = synchronizedUnaryFn(ru_def_cache_lock, \env : RuEnv -> {
 	if (sizeConcurHashMap(ruId2Def) > 0) {
 		defs = valuesConcurHashMap(ruId2Def);
 		clearConcurHashMap(ruId2Def);
-		iter(defs, \d -> ruDefCacheAddDef(d, env));
+		// A def whose top rule is not (yet) in the lang cache is RE-PENDED, not
+		// dropped and never a crash: under concurrent loads the rule may arrive
+		// later, and a partial/stale lang must never bring the server down. A
+		// later ruInitDefCache (e.g. after the load finishes) completes it.
+		iter(defs, \d -> if (!ruDefCacheAddDef(d, env)) setConcurHashMap(ruId2Def, d.info.id, d));
 	}
-}
+});
 
 ruDefCacheRule2Def(rule_id : int, env : RuEnv) -> Maybe<RuCachedDef> {
 	ruInitDefCache(env);
@@ -70,7 +85,9 @@ ruDefIgnoreId(id : int) -> bool {
 	}
 }
 
-ruDefCacheAddDef(d : RuDef, env : RuEnv) -> void {
+// Returns true if the def was cached (or is unrecoverable), false if its rule is
+// not yet in the lang cache and the def should be retried later (re-pended).
+ruDefCacheAddDef(d : RuDef, env : RuEnv) -> bool {
 	switch (ruExp(d.defm).nodes[0]) {
 		RuRuleNode(rule_type,__): {
 			rule_id = ruIdType2Id(rule_type);
@@ -96,14 +113,20 @@ ruDefCacheAddDef(d : RuDef, env : RuEnv) -> void {
 						env.out.trace("def-cache", \-> "definition " + id2s(d.info.id) + " has no unique symbols");
 						//ruDefCacheFixNoSymbs(d, rule, all_symbs);
 					}
+					true;
 				}
 				None(): {
-					ruCrash("Rule '" + id2s(rule_id) + "' is not found in rule cache");
+					// Rule not (yet) loaded: defer rather than crash the server.
+					env.out.trace("def-cache", \-> "rule '" + id2s(rule_id) + "' not in cache yet; deferring def '" + id2s(d.info.id) + "'");
+					false;
 				}
 			}
 		}
 		default: {
-			ruCrash("defiendum must not be a variable: '" + ruExpRPN2s(ruExp(d.defm)) + "'");
+			// Malformed def (variable defiendum): report, but do not re-pend (it
+			// would loop forever) and do not crash.
+			env.out.error("defiendum must not be a variable: '" + ruExpRPN2s(ruExp(d.defm)) + "'", []);
+			true;
 		}
 	}
 }
