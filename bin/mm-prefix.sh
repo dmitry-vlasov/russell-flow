@@ -12,8 +12,8 @@
 # statement (`$.`) or closed a scope (`$}`) — i.e. a safe between-statements
 # boundary. The result parses and verifies as a self-contained theory.
 #
-# Usage:   tools/mm-prefix.sh <input.mm> <target-lines> <output.mm>
-# Example: tools/mm-prefix.sh set.mm 100000 set-100000.mm
+# Usage:   bin/mm-prefix.sh <input.mm> <target-lines> <output.mm>
+# Example: bin/mm-prefix.sh set.mm 100000 set-100000.mm
 #
 # Note: the cut tracks upstream set.mm content, so the exact set of theorems in
 # the prefix shifts as set.mm evolves. Tests that pin specific (theorem, tactic)
