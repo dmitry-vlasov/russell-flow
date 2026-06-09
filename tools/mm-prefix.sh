@@ -48,4 +48,20 @@ BEGIN { depth = 0; incomment = 0; last = "" }
 }
 ' "$INPUT" > "$OUTPUT"
 
+# Always include the `$t` typesetting block (htmldef/latexdef/althtmldef). It lives
+# far down set.mm, so short prefixes would otherwise omit it and the translator
+# would emit bare ASCII symbols (e.g. `/\` instead of `∧`). That makes a prefix
+# CONTRADICT full set.mm — the same grammar rule (`wa`) gets different symbols —
+# which corrupts the shared, cross-project caches of a long-lived Russell server.
+# Appending `$t` (a position-independent comment) keeps every prefix's symbol names
+# identical to set.mm. Skip if the prefix already contains it.
+if ! grep -q '[$]( [$]t' "$OUTPUT"; then
+	awk '
+		/[$]\( [$]t/ { cap = 1 }
+		cap          { print }
+		cap && /[$]\)/ { exit }
+	' "$INPUT" >> "$OUTPUT"
+	echo "mm-prefix: appended \$t typesetting block"
+fi
+
 echo "mm-prefix: wrote $(wc -l < "$OUTPUT") lines to $OUTPUT (target $TARGET)"
