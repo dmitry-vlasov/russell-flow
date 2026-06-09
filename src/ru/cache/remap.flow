@@ -1,0 +1,123 @@
+import ru/src;
+import ru/util/exp;
+
+export {
+	// Deep id-rewrite of a source: every symbol id (rule/type/const/var/assertion
+	// id, packed RuRuleNode idType, etc.) is passed through `rm`. Negative ids
+	// (sentinels like -1) must be returned unchanged by `rm`. `pos`/`ind`/
+	// `arityLen`/comments/strings carry no ids and are preserved.
+	//
+	// This single traversal is used both ways:
+	//   * collect: pass a `rm` that records the id and returns it unchanged
+	//     (ruSourceCollectIds);
+	//   * remap:   pass a `rm` that maps old session ids -> current session ids.
+	ruRemapSourceIds(src : RuSource, rm : (int) -> int) -> RuSource;
+
+	// All (non-negative) symbol ids occurring in a source — for the cache's
+	// id -> name table.
+	ruSourceCollectIds(src : RuSource) -> Set<int>;
+}
+
+ruSourceCollectIds(src : RuSource) -> Set<int> {
+	ids = ref makeSet();
+	ruRemapSourceIds(src, \id -> {
+		if (id >= 0) ids := insertSet(^ids, id);
+		id;
+	});
+	^ids;
+}
+
+ruRemapVar(v : RuVar, rm : (int) -> int) -> RuVar {
+	RuVar(rm(v.id), rm(v.type));
+}
+
+ruRemapVarsDisjs(vd : RuVarsDisjs, rm : (int) -> int) -> RuVarsDisjs {
+	RuVarsDisjs(
+		foldTree(vd.vars, makeTree(), \k, v, acc -> setTree(acc, rm(k), ruRemapVar(v, rm))),
+		// A RuDisj is stored canonically (smaller var id first; see ruCreateDisjs).
+		// Re-interning changes the ids, so the smaller/larger order can flip — restore
+		// the canonical order, else set membership of disjoints breaks.
+		mapSet(vd.disjs, \d -> {
+			a = ruRemapVar(d.v1, rm);
+			b = ruRemapVar(d.v2, rm);
+			if (a.id < b.id) RuDisj(a, b) else RuDisj(b, a);
+		})
+	);
+}
+
+ruRemapTerm(t : RuTerm, rm : (int) -> int) -> RuTerm {
+	RuTerm(rm(t.type), map(t.nodes, \n ->
+		switch (n) {
+			RuConstRef(id): RuConstRef(rm(id));
+			RuVar(__,__):   ruRemapVar(n, rm);
+		}
+	), t.pos);
+}
+
+ruRemapExp(e : RuExp, rm : (int) -> int) -> RuExp {
+	RuExp(map(e.nodes, \n ->
+		switch (n) {
+			// idType packs rule id (low) + type id (high) via ruMakeIdType.
+			RuRuleNode(idType, arityLen):
+				RuRuleNode(ruMakeIdType(rm(ruIdType2Id(idType)), rm(ruIdType2Type(idType))), arityLen);
+			RuVar(__,__): ruRemapVar(n, rm);
+		}
+	), e.pos);
+}
+
+ruRemapTermExp(te : RuTermExp, rm : (int) -> int) -> RuTermExp {
+	switch (te) {
+		RuTerm(__,__,__): ruRemapTerm(te, rm);
+		RuExp(__,__):     ruRemapExp(te, rm);
+	}
+}
+
+ruRemapStmt(s : RuStmt, rm : (int) -> int) -> RuStmt {
+	RuStmt(rm(s.class), map(s.exps, \e -> ruRemapTermExp(e, rm)), s.pos);
+}
+
+ruRemapInference(inf : RuInference, rm : (int) -> int) -> RuInference {
+	RuInference(
+		ruRemapVarsDisjs(inf.vars, rm),
+		map(inf.hyps, \h -> RuHyp(h.ind, ruRemapStmt(h.stmt, rm), h.pos)),
+		ruRemapStmt(inf.prop, rm)
+	);
+}
+
+ruRemapProof(p : RuProof, rm : (int) -> int) -> RuProof {
+	RuProof(
+		ruRemapVarsDisjs(p.vars, rm),
+		map(p.steps, \st ->
+			// refs are HypRef/StepRef indices, not ids — preserved.
+			RuStep(st.ind, rm(st.assertion), st.refs, ruRemapStmt(st.stmt, rm), ruRemapProof(st.proof, rm), st.pos)
+		),
+		p.pos
+	);
+}
+
+ruRemapDeclInfo(di : RuDeclInfo, rm : (int) -> int) -> RuDeclInfo {
+	RuDeclInfo(rm(di.id), rm(di.src), di.comments, di.pos);
+}
+
+ruRemapDecl(d : RuDecl, rm : (int) -> int) -> RuDecl {
+	switch (d) {
+		RuConst(info, ascii, latex):           RuConst(ruRemapDeclInfo(info, rm), rm(ascii), latex);
+		RuType(info, supers):                  RuType(ruRemapDeclInfo(info, rm), map(supers, rm));
+		RuRule(info, vars, term):              RuRule(ruRemapDeclInfo(info, rm),
+			foldTree(vars, makeTree(), \k, v, acc -> setTree(acc, rm(k), ruRemapVar(v, rm))),
+			ruRemapTerm(term, rm)
+		);
+		RuAxiom(info, infer):                  RuAxiom(ruRemapDeclInfo(info, rm), ruRemapInference(infer, rm));
+		RuTheorem(info, infer, meta, proof):   RuTheorem(ruRemapDeclInfo(info, rm), ruRemapInference(infer, rm), mapSet(meta, rm), ruRemapProof(proof, rm));
+		RuDef(info, infer, defm, defs):        RuDef(ruRemapDeclInfo(info, rm), ruRemapInference(infer, rm), ruRemapTermExp(defm, rm), ruRemapTermExp(defs, rm));
+	}
+}
+
+ruRemapSourceIds(src : RuSource, rm : (int) -> int) -> RuSource {
+	RuSource(
+		map(src.imports, \imp -> RuImport(rm(imp.id), imp.pos)),
+		map(src.decls, \d -> ruRemapDecl(d, rm)),
+		src.comments,
+		RuFileInfo(src.info with id = rm(src.info.id))
+	);
+}

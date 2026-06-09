@@ -8,11 +8,18 @@ import base/cache;
 export {
 	s2id_(s : string) -> int;
 	s2id(string) -> int;
+	// Intern a TYPE name. Types live in a separate low id band [0, RU_TYPE_BAND)
+	// so the value alone tells a type from any other symbol, AND so a type id
+	// always fits the 12-bit type field of a packed idType (see ru/util/exp).
+	// All non-type names are interned with s2id into [RU_TYPE_BAND, ...).
+	tp2id(string) -> int;
 	id2s(id : int) -> string;
 	// Non-crashing id2s: returns "" when id is not registered.
 	id2s_(id : int) -> string;
 	// Returns true when id was registered in this JVM session.
 	ruIdRegistered(id : int) -> bool;
+	// True if the id belongs to the type band (a type id).
+	ruIsTypeId(id : int) -> bool;
 	ruSaveIds(env : RuEnv) -> void;
 	ruReadIds(env : RuEnv) -> void;
 	// Reload the persisted id table when the in-memory one is empty (e.g. after
@@ -24,20 +31,31 @@ export {
 	ruIds() -> [string];
 	ruIdsVersion() -> double;
 	ruClearIds() -> void;
+
+	// Type ids occupy [0, RU_TYPE_BAND); all other ids occupy [RU_TYPE_BAND, ...).
+	RU_TYPE_BAND = 4096;
 }
 
+// Two forward maps so a single NAME may be both a type and a non-type and get a
+// distinct id in each band (e.g. a Metamath typecode is a `$c` constant in the mm
+// world but a grammar type in the ru world, and both coexist during mm2ru2mm).
+// One shared reverse map: the id VALUE alone tells the band (< RU_TYPE_BAND = type).
 RuIds(
-	s2id : ConcurHashMap<string, int>,
+	type_s2id : ConcurHashMap<string, int>,  // type name -> id in [0, RU_TYPE_BAND)
+	gen_s2id  : ConcurHashMap<string, int>,  // other name -> id in [RU_TYPE_BAND, ...)
 	id2s : ConcurHashMap<int, string>,
-	id_counter : ref int,
+	type_counter : ref int,   // next type id, in [0, RU_TYPE_BAND)
+	gen_counter  : ref int,   // next general id, in [RU_TYPE_BAND, ...)
 	was_modified : ref bool,
 	version : ref double, // ids version
 );
 
 ru_ids = RuIds(
 	makeConcurHashMap(fastHashString),
+	makeConcurHashMap(fastHashString),
 	makeConcurHashMap(idfn),
 	ref 0,
+	ref RU_TYPE_BAND,
 	ref false,
 	ref 0.0
 );
@@ -52,36 +70,65 @@ ruIdsVersion() -> double {
 	^(ru_ids.version);
 }
 
+ruIsTypeId(id : int) -> bool {
+	id >= 0 && id < RU_TYPE_BAND;
+}
+
 ruClearIds() -> void {
-	clearConcurHashMap(ru_ids.s2id);
+	clearConcurHashMap(ru_ids.type_s2id);
+	clearConcurHashMap(ru_ids.gen_s2id);
 	clearConcurHashMap(ru_ids.id2s);
 	ru_ids.was_modified := false;
-	ru_ids.id_counter := 0;
+	ru_ids.type_counter := 0;
+	ru_ids.gen_counter := RU_TYPE_BAND;
 	ru_ids_cleared := true;
 }
 
-do_s2id = synchronizedUnaryFn(ru_ids, 
+do_s2id = synchronizedUnaryFn(ru_ids,
 	\s ->
-	if (containsKeyConcurHashMap(ru_ids.s2id, s)) {
-		getConcurHashMap(ru_ids.s2id, s, -1);
+	if (containsKeyConcurHashMap(ru_ids.gen_s2id, s)) {
+		getConcurHashMap(ru_ids.gen_s2id, s, -1);
 	} else {
-		id = atomicRefIntAddition(ru_ids.id_counter, 1);
-		sets2id(s, id);
+		id = atomicRefIntAddition(ru_ids.gen_counter, 1);
+		ru_set_id(ru_ids.gen_s2id, s, id);
+		id;
+	}
+);
+
+do_tp2id = synchronizedUnaryFn(ru_ids,
+	\s ->
+	if (containsKeyConcurHashMap(ru_ids.type_s2id, s)) {
+		getConcurHashMap(ru_ids.type_s2id, s, -1);
+	} else {
+		id = atomicRefIntAddition(ru_ids.type_counter, 1);
+		if (id >= RU_TYPE_BAND) {
+			ruCrash("type-id pool overflow: more than " + i2s(RU_TYPE_BAND) + " grammar types");
+		}
+		ru_set_id(ru_ids.type_s2id, s, id);
 		id;
 	}
 );
 
 s2id(s : string) -> int {
-	if (containsKeyConcurHashMap(ru_ids.s2id, s)) {
-		getConcurHashMap(ru_ids.s2id, s, -1);
+	if (containsKeyConcurHashMap(ru_ids.gen_s2id, s)) {
+		getConcurHashMap(ru_ids.gen_s2id, s, -1);
 	} else {
 		ru_ids.was_modified := true;
 		do_s2id(s);
 	}
-} 
+}
+
+tp2id(s : string) -> int {
+	if (containsKeyConcurHashMap(ru_ids.type_s2id, s)) {
+		getConcurHashMap(ru_ids.type_s2id, s, -1);
+	} else {
+		ru_ids.was_modified := true;
+		do_tp2id(s);
+	}
+}
 
 s2id_(s : string) -> int {
-	getConcurHashMap(ru_ids.s2id, s, -1);
+	getConcurHashMap(ru_ids.gen_s2id, s, -1);
 }
 
 id2s(id : int) -> string {
@@ -106,23 +153,26 @@ ruIdRegistered(id : int) -> bool {
 	id >= 0 && containsKeyConcurHashMap(ru_ids.id2s, id);
 }
 
-sets2id(s : string, id : int) -> void {
+// Register (name -> id) in the given forward map (type_s2id or gen_s2id) and the
+// shared reverse map. A name may exist in BOTH forward maps (different bands), but
+// never twice in one, and an id is registered once.
+ru_set_id(fwd : ConcurHashMap<string, int>, s : string, id : int) -> void {
 	if (s == "" || id < 0) {
 		if (s == "") {
 			ruCrash("setting empty string for id: " + i2s(id));
 		} else {
 			ruCrash("id is less then 0: " + i2s(id));
 		}
-	} else if (containsKeyConcurHashMap(ru_ids.s2id, s)) {
+	} else if (containsKeyConcurHashMap(fwd, s)) {
 		ruCrash(
-			"String '" + s + "' is already in the string-to-id map, corresponding id: " + i2s(s2id(s)) + ", new id: " + i2s(id)
+			"String '" + s + "' is already in the string-to-id map, corresponding id: " + i2s(getConcurHashMap(fwd, s, -1)) + ", new id: " + i2s(id)
 		);
 	} else if (containsKeyConcurHashMap(ru_ids.id2s, id)) {
 		ruCrash(
 			"Id '" + i2s(id) + "' is already in the id-to-string map, corresponding string: '" + id2s(id) + "', new string: '" + s + "'"
 		);
 	} else {
-		setConcurHashMap(ru_ids.s2id, s, id);
+		setConcurHashMap(fwd, s, id);
 		setConcurHashMap(ru_ids.id2s, id, s);
 	}
 }
@@ -131,15 +181,21 @@ ruIds() -> [string] {
 	valuesConcurHashMap(ru_ids.id2s);
 }
 
+// __ids.txt format (two disjoint id bands persisted together):
+//   line 0          : ids version (double)
+//   line 1          : <type_count>
+//   next type_count : type names, in id order 0 .. type_count-1
+//   remaining       : general names, in id order RU_TYPE_BAND, RU_TYPE_BAND+1, ...
+// Names within each band are contiguous (sequential interning), so no gaps.
 ruSaveIds(env : RuEnv) -> void {
-	if (^(ru_ids.was_modified) && ^(ru_ids.id_counter) > 0) {
-		arr = map(enumFromTo(0, ^(ru_ids.id_counter) - 1), \id -> 
-			getConcurHashMap(ru_ids.id2s, id, "")
-		);
+	if (^(ru_ids.was_modified) && (^(ru_ids.type_counter) > 0 || ^(ru_ids.gen_counter) > RU_TYPE_BAND)) {
+		types = map(enumFromTo(0, ^(ru_ids.type_counter) - 1), \id -> getConcurHashMap(ru_ids.id2s, id, ""));
+		gens  = map(enumFromTo(RU_TYPE_BAND, ^(ru_ids.gen_counter) - 1), \id -> getConcurHashMap(ru_ids.id2s, id, ""));
 		cache_dir = ruCacheDir(env.conf, "");
 		file = cache_dir + "/__ids.txt";
-		lines = concatStrings(concat([d2s(ruIdsVersion()) + "\n"],
-			mapi(arr, \i, s -> s + if (i + 1 < length(arr)) "\n" else "")
+		lines = concatStrings(concat(
+			[d2s(ruIdsVersion()) + "\n", i2s(length(types)) + "\n"],
+			mapi(concat(types, gens), \i, s -> s + if (i + 1 < length(types) + length(gens)) "\n" else "")
 		));
 		setFileContent(file, lines);
 		ru_ids.was_modified := false;
@@ -153,9 +209,14 @@ ruReadIds(env : RuEnv) -> void {
 		source = getFileContent(file);
 		lines = strSplit(source, "\n");
 		version = s2d(lines[0]);
-		strings = tailFrom(lines, 1);
-		iteri(strings, \i, s -> sets2id(s, i));
-		ru_ids.id_counter := length(strings);
+		type_count = s2i(lines[1]);
+		body = tailFrom(lines, 2);
+		types = subrange(body, 0, type_count);
+		gens  = tailFrom(body, type_count);
+		iteri(types, \i, s -> ru_set_id(ru_ids.type_s2id, s, i));
+		iteri(gens,  \i, s -> ru_set_id(ru_ids.gen_s2id, s, RU_TYPE_BAND + i));
+		ru_ids.type_counter := length(types);
+		ru_ids.gen_counter := RU_TYPE_BAND + length(gens);
 		ru_ids.was_modified := false;
 		ru_ids.version := version;
 	} else {
@@ -166,7 +227,7 @@ ruReadIds(env : RuEnv) -> void {
 
 ruEnsureIdsLoaded(env : RuEnv) -> void {
 	// After a `clear-ids` the in-memory table is empty and any ids reassigned
-	// since (e.g. by `conf-load`) start from 0 and so COLLIDE with the persisted
+	// since (e.g. by `conf-load`) start over and so COLLIDE with the persisted
 	// canonical numbering that the on-disk caches reference. Drop those and
 	// reload the canonical table so cached numeric ids resolve correctly.
 	if (^ru_ids_cleared) {
