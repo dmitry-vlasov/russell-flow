@@ -59,9 +59,9 @@ The canonical demo: translate a fragment of the Metamath set theory library to R
 wget https://us.metamath.org/downloads/set.mm
 
 # Take a manageable fragment (~100k lines). A raw `head -n` is usually NOT valid
-# Metamath (it can cut inside a `${ ... $}` scope); tools/mm-prefix.sh cuts at a
+# Metamath (it can cut inside a `${ ... $}` scope); bin/mm-prefix.sh cuts at a
 # clean statement/scope boundary so the result parses and verifies.
-tools/mm-prefix.sh set.mm 100000 set-100000.mm
+bin/mm-prefix.sh set.mm 100000 set-100000.mm
 
 cd /directory/containing/set-100000.mm
 
