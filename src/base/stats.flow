@@ -37,6 +37,13 @@ export {
 	ruDistribLinSumStats(field_key : string, field_val : string, n : int) -> ([RuStatsRow]) -> string;
 	ruDistribLinAvgStats(field_key : string, field_val : string, n : int) -> ([RuStatsRow]) -> string;
 
+	// Structured, script-facing statistics: raw per-field numbers + distribution buckets,
+	// stored as a Tree<string,flow> so a script (scripts/info/stats.rus) does ALL the
+	// formatting (labels, table layout, bucket ranges) — no presentation lives here.
+	// Shape: { table:string, num:int, kind:string, scale:int,
+	//          fields: [ { name, max, min, sum, avg, sigma, distrib:[{bucket,value}] } ] }.
+	ruStatsStructured(table_name : string, fields : [string], key : string, kind : string, scale : int) -> Tree<string, flow>;
+
 	ruAddTime(table_name : string, time : int) -> void;
 	ruShowTime(table_name : string) -> string;
 
@@ -310,6 +317,54 @@ ruDistribLinAvgStats(field_key : string, field_val : string, n : int) -> ([RuSta
 			"\n"
 		);
 	}
+}
+
+// Distribution buckets as raw data: bucket index -> summed value (no label formatting).
+ruStatsDistribData(rows : [RuStatsRow], field_key : string, field_val : string, kind : string, scale : int) -> [Pair<int, double>] {
+	distrib = fold(rows, makeTree(), \acc, row ->
+		switch (lookupTree(row.data, field_key)) {
+			Some(key): {
+				k = if (kind == "lin") round(key) / scale else rudLogN(key, scale);
+				switch (lookupTree(row.data, field_val)) {
+					Some(val): setTree(acc, k, val + lookupTreeDef(acc, k, 0.0));
+					None(): acc;
+				}
+			}
+			None(): acc;
+		}
+	);
+	tree2pairs(distrib);
+}
+
+ruStatsStructured(table_name : string, fields0 : [string], key : string, kind : string, scale : int) -> Tree<string, flow> {
+	rows = valuesConcurHashMap(ruGetStats(table_name).array);
+	num = length(rows);
+	fields = if (fields0 != []) fields0 else if (rows == []) [] else getTreeKeys(rows[0].data);
+	field_stats = map(fields, \field -> {
+		vals = filtermap(rows, \r -> lookupTree(r.data, field));
+		sum = ruSumDoublesFromArray(vals);
+		avg = if (num == 0) 0.0 else sum / i2d(num);
+		sigma = if (num == 0) 0.0 else sqrt(fold(vals, 0.0, \a, v -> a + v * v) / i2d(num));
+		distrib = ruStatsDistribData(rows, key, field, kind, scale);
+		pairs2tree([
+			Pair("name",   flow(field)),
+			Pair("max",    flow(if (vals == []) 0.0 else ruMaxDoubleFromArray(vals))),
+			Pair("min",    flow(if (vals == []) 0.0 else ruMinDoubleFromArray(vals))),
+			Pair("sum",    flow(sum)),
+			Pair("avg",    flow(avg)),
+			Pair("sigma",  flow(sigma)),
+			Pair("distrib", flow(map(distrib, \p ->
+				pairs2tree([Pair("bucket", flow(p.first)), Pair("value", flow(p.second))])
+			))),
+		]);
+	});
+	pairs2tree([
+		Pair("table",  flow(table_name)),
+		Pair("num",    flow(num)),
+		Pair("kind",   flow(kind)),
+		Pair("scale",  flow(scale)),
+		Pair("fields", flow(field_stats)),
+	]);
 }
 
 ruFoldStats(table_name : string, init : ?, fn : (?, RuStatsRow) -> ?) -> ? {
