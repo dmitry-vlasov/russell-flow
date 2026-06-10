@@ -21,10 +21,33 @@ export {
 
 	// Hover at the task's file/line/col position (shared by info-hover and lsp-hover).
 	ruHoverAt(task : RuTask, env : RuEnv) -> RuHover;
+
+	// A located range with its source code (enough for both human line/col and LSP
+	// ranges). Shared by info-decl and lsp-definition.
+	RuLocData(path : string, code : string, range : RuRange);
+	ruDeclLocationAt(task : RuTask, env : RuEnv) -> Maybe<RuLocData>;
 }
 
 ruHoverAt(task : RuTask, env : RuEnv) -> RuHover {
 	eitherMap(ruTask2LineCol(task), \lc -> ruCursorHover(ruUnderACursor(lc, env), env), RuHover("", ""));
+}
+
+ruDeclLocationAt(task : RuTask, env : RuEnv) -> Maybe<RuLocData> {
+	maybeBind(ruTask2LineCol(task), \lc -> {
+		cursor = ruUnderACursor(lc, env);
+		id = ruCursorMostSpecificId(cursor, env);
+		if (id == -1) None() else
+		switch (ruDeclCacheGet(id)) {
+			Some(decl): maybeMap(ruCacheGet(decl.info.src, false, env), \src ->
+				RuLocData(src.info.path, ruCodeCacheGet(decl.info.src, env).code, ruCodeCacheDeclRange(decl, src, env))
+			);
+			// A file id only makes sense on an import line (jump to the imported file).
+			None(): if (!startsWith(cursor.strs.line, "import")) None() else {
+				code = ruCodeCacheGet(id, env);
+				if (code == ruNoCode) None() else Some(RuLocData(code.path, code.code, RuRange(0, ruFirstNLinesPos(code.code, 32))));
+			}
+		}
+	});
 }
 
 ruOutlineData(file : string, env : RuEnv) -> RuOutlineData {
@@ -74,58 +97,18 @@ ruCommInfoDecl = RuComm(
 
 ruRunInfoDecl(unit : RuUnit) -> Maybe<RuState> {
 	env = ruUnitEnv(unit);
-	task = unit.task;
-	state = unit.state;
-	conf = state.conf;
-	lsp = ruTaskBoolArg(task, "lsp", false);
-	buf = ref [];
-	maybeApply(ruTask2LineCol(task), \lc -> {
-		cursor = ruUnderACursor(lc, env);
-		id = ruCursorMostSpecificId(cursor, env);
-		if (id != -1) {
-			switch (ruDeclCacheGet(id)) {
-				Some(decl): {
-					maybeApply(ruCacheGet(decl.info.src, false, env), \src -> {
-						range = ruCodeCacheDeclRange(decl, src, env);
-						code = ruCodeCacheGet(decl.info.src, env).code;
-						if (lsp) {
-							loc = ruRangeCode2LspLocation(range, src.info.path, code);
-							env.out.respond(JsonArray([lspLocation2Json(loc)]));
-						} else {
-							refArrayPush(buf,
-								ruRange2s(
-									range,
-									"declaration of " + cursor.strs.name,
-									src.info.path,
-									code
-								)
-							)
-						}
-					});
-				}
-				None(): {
-					// Only use id as a file id on import lines: that is the only case where
-					// ruCursorMostSpecificId returns a file id. For symbol ids (constants, vars,
-					// rules) ruCodeCacheGet would treat the symbol name as a filename.
-					if (startsWith(cursor.strs.line, "import")) {
-						code = ruCodeCacheGet(id, env);
-						if (code != ruNoCode) {
-							range = RuRange(0, ruFirstNLinesPos(code.code, 32));
-							if (lsp) {
-								loc = ruRangeCode2LspLocation(range, code.path, code.code);
-								env.out.respond(JsonArray([lspLocation2Json(loc)]));
-							} else {
-								refArrayPush(buf,
-									ruRange2s(range, cursor.strs.line, code.path, code.code)
-								);
-							}
-						}
-					}
-				}
-			}
-		}
-	});
-	Some(ruStoreText(state, "info-decl", strGlue(^buf, "\n")));
+	// Pure data {found, path, line, col}; the LSP path is lsp-definition.
+	tree = eitherMap(ruDeclLocationAt(unit.task, env),
+		\loc -> {
+			ln = findLine(makeLineResolver(loc.code), loc.range.start);
+			pairs2tree([
+				Pair("found", flow(true)), Pair("path", flow(loc.path)),
+				Pair("line", flow(ln.lineno)), Pair("col", flow(ln.lineIndex + 1)),
+			]);
+		},
+		pairs2tree([Pair("found", flow(false)), Pair("path", flow("")), Pair("line", flow(0)), Pair("col", flow(0))])
+	);
+	Some(RuState(unit.state with vars = setTree(unit.state.vars, "info-decl", tree)))
 }
 
 ruCommInfoHover = RuComm(
