@@ -1,0 +1,273 @@
+// Unilambda — native first-order clause interpreter (recursion + multi-clause).
+//
+// This is the general functional-logic core, independent of the Russell math:
+// a `UniProgram` is a table of named clauses `name = \ args |- result`, with
+// multiple clauses per name. `eval` (uniNormalize) reduces a term to normal
+// form by, at each application `f(args)`: normalizing the arguments, then — if
+// `f` has clauses — matching them (first match wins) and normalizing the
+// resulting body, which may itself contain further calls (recursion). A symbol
+// with no clauses is a constructor: it stays as data.
+//
+//   plus = \ x*, 0 |- x*
+//   plus = \ x*, s(y*) |- s(plus(x*, y*))
+//   eval plus(s(0), s(s(0)))      ==>  s(s(s(0)))
+//
+// Variables are written with a trailing `*` (`x*`); bare identifiers are
+// constructors / function symbols. `uneval` (backward, non-deterministic) and
+// the bridge to the Russell-statement universe are later increments.
+
+import uni/ast;
+import ds/tree;
+
+export {
+	UniClause(name : int, args : [UniTerm], result : UniTerm);
+	UniProgram(clauses : Tree<int, [UniClause]>);
+
+	ruEmptyUniProgram = UniProgram(makeTree());
+
+	// Parse a `.uni` source into a clause program plus the list of `eval`
+	// query terms it contains.
+	UniProgRes ::= UniProgOk, UniProgErr;
+		UniProgOk(prog : UniProgram, queries : [UniTerm]);
+		UniProgErr(msg : string);
+	uniParseProgram(src : string) -> UniProgRes;
+
+	// Reduce a term to normal form (first-match, call-by-value). `fuel` bounds
+	// recursion depth as a runaway guard.
+	uniNormalize(prog : UniProgram, t : UniTerm, fuel : int) -> UniTerm;
+
+	uniCTerm2s(t : UniTerm) -> string;
+}
+
+// ---- term utilities -------------------------------------------------------
+
+uniTermEq(a : UniTerm, b : UniTerm) -> bool {
+	switch (a) {
+		UniVar(na): switch (b) { UniVar(nb): na == nb; UniApp(__, __): false; };
+		UniApp(fa, aa): switch (b) {
+			UniVar(__): false;
+			UniApp(fb, ab): fa == fb && length(aa) == length(ab) &&
+				forall(mapi(aa, \i, x -> uniTermEq(x, ab[i])), idfn);
+		};
+	}
+}
+
+uniTermVars(t : UniTerm, acc : [int]) -> [int] {
+	switch (t) {
+		UniVar(n): if (contains(acc, n)) acc else arrayPush(acc, n);
+		UniApp(__, args): fold(args, acc, \ac, a -> uniTermVars(a, ac));
+	}
+}
+
+uniApplyT(sub : Tree<int, UniTerm>, t : UniTerm) -> UniTerm {
+	switch (t) {
+		UniVar(n): switch (lookupTree(sub, n)) {
+			Some(t2): uniApplyT(sub, t2);
+			None(): t;
+		};
+		UniApp(f, args): UniApp(f, map(args, \a -> uniApplyT(sub, a)));
+	}
+}
+
+// One-way match: bind pattern variables so that pattern·sub == subject.
+uniMatch(pattern : UniTerm, subject : UniTerm, sub : Tree<int, UniTerm>) -> Maybe<Tree<int, UniTerm>> {
+	switch (pattern) {
+		UniVar(n): switch (lookupTree(sub, n)) {
+			Some(bound): if (uniTermEq(bound, subject)) Some(sub) else None();
+			None(): Some(setTree(sub, n, subject));
+		};
+		UniApp(pf, pargs): switch (subject) {
+			UniVar(__): None();
+			UniApp(sf, sargs): if (pf != sf || length(pargs) != length(sargs)) None() else {
+				fold(zip(pargs, sargs), Some(sub), \acc, p ->
+					maybeBind(acc, \s -> uniMatch(p.first, p.second, s))
+				);
+			};
+		};
+	}
+}
+
+// ---- evaluation -----------------------------------------------------------
+
+uniNormalize(prog : UniProgram, t : UniTerm, fuel : int) -> UniTerm {
+	if (fuel <= 0) t else {
+		switch (t) {
+			UniVar(__): t;
+			UniApp(f, args): {
+				nargs = map(args, \a -> uniNormalize(prog, a, fuel - 1));
+				switch (lookupTree(prog.clauses, f)) {
+					None(): UniApp(f, nargs);                 // constructor: data
+					Some(clauses): uniFirstClause(prog, f, clauses, 0, nargs, fuel);
+				}
+			}
+		}
+	}
+}
+
+// Try clauses in order; the first whose (freshened) arg-patterns match the
+// normalized arguments fires, and its body is normalized. If none match the
+// application is stuck and returned as-is.
+uniFirstClause(prog : UniProgram, f : int, clauses : [UniClause], i : int, nargs : [UniTerm], fuel : int) -> UniTerm {
+	if (i >= length(clauses)) UniApp(f, nargs) else {
+		c = uniFreshen(clauses[i], i, fuel);
+		if (length(c.args) != length(nargs)) uniFirstClause(prog, f, clauses, i + 1, nargs, fuel) else {
+			switch (fold(zip(c.args, nargs), Some(makeTree()), \acc, p ->
+				maybeBind(acc, \s -> uniMatch(p.first, p.second, s)))) {
+				None(): uniFirstClause(prog, f, clauses, i + 1, nargs, fuel);
+				Some(sub): uniNormalize(prog, uniApplyT(sub, c.result), fuel - 1);
+			}
+		}
+	}
+}
+
+// Rename a clause's variables to a depth/clause-unique namespace so recursive
+// re-use of the same clause cannot capture variables across levels.
+uniFreshen(c : UniClause, idx : int, fuel : int) -> UniClause {
+	vars = fold(c.args, uniTermVars(c.result, []), \acc, a -> uniTermVars(a, acc));
+	tag = "_" + i2s(fuel) + "_" + i2s(idx);
+	ren = fold(vars, makeTree(), \acc, v -> setTree(acc, v, UniVar(s2id(id2s(v) + tag))));
+	UniClause(c.name, map(c.args, \a -> uniApplyT(ren, a)), uniApplyT(ren, c.result));
+}
+
+uniCTerm2s(t : UniTerm) -> string {
+	switch (t) {
+		UniVar(n): id2s(n) + "*";
+		UniApp(f, args): if (args == []) id2s(f) else
+			id2s(f) + "(" + strGlue(map(args, uniCTerm2s), ", ") + ")";
+	}
+}
+
+// ---- parser ---------------------------------------------------------------
+
+UniTPR ::= UniTPok, UniTPerr;
+	UniTPok(term : UniTerm, pos : int);
+	UniTPerr(msg : string, pos : int);
+
+uniParseProgram(src : string) -> UniProgRes {
+	lines = strSplit(src, "\n");
+	fold(lines, UniProgOk(ruEmptyUniProgram, []), \acc, line0 ->
+		switch (acc) {
+			UniProgErr(__): acc;
+			UniProgOk(prog, queries): {
+				line = trim2(line0, " \t\r");
+				if (line == "" || startsWith(line, "#") || startsWith(line, "//")) acc
+				else if (startsWith(line, "eval ")) {
+					switch (uniParseCTerm(trim2(strRight(line, 5), " \t"), 0)) {
+						UniTPerr(m, p): UniProgErr("query parse error in '" + line + "': " + m);
+						UniTPok(term, __): UniProgOk(prog, arrayPush(queries, term));
+					}
+				} else {
+					switch (uniParseClauseLine(line)) {
+						UniClauseErr(m): UniProgErr("clause parse error in '" + line + "': " + m);
+						UniClauseOk(c): UniProgOk(uniAddClause(prog, c), queries);
+					}
+				}
+			}
+		}
+	);
+}
+
+uniAddClause(prog : UniProgram, c : UniClause) -> UniProgram {
+	UniProgram(setTree(prog.clauses, c.name, arrayPush(lookupTreeDef(prog.clauses, c.name, []), c)));
+}
+
+UniClauseRes ::= UniClauseOk, UniClauseErr;
+	UniClauseOk(clause : UniClause);
+	UniClauseErr(msg : string);
+
+// Parse one clause line `name = \ a1, a2 |- result`.
+uniParseClauseLine(line : string) -> UniClauseRes {
+	eq = strIndexOf(line, "=");
+	if (eq < 0) UniClauseErr("expected '='") else {
+		name = trim2(substring(line, 0, eq), " \t");
+		rest = trim2(substring(line, eq + 1, strlen(line) - eq - 1), " \t");
+		if (name == "") UniClauseErr("empty clause name")
+		else if (!startsWith(rest, "\\")) UniClauseErr("expected '\\' after '='")
+		else uniParseClauseBody(s2id(name), trim2(strRight(rest, 1), " \t"));
+	}
+}
+
+// Parse `a1, a2 |- result` into a clause for `name`.
+uniParseClauseBody(name : int, body : string) -> UniClauseRes {
+	uniParseHead(name, body, 0, []);
+}
+
+uniParseHead(name : int, s : string, i0 : int, acc : [UniTerm]) -> UniClauseRes {
+	i = uniCWs(s, i0);
+	// allow an empty argument list: `\ |- result`
+	if (i < strlen(s) && getCharAt(s, i) == "|") uniParseResult(name, s, i, acc) else {
+		switch (uniParseCTerm(s, i)) {
+			UniTPerr(m, __): UniClauseErr(m);
+			UniTPok(term, p): {
+				acc1 = arrayPush(acc, term);
+				j = uniCWs(s, p);
+				if (j >= strlen(s)) UniClauseErr("expected ',' or '|-'")
+				else if (getCharAt(s, j) == ",") uniParseHead(name, s, j + 1, acc1)
+				else if (getCharAt(s, j) == "|") uniParseResult(name, s, j, acc1)
+				else UniClauseErr("expected ',' or '|-'");
+			}
+		}
+	}
+}
+
+// At the `|-` turnstile: consume it, then parse the single result term.
+uniParseResult(name : int, s : string, i : int, args : [UniTerm]) -> UniClauseRes {
+	if (i + 1 >= strlen(s) || getCharAt(s, i) != "|" || getCharAt(s, i + 1) != "-") {
+		UniClauseErr("expected '|-'");
+	} else {
+		switch (uniParseCTerm(s, i + 2)) {
+			UniTPerr(m, __): UniClauseErr(m);
+			UniTPok(result, p): {
+				if (uniCWs(s, p) == strlen(s)) UniClauseOk(UniClause(name, args, result))
+				else UniClauseErr("unexpected input after result");
+			}
+		}
+	}
+}
+
+uniParseCTerm(s : string, i0 : int) -> UniTPR {
+	i = uniCWs(s, i0);
+	idEnd = uniCIdent(s, i);
+	if (idEnd == i) UniTPerr("expected a term", i) else {
+		ident = substring(s, i, idEnd - i);
+		if (endsWith(ident, "*")) {
+			UniTPok(UniVar(s2id(substring(ident, 0, strlen(ident) - 1))), idEnd);
+		} else {
+			j = uniCWs(s, idEnd);
+			if (j < strlen(s) && getCharAt(s, j) == "(") uniParseCApp(s, ident, j + 1)
+			else UniTPok(UniApp(s2id(ident), []), idEnd);
+		}
+	}
+}
+
+uniParseCApp(s : string, name : string, i0 : int) -> UniTPR {
+	i = uniCWs(s, i0);
+	if (i < strlen(s) && getCharAt(s, i) == ")") UniTPok(UniApp(s2id(name), []), i + 1)
+	else uniParseCArgs(s, i, [], \args, p -> UniTPok(UniApp(s2id(name), args), p));
+}
+
+uniParseCArgs(s : string, i0 : int, acc : [UniTerm], k : ([UniTerm], int) -> UniTPR) -> UniTPR {
+	switch (uniParseCTerm(s, i0)) {
+		UniTPerr(m, p): UniTPerr(m, p);
+		UniTPok(term, p): {
+			acc1 = arrayPush(acc, term);
+			j = uniCWs(s, p);
+			if (j >= strlen(s)) UniTPerr("expected ',' or ')'", j)
+			else if (getCharAt(s, j) == ",") uniParseCArgs(s, j + 1, acc1, k)
+			else if (getCharAt(s, j) == ")") k(acc1, j + 1)
+			else UniTPerr("expected ',' or ')'", j);
+		}
+	}
+}
+
+uniCWs(s : string, i : int) -> int {
+	if (i < strlen(s) && uniCWsChar(getCharAt(s, i))) uniCWs(s, i + 1) else i;
+}
+uniCWsChar(c : string) -> bool { c == " " || c == "\t" || c == "\n" || c == "\r"; }
+
+uniCIdent(s : string, i : int) -> int {
+	if (i < strlen(s) && uniCIdentChar(getCharAt(s, i))) uniCIdent(s, i + 1) else i;
+}
+uniCIdentChar(c : string) -> bool {
+	strContains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.*", c);
+}
