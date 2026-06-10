@@ -1,0 +1,170 @@
+// Unilambda `eval` — the forward / verification direction.
+//
+// Given a proof term (an application tree over assertion names), compute the
+// most-general statement it proves. This is principal-statement inference:
+// each leaf metavariable starts as a fresh schematic statement, each
+// application unifies its arguments against the (standardized-apart)
+// hypotheses of the applied assertion, and the accumulated unifier is applied
+// to the assertion's conclusion.
+//
+// It is a generalization of the verifier's per-step `ruMatchStep`
+// (src/ru/verify/match.flow): the verifier *checks* a supplied statement by
+// one-way matching with the assertion's fixed vars, whereas `eval` *computes*
+// the statement by full unification over freshly-renamed vars — exactly the
+// per-application freshening in ruIterAssertionsForFact
+// (src/ru/prover/core/forward_closure.flow).
+
+import uni/ast;
+import ru/src;
+import ru/math;
+import ru/subst;
+import ru/unify/exps;
+import ru/util/src;       // ruArity, ruAssertion2Vars
+import ru/util/src2s;     // ruExp, ru2s
+import base/env;          // RuEnv
+import base/concurrent;   // ruAtomicIntAdd
+
+export {
+	// Threaded evaluation state: leaf metavariable -> its assigned statement,
+	// the accumulated global unifier, and a per-evaluation fresh-var source.
+	UniEval(
+		leaves  : Tree<int, RuStmt>,
+		sub     : RuSubst,
+		fresher : (RuVar) -> RuVar
+	);
+
+	UniEvalRes ::= UniOk, UniErr;
+		// `stmt` is the computed statement of the evaluated (sub)term; `ev`
+		// carries the updated leaves/unifier for the caller to read out.
+		UniOk(stmt : RuStmt, ev : UniEval);
+		UniErr(msg : string);
+
+	// Evaluate a proof term to the statement it proves (its conclusion).
+	uniEval(t : UniTerm, math : RuMath, env : RuEnv) -> UniEvalRes;
+
+	uniIsAssertion(name : int, math : RuMath) -> bool;
+	uniApplyStmt(s : RuSubst, stmt : RuStmt) -> RuStmt;
+}
+
+uniIsAssertion(name : int, math : RuMath) -> bool {
+	containsKeyTree(math.decls.assertions, name);
+}
+
+uniApplyStmt(s : RuSubst, stmt : RuStmt) -> RuStmt {
+	RuStmt(
+		stmt.class,
+		cast(map(stmt.exps, \e -> ruApplySubst(ruExp(e), s)) : [RuExp] -> [RuTermExp]),
+		stmt.pos
+	);
+}
+
+// Unify two statements, refining `sub`. Statements must share class and arity.
+uniUnifyStmts(s1 : RuStmt, s2 : RuStmt, sub : RuSubst, math : RuMath, env : RuEnv) -> Maybe<RuSubst> {
+	if (s1.class != s2.class || length(s1.exps) != length(s2.exps)) None() else {
+		fold(zip(s1.exps, s2.exps), Some(sub), \acc, p ->
+			maybeBind(acc, \sb -> ruUnifyExps([ruExp(p.first), ruExp(p.second)], sb, math, env))
+		);
+	}
+}
+
+uniEval(t : UniTerm, math : RuMath, env : RuEnv) -> UniEvalRes {
+	fresh_id = ref 0;
+	inc = ruAtomicIntAdd(fresh_id);
+	fresher = \v : RuVar -> RuVar(s2id(id2s(v.id) + "_u" + i2s(inc(1))), v.type);
+	uniEvalT(t, UniEval(makeTree(), ruEmptySubst, fresher), math, env);
+}
+
+// Evaluate a term that must yield a statement.
+uniEvalT(t : UniTerm, ev : UniEval, math : RuMath, env : RuEnv) -> UniEvalRes {
+	switch (t) {
+		UniApp(name, args): uniEvalApp(name, args, ev, math, env);
+		UniVar(name): {
+			if (uniIsAssertion(name, math)) {
+				uniEvalApp(name, [], ev, math, env);
+			} else {
+				switch (lookupTree(ev.leaves, name)) {
+					Some(s): UniOk(uniApplyStmt(ev.sub, s), ev);
+					None(): UniErr("free leaf '" + id2s(name) + "' has no statement — use it as an argument");
+				}
+			}
+		}
+	}
+}
+
+// Apply assertion `name` to `args`: standardize the assertion's vars apart,
+// unify each argument against the corresponding hypothesis, return the
+// substituted conclusion.
+uniEvalApp(name : int, args : [UniTerm], ev : UniEval, math : RuMath, env : RuEnv) -> UniEvalRes {
+	switch (lookupTree(math.decls.assertions, name)) {
+		None(): UniErr("unknown rule/assertion: '" + id2s(name) + "'");
+		Some(ass): {
+			hyps = ass.infer.hyps;
+			if (length(args) != length(hyps)) {
+				UniErr("arity mismatch for '" + id2s(name) + "': " +
+					i2s(length(args)) + " argument(s), " + i2s(length(hyps)) + " hypothes(es)");
+			} else {
+				fresh_sub = ruMakeFresherSubst(set2array(ruAssertion2Vars(ass)), ev.fresher);
+				folded = foldi(args, UniOk(ass.infer.prop, ev), \i, acc, arg ->
+					switch (acc) {
+						UniErr(__): acc;
+						UniOk(__, ev_i): {
+							hyp_pat = uniApplyStmt(ev_i.sub, uniApplyStmt(fresh_sub, hyps[i].stmt));
+							uniEvalArg(arg, hyp_pat, ev_i, math, env);
+						}
+					}
+				);
+				switch (folded) {
+					UniErr(__): folded;
+					UniOk(__, ev_f): {
+						prop = uniApplyStmt(ev_f.sub, uniApplyStmt(fresh_sub, ass.infer.prop));
+						UniOk(prop, ev_f);
+					}
+				}
+			}
+		}
+	}
+}
+
+// Match one argument against the hypothesis pattern it fills.
+uniEvalArg(arg : UniTerm, hyp_pat : RuStmt, ev : UniEval, math : RuMath, env : RuEnv) -> UniEvalRes {
+	switch (arg) {
+		UniVar(name): {
+			if (uniIsAssertion(name, math)) {
+				uniMatchSub(uniEvalApp(name, [], ev, math, env), hyp_pat, math, env);
+			} else {
+				// A genuine leaf metavariable: on first use it takes the shape of
+				// the hypothesis it fills (already freshened); on later uses its
+				// prior shape is unified with the new hypothesis pattern.
+				switch (lookupTree(ev.leaves, name)) {
+					None(): {
+						assigned = uniApplyStmt(ev.sub, hyp_pat);
+						UniOk(assigned, UniEval(ev with leaves = setTree(ev.leaves, name, assigned)));
+					}
+					Some(prev): {
+						switch (uniUnifyStmts(uniApplyStmt(ev.sub, prev), hyp_pat, ev.sub, math, env)) {
+							None(): UniErr("leaf '" + id2s(name) + "' used at incompatible statements");
+							Some(sb): UniOk(hyp_pat, UniEval(ev with sub = sb));
+						}
+					}
+				}
+			}
+		}
+		UniApp(nm, as): uniMatchSub(uniEvalApp(nm, as, ev, math, env), hyp_pat, math, env);
+	}
+}
+
+// Take a subterm's evaluation result and unify its statement with `hyp_pat`.
+uniMatchSub(res : UniEvalRes, hyp_pat : RuStmt, math : RuMath, env : RuEnv) -> UniEvalRes {
+	switch (res) {
+		UniErr(__): res;
+		UniOk(arg_stmt, ev2): {
+			a = uniApplyStmt(ev2.sub, arg_stmt);
+			h = uniApplyStmt(ev2.sub, hyp_pat);
+			switch (uniUnifyStmts(a, h, ev2.sub, math, env)) {
+				None(): UniErr("argument does not match hypothesis:\n  arg: " +
+					ru2s(a, math) + "\n  hyp: " + ru2s(h, math));
+				Some(sb): UniOk(arg_stmt, UniEval(ev2 with sub = sb));
+			}
+		}
+	}
+}
