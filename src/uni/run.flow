@@ -1,246 +1,198 @@
-// Unilambda — native first-order clause interpreter (recursion + multi-clause).
+// Unilambda — clause interpreter, RuExp-native (one order-sorted universe).
 //
-// This is the general functional-logic core, independent of the Russell math:
-// a `UniProgram` is a table of named clauses `name = \ args |- result`, with
-// multiple clauses per name. `eval` (uniNormalize) reduces a term to normal
-// form by, at each application `f(args)`: normalizing the arguments, then — if
-// `f` has clauses — matching them (first match wins) and normalizing the
-// resulting body, which may itself contain further calls (recursion). A symbol
-// with no clauses is a constructor: it stays as data.
+// Terms ARE Russell expressions (`RuExp`): a function/constructor application
+// `f(a, ...)` is a rule node, a `*`-suffixed identifier is a typed variable.
+// Unification, matching and substitution are Russell's own order-sorted
+// machinery (`ruUnifyExps`, `ruMatchExp`, `ruApplySubst`), so binding to real
+// Russell math is just a matter of which sorts/symbols the terms use; the
+// standalone case below uses a single universal sort, the bound case (later)
+// uses wff/class/set with the loaded grammar.
 //
-//   plus = \ x*, 0 |- x*
-//   plus = \ x*, s(y*) |- s(plus(x*, y*))
-//   eval plus(s(0), s(s(0)))      ==>  s(s(s(0)))
-//
-// Variables are written with a trailing `*` (`x*`); bare identifiers are
-// constructors / function symbols. `uneval` (backward, non-deterministic) and
-// the bridge to the Russell-statement universe are later increments.
+// A `UniProgram` is a table of clauses `f(args) = body`, multiple per `f`.
+// `f` with clauses is a defined function (reduced by narrowing); a symbol with
+// no clauses is a constructor (data). `uniEval` reduces forward (call-by-value,
+// first match, via `ruMatchExp`); `uniSolve` runs backward (narrowing, via
+// `ruUnifyExps`), enumerating every substitution making `goal` reduce to `target`.
 
-import uni/ast;
-import ds/tree;
+import ru/src;            // RuExp, RuVar, RuRuleNode, ruMakeRuleNode, arity/len/idType accessors
+import ru/subst;          // RuSubst, ruApplySubst, ruMatchExp, ruMakeFresherSubst, ruEmptySubst
+import ru/unify/exps;     // ruUnifyExps
+import ru/util/src;       // ruExp2Vars
+import ru/math;           // RuMath
+import base/ids;          // s2id, id2s, tp2id
+import base/env;          // RuEnv
 import base/concurrent;   // ruAtomicIntAdd
+import ds/tree;
 
 export {
-	UniClause(name : int, args : [UniTerm], result : UniTerm);
-	UniProgram(clauses : Tree<int, [UniClause]>);
+	UniClause(name : int, head : RuExp, body : RuExp);
+	UniProgram(clauses : Tree<int, [UniClause]>, defined : Set<int>);
+	ruEmptyUniProgram = UniProgram(makeTree(), makeSet());
 
-	ruEmptyUniProgram = UniProgram(makeTree());
-
-	// A `.uni` query is either forward (`eval t`) or backward (`solve g = t`).
 	UniQuery ::= UniQEval, UniQSolve;
-		UniQEval(term : UniTerm);
-		UniQSolve(goal : UniTerm, target : UniTerm);
+		UniQEval(term : RuExp);
+		UniQSolve(goal : RuExp, target : RuExp);
 
-	// Parse a `.uni` source into a clause program plus its queries.
 	UniProgRes ::= UniProgOk, UniProgErr;
 		UniProgOk(prog : UniProgram, queries : [UniQuery]);
 		UniProgErr(msg : string);
 	uniParseProgram(src : string) -> UniProgRes;
 
-	// Reduce a term to normal form (first-match, call-by-value). `fuel` bounds
-	// recursion depth as a runaway guard.
-	uniNormalize(prog : UniProgram, t : UniTerm, fuel : int) -> UniTerm;
+	// Forward: reduce a term to normal form (first-match, call-by-value).
+	uniReduce(prog : UniProgram, e : RuExp, math : RuMath, env : RuEnv, fuel : int) -> RuExp;
 
-	// Backward direction (narrowing): all substitutions over `goal`'s variables
-	// for which `goal` reduces to `target`. `fuel` bounds search depth — undirected
-	// narrowing is only semi-decidable, so deeper solutions beyond `fuel` are missed.
-	uniSolve(prog : UniProgram, goal : UniTerm, target : UniTerm, fuel : int) -> [Tree<int, UniTerm>];
+	// Backward (narrowing): every substitution over `goal`'s variables for which
+	// `goal` reduces to `target`. `fuel` bounds depth (narrowing is semi-decidable).
+	uniSolve(prog : UniProgram, goal : RuExp, target : RuExp, math : RuMath, env : RuEnv, fuel : int) -> [RuSubst];
 
-	uniApplyT(sub : Tree<int, UniTerm>, t : UniTerm) -> UniTerm;
-	uniTermVars(t : UniTerm, acc : [int]) -> [int];
-	uniCTerm2s(t : UniTerm) -> string;
+	// Build / inspect / render RuExp terms in unilambda's f(args) / x* notation.
+	uniVarExp(name : int) -> RuExp;
+	uniMkApp(rule : int, args : [RuExp]) -> RuExp;
+	uniExp2s(e : RuExp) -> string;
 }
 
-// ---- term utilities -------------------------------------------------------
+// The single universal sort for the standalone clause language. (When binding
+// to real math, terms carry the actual wff/class/set sorts instead.)
+uniSort() -> int { tp2id("uni-term"); }
 
-uniTermEq(a : UniTerm, b : UniTerm) -> bool {
-	switch (a) {
-		UniVar(na): switch (b) { UniVar(nb): na == nb; UniApp(__, __): false; };
-		UniApp(fa, aa): switch (b) {
-			UniVar(__): false;
-			UniApp(fb, ab): fa == fb && length(aa) == length(ab) &&
-				forall(mapi(aa, \i, x -> uniTermEq(x, ab[i])), idfn);
-		};
+uniVarExp(name : int) -> RuExp { RuExp([RuVar(name, uniSort())], -1); }
+
+uniMkApp(rule : int, args : [RuExp]) -> RuExp {
+	kids = concatA(map(args, \a -> a.nodes));
+	RuExp(concat([ruMakeRuleNode(rule, uniSort(), length(args), length(kids))], kids), -1);
+}
+
+// ---- RuExp tree navigation (flat prefix RPN; rule node `len` = #child nodes) ----
+
+uniExpIsVar(e : RuExp) -> bool {
+	switch (e.nodes[0]) { RuVar(__, __): true; RuRuleNode(__, __): false; }
+}
+
+uniExpRule(e : RuExp) -> int {
+	switch (e.nodes[0]) { RuVar(__, __): -1; RuRuleNode(rt, __): ruIdType2Id(rt); }
+}
+
+uniExpArgs(e : RuExp) -> [RuExp] {
+	switch (e.nodes[0]) {
+		RuVar(__, __): [];
+		RuRuleNode(__, al): uniExtractKids(e.nodes, 1, ruArityLen2Arity(al), []);
 	}
 }
 
-uniTermVars(t : UniTerm, acc : [int]) -> [int] {
-	switch (t) {
-		UniVar(n): if (contains(acc, n)) acc else arrayPush(acc, n);
-		UniApp(__, args): fold(args, acc, \ac, a -> uniTermVars(a, ac));
+uniExtractKids(nodes : [RuExpNode], off : int, k : int, acc : [RuExp]) -> [RuExp] {
+	if (k == 0) acc else {
+		span = switch (nodes[off]) { RuVar(__, __): 1; RuRuleNode(__, al): ruArityLen2Len(al) + 1; };
+		uniExtractKids(nodes, off + span, k - 1, arrayPush(acc, RuExp(subrange(nodes, off, span), -1)));
 	}
 }
 
-uniApplyT(sub : Tree<int, UniTerm>, t : UniTerm) -> UniTerm {
-	switch (t) {
-		UniVar(n): switch (lookupTree(sub, n)) {
-			Some(t2): uniApplyT(sub, t2);
-			None(): t;
-		};
-		UniApp(f, args): UniApp(f, map(args, \a -> uniApplyT(sub, a)));
+uniExp2s(e : RuExp) -> string {
+	switch (e.nodes[0]) {
+		RuVar(id, __): id2s(id) + "*";
+		RuRuleNode(rt, __): {
+			r = ruIdType2Id(rt);
+			args = uniExpArgs(e);
+			if (args == []) id2s(r) else id2s(r) + "(" + strGlue(map(args, uniExp2s), ", ") + ")";
+		}
 	}
 }
 
-// One-way match: bind pattern variables so that pattern·sub == subject.
-uniMatch(pattern : UniTerm, subject : UniTerm, sub : Tree<int, UniTerm>) -> Maybe<Tree<int, UniTerm>> {
-	switch (pattern) {
-		UniVar(n): switch (lookupTree(sub, n)) {
-			Some(bound): if (uniTermEq(bound, subject)) Some(sub) else None();
-			None(): Some(setTree(sub, n, subject));
-		};
-		UniApp(pf, pargs): switch (subject) {
-			UniVar(__): None();
-			UniApp(sf, sargs): if (pf != sf || length(pargs) != length(sargs)) None() else {
-				fold(zip(pargs, sargs), Some(sub), \acc, p ->
-					maybeBind(acc, \s -> uniMatch(p.first, p.second, s))
-				);
-			};
-		};
-	}
+// ---- clauses / freshening -------------------------------------------------
+
+uniAddClause(prog : UniProgram, c : UniClause) -> UniProgram {
+	UniProgram(
+		setTree(prog.clauses, c.name, arrayPush(lookupTreeDef(prog.clauses, c.name, []), c)),
+		insertSet(prog.defined, c.name)
+	);
 }
 
-// ---- evaluation -----------------------------------------------------------
+uniFreshenClause(c : UniClause, inc : (int) -> int) -> UniClause {
+	vars = set2array(mergeSets(ruExp2Vars(c.head), ruExp2Vars(c.body)));
+	fresh = ruMakeFresherSubst(vars, \v -> RuVar(s2id(id2s(v.id) + "_n" + i2s(inc(1))), v.type));
+	UniClause(c.name, ruApplySubst(c.head, fresh), ruApplySubst(c.body, fresh));
+}
 
-uniNormalize(prog : UniProgram, t : UniTerm, fuel : int) -> UniTerm {
-	if (fuel <= 0) t else {
-		switch (t) {
-			UniVar(__): t;
-			UniApp(f, args): {
-				nargs = map(args, \a -> uniNormalize(prog, a, fuel - 1));
-				switch (lookupTree(prog.clauses, f)) {
-					None(): UniApp(f, nargs);                 // constructor: data
-					Some(clauses): uniFirstClause(prog, f, clauses, 0, nargs, fuel);
-				}
+// ---- forward evaluation (matching) ----------------------------------------
+
+uniReduce(prog : UniProgram, e : RuExp, math : RuMath, env : RuEnv, fuel : int) -> RuExp {
+	counter = ref 0;
+	uniNormalize(prog, e, math, env, ruAtomicIntAdd(counter), fuel);
+}
+
+uniNormalize(prog : UniProgram, e : RuExp, math : RuMath, env : RuEnv, inc : (int) -> int, fuel : int) -> RuExp {
+	if (fuel <= 0) e else {
+		switch (e.nodes[0]) {
+			RuVar(__, __): e;
+			RuRuleNode(rt, __): {
+				r = ruIdType2Id(rt);
+				nargs = map(uniExpArgs(e), \a -> uniNormalize(prog, a, math, env, inc, fuel - 1));
+				e2 = uniMkApp(r, nargs);
+				if (containsSet(prog.defined, r)) {
+					uniFirstClause(prog, lookupTreeDef(prog.clauses, r, []), 0, e2, math, env, inc, fuel);
+				} else e2;
 			}
 		}
 	}
 }
 
-// Try clauses in order; the first whose (freshened) arg-patterns match the
-// normalized arguments fires, and its body is normalized. If none match the
-// application is stuck and returned as-is.
-uniFirstClause(prog : UniProgram, f : int, clauses : [UniClause], i : int, nargs : [UniTerm], fuel : int) -> UniTerm {
-	if (i >= length(clauses)) UniApp(f, nargs) else {
-		c = uniFreshen(clauses[i], i, fuel);
-		if (length(c.args) != length(nargs)) uniFirstClause(prog, f, clauses, i + 1, nargs, fuel) else {
-			switch (fold(zip(c.args, nargs), Some(makeTree()), \acc, p ->
-				maybeBind(acc, \s -> uniMatch(p.first, p.second, s)))) {
-				None(): uniFirstClause(prog, f, clauses, i + 1, nargs, fuel);
-				Some(sub): uniNormalize(prog, uniApplyT(sub, c.result), fuel - 1);
-			}
+uniFirstClause(prog : UniProgram, clauses : [UniClause], i : int, e2 : RuExp, math : RuMath, env : RuEnv, inc : (int) -> int, fuel : int) -> RuExp {
+	if (i >= length(clauses)) e2 else {
+		c = uniFreshenClause(clauses[i], inc);
+		switch (ruMatchExp(e2, c.head, math, env)) {
+			None(): uniFirstClause(prog, clauses, i + 1, e2, math, env, inc, fuel);
+			Some(sub): uniNormalize(prog, ruApplySubst(c.body, sub), math, env, inc, fuel - 1);
 		}
 	}
 }
 
-// Rename a clause's variables to a depth/clause-unique namespace so recursive
-// re-use of the same clause cannot capture variables across levels.
-uniFreshen(c : UniClause, idx : int, fuel : int) -> UniClause {
-	vars = fold(c.args, uniTermVars(c.result, []), \acc, a -> uniTermVars(a, acc));
-	tag = "_" + i2s(fuel) + "_" + i2s(idx);
-	ren = fold(vars, makeTree(), \acc, v -> setTree(acc, v, UniVar(s2id(id2s(v) + tag))));
-	UniClause(c.name, map(c.args, \a -> uniApplyT(ren, a)), uniApplyT(ren, c.result));
+// ---- backward narrowing ---------------------------------------------------
+
+uniSolve(prog : UniProgram, goal : RuExp, target : RuExp, math : RuMath, env : RuEnv, fuel : int) -> [RuSubst] {
+	counter = ref 0;
+	inc = ruAtomicIntAdd(counter);
+	filtermap(uniNarrow(prog, goal, ruEmptySubst, math, env, inc, fuel), \p ->
+		ruUnifyExps([p.first, ruApplySubst(target, p.second)], p.second, math, env)
+	);
 }
 
-uniCTerm2s(t : UniTerm) -> string {
-	switch (t) {
-		UniVar(n): id2s(n) + "*";
-		UniApp(f, args): if (args == []) id2s(f) else
-			id2s(f) + "(" + strGlue(map(args, uniCTerm2s), ", ") + ")";
-	}
-}
-
-// ---- backward direction: unification + narrowing --------------------------
-
-// Resolve a term's top-level variable chain under the (triangular) substitution.
-uniWalk(sub : Tree<int, UniTerm>, t : UniTerm) -> UniTerm {
-	switch (t) {
-		UniVar(n): switch (lookupTree(sub, n)) { Some(t2): uniWalk(sub, t2); None(): t; };
-		UniApp(__, __): t;
-	}
-}
-
-uniOccurs(n : int, t : UniTerm, sub : Tree<int, UniTerm>) -> bool {
-	switch (uniWalk(sub, t)) {
-		UniVar(m): m == n;
-		UniApp(__, args): exists(args, \a -> uniOccurs(n, a, sub));
-	}
-}
-
-// Two-way first-order unification with occurs-check, extending `sub`.
-uniUnify(a : UniTerm, b : UniTerm, sub : Tree<int, UniTerm>) -> Maybe<Tree<int, UniTerm>> {
-	wa = uniWalk(sub, a);
-	wb = uniWalk(sub, b);
-	switch (wa) {
-		UniVar(na): switch (wb) {
-			UniVar(nb): if (na == nb) Some(sub) else Some(setTree(sub, na, wb));
-			UniApp(__, __): if (uniOccurs(na, wb, sub)) None() else Some(setTree(sub, na, wb));
-		};
-		UniApp(fa, aa): switch (wb) {
-			UniVar(nb): if (uniOccurs(nb, wa, sub)) None() else Some(setTree(sub, nb, wa));
-			UniApp(fb, bb): if (fa != fb || length(aa) != length(bb)) None() else {
-				fold(zip(aa, bb), Some(sub), \acc, p -> maybeBind(acc, \s -> uniUnify(p.first, p.second, s)));
-			};
-		};
-	}
-}
-
-uniFreshenInc(c : UniClause, inc : (int) -> int) -> UniClause {
-	vars = fold(c.args, uniTermVars(c.result, []), \acc, a -> uniTermVars(a, acc));
-	tag = "_n" + i2s(inc(1));
-	ren = fold(vars, makeTree(), \acc, v -> setTree(acc, v, UniVar(s2id(id2s(v) + tag))));
-	UniClause(c.name, map(c.args, \a -> uniApplyT(ren, a)), uniApplyT(ren, c.result));
-}
-
-// Narrow a term: enumerate (normal-form, substitution) pairs reachable by
-// reducing defined-function applications, instantiating variables via the
-// clause heads as needed. Arguments are narrowed first (innermost).
-uniNarrow(prog : UniProgram, t : UniTerm, sub : Tree<int, UniTerm>, inc : (int) -> int, fuel : int) -> [Pair<UniTerm, Tree<int, UniTerm>>] {
+uniNarrow(prog : UniProgram, e : RuExp, sub : RuSubst, math : RuMath, env : RuEnv, inc : (int) -> int, fuel : int) -> [Pair<RuExp, RuSubst>] {
 	if (fuel <= 0) [] else {
-		st = uniWalk(sub, t);
-		switch (st) {
-			UniVar(__): [Pair(st, sub)];   // a variable is already a value
-			UniApp(f, args): {
-				argSols = uniNarrowArgs(prog, args, sub, inc, fuel);
-				switch (lookupTree(prog.clauses, f)) {
-					None(): map(argSols, \p -> Pair(UniApp(f, p.first), p.second));   // constructor
-					Some(clauses): concatA(map(argSols, \p ->
-						concatA(map(clauses, \c0 -> {
-							c = uniFreshenInc(c0, inc);
-							switch (uniUnify(UniApp(f, p.first), UniApp(f, c.args), p.second)) {
-								None(): [];
-								Some(s2): uniNarrow(prog, c.result, s2, inc, fuel - 1);
-							}
-						}))
-					));
-				}
+		e0 = ruApplySubst(e, sub);
+		if (uniExpIsVar(e0)) [Pair(e0, sub)] else {
+			r = uniExpRule(e0);
+			argSols = uniNarrowArgs(prog, uniExpArgs(e0), sub, math, env, inc, fuel);
+			if (containsSet(prog.defined, r)) {
+				concatA(map(argSols, \p ->
+					concatA(map(lookupTreeDef(prog.clauses, r, []), \c0 -> {
+						c = uniFreshenClause(c0, inc);
+						ne = uniMkApp(r, p.first);
+						switch (ruUnifyExps([ne, c.head], p.second, math, env)) {
+							None(): [];
+							Some(s2): uniNarrow(prog, c.body, s2, math, env, inc, fuel - 1);
+						}
+					}))
+				));
+			} else {
+				map(argSols, \p -> Pair(uniMkApp(r, p.first), p.second));
 			}
 		}
 	}
 }
 
-// Cartesian product of the per-argument narrowings.
-uniNarrowArgs(prog : UniProgram, args : [UniTerm], sub : Tree<int, UniTerm>, inc : (int) -> int, fuel : int) -> [Pair<[UniTerm], Tree<int, UniTerm>>] {
+uniNarrowArgs(prog : UniProgram, args : [RuExp], sub : RuSubst, math : RuMath, env : RuEnv, inc : (int) -> int, fuel : int) -> [Pair<[RuExp], RuSubst>] {
 	fold(args, [Pair([], sub)], \acc, arg ->
 		concatA(map(acc, \pr ->
-			map(uniNarrow(prog, arg, pr.second, inc, fuel), \q ->
+			map(uniNarrow(prog, arg, pr.second, math, env, inc, fuel), \q ->
 				Pair(arrayPush(pr.first, q.first), q.second)
 			)
 		))
 	);
 }
 
-uniSolve(prog : UniProgram, goal : UniTerm, target : UniTerm, fuel : int) -> [Tree<int, UniTerm>] {
-	counter = ref 0;
-	inc = ruAtomicIntAdd(counter);
-	filtermap(uniNarrow(prog, goal, makeTree(), inc, fuel), \p ->
-		uniUnify(p.first, uniApplyT(p.second, target), p.second)
-	);
-}
-
 // ---- parser ---------------------------------------------------------------
 
 UniTPR ::= UniTPok, UniTPerr;
-	UniTPok(term : UniTerm, pos : int);
+	UniTPok(term : RuExp, pos : int);
 	UniTPerr(msg : string, pos : int);
 
 uniParseProgram(src : string) -> UniProgRes {
@@ -281,10 +233,6 @@ uniParseProgram(src : string) -> UniProgRes {
 	);
 }
 
-uniAddClause(prog : UniProgram, c : UniClause) -> UniProgram {
-	UniProgram(setTree(prog.clauses, c.name, arrayPush(lookupTreeDef(prog.clauses, c.name, []), c)));
-}
-
 UniClauseRes ::= UniClauseOk, UniClauseErr;
 	UniClauseOk(clause : UniClause);
 	UniClauseErr(msg : string);
@@ -297,42 +245,35 @@ uniParseClauseLine(line : string) -> UniClauseRes {
 		rest = trim2(substring(line, eq + 1, strlen(line) - eq - 1), " \t");
 		if (name == "") UniClauseErr("empty clause name")
 		else if (!startsWith(rest, "\\")) UniClauseErr("expected '\\' after '='")
-		else uniParseClauseBody(s2id(name), trim2(strRight(rest, 1), " \t"));
+		else uniParseHead(s2id(name), name, trim2(strRight(rest, 1), " \t"), 0, []);
 	}
 }
 
-// Parse `a1, a2 |- result` into a clause for `name`.
-uniParseClauseBody(name : int, body : string) -> UniClauseRes {
-	uniParseHead(name, body, 0, []);
-}
-
-uniParseHead(name : int, s : string, i0 : int, acc : [UniTerm]) -> UniClauseRes {
+uniParseHead(name : int, nameStr : string, s : string, i0 : int, acc : [RuExp]) -> UniClauseRes {
 	i = uniCWs(s, i0);
-	// allow an empty argument list: `\ |- result`
-	if (i < strlen(s) && getCharAt(s, i) == "|") uniParseResult(name, s, i, acc) else {
+	if (i < strlen(s) && getCharAt(s, i) == "|") uniParseResult(name, nameStr, s, i, acc) else {
 		switch (uniParseCTerm(s, i)) {
 			UniTPerr(m, __): UniClauseErr(m);
 			UniTPok(term, p): {
 				acc1 = arrayPush(acc, term);
 				j = uniCWs(s, p);
 				if (j >= strlen(s)) UniClauseErr("expected ',' or '|-'")
-				else if (getCharAt(s, j) == ",") uniParseHead(name, s, j + 1, acc1)
-				else if (getCharAt(s, j) == "|") uniParseResult(name, s, j, acc1)
+				else if (getCharAt(s, j) == ",") uniParseHead(name, nameStr, s, j + 1, acc1)
+				else if (getCharAt(s, j) == "|") uniParseResult(name, nameStr, s, j, acc1)
 				else UniClauseErr("expected ',' or '|-'");
 			}
 		}
 	}
 }
 
-// At the `|-` turnstile: consume it, then parse the single result term.
-uniParseResult(name : int, s : string, i : int, args : [UniTerm]) -> UniClauseRes {
+uniParseResult(name : int, nameStr : string, s : string, i : int, args : [RuExp]) -> UniClauseRes {
 	if (i + 1 >= strlen(s) || getCharAt(s, i) != "|" || getCharAt(s, i + 1) != "-") {
 		UniClauseErr("expected '|-'");
 	} else {
 		switch (uniParseCTerm(s, i + 2)) {
 			UniTPerr(m, __): UniClauseErr(m);
-			UniTPok(result, p): {
-				if (uniCWs(s, p) == strlen(s)) UniClauseOk(UniClause(name, args, result))
+			UniTPok(body, p): {
+				if (uniCWs(s, p) == strlen(s)) UniClauseOk(UniClause(name, uniMkApp(name, args), body))
 				else UniClauseErr("unexpected input after result");
 			}
 		}
@@ -345,22 +286,22 @@ uniParseCTerm(s : string, i0 : int) -> UniTPR {
 	if (idEnd == i) UniTPerr("expected a term", i) else {
 		ident = substring(s, i, idEnd - i);
 		if (endsWith(ident, "*")) {
-			UniTPok(UniVar(s2id(substring(ident, 0, strlen(ident) - 1))), idEnd);
+			UniTPok(uniVarExp(s2id(substring(ident, 0, strlen(ident) - 1))), idEnd);
 		} else {
 			j = uniCWs(s, idEnd);
 			if (j < strlen(s) && getCharAt(s, j) == "(") uniParseCApp(s, ident, j + 1)
-			else UniTPok(UniApp(s2id(ident), []), idEnd);
+			else UniTPok(uniMkApp(s2id(ident), []), idEnd);
 		}
 	}
 }
 
 uniParseCApp(s : string, name : string, i0 : int) -> UniTPR {
 	i = uniCWs(s, i0);
-	if (i < strlen(s) && getCharAt(s, i) == ")") UniTPok(UniApp(s2id(name), []), i + 1)
-	else uniParseCArgs(s, i, [], \args, p -> UniTPok(UniApp(s2id(name), args), p));
+	if (i < strlen(s) && getCharAt(s, i) == ")") UniTPok(uniMkApp(s2id(name), []), i + 1)
+	else uniParseCArgs(s, i, [], \args, p -> UniTPok(uniMkApp(s2id(name), args), p));
 }
 
-uniParseCArgs(s : string, i0 : int, acc : [UniTerm], k : ([UniTerm], int) -> UniTPR) -> UniTPR {
+uniParseCArgs(s : string, i0 : int, acc : [RuExp], k : ([RuExp], int) -> UniTPR) -> UniTPR {
 	switch (uniParseCTerm(s, i0)) {
 		UniTPerr(m, p): UniTPerr(m, p);
 		UniTPok(term, p): {
