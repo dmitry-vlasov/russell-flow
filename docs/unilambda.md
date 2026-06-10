@@ -136,6 +136,42 @@ eval  append(cons(a, cons(b, nil)), cons(c, nil))        # [a,b] ++ [c] = [a,b,c
 solve append(xs*, ys*) = cons(a, cons(b, cons(c, nil)))  # every split of [a,b,c]
 ```
 
+### Curry–Howard: types are propositions, inhabitation is proving
+
+Encoding a *typing relation* as clauses turns the same machinery into a tiny
+proof assistant. Take the simply-typed λ-calculus (implicational fragment) —
+equivalently intuitionistic implicational propositional logic. With de Bruijn
+terms (`var(N)`, `lam(E)`, `app(F,X)`, indices as Peano numerals), arrow types
+`arr(A,B)`, and a context as a list, the judgment `hastype(G, term, type)`
+reduces to `true` exactly when the term has that type (`test/uni/ch.uni`):
+
+```
+hastype = \ G*, var(N*), A* |- nth(G*, N*, A*)
+hastype = \ G*, lam(E*), arr(A*, B*) |- hastype(cons(A*, G*), E*, B*)
+hastype = \ G*, app(F*, X*), B* |- and(hastype(G*, F*, arr(A*, B*)), hastype(G*, X*, A*))
+```
+
+By Curry–Howard the two directions of `solve` become the two halves of the
+correspondence:
+
+```
+# forward = type inference (read off the principal type of a term/proof)
+solve hastype(nil, lam(lam(var(s(0)))), T*) = true   ==> T = arr(A, arr(B, A))   # K : A->B->A
+# backward = inhabitation = PROVING a proposition (find its proof term)
+solve hastype(nil, E*, arr(o, arr(p, o))) = true     ==> E = lam(lam(var(s(0))))  # proof of o->(p->o)
+```
+
+The inhabitant of `o -> (p -> o)` is the **K combinator** — exactly the proof
+term of `ax-1`'s proposition. So `uneval` over the typing rules *proves
+propositions by finding their proof terms*. This is the encoding-direction
+result: Curry–Howard's typing relation embeds *into* unilambda as a first-order
+logic program (as in Twelf/λProlog), with the single sort absorbing types,
+terms and contexts as ordinary data — what is lost versus a dependently-typed
+framework is automatic *enforcement* (adequacy, capture-avoidance), which here is
+hand-encoded (de Bruijn indices, explicit context lookup). Inhabitation is the
+hard, explosive direction; the `solve` budget keeps it terminating and the
+shallow/canonical proof is found first.
+
 ---
 
 ## 3. Bound to Russell — `uni-brun`
@@ -184,9 +220,13 @@ core of definite logic programming / narrowing, here over Russell's binder-free,
 sidesteps the higher-order-unification undecidability that forces λProlog/Isabelle
 into semi-decidable search).
 
-`uneval`/`solve` search is bounded by a `fuel` depth limit: undirected narrowing
-is only semi-decidable, so deeper solutions beyond the bound are not found.
-Target-directed (needed) narrowing would tame this; it is future work.
+`uneval`/`solve` search is bounded two ways: a per-path `fuel` depth limit (the
+`fuel` argument of `uni-run`/`uni-brun`, default 15) and a global total-work
+`budget`, so it always terminates even when a clause set generates unboundedly
+many candidates. Undirected narrowing is only semi-decidable, so deep solutions
+beyond the bounds are missed and the explosive directions (e.g. inhabitation)
+merely return the shallow/canonical solutions found first. Target-directed
+(needed) narrowing would tame this properly; it is future work.
 
 ---
 
