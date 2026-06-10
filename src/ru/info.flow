@@ -30,6 +30,42 @@ export {
 	// All uses (proof-step references) of the entity at the cursor: located ranges
 	// paired with their source resolver. Shared by info-uses and lsp-references.
 	ruUsesAt(task : RuTask, env : RuEnv) -> [Pair<RuLocation, LineResolver>];
+
+	// Source with helper info: code and line resolver.
+	RuInfoSource(src : RuSource, code : string, path : string, resolver : LineResolver);
+	// Math entities of a given kind ("" or "all" = every kind except theorems; a
+	// specific kind name otherwise) paired with their source info. Shared by info-math
+	// and lsp-math.
+	ruMathEntities(kind : string, env : RuEnv) -> [Pair<RuDecl, RuInfoSource>];
+}
+
+ruMathEntities(kind0 : string, env : RuEnv) -> [Pair<RuDecl, RuInfoSource>] {
+	kind = if (kind0 == "all") "" else kind0;
+	decls = filter(ruDeclCacheAll(), \decl ->
+		switch (decl) {
+			RuConst(__,__,__):      kind == "const" || kind == "";
+			RuType(__,__):          kind == "type"  || kind == "";
+			RuRule(__,__,__):       kind == "rule"  || kind == "";
+			RuAxiom(__,__):         kind == "axiom" || kind == "";
+			RuDef(__,__,__,__):     kind == "def"   || kind == "";
+			RuTheorem(__,__,__,__): kind == "theorem";
+		}
+	);
+	srcs = set2array(fold(decls, makeSet(), \acc, decl -> insertSet(acc, decl.info.src)));
+	infos = fold(
+		filtermap(
+			ruConcurrent(map(srcs, \s -> \env1 ->
+				maybeBind(ruSourceCacheGet(s, false, env1), \src -> {
+					code = ruCodeCacheGet(s, env1);
+					if (!ruCodeIsDefined(code)) None()
+					else Some(RuInfoSource(src, code.code, code.path, makeLineResolver(code.code)));
+				})
+			), env),
+			idfn
+		),
+		makeTree(), \acc, info -> setTree(acc, info.src.info.id, info)
+	);
+	filtermap(decls, \decl -> maybeMap(lookupTree(infos, decl.info.src), \info -> Pair(decl, info)));
 }
 
 ruUsesAt(task : RuTask, env : RuEnv) -> [Pair<RuLocation, LineResolver>] {
@@ -237,46 +273,21 @@ ruRunInfoSymbol(unit : RuUnit) -> Maybe<RuState> {
 	state = unit.state;
 	conf = state.conf;
 	name = ruTaskStringArg(task, "name", "");
-	lsp = ruTaskBoolArg(task, "lsp", false);
 	id = s2id_(name);
-	if (lsp) {
-		switch (ruCachedDecl2LspSymbolInfo(id, env)) {
-			Some(info): {
-				json = JsonArray([lspSymbolInformation2Json(info)]);
-				env.out.respond(json);
-			}
-			None(): {
-				code = ruCodeCacheGet(id, env);
-				if (code.path != "") {
-					range = RuRange(0, ruFirstNLinesPos(code.code, 32));
-					loc = ruRangeCode2LspLocation(range, code.path, code.code);
-					env.out.respond(JsonArray([lspLocation2Json(loc)]));
-				} else {
-					// ??
-				}
-			}
-		}
-		maybeApply(ruCachedDecl2LspSymbolInfo(id, env), \info -> {
-			json = JsonArray([lspSymbolInformation2Json(info)]);
-			env.out.respond(json);
-		});
-		Some(state);
+	// Raw data {kind, decl, path, code} (same shape as info-show); scripts/info/symbol.rus
+	// formats. The LSP workspace/symbol path is the separate lsp-workspace-symbol command.
+	store = \kind, decl, path, code -> Some(RuState(state with vars = setTree(state.vars, "info-symbol",
+		pairs2tree([Pair("kind", flow(kind)), Pair("decl", flow(decl)), Pair("path", flow(path)), Pair("code", flow(code))])
+	)));
+	info = ruCachedDecl2s(id, env);
+	if (info != "") {
+		store("decl", info, "", "");
 	} else {
-		// Raw data {kind, decl, path, code} (same shape as info-show); the
-		// formatting lives in scripts/info/symbol.rus.
-		store = \kind, decl, path, code -> Some(RuState(state with vars = setTree(state.vars, "info-symbol",
-			pairs2tree([Pair("kind", flow(kind)), Pair("decl", flow(decl)), Pair("path", flow(path)), Pair("code", flow(code))])
-		)));
-		info = ruCachedDecl2s(s2id_(name), env);
-		if (info != "") {
-			store("decl", info, "", "");
+		code = ruCodeCacheGet(id, env);
+		if (code.path != "") {
+			store("source", "", code.path, ruTakeFirstNLines(code.code, 32));
 		} else {
-			code = ruCodeCacheGet(id, env);
-			if (code.path != "") {
-				store("source", "", code.path, ruTakeFirstNLines(code.code, 32));
-			} else {
-				store("none", "", "", "");
-			}
+			store("none", "", "", "");
 		}
 	}
 }
@@ -414,97 +425,26 @@ ruCommInfoMath = RuComm(
 	ruRunInfoMath
 );
 
-// Source with helper info: code and line resolver.
-RuInfoSource(
-	src : RuSource,
-	code : string,
-	path : string,
-	resolver : LineResolver
-);
 
 ruRunInfoMath(unit : RuUnit) -> Maybe<RuState> {
 	env = ruUnitEnv(unit);
-	task = unit.task;
-	state = unit.state;
-	conf = state.conf;
-	kind0 = ruTaskStringArg(task, "kind", "");
-	kind = if (kind0 == "all") "" else kind0; // "all" / empty both mean every kind
-	lsp = ruTaskBoolArg(task, "lsp", false);
-	timer = ruMakeTimer();
-	decls = filter(ruDeclCacheAll(), \decl ->
-		switch (decl) {
-			RuConst(__,__,__):      kind == "const" || kind == "";
-			RuType(__,__):          kind == "type"  || kind == "";
-			RuRule(__,__,__):       kind == "rule"  || kind == "";
-			RuAxiom(__,__):         kind == "axiom" || kind == "";
-			RuDef(__,__,__,__):     kind == "def"   || kind == "";
-			RuTheorem(__,__,__,__): kind == "theorem";
-		}
+	// Pure data {entries:[{kind,name,path,line,col}]}; scripts/info/math.rus formats.
+	// The LSP path is the separate lsp-math command.
+	entries = filtermap(ruMathEntities(ruTaskStringArg(unit.task, "kind", ""), env),
+		\p -> maybeMap(ruNameRangeByPos(p.first.info.pos, p.second.code), \range -> {
+			ln = findLine(p.second.resolver, range.start);
+			pairs2tree([
+				Pair("kind", flow(ruDeclKind(p.first))),
+				Pair("name", flow(id2s(p.first.info.id))),
+				Pair("path", flow(p.second.path)),
+				Pair("line", flow(ln.lineno)),
+				Pair("col",  flow(ln.lineIndex + 1)),
+			]);
+		})
 	);
-	srcs = set2array(fold(decls, makeSet(), \acc, decl -> insertSet(acc, decl.info.src)));
-	infos = fold(
-		filtermap(
-			ruConcurrent(
-				map(srcs, \s -> \env1 ->
-					maybeBind(ruSourceCacheGet(s, false, env1), \src -> {
-							code = ruCodeCacheGet(s, env1);
-							if (!ruCodeIsDefined(code)) None() else {
-								Some(RuInfoSource(
-									src, code.code, code.path, 
-									makeLineResolver(code.code),
-								));
-							}
-						}
-					)
-				), env
-			), 
-			idfn 
-		),
-		makeTree(), \acc, info -> setTree(acc, info.src.info.id, info)
-	);
-	if (lsp) {
-		info = JsonArray(filtermap(decls,
-			\decl -> {
-				maybeBind(lookupTree(infos, decl.info.src), \info -> {
-					maybeMap(ruNameRangeByPos(decl.info.pos, info.code),
-						\range -> {
-							JsonObject([
-								Pair("kind", JsonString(ruDeclKind(decl))),
-								Pair("location", lspLocation2Json(ruRangeResolver2LspLocation(range, info.path, info.resolver))),
-								Pair("name", JsonString(id2s(decl.info.id))),
-								Pair("tooltip", JsonString(ruDeclCode(decl, info.src, info.code, env)))
-							])
-						}
-					)
-				});
-			}
-		));
-		env.out.respond(info);
-		Some(state);
-	} else {
-		// Store each entity as raw data {kind, name, path, line, col}; the layout
-		// (path:line:col: kind name) lives in scripts/info/math.rus.
-		entries = filtermap(decls,
-			\decl ->
-				maybeBind(lookupTree(infos, decl.info.src), \info ->
-					maybeMap(ruNameRangeByPos(decl.info.pos, info.code),
-						\range -> {
-							ln = findLine(info.resolver, range.start);
-							pairs2tree([
-								Pair("kind", flow(ruDeclKind(decl))),
-								Pair("name", flow(id2s(decl.info.id))),
-								Pair("path", flow(info.path)),
-								Pair("line", flow(ln.lineno)),
-								Pair("col",  flow(ln.lineIndex + 1)),
-							]);
-						}
-					)
-				)
-		);
-		Some(RuState(state with vars = setTree(state.vars, "info-math",
-			pairs2tree([Pair("entries", flow(entries))])
-		)));
-	}
+	Some(RuState(unit.state with vars = setTree(unit.state.vars, "info-math",
+		pairs2tree([Pair("entries", flow(entries))])
+	)))
 }
 
 ruCommInfoOntology = RuComm(
