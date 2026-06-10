@@ -40,7 +40,14 @@ ruHelpCommands(comms_tree : () -> Tree<string, RuComm>) -> [RuComm] {[
 	),
 	RuComm(
 		RuCommInfo("help-scripts", "help", "show all available scripts", "", false, false, [], []),
-		\unit -> { env = ruUnitEnv(unit); unit.out.println(ruScriptsMessage(env)); Some(unit.state); }
+		\unit -> {
+			env = ruUnitEnv(unit);
+			prefixes = foldTree(unit.task.args, [], \name, value, acc ->
+				if (value == "" && name != "help-scripts" && name != "scripts") concat(acc, [name]) else acc
+			);
+			unit.out.println(ruScriptsMessage(env, prefixes));
+			Some(unit.state);
+		}
 	),
 ]};
 
@@ -61,7 +68,10 @@ ruRunHelp(task : RuTask, comms_tree : () -> Tree<string, RuComm>, env : RuEnv) -
 		commands = foldTree(task.args, [], \name, value, acc ->
 			if (value == "" && name != "help") concat(acc, [name]) else acc
 		);
-		if (commands != []) {
+		if (contains(commands, "scripts")) {
+			// `help scripts [<prefix> ...]` — list scripts, narrowed by the other tokens.
+			ruScriptsMessage(env, filter(commands, \c -> c != "scripts"));
+		} else if (commands != []) {
 			strGlue(map(commands, \comm -> ruHelpOn(comm, comms_tree, env)), "");
 		} else {
 			ruHelpOn("", comms_tree, env);
@@ -173,7 +183,7 @@ ruHelpOn(what : string, comms_tree : () -> Tree<string, RuComm>, env : RuEnv) ->
 	} else if (what == "config") {
 		ruConfigMessage();
 	} else if (what == "scripts") {
-		ruScriptsMessage(env);
+		ruScriptsMessage(env, []);
 	} else {
 		filtered = filter(commands, \comm -> comm.info.category == what || what == "all");
 		if (filtered != []) {
@@ -186,7 +196,9 @@ ruHelpOn(what : string, comms_tree : () -> Tree<string, RuComm>, env : RuEnv) ->
 					what1 = changeFileExt(what, "");
 					switch (find(scripts, \script -> script.commInfo.name == what1)) {
 						Some(script): ruCommInfo2s(script.commInfo, true);
-						None(): "";
+						// Not an exact script: try it as a path prefix (e.g. `help reprove`).
+						None(): if (exists(scripts, \s -> startsWith(s.commInfo.name, what1)))
+							ruScriptsMessage(env, [what1]) else "";
 					}
 				}
 			}
@@ -194,12 +206,37 @@ ruHelpOn(what : string, comms_tree : () -> Tree<string, RuComm>, env : RuEnv) ->
 	}
 }
 
-ruScriptsMessage(env : RuEnv) -> string {
-	scripts = ruLoadAllScripts(env);
-	script_matr = [
-		map(scripts, \s -> s.commInfo.name),
-		map(scripts, \s -> s.commInfo.help),
-	];
-	"Scripts available: \n" + 
-	stringTable2s(script_matr, Some(["Script", "Help"])) + "\n";
+// List scripts, optionally narrowed to those whose name starts with any of the
+// given (partial) path prefixes — e.g. `help scripts reprove` or `help scripts
+// reprove/oracle`. The table shows a one-line summary; full help for a single
+// script is `help <script-name>`.
+ruScriptsMessage(env : RuEnv, prefixes : [string]) -> string {
+	all = ruLoadAllScripts(env);
+	scripts = if (prefixes == []) all else
+		filter(all, \s -> exists(prefixes, \p -> startsWith(s.commInfo.name, p)));
+	if (scripts == []) {
+		"No scripts match: " + strGlue(prefixes, ", ") + "\nRun 'help scripts' to list all.\n";
+	} else {
+		script_matr = [
+			map(scripts, \s -> s.commInfo.name),
+			map(scripts, \s -> ruScriptHelpSummary(s.commInfo.help)),
+		];
+		header = if (prefixes == []) "Scripts available:"
+			else "Scripts matching '" + strGlue(prefixes, ", ") + "':";
+		header + " \n" +
+		stringTable2s(script_matr, Some(["Script", "Help"])) + "\n" +
+		(if (prefixes == [])
+			"\nTip: 'help scripts <prefix>' narrows by path (e.g. 'help scripts reprove');" +
+			" 'help <script-name>' shows full help.\n"
+		else "");
+	}
+}
+
+// First non-blank line of a script's help block, for the compact list.
+ruScriptHelpSummary(help : string) -> string {
+	lines = filtermap(strSplit(help, "\n"), \l -> {
+		t = trim2(l, " \t\r");
+		if (t == "") None() else Some(t);
+	});
+	if (lines == []) "" else lines[0];
 }
