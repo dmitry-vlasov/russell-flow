@@ -145,35 +145,32 @@ ruRunInfoFind(unit : RuUnit) -> Maybe<RuState> {
 	state = unit.state;
 	conf = state.conf;
 	name = ruTaskStringArg(task, "name", "");
-	buf = ref [];
-	decl_info = \decl -> maybeApply(ruCacheGet(decl.info.src, false, env), \cached ->
-		refArrayPush(buf,
-			ruRange2s(
-				ruCodeCacheDeclRange(decl, cached, env),
-				"declaration of " + name,
-				cached.info.path,
-				ruCodeCacheGet(cached.info.id, env).code
-			)
-		)
-	);
+	// Raw data {kind, path, line, col, msg, snippet}; scripts/info/find.rus formats.
+	result = ref pairs2tree([
+		Pair("kind", flow("none")), Pair("path", flow("")),
+		Pair("line", flow(0)), Pair("col", flow(0)),
+		Pair("msg", flow("")), Pair("snippet", flow("")),
+	]);
+	locate = \decl -> maybeApply(ruCacheGet(decl.info.src, false, env), \cached -> {
+		code = ruCodeCacheGet(cached.info.id, env).code;
+		ln = findLine(makeLineResolver(code), ruCodeCacheDeclRange(decl, cached, env).start);
+		result := pairs2tree([
+			Pair("kind", flow("location")), Pair("path", flow(cached.info.path)),
+			Pair("line", flow(ln.lineno)), Pair("col", flow(ln.lineIndex + 1)),
+			Pair("msg", flow("declaration of " + name)), Pair("snippet", flow("")),
+		]);
+	});
 	id = s2id_(name);
 	switch (ruDeclCacheGet(id)) {
-		Some(decl): {
-			decl_info(decl);
-		}
+		Some(decl): locate(decl);
 		None(): {
 			code = ruCodeCacheGet(id, env);
 			if (code.path != "") {
-				range = RuRange(0, ruFirstNLinesPos(code.code, 32));
-				/*if (lsp) {
-					loc = ruRangeCode2LspLocation(range, code.path, code.code);
-					env.out.respond(JsonArray([lspLocation2Json(loc)]));
-				} else {*/
-					refArrayPush(buf,
-						code.path + ":\n\n" +
-						ruTakeFirstNLines(code.code, 32)
-					);
-				//}
+				result := pairs2tree([
+					Pair("kind", flow("source")), Pair("path", flow(code.path)),
+					Pair("line", flow(0)), Pair("col", flow(0)), Pair("msg", flow("")),
+					Pair("snippet", flow(ruTakeFirstNLines(code.code, 32))),
+				]);
 			} else {
 				lang = ruLangCacheGet();
 				normalize = \s -> strReplaces(s, [" ", "", "\t", ""]);
@@ -182,17 +179,13 @@ ruRunInfoFind(unit : RuUnit) -> Maybe<RuState> {
 					if (normalize(const.latex) == nm || id2s(const.ascii) == nm) Some(const) else None()
 				);
 				switch (mconst) {
-					Some(const): {
-						decl_info(const);
-					}
-					None(): {
-						env.out.error("Declaration '" + name + "' is not found", []);
-					}
+					Some(const): locate(const);
+					None(): env.out.error("Declaration '" + name + "' is not found", []);
 				}
 			}
 		}
 	}
-	Some(ruStoreText(state, "info-find", strGlue(^buf, "\n")));
+	Some(RuState(state with vars = setTree(state.vars, "info-find", ^result)));
 }
 
 ruCommInfoSymbol = RuComm(
@@ -266,16 +259,21 @@ ruRunInfoSource(unit : RuUnit) -> Maybe<RuState> {
 	state = unit.state;
 	conf = state.conf;
 	name = ruTaskStringArg(task, "name", "");
+	store = \decls -> Some(RuState(state with vars = setTree(state.vars, "info-source",
+		pairs2tree([
+			Pair("name",  flow(name)),
+			Pair("count", flow(length(decls))),
+			Pair("decls", flow(map(decls, \d -> pairs2tree([
+				Pair("kind", flow(ruDeclKind(d))),
+				Pair("name", flow(id2s(d.info.id))),
+			])))),
+		])
+	)));
 	switch (ruCacheGet(s2id_(name), false, env)) {
-		Some(src): {
-			Some(ruStoreText(state, "info-source",
-				"Source '" + name + "' decls (" + i2s(length(src.decls)) + "):\n" +
-				strGlue(map(src.decls, \d -> "\t" + ruDeclKind(d) + " " + id2s(d.info.id)), "\n")
-			));
-		}
+		Some(src): store(src.decls);
 		None(): {
 			env.out.error("Source '" + name + "' is not found", []);
-			Some(ruStoreText(state, "info-source", ""));
+			store([]);
 		}
 	}
 }
@@ -672,11 +670,12 @@ ruCommInfoVars = RuComm(
 		env = ruUnitEnv(unit);
 		state = unit.state;
 		math = ruMathFromSources(state.ru, env);
-		Some(ruStoreText(state, "info-vars", concatStrings(
-			map(
+		// Store the declared variables as raw data; scripts/info/vars.rus formats.
+		Some(RuState(state with vars = setTree(state.vars, "info-vars",
+			pairs2tree([Pair("vars", flow(map(
 				sortCustom(set2array(ruDeclsDeclaredVars(math.decls)), \v -> id2s(v.id), true),
-				\v -> "\t" + id2s(v.id) + " : " + id2s(v.type) + "\n"
-			)
+				\v -> pairs2tree([Pair("name", flow(id2s(v.id))), Pair("type", flow(id2s(v.type)))])
+			)))])
 		)));
 	}
 );
