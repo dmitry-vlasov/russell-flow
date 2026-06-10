@@ -18,6 +18,7 @@
 
 import uni/ast;
 import ds/tree;
+import base/concurrent;   // ruAtomicIntAdd
 
 export {
 	UniClause(name : int, args : [UniTerm], result : UniTerm);
@@ -25,10 +26,14 @@ export {
 
 	ruEmptyUniProgram = UniProgram(makeTree());
 
-	// Parse a `.uni` source into a clause program plus the list of `eval`
-	// query terms it contains.
+	// A `.uni` query is either forward (`eval t`) or backward (`solve g = t`).
+	UniQuery ::= UniQEval, UniQSolve;
+		UniQEval(term : UniTerm);
+		UniQSolve(goal : UniTerm, target : UniTerm);
+
+	// Parse a `.uni` source into a clause program plus its queries.
 	UniProgRes ::= UniProgOk, UniProgErr;
-		UniProgOk(prog : UniProgram, queries : [UniTerm]);
+		UniProgOk(prog : UniProgram, queries : [UniQuery]);
 		UniProgErr(msg : string);
 	uniParseProgram(src : string) -> UniProgRes;
 
@@ -36,6 +41,13 @@ export {
 	// recursion depth as a runaway guard.
 	uniNormalize(prog : UniProgram, t : UniTerm, fuel : int) -> UniTerm;
 
+	// Backward direction (narrowing): all substitutions over `goal`'s variables
+	// for which `goal` reduces to `target`. `fuel` bounds search depth — undirected
+	// narrowing is only semi-decidable, so deeper solutions beyond `fuel` are missed.
+	uniSolve(prog : UniProgram, goal : UniTerm, target : UniTerm, fuel : int) -> [Tree<int, UniTerm>];
+
+	uniApplyT(sub : Tree<int, UniTerm>, t : UniTerm) -> UniTerm;
+	uniTermVars(t : UniTerm, acc : [int]) -> [int];
 	uniCTerm2s(t : UniTerm) -> string;
 }
 
@@ -137,6 +149,94 @@ uniCTerm2s(t : UniTerm) -> string {
 	}
 }
 
+// ---- backward direction: unification + narrowing --------------------------
+
+// Resolve a term's top-level variable chain under the (triangular) substitution.
+uniWalk(sub : Tree<int, UniTerm>, t : UniTerm) -> UniTerm {
+	switch (t) {
+		UniVar(n): switch (lookupTree(sub, n)) { Some(t2): uniWalk(sub, t2); None(): t; };
+		UniApp(__, __): t;
+	}
+}
+
+uniOccurs(n : int, t : UniTerm, sub : Tree<int, UniTerm>) -> bool {
+	switch (uniWalk(sub, t)) {
+		UniVar(m): m == n;
+		UniApp(__, args): exists(args, \a -> uniOccurs(n, a, sub));
+	}
+}
+
+// Two-way first-order unification with occurs-check, extending `sub`.
+uniUnify(a : UniTerm, b : UniTerm, sub : Tree<int, UniTerm>) -> Maybe<Tree<int, UniTerm>> {
+	wa = uniWalk(sub, a);
+	wb = uniWalk(sub, b);
+	switch (wa) {
+		UniVar(na): switch (wb) {
+			UniVar(nb): if (na == nb) Some(sub) else Some(setTree(sub, na, wb));
+			UniApp(__, __): if (uniOccurs(na, wb, sub)) None() else Some(setTree(sub, na, wb));
+		};
+		UniApp(fa, aa): switch (wb) {
+			UniVar(nb): if (uniOccurs(nb, wa, sub)) None() else Some(setTree(sub, nb, wa));
+			UniApp(fb, bb): if (fa != fb || length(aa) != length(bb)) None() else {
+				fold(zip(aa, bb), Some(sub), \acc, p -> maybeBind(acc, \s -> uniUnify(p.first, p.second, s)));
+			};
+		};
+	}
+}
+
+uniFreshenInc(c : UniClause, inc : (int) -> int) -> UniClause {
+	vars = fold(c.args, uniTermVars(c.result, []), \acc, a -> uniTermVars(a, acc));
+	tag = "_n" + i2s(inc(1));
+	ren = fold(vars, makeTree(), \acc, v -> setTree(acc, v, UniVar(s2id(id2s(v) + tag))));
+	UniClause(c.name, map(c.args, \a -> uniApplyT(ren, a)), uniApplyT(ren, c.result));
+}
+
+// Narrow a term: enumerate (normal-form, substitution) pairs reachable by
+// reducing defined-function applications, instantiating variables via the
+// clause heads as needed. Arguments are narrowed first (innermost).
+uniNarrow(prog : UniProgram, t : UniTerm, sub : Tree<int, UniTerm>, inc : (int) -> int, fuel : int) -> [Pair<UniTerm, Tree<int, UniTerm>>] {
+	if (fuel <= 0) [] else {
+		st = uniWalk(sub, t);
+		switch (st) {
+			UniVar(__): [Pair(st, sub)];   // a variable is already a value
+			UniApp(f, args): {
+				argSols = uniNarrowArgs(prog, args, sub, inc, fuel);
+				switch (lookupTree(prog.clauses, f)) {
+					None(): map(argSols, \p -> Pair(UniApp(f, p.first), p.second));   // constructor
+					Some(clauses): concatA(map(argSols, \p ->
+						concatA(map(clauses, \c0 -> {
+							c = uniFreshenInc(c0, inc);
+							switch (uniUnify(UniApp(f, p.first), UniApp(f, c.args), p.second)) {
+								None(): [];
+								Some(s2): uniNarrow(prog, c.result, s2, inc, fuel - 1);
+							}
+						}))
+					));
+				}
+			}
+		}
+	}
+}
+
+// Cartesian product of the per-argument narrowings.
+uniNarrowArgs(prog : UniProgram, args : [UniTerm], sub : Tree<int, UniTerm>, inc : (int) -> int, fuel : int) -> [Pair<[UniTerm], Tree<int, UniTerm>>] {
+	fold(args, [Pair([], sub)], \acc, arg ->
+		concatA(map(acc, \pr ->
+			map(uniNarrow(prog, arg, pr.second, inc, fuel), \q ->
+				Pair(arrayPush(pr.first, q.first), q.second)
+			)
+		))
+	);
+}
+
+uniSolve(prog : UniProgram, goal : UniTerm, target : UniTerm, fuel : int) -> [Tree<int, UniTerm>] {
+	counter = ref 0;
+	inc = ruAtomicIntAdd(counter);
+	filtermap(uniNarrow(prog, goal, makeTree(), inc, fuel), \p ->
+		uniUnify(p.first, uniApplyT(p.second, target), p.second)
+	);
+}
+
 // ---- parser ---------------------------------------------------------------
 
 UniTPR ::= UniTPok, UniTPerr;
@@ -154,7 +254,21 @@ uniParseProgram(src : string) -> UniProgRes {
 				else if (startsWith(line, "eval ")) {
 					switch (uniParseCTerm(trim2(strRight(line, 5), " \t"), 0)) {
 						UniTPerr(m, p): UniProgErr("query parse error in '" + line + "': " + m);
-						UniTPok(term, __): UniProgOk(prog, arrayPush(queries, term));
+						UniTPok(term, __): UniProgOk(prog, arrayPush(queries, UniQEval(term)));
+					}
+				} else if (startsWith(line, "solve ")) {
+					rest = trim2(strRight(line, 6), " \t");
+					eq = strIndexOf(rest, "=");
+					if (eq < 0) UniProgErr("solve query needs 'goal = target' in '" + line + "'") else {
+						gp = uniParseCTerm(trim2(substring(rest, 0, eq), " \t"), 0);
+						tp = uniParseCTerm(trim2(substring(rest, eq + 1, strlen(rest) - eq - 1), " \t"), 0);
+						switch (gp) {
+							UniTPerr(m, __): UniProgErr("solve goal parse error in '" + line + "': " + m);
+							UniTPok(g, __): switch (tp) {
+								UniTPerr(m, __): UniProgErr("solve target parse error in '" + line + "': " + m);
+								UniTPok(tg, __): UniProgOk(prog, arrayPush(queries, UniQSolve(g, tg)));
+							};
+						}
 					}
 				} else {
 					switch (uniParseClauseLine(line)) {
