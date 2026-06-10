@@ -101,8 +101,32 @@ russellj uni-run file=test/uni/nat.uni
 ### Horn logic embeds for free
 
 A Horn clause *is* a unilambda clause and SLD resolution *is* `uneval`, so a
-classic logic program runs with no new machinery — `append/3` forward and
-backward (`test/uni/horn.uni`):
+relational logic program runs with no new machinery. Encode a Prolog **predicate**
+`p(...)` as a function that reduces to the token `true` exactly when it holds; a
+rule body `:- B1, B2` becomes the conjunction `and(B1, B2)` (with a single fact
+`and = \ true, true |- true`); existential body variables are fresh; and the
+query `:- p(...)` becomes `solve p(...) = true`. Peano arithmetic as relations
+(`test/uni/peano.uni`):
+
+```
+                                                  and  = \ true, true |- true
+plus(X, 0, X).                                    plus = \ X*, 0, X* |- true
+plus(X, s(Y), s(Z)) :- plus(X, Y, Z).             plus = \ X*, s(Y*), s(Z*) |- plus(X*, Y*, Z*)
+mult(X, 0, 0).                                     mult = \ X*, 0, 0 |- true
+mult(X, s(Y), Z) :- mult(X, Y, T), plus(T, X, Z).  mult = \ X*, s(Y*), Z* |- and(mult(X*, Y*, T*), plus(T*, X*, Z*))
+```
+
+The backtracking SLD search is `uneval`, enumerating every solution:
+
+```
+solve plus(X*, Y*, s(s(s(0)))) = true       # :- plus(X,Y,3)
+  ==> {X=3,Y=0}; {X=2,Y=1}; {X=1,Y=2}; {X=0,Y=3}
+solve mult(X*, Y*, s(s(s(s(0))))) = true     # :- mult(X,Y,4)
+  ==> {X=4,Y=1}; {X=2,Y=2}; {X=1,Y=4}
+```
+
+The same engine also runs functional-logic programs directly — e.g. list
+`append` forward and backward (`test/uni/horn.uni`):
 
 ```
 append = \ nil, ys* |- ys*
