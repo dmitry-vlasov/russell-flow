@@ -1,0 +1,240 @@
+// Unilambda bound to Russell: clauses whose terms are REAL Russell formulas.
+//
+// A bound `.uni` program (run over a loaded math) has three line kinds:
+//   var <name> : <type>           -- declare a typed Russell variable
+//   <f> = \ <term>, ... |- <term> -- a clause (defined function <f>)
+//   eval <term>   /   solve <g> = <t>
+// where a <term> is one of:
+//   `<russell formula>`   -- concrete Russell syntax, parsed via the grammar
+//   <f>(<term>, ...)      -- application of a defined function
+//   <x>*                  -- a unilambda metavariable
+//
+// Backtick formulas are parsed with `ruCreateTermNodes` + `ruParseExp` against
+// the loaded `RuLang`, producing real order-sorted `RuExp` (real rules, real
+// wff/class/set sorts). The clause engine (src/uni/run.flow) is unchanged — it
+// already runs on `RuExp` via `ruUnifyExps` — so forward `eval` and backward
+// `solve` work over genuine Russell formulas. This is the Russell↔unilambda bind.
+
+import uni/run;
+import ru/src;
+import ru/lang;
+import ru/parse/src;          // RuParseExpr
+import ru/parse/exps/lang;    // ruCreateTermNodes
+import ru/parse/exps/exp;     // ruParseExp
+import ru/util/src;           // ruExp2Vars
+import ru/util/exp2s;         // ruExp2s
+import base/ids;              // tp2id, s2id, id2s
+import base/env;              // RuEnv
+import base/place;            // RuPlace
+
+export {
+	// Parse a bound `.uni` program against the loaded grammar.
+	uniParseBound(src : string, lang : RuLang, env : RuEnv) -> UniProgRes;
+	// Render an RuExp: defined-function applications in f(args) form, everything
+	// else (real wff/class/set subterms) via the Russell printer.
+	uniBoundExp2s(e : RuExp, lang : RuLang, defined : Set<int>) -> string;
+}
+
+// Sort used for unilambda-level positions (function results, metavariables).
+// For the prop-calc demo everything is a wff; generalising to class/set is a
+// matter of inferring per-symbol sorts.
+uniWffSort() -> int { tp2id("wff"); }
+
+UniBCtx(vars : Tree<int, RuVar>, lang : RuLang, env : RuEnv);
+
+UniBAcc ::= UniBAccOk, UniBAccErr;
+	UniBAccOk(vars : Tree<int, RuVar>, prog : UniProgram, queries : [UniQuery]);
+	UniBAccErr(msg : string);
+
+uniParseBound(src : string, lang : RuLang, env : RuEnv) -> UniProgRes {
+	acc = fold(strSplit(src, "\n"), UniBAccOk(makeTree(), ruEmptyUniProgram, []), \a, line0 ->
+		switch (a) {
+			UniBAccErr(__): a;
+			UniBAccOk(vars, prog, queries): {
+				line = trim2(line0, " \t\r");
+				ctx = UniBCtx(vars, lang, env);
+				if (line == "" || startsWith(line, "#") || startsWith(line, "//")) a
+				else if (startsWith(line, "var ")) uniParseVarDecl(trim2(strRight(line, 4), " \t"), a)
+				else if (startsWith(line, "eval ")) {
+					switch (uniParseBTerm(trim2(strRight(line, 5), " \t"), 0, ctx)) {
+						UniBErr(m, __): UniBAccErr("eval parse error in '" + line + "': " + m);
+						UniBOk(t, __): UniBAccOk(vars, prog, arrayPush(queries, UniQEval(t)));
+					}
+				} else if (startsWith(line, "solve ")) {
+					rest = trim2(strRight(line, 6), " \t");
+					eq = strIndexOf(rest, "=");
+					if (eq < 0) UniBAccErr("solve needs 'goal = target' in '" + line + "'") else {
+						switch (uniParseBTerm(trim2(substring(rest, 0, eq), " \t"), 0, ctx)) {
+							UniBErr(m, __): UniBAccErr("solve goal error in '" + line + "': " + m);
+							UniBOk(g, __): switch (uniParseBTerm(trim2(substring(rest, eq + 1, strlen(rest) - eq - 1), " \t"), 0, ctx)) {
+								UniBErr(m, __): UniBAccErr("solve target error in '" + line + "': " + m);
+								UniBOk(t, __): UniBAccOk(vars, prog, arrayPush(queries, UniQSolve(g, t)));
+							};
+						}
+					}
+				} else uniParseBClause(line, ctx, a);
+			}
+		}
+	);
+	switch (acc) {
+		UniBAccErr(m): UniProgErr(m);
+		UniBAccOk(__, prog, queries): UniProgOk(prog, queries);
+	}
+}
+
+uniParseVarDecl(rest : string, a : UniBAcc) -> UniBAcc {
+	switch (a) {
+		UniBAccErr(__): a;
+		UniBAccOk(vars, prog, queries): {
+			colon = strIndexOf(rest, ":");
+			if (colon < 0) UniBAccErr("var decl needs 'name : type' in 'var " + rest + "'") else {
+				name = trim2(substring(rest, 0, colon), " \t");
+				type = trim2(substring(rest, colon + 1, strlen(rest) - colon - 1), " \t");
+				UniBAccOk(setTree(vars, s2id(name), RuVar(s2id(name), tp2id(type))), prog, queries);
+			}
+		}
+	}
+}
+
+uniParseBClause(line : string, ctx : UniBCtx, a : UniBAcc) -> UniBAcc {
+	switch (a) {
+		UniBAccErr(__): a;
+		UniBAccOk(vars, prog, queries): {
+			eq = strIndexOf(line, "=");
+			if (eq < 0) UniBAccErr("clause needs '=' in '" + line + "'") else {
+				name = trim2(substring(line, 0, eq), " \t");
+				rest = trim2(substring(line, eq + 1, strlen(line) - eq - 1), " \t");
+				if (!startsWith(rest, "\\")) UniBAccErr("expected '\\' after '=' in '" + line + "'") else {
+					switch (uniParseBHead(s2id(name), trim2(strRight(rest, 1), " \t"), 0, [], ctx)) {
+						UniBClErr(m): UniBAccErr("clause error in '" + line + "': " + m);
+						UniBClOk(c): UniBAccOk(vars, uniBAddClause(prog, c), queries);
+					}
+				}
+			}
+		}
+	}
+}
+
+UniBClRes ::= UniBClOk, UniBClErr;
+	UniBClOk(clause : UniClause);
+	UniBClErr(msg : string);
+
+uniParseBHead(name : int, s : string, i0 : int, acc : [RuExp], ctx : UniBCtx) -> UniBClRes {
+	i = uniBWs(s, i0);
+	if (i < strlen(s) && getCharAt(s, i) == "|") uniParseBResult(name, s, i, acc, ctx) else {
+		switch (uniParseBTerm(s, i, ctx)) {
+			UniBErr(m, __): UniBClErr(m);
+			UniBOk(t, p): {
+				acc1 = arrayPush(acc, t);
+				j = uniBWs(s, p);
+				if (j >= strlen(s)) UniBClErr("expected ',' or '|-'")
+				else if (getCharAt(s, j) == ",") uniParseBHead(name, s, j + 1, acc1, ctx)
+				else if (getCharAt(s, j) == "|") uniParseBResult(name, s, j, acc1, ctx)
+				else UniBClErr("expected ',' or '|-'");
+			}
+		}
+	}
+}
+
+uniParseBResult(name : int, s : string, i : int, args : [RuExp], ctx : UniBCtx) -> UniBClRes {
+	if (i + 1 >= strlen(s) || getCharAt(s, i) != "|" || getCharAt(s, i + 1) != "-") UniBClErr("expected '|-'") else {
+		switch (uniParseBTerm(s, i + 2, ctx)) {
+			UniBErr(m, __): UniBClErr(m);
+			UniBOk(body, p): {
+				if (uniBWs(s, p) == strlen(s)) UniBClOk(UniClause(name, uniMkAppS(name, uniWffSort(), args), body))
+				else UniBClErr("unexpected input after result");
+			}
+		}
+	}
+}
+
+UniBR ::= UniBOk, UniBErr;
+	UniBOk(term : RuExp, pos : int);
+	UniBErr(msg : string, pos : int);
+
+uniParseBTerm(s : string, i0 : int, ctx : UniBCtx) -> UniBR {
+	i = uniBWs(s, i0);
+	if (i >= strlen(s)) UniBErr("expected a term", i)
+	else if (getCharAt(s, i) == "`") {
+		close = uniBFind(s, "`", i + 1);
+		if (close < 0) UniBErr("unterminated backtick", i) else {
+			content = trim2(substring(s, i + 1, close - i - 1), " \t");
+			switch (uniBFormula(content, ctx)) {
+				None(): UniBErr("cannot parse Russell formula: `" + content + "`", i);
+				Some(e): UniBOk(e, close + 1);
+			}
+		}
+	} else {
+		idEnd = uniBIdent(s, i);
+		if (idEnd == i) UniBErr("expected a term", i) else {
+			ident = substring(s, i, idEnd - i);
+			if (endsWith(ident, "*")) {
+				UniBOk(RuExp([RuVar(s2id(substring(ident, 0, strlen(ident) - 1)), uniWffSort())], -1), idEnd);
+			} else {
+				j = uniBWs(s, idEnd);
+				if (j < strlen(s) && getCharAt(s, j) == "(") uniParseBApp(s, ident, j + 1, ctx)
+				else UniBOk(uniMkAppS(s2id(ident), uniWffSort(), []), idEnd);
+			}
+		}
+	}
+}
+
+uniParseBApp(s : string, name : string, i0 : int, ctx : UniBCtx) -> UniBR {
+	i = uniBWs(s, i0);
+	if (i < strlen(s) && getCharAt(s, i) == ")") UniBOk(uniMkAppS(s2id(name), uniWffSort(), []), i + 1)
+	else uniParseBArgs(s, i, [], ctx, \args, p -> UniBOk(uniMkAppS(s2id(name), uniWffSort(), args), p));
+}
+
+uniParseBArgs(s : string, i0 : int, acc : [RuExp], ctx : UniBCtx, k : ([RuExp], int) -> UniBR) -> UniBR {
+	switch (uniParseBTerm(s, i0, ctx)) {
+		UniBErr(m, p): UniBErr(m, p);
+		UniBOk(t, p): {
+			acc1 = arrayPush(acc, t);
+			j = uniBWs(s, p);
+			if (j >= strlen(s)) UniBErr("expected ',' or ')'", j)
+			else if (getCharAt(s, j) == ",") uniParseBArgs(s, j + 1, acc1, ctx, k)
+			else if (getCharAt(s, j) == ")") k(acc1, j + 1)
+			else UniBErr("expected ',' or ')'", j);
+		}
+	}
+}
+
+// Parse a concrete Russell formula string against the loaded grammar.
+uniBFormula(content : string, ctx : UniBCtx) -> Maybe<RuExp> {
+	toks = filter(strSplit(content, " "), \t -> t != "");
+	if (toks == []) None() else {
+		pe = RuParseExpr(map(toks, s2id), 0);
+		nodes = ruCreateTermNodes(pe, ctx.vars, ctx.env);
+		ruParseExp(RuTerm(uniWffSort(), nodes, 0), ctx.lang, RuPlace("<uni>", 0), ctx.env);
+	}
+}
+
+uniBoundExp2s(e : RuExp, lang : RuLang, defined : Set<int>) -> string {
+	switch (e.nodes[0]) {
+		RuVar(id, __): id2s(id);  // a Russell variable; render its plain name
+		RuRuleNode(rt, __): {
+			r = ruIdType2Id(rt);
+			if (containsSet(defined, r)) {
+				args = uniExpArgs(e);
+				if (args == []) id2s(r) else id2s(r) + "(" + strGlue(map(args, \a -> uniBoundExp2s(a, lang, defined)), ", ") + ")";
+			} else ruExp2s(e, lang);
+		}
+	}
+}
+
+uniBAddClause(prog : UniProgram, c : UniClause) -> UniProgram {
+	UniProgram(
+		setTree(prog.clauses, c.name, arrayPush(lookupTreeDef(prog.clauses, c.name, []), c)),
+		insertSet(prog.defined, c.name)
+	);
+}
+
+uniBWs(s : string, i : int) -> int {
+	if (i < strlen(s) && (getCharAt(s, i) == " " || getCharAt(s, i) == "\t" || getCharAt(s, i) == "\n" || getCharAt(s, i) == "\r")) uniBWs(s, i + 1) else i;
+}
+uniBIdent(s : string, i : int) -> int {
+	if (i < strlen(s) && strContains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.*", getCharAt(s, i))) uniBIdent(s, i + 1) else i;
+}
+uniBFind(s : string, c : string, i : int) -> int {
+	if (i >= strlen(s)) -1 else if (getCharAt(s, i) == c) i else uniBFind(s, c, i + 1);
+}
