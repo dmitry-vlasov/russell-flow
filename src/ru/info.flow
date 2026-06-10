@@ -26,6 +26,40 @@ export {
 	// ranges). Shared by info-decl and lsp-definition.
 	RuLocData(path : string, code : string, range : RuRange);
 	ruDeclLocationAt(task : RuTask, env : RuEnv) -> Maybe<RuLocData>;
+
+	// All uses (proof-step references) of the entity at the cursor: located ranges
+	// paired with their source resolver. Shared by info-uses and lsp-references.
+	ruUsesAt(task : RuTask, env : RuEnv) -> [Pair<RuLocation, LineResolver>];
+}
+
+ruUsesAt(task : RuTask, env : RuEnv) -> [Pair<RuLocation, LineResolver>] {
+	eitherMap(ruTask2LineCol(task), \lc -> {
+		cursor = ruUnderACursor(lc, env);
+		name = ruTaskStringArg(task, "name", cursor.strs.name);
+		if (name == "") [] else {
+			id = s2id_(name);
+			eitherMap(ruDeclCacheGet(id), \decl ->
+				list2array(fold(ruSourceCacheAll(true, env), makeList(), \acc, s ->
+					fold(s.decls, acc, \ac, d ->
+						switch (d) {
+							RuTheorem(__,__,__,proof):
+								fold(proof.steps, ac, \a, step ->
+									if (step.assertion != id) a else {
+										code = ruCodeCacheGet(s.info.id, env).code;
+										resolver = makeLineResolver(code);
+										eitherMap(ruNameRangeByPos(step.pos, code),
+											\range -> Cons(Pair(RuLocation(s.info.id, s.info.path, range), resolver), a), a
+										);
+									}
+								);
+							default: ac;
+						}
+					)
+				)),
+				[]
+			);
+		}
+	}, []);
 }
 
 ruHoverAt(task : RuTask, env : RuEnv) -> RuHover {
@@ -358,53 +392,18 @@ ruCommInfoUses = RuComm(
 
 ruRunInfoUses(unit : RuUnit) -> Maybe<RuState> {
 	env = ruUnitEnv(unit);
-	task = unit.task;
-	state = unit.state;
-	conf = state.conf;
-	buf = ref [];
-	maybeApply(ruTask2LineCol(task), \lc -> {
-		cursor = ruUnderACursor(lc, env);
-		name = ruTaskStringArg(task, "name", cursor.strs.name);
-		if (name != "") {
-			lsp = ruTaskBoolArg(task, "lsp", false);
-			id = s2id_(name);
-			maybeApply(ruDeclCacheGet(id), \decl ->
-				maybeApply(ruCacheGet(decl.info.src, false, env), \src -> {
-					locations = fold(ruSourceCacheAll(true, env), makeList(), \acc, s ->
-						fold(s.decls, acc, \ac, d ->
-							switch (d) {
-								RuTheorem(__,__,__,proof):
-									fold(proof.steps, ac, \a, step ->
-										if (step.assertion != id) a else {
-											code = ruCodeCacheGet(s.info.id, env).code;
-											resolver = makeLineResolver(code);
-											eitherMap(ruNameRangeByPos(step.pos, code),
-												\range -> Cons(Pair(RuLocation(s.info.id, s.info.path, range), resolver), a), a
-											);
-										}
-									);
-								default: ac;
-							}
-						)
-					);
-					if (lsp) {
-						env.out.respond(JsonArray(
-								map(list2array(locations), 
-									\location -> lspLocation2Json(ruLocation2LspLocation(location.first, "", Some(location.second)))
-								)
-						));
-					} else {
-						refArrayPush(buf, superglue(
-								list2array(locations),
-								\location -> ruLocationWithResolver2s(location.first, "uses " + name, location.second),
-								"\n"
-						));
-					}
-				})
-			);
-		}
+	// Pure data {uses:[{path, line, col}]}; the LSP path is lsp-references.
+	uses = map(ruUsesAt(unit.task, env), \p -> {
+		ln = findLine(p.second, p.first.range.start);
+		pairs2tree([
+			Pair("path", flow(p.first.path)),
+			Pair("line", flow(ln.lineno)),
+			Pair("col",  flow(ln.lineIndex + 1)),
+		]);
 	});
-	Some(ruStoreText(state, "info-uses", strGlue(^buf, "\n")));
+	Some(RuState(unit.state with vars = setTree(unit.state.vars, "info-uses",
+		pairs2tree([Pair("uses", flow(uses))])
+	)))
 }
 
 ruCommInfoMath = RuComm(
