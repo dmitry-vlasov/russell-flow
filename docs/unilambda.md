@@ -98,6 +98,19 @@ russellj uni-run file=test/uni/nat.uni
 - **`solve <goal> = <target>`** narrows the goal backward, enumerating every
   substitution over the goal's variables for which it reduces to the target.
 
+A query may carry an expectation with `=>`, turning it into a self-checking
+assertion that aborts (non-zero exit) on mismatch — so a `.uni` file is also a
+regression test:
+
+```
+eval  plus(s(0), s(s(0)))        => s(s(s(0)))   # assert the normal form
+solve plus(x*, y*) = s(s(s(0)))  => 4            # assert the number of solutions
+```
+
+The solution-count assertion is sound: `solve` only returns substitutions
+verified to make the goal reduce to the target, so the count fully characterises
+the (finite) answer set.
+
 ### Horn logic embeds for free
 
 A Horn clause *is* a unilambda clause and SLD resolution *is* `uneval`, so a
