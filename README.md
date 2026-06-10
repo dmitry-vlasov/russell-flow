@@ -15,6 +15,7 @@ The implementation is written in [Flow9](https://github.com/area9innovation/flow
 | [Metamath Translation](docs/metamath-translation.md) | Translating between Metamath (`.mm`) and Russell (`.ru`) formats |
 | [Proof Search Algorithm](docs/proof-search-algorithm.md) | Backward-chaining proof search, Proof Variant Trees, oracle-guided reproof |
 | [Unification Algorithms](docs/unification-algorithms.md) | Trie-indexed matching, multi-index unification, substitution composition |
+| [Unilambda](docs/unilambda.md) | Bidirectional, non-deterministic language on the Russell kernel: `eval` (verify) and `uneval` (narrowing/proof search) |
 | [Algorithm Paper](docs/proof_search_algo.pdf) | Theoretical basis: "Proof Search Algorithm in Pure Logical Framework" |
 
 ---

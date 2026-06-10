@@ -232,3 +232,9 @@ The algorithm satisfies three key properties (proved in the paper):
 3. **Completeness**: if a proof exists within the search bound, the algorithm finds it
 
 The completeness guarantee requires that the PVT is expanded sufficiently — in practice, resource limits (time, memory) bound the search.
+
+---
+
+## See also
+
+- [Unilambda](unilambda.md) — the same backward direction presented as `uneval`: narrowing over clause-shaped rules, with the dual forward `eval`.

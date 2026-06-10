@@ -195,3 +195,9 @@ The trie index eliminates most non-matching candidates early: an assertion whose
 | `src/ru/unify/unified.flow` | `RuUnified`, unified result type |
 | `src/ru/subst.flow` | `RuSubst`, `ruApplySubst`, `ruMergeSubst`, `ruUnsafeCompose` |
 | `src/ru/index.flow` | `ruSetIndex`, `ruIndexValues`, `ruFoldIndex` |
+
+---
+
+## See also
+
+- [Unilambda](unilambda.md) — a bidirectional language built directly on these primitives: `eval` is forward unification (`ruUnifyExps`), `uneval` is backward narrowing over the same engine.

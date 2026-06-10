@@ -11,7 +11,8 @@
 - Roundtrip test (CI): `bin/russellj translate/mm2ru2mm set`
 - Verify: `bin/russellj verify afile=set-50000`
 - Reprove: `bin/russellj reprove/oracle afile=set-50000`
-- REPL: `bin/russellj server=console`
+- REPL: `bin/russellj server=console` (or `server=unilambda` for the unilambda REPL)
+- Unilambda: `bin/russellj test/uni` (eval+uneval suite); `uni-eval` / `uni-run` / `uni-brun` commands
 - Memory override: `bin/russellj mem=16g ...` (default 10g)
 
 ## Mathematics Libraries
@@ -33,6 +34,7 @@ Never hardcode absolute paths to math libraries in `russell.conf` files.
 | [src/ru/src.flow](src/ru/src.flow) | Core AST: `RuSource`, `RuDecl`, `RuAssertion`, `RuMath` |
 | [src/ru/prover/](src/ru/prover/) | Proof search: oracle-guided backward chaining |
 | [src/ru/unify/](src/ru/unify/) | Unification: trie-indexed pattern matching |
+| [src/uni/](src/uni/) | Unilambda: bidirectional `eval`/`uneval` on the RuExp kernel — see [docs/unilambda.md](docs/unilambda.md) |
 | [src/mm/mm2ru.flow](src/mm/mm2ru.flow) | Metamath → Russell translator |
 | [docs/](docs/) | Architecture docs: language, algorithms, translation |
 
