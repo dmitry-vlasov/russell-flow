@@ -10,6 +10,30 @@ import ru/cache/cache;
 
 export {
 	ruInfoCommands : [RuComm];
+
+	// Shared outline data (imports + declarations with their name ranges), computed
+	// once and consumed by BOTH the human path (info-outline -> scripts/info/outline.rus)
+	// and the LSP path (lsp-document-symbol). Keeps the source `code` so each consumer
+	// resolves positions itself (human: 1-based line/col; LSP: 0-based ranges).
+	RuOutlineItem(kind : string, name : string, range : RuRange);
+	RuOutlineData(path : string, code : string, items : [RuOutlineItem]);
+	ruOutlineData(file : string, env : RuEnv) -> RuOutlineData;
+}
+
+ruOutlineData(file : string, env : RuEnv) -> RuOutlineData {
+	module = ruTrimPath(file, env.conf, ".ru");
+	eitherMap(ruCacheGet(s2id_(module), false, env), \src -> {
+		code = ruCodeCacheGet(src.info.id, env).code;
+		items = concat(
+			filtermap(src.imports, \imp ->
+				maybeMap(ruNameRangeByPos(imp.pos, code), \range -> RuOutlineItem("import", id2s(imp.id), range))
+			),
+			filtermap(src.decls, \decl ->
+				maybeMap(ruNameRangeByPos(decl.info.pos, code), \range -> RuOutlineItem(ruDeclKind(decl), id2s(decl.info.id), range))
+			)
+		);
+		RuOutlineData(src.info.path, code, items);
+	}, RuOutlineData("", "", []));
 }
 
 ruInfoCommands = [
@@ -324,59 +348,21 @@ ruCommInfoOutline = RuComm(
 
 ruRunInfoOutline(unit : RuUnit) -> Maybe<RuState> {
 	env = ruUnitEnv(unit);
-	task = unit.task;
-	state = unit.state;
-	conf = state.conf;
-	file = ruTaskStringArg(task, "file", "");
-	lsp = ruTaskBoolArg(task, "lsp", false);
-	module = ruTrimPath(file, conf, ".ru");
-	path = ref "";
-	entries = ref [];
-	maybeApply(ruCacheGet(s2id_(module), false, env), \src -> {
-		code = ruCodeCacheGet(src.info.id, env).code;
-		resolver = makeLineResolver(code);
-		if (lsp) {
-			imports = filtermap(src.imports, \imp ->
-				maybeMap(ruNameRangeByPos(imp.pos, code), \range -> {
-						name = id2s(imp.id);
-						loc = ruRangeResolver2LspLocation(range, src.info.path, resolver);
-						kind = ruString2LspSymbolKind("import");
-						lspSymbol2Json(LspSymbol(name, "", kind, false, loc.range, loc.range, []));
-					}
-				)
-			);
-			decls = filtermap(src.decls, \decl ->
-				maybeMap(ruNameRangeByPos(decl.info.pos, code), \range -> {
-						name = id2s(decl.info.id);
-						loc = ruRangeResolver2LspLocation(range, src.info.path, resolver);
-						kind = ruString2LspSymbolKind(ruDeclKind(decl));
-						lspSymbol2Json(LspSymbol(name, "", kind, false, loc.range, loc.range, []));
-					}
-				)
-			);
-			json = JsonArray(concat(imports, decls));
-			env.out.respond(json);
-		} else {
-			// Store each outline item as raw data {kind, name, line, col}; the
-			// formatting (path:line:col: kind name) lives in scripts/info/outline.rus.
-			entry = \kind, name, pos -> maybeMap(ruNameRangeByPos(pos, code), \range -> {
-				ln = findLine(resolver, range.start);
-				pairs2tree([
-					Pair("kind", flow(kind)),
-					Pair("name", flow(name)),
-					Pair("line", flow(ln.lineno)),
-					Pair("col",  flow(ln.lineIndex + 1)),
-				]);
-			});
-			path := src.info.path;
-			entries := concat(
-				filtermap(src.imports, \imp -> entry("import", id2s(imp.id), imp.pos)),
-				filtermap(src.decls, \decl -> entry(ruDeclKind(decl), id2s(decl.info.id), decl.info.pos))
-			);
-		}
+	data = ruOutlineData(ruTaskStringArg(unit.task, "file", ""), env);
+	resolver = makeLineResolver(data.code);
+	// Pure data {path, entries:[{kind,name,line,col}]}; scripts/info/outline.rus
+	// formats. The LSP documentSymbol path is the separate lsp-document-symbol command.
+	entries = map(data.items, \it -> {
+		ln = findLine(resolver, it.range.start);
+		pairs2tree([
+			Pair("kind", flow(it.kind)),
+			Pair("name", flow(it.name)),
+			Pair("line", flow(ln.lineno)),
+			Pair("col",  flow(ln.lineIndex + 1)),
+		]);
 	});
-	Some(RuState(state with vars = setTree(state.vars, "info-outline",
-		pairs2tree([Pair("path", flow(^path)), Pair("entries", flow(^entries))])
+	Some(RuState(unit.state with vars = setTree(unit.state.vars, "info-outline",
+		pairs2tree([Pair("path", flow(data.path)), Pair("entries", flow(entries))])
 	)))
 }
 
