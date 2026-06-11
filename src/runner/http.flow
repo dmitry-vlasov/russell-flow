@@ -23,17 +23,43 @@ RuQueuedResponse(
 // Storage for the intermediate states of requests (makes sense only for a server)
 ru_requests : ConcurHashMap<string, RuRequestState> = makeConcurHashMap(fastHashString);
 
+// Timestamp (ms) of the most recent request. The VS Code extension polls this server
+// every ~3s while its window is open, so a long gap means the client is gone and the
+// (now orphaned) server should exit rather than linger and serve stale state.
+ru_http_last_request : ref double = ref 0.0;
+
+// Exit the server after `idle_ms` with no request. Re-arms itself each tick.
+ruHttpServerWatchdog(idle_ms : double, server : () -> void, env : RuEnv, conf : RuConf) -> void {
+	if (idle_ms > 0.0) {
+		timer(30000, \-> {
+			if (timestamp() - ^ru_http_last_request > idle_ms) {
+				env.out.println("Http server idle for " + d2st(idle_ms / 1000.0, 0) + "s with no client; shutting down.");
+				ruHttpServerLog("Server idle; stopped.", conf);
+				server();
+				quit(0);
+			} else {
+				ruHttpServerWatchdog(idle_ms, server, env, conf);
+			}
+		});
+	}
+}
+
 ruHttpServer(env : RuEnv) -> void {
 	conf = env.conf;
 	port = s2i(ruOptsString(conf.opts, "server-port", "20001"));
+	// Idle shutdown so a window-less (orphaned) server doesn't linger; 0 disables.
+	idle_ms = s2d(ruOptsString(conf.opts, "server-idle-timeout", "120")) * 1000.0;
 	server = ref nop;
 	server := createHttpServer(port,
 		\-> {
 			ruHttpServerLog("Server started.", conf);
-			env.out.println("Http server started.")
+			env.out.println("Http server started.");
+			ru_http_last_request := timestamp();
+			ruHttpServerWatchdog(idle_ms, ^server, env, conf);
 		},
 		\msg -> env.out.error(msg, []),
 		\request, respond -> {
+			ru_http_last_request := timestamp();
 			req = deserialize(request.body, IllegalStruct());
 			if (req == IllegalStruct()) {
 				ruHttpServerLog("Illegal request: '" + ruCutLongString(ruServerEscapeString(request.body)) + "'", conf);
