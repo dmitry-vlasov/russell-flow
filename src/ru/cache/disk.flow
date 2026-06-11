@@ -57,8 +57,16 @@ ruDiskCacheClear(env : RuEnv) -> void {
 
 ruDiskCacheSave(s : RuSource, env : RuEnv) -> void {
 	src = RuSource(s with info = ruUpdateFileInfo(s.info, env.conf.workingDir));
-	ruDiskCacheDoSave(ruSerializeCached(src), src.info.module, "exact", env);
-	ruDiskCacheDoSave(ruSerializeCached(ruClearSourceProofs(src)), src.info.module, "proofless", env);
+	// Never persist a source that still references unregistered ids (id2s_ == ""). Such
+	// a source was captured while a concurrent project-switch reset cleared the id
+	// tables; loading it later crashes with "Id N is not registered". Skip the save —
+	// the source stays in memory and a later clean save (or a reparse) writes it right.
+	if (exists(set2array(ruSourceCollectIds(src)), \i -> i >= 0 && id2s_(i) == "")) {
+		env.out.trace("disk-cache", \-> "skip saving '" + src.info.module + "': source has unregistered ids");
+	} else {
+		ruDiskCacheDoSave(ruSerializeCached(src), src.info.module, "exact", env);
+		ruDiskCacheDoSave(ruSerializeCached(ruClearSourceProofs(src)), src.info.module, "proofless", env);
+	}
 }
 
 // Serialize a source with its id -> name table, so its ids can be re-interned
@@ -97,7 +105,22 @@ ruDiskCacheLoad(id : int, mode : string, env : RuEnv) -> Pair<Maybe<RuSource>, s
 			} else {
 				cached = cast(deserialized : flow -> RuCachedFileSource);
 				file_path = ruFindPath(file, conf, ".ru");
-				if (cached.version == ruCacheVersion) {
+				if (cached.version != ruCacheVersion) {
+					message = "Cached file " + file + " has obsolete cache version:\n" +
+						"cached.version != ruCacheVersion: " + i2s(cached.version) + " != " + i2s(ruCacheVersion);
+					ruDiskCacheDelete(id, env);
+					env.out.trace("disk-cache", \-> message);
+					Pair(None(), message);
+				} else if (exists(cached.names, \p -> p.first >= 0 && p.second == "")) {
+					// Corrupt cache: an id was persisted without a name (a source captured
+					// mid-reset slipped past ruDiskCacheSave's guard in an older build). The
+					// remap can't re-intern it, so it would stay unregistered and crash on
+					// first use (id2s). Invalidate and reparse from source instead.
+					message = "Cached file " + file + " has unnamed ids (corrupt); deleted, will reparse.";
+					ruDiskCacheDelete(id, env);
+					env.out.trace("disk-cache", \-> message);
+					Pair(None(), message);
+				} else {
 					// Re-intern every id against the CURRENT session by name: type-band
 					// ids via tp2id, others via s2id. After the remap all ids are valid in
 					// this session regardless of which generation/project produced the
@@ -134,12 +157,6 @@ ruDiskCacheLoad(id : int, mode : string, env : RuEnv) -> Pair<Maybe<RuSource>, s
 							Pair(Some(src), "");
 						}
 					}
-				} else {
-					message = "Cached file " + file + " has obsolete cache version:\n" + 
-						"cached.version != ruCacheVersion: " + i2s(cached.version) + " != " + i2s(ruCacheVersion);
-					ruDiskCacheDelete(id, env);
-					env.out.trace("disk-cache", \-> message);
-					Pair(None(), message);
 				}
 			}
 			if (isNone(ret.first)) {
