@@ -72,25 +72,25 @@ uni> exit
 A `.uni` program is a table of **clauses** `name = \ args |- body`, with possibly
 several clauses per name, plus `eval` / `solve` queries. A symbol with clauses is
 a **defined function** (reduced); a symbol with none is a **constructor** (data).
-Variables carry a trailing `*`; bare identifiers are constructors / functions;
-`#` starts a comment.
+Variables are written with a `?` prefix (the unify-mode marker); bare
+identifiers are constructors / functions; `#` starts a comment.
 
 ```
 # Peano naturals
-plus = \ x*, 0 |- x*
-plus = \ x*, s(y*) |- s(plus(x*, y*))
-mult = \ x*, 0 |- 0
-mult = \ x*, s(y*) |- plus(x*, mult(x*, y*))
+plus = \ ?x, 0 |- ?x
+plus = \ ?x, s(?y) |- s(plus(?x, ?y))
+mult = \ ?x, 0 |- 0
+mult = \ ?x, s(?y) |- plus(?x, mult(?x, ?y))
 
 eval plus(s(0), s(s(0)))            # forward: 1 + 2 = 3
-solve plus(x*, y*) = s(s(s(0)))     # backward: every (x, y) with x + y = 3
+solve plus(?x, ?y) = s(s(s(0)))     # backward: every (x, y) with x + y = 3
 ```
 
 ```
 russellj uni-run file=test/uni/nat.uni
   eval  plus(s(0), s(s(0)))  ==>  s(s(s(0)))
-  solve plus(x*, y*) = s(s(s(0)))  ==>  { x* = s(s(s(0))), y* = 0 }; { x* = s(s(0)), y* = s(0) };
-                                        { x* = s(0), y* = s(s(0)) }; { x* = 0, y* = s(s(s(0))) }
+  solve plus(?x, ?y) = s(s(s(0)))  ==>  { ?x = s(s(s(0))), ?y = 0 }; { ?x = s(s(0)), ?y = s(0) };
+                                        { ?x = s(0), ?y = s(s(0)) }; { ?x = 0, ?y = s(s(s(0))) }
 ```
 
 - **`eval <term>`** reduces a term to normal form (call-by-value, first matching
@@ -104,7 +104,7 @@ regression test:
 
 ```
 eval  plus(s(0), s(s(0)))        => s(s(s(0)))   # assert the normal form
-solve plus(x*, y*) = s(s(s(0)))  => 4            # assert the number of solutions
+solve plus(?x, ?y) = s(s(s(0)))  => 4            # assert the number of solutions
 ```
 
 The solution-count assertion is sound: `solve` only returns substitutions
@@ -123,30 +123,30 @@ query `:- p(...)` becomes `solve p(...) = true`. Peano arithmetic as relations
 
 ```
                                                   and  = \ true, true |- true
-plus(X, 0, X).                                    plus = \ X*, 0, X* |- true
-plus(X, s(Y), s(Z)) :- plus(X, Y, Z).             plus = \ X*, s(Y*), s(Z*) |- plus(X*, Y*, Z*)
-mult(X, 0, 0).                                     mult = \ X*, 0, 0 |- true
-mult(X, s(Y), Z) :- mult(X, Y, T), plus(T, X, Z).  mult = \ X*, s(Y*), Z* |- and(mult(X*, Y*, T*), plus(T*, X*, Z*))
+plus(X, 0, X).                                    plus = \ ?X, 0, ?X |- true
+plus(X, s(Y), s(Z)) :- plus(X, Y, Z).             plus = \ ?X, s(?Y), s(?Z) |- plus(?X, ?Y, ?Z)
+mult(X, 0, 0).                                     mult = \ ?X, 0, 0 |- true
+mult(X, s(Y), Z) :- mult(X, Y, T), plus(T, X, Z).  mult = \ ?X, s(?Y), ?Z |- and(mult(?X, ?Y, ?T), plus(?T, ?X, ?Z))
 ```
 
 The backtracking SLD search is `uneval`, enumerating every solution:
 
 ```
-solve plus(X*, Y*, s(s(s(0)))) = true       # :- plus(X,Y,3)
-  ==> {X=3,Y=0}; {X=2,Y=1}; {X=1,Y=2}; {X=0,Y=3}
-solve mult(X*, Y*, s(s(s(s(0))))) = true     # :- mult(X,Y,4)
-  ==> {X=4,Y=1}; {X=2,Y=2}; {X=1,Y=4}
+solve plus(?X, ?Y, s(s(s(0)))) = true       # :- plus(X,Y,3)
+  ==> {?X=3,?Y=0}; {?X=2,?Y=1}; {?X=1,?Y=2}; {?X=0,?Y=3}
+solve mult(?X, ?Y, s(s(s(s(0))))) = true     # :- mult(X,Y,4)
+  ==> {?X=4,?Y=1}; {?X=2,?Y=2}; {?X=1,?Y=4}
 ```
 
 The same engine also runs functional-logic programs directly — e.g. list
 `append` forward and backward (`test/uni/horn.uni`):
 
 ```
-append = \ nil, ys* |- ys*
-append = \ cons(x*, xs*), ys* |- cons(x*, append(xs*, ys*))
+append = \ nil, ?ys |- ?ys
+append = \ cons(?x, ?xs), ?ys |- cons(?x, append(?xs, ?ys))
 
 eval  append(cons(a, cons(b, nil)), cons(c, nil))        # [a,b] ++ [c] = [a,b,c]
-solve append(xs*, ys*) = cons(a, cons(b, cons(c, nil)))  # every split of [a,b,c]
+solve append(?xs, ?ys) = cons(a, cons(b, cons(c, nil)))  # every split of [a,b,c]
 ```
 
 ### Curry–Howard: types are propositions, inhabitation is proving
@@ -159,9 +159,9 @@ terms (`var(N)`, `lam(E)`, `app(F,X)`, indices as Peano numerals), arrow types
 reduces to `true` exactly when the term has that type (`test/uni/ch.uni`):
 
 ```
-hastype = \ G*, var(N*), A* |- nth(G*, N*, A*)
-hastype = \ G*, lam(E*), arr(A*, B*) |- hastype(cons(A*, G*), E*, B*)
-hastype = \ G*, app(F*, X*), B* |- and(hastype(G*, F*, arr(A*, B*)), hastype(G*, X*, A*))
+hastype = \ ?G, var(?N), ?A |- nth(?G, ?N, ?A)
+hastype = \ ?G, lam(?E), arr(?A, ?B) |- hastype(cons(?A, ?G), ?E, ?B)
+hastype = \ ?G, app(?F, ?X), ?B |- and(hastype(?G, ?F, arr(?A, ?B)), hastype(?G, ?X, ?A))
 ```
 
 By Curry–Howard the two directions of `solve` become the two halves of the
@@ -169,9 +169,9 @@ correspondence:
 
 ```
 # forward = type inference (read off the principal type of a term/proof)
-solve hastype(nil, lam(lam(var(s(0)))), T*) = true   ==> T = arr(A, arr(B, A))   # K : A->B->A
+solve hastype(nil, lam(lam(var(s(0)))), ?T) = true   ==> ?T = arr(A, arr(B, A))   # K : A->B->A
 # backward = inhabitation = PROVING a proposition (find its proof term)
-solve hastype(nil, E*, arr(o, arr(p, o))) = true     ==> E = lam(lam(var(s(0))))  # proof of o->(p->o)
+solve hastype(nil, ?E, arr(o, arr(p, o))) = true     ==> ?E = lam(lam(var(s(0))))  # proof of o->(p->o)
 ```
 
 The inhabitant of `o -> (p -> o)` is the **K combinator** — exactly the proof
@@ -204,7 +204,7 @@ swap = \ `( ph -> ps )` |- `( ps -> ph )`  # flip an implication
 
 eval ante(`( ( a -> b ) -> c )`)           # => ( a -> b )
 eval swap(`( a -> b )`)                    # => ( b -> a )
-solve swap(x*) = `( a -> b )`              # backward => x* = ( b -> a )
+solve swap(?x) = `( a -> b )`              # backward => ?x = ( b -> a )
 ```
 
 This needs a loaded math (run after `conf-load` / `read-ru`); see
