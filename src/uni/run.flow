@@ -29,13 +29,15 @@ export {
 	UniProgram(clauses : Tree<int, [UniClause]>, defined : Set<int>);
 	ruEmptyUniProgram = UniProgram(makeTree(), makeSet());
 
-	// A `.uni` query is either forward (`eval t`) or backward (`solve g = t`).
-	// An optional `=> <expectation>` turns it into a self-checking assertion:
+	// A `.uni` query is either forward (`eval t`) or backward (`solve g = t`, or
+	// `solve1 g = t` for the first solution only). An optional `=> <expectation>`
+	// turns it into a self-checking assertion:
 	//   eval  t      => <normal form>   (assert the reduced term)
-	//   solve g = t  => <count>         (assert the number of solutions)
+	//   solve g = t  => <count>         (assert the number of solutions; solve1: 0 or 1)
 	UniQuery ::= UniQEval, UniQSolve;
 		UniQEval(term : RuExp, expect : Maybe<RuExp>);
-		UniQSolve(goal : RuExp, target : RuExp, expect : Maybe<int>);
+		// first = true for `solve1` (stop at the first solution).
+		UniQSolve(goal : RuExp, target : RuExp, expect : Maybe<int>, first : bool);
 
 	// Split a "<query> => <expectation>" line at the `=>`.
 	uniSplitExpect(s : string) -> Pair<string, Maybe<string>>;
@@ -51,6 +53,10 @@ export {
 	// Backward (narrowing): every substitution over `goal`'s variables for which
 	// `goal` reduces to `target`. `fuel` bounds depth (narrowing is semi-decidable).
 	uniSolve(prog : UniProgram, goal : RuExp, target : RuExp, math : RuMath, env : RuEnv, fuel : int) -> [RuSubst];
+
+	// First-solution (`solve1`): the first substitution for which `goal` reduces
+	// to `target`, short-circuiting. For proof search / inhabitation (one witness).
+	uniSolveFirst(prog : UniProgram, goal : RuExp, target : RuExp, math : RuMath, env : RuEnv, fuel : int) -> Maybe<RuSubst>;
 
 	// Build / inspect / render RuExp terms in unilambda's f(args) / x* notation.
 	uniVarExp(name : int) -> RuExp;
@@ -248,6 +254,69 @@ uniNarrowArgs(prog : UniProgram, args : [RuExp], sub : RuSubst, math : RuMath, e
 	);
 }
 
+// ---- first-solution search (short-circuiting backtracking DFS) ------------
+//
+// `solve1`: find ONE witness. Used for proof search / inhabitation, where there
+// are (infinitely) many solutions and you want the first. Continuation-passing
+// DFS — it returns as soon as a solution is found, so it never exhausts the
+// budget when a solution exists, and clauses are tried in source order (put
+// introductions before eliminations to find the canonical witness first).
+
+uniSolveFirst(prog : UniProgram, goal : RuExp, target : RuExp, math : RuMath, env : RuEnv, fuel : int) -> Maybe<RuSubst> {
+	counter = ref 0;
+	inc = ruAtomicIntAdd(counter);
+	budget = ref uniSolveBudget;
+	uniProve(prog, goal, ruEmptySubst, math, env, inc, budget, fuel,
+		\nf, s -> ruUnifyExps([nf, ruApplySubst(target, s)], s, math, env)
+	);
+}
+
+// Narrow `e` (DFS); for the first value it reaches, call `k`; return the first
+// `k` success, backtracking over argument narrowings and clause choices.
+uniProve(prog : UniProgram, e : RuExp, sub : RuSubst, math : RuMath, env : RuEnv, inc : (int) -> int, budget : ref int, fuel : int, k : (RuExp, RuSubst) -> Maybe<RuSubst>) -> Maybe<RuSubst> {
+	if (fuel <= 0 || ^budget <= 0) None() else {
+		budget := ^budget - 1;
+		e0 = ruApplySubst(e, sub);
+		if (uniExpIsVar(e0)) k(e0, sub) else {
+			r = uniExpRule(e0);
+			sort = uniSortOf(e0);
+			uniProveArgs(prog, uniExpArgs(e0), sub, math, env, inc, budget, fuel, \nargs, s1 -> {
+				ne = uniMkAppS(r, sort, nargs);
+				if (containsSet(prog.defined, r)) {
+					uniProveClauses(prog,
+						filter(lookupTreeDef(prog.clauses, r, []), \c0 -> uniArgsCompatible(uniExpArgs(c0.head), nargs)),
+						ne, s1, math, env, inc, budget, fuel, k);
+				} else {
+					k(ne, s1);
+				}
+			});
+		}
+	}
+}
+
+uniProveArgs(prog : UniProgram, args : [RuExp], sub : RuSubst, math : RuMath, env : RuEnv, inc : (int) -> int, budget : ref int, fuel : int, k : ([RuExp], RuSubst) -> Maybe<RuSubst>) -> Maybe<RuSubst> {
+	uniProveArgsAt(prog, args, 0, [], sub, math, env, inc, budget, fuel, k);
+}
+uniProveArgsAt(prog : UniProgram, args : [RuExp], i : int, acc : [RuExp], sub : RuSubst, math : RuMath, env : RuEnv, inc : (int) -> int, budget : ref int, fuel : int, k : ([RuExp], RuSubst) -> Maybe<RuSubst>) -> Maybe<RuSubst> {
+	if (i >= length(args)) k(acc, sub)
+	else uniProve(prog, args[i], sub, math, env, inc, budget, fuel, \narg, s1 ->
+		uniProveArgsAt(prog, args, i + 1, arrayPush(acc, narg), s1, math, env, inc, budget, fuel, k));
+}
+
+// Try clauses in order; first whose head unifies with `ne` and whose body proves
+// (continuation `k`) wins.
+uniProveClauses(prog : UniProgram, clauses : [UniClause], ne : RuExp, sub : RuSubst, math : RuMath, env : RuEnv, inc : (int) -> int, budget : ref int, fuel : int, k : (RuExp, RuSubst) -> Maybe<RuSubst>) -> Maybe<RuSubst> {
+	if (clauses == []) None() else {
+		c = uniFreshenClause(clauses[0], inc);
+		res = maybeBind(ruUnifyExps([ne, c.head], sub, math, env), \s2 ->
+			uniProve(prog, c.body, s2, math, env, inc, budget, fuel, k));
+		switch (res) {
+			Some(__): res;
+			None(): uniProveClauses(prog, tail(clauses), ne, sub, math, env, inc, budget, fuel, k);
+		}
+	}
+}
+
 // ---- parser ---------------------------------------------------------------
 
 UniTPR ::= UniTPok, UniTPerr;
@@ -280,8 +349,8 @@ uniParseProgram(src : string) -> UniProgRes {
 							};
 						};
 					}
-				} else if (startsWith(line, "solve ")) {
-					sv = uniSplitExpect(trim2(strRight(line, 6), " \t"));
+				} else if (startsWith(line, "solve1 ") || startsWith(line, "solve ")) {
+					sv = uniSplitExpect(trim2(strRight(line, if (startsWith(line, "solve1 ")) 7 else 6), " \t"));
 					rest = sv.first;
 					eq = strIndexOf(rest, "=");
 					if (eq < 0) UniProgErr("solve query needs 'goal = target' in '" + line + "'") else {
@@ -291,7 +360,7 @@ uniParseProgram(src : string) -> UniProgRes {
 							UniTPerr(m, __): UniProgErr("solve goal parse error in '" + line + "': " + m);
 							UniTPok(g, __): switch (tp) {
 								UniTPerr(m, __): UniProgErr("solve target parse error in '" + line + "': " + m);
-								UniTPok(tg, __): UniProgOk(prog, arrayPush(queries, UniQSolve(g, tg, maybeMap(sv.second, s2i))));
+								UniTPok(tg, __): UniProgOk(prog, arrayPush(queries, UniQSolve(g, tg, maybeMap(sv.second, s2i), startsWith(line, "solve1 "))));
 							};
 						}
 					}

@@ -95,8 +95,14 @@ russellj uni-run file=test/uni/nat.uni
 
 - **`eval <term>`** reduces a term to normal form (call-by-value, first matching
   clause).
-- **`solve <goal> = <target>`** narrows the goal backward, enumerating every
+- **`solve <goal> = <target>`** narrows the goal backward, enumerating *every*
   substitution over the goal's variables for which it reduces to the target.
+- **`solve1 <goal> = <target>`** finds just the *first* solution and stops. This
+  is the right mode for **proof search / inhabitation**, where there are
+  (infinitely) many witnesses and you want one: the search short-circuits at the
+  first hit, so it terminates as soon as a witness exists — independently of the
+  budget — and clauses are tried in source order, so put introduction rules
+  before elimination rules to obtain the canonical (normal-form) witness.
 
 A query may carry an expectation with `=>`, turning it into a self-checking
 assertion that aborts (non-zero exit) on mismatch — so a `.uni` file is also a
@@ -169,9 +175,9 @@ correspondence:
 
 ```
 # forward = type inference (read off the principal type of a term/proof)
-solve hastype(nil, lam(lam(var(s(0)))), ?T) = true   ==> ?T = arr(A, arr(B, A))   # K : A->B->A
-# backward = inhabitation = PROVING a proposition (find its proof term)
-solve hastype(nil, ?E, arr(o, arr(p, o))) = true     ==> ?E = lam(lam(var(s(0))))  # proof of o->(p->o)
+solve  hastype(nil, lam(lam(var(s(0)))), ?T) = true  ==> ?T = arr(A, arr(B, A))   # K : A->B->A
+# backward = inhabitation = PROVING a proposition (find ONE proof term)
+solve1 hastype(nil, ?E, arr(o, arr(p, o))) = true    ==> ?E = lam(lam(var(s(0))))  # proof of o->(p->o)
 ```
 
 The inhabitant of `o -> (p -> o)` is the **K combinator** — exactly the proof
