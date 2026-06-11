@@ -21,15 +21,26 @@ export function run_cmd_sync(cmd: string, wd: string, args: string[]) {
     return spawnSync('/bin/bash', ['-l', '-c', bashLoginCmd(cmd, args)], options);
 }
 
+// One server per workspace: derive a stable port from the workspace path so different
+// projects never share a server (no cross-project contamination, no stray server
+// serving the wrong project). Base port from config, offset by a hash of the folder.
+export function getWorkspacePort(): number {
+    const base = vscode.workspace.getConfiguration("russell").get("portOfHttpServer") as number;
+    const dir = getRussellDir();
+    let h = 0;
+    for (let i = 0; i < dir.length; i++) { h = (((h << 5) - h) + dir.charCodeAt(i)) | 0; }
+    return base + (Math.abs(h) % 1000);
+}
+
 export function shutdownHttpServer() {
-    const port = vscode.workspace.getConfiguration("russell").get("portOfHttpServer");
+    const port = getWorkspacePort();
     return run_cmd("russellj", ".", ["server-shutdown", "server-port=" + port], (s) => { console.log(s); });
 }
 
 export function launchHttpServer(on_start: () => void, on_stop: () => void, serverChannel: vscode.OutputChannel) {
     on_start();
     const russell_dir = getRussellDir();
-    const port = vscode.workspace.getConfiguration("russell").get("portOfHttpServer");
+    const port = getWorkspacePort();
     const memory = vscode.workspace.getConfiguration("russell").get("memForHttpServer");
     serverChannel.appendLine(
         (new Date()).toString() + " Russell Http server is starting in '" + russell_dir + "' directory"

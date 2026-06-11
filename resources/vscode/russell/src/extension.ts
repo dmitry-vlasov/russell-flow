@@ -182,7 +182,7 @@ function startLspClient() {
 	// Otherwise the run options are used
 	let serverOptions: ServerOptions = process.platform == "win32"
 		? { command: 'russell.bat', options: { detached: false } }
-		: { command: '/bin/bash', args: ['-l', '-c', 'russell_lsp'], options: { detached: false } };
+		: { command: '/bin/bash', args: ['-l', '-c', 'russell_lsp server-port=' + tools.getWorkspacePort()], options: { detached: false } };
 	// Options to control the language client
 	let clientOptions: LanguageClientOptions = {
 		// Register the server for plain text documents
@@ -244,7 +244,7 @@ function handleConfigurationUpdates(_context: vscode.ExtensionContext) {
 }
 
 function checkHttpServerStatus(initial: boolean) {
-	const port : number = vscode.workspace.getConfiguration("russell").get("portOfHttpServer");
+	const port : number = tools.getWorkspacePort();
 	isPortReachable(port, {host: 'localhost'}).then(
 		(reacheable : boolean) => {
 			if (reacheable) {
