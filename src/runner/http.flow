@@ -46,9 +46,13 @@ ruHttpServerWatchdog(idle_ms : double, server : () -> void, env : RuEnv, conf : 
 
 ruHttpServer(env : RuEnv) -> void {
 	conf = env.conf;
-	port = s2i(ruOptsString(conf.opts, "server-port", "20001"));
+	// Read from the URL parameters (where CLI args land), the SAME source ruProcessRemote
+	// uses to find the server — not conf.opts, which the bare `server-port=N` arg never
+	// reaches, so the server used to silently fall back to 20001 and every workspace
+	// collided on one port.
+	port = s2i(getUrlParameterDef("server-port", "20001"));
 	// Idle shutdown so a window-less (orphaned) server doesn't linger; 0 disables.
-	idle_ms = s2d(ruOptsString(conf.opts, "server-idle-timeout", "120")) * 1000.0;
+	idle_ms = s2d(getUrlParameterDef("server-idle-timeout", "120")) * 1000.0;
 	server = ref nop;
 	server := createHttpServer(port,
 		\-> {
@@ -57,7 +61,19 @@ ruHttpServer(env : RuEnv) -> void {
 			ru_http_last_request := timestamp();
 			ruHttpServerWatchdog(idle_ms, ^server, env, conf);
 		},
-		\msg -> env.out.error(msg, []),
+		\msg -> {
+			if (strContains(toLowerCase(msg), "already in use")) {
+				// Another Russell server already owns this workspace's port (a reused or
+				// still-shutting-down instance from a window reload). Exit cleanly: that
+				// server serves this workspace — don't leave a dead process behind or
+				// spam an alarming bind error.
+				ruHttpServerLog("Workspace port " + i2s(port) + " already in use; another server owns it. Exiting.", conf);
+				env.out.println("A Russell server is already running for this workspace (port " + i2s(port) + "); exiting.");
+				quit(0);
+			} else {
+				env.out.error(msg, []);
+			}
+		},
 		\request, respond -> {
 			ru_http_last_request := timestamp();
 			req = deserialize(request.body, IllegalStruct());
