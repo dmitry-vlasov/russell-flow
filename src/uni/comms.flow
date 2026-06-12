@@ -75,6 +75,16 @@ uniCommands = [
 	),
 	RuComm(
 		RuCommInfo(
+			"uni-peval", "uni",
+			"run a proof-term test file: print each term's principal statement, assert `=>` expectations", "file",
+			false, false,
+			[RuCommArg("file", false, "path to a proof-term file (lines: `term => statement`)", "")],
+			[]
+		),
+		ruRunUniPEval
+	),
+	RuComm(
+		RuCommInfo(
 			"uni-run", "uni",
 			"run a .uni clause program: reduce each `eval` query to normal form", "file",
 			false, false,
@@ -233,4 +243,82 @@ ruRunUniEval(unit : RuUnit) -> Maybe<RuState> {
 uniStmtBare2s(stmt : RuStmt, math : RuMath) -> string {
 	s = strGlue(map(stmt.exps, \e -> ruExp2s(ruExp(e), math.decls.lang)), " ");
 	if (startsWith(s, "|- ")) strRight(s, 3) else s;
+}
+
+// --- proof-term assertions (uni-peval) -------------------------------------
+// `eval` of a proof term yields its principal statement, which is unique only
+// UP TO VARIABLE RENAMING. The rendered form carries auto-generated fresh-var
+// tokens (e.g. `ph_u3`) whose numbering is a freshening artifact. To assert a
+// result we canonicalize: every `<letters>_u<digits>` token becomes a positional
+// name v1, v2, … in order of first occurrence, and spaces are dropped. Two
+// statements are equal up to renaming iff their canon forms are equal — so a
+// `.uni` proof file can write the expected statement with stable v-names.
+
+uniCanonIsAlpha(c : int) -> bool { (c >= 97 && c <= 122) || (c >= 65 && c <= 90); }
+uniCanonIsDigit(c : int) -> bool { c >= 48 && c <= 57; }
+
+uniScanWhile(s : string, i : int, n : int, pred : (int) -> bool) -> int {
+	if (i < n && pred(getCharCodeAt(s, i))) uniScanWhile(s, i + 1, n, pred) else i;
+}
+
+uniCanonStmtStr(s : string) -> string { uniCanonScan(s, 0, strlen(s), makeTree(), 0, ""); }
+
+uniCanonScan(s : string, i : int, n : int, names : Tree<string, string>, cnt : int, acc : string) -> string {
+	if (i >= n) acc
+	else {
+		c = getCharCodeAt(s, i);
+		if (uniCanonIsAlpha(c)) {
+			j = uniScanWhile(s, i, n, uniCanonIsAlpha);
+			// a fresh-var token is <letters>_u<digits>
+			if (j + 2 < n && getCharCodeAt(s, j) == 95 && getCharCodeAt(s, j + 1) == 117 && uniCanonIsDigit(getCharCodeAt(s, j + 2))) {
+				k = uniScanWhile(s, j + 2, n, uniCanonIsDigit);
+				tok = substring(s, i, k - i);
+				known = containsKeyTree(names, tok);
+				v = either(lookupTree(names, tok), "v" + i2s(cnt + 1));
+				uniCanonScan(s, k, n, if (known) names else setTree(names, tok, v), if (known) cnt else cnt + 1, acc + v);
+			} else {
+				uniCanonScan(s, j, n, names, cnt, acc + substring(s, i, j - i));
+			}
+		} else if (c == 32) {
+			uniCanonScan(s, i + 1, n, names, cnt, acc);
+		} else {
+			uniCanonScan(s, i + 1, n, names, cnt, acc + substring(s, i, 1));
+		}
+	}
+}
+
+// Run a proof-term test file: each non-comment line is `<term> [=> <stmt>]`.
+// The principal statement is printed; if `=> <stmt>` is given it is asserted
+// up to variable renaming, aborting (exit 255) on mismatch.
+ruRunUniPEval(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	file = ruTaskStringArg(unit.task, "file", "");
+	if (file == "") {
+		env.out.error("uni-peval: missing required 'file' argument", []);
+		Some(unit.state);
+	} else {
+		path = uniResolveUniFile(file, unit.state.conf);
+		if (!fileExists(path)) {
+			env.out.error("uni-peval: file not found: '" + file + "'", []);
+			Some(unit.state);
+		} else {
+			math = ruMathFromSources(unit.state.ru, env);
+			lines = filtermap(strSplit(getFileContent(path), "\n"), \l0 -> {
+				l = trim2(uniStripLineComment(l0), " \t\r");
+				if (l == "") None() else Some(l);
+			});
+			iter(lines, \line -> {
+				ev = uniSplitExpect(line);
+				term_str = ev.first;
+				got = uniRenderEval(term_str, math, env);
+				env.out.println(term_str + "  ==>  " + got);
+				maybeApply(ev.second, \exp ->
+					if (uniCanonStmtStr(got) != uniCanonStmtStr(exp)) {
+						ruCrash("uni-peval assertion failed: " + term_str + " => expected '" + exp + "', got '" + got + "'");
+					}
+				);
+			});
+			Some(unit.state);
+		}
+	}
 }

@@ -50,6 +50,22 @@ mpd(x,a1i(y))     ==>  \ ( ph -> ps ), ( ps -> ch ) |- ( ph -> ch )             
 > Note: arguments on the command line must avoid spaces and shell metacharacters,
 > so write `ax-mp(x,ax-1)` rather than `ax-mp(x, ax-1)`.
 
+### Self-checking proof-term files — `uni-peval`
+
+`uni-eval` evaluates one term from the command line; `uni-peval file=…` runs a
+whole file of them, one `<term> => <statement>` per line, and asserts each result
+(aborting with exit 255 on mismatch) — the proof-term analogue of the `=>`
+expectations in `.uni` clause files. Because the principal statement is unique only
+*up to variable renaming*, the expectation is compared modulo renaming: write the
+schematic variables as `v1, v2, …` in order of first occurrence, and `uni-peval`
+canonicalizes the engine's fresh-var names (`ph_u3`, …) the same way before
+comparing. See [scripts/test/uni/proofs.uni](../scripts/test/uni/proofs.uni).
+
+```
+russellj uni-peval file=test/uni/proofs.uni
+  syl(x, y)  ==>  \ ( ph_u1 → ps_u2 ), ( ps_u2 → ch_u3 ) |- ( ph_u1 → ch_u3 )
+```
+
 ### Interactive REPL
 
 `server=unilambda` is a stateful REPL: load a math once, then issue many
@@ -257,10 +273,10 @@ and [`src/ru/subst.flow`](../src/ru/subst.flow):
 | File | Role |
 |------|------|
 | `eval.flow` | proof-term `eval` over assertions (generalizes the verifier's `ruMatchStep`) |
-| `run.flow` | the `RuExp`-native clause engine: `uniReduce` (forward), `uniSolve` (backward narrowing), `.uni` parser |
+| `run.flow` | the `RuExp`-native clause engine: `uniReduce` (forward), `uniSolve`/`uniSolveFirst` (backward narrowing), `.uni` parser |
 | `bound.flow` | bound mode: `var` decls + backtick formulas parsed via the grammar |
 | `ast.flow`, `parse.flow` | proof-term AST and parser |
-| `comms.flow` | the `uni-eval` / `uni-run` / `uni-brun` commands |
+| `comms.flow` | the `uni-eval` / `uni-peval` / `uni-run` / `uni-brun` commands; `uniCanonStmtStr` (renaming-canonical assertion) |
 
 Key reused facts: a `RuRuleNode`'s `len` field is its children's node count (so a
 flat-RPN `RuExp` decomposes into head + arguments by `subrange`), and
