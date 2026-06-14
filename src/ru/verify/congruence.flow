@@ -1,0 +1,157 @@
+import ru/subst;
+import ru/util/exp;
+import ru/util/src2s;
+import base/env;
+
+// Semantic check that a `congruence` declaration really is a congruence: a relation
+// preserved under replacing equals by equals. Two shapes are accepted (both produced
+// by the Mizar/MPTP translator, and both implication-agnostic / hypotheses-form):
+//
+//   functor f/n:    a0=b0, …, a(n-1)=b(n-1)              |-  ( f(a0..) R f(b0..) )
+//   predicate p/n:  a0=b0, …, a(n-1)=b(n-1),  p(a0..)    |-  p(b0..)
+//
+// where every `aᵢ=bᵢ` is a binary relation between two variables. We build the
+// substitution σ = {bᵢ ↦ aᵢ} and require that σ turns the conclusion into a premise:
+//   functor:   the conclusion is a binary atom (L R M) and σ(M) = L;
+//   predicate: σ(conclusion) = the single non-equality premise hypothesis.
+// This makes `=` (or any congruence relation) binary by construction and ties the two
+// sides together structurally, rejecting anything that is not a real congruence.
+
+export {
+	// `eqRule` is the id of the equality rule (the one whose term is `( x = y )`).
+	// None() = a valid congruence; Some(reason) = why it is not one.
+	ruVerifyCong(cong : RuCong, eqRule : int) -> Maybe<string>;
+	// Check every congruence in the math base; emit an error per invalid one and
+	// return their names (empty = all congruences valid).
+	ruVerifyCongruences(math : RuMath, env : RuEnv) -> [string];
+}
+
+ruVerifyCongruences(math : RuMath, env : RuEnv) -> [string] {
+	eqRule = ruFindEqualityRule(math);
+	filtermap(getTreeValues(math.decls.assertions), \a -> switch (a) {
+		RuCong(info, __): switch (ruVerifyCong(a, eqRule)) {
+			None(): None();
+			Some(reason): {
+				env.out.error("congruence '" + id2s(info.id) + "' is not a valid congruence: " + reason, []);
+				Some(id2s(info.id));
+			}
+		}
+		default: None();
+	});
+}
+
+// The equality rule is the one whose term notation contains the `=` constant symbol
+// (e.g. wceq: `( A = B )`). Foundation-agnostic — we don't hard-code the rule name.
+ruFindEqualityRule(math : RuMath) -> int {
+	eqConst = s2id("=");
+	foldTree(math.decls.lang.rules, -1, \id, rule : RuRule, acc ->
+		if (acc != -1) acc
+		else if (exists(rule.term.nodes, \n -> switch (n) { RuConstRef(c): c == eqConst; RuVar(__, __): false; })) id
+		else acc
+	);
+}
+
+RuCongHyp ::= RuCongEq, RuCongPremise;
+	RuCongEq(a : RuVar, b : RuVar);   // a relation hypothesis (a R b) between two vars
+	RuCongPremise(exp : RuExp);       // any other hypothesis (the predicate premise)
+
+ruVerifyCong(cong : RuCong, eqRule : int) -> Maybe<string> {
+	hyps = cong.infer.hyps;
+	kinds = map(hyps, \h -> ruCongClassifyHyp(h, eqRule));
+	eqs = filtermap(kinds, \k -> switch (k) { RuCongEq(a, b): Some(Pair(a, b)); default: None(); });
+	premises = filtermap(kinds, \k -> switch (k) { RuCongPremise(e): Some(e); default: None(); });
+	if (eqs == []) {
+		Some("a congruence needs at least one equality hypothesis of the form ( x = y )");
+	} else {
+		// σ : bᵢ ↦ aᵢ
+		ren = pairs2tree(map(eqs, \p -> Pair(p.second, p.first)));
+		concl = ruCongStmtExp(cong.infer.prop);
+		if (premises == []) {
+			// functor congruence: conclusion is a binary atom ( L R M ); σ(M) must equal L.
+			switch (ruCongBinarySplit(concl)) {
+				None(): Some("the conclusion of a functor congruence must be a binary relation ( L R M )");
+				Some(lm): {
+					if (ruApplyRenaming2Exp(ren, lm.second).nodes == lm.first.nodes) None()
+					else Some("not a congruence: substituting the equal arguments into the right-hand side does not reproduce the left-hand side");
+				}
+			}
+		} else if (length(premises) == 1) {
+			// predicate congruence: σ(conclusion) must equal the premise atom.
+			if (ruApplyRenaming2Exp(ren, concl).nodes == premises[0].nodes) None()
+			else Some("not a congruence: substituting the equal arguments into the conclusion does not reproduce the premise hypothesis");
+		} else {
+			Some("a congruence may have at most one non-equality (premise) hypothesis, but has " + i2s(length(premises)));
+		}
+	}
+}
+
+ruCongClassifyHyp(h : RuHyp, eqRule : int) -> RuCongHyp {
+	exp = ruCongStmtExp(h.stmt);
+	// An equality hypothesis is `( x = y )`: the equality relation between two bare
+	// variables. Any other hypothesis (e.g. a predicate atom `( in a b )`) is the premise.
+	if (ruCongRootRuleId(exp) != eqRule) RuCongPremise(exp)
+	else switch (ruCongBinarySplit(exp)) {
+		None(): RuCongPremise(exp);
+		Some(lm): {
+			ma = ruCongAsVar(lm.first);
+			mb = ruCongAsVar(lm.second);
+			switch (ma) {
+				Some(a): switch (mb) {
+					Some(b): RuCongEq(a, b);
+					None(): RuCongPremise(exp);
+				}
+				None(): RuCongPremise(exp);
+			}
+		}
+	}
+}
+
+// Rule id at the root of an expression (-1 if it is a bare variable / empty).
+ruCongRootRuleId(e : RuExp) -> int {
+	if (e.nodes == []) -1
+	else switch (e.nodes[0]) {
+		RuRuleNode(idType, __): ruIdType2Id(idType);
+		RuVar(__, __): -1;
+	}
+}
+
+ruCongStmtExp(stmt : RuStmt) -> RuExp {
+	if (stmt.exps == []) RuExp([], -1) else ruExp(stmt.exps[0]);
+}
+
+ruCongAsVar(e : RuExp) -> Maybe<RuVar> {
+	if (length(e.nodes) != 1) None()
+	else switch (e.nodes[0]) {
+		RuVar(id, type): Some(RuVar(id, type));
+		RuRuleNode(__,__): None();
+	}
+}
+
+// Split ( R arg0 arg1 ) into (arg0, arg1) when the root is a binary rule node.
+ruCongBinarySplit(e : RuExp) -> Maybe<Pair<RuExp, RuExp>> {
+	if (e.nodes == []) None()
+	else switch (e.nodes[0]) {
+		RuVar(__,__): None();
+		RuRuleNode(__, arityLen): {
+			if (ruArityLen2Arity(arityLen) != 2) None()
+			else {
+				s1 = ruCongSubtreeSize(e.nodes, 1);
+				s2 = ruCongSubtreeSize(e.nodes, 1 + s1);
+				Some(Pair(
+					RuExp(subrange(e.nodes, 1, s1), -1),
+					RuExp(subrange(e.nodes, 1 + s1, s2), -1)
+				));
+			}
+		}
+	}
+}
+
+// Size (node count) of the subtree rooted at index i in a prefix-encoded node array.
+ruCongSubtreeSize(nodes : [RuExpNode], i : int) -> int {
+	if (i >= length(nodes)) 0
+	else switch (nodes[i]) {
+		RuVar(__,__): 1;
+		RuRuleNode(__, arityLen):
+			fold(enumFromTo(0, ruArityLen2Arity(arityLen) - 1), 1, \pos, __ -> pos + ruCongSubtreeSize(nodes, i + pos));
+	}
+}
