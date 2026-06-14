@@ -20,15 +20,14 @@ export {
 	// OPEN (`?`) step; the conclusion is the last step. `statement` is the full ∀ form
 	// (used for the signature). A direct/no-proof theorem has hyps=[] and steps=[statement].
 	MizThm(name : string, hyps : [TptpForm], steps : [TptpForm], statement : TptpForm, unhandled : [string]);
-	mizArticleTheorems(xmlContent : string, atrContent : string) -> Maybe<[MizThm]>;
+	mizArticleTheorems(xmlContent : string, sig : MizSig) -> Maybe<[MizThm]>;
 
 	// The article's environment theorems (its `.eth` — imported theorems a proof may cite)
 	// as AXIOMS, so the open steps' premises are available. t<nr>_<aid> (T) / d<nr>_<aid> (D).
-	mizParseEnv(ethContent : string, atrContent : string) -> [TptpDecl];
+	mizParseEnv(ethContent : string, sig : MizSig) -> [TptpDecl];
 }
 
-mizParseEnv(ethContent : string, atrContent : string) -> [TptpDecl] {
-	sig = mizParseAtr(atrContent);
+mizParseEnv(ethContent : string, sig : MizSig) -> [TptpDecl] {
 	switch (mizParseXml(ethContent)) {
 		None(): [];
 		Some(root): {
@@ -40,15 +39,14 @@ mizParseEnv(ethContent : string, atrContent : string) -> [TptpDecl] {
 					if (th.kids == [] || (kind != "T" && kind != "D")) None()
 					else Some(TptpDecl(
 						(if (kind == "T") "t" else "d") + mizAttr(th, "nr") + "_" + toLowerCase(mizAttr(th, "aid")),
-						"axiom", mizForm(sig, [], th.kids[0])));
+						"axiom", mizResugar(mizForm(sig, [], th.kids[0]))));
 				});
 			}
 		}
 	}
 }
 
-mizArticleTheorems(xmlContent : string, atrContent : string) -> Maybe<[MizThm]> {
-	sig = mizParseAtr(atrContent);
+mizArticleTheorems(xmlContent : string, sig : MizSig) -> Maybe<[MizThm]> {
 	switch (mizParseXml(xmlContent)) {
 		None(): None();
 		Some(root): {
@@ -77,13 +75,13 @@ mizTheorem(sig : MizSig, aid : string, idx : int, thm : MizXml) -> Maybe<MizThm>
 		Some(prop):
 			if (prop.kids == []) None()
 			else {
-				statement = mizForm(sig, [], prop.kids[0]);
+				statement = mizResugar(mizForm(sig, [], prop.kids[0]));
 				switch (mizFindFirst([thm], "Proof")) {
 					None(): Some(MizThm(name, [], [statement], statement, []));
 					Some(proof): {
 						w = mizWalkProof(sig, proof);
 						if (w.steps == []) Some(MizThm(name, [], [statement], statement, w.unhandled))
-						else Some(MizThm(name, w.hyps, w.steps, statement, w.unhandled));
+						else Some(MizThm(name, map(w.hyps, mizResugar), map(w.steps, mizResugar), statement, w.unhandled));
 					}
 				}
 			}
@@ -181,9 +179,13 @@ mizTypePred(sig : MizSig, typ : MizXml, t : TptpTerm) -> TptpForm {
 }
 
 mizSymName(sig : MizSig, kind : string, nr : int) -> string {
-	switch (mizResolve(sig, kind, nr)) {
-		Some(c): mizConstrName(kind, c);
-		None():  toLowerCase(kind) + i2s(nr) + "_unresolved";
+	switch (lookupTree(sig.readable, kind + ":" + i2s(nr))) {
+		Some(r): r;   // human notation symbol (in/object/union/…)
+		None():
+			switch (mizResolve(sig, kind, nr)) {
+				Some(c): mizConstrName(kind, c);   // mechanical MPTP name for operator symbols
+				None():  toLowerCase(kind) + i2s(nr) + "_unresolved";
+			}
 	}
 }
 
@@ -191,4 +193,51 @@ mizFoldAnd(fs : [TptpForm]) -> TptpForm {
 	if (fs == []) TptpPred("$true", [])
 	else if (length(fs) == 1) fs[0]
 	else TptpBin("and", fs[0], mizFoldAnd(tail(fs)));
+}
+
+// ---- re-sugar: recover →/↔/∨/∃ from Mizar's ¬/∧/∀ normal form (bottom-up) ----
+
+mizResugar(f : TptpForm) -> TptpForm {
+	switch (f) {
+		TptpPred(__, __): f;
+		TptpEq(__, __):   f;
+		TptpNeg(g):       mizResugarNeg(mizResugar(g));
+		TptpBin(op, a, b): mizResugarBin(op, mizResugar(a), mizResugar(b));
+		TptpQuant(q, vs, body): TptpQuant(q, vs, mizResugar(body));
+	}
+}
+
+// ¬(A ∧ ¬B) → A→B ;  ¬(¬A ∧ ¬B) → A∨B ;  ¬∀x¬P → ∃x P
+mizResugarNeg(g : TptpForm) -> TptpForm {
+	def = TptpNeg(g);
+	switch (g) {
+		TptpBin(op, a, b):
+			if (op != "and") def
+			else switch (b) {
+				TptpNeg(b1): switch (a) {
+					TptpNeg(a1): TptpBin("or", a1, b1);
+					default:     TptpBin("imp", a, b1);
+				}
+				default: def;
+			};
+		TptpQuant(q, vs, body):
+			if (q != "forall") def
+			else switch (body) { TptpNeg(p): TptpQuant("exists", vs, p); default: def; };
+		default: def;
+	}
+}
+
+// (A→B) ∧ (B→A) → A↔B
+mizResugarBin(op : string, a : TptpForm, b : TptpForm) -> TptpForm {
+	def = TptpBin(op, a, b);
+	if (op != "and") def
+	else switch (a) {
+		TptpBin(op1, a1, a2):
+			if (op1 != "imp") def
+			else switch (b) {
+				TptpBin(op2, b1, b2): if (op2 == "imp" && a1 == b2 && a2 == b1) TptpBin("iff", a1, a2) else def;
+				default: def;
+			};
+		default: def;
+	}
 }
