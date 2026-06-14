@@ -1,0 +1,114 @@
+import mizar/xml;
+import mizar/atr;
+import mptp/src;
+import base/fileinfo;
+import string;
+import math/math;
+
+// Translate a Mizar analyzed article XML into the (relativized FOL) TptpSource the
+// MPTP back-end already turns into Russell. Milestone 1: theorem STATEMENTS only
+// (the <Proposition> under each <JustifiedTheorem>); proofs come next.
+//
+// Mizar XML normalizes formulas to three logical primitives — <Not>, <And> (n-ary),
+// <For> (typed ∀) — plus <Pred>/<Func>/<Typ>/<Is>/<Var>/<Verum>. Soft types are
+// relativized here: `∀x:T . body` -> `∀x (T(x) -> body)`, `x is T` -> `T(x)`, where
+// T(x) is the mode's sort predicate. Equality (`r1_hidden`) maps to TptpEq.
+
+export {
+	mizXml2Tptp(xmlContent : string, atrContent : string) -> Maybe<TptpSource>;
+}
+
+mizXml2Tptp(xmlContent : string, atrContent : string) -> Maybe<TptpSource> {
+	sig = mizParseAtr(atrContent);
+	switch (mizParseXml(xmlContent)) {
+		None(): None();
+		Some(root): {
+			art = if (root.tag == "Article") Some(root) else mizFindFirst(root.kids, "Article");
+			switch (art) {
+				None(): None();
+				Some(a): {
+					aid  = toLowerCase(mizAttr(a, "aid"));
+					thms = mizKidsTagged(a, "JustifiedTheorem");
+					decls = filtermap(mapi(thms, \i, thm -> mizThmDecl(sig, aid, i, thm)), \m -> m);
+					Some(TptpSource(decls, ruNoFileInfo));
+				}
+			}
+		}
+	}
+}
+
+// One <JustifiedTheorem> -> a theorem decl named t<N>_<aid> (N = 1-based position
+// among the article's theorems, matching the MML/MPTP numbering).
+mizThmDecl(sig : MizSig, aid : string, idx : int, thm : MizXml) -> Maybe<TptpDecl> {
+	switch (mizFindFirst([thm], "Proposition")) {
+		None(): None();
+		Some(prop):
+			if (prop.kids == []) None()
+			else Some(TptpDecl("t" + i2s(idx + 1) + "_" + aid, "theorem", mizForm(sig, [], prop.kids[0])));
+	}
+}
+
+// ---- formula translation (binding env = var names in binding order; Var nr=1 outermost) ----
+
+mizForm(sig : MizSig, env : [string], e : MizXml) -> TptpForm {
+	kids = e.kids;
+	if (e.tag == "Not") {
+		TptpNeg(mizForm(sig, env, kids[0]));
+	} else if (e.tag == "And") {
+		mizFoldAnd(map(kids, \k -> mizForm(sig, env, k)));
+	} else if (e.tag == "For") {
+		vname = "X" + mizAttr(e, "vid");
+		env2  = arrayPush(env, vname);
+		guard = mizTypePred(sig, kids[0], TptpVar(vname));   // kids: [Typ, body]
+		body  = mizForm(sig, env2, kids[1]);
+		TptpQuant("forall", [vname], TptpBin("imp", guard, body));
+	} else if (e.tag == "Pred") {
+		name = mizSymName(sig, mizAttr(e, "kind"), s2i(mizAttr(e, "nr")));
+		args = map(kids, \k -> mizTerm(sig, env, k));
+		if (name == "r1_hidden" && length(args) == 2) TptpEq(args[0], args[1])
+		else TptpPred(name, args);
+	} else if (e.tag == "Is") {
+		mizTypePred(sig, kids[1], mizTerm(sig, env, kids[0]));   // kids: [term, Typ]
+	} else if (e.tag == "Verum") {
+		TptpPred("$true", []);
+	} else {
+		TptpPred("$unhandled_" + e.tag, []);
+	}
+}
+
+mizTerm(sig : MizSig, env : [string], e : MizXml) -> TptpTerm {
+	if (e.tag == "Var") {
+		nr = s2i(mizAttr(e, "nr"));
+		TptpVar(if (nr >= 1 && nr <= length(env)) env[nr - 1] else "Xunbound" + i2s(nr));
+	} else if (e.tag == "Const") {
+		TptpVar("C" + mizAttr(e, "vid"));
+	} else if (e.tag == "Func") {
+		TptpApp(mizSymName(sig, mizAttr(e, "kind"), s2i(mizAttr(e, "nr"))),
+			map(e.kids, \k -> mizTerm(sig, env, k)));
+	} else if (e.tag == "LocusVar") {
+		TptpVar("L" + mizAttr(e, "nr"));
+	} else if (e.tag == "Int") {
+		TptpApp("num" + mizAttr(e, "x"), []);
+	} else {
+		TptpApp("unhandled_term_" + e.tag, []);
+	}
+}
+
+// `<Typ kind="M" nr=..>` applied to a term -> its sort predicate. Clusters
+// (adjectives) are ignored for now (empty for the foundational base types).
+mizTypePred(sig : MizSig, typ : MizXml, t : TptpTerm) -> TptpForm {
+	TptpPred(mizSymName(sig, mizAttr(typ, "kind"), s2i(mizAttr(typ, "nr"))), [t]);
+}
+
+mizSymName(sig : MizSig, kind : string, nr : int) -> string {
+	switch (mizResolve(sig, kind, nr)) {
+		Some(c): mizConstrName(kind, c);
+		None():  toLowerCase(kind) + i2s(nr) + "_unresolved";
+	}
+}
+
+mizFoldAnd(fs : [TptpForm]) -> TptpForm {
+	if (fs == []) TptpPred("$true", [])
+	else if (length(fs) == 1) fs[0]
+	else TptpBin("and", fs[0], mizFoldAnd(tail(fs)));
+}

@@ -1,0 +1,117 @@
+import comm;
+import base/env;
+import base/fileinfo;
+import mizar/miz2ru;
+import mptp/src;
+import mptp/mptp2ru;
+import ru/parse/exps/sources;
+
+// Commands for the Mizar analyzed-XML front-end. The proof corpus lives in the MML
+// dir as per-article `.xml` (+ `.atr` for constructor resolution). Milestone 1:
+//   `mizar-stmts`  — translate an article's theorem statements and print them (debug),
+//   `mizar-to-ru`  — translate statements into a Russell article importing the foundation.
+// Mirrors the MPTP front-end (`mptp-to-ru`): only the source changes (XML vs TPTP); the
+// back-end (mptpArticleSource -> RuParseSource -> RuSource) is shared.
+
+export {
+	ruMizarCommands : [RuComm];
+}
+
+ruMizarCommands = [
+	ruCommMizarStmts,
+	ruCommMizarToRu,
+];
+
+// MML analyzed-xml dir: explicit `dir=`, else the first import-root + /MML/mml.
+mizArticleDir(unit : RuUnit) -> string {
+	d = ruTaskStringArg(unit.task, "dir", "");
+	roots = unit.state.conf.importRoots;
+	if (d != "") d
+	else if (roots == []) ""
+	else roots[0] + "/MML/mml";
+}
+
+mizReadArticle(env : RuEnv, dir : string, article : string) -> Maybe<Pair<string, string>> {
+	if (dir == "" || article == "") {
+		env.out.error("mizar: 'article' is required (and a resolvable MML dir — pass dir= or set RUSSELL_MATH)", []);
+		None();
+	} else {
+		xmlPath = dir + "/" + article + ".xml";
+		atrPath = dir + "/" + article + ".atr";
+		if (!fileExists(xmlPath)) { env.out.error("mizar: not found: " + xmlPath, []); None(); }
+		else if (!fileExists(atrPath)) { env.out.error("mizar: not found: " + atrPath + " (verify the article first)", []); None(); }
+		else Some(Pair(getFileContent(xmlPath), getFileContent(atrPath)));
+	}
+}
+
+ruCommMizarStmts = RuComm(
+	RuCommInfo(
+		"mizar-stmts", "io", "translate a Mizar article's theorem statements to relativized FOL and print them", "article", false, false,
+		[
+			RuCommArg("article", false, "article name (e.g. tarski)", ""),
+			RuCommArg("dir", true, "MML analyzed-xml dir (default $RUSSELL_MATH/MML/mml)", "")
+		], []
+	),
+	ruRunMizarStmts
+);
+
+ruRunMizarStmts(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	article = ruTaskStringArg(unit.task, "article", "");
+	switch (mizReadArticle(env, mizArticleDir(unit), article)) {
+		None(): None();
+		Some(p): switch (mizXml2Tptp(p.first, p.second)) {
+			None(): { env.out.error("mizar-stmts: no <Article> root in " + article + ".xml", []); None(); }
+			Some(tptp): {
+				env.out.println("mizar-stmts: " + article + " -> " + i2s(length(tptp.decls)) + " theorem statements");
+				iter(tptp.decls, \d -> env.out.println(tptpDecl2s(d)));
+				Some(unit.state);
+			}
+		}
+	}
+}
+
+ruCommMizarToRu = RuComm(
+	RuCommInfo(
+		"mizar-to-ru", "translate", "translate a Mizar analyzed article (xml+atr) into a Russell article importing the foundation (load it first via read-ru)", "article", false, false,
+		[
+			RuCommArg("article", false, "article name (e.g. tarski)", ""),
+			RuCommArg("dir", true, "MML analyzed-xml dir (default $RUSSELL_MATH/MML/mml)", ""),
+			RuCommArg("module", true, "module name for the generated article (default = article)", ""),
+			RuCommArg("foundation", true, "foundation module to import", "miz_logic")
+		], []
+	),
+	ruRunMizarToRu
+);
+
+ruRunMizarToRu(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	state = unit.state;
+	article = ruTaskStringArg(unit.task, "article", "");
+	module0 = ruTaskStringArg(unit.task, "module", "");
+	module = if (module0 != "") module0 else article;
+	foundation = ruTaskStringArg(unit.task, "foundation", "miz_logic");
+	switch (mizReadArticle(env, mizArticleDir(unit), article)) {
+		None(): None();
+		Some(p): switch (mizXml2Tptp(p.first, p.second)) {
+			None(): { env.out.error("mizar-to-ru: no <Article> root in " + article + ".xml", []); None(); }
+			Some(tptp): {
+				// Import the foundation by its ACTUAL loaded source id (read-from-disk module
+				// ids may be path-qualified), exactly as mptp-to-ru does.
+				found_id = foldTree(state.ru, s2id(foundation), \id, s, acc ->
+					if (s.info.module == foundation || endsWith(s.info.module, "/" + foundation)) s.info.id else acc);
+				src = mptpArticleSource(tptp, found_id, module, state.conf);
+				err = ref 0;
+				env1 = ruAddErrCounter2Env(env, err);
+				articleSrc = ruParseSource2RuSource(src, env1);
+				if (^err != 0) {
+					env.out.error("mizar-to-ru: failed to parse '" + module + "' against '" + foundation + "' (load the foundation first via read-ru)", []);
+					None();
+				} else {
+					env.out.println("mizar-to-ru: '" + module + "' = " + i2s(length(tptp.decls)) + " theorems importing '" + foundation + "'");
+					Some(RuState(state with ru = setTree(state.ru, articleSrc.info.id, articleSrc)));
+				}
+			}
+		}
+	}
+}

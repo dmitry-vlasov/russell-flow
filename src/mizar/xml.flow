@@ -1,0 +1,92 @@
+import ds/tree;
+import string;
+
+// Minimal XML parser for Mizar analyzed-XML files. We can't use flow9's formats/xml
+// (it imports behaviour.flow, whose `const`/`next` exports collide with Russell's),
+// and we don't need a general parser: the verifier emits exactly ONE element per line
+// (open `<T a="v">`, self-close `<T a="v"/>`, or close `</T>`), attribute values never
+// contain spaces or quotes, and there are no meaningful text nodes. So we tokenize per
+// line and build the tree with an explicit stack — linear and stack-safe.
+
+export {
+	MizXml(tag : string, attrs : Tree<string, string>, kids : [MizXml]);
+
+	mizParseXml(content : string) -> Maybe<MizXml>;     // the root element
+	mizAttr(x : MizXml, key : string) -> string;        // "" if absent
+	mizKidsTagged(x : MizXml, tag : string) -> [MizXml]; // direct children with this tag
+	mizFindFirst(xs : [MizXml], tag : string) -> Maybe<MizXml>;  // first (DFS) element with tag
+}
+
+mizAttr(x : MizXml, key : string) -> string { lookupTreeDef(x.attrs, key, ""); }
+
+mizKidsTagged(x : MizXml, tag : string) -> [MizXml] { filter(x.kids, \k -> k.tag == tag); }
+
+mizFindFirst(xs : [MizXml], tag : string) -> Maybe<MizXml> {
+	fold(xs, None(), \acc : Maybe<MizXml>, x ->
+		switch (acc) {
+			Some(__): acc;
+			None(): if (x.tag == tag) Some(x) else mizFindFirst(x.kids, tag);
+		}
+	);
+}
+
+// ---- line-based parser ----
+
+MizTok ::= MizOpen, MizSelfClose, MizClose, MizSkip;
+	MizOpen(tag : string, attrs : Tree<string, string>);
+	MizSelfClose(tag : string, attrs : Tree<string, string>);
+	MizClose(tag : string);
+	MizSkip();
+
+MizFrame(tag : string, attrs : Tree<string, string>, kids : [MizXml]);
+MizAcc(stack : [MizFrame], root : Maybe<MizXml>);
+
+mizParseXml(content : string) -> Maybe<MizXml> {
+	fold(strSplit(content, "\n"), MizAcc([], None()), \acc, line -> mizStep(acc, mizLineTok(trim2(line, " \t\r")))).root;
+}
+
+mizStep(acc : MizAcc, tok : MizTok) -> MizAcc {
+	switch (tok) {
+		MizSkip(): acc;
+		MizOpen(tag, attrs): MizAcc(arrayPush(acc.stack, MizFrame(tag, attrs, [])), acc.root);
+		MizSelfClose(tag, attrs): mizAddKid(acc, MizXml(tag, attrs, []));
+		MizClose(__): {
+			if (acc.stack == []) acc
+			else {
+				top  = lastElement(acc.stack, MizFrame("", makeTree(), []));
+				rest = subrange(acc.stack, 0, length(acc.stack) - 1);
+				mizAddKid(MizAcc(rest, acc.root), MizXml(top.tag, top.attrs, top.kids));
+			}
+		}
+	}
+}
+
+mizAddKid(acc : MizAcc, node : MizXml) -> MizAcc {
+	if (acc.stack == []) MizAcc(acc.stack, Some(node))   // a top-level node is the root
+	else {
+		top  = lastElement(acc.stack, MizFrame("", makeTree(), []));
+		top2 = MizFrame(top.tag, top.attrs, arrayPush(top.kids, node));
+		MizAcc(arrayPush(subrange(acc.stack, 0, length(acc.stack) - 1), top2), acc.root);
+	}
+}
+
+mizLineTok(t : string) -> MizTok {
+	if (t == "" || startsWith(t, "<?") || startsWith(t, "<!") || !startsWith(t, "<")) MizSkip()
+	else if (startsWith(t, "</")) MizClose(trim2(substring(t, 2, strlen(t) - 3), " "))   // </Tag>
+	else {
+		selfClose = endsWith(t, "/>");
+		inner = substring(t, 1, strlen(t) - (if (selfClose) 3 else 2));   // drop '<' and '>' or '/>'
+		sp = strIndexOf(inner, " ");
+		tag   = if (sp < 0) inner else substring(inner, 0, sp);
+		attrs = if (sp < 0) makeTree() else mizParseAttrs(substring(inner, sp + 1, strlen(inner) - sp - 1));
+		if (selfClose) MizSelfClose(tag, attrs) else MizOpen(tag, attrs);
+	}
+}
+
+mizParseAttrs(s : string) -> Tree<string, string> {
+	fold(filter(strSplit(s, " "), \p -> p != ""), makeTree(), \acc, p -> {
+		eq = strIndexOf(p, "=");
+		if (eq < 0) acc
+		else setTree(acc, substring(p, 0, eq), trim2(substring(p, eq + 1, strlen(p) - eq - 1), "\""));
+	});
+}
