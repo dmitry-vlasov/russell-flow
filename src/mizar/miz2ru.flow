@@ -15,19 +15,15 @@ import math/math;
 // T(x) is the mode's sort predicate. Equality (`r1_hidden`) maps to TptpEq.
 
 export {
-	mizXml2Tptp(xmlContent : string, atrContent : string) -> Maybe<TptpSource>;
+	// One Russell theorem per Mizar theorem: shared context `hyps` (the let-guards +
+	// assumptions) and `steps` — the proof's step propositions, each later emitted as an
+	// OPEN (`?`) step; the conclusion is the last step. `statement` is the full ∀ form
+	// (used for the signature). A direct/no-proof theorem has hyps=[] and steps=[statement].
+	MizThm(name : string, hyps : [TptpForm], steps : [TptpForm], statement : TptpForm, unhandled : [string]);
+	mizArticleTheorems(xmlContent : string, atrContent : string) -> Maybe<[MizThm]>;
 
-	// Milestone 2: per-step proof gaps. Walking a proof's skeleton, `let x:T` and
-	// `assume H` accumulate a context φ; each `by`-justified step is a gap φ ⊢ P,
-	// emitted in deduction form `⊢ (φ → P)`. MizGaps collects them + flags any
-	// skeleton item kinds not yet handled (so coverage is data-driven).
-	MizGaps(phi : [TptpForm], gaps : [MizGap], unhandled : [string]);
-		MizGap(hyps : [TptpForm], goal : TptpForm, premises : [string]);   // φ ⊢ goal + cited premises
-	mizArticleGaps(xmlContent : string, atrContent : string, ethContent : string) -> Maybe<[Pair<string, MizGaps>]>;
-
-	// The article's environment theorems (its `.eth` — the imported theorems a proof can
-	// cite via <Ref>) translated as AXIOMS, so the gaps' premises are available. Named
-	// t<nr>_<aid> (kind T) / d<nr>_<aid> (kind D), matching how <Ref>s resolve.
+	// The article's environment theorems (its `.eth` — imported theorems a proof may cite)
+	// as AXIOMS, so the open steps' premises are available. t<nr>_<aid> (T) / d<nr>_<aid> (D).
 	mizParseEnv(ethContent : string, atrContent : string) -> [TptpDecl];
 }
 
@@ -51,7 +47,7 @@ mizParseEnv(ethContent : string, atrContent : string) -> [TptpDecl] {
 	}
 }
 
-mizXml2Tptp(xmlContent : string, atrContent : string) -> Maybe<TptpSource> {
+mizArticleTheorems(xmlContent : string, atrContent : string) -> Maybe<[MizThm]> {
 	sig = mizParseAtr(atrContent);
 	switch (mizParseXml(xmlContent)) {
 		None(): None();
@@ -62,133 +58,71 @@ mizXml2Tptp(xmlContent : string, atrContent : string) -> Maybe<TptpSource> {
 				Some(a): {
 					aid  = toLowerCase(mizAttr(a, "aid"));
 					thms = mizKidsTagged(a, "JustifiedTheorem");
-					decls = filtermap(mapi(thms, \i, thm -> mizThmDecl(sig, aid, i, thm)), \m -> m);
-					Some(TptpSource(decls, ruNoFileInfo));
+					Some(filtermap(mapi(thms, \i, thm -> mizTheorem(sig, aid, i, thm)), \m -> m));
 				}
 			}
 		}
 	}
 }
 
-// One <JustifiedTheorem> -> a theorem decl named t<N>_<aid> (N = 1-based position
-// among the article's theorems, matching the MML/MPTP numbering).
-mizThmDecl(sig : MizSig, aid : string, idx : int, thm : MizXml) -> Maybe<TptpDecl> {
+MizWalk(hyps : [TptpForm], steps : [TptpForm], unhandled : [string]);
+
+// One <JustifiedTheorem> -> a MizThm. Direct/no-proof theorem: a single open step proving
+// the statement. With a proof: the let/assume context as hyps + the proof step props as
+// open steps. Falls back to the single-step form if the skeleton yielded no steps.
+mizTheorem(sig : MizSig, aid : string, idx : int, thm : MizXml) -> Maybe<MizThm> {
+	name = "t" + i2s(idx + 1) + "_" + aid;
 	switch (mizFindFirst([thm], "Proposition")) {
 		None(): None();
 		Some(prop):
 			if (prop.kids == []) None()
-			else Some(TptpDecl("t" + i2s(idx + 1) + "_" + aid, "theorem", mizForm(sig, [], prop.kids[0])));
-	}
-}
-
-// ---- Milestone 2: proof-skeleton gap extraction ----
-
-mizArticleGaps(xmlContent : string, atrContent : string, ethContent : string) -> Maybe<[Pair<string, MizGaps>]> {
-	sig    = mizParseAtr(atrContent);
-	envMap = mizEnvMap(ethContent);   // env article index -> defining article id (for <Ref> resolution)
-	switch (mizParseXml(xmlContent)) {
-		None(): None();
-		Some(root): {
-			art = if (root.tag == "Article") Some(root) else mizFindFirst(root.kids, "Article");
-			switch (art) {
-				None(): None();
-				Some(a): {
-					aid  = toLowerCase(mizAttr(a, "aid"));
-					thms = mizKidsTagged(a, "JustifiedTheorem");
-					Some(filtermap(mapi(thms, \i, thm ->
-						switch (mizFindFirst([thm], "Proof")) {
-							None(): None();   // direct-by theorem: the whole statement is the (single) gap
-							Some(proof): Some(Pair("t" + i2s(i + 1) + "_" + aid, mizProofGaps(sig, envMap, proof)));
-						}
-					), \m -> m));
+			else {
+				statement = mizForm(sig, [], prop.kids[0]);
+				switch (mizFindFirst([thm], "Proof")) {
+					None(): Some(MizThm(name, [], [statement], statement, []));
+					Some(proof): {
+						w = mizWalkProof(sig, proof);
+						if (w.steps == []) Some(MizThm(name, [], [statement], statement, w.unhandled))
+						else Some(MizThm(name, w.hyps, w.steps, statement, w.unhandled));
+					}
 				}
 			}
-		}
 	}
 }
 
-// .eth: build env article index -> defining article id, so <Ref articlenr=N kind nr>
-// resolves to the absolute premise name <t|d><nr>_<aid>.
-mizEnvMap(ethContent : string) -> Tree<int, string> {
-	switch (mizParseXml(ethContent)) {
-		None(): makeTree();
-		Some(root): {
-			ths = if (root.tag == "Theorems") Some(root) else mizFindFirst(root.kids, "Theorems");
-			switch (ths) {
-				None(): makeTree();
-				Some(t): fold(mizKidsTagged(t, "Theorem"), makeTree(), \acc, th -> {
-					aid = mizAttr(th, "aid");
-					if (aid == "") acc else setTree(acc, s2i(mizAttr(th, "articlenr")), aid);
-				});
-			}
-		}
-	}
+// Walk a proof skeleton: `let x:T` / `assume H` -> hypotheses (shared context); each
+// `by`-justified step (Conclusion or labeled Proposition) -> an open proof step.
+mizWalkProof(sig : MizSig, proof : MizXml) -> MizWalk {
+	fold(proof.kids, MizWalk([], [], []), \w, item -> mizWalkItem(sig, w, item));
 }
 
-mizRefName(envMap : Tree<int, string>, ref : MizXml) -> string {
-	aid  = lookupTreeDef(envMap, s2i(mizAttr(ref, "articlenr")), "");
-	kind = mizAttr(ref, "kind");
-	if (aid == "") "" else (if (kind == "T") "t" else if (kind == "D") "d" else toLowerCase(kind)) + mizAttr(ref, "nr") + "_" + toLowerCase(aid);
-}
-
-mizByRefs(envMap : Tree<int, string>, by : MizXml) -> [string] {
-	filtermap(mizKidsTagged(by, "Ref"), \r -> { n = mizRefName(envMap, r); if (n == "") None() else Some(n); });
-}
-
-mizProofGaps(sig : MizSig, envMap : Tree<int, string>, proof : MizXml) -> MizGaps {
-	fold(proof.kids, MizGaps([], [], []), \g, item -> mizProofItem(sig, envMap, g, item));
-}
-
-// One skeleton item updates the context φ and/or appends a deduction-form gap.
-mizProofItem(sig : MizSig, envMap : Tree<int, string>, g : MizGaps, item : MizXml) -> MizGaps {
+mizWalkItem(sig : MizSig, w : MizWalk, item : MizXml) -> MizWalk {
 	tag = item.tag;
 	if (tag == "Let") {
-		// `let x:T` -> add the type guard T(x) to φ (x is now a free Const by vid)
-		if (item.kids == []) g
+		if (item.kids == []) w
 		else {
 			typ = item.kids[0];
-			MizGaps(arrayPush(g.phi, mizTypePred(sig, typ, TptpVar("X" + mizAttr(typ, "vid")))), g.gaps, g.unhandled);
+			MizWalk(arrayPush(w.hyps, mizTypePred(sig, typ, TptpVar("X" + mizAttr(typ, "vid")))), w.steps, w.unhandled);
 		}
 	} else if (tag == "Assume") {
-		// `assume H` -> add H to φ
 		hs = filtermap(item.kids, \k -> if (k.tag == "Proposition" && k.kids != []) Some(mizForm(sig, [], k.kids[0])) else None());
-		MizGaps(concat(g.phi, hs), g.gaps, g.unhandled);
+		MizWalk(concat(w.hyps, hs), w.steps, w.unhandled);
 	} else if (tag == "Conclusion") {
-		// the By is INSIDE a Conclusion
-		refs = switch (mizFindFirst(item.kids, "By")) { Some(b): mizByRefs(envMap, b); None(): []; };
-		mizStepGap(sig, g, mizFindFirst(item.kids, "Proposition"), refs);
+		mizAddStep(sig, w, mizFindFirst(item.kids, "Proposition"));
 	} else if (tag == "Proposition") {
-		mizStepGap(sig, g, Some(item), []);   // intermediate step; its By is the NEXT sibling
-	} else if (tag == "By") {
-		// top-level By -> attach its refs to the most recent gap (the preceding Proposition)
-		if (g.gaps == []) g
-		else {
-			last = lastElement(g.gaps, MizGap([], TptpPred("$true", []), []));
-			updated = MizGap(last.hyps, last.goal, concat(last.premises, mizByRefs(envMap, item)));
-			MizGaps(g.phi, arrayPush(subrange(g.gaps, 0, length(g.gaps) - 1), updated), g.unhandled);
-		}
-	} else if (tag == "BlockThesis" || tag == "Thesis" || tag == "EndPosition") {
-		g;
+		mizAddStep(sig, w, Some(item));
+	} else if (tag == "BlockThesis" || tag == "Thesis" || tag == "EndPosition" || tag == "By") {
+		w;
 	} else {
-		MizGaps(g.phi, g.gaps, arrayPush(g.unhandled, tag));
+		MizWalk(w.hyps, w.steps, arrayPush(w.unhandled, tag));
 	}
 }
 
-// A `by`-justified step: gap = (φ → P) with premises; P then joins φ as an available fact.
-mizStepGap(sig : MizSig, g : MizGaps, mprop : Maybe<MizXml>, premises : [string]) -> MizGaps {
+mizAddStep(sig : MizSig, w : MizWalk, mprop : Maybe<MizXml>) -> MizWalk {
 	switch (mprop) {
-		None(): g;
-		Some(prop):
-			if (prop.kids == []) g
-			else {
-				p = mizForm(sig, [], prop.kids[0]);
-				MizGaps(arrayPush(g.phi, p), arrayPush(g.gaps, MizGap(g.phi, p, premises)), g.unhandled);
-			}
+		None(): w;
+		Some(prop): if (prop.kids == []) w else MizWalk(w.hyps, arrayPush(w.steps, mizForm(sig, [], prop.kids[0])), w.unhandled);
 	}
-}
-
-mizDeduction(phi : [TptpForm], goal : TptpForm) -> TptpForm {
-	fold(reverseA(phi), goal, \acc, h -> TptpBin("imp", h, acc));
 }
 
 // ---- formula translation (binding env = var names in binding order; Var nr=1 outermost) ----
