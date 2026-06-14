@@ -16,6 +16,22 @@ import math/math;
 
 export {
 	mizXml2Tptp(xmlContent : string, atrContent : string) -> Maybe<TptpSource>;
+
+	// Milestone 2: per-step proof gaps. Walking a proof's skeleton, `let x:T` and
+	// `assume H` accumulate a context φ; each `by`-justified step is a gap φ ⊢ P,
+	// emitted in deduction form `⊢ (φ → P)`. MizGaps collects them + flags any
+	// skeleton item kinds not yet handled (so coverage is data-driven).
+	MizGaps(phi : [TptpForm], gaps : [TptpForm], unhandled : [string]);
+	mizArticleGaps(xmlContent : string, atrContent : string) -> Maybe<[Pair<string, MizGaps>]>;  // per theorem
+	mizArticleGapDecls(xmlContent : string, atrContent : string) -> [TptpDecl];  // gaps as open theorems t<N>_<aid>_g<k>
+}
+
+mizArticleGapDecls(xmlContent : string, atrContent : string) -> [TptpDecl] {
+	switch (mizArticleGaps(xmlContent, atrContent)) {
+		None(): [];
+		Some(thms): concatA(map(thms, \t ->
+			mapi(t.second.gaps, \k, gp -> TptpDecl(t.first + "_g" + i2s(k + 1), "theorem", gp))));
+	}
 }
 
 mizXml2Tptp(xmlContent : string, atrContent : string) -> Maybe<TptpSource> {
@@ -46,6 +62,77 @@ mizThmDecl(sig : MizSig, aid : string, idx : int, thm : MizXml) -> Maybe<TptpDec
 			if (prop.kids == []) None()
 			else Some(TptpDecl("t" + i2s(idx + 1) + "_" + aid, "theorem", mizForm(sig, [], prop.kids[0])));
 	}
+}
+
+// ---- Milestone 2: proof-skeleton gap extraction ----
+
+mizArticleGaps(xmlContent : string, atrContent : string) -> Maybe<[Pair<string, MizGaps>]> {
+	sig = mizParseAtr(atrContent);
+	switch (mizParseXml(xmlContent)) {
+		None(): None();
+		Some(root): {
+			art = if (root.tag == "Article") Some(root) else mizFindFirst(root.kids, "Article");
+			switch (art) {
+				None(): None();
+				Some(a): {
+					aid  = toLowerCase(mizAttr(a, "aid"));
+					thms = mizKidsTagged(a, "JustifiedTheorem");
+					Some(filtermap(mapi(thms, \i, thm ->
+						switch (mizFindFirst([thm], "Proof")) {
+							None(): None();   // direct-by theorem: the whole statement is the (single) gap
+							Some(proof): Some(Pair("t" + i2s(i + 1) + "_" + aid, mizProofGaps(sig, proof)));
+						}
+					), \m -> m));
+				}
+			}
+		}
+	}
+}
+
+mizProofGaps(sig : MizSig, proof : MizXml) -> MizGaps {
+	fold(proof.kids, MizGaps([], [], []), \g, item -> mizProofItem(sig, g, item));
+}
+
+// One skeleton item updates the context φ and/or appends a deduction-form gap.
+mizProofItem(sig : MizSig, g : MizGaps, item : MizXml) -> MizGaps {
+	tag = item.tag;
+	if (tag == "Let") {
+		// `let x:T` -> add the type guard T(x) to φ (x is now a free Const by vid)
+		if (item.kids == []) g
+		else {
+			typ = item.kids[0];
+			MizGaps(arrayPush(g.phi, mizTypePred(sig, typ, TptpVar("X" + mizAttr(typ, "vid")))), g.gaps, g.unhandled);
+		}
+	} else if (tag == "Assume") {
+		// `assume H` -> add H to φ
+		hs = filtermap(item.kids, \k -> if (k.tag == "Proposition" && k.kids != []) Some(mizForm(sig, [], k.kids[0])) else None());
+		MizGaps(concat(g.phi, hs), g.gaps, g.unhandled);
+	} else if (tag == "Conclusion") {
+		mizStepGap(sig, g, mizFindFirst(item.kids, "Proposition"));
+	} else if (tag == "Proposition") {
+		mizStepGap(sig, g, Some(item));   // an intermediate labeled step
+	} else if (tag == "BlockThesis" || tag == "Thesis" || tag == "EndPosition" || tag == "By") {
+		g;   // structural / informational
+	} else {
+		MizGaps(g.phi, g.gaps, arrayPush(g.unhandled, tag));
+	}
+}
+
+// A `by`-justified step: gap = (φ → P); P then joins φ as an available fact.
+mizStepGap(sig : MizSig, g : MizGaps, mprop : Maybe<MizXml>) -> MizGaps {
+	switch (mprop) {
+		None(): g;
+		Some(prop):
+			if (prop.kids == []) g
+			else {
+				p = mizForm(sig, [], prop.kids[0]);
+				MizGaps(arrayPush(g.phi, p), arrayPush(g.gaps, mizDeduction(g.phi, p)), g.unhandled);
+			}
+	}
+}
+
+mizDeduction(phi : [TptpForm], goal : TptpForm) -> TptpForm {
+	fold(reverseA(phi), goal, \acc, h -> TptpBin("imp", h, acc));
 }
 
 // ---- formula translation (binding env = var names in binding order; Var nr=1 outermost) ----
@@ -81,7 +168,7 @@ mizTerm(sig : MizSig, env : [string], e : MizXml) -> TptpTerm {
 		nr = s2i(mizAttr(e, "nr"));
 		TptpVar(if (nr >= 1 && nr <= length(env)) env[nr - 1] else "Xunbound" + i2s(nr));
 	} else if (e.tag == "Const") {
-		TptpVar("C" + mizAttr(e, "vid"));
+		TptpVar("X" + mizAttr(e, "vid"));   // a let-fixed var; same naming as For-bound (by vid)
 	} else if (e.tag == "Func") {
 		TptpApp(mizSymName(sig, mizAttr(e, "kind"), s2i(mizAttr(e, "nr"))),
 			map(e.kids, \k -> mizTerm(sig, env, k)));
