@@ -1,0 +1,271 @@
+import comm;
+import base/fileinfo;
+import mptp/parse/parse;
+import mptp/mptp2ru;
+import mptp/setmm2miz;
+import ru/parse/exps/sources;
+import ru/parse/load;
+import ru/parse/parse;
+import base/util/fileinfo;
+
+// Commands for the MPTP (TPTP `fof`) front-end. For now: `tptp-parse`, which
+// reads a .p file, parses it to the typed AST, and prints it back — the
+// round-trip used to validate the Flow9 parser against the Python oracle.
+// Next: `mptp-to-ru` (TptpSource -> RuParseSource), modeled on mm-to-ru.
+
+export {
+	ruMptpCommands : [RuComm];
+}
+
+ruMptpCommands = [
+	ruCommTptpParse,
+	ruCommMptpFoundation,
+	ruCommMptpToRu,
+	ruCommSetmm2Miz,
+];
+
+// Translate a set.mm logic module (+ its transitive imports) from the 3-type
+// (wff/setvar/class) scheme into the flat 2-type (wff/set) foundation scheme.
+// Loads RAW (cache bypassed) so we get RuParseSource to transform. Valid only
+// for the CLASSICAL_FIRST-ORDER_LOGIC_WITH_EQUALITY fragment (below df-clab).
+ruCommSetmm2Miz = RuComm(
+	RuCommInfo(
+		"setmm2miz", "translate", "collapse the set.mm logic fragment (wff/setvar/class) to the flat wff/set foundation", "module", false, false,
+		[
+			RuCommArg("module", true, "library root to load (its whole closure); the `keep` fragment is translated", "set_root"),
+			RuCommArg("keep", true, "module-path prefix of the translatable fragment to keep (below df-clab)", "CLASSICAL_FIRST-ORDER_LOGIC_WITH_EQUALITY"),
+			RuCommArg("out", true, "foundation module name (root that re-exports the translated sources)", "miz_logic"),
+			RuCommArg("out-dir", true, "directory to write the generated foundation into (default current dir)", "."),
+			RuCommArg("format", true, "output format: 'file' (single monolithic .ru) or 'dir' (multi-file library + root)", "file")
+		], []
+	),
+	ruRunSetmm2Miz
+);
+
+ruRunSetmm2Miz(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	state = unit.state;
+	module = ruTaskStringArg(unit.task, "module", "");
+	if (module == "") { env.out.error("setmm2miz: 'module' is required", []); None(); }
+	else {
+		err = ref 0;
+		env1 = ruAddErrCounter2Env(env, err);
+		// from_cache = always None → every source is loaded RAW (we need RuParseSource).
+		switch (ruLoadAllInfo(env1, s2id(module), \__ -> None(), nop2, nop2)) {
+			None(): { env.out.error("setmm2miz: failed to load module '" + module + "'", []); None(); }
+			Some(loaded): {
+				parsed = foldTree(loaded, makeTree(), \id, l, acc ->
+					switch (l) {
+						RuRawSource(__, __, __):
+							eitherFn(ruParseSource(l, env1), \ps -> setTree(acc, id, ps), \ -> acc);
+						RuSource(__, __, __, __): acc;  // cache bypassed, so not expected
+					}
+				);
+				ns      = ruTaskStringArg(unit.task, "out", "miz_logic");
+				out_dir = ruTaskStringArg(unit.task, "out-dir", ".");
+				keep    = ruTaskStringArg(unit.task, "keep", "CLASSICAL_FIRST-ORDER_LOGIC_WITH_EQUALITY");
+				format  = ruTaskStringArg(unit.task, "format", "file");
+				mk_path = \mod -> out_dir + "/" + mod + ".ru";
+				mk_info = \mod -> RuFileInfo(ruNewFileInfo(mod, state.conf, ".ru") with path = mk_path(mod));
+				// Keep only the translatable fragment (below df-clab) and topo-order it (imports
+				// before importers). `file` → merge all decls into one self-contained file (no
+				// imports; round-trips trivially). `dir` → one file per source (original module
+				// names + imports) plus a root re-exporting all; re-read with `conf-load dir=<out-dir>`.
+				// Module names depend on import-root order (e.g. "set/CLASSICAL_…" when
+				// RUSSELL_MATH=~/dev/math is also a root, vs "CLASSICAL_…" with set as the root).
+				// Normalise to the canonical name from `keep` onwards so the filter, ids, imports
+				// and output paths are all import-root-independent.
+				norm = \m -> { ps = strSplit(m, keep); if (length(ps) >= 2) keep + ps[1] else m };
+				kept    = filtermap(getTreeValues(parsed), \ps ->
+					if (!strContains(ps.info.module, keep)) None()
+					else {
+						nm = norm(ps.info.module);
+						Some(RuParseSource(
+							map(ps.imports, \imp -> RuParseImport(s2id(norm(id2s(imp.module))), imp.pos)),
+							ps.decls, ps.comments,
+							RuFileInfo(ps.info with id = s2id(nm), module = nm)
+						));
+					}
+				);
+				ordered = ruParsedSourcesOrder(kept, env.out);
+				// `dir` keeps original names, so refuse if an output path would hit an original.
+				collision = format == "dir" && exists(kept, \ps -> ruResolveRelativePath(mk_path(ps.info.module), state.conf.workingDir) == ps.info.path);
+				sources : Tree<int, RuAnySource> = if (format == "dir") {
+					per = fold(ordered, makeTree(), \acc, rp -> switch (rp) {
+						RuParseSource(__, __, __, __): {
+							ps = setmm2mizSource(rp);
+							setTree(acc, ps.info.id, RuParseSource(ps.imports, ps.decls, ps.comments,
+								RuFileInfo(ps.info with path = mk_path(ps.info.module))));
+						}
+						default: acc;
+					});
+					root = RuParseSource(map(getTreeKeys(per), \id -> RuParseImport(id, -1)), [], [], mk_info(ns));
+					setTree(per, root.info.id, root);
+				} else {
+					merged = fold(ordered, Pair([], makeSet()), \acc, rp -> switch (rp) {
+						RuParseSource(__, __, __, __):
+							fold(setmm2mizSource(rp).decls, acc, \ac, d -> {
+								lid = switch (d) {
+									RuParseConst(i, __, __, __, __): Some(i);
+									RuParseType(i, __, __, __):      Some(i);
+									RuParseRule(i, __, __, __, __):  Some(i);
+									default:                          None();
+								};
+								switch (lid) {
+									Some(i): if (containsSet(ac.second, i)) ac else Pair(arrayPush(ac.first, d), insertSet(ac.second, i));
+									None():  Pair(arrayPush(ac.first, d), ac.second);
+								}
+							});
+						default: acc;
+					}).first;
+					makeTree1(s2id(ns), RuParseSource([], merged, [], mk_info(ns)));
+				};
+				if (^err != 0) { env.out.error("setmm2miz: parse errors in source fragment", []); None(); }
+				else if (collision) { env.out.error("setmm2miz: out-dir overlaps the source library (would overwrite originals); choose a different out-dir", []); None(); }
+				else switch (ruCollectMathFast(sources, env)) {
+					None(): { env.out.error("setmm2miz: collect/verify of the collapsed fragment failed", []); None(); }
+					Some(math): {
+						// `dir`: drop a russell.conf so the library is a self-describing project —
+						// `conf-load dir=<out-dir>` then sets import-roots to it, module names
+						// resolve relatively, and imports order correctly (mirrors set/russell.conf).
+						if (format == "dir") {
+							abs = ruResolveRelativePath(out_dir, state.conf.workingDir);
+							ruEnsureDirectoryExists(abs, env.out);  // write-ru creates it later; the conf is written now
+							conf_json = "{\n\t\"project\": \"" + ns + "\",\n\t\"import-roots\": [\"" + abs + "\"],\n" +
+								"\t\"project-roots\": [\"" + abs + "/" + ns + ".ru\"],\n\t\"opts\": {\"ru-root\": \"" + abs + "\"}\n}\n";
+							if (!setFileContent(abs + "/russell.conf", conf_json)) {
+								env.out.error("setmm2miz: failed to write " + abs + "/russell.conf", []);
+							} else {};
+						} else {};
+						where = if (format == "dir") i2s(sizeTree(math.sources)) + " files in " + out_dir + "/ (root " + ns + ".ru, + russell.conf)"
+								else "single file " + out_dir + "/" + ns + ".ru";
+						env.out.println("setmm2miz: '" + module + "' → foundation '" + ns + "' (" +
+							i2s(sizeTree(math.decls.assertions)) + " assertions, " + where + ")");
+						Some(RuState(state with ru = math.sources));
+					}
+				}
+			}
+		}
+	}
+}
+
+// state.ru (already-collected RuSources) viewed as a tree of RuAnySource, so a
+// freshly-built RuParseSource can be collected together with what is loaded.
+mptpStateSources(state : RuState) -> Tree<int, RuAnySource> {
+	foldTree(state.ru, makeTree(), \id, s, acc -> setTree(acc, id, s));
+}
+
+ruCommMptpFoundation = RuComm(
+	RuCommInfo(
+		"mptp-foundation", "translate", "generate the signature-independent Russell foundation (grammar + FOL axioms + definitions + lemma corpus)", "module", false, false,
+		[ RuCommArg("module", true, "module name for the foundation source", "miz_logic") ], []
+	),
+	ruRunMptpFoundation
+);
+
+ruRunMptpFoundation(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	state = unit.state;
+	module = ruTaskStringArg(unit.task, "module", "miz_logic");
+	src = mptpFoundationSource(module, state.conf);
+	switch (ruCollectMathFast(makeTree1(src.info.id, src), env)) {
+		None(): { env.out.error("mptp-foundation: collect of the foundation failed", []); None(); }
+		Some(math): {
+			env.out.println("mptp-foundation: '" + module + "' (" + i2s(sizeTree(math.decls.assertions)) + " assertions; lemmas open — `prove` then `write-ru`)");
+			Some(RuState(state with ru = math.sources));
+		}
+	}
+}
+
+ruCommMptpToRu = RuComm(
+	RuCommInfo(
+		"mptp-to-ru", "translate", "translate a TPTP fof (.p) into a Russell article importing the foundation (load it first via read-ru)", "file", false, false,
+		[
+			RuCommArg("file", false, "input .p file", ""),
+			RuCommArg("module", true, "module name for the generated article", "miz"),
+			RuCommArg("foundation", true, "module name of the foundation to import", "miz_logic")
+		], []
+	),
+	ruRunMptpToRu
+);
+
+ruRunMptpToRu(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	state = unit.state;
+	file = ruTaskStringArg(unit.task, "file", "");
+	module = ruTaskStringArg(unit.task, "module", "miz");
+	foundation = ruTaskStringArg(unit.task, "foundation", "miz_logic");
+	path = ruResolveRelativePath(file, state.conf.workingDir);
+	if (!fileExists(path)) {
+		env.out.error("tptp file: '" + file + "' is not found", []);
+		None();
+	} else {
+		switch (tptpParse(getFileContent(path), ruNoFileInfo)) {
+			None(): { env.out.error("TPTP parse failed for '" + file + "'", []); None(); }
+			Some(tptp): {
+				// Import the foundation by its ACTUAL loaded source id, not by the bare name:
+				// when read from disk its module id may be a path (e.g. /tmp/x/miz_logic) that
+				// doesn't equal s2id(foundation), so a bare-name import would not resolve and the
+				// foundation would be invisible to the prover. Match the loaded source whose
+				// module equals or ends with the foundation name.
+				found_id = foldTree(state.ru, s2id(foundation), \id, s, acc ->
+					if (s.info.module == foundation || endsWith(s.info.module, "/" + foundation)) s.info.id else acc);
+				src = mptpArticleSource(tptp, found_id, module, state.conf);
+				// Convert the article to a RuSource against the foundation's already-cached
+				// lang (load the foundation first via read-ru), then add it alongside. We do
+				// NOT re-collect the foundation: the import-ordering can't mix a parsed
+				// RuParseSource with an already-collected RuSource (different import fields).
+				err = ref 0;
+				env1 = ruAddErrCounter2Env(env, err);
+				article = ruParseSource2RuSource(src, env1);
+				if (^err != 0) {
+					env.out.error("mptp-to-ru: failed to parse the article against '" + foundation + "' (load it first via read-ru)", []);
+					None();
+				} else {
+					new_ru = setTree(state.ru, article.info.id, article);
+					env.out.println("mptp-to-ru: '" + module + "' = " + i2s(length(tptp.decls)) + " fof decls importing '" + foundation + "'");
+					Some(RuState(state with ru = new_ru));
+				}
+			}
+		}
+	}
+}
+
+ruCommTptpParse = RuComm(
+	RuCommInfo(
+		"tptp-parse", "io", "parse a TPTP fof (.p) file and print its AST", "file", false, false,
+		[
+			RuCommArg("file", false, "input .p file", ""),
+			RuCommArg("dump", true, "dump the raw SyntaxTree (debug)", "")
+		], []
+	),
+	ruRunTptpParse
+);
+
+ruRunTptpParse(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	state = unit.state;
+	file = ruTaskStringArg(unit.task, "file", "");
+	path = ruResolveRelativePath(file, state.conf.workingDir);
+	if (!fileExists(path)) {
+		env.out.error("tptp file: '" + file + "' is not found", []);
+		None();
+	} else {
+		src = getFileContent(path);
+		if (ruTaskStringArg(unit.task, "dump", "") == "1") {
+			env.out.println(tptpDumpTree(src));
+		} else {};
+		switch (tptpParse(src, ruNoFileInfo)) {
+			Some(tptp): {
+				env.out.println("tptp-parse: " + i2s(length(tptp.decls)) + " decls");
+				iter(tptp.decls, \d -> env.out.println(tptpDecl2s(d)));
+				Some(state);
+			}
+			None(): {
+				pos = eitherMap(tptpParseErr(src), idfn, -1);
+				env.out.error("TPTP parse error at offset " + i2s(pos), []);
+				None();
+			}
+		}
+	}
+}

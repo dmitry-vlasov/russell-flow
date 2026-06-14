@@ -1,0 +1,141 @@
+import lingo/compiler/syntaxtree_types;
+import lingo/compiler/syntaxtree_util;
+import mptp/parse/file;
+import mptp/parse/ast;
+import mptp/parse/ast_mnemonics;
+import mptp/src;
+
+// Lower the generated parser's SyntaxTree into the typed AST (mptp/src.flow).
+//
+// The precedence rules (form/iff/imp/disj/conj/unary/atom) COLLAPSE when a level
+// has a single child (zero repetitions / single alternative): e.g. a formula with
+// no `&` has no `conj` node, it is directly its `unary`. So we dispatch on each
+// node's actual `.rule` rather than assuming a fixed nesting. Child indices come
+// from the grammar's element order (whitespace IS a captured child); they are
+// stable because collapsing removes whole wrapper levels, not a node's own slots.
+
+export {
+	tptpParse(src : string, info : RuFileInfo) -> Maybe<TptpSource>;
+	tptpParseErr(src : string) -> Maybe<int>;   // None = ok; Some(pos) = error offset
+	tptpDumpTree(src : string) -> string;        // debug: raw SyntaxTree shape
+}
+
+tptpDumpTree(src : string) -> string {
+	st = parse_tptp_source(src).first;
+	tDumpST(st, src, 0);
+}
+
+tDumpST(st : SyntaxTree, src : string, ind : int) -> string {
+	pad = strRepeat("  ", ind);
+	head = pad + "rule=" + i2s(st.rule) + " choice=" + i2s(st.choice) +
+		" nchildren=" + i2s(length(st.children)) +
+		" text='" + trim2(grabSTText(st, src), " \t\n\r") + "'";
+	kids = mapi(st.children, \i, grp ->
+		pad + " [" + i2s(i) + "] (" + i2s(length(grp)) + ")\n" +
+		strGlue(map(grp, \c -> tDumpST(c, src, ind + 2)), "\n")
+	);
+	if (st.children == []) head else head + "\n" + strGlue(kids, "\n");
+}
+
+tptpParseErr(src : string) -> Maybe<int> {
+	pr = parse_tptp_source(src);
+	if (pr.first.end == strlen(src)) None() else Some(pr.first.end);
+}
+
+tptpParse(src : string, info : RuFileInfo) -> Maybe<TptpSource> {
+	pr = parse_tptp_source(src);
+	st = pr.first;
+	if (st.end != strlen(src)) {
+		None();
+	} else {
+		Some(TptpSource(
+			map(get_tptp_source_tptp_decl_s(st), \d -> tLowerDecl(d, src)),
+			info
+		));
+	}
+}
+
+tTxt(st : SyntaxTree, src : string) -> string { trim2(grabSTText(st, src), " \t\n\r"); }
+
+tLowerDecl(st : SyntaxTree, src : string) -> TptpDecl {
+	TptpDecl(
+		tTxt(get_tptp_source_tptp_name(st), src),
+		tTxt(get_tptp_source_tptp_role(st), src),
+		tLowerForm(get_tptp_source_tptp_form(st), src)
+	);
+}
+
+tFoldBin(op : string, st : SyntaxTree, src : string) -> TptpForm {
+	left = tLowerForm(st.children[0][0], src);
+	fold(st.children[1], left, \acc, a -> TptpBin(op, acc, tLowerForm(a.children[1][0], src)));
+}
+
+tLowerForm(st : SyntaxTree, src : string) -> TptpForm {
+	r = st.rule;
+	if      (r == st_tptp_form)      tLowerForm(st.children[0][0], src)       // form  = iff
+	else if (r == st_tptp_unary)     tLowerForm(st.children[0][0], src)       // unary = neg|forall|exists|atom
+	else if (r == st_tptp_atom)      tLowerForm(st.children[0][0], src)       // atom  = parenform|eqpred
+	else if (r == st_tptp_iff)       tFoldBin("iff", st, src)                 // iff = imp ("<=>" ws imp)*
+	else if (r == st_tptp_disj)      tFoldBin("or",  st, src)                 // disj = conj ("|" ws conj)*
+	else if (r == st_tptp_conj)      tFoldBin("and", st, src)                 // conj = unary ("&" ws unary)*
+	else if (r == st_tptp_imp) {                                              // imp = disj ("=>" ws imp)?
+		if (st.children[1] == []) tLowerForm(st.children[0][0], src)
+		else TptpBin("imp", tLowerForm(st.children[0][0], src), tLowerForm(st.children[1][0].children[1][0], src));
+	}
+	else if (r == st_tptp_neg)       TptpNeg(tLowerForm(st.children[1][0], src))   // neg = "~" ws unary
+	else if (r == st_tptp_forall)    TptpQuant("forall", tLowerVarlist(st.children[2][0], src), tLowerForm(st.children[5][0], src))
+	else if (r == st_tptp_exists)    TptpQuant("exists", tLowerVarlist(st.children[2][0], src), tLowerForm(st.children[5][0], src))
+	else if (r == st_tptp_truec)     TptpPred("$true", [])                    // $true
+	else if (r == st_tptp_falsec)    TptpPred("$false", [])                   // $false
+	else if (r == st_tptp_parenform) tLowerForm(st.children[1][0], src)       // parenform = "(" ws form ")" ws
+	else if (r == st_tptp_eqpred) {                                          // eqpred = term eqrhs?
+		if (st.children[1] == []) tTermToPred(tLowerTerm(st.children[0][0], src))  // bare predicate (no eqrhs)
+		else tLowerEqpred(st, src);                                          // equality / disequality
+	}
+	else                             tTermToPred(tLowerTerm(st, src));        // term/func/var collapsed: bare predicate
+}
+
+// eqpred = term eqrhs?  — here children[1] is non-empty (else it collapsed to a term)
+tLowerEqpred(st : SyntaxTree, src : string) -> TptpForm {
+	l = tLowerTerm(st.children[0][0], src);
+	eqrhsNode = st.children[1][0];
+	sub = if (eqrhsNode.rule == st_tptp_eqrhs) eqrhsNode.children[0][0] else eqrhsNode;
+	r = tLowerTerm(sub.children[1][0], src);                                  // eq/neeq = OP ws term
+	if (sub.rule == st_tptp_eq) TptpEq(l, r) else TptpNeg(TptpEq(l, r));
+}
+
+tTermToPred(t : TptpTerm) -> TptpForm {
+	switch (t) {
+		TptpApp(n, a): TptpPred(n, a);
+		TptpVar(n): TptpPred(n, []);
+	}
+}
+
+// varlist = var ("," ws var)*  — collapses to a bare var when there is just one
+tLowerVarlist(st : SyntaxTree, src : string) -> [string] {
+	if (st.rule == st_tptp_varlist) {
+		concat([tVarName(st.children[0][0], src)], map(st.children[1], \a -> tVarName(a.children[1][0], src)));
+	} else {
+		[tVarName(st, src)];
+	}
+}
+
+tVarName(st : SyntaxTree, src : string) -> string { tTxt(st.children[0][0], src); }  // var = uname ws
+
+tLowerTerm(st : SyntaxTree, src : string) -> TptpTerm {
+	r = st.rule;
+	if      (r == st_tptp_term) tLowerTerm(st.children[0][0], src)            // term = var|func
+	else if (r == st_tptp_var)  TptpVar(tTxt(st.children[0][0], src))
+	else                        tLowerFunc(st, src);                         // func = lname args?
+}
+
+tLowerFunc(st : SyntaxTree, src : string) -> TptpTerm {
+	name = tTxt(st.children[0][0], src);                                      // lname
+	argsOpt = st.children[1];                                                 // args? (0 or 1)
+	args = if (argsOpt == []) [] else {
+		an = argsOpt[0];                                                      // args = "(" ws term ("," ws term)* ")" ws
+		concat([tLowerTerm(an.children[1][0], src)],
+			map(an.children[2], \a -> tLowerTerm(a.children[1][0], src)));
+	};
+	TptpApp(name, args);
+}

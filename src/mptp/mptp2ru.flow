@@ -1,0 +1,370 @@
+import ru/parse/src;
+import ru/parse/util;
+import base/util/fileinfo;
+import base/ids;
+import base/id_consts;
+import mptp/src;
+
+// Translate a parsed TPTP (MPTP) source into a Russell RuParseSource: a
+// self-contained flat-FOL kernel + the article signature (one const+rule per
+// functor/predicate) + every fof as an axiom (theorems/conjectures as STUB
+// axioms). Builds RuParse* structs directly — the same intermediate mm2ru
+// produces — so the result rides the normal collect/verify pipeline.
+// Mirrors src/mm/mm2ru.flow. The Python scripts/mptp/mptp2ru.py is the oracle
+// for the expected .ru output.
+
+export {
+	mptpFoundationSource(module : string, conf : RuConf) -> RuParseSource;
+	mptpArticleSource(tptp : TptpSource, foundation_id : int, module : string, conf : RuConf) -> RuParseSource;
+}
+
+// ---- small builders -------------------------------------------------------
+
+mptpConst(sym : string) -> RuParseConst { RuParseConst(s2id(sym), [], -1, "", -1); }
+mptpVar(name : string, type : string) -> RuParseVar { RuParseVar(s2id(name), tp2id(type), -1); }
+mptpExpr(toks : [string]) -> RuParseExpr { RuParseExpr(map(toks, s2id), -1); }
+
+mptpRule(name : string, vars : [Pair<string, string>], rtype : string, toks : [string]) -> RuParseRule {
+	RuParseRule(s2id(name), [], map(vars, \p -> mptpVar(p.first, p.second)),
+		RuParseTerm(tp2id(rtype), mptpExpr(toks), -1), -1);
+}
+
+mptpStmt(toks : [string]) -> RuParseStmt {
+	// The provability marker sits in the statement *class* position, which the .ru
+	// reader lexes as an identifier, so it must be ascii `|-` (the unicode ⊢ is not
+	// a valid id-char and breaks the text round-trip). Operators inside may stay unicode.
+	RuParseStmt(s2id("|-"), [tp2id("wff")], mptpExpr(toks), -1);
+}
+
+// |- <formula> as an axiom over `set`-typed vars (used for the MPTP definitions/axioms)
+mptpAxiom(name : string, vars : [string], toks : [string]) -> RuParseAxiom {
+	RuParseAxiom(s2id(name), [], map(vars, \v -> mptpVar(v, "set")), [], [], mptpStmt(toks), -1);
+}
+
+// general logical axiom/rule: typed vars, distinct-variable pairs, |- hypotheses, |- conclusion
+mptpFolAx(name : string, vars : [Pair<string, string>], disjs : [Pair<string, string>],
+		hyps : [[string]], prop : [string]) -> RuParseAxiom {
+	RuParseAxiom(s2id(name), [],
+		map(vars, \p -> mptpVar(p.first, p.second)),
+		map(disjs, \d -> RuParseDisj([s2id(d.first), s2id(d.second)], -1)),
+		mapi(hyps, \i, h -> RuParseHyp(i, mptpStmt(h), -1)),
+		mptpStmt(prop), -1);
+}
+
+// definition: defiendum :↔ definiens. `prop` carries the reserved defiendum/definiens
+// placeholder tokens joined by ↔, exactly as the .ru reader produces (ruMakeDef).
+mptpDef(name : string, vars : [Pair<string, string>], defm : [string], defs : [string]) -> RuParseDef {
+	RuParseDef(s2id(name), [], map(vars, \p -> mptpVar(p.first, p.second)), [], [],
+		RuParseTerm(tp2id("wff"), mptpExpr(defm), -1),
+		RuParseTerm(tp2id("wff"), mptpExpr(defs), -1),
+		RuParseStmt(s2id("|-"), [tp2id("wff")],
+			RuParseExpr([s2id("("), ruIdDefiendum(), s2id("↔"), ruIdDefiniens(), s2id(")")], -1), -1),
+		-1);
+}
+
+// ∧ / ∨ / ∃ as genuine definitions (df-an/df-or/df-ex), mirroring set.mm
+mptpDefs() -> [RuParseDef] {
+	w2 = [Pair("ph", "wff"), Pair("ps", "wff")];
+	[
+		mptpDef("df-an", w2, ["(", "ph", "∧", "ps", ")"], ["¬", "(", "ph", "→", "¬", "ps", ")"]),
+		mptpDef("df-or", w2, ["(", "ph", "∨", "ps", ")"], ["(", "¬", "ph", "→", "ps", ")"]),
+		mptpDef("df-ex", [Pair("ph", "wff"), Pair("x", "set")], ["∃", "x", "ph"], ["¬", "∀", "x", "¬", "ph"]),
+	];
+}
+
+// ---- classical FOL + equality proof calculus (set.mm axioms, flat `set` sort) ----
+
+mptpFolAxioms() -> [RuParseAxiom] {
+	w2 = [Pair("ph", "wff"), Pair("ps", "wff")];
+	[
+		// propositional
+		mptpFolAx("ax-mp", w2, [], [["ph"], ["(", "ph", "→", "ps", ")"]], ["ps"]),
+		mptpFolAx("ax-1", w2, [], [], ["(", "ph", "→", "(", "ps", "→", "ph", ")", ")"]),
+		mptpFolAx("ax-2", [Pair("ph", "wff"), Pair("ps", "wff"), Pair("ch", "wff")], [], [],
+			["(", "(", "ph", "→", "(", "ps", "→", "ch", ")", ")", "→",
+			 "(", "(", "ph", "→", "ps", ")", "→", "(", "ph", "→", "ch", ")", ")", ")"]),
+		mptpFolAx("ax-3", w2, [], [], ["(", "(", "¬", "ph", "→", "¬", "ps", ")", "→", "(", "ps", "→", "ph", ")", ")"]),
+		// biconditional (elim/elim/intro) — replaces df-bi
+		mptpFolAx("bi1", w2, [], [], ["(", "(", "ph", "↔", "ps", ")", "→", "(", "ph", "→", "ps", ")", ")"]),
+		mptpFolAx("bi2", w2, [], [], ["(", "(", "ph", "↔", "ps", ")", "→", "(", "ps", "→", "ph", ")", ")"]),
+		mptpFolAx("bi3", w2, [], [],
+			["(", "(", "ph", "→", "ps", ")", "→", "(", "(", "ps", "→", "ph", ")", "→", "(", "ph", "↔", "ps", ")", ")", ")"]),
+		// predicate calculus + equality
+		mptpFolAx("ax-gen", [Pair("ph", "wff"), Pair("x", "set")], [], [["ph"]], ["∀", "x", "ph"]),
+		mptpFolAx("ax-4", [Pair("ph", "wff"), Pair("ps", "wff"), Pair("x", "set")], [], [],
+			["(", "∀", "x", "(", "ph", "→", "ps", ")", "→", "(", "∀", "x", "ph", "→", "∀", "x", "ps", ")", ")"]),
+		mptpFolAx("ax-5", [Pair("ph", "wff"), Pair("x", "set")], [Pair("ph", "x")], [], ["(", "ph", "→", "∀", "x", "ph", ")"]),
+		mptpFolAx("ax-6", [Pair("x", "set"), Pair("y", "set")], [], [], ["¬", "∀", "x", "¬", "(", "x", "=", "y", ")"]),
+		mptpFolAx("ax-7", [Pair("x", "set"), Pair("y", "set"), Pair("z", "set")], [], [],
+			["(", "(", "x", "=", "y", ")", "→", "(", "(", "x", "=", "z", ")", "→", "(", "y", "=", "z", ")", ")", ")"]),
+		mptpFolAx("ax-10", [Pair("ph", "wff"), Pair("x", "set")], [], [],
+			["(", "¬", "∀", "x", "ph", "→", "∀", "x", "¬", "∀", "x", "ph", ")"]),
+		mptpFolAx("ax-11", [Pair("ph", "wff"), Pair("x", "set"), Pair("y", "set")], [], [],
+			["(", "∀", "x", "∀", "y", "ph", "→", "∀", "y", "∀", "x", "ph", ")"]),
+		mptpFolAx("ax-12", [Pair("ph", "wff"), Pair("x", "set"), Pair("y", "set")], [], [],
+			["(", "(", "x", "=", "y", ")", "→", "(", "∀", "y", "ph", "→", "∀", "x", "(", "(", "x", "=", "y", ")", "→", "ph", ")", ")", ")"]),
+		mptpFolAx("ax-13", [Pair("x", "set"), Pair("y", "set"), Pair("z", "set")], [], [],
+			["(", "¬", "(", "x", "=", "y", ")", "→", "(", "(", "y", "=", "z", ")", "→", "∀", "x", "(", "y", "=", "z", ")", ")", ")"]),
+	];
+}
+
+// per-signature equality congruence (generalises set.mm ax-8/ax-9 to the whole signature):
+//   functor:   (a = b) -> ( f(..a..) = f(..b..) )       per argument position
+//   predicate: (a = b) -> ( p(..a..) -> p(..b..) )
+mptpCong(prefix : string, name : string, arity : int, pos : int, is_func : bool) -> RuParseAxiom {
+	argName = \j -> if (j == pos) "a" else "c" + i2s(j);
+	idxs = enumFromTo(0, arity - 1);
+	left  = mptpApp(name, map(idxs, \j -> [argName(j)]));
+	right = mptpApp(name, map(idxs, \j -> [if (j == pos) "b" else argName(j)]));
+	conn  = if (is_func) "=" else "→";
+	prop  = concatA([["(", "(", "a", "=", "b", ")", "→", "("], left, [conn], right, [")", ")"]]);
+	vars  = concat([Pair("a", "set"), Pair("b", "set")],
+		filtermap(idxs, \j -> if (j == pos) None() else Some(Pair("c" + i2s(j), "set"))));
+	mptpFolAx(prefix + name + "_cong" + i2s(pos), vars, [], [], prop);
+}
+
+mptpCongruences(sig : MptpSig) -> [RuParseAxiom] {
+	congs = \prefix, pairs, is_func -> concatA(map(pairs, \p ->
+		map(enumFromTo(0, p.second - 1), \i -> mptpCong(prefix, p.first, p.second, i, is_func))));
+	concat(
+		congs("fn_", tree2pairs(sig.funcs), true),
+		congs("pr_", tree2pairs(sig.preds), false)
+	);
+}
+
+// fully-parenthesised prefix application shared by rule body and usage:
+//   arity 0 -> [name];  arity n -> "(" name arg0 .. argn ")"
+mptpApp(name : string, argToks : [[string]]) -> [string] {
+	if (argToks == []) [name]
+	else concat(concat(["(", name], concatA(argToks)), [")"]);
+}
+
+// ---- the fixed flat-FOL kernel --------------------------------------------
+
+mptpKernelConsts() -> [RuParseConst] {
+	map(["(", ")", "¬", "→", "↔", "∧", "∨", "∀", "∃", "=", "|-"], mptpConst);
+}
+
+mptpKernelRules() -> [RuParseRule] {
+	[
+		mptpRule("wn",  [Pair("ph", "wff")],                  "wff", ["¬", "ph"]),
+		mptpRule("wi",  [Pair("ph", "wff"), Pair("ps", "wff")], "wff", ["(", "ph", "→", "ps", ")"]),
+		mptpRule("wb",  [Pair("ph", "wff"), Pair("ps", "wff")], "wff", ["(", "ph", "↔", "ps", ")"]),
+		mptpRule("wa",  [Pair("ph", "wff"), Pair("ps", "wff")], "wff", ["(", "ph", "∧", "ps", ")"]),
+		mptpRule("wo",  [Pair("ph", "wff"), Pair("ps", "wff")], "wff", ["(", "ph", "∨", "ps", ")"]),
+		mptpRule("wal", [Pair("x", "set"), Pair("ph", "wff")], "wff", ["∀", "x", "ph"]),
+		mptpRule("wex", [Pair("x", "set"), Pair("ph", "wff")], "wff", ["∃", "x", "ph"]),
+		mptpRule("weq", [Pair("a", "set"), Pair("b", "set")],  "wff", ["(", "a", "=", "b", ")"]),
+	];
+}
+
+// ---- signature collection -------------------------------------------------
+
+// (funcs, preds) : name -> arity
+MptpSig(funcs : Tree<string, int>, preds : Tree<string, int>);
+
+mptpCollectSig(decls : [TptpDecl]) -> MptpSig {
+	fold(decls, MptpSig(makeTree(), makeTree()), \acc, d -> mptpSigForm(acc, d.form));
+}
+
+mptpSigForm(acc : MptpSig, f : TptpForm) -> MptpSig {
+	switch (f) {
+		TptpPred(name, args): if (name == "$true" || name == "$false") acc  // foundation constants ⊤/F., not article signature
+			else fold(args, MptpSig(acc.funcs, setTree(acc.preds, name, length(args))), mptpSigTerm);
+		TptpEq(l, r):         mptpSigTerm(mptpSigTerm(acc, l), r);
+		TptpNeg(g):           mptpSigForm(acc, g);
+		TptpBin(__, l, r):    mptpSigForm(mptpSigForm(acc, l), r);
+		TptpQuant(__, __, b): mptpSigForm(acc, b);
+	}
+}
+
+mptpSigTerm(acc : MptpSig, t : TptpTerm) -> MptpSig {
+	switch (t) {
+		TptpVar(__): acc;
+		TptpApp(name, args): fold(args, MptpSig(setTree(acc.funcs, name, length(args)), acc.preds), mptpSigTerm);
+	}
+}
+
+mptpSigDecls(sig : MptpSig) -> Pair<[RuParseConst], [RuParseRule]> {
+	fns = map(tree2pairs(sig.funcs), \p -> mptpSigRule("fn_", p.first, p.second, "set"));
+	prs = map(tree2pairs(sig.preds), \p -> mptpSigRule("pr_", p.first, p.second, "wff"));
+	// a predicate symbol that is never also a functor still needs its constant
+	names = uniq(concat(getTreeKeys(sig.funcs), getTreeKeys(sig.preds)));
+	Pair(map(names, mptpConst), concat(fns, prs));
+}
+
+mptpSigRule(prefix : string, name : string, arity : int, rtype : string) -> RuParseRule {
+	vars = map(enumFromTo(0, arity - 1), \i -> Pair("a" + i2s(i), "set"));
+	body = mptpApp(name, map(enumFromTo(0, arity - 1), \i -> ["a" + i2s(i)]));
+	mptpRule(prefix + name, vars, rtype, body);
+}
+
+// ---- formula / term -> token list -----------------------------------------
+
+mptpVrename(v : string) -> string { "v_" + toLowerCase(v); }
+
+mptpOpSym(op : string) -> string {
+	if (op == "and") "∧" else if (op == "or") "∨" else if (op == "imp") "→" else "↔";
+}
+
+mptpTermToks(t : TptpTerm) -> [string] {
+	switch (t) {
+		TptpVar(name): [mptpVrename(name)];
+		TptpApp(name, args): mptpApp(name, map(args, mptpTermToks));
+	}
+}
+
+mptpFormToks(f : TptpForm) -> [string] {
+	switch (f) {
+		TptpPred(name, args):
+			if (name == "$true") ["⊤"] else if (name == "$false") ["F."]
+			else mptpApp(name, map(args, mptpTermToks));
+		TptpEq(l, r):         concat(concat(["("], mptpTermToks(l)), concat(["="], concat(mptpTermToks(r), [")"])));
+		TptpNeg(g):           concat(["¬"], mptpFormToks(g));
+		TptpBin(op, l, r):    concat(concat(["("], mptpFormToks(l)), concat([mptpOpSym(op)], concat(mptpFormToks(r), [")"])));
+		TptpQuant(op, vars, body): {
+			q = if (op == "forall") "∀" else "∃";
+			foldr(vars, mptpFormToks(body), \acc, v -> concat([q, mptpVrename(v)], acc));
+		}
+	}
+}
+
+mptpFormVars(f : TptpForm) -> [string] {
+	uniq(mptpDoFormVars(f));
+}
+
+mptpDoFormVars(f : TptpForm) -> [string] {
+	switch (f) {
+		TptpPred(__, args): concatA(map(args, mptpDoTermVars));
+		TptpEq(l, r):       concat(mptpDoTermVars(l), mptpDoTermVars(r));
+		TptpNeg(g):         mptpDoFormVars(g);
+		TptpBin(__, l, r):  concat(mptpDoFormVars(l), mptpDoFormVars(r));
+		TptpQuant(__, vs, body): concat(map(vs, mptpVrename), mptpDoFormVars(body));
+	}
+}
+
+mptpDoTermVars(t : TptpTerm) -> [string] {
+	switch (t) {
+		TptpVar(name): [mptpVrename(name)];
+		TptpApp(__, args): concatA(map(args, mptpDoTermVars));
+	}
+}
+
+mptpDeclAxiom(d : TptpDecl) -> RuParseAxiom {
+	mptpAxiom(d.name, mptpFormVars(d.form), mptpFormToks(d.form));
+}
+
+// theorem/conjecture role -> an OPEN RuParseTheorem: proof is a single `problem`
+// step (step 1 : wff = ? |- goal), i.e. a `prove` target. The transport phase
+// replaces this with a real proof.
+mptpDeclTheorem(d : TptpDecl) -> RuParseTheorem {
+	toks = mptpFormToks(d.form);
+	vars = map(mptpFormVars(d.form), \v -> mptpVar(v, "set"));
+	problem = RuParseStep(0, ruParseProblem, [],
+		RuParseStmt(s2id("|-"), [tp2id("wff")], mptpExpr(toks), -1), ruParseNoProof, -1);
+	RuParseTheorem(s2id(d.name), [], vars, [], RuParseMeta([], -1), [],
+		mptpStmt(toks), RuParseProof([], [], [problem], -1), -1);
+}
+
+mptpDeclAssertion(d : TptpDecl) -> RuParseDecl {
+	if (d.role == "theorem" || d.role == "conjecture") mptpDeclTheorem(d) else mptpDeclAxiom(d);
+}
+
+// ---- bootstrap derived-lemma layer (open theorems; proved by `prove`) -------
+// Short, high-reuse propositional lemmas that give proof search chaining material
+// it otherwise lacks from raw axioms. Emitted OPEN (single problem step), in
+// dependency order; `prove target=all` discharges them before the MPTP theorems.
+
+mptpOpenThm(name : string, vars : [Pair<string, string>], hyps : [[string]], prop : [string]) -> RuParseTheorem {
+	problem = RuParseStep(0, ruParseProblem, [],
+		RuParseStmt(s2id("|-"), [tp2id("wff")], mptpExpr(prop), -1), ruParseNoProof, -1);
+	RuParseTheorem(s2id(name), [], map(vars, \p -> mptpVar(p.first, p.second)), [],
+		RuParseMeta([], -1),
+		mapi(hyps, \i, h -> RuParseHyp(i, mptpStmt(h), -1)),
+		mptpStmt(prop), RuParseProof([], [], [problem], -1), -1);
+}
+
+mptpLemmas() -> [RuParseTheorem] {
+	w2 = [Pair("ph", "wff"), Pair("ps", "wff")];
+	w3 = [Pair("ph", "wff"), Pair("ps", "wff"), Pair("ch", "wff")];
+	[
+		// a1i:  ph  ⊢  ( ps → ph )
+		mptpOpenThm("a1i", w2, [["ph"]], ["(", "ps", "→", "ph", ")"]),
+		// id:  ⊢  ( ph → ph )
+		mptpOpenThm("id", [Pair("ph", "wff")], [], ["(", "ph", "→", "ph", ")"]),
+		// a2i:  ( ph → ( ps → ch ) )  ⊢  ( ( ph → ps ) → ( ph → ch ) )
+		mptpOpenThm("a2i", w3, [["(", "ph", "→", "(", "ps", "→", "ch", ")", ")"]],
+			["(", "(", "ph", "→", "ps", ")", "→", "(", "ph", "→", "ch", ")", ")"]),
+		// mpd:  ( ph → ps ) , ( ph → ( ps → ch ) )  ⊢  ( ph → ch )
+		mptpOpenThm("mpd", w3, [["(", "ph", "→", "ps", ")"], ["(", "ph", "→", "(", "ps", "→", "ch", ")", ")"]],
+			["(", "ph", "→", "ch", ")"]),
+		// syl:  ( ph → ps ) , ( ps → ch )  ⊢  ( ph → ch )
+		mptpOpenThm("syl", w3, [["(", "ph", "→", "ps", ")"], ["(", "ps", "→", "ch", ")"]],
+			["(", "ph", "→", "ch", ")"]),
+		// mpbi:  ph , ( ph ↔ ps )  ⊢  ps
+		mptpOpenThm("mpbi", w2, [["ph"], ["(", "ph", "↔", "ps", ")"]], ["ps"]),
+		// mpbir:  ps , ( ph ↔ ps )  ⊢  ph
+		mptpOpenThm("mpbir", w2, [["ps"], ["(", "ph", "↔", "ps", ")"]], ["ph"]),
+		// alimi:  ( ph → ps )  ⊢  ( ∀ x ph → ∀ x ps )   [ax-gen, ax-4, ax-mp]
+		mptpOpenThm("alimi", [Pair("ph", "wff"), Pair("ps", "wff"), Pair("x", "set")],
+			[["(", "ph", "→", "ps", ")"]], ["(", "∀", "x", "ph", "→", "∀", "x", "ps", ")"]),
+	];
+}
+
+// ---- assemble -------------------------------------------------------------
+
+// Assign an increasing source position to each top-level decl. Directly-built
+// RuParse decls all carry pos=-1; some downstream ordering (and the prover's
+// per-theorem assertion scope) relies on real, distinct, increasing positions,
+// which the text parser supplies but a hand-built source does not.
+mptpSetPos(decl : RuParseDecl, pos : int) -> RuParseDecl {
+	switch (decl) {
+		RuParseConst(id, c, a, l, __):           RuParseConst(id, c, a, l, pos);
+		RuParseType(id, c, s, __):               RuParseType(id, c, s, pos);
+		RuParseRule(id, c, v, t, __):            RuParseRule(id, c, v, t, pos);
+		RuParseAxiom(id, c, v, d, h, p, __):     RuParseAxiom(id, c, v, d, h, p, pos);
+		RuParseDef(id, c, v, d, h, dm, ds, p, __): RuParseDef(id, c, v, d, h, dm, ds, p, pos);
+		RuParseTheorem(id, c, v, d, m, h, p, pr, __): RuParseTheorem(id, c, v, d, m, h, p, pr, pos);
+	}
+}
+
+mptpPosition(decls : [RuParseDecl]) -> [RuParseDecl] {
+	mapi(decls, \i, d -> mptpSetPos(d, (i + 1) * 16));
+}
+
+// The signature-INDEPENDENT logic: grammar + FOL axioms + definitions + the
+// derived-lemma corpus. Authored/maintained as a standalone Russell foundation
+// `.ru` (generate once, prove the lemmas, commit, then grow it by editing the
+// .ru directly). Articles import it rather than re-emitting it.
+mptpFoundationSource(module : string, conf : RuConf) -> RuParseSource {
+	consts : [RuParseDecl] = map(mptpKernelConsts(), \c -> c);
+	types  : [RuParseDecl] = [RuParseType(tp2id("set"), [], [], -1), RuParseType(tp2id("wff"), [], [], -1)];
+	krules : [RuParseDecl] = map(mptpKernelRules(), \r -> r);
+	kdefs  : [RuParseDecl] = map(mptpDefs(), \d -> d);
+	folax  : [RuParseDecl] = map(mptpFolAxioms(), \a -> a);
+	lemmas : [RuParseDecl] = map(mptpLemmas(), \t -> t);
+	RuParseSource(
+		[],
+		mptpPosition(concatA([consts, types, krules, kdefs, folax, lemmas])),
+		[],
+		ruNewFileInfo(module, conf, ".ru")
+	);
+}
+
+// A translated article: imports the foundation, then adds only the
+// signature-DEPENDENT material — the symbol signature, per-symbol equality
+// congruences, and the relativized axioms/theorems.
+mptpArticleSource(tptp : TptpSource, foundation_id : int, module : string, conf : RuConf) -> RuParseSource {
+	sig = mptpCollectSig(tptp.decls);
+	sig_decls = mptpSigDecls(sig);
+	sconsts : [RuParseDecl] = map(sig_decls.first, \c -> c);
+	srules : [RuParseDecl] = map(sig_decls.second, \r -> r);
+	congs  : [RuParseDecl] = map(mptpCongruences(sig), \a -> a);
+	axioms : [RuParseDecl] = map(tptp.decls, \d -> mptpDeclAssertion(d));
+	RuParseSource(
+		[RuParseImport(foundation_id, -1)],
+		mptpPosition(concatA([sconsts, srules, congs, axioms])),
+		[],
+		ruNewFileInfo(module, conf, ".ru")
+	);
+}
