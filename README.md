@@ -126,6 +126,32 @@ russellj scripts/translate/mm2ru.rus afile=set-100000
 
 ---
 
+## Testing
+
+Run the complete test battery — the same checks as CI (scripting language, MM↔RU
+roundtrip, unilambda, refactors, tactic semantics, oracle reprove), end-to-end in a
+single process:
+
+```bash
+russellj mem=16g test/all
+```
+
+`test/all` reads its datasets (`set-3000`/`set-30000`/`set-100000`, the full `set.mm`,
+and `mm-theory/kore-fol`) from the math directory `$RUSSELL_MATH`. You can launch it from
+any directory — `russellj` automatically runs `test/*` commands from `$RUSSELL_MATH` — but
+the datasets must already be present there. Generate the `set-N` fragments first if needed:
+
+```bash
+bin/mm-prefix.sh "$RUSSELL_MATH/set.mm"   3000 "$RUSSELL_MATH/set-3000.mm"
+bin/mm-prefix.sh "$RUSSELL_MATH/set.mm"  30000 "$RUSSELL_MATH/set-30000.mm"
+bin/mm-prefix.sh "$RUSSELL_MATH/set.mm" 100000 "$RUSSELL_MATH/set-100000.mm"
+```
+
+A successful run ends with `######## ALL TESTS PASSED ########`. Individual steps can be
+run on their own, e.g. `russellj test/smoke afile=set-3000` or `russellj test/uni`.
+
+---
+
 ## Project layout
 
 ```
