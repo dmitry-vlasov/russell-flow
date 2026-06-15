@@ -1,0 +1,137 @@
+import ru/src;
+import ru/util/exp;
+import base/ids;
+import ds/set;
+
+// Propositional layer of the Checker tactic (the `prop` atom). The first, foundational module of
+// the pipeline: the equalizer/unfold only PRODUCE atoms that this layer must then assemble into a
+// Hilbert proof. This file holds the pure, independently-testable core — atomize an RuExp (every
+// maximal non-{¬→↔∧∨} subexpression becomes an opaque propositional variable) and DECIDE whether
+// hypotheses propositionally entail a goal. The tactic proper (Kalmár construction → RuProofStep
+// tree → follow-proof, modelled on spr) builds on this. See [[project_mizar_import]] B-step-2.
+
+export {
+	// A propositional formula over opaque atoms (keyed by their RuExp structure).
+	RuPForm ::= RuPAtom, RuPNot, RuPImp, RuPIff, RuPAnd, RuPOr, RuPTrue, RuPFalse;
+		RuPAtom(key : string);
+		RuPNot(a : RuPForm);
+		RuPImp(a : RuPForm, b : RuPForm);
+		RuPIff(a : RuPForm, b : RuPForm);
+		RuPAnd(a : RuPForm, b : RuPForm);
+		RuPOr(a : RuPForm, b : RuPForm);
+		RuPTrue();
+		RuPFalse();
+
+	// The connective rule ids (wn/wi/wb/wa/wo + ⊤/⊥) the atomizer descends through.
+	RuPConnectives(wn : int, wi : int, wb : int, wa : int, wo : int, wtru : int, wfal : int);
+	ruPConnectives() -> RuPConnectives;
+
+	ruPAtomize(conn : RuPConnectives, exp : RuExp) -> RuPForm;
+	ruPEntails(hyps : [RuPForm], goal : RuPForm) -> bool;
+	ruPAtoms(f : RuPForm) -> Set<string>;
+}
+
+ruPConnectives() -> RuPConnectives {
+	RuPConnectives(s2id("wn"), s2id("wi"), s2id("wb"), s2id("wa"), s2id("wo"), s2id("⊤"), s2id("F."));
+}
+
+// ---- atomization -----------------------------------------------------------
+// RuExp.nodes is a flat PREFIX array. A node's subtree span is found by recursively consuming its
+// `arity` children — the `len`/arityLen field is NOT relied on (it is not always maintained in
+// freshly-parsed expressions, which silently truncated atoms and split identical subexprs).
+
+ruPAtomize(conn : RuPConnectives, exp : RuExp) -> RuPForm {
+	ruPAtomizeAt(conn, exp.nodes, 0).first;
+}
+
+// Returns (formula for the subtree at i, index just past that subtree).
+ruPAtomizeAt(conn : RuPConnectives, nodes : [RuExpNode], i : int) -> Pair<RuPForm, int> {
+	node = nodes[i];
+	switch (node) {
+		RuVar(__, __): Pair(RuPAtom(ruPNodeKey(node)), i + 1);   // a bare variable is an atom
+		RuRuleNode(idType, __): {
+			rule = ruIdType2Id(idType);
+			if (rule == conn.wtru) Pair(RuPTrue(), i + 1)
+			else if (rule == conn.wfal) Pair(RuPFalse(), i + 1)
+			else if (rule == conn.wn) {
+				c = ruPAtomizeAt(conn, nodes, i + 1);
+				Pair(RuPNot(c.first), c.second);
+			}
+			else if (rule == conn.wi || rule == conn.wb || rule == conn.wa || rule == conn.wo) {
+				c1 = ruPAtomizeAt(conn, nodes, i + 1);
+				c2 = ruPAtomizeAt(conn, nodes, c1.second);
+				f  = if (rule == conn.wi) RuPImp(c1.first, c2.first)
+					else if (rule == conn.wb) RuPIff(c1.first, c2.first)
+					else if (rule == conn.wa) RuPAnd(c1.first, c2.first)
+					else RuPOr(c1.first, c2.first);
+				Pair(f, c2.second);
+			}
+			// not a connective: the whole subtree [i, end) is one opaque atom (span by arity).
+			else {
+				end = ruPSpanEnd(nodes, i);
+				Pair(RuPAtom(ruPSubtreeKey(nodes, i, end)), end);
+			}
+		}
+	}
+}
+
+// End index of the subtree rooted at i, found by consuming `arity` children recursively.
+ruPSpanEnd(nodes : [RuExpNode], i : int) -> int {
+	node = nodes[i];
+	switch (node) {
+		RuVar(__, __): i + 1;
+		RuRuleNode(__, arityLen): {
+			arity = ruArityLen2Arity(arityLen);
+			fold(enumFromTo(1, arity), i + 1, \pos, __ -> ruPSpanEnd(nodes, pos));
+		}
+	}
+}
+
+ruPNodeKey(node : RuExpNode) -> string {
+	switch (node) {
+		RuVar(id, type):              "V" + i2s(id) + "#" + i2s(type);
+		RuRuleNode(idType, __):       "R" + i2s(ruIdType2Id(idType));   // structure key: rule id only
+	}
+}
+
+ruPSubtreeKey(nodes : [RuExpNode], from : int, to : int) -> string {
+	strGlue(map(enumFromTo(from, to - 1), \k -> ruPNodeKey(nodes[k])), ",");
+}
+
+// ---- decision (exhaustive valuation) ---------------------------------------
+
+ruPAtoms(f : RuPForm) -> Set<string> {
+	switch (f) {
+		RuPAtom(k):   makeSet1(k);
+		RuPNot(a):    ruPAtoms(a);
+		RuPImp(a, b): mergeSets(ruPAtoms(a), ruPAtoms(b));
+		RuPIff(a, b): mergeSets(ruPAtoms(a), ruPAtoms(b));
+		RuPAnd(a, b): mergeSets(ruPAtoms(a), ruPAtoms(b));
+		RuPOr(a, b):  mergeSets(ruPAtoms(a), ruPAtoms(b));
+		RuPTrue():    makeSet();
+		RuPFalse():   makeSet();
+	}
+}
+
+ruPEval(val : Tree<string, bool>, f : RuPForm) -> bool {
+	switch (f) {
+		RuPAtom(k):   lookupTreeDef(val, k, false);
+		RuPNot(a):    !ruPEval(val, a);
+		RuPImp(a, b): !ruPEval(val, a) || ruPEval(val, b);
+		RuPIff(a, b): ruPEval(val, a) == ruPEval(val, b);
+		RuPAnd(a, b): ruPEval(val, a) && ruPEval(val, b);
+		RuPOr(a, b):  ruPEval(val, a) || ruPEval(val, b);
+		RuPTrue():    true;
+		RuPFalse():   false;
+	}
+}
+
+ruPEntails(hyps : [RuPForm], goal : RuPForm) -> bool {
+	atoms = set2array(fold(hyps, ruPAtoms(goal), \acc, h -> mergeSets(acc, ruPAtoms(h))));
+	n = length(atoms);
+	// Over all 2^n valuations, every model of the hyps must satisfy the goal.
+	forall(enumFromTo(0, bitShl(1, n) - 1), \mask -> {
+		val = foldi(atoms, makeTree(), \bit, acc, a -> setTree(acc, a, bitAnd(bitUshr(mask, bit), 1) == 1));
+		!forall(hyps, \h -> ruPEval(val, h)) || ruPEval(val, goal);
+	});
+}
