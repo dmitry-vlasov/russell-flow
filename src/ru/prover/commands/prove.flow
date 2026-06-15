@@ -1,5 +1,6 @@
 import ru/prover/core/prove;
 import ru/prover/core/util;
+import ru/prover/core/relevance;
 import ru/prover/tactics/breadth_first;
 import ru/prover/tactics/dsl;
 import ru/prover/core/stats;
@@ -30,7 +31,11 @@ ruCommProve = RuComm(
 			RuCommArg("forward-closure-depth", true,  "shallow forward proof search: depth of premise closure (0 disables; 1-3 typical)", "0"),
 			RuCommArg("forward-closure-size",  true,  "max number of facts in the forward closure index",                               "1024"),
 			RuCommArg("tactic",                true,  "tactic DSL expression; if empty, bounded-bfs(max-depth, max-size) is used",      ""),
-			RuCommArg("min-index-rule-nodes",  true,  "min rule-node count for step index entries (1 = index all steps)",                 "1")
+			RuCommArg("min-index-rule-nodes",  true,  "min rule-node count for step index entries (1 = index all steps)",                 "1"),
+			RuCommArg("relevance-depth",       true,  "SInE premise-selection rounds (0 = off = whole foundation; 1-3 typical)",          "0"),
+			RuCommArg("relevance-tolerance",   true,  "SInE trigger tolerance (>=1; higher = more premises kept)",                        "1.2"),
+			RuCommArg("relevance-ubiq",        true,  "fraction of assertions a symbol must hit to count as ubiquitous logical glue",     "0.4"),
+			RuCommArg("exclude-disjointed",    true,  "drop disjoint-variable theorems from scope (soundness guard for the flat set sort)", "1")
 		], ruMapFnCommArgs), []
 	),
 	ruRunProve
@@ -47,7 +52,33 @@ ruRunProve(unit : RuUnit) -> Maybe<RuState> {
 		env.out.error("prove: no target", []);
 		Some(state);
 	} else {
-		index          = ruMakeIndexForTarget(target, math, env);
+		rel_depth      = ruTaskIntArg(task, "relevance-depth", 0);
+		index          = if (rel_depth <= 0) ruMakeIndexForTarget(target, math, env)
+			else switch (target) {
+				RuTargetDecl(decl): switch (decl) {
+					RuTheorem(__, __, __, __): {
+						goalSyms = ruAssertionSymbols(decl);
+						tol  = ruTaskDoubleArg(task, "relevance-tolerance", 1.2);
+						ubiq = ruTaskDoubleArg(task, "relevance-ubiq", 0.4);
+						log_max = ruTaskIntArg(task, "relevance-logical-steps", 6);
+						scope = ruRelevantAssertions(goalSyms, math.decls.assertions, tol, ubiq, rel_depth, log_max);
+						// SOUNDNESS GUARD: the flat `set` sort (setmm2miz) collapses set.mm's
+						// setvar/class, so disjoint-variable theorems (chvarv, …) can be misapplied
+						// by substituting a setvar with a term (proving x = ∅). Until the foundation
+						// distinguishes setvar, drop disjoint-conditioned assertions from search.
+						no_dv = ruTaskBoolArg(task, "exclude-disjointed", true);
+						dvIds = if (!no_dv) makeSet() else foldTree(math.decls.assertions, makeSet(),
+							\id, ass, acc -> if (sizeSet(ass.infer.vars.disjs) == 0) acc else insertSet(acc, id));
+						env.out.println("relevance: scoped to " + i2s(sizeSet(scope)) + " / " +
+							i2s(sizeTree(math.decls.assertions)) + " assertions (depth " + i2s(rel_depth) +
+							(if (no_dv) ", −" + i2s(sizeSet(dvIds)) + " disjoint-conditioned" else "") + ")");
+						ruInitTheoremAssertionsIndexKeep(decl, math, env,
+							\id -> containsSet(scope, id) && !containsSet(dvIds, id));
+					}
+					default: ruMakeIndexForTarget(target, math, env);
+				}
+				default: ruMakeIndexForTarget(target, math, env);
+			};
 		max_frag_depth = ruTaskIntArg(task, "fragment-depth", 0);
 		frag_pair      = if (max_frag_depth > 0)
 			Some(ruBuildFragments(math, max_frag_depth, env))

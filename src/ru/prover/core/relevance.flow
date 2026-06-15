@@ -1,0 +1,94 @@
+import ru/util/src2s;
+import ru/util/exp;
+import ru/src;
+
+// SInE-style premise selection (relevance filtering). The prover's per-theorem index
+// otherwise spans EVERY preceding assertion (the whole foundation, ~2700 for the Mizar
+// import) — far too wide for bounded search. SInE scopes to the assertions reachable from
+// the goal's symbols: a rare symbol "triggers" the axioms that introduce it, expanded a few
+// rounds; the schematic logical layer (mp/syl/…, built only from ubiquitous connectives) is
+// always kept. See https://doi.org/10.1007/978-3-642-22438-6_23 (Hoder & Voronkov, SInE).
+export {
+	// Symbols (constructor/rule ids) used in an expression.
+	ruExpSymbols(e : RuExp) -> Set<int>;
+	// Symbols across an assertion's hypotheses and conclusion.
+	ruAssertionSymbols(ass : RuAssertion) -> Set<int>;
+	// The in-scope assertion ids: those reachable from `goalSyms` plus the ubiquitous
+	// logical layer. `tolerance` >= 1 widens which symbols count as triggers (1 = only the
+	// least-frequent symbol of each axiom). `ubiq` in (0,1]: a symbol appearing in >= ubiq*N
+	// assertions is "ubiquitous" — never a trigger, and axioms built only from such symbols
+	// are always kept. `depth` = expansion rounds.
+	ruRelevantAssertions(goalSyms : Set<int>, assertions : Tree<int, RuAssertion>,
+		tolerance : double, ubiq : double, depth : int, logicalMaxSteps : int) -> Set<int>;
+}
+
+ruExpSymbols(e : RuExp) -> Set<int> {
+	fold(e.nodes, makeSet(), \acc, n -> switch (n) {
+		RuRuleNode(idType, __): insertSet(acc, ruIdType2Id(idType));
+		RuVar(__, __):          acc;
+	});
+}
+
+ruStmtSymbols(s : RuStmt, acc : Set<int>) -> Set<int> {
+	fold(s.exps, acc, \ac, te -> mergeSets(ac, ruExpSymbols(ruExp(te))));
+}
+
+ruAssertionSymbols(ass : RuAssertion) -> Set<int> {
+	inf = ass.infer;
+	fold(inf.hyps, ruStmtSymbols(inf.prop, makeSet()), \acc, h -> ruStmtSymbols(h.stmt, acc));
+}
+
+ruRelevantAssertions(goalSyms : Set<int>, assertions : Tree<int, RuAssertion>,
+	tolerance : double, ubiq : double, depth : int, logicalMaxSteps : int) -> Set<int> {
+	// symbol set per assertion + global symbol frequencies.
+	symsOf = mapTree(assertions, ruAssertionSymbols);
+	n      = sizeTree(assertions);
+	freq   = foldTree(symsOf, makeTree(), \__, syms, acc ->
+		foldSet(syms, acc, \ac, s -> setTree(ac, s, lookupTreeDef(ac, s, 0) + 1)));
+	freqOf  = \s -> lookupTreeDef(freq, s, 0);
+	ubiqMin = ubiq * i2d(n);
+	isUbiq  = \s -> i2d(freqOf(s)) >= ubiqMin;
+	// The logical kernel, always kept: pure-logical assertions (every symbol ubiquitous) that
+	// are either AXIOMS (ax-mp, ax-1/2/3, ax-4/gen, bi1/2/3, df-an/or/ex, equality/membership)
+	// or SHORT inference THEOREMS (mp, sp, syl, mpbi, … — the bootstrap lemmas the gaps chain
+	// through). The thousands of longer derived logical theorems and the domain definition
+	// axioms (rare symbols → pulled in by relevance) are excluded.
+	always = foldTree(assertions, makeSet(), \id, ass, acc -> {
+		syms        = lookupTreeDef(symsOf, id, makeSet());
+		pureLogical = !existsSet(syms, \s -> !isUbiq(s));
+		keep = pureLogical && switch (ass) {
+			RuAxiom(__, __):                 true;
+			RuTheorem(__, __, __, proof):    length(proof.steps) <= logicalMaxSteps;
+			default:                         false;
+		};
+		if (keep) insertSet(acc, id) else acc;
+	});
+	// trigger symbols of each axiom: those near its least-frequent symbol (SInE D-relation).
+	triggersOf = mapTree(symsOf, \syms ->
+		if (sizeSet(syms) == 0) makeSet() else {
+			minf = foldSet(syms, 1000000000, \m, s -> min(m, freqOf(s)));
+			thr  = tolerance * i2d(minf);
+			filterSet(syms, \s -> i2d(freqOf(s)) <= thr);
+		});
+	// only RARE symbols cross the frontier — common symbols (=, set_, ∈, connectives) would
+	// otherwise drag in half the foundation on the second round.
+	rareSymsOf = mapTree(symsOf, \syms -> filterSet(syms, \s -> !isUbiq(s)));
+	seed = filterSet(goalSyms, \s -> !isUbiq(s));
+	mergeSets(always, ruSineExpand(rareSymsOf, triggersOf, seed, makeSet(), depth));
+}
+
+// One expansion round: select every unselected axiom triggered by a reachable symbol, add its
+// RARE symbols to the frontier, recurse. Stops at a fixpoint or after `depth` rounds.
+ruSineExpand(rareSymsOf : Tree<int, Set<int>>, triggersOf : Tree<int, Set<int>>,
+	reachable : Set<int>, selected : Set<int>, depth : int) -> Set<int> {
+	if (depth <= 0) selected else {
+		newSel = foldTree(triggersOf, [], \id, trigs, acc ->
+			if (containsSet(selected, id) || sizeSet(intersectSets(trigs, reachable)) == 0) acc
+			else arrayPush(acc, id));
+		if (newSel == []) selected else {
+			selected2  = fold(newSel, selected, \acc, id -> insertSet(acc, id));
+			reachable2 = fold(newSel, reachable, \r, id -> mergeSets(r, lookupTreeDef(rareSymsOf, id, makeSet())));
+			ruSineExpand(rareSymsOf, triggersOf, reachable2, selected2, depth - 1);
+		}
+	}
+}
