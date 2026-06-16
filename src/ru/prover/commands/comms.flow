@@ -18,7 +18,12 @@ import ru/util/cursor;
 import lsp/protocol;
 
 import ru/prover/tactics/follow_proof;
+import ru/prover/tactics/kalmar;
 import ru/prover/ml/common_subproofs;
+import ru/verify/proof;
+import ru/verify/err;
+import ru/unify/index;
+import ru/util/utils;
 
 export {
 	ruProverCommands : [RuComm] = [
@@ -47,7 +52,161 @@ export {
 		ruCommProveTry,
 		ruCommProveForbid,
 		ruCommProveCandidates,
+		ruCommPropKalmar,
+		ruCommPropProve,
 	]
+}
+
+ruCommPropProve = RuComm(
+	RuCommInfo(
+		"prop-prove", "prover", "build + run the Kalmár assembly (prop closer) for a theorem's hyps ⊢ goal", "theorem", true, false,
+		[
+			RuCommArg("theorem",  false, "theorem whose hyps ⊢ prop is the target", ""),
+			RuCommArg("max-size", true,  "node budget for the follow-proof tactic", "200000"),
+		], []
+	),
+	ruRunPropProve
+);
+
+ruRunPropProve(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	state = unit.state;
+	task = unit.task;
+	math = ruMathFromSources(state.ru, env);
+	th_name = ruTaskStringArg(task, "theorem", "");
+	max_size = ruTaskIntArg(task, "max-size", 200000);
+	switch (lookupTree(math.decls.assertions, s2id_(th_name))) {
+		Some(ass): {
+			infer = switch (ass) {
+				RuAxiom(__, inf):         inf;
+				RuCong(__, inf):          inf;
+				RuTheorem(__, inf,__,__): inf;
+				RuDef(__, inf,__,__):     inf;
+			};
+			goal_stmt = infer.prop;
+			goal_exp  = ruExp(goal_stmt.exps[0]);
+			hyp_exps  = map(infer.hyps, \h -> ruExp(h.stmt.exps[0]));
+			conn = ruPConnectives();
+			wff  = tp2id_("wff");
+			// (1) DEV CHECK: build the skeleton and run it through the real verifier.
+			switch (ruKalmarSkeleton(conn, wff, goal_stmt.class, hyp_exps, goal_exp)) {
+				Some(skel): {
+					proof = RuProof(ruEmptyVarsDisjs, ruMakeLinearProof(skel), -1);
+					res = ruVerifyProof(proof, infer.hyps, goal_stmt, math, env);
+					env.out.println("prop-prove " + th_name + " dev-check: " +
+						(if (res.errs == []) "VERIFIED" else "FAILED — " + ruVerifyErrs2s(res.errs, math)) +
+						" (" + i2s(length(proof.steps)) + " steps)");
+				}
+				None(): env.out.println("prop-prove " + th_name + " dev-check: not propositionally entailed (or >12 atoms)");
+			}
+			// (2) TACTIC CHECK: drive the general prover with the Kalmár follow-proof tactic.
+			switch (ass) {
+				RuTheorem(__,__,__, th_proof): {
+					switch (ruKalmarTactic(conn, wff, goal_stmt.class, hyp_exps, goal_exp, max_size)) {
+						Some(tactic): {
+							// Index scoped to exactly the construction lemmas the skeleton uses, so the engine
+							// branches minimally while following the skeleton (the tactic owns its search scope).
+							lemma_names = ["ax-mp", "ax-1", "ax-2", "id", "pm2.21", "notnot", "pm3.2",
+								"simpl", "simpr", "con3", "biimp", "biimpr", "impbi", "annim", "ioran",
+								"orc", "olc", "pm2.61", "tru", "notfal"];
+							index = fold(lemma_names, ruMakeIndex(), \acc, nm ->
+								switch (lookupTree(math.decls.assertions, s2id_(nm))) {
+									Some(a): ruSetIndex(ruExp(ruAssInfer(a).prop.exps[0]), a, acc);
+									None():  acc;
+								}
+							);
+							ptask = RuProverTask(ass.info, tactic, "kalmar:" + th_name, task.args,
+								infer.hyps, ruProofQedStep(th_proof));
+							penv  = ruInitProver(ptask, math, env, index, -1.0);
+							penv1 = ruProveSequential(penv);
+							env.out.println("prop-prove " + th_name + " tactic: " +
+								(if (length(^(penv1.tree.proofs)) > 0) "PROVED" else "not proved") +
+								" (tree nodes=" + i2s(sizeTree(penv1.tree.nodes)) + ")");
+						}
+						None(): env.out.println("prop-prove " + th_name + " tactic: no skeleton built");
+					}
+				}
+				default: { }
+			}
+			Some(state);
+		}
+		None(): {
+			env.out.error("assertion '" + th_name + "' not found", []);
+			Some(state);
+		}
+	}
+}
+
+// Extract the inference of any assertion (union field access miscompiles; use an explicit switch).
+ruAssInfer(ass : RuAssertion) -> RuInference {
+	switch (ass) {
+		RuAxiom(__, inf):         inf;
+		RuCong(__, inf):          inf;
+		RuTheorem(__, inf,__,__): inf;
+		RuDef(__, inf,__,__):     inf;
+	}
+}
+
+ruCommPropKalmar = RuComm(
+	RuCommInfo(
+		"prop-kalmar", "prover", "verify the Kalmár-lemma RuStep emitter on a theorem's prop", "theorem", true, false,
+		[
+			RuCommArg("theorem", false, "assertion whose prop is the goal formula", ""),
+		], []
+	),
+	ruRunPropKalmar
+);
+
+ruRunPropKalmar(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	state = unit.state;
+	task = unit.task;
+	conf = state.conf;
+	math = ruMathFromSources(state.ru, env);
+	th_name = ruTaskStringArg(task, "theorem", "");
+	switch (lookupTree(math.decls.assertions, s2id_(th_name))) {
+		Some(ass): {
+			infer = switch (ass) {
+				RuAxiom(__, inf):       inf;
+				RuCong(__, inf):        inf;
+				RuTheorem(__, inf,__,__): inf;
+				RuDef(__, inf,__,__):   inf;
+			};
+			goal_stmt = infer.prop;
+			goal_exp = ruExp(goal_stmt.exps[0]);
+			conn = ruPConnectives();
+			wff = tp2id_("wff");
+			f = ruPAtomize(conn, goal_exp);
+			atoms = set2array(ruPAtoms(f));
+			n = length(atoms);
+			if (n > 12) {
+				env.out.error("too many atoms (" + i2s(n) + ") to enumerate", []);
+				Some(state);
+			} else {
+				// For every valuation, emit the Kalmár-lemma proof of lit_v(goal) and verify it.
+				failures = filtermap(enumFromTo(0, bitShl(1, n) - 1), \mask -> {
+					val = foldi(atoms, makeTree(), \bit, acc, a -> setTree(acc, a, bitAnd(bitUshr(mask, bit), 1) == 1));
+					lemma = ruKalmarLemma(conn, wff, goal_stmt.class, goal_exp, val);
+					proof = RuProof(ruEmptyVarsDisjs, ruMakeLinearProof(lemma.proof), -1);
+					res = ruVerifyProof(proof, lemma.hyps, lemma.qed, math, env);
+					if (res.errs == []) None()
+					else Some(Pair(mask, ruVerifyErrs2s(res.errs, math)));
+				});
+				total = bitShl(1, n);
+				passed = total - length(failures);
+				env.out.println("prop-kalmar " + th_name + ": " + i2s(n) + " atoms, " +
+					i2s(passed) + "/" + i2s(total) + " valuations verified");
+				iter(take(failures, 5), \pf ->
+					env.out.println("  FAIL mask=" + i2s(pf.first) + ": " + pf.second)
+				);
+				Some(state);
+			}
+		}
+		None(): {
+			env.out.error("assertion '" + th_name + "' not found", []);
+			Some(state);
+		}
+	}
 }
 
 ruCommProveStart = RuComm(

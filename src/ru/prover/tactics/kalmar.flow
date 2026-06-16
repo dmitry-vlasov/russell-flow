@@ -1,0 +1,566 @@
+import ru/prover/tactics/propositional;
+import ru/prover/tactics/follow_proof;
+import ru/prover/core/controls;
+import ru/prover/core/tree;
+import ru/proof_tree;
+import ds/set;
+
+// The Kalmár construction — second module of the propositional layer (see [[project_mizar_import]]).
+// `propositional.flow` only DECIDES entailment (ruPEntails, an exhaustive valuation scan). This file
+// turns that decision into an actual Hilbert DERIVATION. It is still pure and structural — it works on
+// RuPForm over opaque atoms, produces an abstract proof term (RuKProof), and is validated by the same
+// truth-table semantics (ruPEval). The next module realizes an RuKProof as an RuStep tree against the
+// concrete foundation lemmas (ax-mp/pm2.21/pm3.2/…) and feeds follow-proof, modelled on spr.
+//
+// This module implements KALMÁR'S LEMMA, the structural heart: for a fixed total valuation `v` of the
+// atoms and any subformula `f`, construct a FORWARD derivation of the LITERAL
+//     lit_v(f) = f            if v ⊨ f
+//                ¬f           otherwise
+// from the literal hypotheses { lit_v(p) : p an atom }. The derivation is a tree of single forward
+// steps (each premise-list propositionally entails the conclusion), so it is checkable without any
+// notion of assumption-discharge.
+//
+// NOT YET HERE (the next milestone — the ASSEMBLY): combining the 2^n per-valuation derivations into a
+// hypothesis-free / hyps-discharging proof of the goal. That stage discharges the literal hypotheses
+// (the weak deduction theorem, via the foundation's dedlema/dedlemb/dedlem0a/dedlem0b) and therefore
+// is NOT a pure forward chain — it needs the real RuStep/Hilbert apparatus to stay sound, so it lives
+// with the RuStep emitter, not in this pure layer.
+
+export {
+	// An abstract Hilbert-proof term over RuPForm: `concl` is the derived formula, `rule` names the
+	// foundation lemma/inference that justifies it (or "hyp" for a literal hypothesis leaf), and
+	// `premises` are the sub-derivations whose conclusions feed the rule. A leaf has no premises.
+	RuKProof(concl : RuPForm, rule : string, premises : [RuKProof]);
+
+	// Kalmár's lemma: derive lit_v(f) from the literal hypotheses of v. Total over RuPForm.
+	ruKLit(val : Tree<string, bool>, f : RuPForm) -> RuKProof;
+
+	// The literal hypotheses of a valuation over a formula's atoms: lit_v(p) for each atom p of f.
+	ruKLiterals(val : Tree<string, bool>, f : RuPForm) -> [RuPForm];
+
+	// Pure validator: every step is a sound forward derivation and the root is lit_v(f).
+	//   - "hyp" leaf      : its conclusion is one of the literal hypotheses of v;
+	//   - other leaf      : its conclusion is a tautology (a closed-lemma instance, 0 premises);
+	//   - internal node   : its premises' conclusions propositionally entail its conclusion;
+	//   - root            : its conclusion is exactly lit_v(f).
+	ruKLitCheck(val : Tree<string, bool>, f : RuPForm, proof : RuKProof) -> bool;
+
+	// ---- RuStep emitter ----------------------------------------------------
+	// Realize an abstract RuKProof against the concrete foundation as an RuProofTree (what follow-proof
+	// consumes and ruMakeLinearProof turns into verifiable RuSteps). The context carries everything
+	// needed to rebuild real RuExps: the connective rule ids + wff type, the statement class (turnstile)
+	// of the goal, the atom→subtree map (ruPAtomNodes), and the literal→hyp-index map.
+	RuKEmitCtx(
+		conn      : RuPConnectives,
+		wff       : int,
+		stmtClass : int,
+		atomNodes : Tree<string, [RuExpNode]>,
+		litIndex  : Tree<RuPForm, int>
+	);
+
+	// RuPForm → real RuExp (atoms spliced from their original subtrees, connectives freshly built).
+	ruKForm2Exp(ctx : RuKEmitCtx, f : RuPForm) -> RuExp;
+
+	// The Kalmár lemma realized against a concrete goal expression, ready to verify: the literal
+	// hypotheses (indexed 0..n-1), the conclusion lit_v(goal), and the proof tree. Feed (proof, hyps,
+	// qed) straight to ruVerifyProof. `stmtClass` = the goal statement's turnstile class. (Dev check.)
+	RuKalmarLemma(hyps : [RuHyp], qed : RuStmt, proof : RuProofTree);
+	ruKalmarLemma(conn : RuPConnectives, wff : int, stmtClass : int, goal : RuExp, val : Tree<string, bool>) -> RuKalmarLemma;
+
+	// ---- the assembled skeleton + tactic -----------------------------------
+	// Build the full hypothesis-discharging proof SKELETON for `hyps ⊢ goal` (the assembly: per-atom
+	// case-split + deduction theorem + pm2.61), as an RuProofStep tree over foundation assertions, or
+	// None if `hyps` do not propositionally entail `goal`. Hyp leaves are RuProofHyp at the indices of
+	// `hyps`. This is the STRUCTURE only — it is meant to guide the engine, not to be a finished proof.
+	ruKalmarSkeleton(conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp) -> Maybe<RuProofTree>;
+
+	// The prop closer as a TACTIC: builds the skeleton and hands it to bounded follow-proof, which lets
+	// the general backward-search engine do the actual proving (picking the skeleton's assertion at each
+	// node, unifying to fill formulas / pin ax-mp cut formulas). None if not entailed.
+	ruKalmarTactic(conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, max_size : int) -> Maybe<RuProverTactic>;
+}
+
+// A typed pure-MP proof term carrying its RuPForm conclusion (so the deduction theorem and assembly
+// can build the A→C implications without re-atomizing). Emitted to RuProofTree by ruKT2Tree.
+RuKT ::= RuKTHyp, RuKTAx, RuKTMp;
+	RuKTHyp(idx : int, concl : RuPForm);                 // hypothesis leaf (idx into the premises array)
+	RuKTAx(name : string, concl : RuPForm);              // 0-premise closed-lemma instance
+	RuKTMp(ante : RuKT, imp : RuKT, concl : RuPForm);    // ax-mp(ante : X, imp : X→concl)
+
+ruKTConcl(t : RuKT) -> RuPForm {
+	switch (t) { RuKTHyp(__, c): c; RuKTAx(__, c): c; RuKTMp(__, __, c): c; }
+}
+
+// ---- RuPForm → RuExp -------------------------------------------------------
+
+ruKForm2Nodes(ctx : RuKEmitCtx, f : RuPForm) -> [RuExpNode] {
+	bin = \rule, a, b -> {
+		an = ruKForm2Nodes(ctx, a);
+		bn = ruKForm2Nodes(ctx, b);
+		concat([ruMakeRuleNode(rule, ctx.wff, 2, length(an) + length(bn))], concat(an, bn));
+	};
+	switch (f) {
+		RuPAtom(k):   lookupTreeDef(ctx.atomNodes, k, []);
+		RuPNot(a): {
+			an = ruKForm2Nodes(ctx, a);
+			concat([ruMakeRuleNode(ctx.conn.wn, ctx.wff, 1, length(an))], an);
+		}
+		RuPImp(a, b): bin(ctx.conn.wi, a, b);
+		RuPIff(a, b): bin(ctx.conn.wb, a, b);
+		RuPAnd(a, b): bin(ctx.conn.wa, a, b);
+		RuPOr(a, b):  bin(ctx.conn.wo, a, b);
+		RuPTrue():    [ruMakeRuleNode(ctx.conn.wtru, ctx.wff, 0, 0)];
+		RuPFalse():   [ruMakeRuleNode(ctx.conn.wfal, ctx.wff, 0, 0)];
+	}
+}
+
+ruKForm2Exp(ctx : RuKEmitCtx, f : RuPForm) -> RuExp {
+	RuExp(ruKForm2Nodes(ctx, f), -1);
+}
+
+ruKStmt(ctx : RuKEmitCtx, f : RuPForm) -> RuStmt {
+	RuStmt(ctx.stmtClass, [ruKForm2Exp(ctx, f)], -1);
+}
+
+// ---- emitter (PURE-MP form) ------------------------------------------------
+// Every emitted node is a hypothesis leaf, a 0-premise closed-lemma instance, or an `ax-mp`. Keeping
+// the skeleton in this normal form is what makes the deduction theorem (ruKDeduct) simple AND closed
+// under composition: ruKDeduct only ever emits ax-mp + {ax-1, ax-2, id} closed instances, so its
+// output is itself pure-MP and can be re-processed by an outer deduction-theorem level.
+// (Flow `switch` is over union cases only, so the rule dispatch is an if/else chain.)
+
+// 0-premise closed-lemma instance whose conclusion is `concl`. (`ctx` unused — kept for call-site uniformity.)
+ruKax(ctx : RuKEmitCtx, name : string, concl : RuPForm) -> RuKT {
+	RuKTAx(name, concl);
+}
+// ax-mp(anteProof : ante, impProof : ante → concl) ⊢ concl.
+ruKmp(ctx : RuKEmitCtx, anteProof : RuKT, impProof : RuKT, concl : RuPForm) -> RuKT {
+	RuKTMp(anteProof, impProof, concl);
+}
+// from a premise proving X, via a closed lemma whose instance is (X → concl): ax-mp(X, lemma).
+ruKmp1c(ctx : RuKEmitCtx, pNode : RuKProof, closedName : string, concl : RuPForm) -> RuKT {
+	ruKmp(ctx, ruKEmit(ctx, pNode), ruKax(ctx, closedName, RuPImp(pNode.concl, concl)), concl);
+}
+// from premises proving X and Y, via a closed lemma whose instance is (X → (Y → concl)): two ax-mp.
+ruKmp2c(ctx : RuKEmitCtx, p0 : RuKProof, p1 : RuKProof, closedName : string, concl : RuPForm) -> RuKT {
+	inst = ruKax(ctx, closedName, RuPImp(p0.concl, RuPImp(p1.concl, concl)));
+	t1   = ruKmp(ctx, ruKEmit(ctx, p0), inst, RuPImp(p1.concl, concl));
+	ruKmp(ctx, ruKEmit(ctx, p1), t1, concl);
+}
+
+ruKEmit(ctx : RuKEmitCtx, node : RuKProof) -> RuKT {
+	c  = node.concl;
+	ps = node.premises;
+	r  = node.rule;
+	if (r == "hyp")     RuKTHyp(lookupTreeDef(ctx.litIndex, c, -1), c)
+	else if (r == "tru")     ruKax(ctx, "tru", c)
+	else if (r == "notfali") {
+		// ¬⊥ from ⊤ and notfal (¬⊥ ↔ ⊤): ax-mp(tru, biimpr-of-notfal).
+		notfalForm = RuPIff(c, RuPTrue());                                   // (¬⊥ ↔ ⊤)
+		bwd = ruKmp(ctx, ruKax(ctx, "notfal", notfalForm),
+			ruKax(ctx, "biimpr", RuPImp(notfalForm, RuPImp(RuPTrue(), c))), RuPImp(RuPTrue(), c));
+		ruKmp(ctx, ruKax(ctx, "tru", RuPTrue()), bwd, c);
+	}
+	else if (r == "notnoti")  ruKmp1c(ctx, ps[0], "notnot",  c)   // a ⊢ ¬¬a
+	else if (r == "pm2.21i")  ruKmp1c(ctx, ps[0], "pm2.21",  c)   // ¬a ⊢ a→b
+	else if (r == "a1i")      ruKmp1c(ctx, ps[0], "ax-1",    c)   // b ⊢ a→b
+	else if (r == "orc")      ruKmp1c(ctx, ps[0], "orc",     c)   // a ⊢ a∨b
+	else if (r == "olc")      ruKmp1c(ctx, ps[0], "olc",     c)   // b ⊢ a∨b
+	else if (r == "pm3.2")    ruKBuildAnd(ctx, ps[0], ps[1])      // a, b ⊢ a∧b
+	else if (r == "intnanr") {
+		// ¬a ⊢ ¬(a∧b): (a∧b→a) by simpl, con3 → (¬a→¬(a∧b)), ax-mp.
+		switch (c) { RuPNot(conj): switch (conj) { RuPAnd(a, b): {
+			simplF = RuPImp(conj, a);
+			step = ruKmp(ctx, ruKax(ctx, "simpl", simplF),
+				ruKax(ctx, "con3", RuPImp(simplF, RuPImp(RuPNot(a), c))), RuPImp(RuPNot(a), c));
+			ruKmp(ctx, ruKEmit(ctx, ps[0]), step, c);
+		} default: RuKTHyp(-1, c); }
+		default: RuKTHyp(-1, c); }
+	}
+	else if (r == "intnan") {
+		// ¬b ⊢ ¬(a∧b): (a∧b→b) by simpr, con3 → (¬b→¬(a∧b)), ax-mp.
+		switch (c) { RuPNot(conj): switch (conj) { RuPAnd(a, b): {
+			simprF = RuPImp(conj, b);
+			step = ruKmp(ctx, ruKax(ctx, "simpr", simprF),
+				ruKax(ctx, "con3", RuPImp(simprF, RuPImp(RuPNot(b), c))), RuPImp(RuPNot(b), c));
+			ruKmp(ctx, ruKEmit(ctx, ps[0]), step, c);
+		} default: RuKTHyp(-1, c); }
+		default: RuKTHyp(-1, c); }
+	}
+	else if (r == "pm3.2ni") {
+		// ¬a, ¬b ⊢ ¬(a∨b): build (¬a∧¬b), then biimpr-of-ioran ((¬a∧¬b)→¬(a∨b)).
+		switch (c) { RuPNot(disj): switch (disj) { RuPOr(a, b): {
+			conj    = ruKBuildAnd(ctx, ps[0], ps[1]);          // (¬a∧¬b)
+			conjF   = RuPAnd(RuPNot(a), RuPNot(b));
+			ioranF  = RuPIff(c, conjF);                        // (¬(a∨b) ↔ (¬a∧¬b))
+			bwd     = ruKmp(ctx, ruKax(ctx, "ioran", ioranF),
+				ruKax(ctx, "biimpr", RuPImp(ioranF, RuPImp(conjF, c))), RuPImp(conjF, c));
+			ruKmp(ctx, conj, bwd, c);
+		} default: RuKTHyp(-1, c); }
+		default: RuKTHyp(-1, c); }
+	}
+	else if (r == "annim-imp-false") ruKBuildNotImp(ctx, ps[0], ps[1])   // a, ¬b ⊢ ¬(a→b)
+	else if (r == "impbii") {
+		// a↔b from the two literals: build (a→b) and (b→a), combine via impbi.
+		switch (c) {
+			RuPIff(a, b): {
+				p0 = ps[0]; p1 = ps[1];
+				ab_ba = if (p0.concl == a) {
+					// both true: a1i (b ⊢ a→b) and (a ⊢ b→a), both via ax-1.
+					Pair(ruKmp1c(ctx, p1, "ax-1", RuPImp(a, b)), ruKmp1c(ctx, p0, "ax-1", RuPImp(b, a)));
+				} else {
+					// both false: pm2.21 (¬a ⊢ a→b) and (¬b ⊢ b→a).
+					Pair(ruKmp1c(ctx, p0, "pm2.21", RuPImp(a, b)), ruKmp1c(ctx, p1, "pm2.21", RuPImp(b, a)));
+				};
+				// impbi: (a→b) → ((b→a) → (a↔b)).
+				inst = ruKax(ctx, "impbi", RuPImp(RuPImp(a, b), RuPImp(RuPImp(b, a), c)));
+				t1   = ruKmp(ctx, ab_ba.first, inst, RuPImp(RuPImp(b, a), c));
+				ruKmp(ctx, ab_ba.second, t1, c);
+			}
+			default: RuKTHyp(-1, c);  // unreachable: impbii concl is always ↔
+		}
+	}
+	else if (r == "nbii") {
+		// ¬(a↔b) from the two opposite literals.
+		switch (c) {
+			RuPNot(iff): switch (iff) {
+				RuPIff(a, b): {
+					p0 = ps[0]; p1 = ps[1];
+					if (p0.concl == a) {
+						// T(a) ∧ ¬T(b): build ¬(a→b), then con3∘biimp ((a↔b)→(a→b)) → (¬(a→b)→¬(a↔b)).
+						notImp  = ruKBuildNotImp(ctx, p0, p1);              // ¬(a→b)
+						biimpF  = RuPImp(iff, RuPImp(a, b));                // (a↔b)→(a→b)
+						con3    = ruKmp(ctx, ruKax(ctx, "biimp", biimpF),
+							ruKax(ctx, "con3", RuPImp(biimpF, RuPImp(RuPNot(RuPImp(a, b)), c))),
+							RuPImp(RuPNot(RuPImp(a, b)), c));               // (¬(a→b)→¬(a↔b))
+						ruKmp(ctx, notImp, con3, c);
+					} else {
+						// ¬T(a) ∧ T(b): build ¬(b→a), then con3∘biimpr ((a↔b)→(b→a)) → (¬(b→a)→¬(a↔b)).
+						notImp  = ruKBuildNotImp(ctx, p1, p0);              // ¬(b→a)
+						biimprF = RuPImp(iff, RuPImp(b, a));                // (a↔b)→(b→a)
+						con3    = ruKmp(ctx, ruKax(ctx, "biimpr", biimprF),
+							ruKax(ctx, "con3", RuPImp(biimprF, RuPImp(RuPNot(RuPImp(b, a)), c))),
+							RuPImp(RuPNot(RuPImp(b, a)), c));               // (¬(b→a)→¬(a↔b))
+						ruKmp(ctx, notImp, con3, c);
+					}
+				}
+				default: RuKTHyp(-1, c);
+			}
+			default: RuKTHyp(-1, c);
+		}
+	}
+	else RuKTHyp(-1, c);  // unknown rule: surfaces as a verify failure
+}
+
+// a, b ⊢ a∧b  via pm3.2 (a → (b → (a∧b))) and two ax-mp.
+ruKBuildAnd(ctx : RuKEmitCtx, p0 : RuKProof, p1 : RuKProof) -> RuKT {
+	ruKmp2c(ctx, p0, p1, "pm3.2", RuPAnd(p0.concl, p1.concl));
+}
+
+// pX ⊢ X,  pNotY ⊢ ¬Y   ⊢   ¬(X→Y)   via (X∧¬Y) and biimp-of-annim ((X∧¬Y) → ¬(X→Y)).
+// NOTE (self-reference): emits an `annim` instance. If the OVERALL goal IS annim's statement
+// ((a∧¬b)↔¬(a→b)), that instance shares the root's RuStmt and ruMakeLinearProof's by-statement dedup
+// drops the root (sound proof, but last step ≠ qed → the dev-check ruVerifyProof rejects it; the
+// follow-proof tactic is unaffected). Only bites when proving a foundation lemma by itself.
+ruKBuildNotImp(ctx : RuKEmitCtx, pX : RuKProof, pNotY : RuKProof) -> RuKT {
+	x  = pX.concl;
+	ny = pNotY.concl;  // = ¬Y
+	y  = switch (ny) { RuPNot(inner): inner; default: ny; };
+	conjF   = RuPAnd(x, ny);
+	notImp  = RuPNot(RuPImp(x, y));
+	annimF  = RuPIff(conjF, notImp);                       // ((X∧¬Y) ↔ ¬(X→Y))
+	conj    = ruKBuildAnd(ctx, pX, pNotY);                 // (X∧¬Y)
+	fwd     = ruKmp(ctx, ruKax(ctx, "annim", annimF),
+		ruKax(ctx, "biimp", RuPImp(annimF, RuPImp(conjF, notImp))), RuPImp(conjF, notImp));  // ((X∧¬Y)→¬(X→Y))
+	ruKmp(ctx, conj, fwd, notImp);
+}
+
+// Emit the typed pure-MP term as a concrete RuProofTree.
+ruKT2Tree(ctx : RuKEmitCtx, t : RuKT) -> RuProofTree {
+	switch (t) {
+		RuKTHyp(idx, c):       RuProofHyp(idx, ruKStmt(ctx, c));
+		RuKTAx(name, c):       RuProofStep(s2id_(name), [], ruKStmt(ctx, c));
+		RuKTMp(ante, imp, c):  RuProofStep(s2id_("ax-mp"), [ruKT2Tree(ctx, ante), ruKT2Tree(ctx, imp)], ruKStmt(ctx, c));
+	}
+}
+
+ruKalmarLemma(conn : RuPConnectives, wff : int, stmtClass : int, goal : RuExp, val : Tree<string, bool>) -> RuKalmarLemma {
+	f         = ruPAtomize(conn, goal);
+	atomNodes = ruPAtomNodes(conn, goal);
+	lits      = ruKLiterals(val, f);
+	litIndex  = foldi(lits, makeTree(), \i, acc, lit -> setTree(acc, lit, i));
+	ctx       = RuKEmitCtx(conn, wff, stmtClass, atomNodes, litIndex);
+	hyps      = mapi(lits, \i, lit -> RuHyp(i, ruKStmt(ctx, lit), -1));
+	qed       = ruKStmt(ctx, ruKLitForm(val, f));
+	RuKalmarLemma(hyps, qed, ruKT2Tree(ctx, ruKEmit(ctx, ruKLit(val, f))));
+}
+
+// ---- deduction theorem -----------------------------------------------------
+// Given a pure-MP proof `t` of C (which may use hypothesis `hypIndex`, whose form is `ante`), produce
+// a pure-MP proof of (ante → C) that no longer uses that hypothesis. Three cases — and the output is
+// itself pure-MP (ax-mp + {id, ax-1, ax-2}), so nested deduction-theorem levels compose.
+ruKDeduct(ante : RuPForm, hypIndex : int, t : RuKT) -> RuKT {
+	c   = ruKTConcl(t);
+	imp = RuPImp(ante, c);
+	switch (t) {
+		RuKTHyp(idx, hc):
+			if (idx == hypIndex) RuKTAx("id", imp)                              // ante→ante  (id)
+			else                 RuKTMp(t, RuKTAx("ax-1", RuPImp(hc, imp)), imp); // ante→hc via ax-1
+		RuKTAx(__, ac):
+			RuKTMp(t, RuKTAx("ax-1", RuPImp(ac, imp)), imp);                   // ante→ac via ax-1
+		RuKTMp(p, q, __): {
+			// p : ph, q : (ph→ps), c = ps.  ax-2 combines (ante→(ph→ps)) and (ante→ph) → (ante→ps).
+			ph  = ruKTConcl(p);
+			ps  = c;
+			dp  = ruKDeduct(ante, hypIndex, p);   // ante→ph
+			dq  = ruKDeduct(ante, hypIndex, q);   // ante→(ph→ps)
+			ax2 = RuKTAx("ax-2", RuPImp(RuPImp(ante, RuPImp(ph, ps)), RuPImp(RuPImp(ante, ph), RuPImp(ante, ps))));
+			t1  = RuKTMp(dq, ax2, RuPImp(RuPImp(ante, ph), RuPImp(ante, ps)));
+			RuKTMp(dp, t1, imp);
+		}
+	}
+}
+
+// ---- assembly --------------------------------------------------------------
+// Emit the Kalmár lemma for valuation `val`, with the atom-literal hyp leaves indexed by `litIdxOf`.
+ruKEmitLemma(ctx : RuKEmitCtx, val : Tree<string, bool>, f : RuPForm, litIdxOf : Tree<string, int>) -> RuKT {
+	litIndex = foldTree(litIdxOf, makeTree(), \atom, idx, acc -> setTree(acc, ruKLitForm(val, RuPAtom(atom)), idx));
+	ruKEmit(RuKEmitCtx(ctx with litIndex = litIndex), ruKLit(val, f));
+}
+
+// Recursive atom-elimination. `atoms` are the still-undecided atoms; `assumed` the partial valuation.
+// At each level peel atom p: prove goal assuming p and assuming ¬p, discharge each (deduction theorem),
+// combine via pm2.61. At a total valuation: Kalmár lemma if all hyps hold, else ex-falso off a false hyp.
+ruKAssemble(
+	ctx : RuKEmitCtx, hyps : [RuPForm], realIdxOf : Tree<RuPForm, int>,
+	goal : RuPForm, atoms : [string], litIdxOf : Tree<string, int>, assumed : Tree<string, bool>
+) -> RuKT {
+	if (atoms == []) {
+		// total valuation
+		if (forall(hyps, \h -> ruPEval(assumed, h))) {
+			ruKEmitLemma(ctx, assumed, goal, litIdxOf);                        // v ⊨ goal
+		} else {
+			h     = either(find(hyps, \hh -> !ruPEval(assumed, hh)), goal);    // a false hyp
+			notH  = ruKEmitLemma(ctx, assumed, h, litIdxOf);                   // proves ¬h
+			hRef  = RuKTHyp(lookupTreeDef(realIdxOf, h, -1), h);
+			step  = RuKTMp(notH, RuKTAx("pm2.21", RuPImp(RuPNot(h), RuPImp(h, goal))), RuPImp(h, goal));
+			RuKTMp(hRef, step, goal);                                          // ex falso → goal
+		}
+	} else {
+		p        = atoms[0];
+		rest     = tail(atoms);
+		pForm    = RuPAtom(p);
+		notPForm = RuPNot(pForm);
+		left     = ruKAssemble(ctx, hyps, realIdxOf, goal, rest, litIdxOf, setTree(assumed, p, true));
+		right    = ruKAssemble(ctx, hyps, realIdxOf, goal, rest, litIdxOf, setTree(assumed, p, false));
+		idx      = lookupTreeDef(litIdxOf, p, -1);
+		pG       = ruKDeduct(pForm, idx, left);                               // (p → goal)
+		npG      = ruKDeduct(notPForm, idx, right);                           // (¬p → goal)
+		pm       = RuKTAx("pm2.61", RuPImp(RuPImp(pForm, goal), RuPImp(RuPImp(notPForm, goal), goal)));
+		t1       = RuKTMp(pG, pm, RuPImp(RuPImp(notPForm, goal), goal));
+		RuKTMp(npG, t1, goal);
+	}
+}
+
+ruKalmarSkeleton(conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp) -> Maybe<RuProofTree> {
+	goalF = ruPAtomize(conn, goal);
+	hypFs = map(hyps, \h -> ruPAtomize(conn, h));
+	allAtoms = set2array(fold(hypFs, ruPAtoms(goalF), \acc, hf -> mergeSets(acc, ruPAtoms(hf))));
+	if (!ruPEntails(hypFs, goalF) || length(allAtoms) > 12) None()
+	else {
+		atomNodes = fold(hyps, ruPAtomNodes(conn, goal), \acc, h -> mergeTree(acc, ruPAtomNodes(conn, h)));
+		realIdxOf = foldi(hypFs, makeTree(), \i, acc, hf -> setTree(acc, hf, i));
+		litBase   = length(hyps);
+		litIdxOf  = foldi(allAtoms, makeTree(), \i, acc, a -> setTree(acc, a, litBase + i));
+		ctx       = RuKEmitCtx(conn, wff, stmtClass, atomNodes, makeTree());  // litIndex set per valuation
+		kt        = ruKAssemble(ctx, hypFs, realIdxOf, goalF, allAtoms, litIdxOf, makeTree());
+		Some(ruKT2Tree(ctx, kt));
+	}
+}
+
+ruKalmarTactic(conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, max_size : int) -> Maybe<RuProverTactic> {
+	switch (ruKalmarSkeleton(conn, wff, stmtClass, hyps, goal)) {
+		Some(tree): switch (tree) {
+			// The skeleton IS a complete certificate (ruMakeLinearProof + ruVerifyProof confirm it).
+			// So inject it directly rather than re-driving the backward engine: follow-proof explodes
+			// here because each backward ax-mp leaves its cut formula free, branching on every
+			// same-assertion candidate. The construction already pinned every cut, so search is wasted.
+			RuProofStep(__, __, __): Some(ruKalmarDirectTactic(RuProof(ruEmptyVarsDisjs, ruMakeLinearProof(tree), -1)));
+			RuProofHyp(__, __):      None();  // goal is itself a hypothesis — the engine closes it directly
+		}
+		None(): None();
+	}
+}
+
+// Inject an already-constructed, verifiable proof straight into the tree as the found proof, then
+// terminate. The prover engine treats `tree.proofs` as the result (ruProverEnvProof / ruTreeIsProved),
+// and the `prove` command normalizes its vars/disjs (ruNormalizeTheoremVarsDisjs) before attaching —
+// so a certificate-producing tactic needs no backward search at all.
+ruKalmarDirectTactic(proof : RuProof) -> RuProverTactic {
+	injected : ref bool = ref false;
+	RuProverTactic("kalmar direct", "kalmar",
+		\tree -> {
+			if (!^injected && length(^(tree.proofs)) == 0) {
+				tree.proofs := [proof];
+				injected := true;
+			}
+			RuTacticDone();
+		},
+		\__ -> false
+	);
+}
+
+// A precise follow-proof: like ruFollowProofTactic, but at every node it follows ONLY the candidate
+// whose assertion matches the skeleton's step at that position (generic follow-proof maps by position
+// alone and so expands every same-arity sibling — which explodes on a large Kalmár skeleton). The
+// engine still does the proving and unification; this tactic just picks exactly the right assertion.
+ruKalmarFollowTactic(proof : RuProofStep, max_size : int) -> RuProverTactic {
+	mapping     : ref Tree<int, RuProofTree> = ref makeTree();   // prover-prop id → skeleton node
+	initialized : ref bool = ref false;
+	keep = ruDeltaKeepExpanding(1000000, max_size);
+	RuProverTactic("kalmar follow", "kalmar",
+		\tree ->
+			if (!keep(tree)) RuTacticDone()
+			else {
+				leafs = ruKalmarFollowExpand(proof, mapping, initialized, tree);
+				if (leafs == []) RuTacticDone() else RuTacticExpand(leafs);
+			},
+		keep
+	);
+}
+
+ruKalmarFollowExpand(
+	proof : RuProofStep, mapping : ref Tree<int, RuProofTree>, initialized : ref bool, tree : RuProverTree
+) -> [RuProverProp] {
+	if (!^initialized) {
+		traverseInOrder(tree.leafs, \__, node ->
+			if (node.assertion.info.id == proof.assertion) mapping := setTree(^mapping, node.id, proof)
+		);
+		initialized := true;
+	}
+	// Return every leaf already mapped to the skeleton, PLUS any leaf we can newly map this pass (a
+	// leaf whose grandparent prop is mapped and whose assertion matches the skeleton's child step).
+	// Returning a leaf in the same pass it is mapped is essential: otherwise the pass that propagates
+	// the mapping yields [] and the tactic halts after one level.
+	foldTree(tree.leafs, [], \__, node, acc ->
+		if (containsKeyTree(^mapping, node.id)) concat(acc, [node])
+		else switch (node.parent) {
+			RuProverExp(ind, __, __, __, grand): switch (lookupTree(^mapping, grand.id)) {
+				Some(p): switch (p) {
+					RuProofStep(__, children, __):
+						if (ind < length(children)) switch (children[ind]) {
+							// follow ONLY the candidate whose assertion matches the skeleton step
+							RuProofStep(ass, __, __): if (node.assertion.info.id == ass) {
+								mapping := setTree(^mapping, node.id, children[ind]);
+								concat(acc, [node]);
+							} else acc;
+							RuProofHyp(__, __): acc;   // hyp leaf: the engine closes it against a premise
+						} else acc;
+					RuProofHyp(__, __): acc;
+				}
+				None(): acc;
+			}
+			RuProverRoot(__, __, __): acc;
+		}
+	);
+}
+
+// lit_v(f) as a formula (f if true under v, else ¬f).
+ruKLitForm(val : Tree<string, bool>, f : RuPForm) -> RuPForm {
+	if (ruPEval(val, f)) f else RuPNot(f);
+}
+
+ruKLiterals(val : Tree<string, bool>, f : RuPForm) -> [RuPForm] {
+	map(set2array(ruPAtoms(f)), \k -> ruKLitForm(val, RuPAtom(k)));
+}
+
+// ---- Kalmár's lemma --------------------------------------------------------
+// Each case returns an RuKProof whose conclusion is lit_v(f). Connective × child-truth determines the
+// justifying lemma. The `rule` strings are the intended foundation lemmas (the emitter realizes an
+// inference `X ⊢ Y` as ax-mp against the named closed lemma); ruKLitCheck guarantees logical soundness
+// independently of the chosen name.
+
+ruKLit(val : Tree<string, bool>, f : RuPForm) -> RuKProof {
+	tv = \x -> ruPEval(val, x);
+	switch (f) {
+		RuPAtom(k):   RuKProof(ruKLitForm(val, f), "hyp", []);   // a literal is a hypothesis
+		RuPTrue():    RuKProof(RuPTrue(), "tru", []);            // ⊤ proved by `tru`
+		RuPFalse():   RuKProof(RuPNot(RuPFalse()), "notfali", []); // lit(⊥)=¬⊥, a tautology
+		RuPNot(a): {
+			ca = ruKLit(val, a);
+			if (tv(a)) {
+				// v ⊨ a, so lit(¬a)=¬¬a; from `a` via notnoti (a ⊢ ¬¬a).
+				RuKProof(RuPNot(RuPNot(a)), "notnoti", [ca]);
+			} else {
+				// v ⊭ a, so lit(¬a)=¬a, which is exactly ca's conclusion.
+				ca;
+			}
+		}
+		RuPImp(a, b): {
+			if (tv(f)) {
+				if (!tv(a)) {
+					// from ¬a via pm2.21i (¬a ⊢ a → b).
+					RuKProof(RuPImp(a, b), "pm2.21i", [ruKLit(val, a)]);
+				} else {
+					// tv(b): from b via a1i (b ⊢ a → b).
+					RuKProof(RuPImp(a, b), "a1i", [ruKLit(val, b)]);
+				}
+			} else {
+				// tv(a) ∧ ¬tv(b): lit=¬(a→b); from a and ¬b via annim ((a∧¬b) ↔ ¬(a→b)).
+				RuKProof(RuPNot(RuPImp(a, b)), "annim-imp-false", [ruKLit(val, a), ruKLit(val, b)]);
+			}
+		}
+		RuPAnd(a, b): {
+			if (tv(f)) {
+				// from a and b via pm3.2 (a → (b → (a ∧ b))).
+				RuKProof(RuPAnd(a, b), "pm3.2", [ruKLit(val, a), ruKLit(val, b)]);
+			} else if (!tv(a)) {
+				// from ¬a via intnanr (¬a ⊢ ¬(a ∧ b)).
+				RuKProof(RuPNot(RuPAnd(a, b)), "intnanr", [ruKLit(val, a)]);
+			} else {
+				// from ¬b via intnan (¬b ⊢ ¬(a ∧ b)).
+				RuKProof(RuPNot(RuPAnd(a, b)), "intnan", [ruKLit(val, b)]);
+			}
+		}
+		RuPOr(a, b): {
+			if (tv(f)) {
+				if (tv(a)) {
+					// from a via orc (a → (a ∨ b)).
+					RuKProof(RuPOr(a, b), "orc", [ruKLit(val, a)]);
+				} else {
+					// tv(b): from b via olc (b → (a ∨ b)).
+					RuKProof(RuPOr(a, b), "olc", [ruKLit(val, b)]);
+				}
+			} else {
+				// ¬a ∧ ¬b: lit=¬(a∨b); from ¬a and ¬b via pm3.2ni (¬a, ¬b ⊢ ¬(a∨b)).
+				RuKProof(RuPNot(RuPOr(a, b)), "pm3.2ni", [ruKLit(val, a), ruKLit(val, b)]);
+			}
+		}
+		RuPIff(a, b): {
+			if (tv(f)) {
+				// v ⊨ a↔b: a and b have the SAME value; lit children are (a,b) or (¬a,¬b).
+				RuKProof(RuPIff(a, b), "impbii", [ruKLit(val, a), ruKLit(val, b)]);
+			} else {
+				// v ⊭ a↔b: a and b DIFFER; lit=¬(a↔b) from the two opposite literals.
+				RuKProof(RuPNot(RuPIff(a, b)), "nbii", [ruKLit(val, a), ruKLit(val, b)]);
+			}
+		}
+	}
+}
+
+// ---- validation ------------------------------------------------------------
+
+ruKLitCheck(val : Tree<string, bool>, f : RuPForm, proof : RuKProof) -> bool {
+	lits = buildSet(ruKLiterals(val, f));
+	proof.concl == ruKLitForm(val, f) && ruKNodeOk(lits, proof);
+}
+
+ruKNodeOk(lits : Set<RuPForm>, node : RuKProof) -> bool {
+	step_ok = if (node.premises == []) {
+		if (node.rule == "hyp") containsSet(lits, node.concl)
+		else ruPEntails([], node.concl);          // 0-premise lemma must be a tautology
+	} else {
+		ruPEntails(map(node.premises, \p -> p.concl), node.concl);
+	};
+	step_ok && forall(node.premises, \p -> ruKNodeOk(lits, p));
+}
