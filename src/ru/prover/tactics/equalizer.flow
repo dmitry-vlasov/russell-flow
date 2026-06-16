@@ -172,6 +172,54 @@ ruEqFactLoop(c : RuEqCtx, atoms : [RuExp], seen : Tree<string, Pair<RuExp, RuPro
 
 // ---- orchestration ---------------------------------------------------------
 ruEqualizerPropTactic(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp) -> Maybe<RuProverTactic> {
+	gh = ruEqHead(goal);
+	// B1: a ⊆ / = GOAL reduces to a membership subgoal over a FRESH setvar via ssriv/eqriv
+	// (`(x∈A→x∈B) ⊢ A⊆B`, `(x∈A↔x∈B) ⊢ A=B`), proven recursively by the equalizer. The fresh var's
+	// disjoint provisos are carried in the injected proof (ruNormalizeTheoremVarsDisjs only keeps,
+	// never synthesises them).
+	if (gh == s2id("wss") || gh == s2id("wceq")) ruEqualizerGoalRel(em, conn, wff, stmtClass, hyps, goal, gh == s2id("wss"))
+	else maybeMap(ruEqualizerProve(em, conn, wff, stmtClass, hyps, goal),
+		\tree -> ruKalmarDirectTactic(RuProof(ruEmptyVarsDisjs, ruMakeLinearProof(tree), -1)));
+}
+
+// All distinct variables (by id) occurring in the given expressions.
+ruEqVarsOf(exps : [RuExp]) -> [RuVar] {
+	getTreeValues(fold(exps, makeTree(), \acc, e -> fold(e.nodes, acc, \a, n ->
+		switch (n) { RuVar(id, t): setTree(a, id, RuVar(id, t)); RuRuleNode(__, __): a; })));
+}
+
+ruEqFreshSetvar(used : Set<int>, setvarT : int, i : int) -> RuVar {
+	nm = "eqz_v" + i2s(i);
+	id = s2id(nm);
+	if (containsSet(used, id)) ruEqFreshSetvar(used, setvarT, i + 1) else RuVar(id, setvarT);
+}
+
+// Goal-side ⊆/= : prove `A⊆B` / `A=B` from the membership subgoal over a fresh setvar.
+ruEqualizerGoalRel(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, isSubset : bool) -> Maybe<RuProverTactic> {
+	ar = ruEqArgs(goal); a = ar.first; b = ar.second;
+	wcelId = s2id("wcel"); wiId = s2id("wi"); wbId = s2id("wb"); setvarT = tp2id_("setvar"); classT = tp2id_("class");
+	tvars = ruEqVarsOf(arrayPush(hyps, goal));
+	fresh = ruEqFreshSetvar(buildSet(map(tvars, \v -> v.id)), setvarT, 0);
+	// the element in a membership atom is a CLASS; a setvar must be coerced via the setvar→class
+	// super-rule (ruSuperTypeName), matching how the parser/substitution represent `setvar ∈ class`.
+	cvNode = ruMakeRuleNode(ruSuperTypeName(classT, setvarT), classT, 1, 1);
+	freshExp = RuExp([cvNode, fresh], -1);
+	memb = \s -> ruEqMkRule(wcelId, wff, [freshExp, s]);
+	subgoal = if (isSubset) ruEqMkRule(wiId, wff, [memb(a), memb(b)]) else ruEqMkRule(wbId, wff, [memb(a), memb(b)]);
+	switch (ruEqualizerProve(em, conn, wff, stmtClass, hyps, subgoal)) {
+		None(): None();
+		Some(subTree): {
+			lemmaId  = if (isSubset) s2id_("ssriv") else s2id_("eqriv");
+			goalTree = RuProofStep(lemmaId, [subTree], RuStmt(stmtClass, [goal], -1));
+			// fresh setvar + disjoint(fresh, v) for every theorem var v (covers ssriv/eqriv's provisos).
+			varsTree = fold(arrayPush(tvars, fresh), makeTree(), \acc, v -> setTree(acc, v.id, v));
+			disjs    = buildSet(map(tvars, \v -> RuDisj(fresh, v)));
+			Some(ruKalmarDirectTactic(RuProof(RuVarsDisjs(varsTree, disjs), ruMakeLinearProof(goalTree), -1)));
+		}
+	}
+}
+
+ruEqualizerProve(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp) -> Maybe<RuProofTree> {
 	facts = ruUnfoldFacts(em.math, em.env, stmtClass, arrayPush(hyps, goal));
 	// atom→subtree nodes over goal + hyps + every fact's biconditional, so ruKForm2Exp can rebuild
 	// any atom that appears after rewriting.
@@ -190,7 +238,10 @@ ruEqualizerPropTactic(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClas
 	goal2Exp  = ruKForm2Exp(ctx, goalForm2);
 	// Equality hyps -> proven biconditional premises (eleq1/eleq2), added to the Kalmár assembly as
 	// extra hyps at indices [|hyps|, |hyps|+|eqFacts|) and spliced with their ax-mp proofs.
-	eqFacts    = ruEqualityFacts(em, stmtClass, hyps, goal);
+	// Pass the unfold facts' biconditionals too: their RHS exposes membership atoms (e.g. x∈A, x∈B
+	// from x∈(A∪B)) that the relation facts (eleq/ssel) must see to fire. They are wb-headed, so the
+	// wceq/wss relation-hyp filter ignores them — they contribute atoms only.
+	eqFacts    = ruEqualityFacts(em, stmtClass, concat(hyps, map(facts, \f -> f.first)), goal);
 	eqFactExps = map(eqFacts, \f -> f.first);
 	mkResidual = \ -> maybeMap(
 		ruKalmarSkeleton(conn, wff, stmtClass, concat(hyps, eqFactExps), goal2Exp),
@@ -208,7 +259,7 @@ ruEqualizerPropTactic(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClas
 			full = if (goalForm2 == goalForm) goal2Tree   // nothing rewritten: residual already proves goal
 				else RuProofStep(s2id_("mpbir"), [goal2Tree, rw.second], RuStmt(stmtClass, [ruKForm2Exp(ctx, goalForm)], -1));
 			switch (full) {
-				RuProofStep(__, __, __): Some(ruKalmarDirectTactic(RuProof(ruEmptyVarsDisjs, ruMakeLinearProof(full), -1)));
+				RuProofStep(__, __, __): Some(full);
 				RuProofHyp(__, __): None();
 			}
 		}
