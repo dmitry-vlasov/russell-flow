@@ -1,7 +1,10 @@
 import base/util/progress;
 import ru/prover/core/prove;
+import ru/prover/core/env;
+import ru/prover/core/expand;
 import ru/prover/tactics/breadth_first;
 import ru/prover/tactics/combinators;
+import ru/prover/tactics/dsl;
 import ru/prover/core/stats;
 import ru/map_decls;
 import comm;
@@ -17,7 +20,8 @@ ruCommMeasureAutoprovability = RuComm(
 			RuCommArg("target", true, "the target: a theorem, file or all", "all"),
 			RuCommArg("step-time-limit", true, "time limit per step in seconds", "1.0"),
 			RuCommArg("max-depth", true, "max prover search depth", "3"),
-			RuCommArg("max-size", true, "max prover tree size", "4096")
+			RuCommArg("max-size", true, "max prover tree size", "4096"),
+			RuCommArg("tactic", true, "tactic DSL expression for each step (empty = bounded BFS); e.g. 'prop'", "")
 		], ruMapFnCommArgs), []
 	),
 	ruRunMeasureCompression
@@ -34,6 +38,7 @@ ruMeasureProofCompression(
 	index      : RuIndex<RuAssertion>,
 	step_limit : double,
 	args       : Tree<string, string>,
+	builder    : Maybe<RuTacticBuilder>,
 	math       : RuMath,
 	conf       : RuConf,
 	env        : RuEnv
@@ -43,36 +48,46 @@ ruMeasureProofCompression(
 	if (n <= 1) RuCompressionResult(th.info.id, 0, 0) else {
 		// test each step except the final QED step independently
 		auto_count = fold(subrange(steps, 0, n - 1), 0, \acc, step ->
-			acc + (if (ruCanProveStep(step, th, index, step_limit, args, math, conf, env)) 1 else 0)
+			acc + (if (ruCanProveStep(step, th, index, step_limit, args, builder, math, conf, env)) 1 else 0)
 		);
 		RuCompressionResult(th.info.id, n - 1, auto_count)
 	}
 }
 
 ruCanProveStep(
-	step  : RuStep,
-	th    : RuTheorem,
-	index : RuIndex<RuAssertion>,
-	limit : double,
-	args  : Tree<string, string>,
-	math  : RuMath,
-	conf  : RuConf,
-	env   : RuEnv
+	step    : RuStep,
+	th      : RuTheorem,
+	index   : RuIndex<RuAssertion>,
+	limit   : double,
+	args    : Tree<string, string>,
+	builder : Maybe<RuTacticBuilder>,
+	math    : RuMath,
+	conf    : RuConf,
+	env     : RuEnv
 ) -> bool {
 	step_ind = step.ind;
 	max_size = s2i(lookupTreeDef(args, "max-size", "4096"));
-	tactic = ruLimitedTactic(ruBreadthFirstTactic, -1.0, max_size, max_size * 100, 0);
 	goal = RuStep(step with assertion = ruStepProblem, refs = [], proof = ruNoProof);
-	task = RuProverTask(
-		th.info,
-		tactic,
-		"measure step " + i2s(step_ind + 1) + " of " + id2s(th.info.id),
-		args,
-		concat(th.infer.hyps, subrange(th.proof.steps, 0, step_ind)),
-		goal
-	);
-	penv1 = ruInitProver(task, math, env, index, limit);
-	penv2 = ruProve(penv1);
+	premises = concat(th.infer.hyps, subrange(th.proof.steps, 0, step_ind));
+	header = "measure step " + i2s(step_ind + 1) + " of " + id2s(th.info.id);
+	penv2 = switch (builder) {
+		None(): {
+			// default: bounded BFS, via ruInitProver (sets the task tactic).
+			tactic = ruLimitedTactic(ruBreadthFirstTactic, -1.0, max_size, max_size * 100, 0);
+			task = RuProverTask(th.info, tactic, header, args, premises, goal);
+			ruProve(ruInitProver(task, math, env, index, limit));
+		}
+		Some(b): {
+			// DSL tactic (e.g. the equalizer `prop`): build the env, then build+install the tactic
+			// (it reads the per-step task), expand the hyp, and prove — mirroring the prove command.
+			task = RuProverTask(th.info, ruBreadthFirstTactic, header, args, premises, goal);
+			penv_pre = ruInitProverEnv(task, math, env, index, limit);
+			built = b.build(penv_pre);
+			penv0 = built.first;
+			penv0.tactic := Some(built.second);
+			ruProve(ruExpandHyp(penv0.tree.root, penv0));
+		}
+	};
 	length(^(penv2.tree.proofs)) > 0
 }
 
@@ -94,11 +109,15 @@ ruRunMeasureCompression(unit : RuUnit) -> Maybe<RuState> {
 		index = ruMakeIndexForTarget(target, math, env);
 		args  = ruTaskArgs2Tree(task.args);
 		step_limit = ruTaskDoubleArg(task, "step-time-limit", 1.0);
+		// Optional per-step tactic from the DSL (e.g. `prop` = the equalizer); empty = bounded BFS.
+		tactic_str = ruTaskStringArg(task, "tactic", "");
+		builder = if (tactic_str == "") None()
+			else ruParseAndBuildTactic(tactic_str, RuTacticContext(math, env, None(), None()));
 
 		measure_fn = \decl, __, env1 -> {
 			th = cast(decl : RuDecl -> RuTheorem);
 			n = inc_processed(1);
-			result = ruMeasureProofCompression(th, index, step_limit, args, math, conf, env1);
+			result = ruMeasureProofCompression(th, index, step_limit, args, builder, math, conf, env1);
 			inc_total(result.total_steps);
 			inc_auto(result.auto_steps);
 			percent = if (result.total_steps == 0) 0 else 100 * result.auto_steps / result.total_steps;
@@ -125,6 +144,8 @@ ruRunMeasureCompression(unit : RuUnit) -> Maybe<RuState> {
 		total   = ^total_steps;
 		auto    = ^auto_steps;
 		percent = if (total == 0) 0 else 100 * auto / total;
+		env.out.println("measure-autoprovability: " + i2s(^processed) + " theorems, auto-provable " +
+			i2s(auto) + "/" + i2s(total) + " steps = " + i2s(percent) + "%");
 				Some(RuState(new_state with
 			vars = setTree(new_state.vars, "measure-autoprovability", pairs2tree([
 				Pair("total-steps", flow(total)),
