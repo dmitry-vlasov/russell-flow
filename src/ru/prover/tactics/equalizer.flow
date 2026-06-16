@@ -1,0 +1,99 @@
+import ru/prover/tactics/kalmar;
+import ru/prover/tactics/unfold;
+import ru/prover/core/controls;
+import ru/proof_tree;
+import base/ids;
+import ds/set;
+
+// The EQUALIZER — the polynomial layer that makes the prop closer scale. Kalmár is exponential in
+// the number of atoms; the unfold facts are BICONDITIONALS (P ↔ RHS), so instead of handing them to
+// Kalmár as extra atoms, we use them as REWRITE rules: rewrite the goal's compound membership atoms
+// away by biconditional congruence (notbii/anbi12i/orbi12i/imbi12i/bibi12i + bitri), a LINEAR chain,
+// reducing the goal to the BASE atoms (memberships in variables). Kalmár then runs on that small
+// residual. A reflexive residual (X ↔ X) closes by biid. This both fixes the perf blowup for the
+// common case and is the equality-congruence step (equality hyps become ↔ facts via eleq, next).
+// See [[project_mizar_import]] B-step-2.
+
+export {
+	// The equalizer-assisted prop closer as a tactic: unfold → rewrite the goal to base atoms (with a
+	// congruence proof goal ↔ goal') → Kalmár on hyps ⊢ goal' → combine via mpbir. None when not
+	// (propositionally, after rewriting) entailed. Replaces the plain unfold+Kalmár path.
+	ruEqualizerPropTactic(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int,
+		hyps : [RuExp], goal : RuExp) -> Maybe<RuProverTactic>;
+}
+
+// A proven biconditional fact P ↔ rhs (P a compound membership atom; `proof` proves the biconditional).
+RuEqzFact(rhs : RuPForm, proof : RuProofTree);
+
+ruEqzStmt(ctx : RuKEmitCtx, l : RuPForm, r : RuPForm) -> RuStmt {
+	RuStmt(ctx.stmtClass, [ruKForm2Exp(ctx, RuPIff(l, r))], -1);
+}
+
+// ---- biconditional congruence rewrite --------------------------------------
+// rewrite(form) = (form', proof of (form ↔ form')) where every compound atom with a fact has been
+// replaced by its (recursively rewritten) RHS. `visiting` guards against (acyclic, but be safe) loops.
+ruEqzRw(ctx : RuKEmitCtx, facts : Tree<string, RuEqzFact>, visiting : Set<string>, form : RuPForm) -> Pair<RuPForm, RuProofTree> {
+	cong1 = \lemma, child, l, r -> RuProofStep(s2id_(lemma), [child], ruEqzStmt(ctx, l, r));
+	cong2 = \lemma, c1, c2, l, r -> RuProofStep(s2id_(lemma), [c1, c2], ruEqzStmt(ctx, l, r));
+	switch (form) {
+		RuPAtom(k):
+			switch (lookupTree(facts, k)) {
+				None(): Pair(form, RuProofStep(s2id_("biid"), [], ruEqzStmt(ctx, form, form)));   // A ↔ A
+				Some(fact):
+					if (containsSet(visiting, k)) Pair(form, RuProofStep(s2id_("biid"), [], ruEqzStmt(ctx, form, form)))
+					else {
+						rhsRw = ruEqzRw(ctx, facts, insertSet(visiting, k), fact.rhs);   // (rhs', rhs ↔ rhs')
+						form2 = rhsRw.first;
+						// P ↔ form2 : the fact (P ↔ rhs) then, if rhs rewrote further, bitri with (rhs ↔ form2).
+						proof = if (fact.rhs == form2) fact.proof
+							else RuProofStep(s2id_("bitri"), [fact.proof, rhsRw.second], ruEqzStmt(ctx, form, form2));
+						Pair(form2, proof);
+					}
+			}
+		RuPNot(a): { r = ruEqzRw(ctx, facts, visiting, a); Pair(RuPNot(r.first), cong1("notbii", r.second, form, RuPNot(r.first))); }
+		RuPAnd(a, b): { ra = ruEqzRw(ctx, facts, visiting, a); rb = ruEqzRw(ctx, facts, visiting, b); f2 = RuPAnd(ra.first, rb.first); Pair(f2, cong2("anbi12i", ra.second, rb.second, form, f2)); }
+		RuPOr(a, b):  { ra = ruEqzRw(ctx, facts, visiting, a); rb = ruEqzRw(ctx, facts, visiting, b); f2 = RuPOr(ra.first, rb.first);  Pair(f2, cong2("orbi12i", ra.second, rb.second, form, f2)); }
+		RuPImp(a, b): { ra = ruEqzRw(ctx, facts, visiting, a); rb = ruEqzRw(ctx, facts, visiting, b); f2 = RuPImp(ra.first, rb.first); Pair(f2, cong2("imbi12i", ra.second, rb.second, form, f2)); }
+		RuPIff(a, b): { ra = ruEqzRw(ctx, facts, visiting, a); rb = ruEqzRw(ctx, facts, visiting, b); f2 = RuPIff(ra.first, rb.first); Pair(f2, cong2("bibi12i", ra.second, rb.second, form, f2)); }
+		RuPTrue():  Pair(form, RuProofStep(s2id_("biid"), [], ruEqzStmt(ctx, form, form)));
+		RuPFalse(): Pair(form, RuProofStep(s2id_("biid"), [], ruEqzStmt(ctx, form, form)));
+	}
+}
+
+// ---- orchestration ---------------------------------------------------------
+ruEqualizerPropTactic(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp) -> Maybe<RuProverTactic> {
+	facts = ruUnfoldFacts(em.math, em.env, stmtClass, arrayPush(hyps, goal));
+	// atom→subtree nodes over goal + hyps + every fact's biconditional, so ruKForm2Exp can rebuild
+	// any atom that appears after rewriting.
+	atomNodes = fold(concat(hyps, map(facts, \f -> f.first)), ruPAtomNodes(conn, goal), \acc, e -> mergeTree(acc, ruPAtomNodes(conn, e)));
+	ctx = RuKEmitCtx(conn, wff, stmtClass, atomNodes, makeTree());
+	// factMap: compound-atom key → (rewritten-to RHS, proof of the biconditional).
+	factMap = fold(facts, makeTree(), \acc, f -> {
+		switch (ruPAtomize(conn, f.first)) {   // f.first = ( P ↔ RHS )
+			RuPIff(lhs, rhs): switch (lhs) { RuPAtom(k): setTree(acc, k, RuEqzFact(rhs, f.second)); default: acc; };
+			default: acc;
+		}
+	});
+	goalForm = ruPAtomize(conn, goal);
+	rw       = ruEqzRw(ctx, factMap, makeSet(), goalForm);   // (goal', goal ↔ goal')
+	goalForm2 = rw.first;
+	goal2Exp  = ruKForm2Exp(ctx, goalForm2);
+	// Prove the residual goal' over the (now base-atom) signature. A reflexive ↔ closes by biid.
+	residual : Maybe<RuProofTree> = switch (goalForm2) {
+		RuPIff(a, b): if (a == b) Some(RuProofStep(s2id_("biid"), [], RuStmt(stmtClass, [goal2Exp], -1)))
+			else ruKalmarSkeleton(conn, wff, stmtClass, hyps, goal2Exp);
+		default: ruKalmarSkeleton(conn, wff, stmtClass, hyps, goal2Exp);
+	};
+	switch (residual) {
+		None(): None();
+		Some(goal2Tree): {
+			// goal from goal' (residual) and (goal ↔ goal') via mpbir: ps, (ph↔ps) ⊢ ph.
+			full = if (goalForm2 == goalForm) goal2Tree   // nothing rewritten: residual already proves goal
+				else RuProofStep(s2id_("mpbir"), [goal2Tree, rw.second], RuStmt(stmtClass, [ruKForm2Exp(ctx, goalForm)], -1));
+			switch (full) {
+				RuProofStep(__, __, __): Some(ruKalmarDirectTactic(RuProof(ruEmptyVarsDisjs, ruMakeLinearProof(full), -1)));
+				RuProofHyp(__, __): None();
+			}
+		}
+	}
+}
