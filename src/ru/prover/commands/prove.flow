@@ -31,6 +31,7 @@ ruCommProve = RuComm(
 			RuCommArg("forward-closure-depth", true,  "shallow forward proof search: depth of premise closure (0 disables; 1-3 typical)", "0"),
 			RuCommArg("forward-closure-size",  true,  "max number of facts in the forward closure index",                               "1024"),
 			RuCommArg("tactic",                true,  "tactic DSL expression; if empty, bounded-bfs(max-depth, max-size) is used",      ""),
+			RuCommArg("steps",                 true,  "1 = prove each open `?` proof step (gap) and install it, instead of the whole statement", "0"),
 			RuCommArg("min-index-rule-nodes",  true,  "min rule-node count for step index entries (1 = index all steps)",                 "1"),
 			RuCommArg("relevance-depth",       true,  "SInE premise-selection rounds (0 = off = whole foundation; 1-3 typical)",          "0"),
 			RuCommArg("relevance-tolerance",   true,  "SInE trigger tolerance (>=1; higher = more premises kept)",                        "1.2"),
@@ -99,12 +100,17 @@ ruRunProve(unit : RuUnit) -> Maybe<RuState> {
 		} else default_builder;
 
 		per_th_ms      = ruParseTime(ruTaskStringArg(task, "time-limit", "60s"));
+		steps_mode     = ruTaskBoolArg(task, "steps", false);
 		proved_count   = ref 0;
 		finished_count = ref 0;
+		steps_closed   = ref 0;
+		steps_total    = ref 0;
 		started_ids    : ref [int] = ref [];
 		proved_ids     : ref [int] = ref [];
 		inc_proved     = ruAtomicIntInc(proved_count);
 		inc_finished   = ruAtomicIntInc(finished_count);
+		add_closed     = ruAtomicIntAdd(steps_closed);
+		add_total      = ruAtomicIntAdd(steps_total);
 		push_started   = ruAtomicRefArrayPush(started_ids);
 		push_proved    = ruAtomicRefArrayPush(proved_ids);
 
@@ -114,6 +120,19 @@ ruRunProve(unit : RuUnit) -> Maybe<RuState> {
 			push_started(th.info.id);
 			// Cap at per_th_ms so retries cannot exceed the user-intended per-theorem limit.
 			capped_limit = min(time_limit, per_th_ms);
+			if (steps_mode) {
+				// Per-step proving: close each open `?` gap `(hyps + prior steps) ⊢ step.stmt`
+				// and install the found proof as a lemma step. A theorem counts as "proved"
+				// only when EVERY step closes (the verifier then sees no problem steps).
+				r = ruProveTheoremSteps(th, index, builder, capped_limit, task.args, math, env1);
+				th2 = r.first; nclosed = r.second.first; ntotal = r.second.second;
+				inc_finished(1);
+				add_closed(nclosed); add_total(ntotal);
+				if (ntotal > 0 && nclosed == ntotal) { inc_proved(1); push_proved(th.info.id); };
+				// No outer normalize: each gap proof is normalized self-contained inside
+				// ruProveTheoremSteps, so its fresh vars/disjs stay in the lemma sub-proof.
+				RuMappedDecl(true, nclosed > 0, th2);
+			} else {
 			goal = if (ruTheoremIsProved(th)) ruProofQedStep(th.proof)
 			       else RuStep(-1, -1, [], th.infer.prop, ruNoProof, -1);
 			prover_task = RuProverTask(th.info, ruDoneTactic, id2s(th.info.id), task.args, th.infer.hyps, goal);
@@ -137,6 +156,7 @@ ruRunProve(unit : RuUnit) -> Maybe<RuState> {
 				None(): {
 										RuMappedDecl(true, false, decl);
 				}
+			}
 			}
 		};
 
@@ -164,13 +184,20 @@ ruRunProve(unit : RuUnit) -> Maybe<RuState> {
 					"prove",
 					\decl -> ruTargetPredicate(target)(decl) && ruDeclIsTheorem(decl),
 					\__ -> 1.0,
-					\ -> "proved: " + i2s(^proved_count) + " theorems"
+					\ -> if (steps_mode)
+							"closed " + i2s(^steps_closed) + "/" + i2s(^steps_total) + " steps, " + i2s(^proved_count) + " fully proved"
+							else "proved: " + i2s(^proved_count) + " theorems"
 				),
 				prove_fn
 			)
 		);
 		// Compute not-proved as started − proved (catches both search failures
 		// and theorems that timed out before prove_fn could complete).
+		if (steps_mode) {
+			st = ^steps_total; sc = ^steps_closed;
+			env.out.println("prove steps: closed " + i2s(sc) + "/" + i2s(st) + " steps = " +
+				i2s(if (st == 0) 0 else 100 * sc / st) + "%, " + i2s(^proved_count) + " theorems fully proved");
+		};
 		proved_set = buildSet(^proved_ids);
 		not_proved = set2array(fold(^started_ids, makeSet(), \acc, id ->
 			if (containsSet(proved_set, id)) acc else insertSet(acc, id)
@@ -185,6 +212,76 @@ ruRunProve(unit : RuUnit) -> Maybe<RuState> {
 				Pair("failed-theorems", flow(map(not_proved, id2s)))
 			]))
 		))
+	}
+}
+
+// Prove each open `?` step of a theorem skeleton in order. For step i the gap is
+// `(hyps + prior steps) ⊢ step.stmt`; on success the found sub-proof is installed as a
+// LEMMA step (assertion = ruStepLemma) whose refs list the premises in the SAME order the
+// prover saw them — RuHypRef for the theorem's hyps, then RuStepRef for the prior steps —
+// so the sub-proof's hyp-refs resolve correctly at verify time (ruRefPremise). Returns the
+// updated theorem and (steps closed, steps total). Already-closed steps are kept as-is.
+ruProveTheoremSteps(
+	th : RuTheorem, index : RuIndex<RuAssertion>, builder : RuTacticBuilder,
+	limit : double, args : Tree<string, flow>, math : RuMath, env : RuEnv
+) -> Pair<RuTheorem, Pair<int, int>> {
+	hyps  = th.infer.hyps;
+	nh    = length(hyps);
+	// Skeleton `?` step stmts carry class -1; the real statement class is the prop's (`|-`). The
+	// prover's conclusion inherits the goal's class, and lemma refs resolve against the stored step
+	// stmts, so normalize EVERY step's class (open or closed) to the prop class for consistency.
+	scls   = th.infer.prop.class;
+	fixCls = \s : RuStmt -> RuStmt(s with class = scls);
+	steps  = map(th.proof.steps, \st -> RuStep(st with stmt = fixCls(st.stmt)));
+	premHyps = map(hyps, \h -> RuHyp(h.ind, fixCls(h.stmt), h.pos));
+	acc = foldi(steps, Pair([], 0), \i, ac : Pair<[RuStep], int>, step -> {
+		done    = ac.first;
+		nclosed = ac.second;
+		if (step.assertion != ruStepProblem) Pair(arrayPush(done, step), nclosed + 1)
+		else {
+			premises : [RuPremise] = concat(premHyps, take(steps, i));
+			goal = RuStep(-1, ruStepLemma, [], step.stmt, ruNoProof, -1);
+			header = "step " + i2s(i + 1) + " of " + id2s(th.info.id);
+			task = RuProverTask(th.info, ruDoneTactic, header, args, premises, goal);
+			penv_pre = ruInitProverEnv(task, math, env, index, limit);
+			built = builder.build(penv_pre);
+			penv0 = built.first;
+			penv0.tactic := Some(built.second);
+			penv2 = ruProve(ruExpandHyp(penv0.tree.root, penv0));
+			switch (ruProverEnvProof(penv2.tree)) {
+				Some(pf): {
+					refs : [RuRef] = concat(
+						map(enumFromTo(0, nh - 1), \j -> RuHypRef(j)),
+						map(enumFromTo(0, i - 1),  \j -> RuStepRef(j))
+					);
+					// Make the gap proof self-contained: normalize it as a standalone derivation
+					// `(premises ⊢ step.stmt)` so its own fresh setvars + disjoint provisos (the
+					// equalizer's goal-side ⊆/= unfold) land IN the sub-proof's vars — the verifier
+					// checks a lemma step's sub-proof with only its own vars, not the outer theorem's.
+					tmpTh = RuTheorem(th.info, RuInference(ruEmptyVarsDisjs, premises2hyps(premises), step.stmt), makeSet(), pf);
+					subProof = ruNormalizeTheoremVarsDisjs(tmpTh).proof;
+					closed = RuStep(step with assertion = ruStepLemma, refs = refs, proof = subProof);
+					Pair(arrayPush(done, closed), nclosed + 1);
+				}
+				None(): Pair(arrayPush(done, step), nclosed);
+			}
+		}
+	});
+	Pair(
+		RuTheorem(th with proof = RuProof(th.proof with steps = acc.first)),
+		Pair(acc.second, length(steps))
+	);
+}
+
+// Premises (hyps ++ prior steps) re-expressed as positional hyps for the standalone sub-proof.
+premises2hyps(premises : [RuPremise]) -> [RuHyp] {
+	mapi(premises, \j, p -> RuHyp(j, ruPremiseStmt(p), -1));
+}
+
+ruPremiseStmt(p : RuPremise) -> RuStmt {
+	switch (p) {
+		RuHyp(__, stmt, __):        stmt;
+		RuStep(__, __, __, stmt, __, __): stmt;
 	}
 }
 
