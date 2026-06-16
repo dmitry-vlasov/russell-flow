@@ -2,6 +2,10 @@ import ru/prover/tactics/kalmar;
 import ru/prover/tactics/unfold;
 import ru/prover/core/controls;
 import ru/proof_tree;
+import ru/subst;
+import ru/util/exp;
+import ru/util/src2s;
+import ru/verify/math;
 import base/ids;
 import ds/set;
 
@@ -60,6 +64,82 @@ ruEqzRw(ctx : RuKEmitCtx, facts : Tree<string, RuEqzFact>, visiting : Set<string
 	}
 }
 
+// ---- equality facts (eleq1/eleq2) ------------------------------------------
+// An equality hypothesis `a = b` lets a membership atom be rewritten across the equality: from
+// `a=b` and `eleq1/eleq2` derive the biconditional `(t∈a) ↔ (t∈b)` (or `(a∈s)↔(b∈s)`), proven by
+// ax-mp with the hypothesis. These join the Kalmár assembly as PROVEN premises (the equality
+// analogue of unfold facts). Closes gaps like `a=b, x∈a ⊢ x∈b`.
+
+ruEqSpan(nodes : [RuExpNode], i : int) -> int {
+	switch (nodes[i]) {
+		RuVar(__, __): i + 1;
+		RuRuleNode(__, al): fold(enumFromTo(1, ruArityLen2Arity(al)), i + 1, \p, __ -> ruEqSpan(nodes, p));
+	}
+}
+ruEqHead(e : RuExp) -> int {
+	if (e.nodes == []) -1 else switch (e.nodes[0]) { RuRuleNode(it, __): ruIdType2Id(it); RuVar(__, __): -1; };
+}
+// the two argument subexprs of a binary-rooted expression (root at 0, args at 1 and span(1)).
+ruEqArgs(e : RuExp) -> Pair<RuExp, RuExp> {
+	nodes = e.nodes;
+	m = ruEqSpan(nodes, 1);
+	Pair(RuExp(subrange(nodes, 1, m - 1), -1), RuExp(subrange(nodes, m, length(nodes) - m), -1));
+}
+ruEqKey(e : RuExp) -> string {
+	strGlue(map(e.nodes, \n -> switch (n) { RuRuleNode(it, __): "R" + i2s(ruIdType2Id(it)); RuVar(id, t): "V" + i2s(id) + "#" + i2s(t); }), ",");
+}
+// all `( t ∈ S )` subtrees of an expression.
+ruEqMembAtoms(e : RuExp, wcelId : int) -> [RuExp] {
+	nodes = e.nodes;
+	filtermap(enumFromTo(0, length(nodes) - 1), \i ->
+		if (switch (nodes[i]) { RuRuleNode(it, __): ruIdType2Id(it) == wcelId; RuVar(__, __): false; })
+			Some(RuExp(subrange(nodes, i, ruEqSpan(nodes, i) - i), -1)) else None());
+}
+
+RuEqHyp(idx : int, hyp : RuExp, a : RuExp, b : RuExp);
+
+// Build an expression `rule(args...)` (prefix nodes; len = children-node count, the ruKForm2Nodes
+// convention the verifier accepts). Used to construct the eleq instance expressions directly.
+ruEqMkRule(rule : int, wff : int, args : [RuExp]) -> RuExp {
+	argNodes = concatA(map(args, \a -> a.nodes));
+	RuExp(concat([ruMakeRuleNode(rule, wff, length(args), length(argNodes))], argNodes), -1);
+}
+
+ruEqualityFacts(em : RuEnvMath, stmtClass : int, hyps : [RuExp], goal : RuExp) -> [Pair<RuExp, RuProofTree>] {
+	wceqId = s2id("wceq"); wcelId = s2id("wcel"); wbId = s2id("wb"); wiId = s2id("wi");
+	wff    = tp2id_("wff");
+	eleq1Id = s2id_("eleq1"); eleq2Id = s2id_("eleq2");
+	eqs = filtermapi(hyps, \i, h -> if (ruEqHead(h) != wceqId) None() else { ar = ruEqArgs(h); Some(RuEqHyp(i, h, ar.first, ar.second)); });
+	if (eqs == []) []
+	else {
+		atoms = concatA(map(arrayPush(hyps, goal), \e -> ruEqMembAtoms(e, wcelId)));
+		raw = concatA(map(eqs, \eq ->
+			filtermap(atoms, \atom -> {
+				ar   = ruEqArgs(atom);   // (element, set)
+				elem = ar.first; set = ar.second;
+				ka = ruEqKey(eq.a); kb = ruEqKey(eq.b);
+				// a fact `(p ↔ q)` proven by `lemmaId` (eleq1/eleq2): ax-mp(eq-hyp, lemmaId-instance),
+				// where the instance is the (directly constructed) `(a=b) → (p↔q)`.
+				mk = \lemmaId, p, q -> {
+					factExp = ruEqMkRule(wbId, wff, [p, q]);
+					impl    = ruEqMkRule(wiId, wff, [eq.hyp, factExp]);
+					proof   = RuProofStep(s2id_("ax-mp"), [
+						RuProofHyp(eq.idx, RuStmt(stmtClass, [eq.hyp], -1)),
+						RuProofStep(lemmaId, [], RuStmt(stmtClass, [impl], -1))
+					], RuStmt(stmtClass, [factExp], -1));
+					Pair(factExp, proof);
+				};
+				if (ruEqKey(set) == ka || ruEqKey(set) == kb)             // equality in the SET position → eleq2
+					Some(mk(eleq2Id, ruEqMkRule(wcelId, wff, [elem, eq.a]), ruEqMkRule(wcelId, wff, [elem, eq.b])))
+				else if (ruEqKey(elem) == ka || ruEqKey(elem) == kb)      // equality in the ELEMENT position → eleq1
+					Some(mk(eleq1Id, ruEqMkRule(wcelId, wff, [eq.a, set]), ruEqMkRule(wcelId, wff, [eq.b, set])))
+				else None();
+			})
+		));
+		getTreeValues(pairs2tree(map(raw, \f -> Pair(ruEqKey(f.first), f))));   // dedup by fact structure
+	}
+}
+
 // ---- orchestration ---------------------------------------------------------
 ruEqualizerPropTactic(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp) -> Maybe<RuProverTactic> {
 	facts = ruUnfoldFacts(em.math, em.env, stmtClass, arrayPush(hyps, goal));
@@ -78,11 +158,18 @@ ruEqualizerPropTactic(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClas
 	rw       = ruEqzRw(ctx, factMap, makeSet(), goalForm);   // (goal', goal ↔ goal')
 	goalForm2 = rw.first;
 	goal2Exp  = ruKForm2Exp(ctx, goalForm2);
+	// Equality hyps -> proven biconditional premises (eleq1/eleq2), added to the Kalmár assembly as
+	// extra hyps at indices [|hyps|, |hyps|+|eqFacts|) and spliced with their ax-mp proofs.
+	eqFacts    = ruEqualityFacts(em, stmtClass, hyps, goal);
+	eqFactExps = map(eqFacts, \f -> f.first);
+	mkResidual = \ -> maybeMap(
+		ruKalmarSkeleton(conn, wff, stmtClass, concat(hyps, eqFactExps), goal2Exp),
+		\tree -> ruUnfoldSplice(tree, length(hyps), map(eqFacts, \f -> f.second))
+	);
 	// Prove the residual goal' over the (now base-atom) signature. A reflexive ↔ closes by biid.
 	residual : Maybe<RuProofTree> = switch (goalForm2) {
-		RuPIff(a, b): if (a == b) Some(RuProofStep(s2id_("biid"), [], RuStmt(stmtClass, [goal2Exp], -1)))
-			else ruKalmarSkeleton(conn, wff, stmtClass, hyps, goal2Exp);
-		default: ruKalmarSkeleton(conn, wff, stmtClass, hyps, goal2Exp);
+		RuPIff(a, b): if (a == b) Some(RuProofStep(s2id_("biid"), [], RuStmt(stmtClass, [goal2Exp], -1))) else mkResidual();
+		default: mkResidual();
 	};
 	switch (residual) {
 		None(): None();
