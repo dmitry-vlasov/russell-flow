@@ -55,11 +55,7 @@ export {
 		wff       : int,
 		stmtClass : int,
 		atomNodes : Tree<string, [RuExpNode]>,
-		litIndex  : Tree<RuPForm, int>,
-		// Per-valuation memo: conclusion RuPForm → its emitted RuKT. Collapses the Kalmár lemma's
-		// repeated sub-conclusions to a shared DAG (MUST be fresh per valuation — the literal-hyp
-		// context differs, so a proof of C under one valuation is unsound under another).
-		memo      : ref Tree<RuPForm, RuKT>
+		litIndex  : Tree<RuPForm, int>
 	);
 
 	// RuPForm → real RuExp (atoms spliced from their original subtrees, connectives freshly built).
@@ -156,20 +152,7 @@ ruKmp2c(ctx : RuKEmitCtx, p0 : RuKProof, p1 : RuKProof, closedName : string, con
 	ruKmp(ctx, ruKEmit(ctx, p1), t1, concl);
 }
 
-// Memoized by conclusion (within a valuation): a sub-conclusion proved once is shared, turning the
-// exponentially-redundant Kalmár tree into a DAG (the build was the bottleneck, not linearization).
 ruKEmit(ctx : RuKEmitCtx, node : RuKProof) -> RuKT {
-	switch (lookupTree(^(ctx.memo), node.concl)) {
-		Some(t): t;
-		None(): {
-			t = ruKEmitDo(ctx, node);
-			ctx.memo := setTree(^(ctx.memo), node.concl, t);
-			t;
-		}
-	}
-}
-
-ruKEmitDo(ctx : RuKEmitCtx, node : RuKProof) -> RuKT {
 	c  = node.concl;
 	ps = node.premises;
 	r  = node.rule;
@@ -296,27 +279,12 @@ ruKBuildNotImp(ctx : RuKEmitCtx, pX : RuKProof, pNotY : RuKProof) -> RuKT {
 	ruKmp(ctx, conj, fwd, notImp);
 }
 
-// Emit the typed pure-MP term as a concrete RuProofTree. Memoized by conclusion so a shared RuKT
-// DAG stays a DAG (shared RuProofStep references) instead of being re-expanded into a 6^n tree —
-// flow keeps the shared references, so memory is O(distinct conclusions). The pruning linearizer
-// (ruMakeLinearProof) then walks the DAG in O(distinct conclusions) too.
+// Emit the typed pure-MP term as a concrete RuProofTree.
 ruKT2Tree(ctx : RuKEmitCtx, t : RuKT) -> RuProofTree {
-	ruKT2TreeM(ctx, t, ref makeTree());
-}
-
-ruKT2TreeM(ctx : RuKEmitCtx, t : RuKT, memo : ref Tree<RuPForm, RuProofTree>) -> RuProofTree {
-	c = ruKTConcl(t);
-	switch (lookupTree(^memo, c)) {
-		Some(r): r;
-		None(): {
-			r = switch (t) {
-				RuKTHyp(idx, __):      RuProofHyp(idx, ruKStmt(ctx, c));
-				RuKTAx(name, __):      RuProofStep(s2id_(name), [], ruKStmt(ctx, c));
-				RuKTMp(ante, imp, __): RuProofStep(s2id_("ax-mp"), [ruKT2TreeM(ctx, ante, memo), ruKT2TreeM(ctx, imp, memo)], ruKStmt(ctx, c));
-			};
-			memo := setTree(^memo, c, r);
-			r;
-		}
+	switch (t) {
+		RuKTHyp(idx, c):       RuProofHyp(idx, ruKStmt(ctx, c));
+		RuKTAx(name, c):       RuProofStep(s2id_(name), [], ruKStmt(ctx, c));
+		RuKTMp(ante, imp, c):  RuProofStep(s2id_("ax-mp"), [ruKT2Tree(ctx, ante), ruKT2Tree(ctx, imp)], ruKStmt(ctx, c));
 	}
 }
 
@@ -325,7 +293,7 @@ ruKalmarLemma(conn : RuPConnectives, wff : int, stmtClass : int, goal : RuExp, v
 	atomNodes = ruPAtomNodes(conn, goal);
 	lits      = ruKLiterals(val, f);
 	litIndex  = foldi(lits, makeTree(), \i, acc, lit -> setTree(acc, lit, i));
-	ctx       = RuKEmitCtx(conn, wff, stmtClass, atomNodes, litIndex, ref makeTree());
+	ctx       = RuKEmitCtx(conn, wff, stmtClass, atomNodes, litIndex);
 	hyps      = mapi(lits, \i, lit -> RuHyp(i, ruKStmt(ctx, lit), -1));
 	qed       = ruKStmt(ctx, ruKLitForm(val, f));
 	RuKalmarLemma(hyps, qed, ruKT2Tree(ctx, ruKEmit(ctx, ruKLit(val, f))));
@@ -336,25 +304,6 @@ ruKalmarLemma(conn : RuPConnectives, wff : int, stmtClass : int, goal : RuExp, v
 // a pure-MP proof of (ante → C) that no longer uses that hypothesis. Three cases — and the output is
 // itself pure-MP (ax-mp + {id, ax-1, ax-2}), so nested deduction-theorem levels compose.
 ruKDeduct(ante : RuPForm, hypIndex : int, t : RuKT) -> RuKT {
-	// Per-call memo by the INPUT conclusion: the output proves (ante → concl(t)), so two input nodes
-	// with the same conclusion yield the same target and can share — collapsing the deduction
-	// theorem's ~3× blowup over a tree with heavily repeated sub-conclusions.
-	ruKDeductM(ante, hypIndex, t, ref makeTree());
-}
-
-ruKDeductM(ante : RuPForm, hypIndex : int, t : RuKT, memo : ref Tree<RuPForm, RuKT>) -> RuKT {
-	c   = ruKTConcl(t);
-	switch (lookupTree(^memo, c)) {
-		Some(r): r;
-		None(): {
-			r = ruKDeductDo(ante, hypIndex, t, memo);
-			memo := setTree(^memo, c, r);
-			r;
-		}
-	}
-}
-
-ruKDeductDo(ante : RuPForm, hypIndex : int, t : RuKT, memo : ref Tree<RuPForm, RuKT>) -> RuKT {
 	c   = ruKTConcl(t);
 	imp = RuPImp(ante, c);
 	switch (t) {
@@ -367,8 +316,8 @@ ruKDeductDo(ante : RuPForm, hypIndex : int, t : RuKT, memo : ref Tree<RuPForm, R
 			// p : ph, q : (ph→ps), c = ps.  ax-2 combines (ante→(ph→ps)) and (ante→ph) → (ante→ps).
 			ph  = ruKTConcl(p);
 			ps  = c;
-			dp  = ruKDeductM(ante, hypIndex, p, memo);   // ante→ph
-			dq  = ruKDeductM(ante, hypIndex, q, memo);   // ante→(ph→ps)
+			dp  = ruKDeduct(ante, hypIndex, p);   // ante→ph
+			dq  = ruKDeduct(ante, hypIndex, q);   // ante→(ph→ps)
 			ax2 = RuKTAx("ax-2", RuPImp(RuPImp(ante, RuPImp(ph, ps)), RuPImp(RuPImp(ante, ph), RuPImp(ante, ps))));
 			t1  = RuKTMp(dq, ax2, RuPImp(RuPImp(ante, ph), RuPImp(ante, ps)));
 			RuKTMp(dp, t1, imp);
@@ -380,8 +329,7 @@ ruKDeductDo(ante : RuPForm, hypIndex : int, t : RuKT, memo : ref Tree<RuPForm, R
 // Emit the Kalmár lemma for valuation `val`, with the atom-literal hyp leaves indexed by `litIdxOf`.
 ruKEmitLemma(ctx : RuKEmitCtx, val : Tree<string, bool>, f : RuPForm, litIdxOf : Tree<string, int>) -> RuKT {
 	litIndex = foldTree(litIdxOf, makeTree(), \atom, idx, acc -> setTree(acc, ruKLitForm(val, RuPAtom(atom)), idx));
-	// FRESH memo per valuation: the literal-hyp context differs, so proofs must not be shared across valuations.
-	ruKEmit(RuKEmitCtx(ctx with litIndex = litIndex, memo = ref makeTree()), ruKLit(val, f));
+	ruKEmit(RuKEmitCtx(ctx with litIndex = litIndex), ruKLit(val, f));
 }
 
 // Recursive atom-elimination. `atoms` are the still-undecided atoms; `assumed` the partial valuation.
@@ -422,17 +370,13 @@ ruKalmarSkeleton(conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuEx
 	goalF = ruPAtomize(conn, goal);
 	hypFs = map(hyps, \h -> ruPAtomize(conn, h));
 	allAtoms = set2array(fold(hypFs, ruPAtoms(goalF), \acc, hf -> mergeSets(acc, ruPAtoms(hf))));
-	// Atom cap: Kalmár's proof has exponentially many DISTINCT intermediate conclusions
-	// (lit₁→…→goal over partial valuations), ~5×/atom — 3 atoms ≈ 4.8k steps, 4 ≈ 15k (7s/3GB),
-	// 5 ≈ 130k (60s/17GB). So decline above 4 (the tactic then yields a no-op and the prover falls
-	// back). A polynomial proof method is the real scaling fix; see [[project_mizar_import]].
-	if (!ruPEntails(hypFs, goalF) || length(allAtoms) > 4) None()
+	if (!ruPEntails(hypFs, goalF) || length(allAtoms) > 12) None()
 	else {
 		atomNodes = fold(hyps, ruPAtomNodes(conn, goal), \acc, h -> mergeTree(acc, ruPAtomNodes(conn, h)));
 		realIdxOf = foldi(hypFs, makeTree(), \i, acc, hf -> setTree(acc, hf, i));
 		litBase   = length(hyps);
 		litIdxOf  = foldi(allAtoms, makeTree(), \i, acc, a -> setTree(acc, a, litBase + i));
-		ctx       = RuKEmitCtx(conn, wff, stmtClass, atomNodes, makeTree(), ref makeTree());  // litIndex + memo set per valuation
+		ctx       = RuKEmitCtx(conn, wff, stmtClass, atomNodes, makeTree());  // litIndex set per valuation
 		kt        = ruKAssemble(ctx, hypFs, realIdxOf, goalF, allAtoms, litIdxOf, makeTree());
 		Some(ruKT2Tree(ctx, kt));
 	}
