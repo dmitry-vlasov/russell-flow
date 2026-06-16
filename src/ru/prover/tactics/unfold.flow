@@ -1,0 +1,178 @@
+import ru/prover/tactics/kalmar;
+import ru/prover/core/controls;
+import ru/prover/core/tree;
+import ru/proof_tree;
+import ru/subst;
+import ru/util/exp;
+import ru/util/src2s;
+import ru/verify/math;
+import base/ids;
+import ds/set;
+
+// The UNFOLD tactic — feeds the propositional closer the facts it needs to assemble. `prop` alone
+// only assembles atoms it is GIVEN; a real gap (e.g. t1_xboole_0 = `x∈(X△Y) ↔ ¬(x∈X ↔ x∈Y)`) has
+// no hypothesis supplying the connecting biconditional. Unfold supplies it: for every compound
+// membership atom `( t ∈ op(args) )` in the goal/hyps, instantiate the foundation's membership lemma
+// for `op` (cun→elun, cin→elin, cdif→eldif, csymdif→elsymdif, csn→elsn, cpr→elpr) at that atom,
+// yielding a biconditional FACT (with its one-step proof = the lemma applied). The A-map foundation
+// makes these instantiable at compound class terms. The facts join the prop assembly; the result is
+// one verified proof, injected directly (no backward search). See [[project_mizar_import]] B-step-2.
+
+export {
+	// Membership-lemma instances relevant to `exps`' compound membership atoms (recursively: a
+	// fact's RHS may expose further compound atoms). Each pair = (instance formula, its proof tree).
+	ruUnfoldFacts(math : RuMath, env : RuEnv, stmtClass : int, exps : [RuExp]) -> [Pair<RuExp, RuProofTree>];
+
+	// The unfold-assisted prop closer as a tactic: gather unfold facts for hyps ⊢ goal, build the
+	// Kalmár skeleton over hyps + facts, splice each fact's hyp-leaf with its proof, inject the
+	// result. None when (hyps + unfold facts) do not propositionally entail the goal.
+	ruUnfoldPropTactic(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int,
+		hyps : [RuExp], goal : RuExp) -> Maybe<RuProverTactic>;
+
+	// (math, env) bundled, to thread through the tactic builder cleanly.
+	RuEnvMath(math : RuMath, env : RuEnv);
+}
+
+// ---- subtree span (flat prefix array, by arity) ----------------------------
+ruUSpanEnd(nodes : [RuExpNode], i : int) -> int {
+	switch (nodes[i]) {
+		RuVar(__, __): i + 1;
+		RuRuleNode(__, arityLen): fold(enumFromTo(1, ruArityLen2Arity(arityLen)), i + 1, \pos, __ -> ruUSpanEnd(nodes, pos));
+	}
+}
+
+ruUNodeId(node : RuExpNode) -> int {
+	switch (node) { RuRuleNode(idType, __): ruIdType2Id(idType); RuVar(__, __): -1; }
+}
+
+// Structural dedup key for an expression (rule id for rule nodes, var id+type for vars).
+ruUKey(e : RuExp) -> string {
+	strGlue(map(e.nodes, \n -> switch (n) {
+		RuRuleNode(idType, __): "R" + i2s(ruIdType2Id(idType));
+		RuVar(id, type):        "V" + i2s(id) + "#" + i2s(type);
+	}), ",");
+}
+
+// ---- membership-lemma registry --------------------------------------------
+// op rule id -> (lemma id, lemma prop exp, lemma membership-LHS pattern exp).
+RuMembLemma(lemmaId : int, prop : RuExp, lhs : RuExp);
+
+ruMembRegistry(math : RuMath) -> Tree<int, RuMembLemma> {
+	pairs = [
+		Pair("cun", "elun"), Pair("cin", "elin"), Pair("cdif", "eldif"),
+		Pair("csymdif", "elsymdif"), Pair("csn", "elsn"), Pair("cpr", "elpr")
+	];
+	fold(pairs, makeTree(), \acc, p -> {
+		opId = s2id(p.first);
+		switch (lookupTree(math.decls.assertions, s2id_(p.second))) {
+			Some(ass): {
+				prop = ruExp(ruMembInfer(ass).prop.exps[0]);
+				// prop = wb( <membership-LHS> , <RHS> ); extract child 0 (the LHS pattern).
+				lhs = ruUChild0(prop);
+				setTree(acc, opId, RuMembLemma(s2id_(p.second), prop, lhs));
+			}
+			None(): acc;
+		}
+	});
+}
+
+ruMembInfer(ass : RuAssertion) -> RuInference {
+	switch (ass) {
+		RuAxiom(__, inf): inf; RuCong(__, inf): inf;
+		RuTheorem(__, inf, __, __): inf; RuDef(__, inf, __, __): inf;
+	}
+}
+
+// First child subtree of a binary-rooted RuExp (the root is at 0, its first child at 1).
+ruUChild0(e : RuExp) -> RuExp {
+	nodes = e.nodes;
+	end = ruUSpanEnd(nodes, 1);
+	RuExp(subrange(nodes, 1, end - 1), -1);
+}
+
+// ---- collect compound membership atoms -------------------------------------
+// Every `( t ∈ S )` subtree whose object S's head rule is a registered set operation.
+ruUMembAtoms(exp : RuExp, wcelId : int, ops : Set<int>) -> [RuExp] {
+	nodes = exp.nodes;
+	filtermap(enumFromTo(0, length(nodes) - 1), \i ->
+		if (ruUNodeId(nodes[i]) != wcelId) None()
+		else {
+			end  = ruUSpanEnd(nodes, i);
+			aEnd = ruUSpanEnd(nodes, i + 1);          // end of the element argument
+			if (aEnd >= end) None()                    // malformed: no object argument
+			else if (!containsSet(ops, ruUNodeId(nodes[aEnd]))) None()
+			else Some(RuExp(subrange(nodes, i, end - i), -1));
+		}
+	);
+}
+
+// ---- unfold ----------------------------------------------------------------
+ruUnfoldFacts(math : RuMath, env : RuEnv, stmtClass : int, exps : [RuExp]) -> [Pair<RuExp, RuProofTree>] {
+	registry = ruMembRegistry(math);
+	wcelId   = s2id("wcel");
+	ops      = buildSet(getTreeKeys(registry));
+	// Iterate to a fixpoint: a fact's RHS may expose further compound membership atoms.
+	ruUnfoldLoop(math, env, stmtClass, registry, wcelId, ops, exps, makeTree(), 6);
+}
+
+ruUnfoldLoop(
+	math : RuMath, env : RuEnv, stmtClass : int, registry : Tree<int, RuMembLemma>,
+	wcelId : int, ops : Set<int>, frontier : [RuExp], seen : Tree<string, Pair<RuExp, RuProofTree>>, fuel : int
+) -> [Pair<RuExp, RuProofTree>] {
+	atoms = concatA(map(frontier, \e -> ruUMembAtoms(e, wcelId, ops)));
+	newFacts = filtermap(atoms, \atom -> {
+		key = ruUKey(atom);
+		if (containsKeyTree(seen, key)) None()
+		else ruUnfoldAtom(registry, wcelId, stmtClass, atom, math, env);
+	});
+	if (newFacts == [] || fuel <= 0) getTreeValues(seen)
+	else {
+		seen1 = fold(newFacts, seen, \acc, f -> setTree(acc, ruUKey(ruUnfoldAtomOf(f)), f));
+		// scan the new facts' instance formulas for further compound atoms.
+		ruUnfoldLoop(math, env, stmtClass, registry, wcelId, ops, map(newFacts, \f -> f.first), seen1, fuel - 1);
+	}
+}
+
+// The membership atom a fact unfolds (= child 0 of its biconditional instance), used as the dedup key.
+ruUnfoldAtomOf(f : Pair<RuExp, RuProofTree>) -> RuExp { ruUChild0(f.first); }
+
+// One atom -> its lemma instance + proof, or None if the lemma does not match.
+ruUnfoldAtom(registry : Tree<int, RuMembLemma>, wcelId : int, stmtClass : int, atom : RuExp, math : RuMath, env : RuEnv) -> Maybe<Pair<RuExp, RuProofTree>> {
+	opId = ruUNodeId(atom.nodes[ruUSpanEnd(atom.nodes, 1)]);   // object's head rule
+	switch (lookupTree(registry, opId)) {
+		None(): None();
+		Some(ml): switch (ruMatchExp(atom, ml.lhs, math, env)) {
+			None(): None();
+			Some(sub): {
+				inst  = ruApplySubst(ml.prop, sub);
+				proof = RuProofStep(ml.lemmaId, [], RuStmt(stmtClass, [inst], -1));
+				Some(Pair(inst, proof));
+			}
+		}
+	}
+}
+
+// ---- splice facts into the Kalmár skeleton ---------------------------------
+// The skeleton treats facts as hyp leaves at indices [base, base+|facts|). Replace each such
+// RuProofHyp with the fact's own proof tree; real-hyp leaves (idx < base) are kept.
+ruUnfoldSplice(tree : RuProofTree, base : int, factProofs : [RuProofTree]) -> RuProofTree {
+	switch (tree) {
+		RuProofHyp(idx, __): if (idx >= base && idx - base < length(factProofs)) factProofs[idx - base] else tree;
+		RuProofStep(ass, children, stmt): RuProofStep(ass, map(children, \c -> ruUnfoldSplice(c, base, factProofs)), stmt);
+	}
+}
+
+ruUnfoldPropTactic(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp) -> Maybe<RuProverTactic> {
+	facts    = ruUnfoldFacts(em.math, em.env, stmtClass, arrayPush(hyps, goal));
+	factExps = map(facts, \f -> f.first);
+	switch (ruKalmarSkeleton(conn, wff, stmtClass, concat(hyps, factExps), goal)) {
+		Some(tree): switch (tree) {
+			RuProofStep(__, __, __): {
+				spliced = ruUnfoldSplice(tree, length(hyps), map(facts, \f -> f.second));
+				Some(ruKalmarDirectTactic(RuProof(ruEmptyVarsDisjs, ruMakeLinearProof(spliced), -1)));
+			}
+			RuProofHyp(__, __): None();   // goal is itself a hypothesis
+		}
+		None(): None();
+	}
+}
