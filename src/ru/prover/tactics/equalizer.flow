@@ -105,38 +105,68 @@ ruEqMkRule(rule : int, wff : int, args : [RuExp]) -> RuExp {
 	RuExp(concat([ruMakeRuleNode(rule, wff, length(args), length(argNodes))], argNodes), -1);
 }
 
+// Relation-fact context: ids + the equality/subset hypotheses to derive facts from.
+RuEqCtx(stmtClass : int, wcelId : int, wbId : int, wiId : int, wff : int,
+	eleq1Id : int, eleq2Id : int, sselId : int, eqs : [RuEqHyp], sss : [RuEqHyp]);
+
 ruEqualityFacts(em : RuEnvMath, stmtClass : int, hyps : [RuExp], goal : RuExp) -> [Pair<RuExp, RuProofTree>] {
-	wceqId = s2id("wceq"); wcelId = s2id("wcel"); wbId = s2id("wb"); wiId = s2id("wi");
-	wff    = tp2id_("wff");
-	eleq1Id = s2id_("eleq1"); eleq2Id = s2id_("eleq2");
-	eqs = filtermapi(hyps, \i, h -> if (ruEqHead(h) != wceqId) None() else { ar = ruEqArgs(h); Some(RuEqHyp(i, h, ar.first, ar.second)); });
-	if (eqs == []) []
+	wceqId = s2id("wceq"); wssId = s2id("wss"); wcelId = s2id("wcel");
+	rel = \rid -> filtermapi(hyps, \i, h -> if (ruEqHead(h) != rid) None() else { ar = ruEqArgs(h); Some(RuEqHyp(i, h, ar.first, ar.second)); });
+	eqs = rel(wceqId);   // `a = b` hypotheses
+	sss = rel(wssId);    // `a ⊆ b` hypotheses
+	if (eqs == [] && sss == []) []
 	else {
+		c = RuEqCtx(stmtClass, wcelId, s2id("wb"), s2id("wi"), tp2id_("wff"),
+			s2id_("eleq1"), s2id_("eleq2"), s2id_("ssel"), eqs, sss);
 		atoms = concatA(map(arrayPush(hyps, goal), \e -> ruEqMembAtoms(e, wcelId)));
-		raw = concatA(map(eqs, \eq ->
-			filtermap(atoms, \atom -> {
-				ar   = ruEqArgs(atom);   // (element, set)
-				elem = ar.first; set = ar.second;
-				ka = ruEqKey(eq.a); kb = ruEqKey(eq.b);
-				// a fact `(p ↔ q)` proven by `lemmaId` (eleq1/eleq2): ax-mp(eq-hyp, lemmaId-instance),
-				// where the instance is the (directly constructed) `(a=b) → (p↔q)`.
-				mk = \lemmaId, p, q -> {
-					factExp = ruEqMkRule(wbId, wff, [p, q]);
-					impl    = ruEqMkRule(wiId, wff, [eq.hyp, factExp]);
-					proof   = RuProofStep(s2id_("ax-mp"), [
-						RuProofHyp(eq.idx, RuStmt(stmtClass, [eq.hyp], -1)),
-						RuProofStep(lemmaId, [], RuStmt(stmtClass, [impl], -1))
-					], RuStmt(stmtClass, [factExp], -1));
-					Pair(factExp, proof);
-				};
-				if (ruEqKey(set) == ka || ruEqKey(set) == kb)             // equality in the SET position → eleq2
-					Some(mk(eleq2Id, ruEqMkRule(wcelId, wff, [elem, eq.a]), ruEqMkRule(wcelId, wff, [elem, eq.b])))
-				else if (ruEqKey(elem) == ka || ruEqKey(elem) == kb)      // equality in the ELEMENT position → eleq1
-					Some(mk(eleq1Id, ruEqMkRule(wcelId, wff, [eq.a, set]), ruEqMkRule(wcelId, wff, [eq.b, set])))
-				else None();
-			})
-		));
-		getTreeValues(pairs2tree(map(raw, \f -> Pair(ruEqKey(f.first), f))));   // dedup by fact structure
+		// Iterate to a fixpoint: a derived fact `(t∈X)→(t∈Y)` exposes the atom `t∈Y`, which may
+		// trigger further facts (e.g. ⊆-transitivity element-chasing X⊆Y, Y⊆Z, t∈X ⊢ t∈Z).
+		ruEqFactLoop(c, atoms, makeTree(), 8);
+	}
+}
+
+// One pass: every relation-fact derivable from the given atoms (deduped by the caller).
+ruEqGenPass(c : RuEqCtx, atoms : [RuExp]) -> [Pair<RuExp, RuProofTree>] {
+	// a fact `factExp` (biconditional or implication) proven by ax-mp(rel-hyp, lemmaId-instance),
+	// the instance being the directly-constructed `(rel-hyp) → factExp`.
+	mk = \relHyp : RuEqHyp, lemmaId, factExp -> {
+		impl  = ruEqMkRule(c.wiId, c.wff, [relHyp.hyp, factExp]);
+		proof = RuProofStep(s2id_("ax-mp"), [
+			RuProofHyp(relHyp.idx, RuStmt(c.stmtClass, [relHyp.hyp], -1)),
+			RuProofStep(lemmaId, [], RuStmt(c.stmtClass, [impl], -1))
+		], RuStmt(c.stmtClass, [factExp], -1));
+		Pair(factExp, proof);
+	};
+	memb = \t, s -> ruEqMkRule(c.wcelId, c.wff, [t, s]);
+	eqRaw = concatA(map(c.eqs, \eq ->
+		filtermap(atoms, \atom -> {
+			ar = ruEqArgs(atom); elem = ar.first; set = ar.second;
+			ka = ruEqKey(eq.a); kb = ruEqKey(eq.b);
+			if (ruEqKey(set) == ka || ruEqKey(set) == kb)             // equality in the SET position → eleq2
+				Some(mk(eq, c.eleq2Id, ruEqMkRule(c.wbId, c.wff, [memb(elem, eq.a), memb(elem, eq.b)])))
+			else if (ruEqKey(elem) == ka || ruEqKey(elem) == kb)      // equality in the ELEMENT position → eleq1
+				Some(mk(eq, c.eleq1Id, ruEqMkRule(c.wbId, c.wff, [memb(eq.a, set), memb(eq.b, set)])))
+			else None();
+		})
+	));
+	// `X ⊆ Y` + `t ∈ X` → the implication fact `(t∈X) → (t∈Y)` via ssel.
+	ssRaw = concatA(map(c.sss, \ss ->
+		filtermap(atoms, \atom -> {
+			ar = ruEqArgs(atom); elem = ar.first; set = ar.second;
+			if (ruEqKey(set) == ruEqKey(ss.a)) Some(mk(ss, c.sselId, ruEqMkRule(c.wiId, c.wff, [memb(elem, ss.a), memb(elem, ss.b)])))
+			else None();
+		})
+	));
+	concat(eqRaw, ssRaw);
+}
+
+ruEqFactLoop(c : RuEqCtx, atoms : [RuExp], seen : Tree<string, Pair<RuExp, RuProofTree>>, fuel : int) -> [Pair<RuExp, RuProofTree>] {
+	newf = filter(ruEqGenPass(c, atoms), \f -> !containsKeyTree(seen, ruEqKey(f.first)));
+	if (newf == [] || fuel <= 0) getTreeValues(seen)
+	else {
+		seen1    = fold(newf, seen, \acc, f -> setTree(acc, ruEqKey(f.first), f));
+		newAtoms = concatA(map(newf, \f -> ruEqMembAtoms(f.first, c.wcelId)));   // atoms exposed by the new facts
+		ruEqFactLoop(c, concat(atoms, newAtoms), seen1, fuel - 1);
 	}
 }
 
