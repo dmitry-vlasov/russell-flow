@@ -414,6 +414,7 @@ ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTactic
 	}
 	else if (n == "ml")              ruTagBuilder("ml", ruDslBuildMl(ast, ctx))
 	else if (n == "apply")           ruTagBuilder("apply", ruDslBuildApply(ast, ctx))
+	else if (n == "ap")              ruTagBuilder("ap", ruDslBuildAp(ast, ctx))
 	else if (n == "prop")            ruTagBuilder("prop", ruDslBuildProp(ast, ctx))
 	else if (n == "linear-guided")   ruTagBuilder("linear-guided", ruDslBuildLinearGuided(ast, ctx))
 	else if (n == "follow-proof")    ruTagBuilder("follow-proof", ruDslBuildFollowProof(ast, ctx))
@@ -508,6 +509,59 @@ ruDslBuildApply(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuild
 			penv.whitelist := aids;
 			Pair(penv, ruBoundedBFSTactic(md, ms));
 		}));
+	}
+}
+
+// ap(<assertion>, <child0>, <child1>, ...): the POSITIONAL, structure-carrying apply — a proof
+// TREE, not a rule set. The assertion is applied at the goal; each child proves the corresponding
+// premise (in order) and is itself an `ap(...)` or the leaf marker `prem` (premise discharged by a
+// hypothesis / prior step). The term mirrors the proof tree exactly, so there is NO search over rule
+// choice: it builds a RuProofStep skeleton and replays it via follow-proof — the engine fills in the
+// statements and threads variables (incl. witness vars like ax-mp's free antecedent). Deterministic;
+// the lattice atom. Whitelist restricts candidate generation to the tree's assertions for speed.
+//   t8 step1:  ap(mpbi, prem, ap(elun))
+//   t8 step2:  ap(ax-mp, prem, ap(ax-mp, ap(mpbi, prem, ap(unss)), ap(ssel)))
+ruApParseTree(ast : RuTacticAst, env : RuEnv) -> Maybe<RuProofTree> {
+	if (ast.name == "prem" || ast.name == "_") Some(RuProofHyp(0, ruNoStmt))
+	else if (ast.name == "ap") {
+		poss = ruDslPositional(ast);
+		if (poss == []) { env.out.error("tactic DSL: ap(...) needs an assertion name", []); None(); }
+		else switch (poss[0]) {
+			RuTacticValLit(s): { env.out.error("tactic DSL: ap: first arg must be an assertion name, got literal " + s, []); None(); }
+			RuTacticValAst(head): {
+				cms = map(tail(poss), \v -> switch (v) {
+					RuTacticValAst(c): ruApParseTree(c, env);
+					RuTacticValLit(s): { env.out.error("tactic DSL: ap: child must be ap(...) or prem, got literal " + s, []); None(); };
+				});
+				if (exists(cms, isNone)) None()
+				else Some(RuProofStep(s2id_(head.name), map(cms, \m -> either(m, RuProofHyp(0, ruNoStmt))), ruNoStmt));
+			}
+		}
+	}
+	else { env.out.error("tactic DSL: ap: expected ap(...) or prem, got '" + ast.name + "'", []); None(); }
+}
+
+ruApTreeAssertions(t : RuProofTree) -> [int] {
+	switch (t) {
+		RuProofStep(a, ch, __): concat([a], concatA(map(ch, ruApTreeAssertions)));
+		RuProofHyp(__, __):     [];
+	}
+}
+
+ruDslBuildAp(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+	switch (ruApParseTree(ast, ctx.env)) {
+		None(): None();
+		Some(tree): switch (tree) {
+			RuProofHyp(__, __): { ctx.env.out.error("tactic DSL: ap root cannot be 'prem'", []); None(); }
+			RuProofStep(a, ch, s): {
+				skel = RuProofStep(a, ch, s);
+				wl   = uniq(ruApTreeAssertions(skel));
+				Some(RuTacticBuilder(\penv -> {
+					penv.whitelist := wl;
+					Pair(penv, ruFollowProofTactic(skel));
+				}));
+			}
+		}
 	}
 }
 
