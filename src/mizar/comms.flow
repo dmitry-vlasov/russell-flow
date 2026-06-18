@@ -7,6 +7,8 @@ import mizar/notation;
 import mptp/src;
 import mptp/mptp2ru;
 import ru/parse/exps/sources;
+import ru/util/src2s;
+import ru/util/exp;
 
 // Commands for the Mizar analyzed-XML front-end. The proof corpus lives in the MML
 // dir as per-article `.xml` (+ `.atr` for constructor resolution). Milestone 1:
@@ -222,13 +224,92 @@ ruRunMizarToRu(unit : RuUnit) -> Maybe<RuState> {
 					env.out.error("mizar-to-ru: failed to parse '" + module + "' against '" + foundation + "' (load the foundation first via read-ru)", []);
 					None();
 				} else {
-					nproofs = length(filter(thms, \t -> length(t.steps) > 1));
+					dedup = ruMizDedupEnvAxioms(articleSrc, ruMizFoundationCanon(state));
+						articleSrc1 = dedup.first;
+						nproofs = length(filter(thms, \t -> length(t.steps) > 1));
 					env.out.println("mizar-to-ru: '" + module + "' = " + i2s(length(thms)) + " theorems (" +
 						i2s(nproofs) + " with multi-step proofs)" +
-						(if (envDecls == []) "" else " + " + i2s(length(envDecls)) + " env axioms") + " importing '" + foundation + "'");
-					Some(RuState(state with ru = setTree(state.ru, articleSrc.info.id, articleSrc)));
+						(if (envDecls == []) "" else " + " + i2s(length(envDecls)) + " env axioms") +
+							(if (dedup.second == 0) "" else " (" + i2s(dedup.second) + " redundant axioms dropped — already in foundation)") +
+							" importing '" + foundation + "'");
+					Some(RuState(state with ru = setTree(state.ru, articleSrc1.info.id, articleSrc1)));
 				}
 			}
 		}
 	}
+}
+
+// ---- Foundation dedup: drop env axioms whose statement already appears in the foundation ----
+
+// Canonical form of an assertion statement for cross-foundation matching: strip the leading
+// ∀-closure, alpha-rename vars by first occurrence, and merge the individual sorts (setvar/set/
+// class → "i") so a setvar-closed Mizar axiom matches a class-var foundation theorem. Two
+// assertions share a canonical form iff they are the same formula up to variable names and the
+// setvar↔class direction. Empty for non-statements. Matching here is used only to DROP redundant
+// env axioms, so it is incompleteness-safe (a wrong match can never make a false proof verify).
+ruMizCanonForm(stmt : RuStmt) -> string {
+	if (stmt.exps == []) "" else ruMizCanonNodes(ruMizStripUniv(ruExp(stmt.exps[0])).nodes);
+}
+
+// Drop a leading chain of ∀ (wal) binders: the env axioms are universally closed, the foundation
+// forms have free metavars (ax-ext is free in x,y; sstr in classes A,B,C).
+ruMizStripUniv(e : RuExp) -> RuExp {
+	if (e.nodes == []) e
+	else switch (e.nodes[0]) {
+		RuVar(__, __): e;
+		RuRuleNode(idType, arityLen):
+			if (id2s(ruIdType2Id(idType)) == "wal" && ruArityLen2Arity(arityLen) == 2) {
+				s1 = ruMizSubtreeSize(e.nodes, 1); // size of the bound-var subtree
+				ruMizStripUniv(RuExp(subrange(e.nodes, 1 + s1, length(e.nodes) - 1 - s1), -1));
+			} else e;
+	}
+}
+
+// Node count of the prefix-encoded subtree rooted at index i.
+ruMizSubtreeSize(nodes : [RuExpNode], i : int) -> int {
+	if (i >= length(nodes)) 0
+	else switch (nodes[i]) {
+		RuVar(__, __): 1;
+		RuRuleNode(__, arityLen): fold(enumFromTo(0, ruArityLen2Arity(arityLen) - 1), 1, \pos, __ -> pos + ruMizSubtreeSize(nodes, i + pos));
+	}
+}
+
+ruMizCanonNodes(nodes : [RuExpNode]) -> string {
+	vm = ref makeTree(); cnt = ref 0;
+	concatStrings(map(nodes, \n -> switch (n) {
+		RuRuleNode(idType, arityLen): id2s(ruIdType2Id(idType)) + "/" + i2s(ruArityLen2Arity(arityLen)) + " ";
+		RuVar(id, type): {
+			idx = switch (lookupTree(^vm, id)) {
+				Some(i): i;
+				None(): { c = ^cnt; vm := setTree(^vm, id, c); cnt := c + 1; c; };
+			};
+			"v" + i2s(idx) + ":" + ruMizCanonSort(type) + " ";
+		}
+	}));
+}
+
+ruMizCanonSort(t : int) -> string {
+	n = id2s(t);
+	if (n == "setvar" || n == "set" || n == "class") "i" else n;
+}
+
+// Canonical forms of every foundation AXIOM/THEOREM currently loaded (the article isn't in state yet).
+ruMizFoundationCanon(state : RuState) -> Set<string> {
+	foldTree(state.ru, makeSet(), \__, s, acc ->
+		fold(s.decls, acc, \ac, d -> switch (d) {
+			RuAxiom(__, infer):       insertSet(ac, ruMizCanonForm(infer.prop));
+			RuTheorem(__, infer, __, __): insertSet(ac, ruMizCanonForm(infer.prop));
+			default: ac;
+		}));
+}
+
+// Drop every env AXIOM in the article whose statement matches a foundation assertion. The article's
+// own theorems (RuTheorem) and article-local definitions (axioms over operators absent from the
+// foundation) are untouched. Returns the filtered source and the number dropped.
+ruMizDedupEnvAxioms(src : RuSource, foundation : Set<string>) -> Pair<RuSource, int> {
+	kept = filter(src.decls, \d -> switch (d) {
+		RuAxiom(__, infer): !containsSet(foundation, ruMizCanonForm(infer.prop));
+		default: true;
+	});
+	Pair(RuSource(src with decls = kept), length(src.decls) - length(kept));
 }
