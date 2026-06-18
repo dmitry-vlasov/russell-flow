@@ -416,6 +416,7 @@ ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTactic
 	else if (n == "apply")           ruTagBuilder("apply", ruDslBuildApply(ast, ctx))
 	else if (n == "ap")              ruTagBuilder("ap", ruDslBuildAp(ast, ctx))
 	else if (n == "prop")            ruTagBuilder("prop", ruDslBuildProp(ast, ctx))
+	else if (n == "checker")         ruTagBuilder("checker", ruDslBuildChecker(ast, ctx))
 	else if (n == "linear-guided")   ruTagBuilder("linear-guided", ruDslBuildLinearGuided(ast, ctx))
 	else if (n == "follow-proof")    ruTagBuilder("follow-proof", ruDslBuildFollowProof(ast, ctx))
 	else if (n == "oracle")          ruTagBuilder("oracle", ruDslBuildOracle(ast))
@@ -481,6 +482,61 @@ ruDslBuildProp(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilde
 			None():  ruDoneTactic;
 		};
 		Pair(penv, tactic);
+	}))
+}
+
+// checker(max-depth=D, max-size=S): the Checker tactic — directed structure + limited BFS, no Kalmár.
+// (1) strip the goal's leading ∀ (ax-gen), (2) unfold compound membership atoms + rewrite the matrix to
+// base atoms via linear biconditional congruence (the equalizer's directed part, proof of matrix↔goal'),
+// (3) replay that skeleton via follow-proof — ax-gen × N over mpbir(<residual OPEN>, <rewrite proof>) —
+// which leaves ONLY the residual goal' as an open leaf, (4) close the residual with bounded BFS over a
+// SMALL propositional-lemma scope. Backward search throughout; nothing is injected.
+ruDslBuildChecker(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+	md = ruDslGetInt(ast, "max-depth", 0, 8);
+	ms = ruDslGetInt(ast, "max-size",  1, 65536);
+	// The limited propositional scope the residual BFS may use.
+	propScope = map(["mpbi", "mpbir", "biimpi", "biimpri", "ax-mp", "syl", "jca", "simpl", "simpr",
+		"pm3.2i", "pm3.24", "exmid", "id", "con2i", "notnotr", "pm2.21i", "jaoi", "orcd", "olcd",
+		"pm2.21", "noti", "imp", "ex", "mt2", "mt3"], s2id_);
+	Some(RuTacticBuilder(\penv -> {
+		task      = penv.conf.task;
+		goalStmt  = task.goal.stmt;
+		goalExp   = ruExp(goalStmt.exps[0]);
+		hypExps   = map(task.premises, \p -> ruExp(p.stmt.exps[0]));
+		stmtClass = goalStmt.class;
+		conn      = ruPConnectives();
+		wff       = tp2id_("wff");
+		stripped  = ruStripForall(goalExp);
+		matrix    = stripped.first;
+		nGen      = stripped.second;
+		rw        = ruEqualizerRewrite(RuEnvMath(ctx.math, ctx.env), conn, wff, stmtClass, hypExps, matrix);
+		// skeleton over the matrix: mpbir(<residual OPEN>, <rewrite>) when rewritten, else just OPEN.
+		matrixStep : RuProofTree = switch (rw.second) {
+			None():        RuProofHyp(0, ruNoStmt);
+			Some(rwProof): RuProofStep(s2id_("mpbir"), [RuProofHyp(0, ruNoStmt), rwProof], RuStmt(stmtClass, [matrix], -1));
+		};
+		// wrap nGen ax-gen steps to re-quantify.
+		skeleton = fold(enumFromTo(1, nGen), matrixStep, \acc, __ -> RuProofStep(s2id_("ax-gen"), [acc], ruNoStmt));
+		bfs = ruBoundedBFSTactic(md, ms);
+		// BFS phase: switch the whitelist to the small prop scope, then run bounded BFS on the residual.
+		bfsPhase = RuProverTactic("checker-bfs", "bfs",
+			\tree -> { penv.whitelist := propScope; bfs.step(tree); },
+			bfs.keep_expanding);
+		switch (skeleton) {
+			RuProofStep(__, __, __): {
+				// follow-proof phase: only the skeleton's own assertions (ax-gen/mpbir/congruence/unfold).
+				// KNOWN LIMITATION: replaying mpbir(<open residual>, <rewrite>) explodes — mpbir's `ps`
+				// (the residual) is unconstrained, so the whitelisted congruence lemmas unify it
+				// spuriously. The fix is to pin `ps` by supplying the rewrite biconditional as a concrete
+				// premise (rewrite-as-premise + splice), not by leaving the residual open here.
+				penv.whitelist := ruProofTreeAssertions(skeleton);
+				Pair(penv, ruSequenceTactic([ruKalmarFollowTactic(skeleton, ms), bfsPhase]));
+			}
+			RuProofHyp(__, __): {  // no ∀, no rewrite: the goal is its own residual.
+				penv.whitelist := propScope;
+				Pair(penv, bfs);
+			}
+		}
 	}))
 }
 

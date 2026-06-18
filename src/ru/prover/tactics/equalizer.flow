@@ -24,6 +24,19 @@ export {
 	// (propositionally, after rewriting) entailed. Replaces the plain unfold+Kalmár path.
 	ruEqualizerPropTactic(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int,
 		hyps : [RuExp], goal : RuExp) -> Maybe<RuProverTactic>;
+
+	// The DIRECTED part of the equalizer, exposed for the open-residual `checker` tactic: unfold the
+	// goal's compound membership atoms + rewrite it to base atoms by linear biconditional congruence.
+	// Returns (residual goal', Some(proof of goal ↔ goal')) when anything rewrote, else (goal, None).
+	// No Kalmár — the residual is left for a bounded BFS to close.
+	ruEqualizerRewrite(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int,
+		hyps : [RuExp], goal : RuExp) -> Pair<RuExp, Maybe<RuProofTree>>;
+
+	// Strip a leading chain of universal quantifiers (wal): returns (matrix, count).
+	ruStripForall(e : RuExp) -> Pair<RuExp, int>;
+
+	// All assertion ids occurring in a proof tree (to whitelist a follow-proof replay).
+	ruProofTreeAssertions(t : RuProofTree) -> [int];
 }
 
 // A proven biconditional fact P ↔ rhs (P a compound membership atom; `proof` proves the biconditional).
@@ -263,5 +276,40 @@ ruEqualizerProve(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : i
 				RuProofHyp(__, __): None();
 			}
 		}
+	}
+}
+
+// ---- directed structure for the open-residual `checker` tactic --------------
+
+ruEqualizerRewrite(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp) -> Pair<RuExp, Maybe<RuProofTree>> {
+	facts = ruUnfoldFacts(em.math, em.env, stmtClass, arrayPush(hyps, goal));
+	atomNodes = fold(concat(hyps, map(facts, \f -> f.first)), ruPAtomNodes(conn, goal),
+		\acc, e -> mergeTree(acc, ruPAtomNodes(conn, e)));
+	ctx = RuKEmitCtx(conn, wff, stmtClass, atomNodes, makeTree());
+	factMap = fold(facts, makeTree(), \acc, f ->
+		switch (ruPAtomize(conn, f.first)) {                 // f.first = ( P ↔ RHS )
+			RuPIff(lhs, rhs): switch (lhs) { RuPAtom(k): setTree(acc, k, RuEqzFact(rhs, f.second)); default: acc; };
+			default: acc;
+		});
+	goalForm = ruPAtomize(conn, goal);
+	rw       = ruEqzRw(ctx, factMap, makeSet(), goalForm);   // (goal', goal ↔ goal')
+	goal2Exp = ruKForm2Exp(ctx, rw.first);
+	if (rw.first == goalForm) Pair(goal2Exp, None())         // nothing rewrote: residual = goal
+	else Pair(goal2Exp, Some(rw.second));
+}
+
+ruStripForall(e : RuExp) -> Pair<RuExp, int> {
+	if (ruEqHead(e) == s2id("wal")) {
+		m    = ruEqSpan(e.nodes, 1);                          // end of the bound-var subtree
+		body = RuExp(subrange(e.nodes, m, length(e.nodes) - m), -1);
+		r    = ruStripForall(body);
+		Pair(r.first, r.second + 1);
+	} else Pair(e, 0);
+}
+
+ruProofTreeAssertions(t : RuProofTree) -> [int] {
+	switch (t) {
+		RuProofHyp(__, __): [];
+		RuProofStep(ass, children, __): concat([ass], concatA(map(children, ruProofTreeAssertions)));
 	}
 }
