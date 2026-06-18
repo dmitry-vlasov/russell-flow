@@ -26,18 +26,21 @@ export {
 
 	// The article's environment theorems (its `.eth` — imported theorems a proof may cite)
 	// as commented AXIOMS (decl + its form, for the signature). t<nr>_<aid> (T) / d<nr>_<aid> (D).
-	mizParseEnv(ethContent : string, sig : MizSig, syms : MizSymbols, srcOf : (string) -> Pair<string, string>) -> [Pair<RuParseDecl, TptpForm>];
+	// isReused(opSymbol) = the foundation already provides this operator (and its definition/lemmas),
+	// so a Mizar DEFINITION (kind D) of it is redundant and is dropped (A-map: ∪/∩/⊆/∈/… via df-*).
+	mizParseEnv(ethContent : string, sig : MizSig, syms : MizSymbols, srcOf : (string) -> Pair<string, string>, isReused : (string) -> bool) -> [Pair<RuParseDecl, TptpForm>];
 
 	// The article's OWN definitions as definitional AXIOMS (the `unfold` material the prover
 	// needs — without these the `by`-gaps that expand a constructor's meaning are unprovable).
 	// Each <DefTheorem> carries the defining biconditional/equation as a closed <Proposition>
 	// (same shape as a theorem); named d<defnr>_<aid>. Returns (decl, form) like mizParseEnv.
-	mizArticleDefs(xmlContent : string, mizSource : string, sig : MizSig, syms : MizSymbols) -> [Pair<RuParseDecl, TptpForm>];
+	// isReused drops definitions of foundation-provided operators (see mizParseEnv).
+	mizArticleDefs(xmlContent : string, mizSource : string, sig : MizSig, syms : MizSymbols, isReused : (string) -> bool) -> [Pair<RuParseDecl, TptpForm>];
 }
 
 // `srcOf(aid)` yields the (.miz, .xml) of the article that DEFINES an env entry, so each
 // imported theorem/definition can carry its original Mizar surface text in its comment.
-mizParseEnv(ethContent : string, sig : MizSig, syms : MizSymbols, srcOf : (string) -> Pair<string, string>) -> [Pair<RuParseDecl, TptpForm>] {
+mizParseEnv(ethContent : string, sig : MizSig, syms : MizSymbols, srcOf : (string) -> Pair<string, string>, isReused : (string) -> bool) -> [Pair<RuParseDecl, TptpForm>] {
 	switch (mizParseXml(ethContent)) {
 		None(): [];
 		Some(root): {
@@ -53,21 +56,26 @@ mizParseEnv(ethContent : string, sig : MizSig, syms : MizSymbols, srcOf : (strin
 						p = srcOf(a);
 						Pair(a, Pair(strSplit(p.first, "\n"), mizParseXml(p.second)));
 					}));
-					map(nodes, \th -> {
+					filtermap(nodes, \th -> {
 						kind = mizAttr(th, "kind");
 						aid  = mizAttr(th, "aid");
 						nr   = mizAttr(th, "nr");
-						nm   = (if (kind == "T") "t" else "d") + nr + "_" + toLowerCase(aid);
-						form = mizResugar(mizForm(sig, [], th.kids[0]));
-						surface = mizEnvSurface(lookupTree(cache, toLowerCase(aid)), kind, nr);
-						// comment = Mizar reference + the original surface text, else the defined symbol.
-						defsym = if (kind != "D") "" else mizSymbolReadable(syms, mizAttr(th, "constrkind"), aid, s2i(mizAttr(th, "constrnr")));
-						ref = aid + ":" + (if (kind == "T") "th " else "def ") + nr;
-						comment = ref + (
-							if (surface != "") "  ::  " + surface
-							else if (defsym == "") "" else "  (defines " + defsym + ")"
-						);
-						Pair(mptpAxiomC(nm, comment, form), form);
+						// A definition (kind D) of a foundation-provided operator (∪/∩/⊆/∈/…) is
+						// redundant — the foundation's df-* already defines it — so drop it.
+						opSym = if (kind != "D") "" else mizSymName(sig, mizAttr(th, "constrkind"), s2i(mizAttr(th, "constrnr")));
+						if (kind == "D" && isReused(opSym)) None() else {
+							nm   = (if (kind == "T") "t" else "d") + nr + "_" + toLowerCase(aid);
+							form = mizResugar(mizForm(sig, [], th.kids[0]));
+							surface = mizEnvSurface(lookupTree(cache, toLowerCase(aid)), kind, nr);
+							// comment = Mizar reference + the original surface text, else the defined symbol.
+							defsym = if (kind != "D") "" else mizSymbolReadable(syms, mizAttr(th, "constrkind"), aid, s2i(mizAttr(th, "constrnr")));
+							ref = aid + ":" + (if (kind == "T") "th " else "def ") + nr;
+							comment = ref + (
+								if (surface != "") "  ::  " + surface
+								else if (defsym == "") "" else "  (defines " + defsym + ")"
+							);
+							Some(Pair(mptpAxiomC(nm, comment, form), form));
+						}
 					});
 				}
 			}
@@ -75,7 +83,7 @@ mizParseEnv(ethContent : string, sig : MizSig, syms : MizSymbols, srcOf : (strin
 	}
 }
 
-mizArticleDefs(xmlContent : string, mizSource : string, sig : MizSig, syms : MizSymbols) -> [Pair<RuParseDecl, TptpForm>] {
+mizArticleDefs(xmlContent : string, mizSource : string, sig : MizSig, syms : MizSymbols, isReused : (string) -> bool) -> [Pair<RuParseDecl, TptpForm>] {
 	lines = strSplit(mizSource, "\n");
 	switch (mizParseXml(xmlContent)) {
 		None(): [];
@@ -88,10 +96,12 @@ mizArticleDefs(xmlContent : string, mizSource : string, sig : MizSig, syms : Miz
 				ck    = mizAttr(dt, "constrkind");
 				cn    = mizAttr(dt, "constrnr");
 				defnr = lookupTreeDef(defnrOf, ck + cn, "");
+				// drop definitions of foundation-provided operators (the foundation's df-* defines them).
+				opSym = mizSymName(sig, ck, s2i(cn));
 				switch (mizFindFirst([dt], "Proposition")) {
 					None(): None();
 					Some(prop):
-						if (defnr == "" || prop.kids == []) None()
+						if (defnr == "" || prop.kids == [] || isReused(opSym)) None()
 						else {
 							form    = mizResugar(mizForm(sig, [], prop.kids[0]));
 							nm      = "d" + defnr + "_" + aid;
