@@ -427,6 +427,7 @@ ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTactic
 	else if (n == "ap")              ruTagBuilder("ap", ruDslBuildAp(ast, ctx))
 	else if (n == "prop")            ruTagBuilder("prop", ruDslBuildProp(ast, ctx))
 	else if (n == "checker")         ruTagBuilder("checker", ruDslBuildChecker(ast, ctx))
+	else if (n == "refine")          ruTagBuilder("refine", ruDslBuildRefine(ast, ctx))
 	else if (n == "linear-guided")   ruTagBuilder("linear-guided", ruDslBuildLinearGuided(ast, ctx))
 	else if (n == "follow-proof")    ruTagBuilder("follow-proof", ruDslBuildFollowProof(ast, ctx))
 	else if (n == "oracle")          ruTagBuilder("oracle", ruDslBuildOracle(ast))
@@ -589,14 +590,24 @@ ruEqRewriteRefiner(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass :
 	});
 }
 
-// checker(max-depth=D, max-size=S): the Checker tactic — directed structure + limited BFS, no Kalmár.
-// Composed from orthogonal refiners: strip-forall ∘ eq-rewrite, with the leaf (the concrete residual)
-// closed by a bounded BFS over a small propositional scope. The refiners construct all connective glue
-// (ax-gen / mpbir) with concrete statements, so search only ever sees a concrete propositional goal.
-ruDslBuildChecker(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
-	md = ruDslGetInt(ast, "max-depth", 0, 8);
-	ms = ruDslGetInt(ast, "max-size",  1, 65536);
-	tl = i2d(ruDslGetInt(ast, "time-limit", 2, 60));
+// Resolve a refiner NAME (a `refine(...)` argument) to its RuRefiner. The orthogonal phases:
+//   strip-forall — peel the leading ∀ (validate = ax-gen)
+//   eq-rewrite   — unfold membership/=/∅ + canonicalise to a residual (validate = mpbir)
+ruRefinerByName(name : string, em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp]) -> Maybe<RuRefiner> {
+	if (name == "strip-forall") Some(ruStripForallRefiner(stmtClass))
+	else if (name == "eq-rewrite") Some(ruEqRewriteRefiner(em, conn, wff, stmtClass, hyps))
+	else None();
+}
+
+ruRefinerNames() -> [string] { ["strip-forall", "eq-rewrite"] }
+
+// Build the refine pipeline tactic from a list of refiner names: compose the refiners, close the
+// concrete residual with bounded BFS over the small propositional scope. Shared by `refine(...)` and
+// `checker`. Budget args (named): max-depth / max-size / time-limit drive the residual BFS.
+ruDslRefineTactic(refinerNames : [string], ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+	md = ruDslGetInt(ast, "max-depth", 99, 8);
+	ms = ruDslGetInt(ast, "max-size",  99, 65536);
+	tl = i2d(ruDslGetInt(ast, "time-limit", 99, 60));
 	Some(RuTacticBuilder(\penv -> {
 		task      = penv.conf.task;
 		goalStmt  = task.goal.stmt;
@@ -604,10 +615,9 @@ ruDslBuildChecker(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBui
 		hypExps   = map(task.premises, \p -> ruExp(p.stmt.exps[0]));
 		stmtClass = goalStmt.class;
 		em        = RuEnvMath(ctx.math, ctx.env);
-		refiners  = [
-			ruStripForallRefiner(stmtClass),
-			ruEqRewriteRefiner(em, ruPConnectives(), tp2id_("wff"), stmtClass, hypExps)
-		];
+		conn      = ruPConnectives();
+		wff       = tp2id_("wff");
+		refiners  = filtermap(refinerNames, \nm -> ruRefinerByName(nm, em, conn, wff, stmtClass, hypExps));
 		// leaf closer: prove the concrete residual by limited BFS (it introduces no extra DV provisos).
 		close = \g -> maybeMap(
 			ruCheckerResidual(ctx.math, ctx.env, task.info, stmtClass, hypExps, g, ruCheckerPropScope(), md, ms, tl),
@@ -617,6 +627,26 @@ ruDslBuildChecker(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBui
 			Some(pd): Pair(penv, ruKalmarDirectTactic(RuProof(RuVarsDisjs(makeTree(), pd.second), ruMakeLinearProof(pd.first), -1)));
 		}
 	}))
+}
+
+// refine(<refiner>, ..., max-depth=D, max-size=S): compose goal refiners (positional, in order) +
+// limited-BFS residual closer. The Checker tactic, decomposed at the syntax level:
+//   refine(strip-forall, eq-rewrite)   ==  checker
+//   refine(eq-rewrite)                  ==  unfold + BFS, no ∀-strip
+//   refine()                            ==  just the residual BFS
+ruDslBuildRefine(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+	poss  = ruDslPositional(ast);
+	names = filtermap(poss, \v -> switch (v) { RuTacticValAst(sub): if (sub.name != "") Some(sub.name) else None(); RuTacticValLit(__): None(); });
+	unknown = filter(names, \nm -> !exists(ruRefinerNames(), \k -> k == nm));
+	if (unknown != []) {
+		ctx.env.out.error("tactic DSL: unknown refiner(s) " + strGlue(unknown, ", ") + " (known: " + strGlue(ruRefinerNames(), ", ") + ")", []);
+		None();
+	} else ruDslRefineTactic(names, ast, ctx);
+}
+
+// checker == refine(strip-forall, eq-rewrite) — kept as convenient sugar.
+ruDslBuildChecker(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+	ruDslRefineTactic(ruRefinerNames(), ast, ctx);
 }
 
 // apply(<assertion>, ..., max-depth=D, max-size=S): restrict backward search to ONLY the named
