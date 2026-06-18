@@ -332,29 +332,73 @@ ruProofTreeAssertions(t : RuProofTree) -> [int] {
 // pm3.24 closes directly (no mpbir/ancom free-var search). Returns (canonForm, proof form↔canonForm).
 // Mizar's ¬∧ normal form otherwise leaves the residual in shapes backward BFS cannot assemble.
 
-ruCanonKey(f : RuPForm) -> string {
+// Node count — the PRIMARY sort key, so smaller forms come first: atoms before compounds, and X
+// before ¬X. This guarantees a contradiction pair (P∧Q) and its negation ¬(P∧Q) end up adjacent
+// with the negation last, so left-association yields the `ph∧¬ph` shape pm3.24 closes.
+ruCanonSize(f : RuPForm) -> int {
+	switch (f) {
+		RuPAtom(__):   1;  RuPTrue(): 1;  RuPFalse(): 1;
+		RuPNot(a):     1 + ruCanonSize(a);
+		RuPAnd(a, b):  1 + ruCanonSize(a) + ruCanonSize(b);
+		RuPOr(a, b):   1 + ruCanonSize(a) + ruCanonSize(b);
+		RuPImp(a, b):  1 + ruCanonSize(a) + ruCanonSize(b);
+		RuPIff(a, b):  1 + ruCanonSize(a) + ruCanonSize(b);
+	}
+}
+
+ruCanonStruct(f : RuPForm) -> string {
 	switch (f) {
 		RuPAtom(k):    k;
-		RuPNot(a):     ruCanonKey(a) + "~";          // ¬X sorts right after X
-		RuPAnd(a, b):  "(" + ruCanonKey(a) + "&" + ruCanonKey(b) + ")";
-		RuPOr(a, b):   "(" + ruCanonKey(a) + "|" + ruCanonKey(b) + ")";
-		RuPImp(a, b):  "(" + ruCanonKey(a) + ">" + ruCanonKey(b) + ")";
-		RuPIff(a, b):  "(" + ruCanonKey(a) + "=" + ruCanonKey(b) + ")";
+		RuPNot(a):     "~" + ruCanonStruct(a);
+		RuPAnd(a, b):  "(" + ruCanonStruct(a) + "&" + ruCanonStruct(b) + ")";
+		RuPOr(a, b):   "(" + ruCanonStruct(a) + "|" + ruCanonStruct(b) + ")";
+		RuPImp(a, b):  "(" + ruCanonStruct(a) + ">" + ruCanonStruct(b) + ")";
+		RuPIff(a, b):  "(" + ruCanonStruct(a) + "=" + ruCanonStruct(b) + ")";
 		RuPTrue():     "T";
 		RuPFalse():    "F";
 	}
 }
 
-ruCanonBin(ctx : RuKEmitCtx, congLemma : string, comLemma : string, mk : (RuPForm, RuPForm) -> RuPForm, a : RuPForm, b : RuPForm) -> Pair<RuPForm, RuProofTree> {
-	ra = ruCanonRw(ctx, a); rb = ruCanonRw(ctx, b);
-	a2 = ra.first; b2 = rb.first;
-	cong = RuProofStep(s2id_(congLemma), [ra.second, rb.second], ruEqzStmt(ctx, mk(a, b), mk(a2, b2)));
-	if (ruCanonKey(a2) <= ruCanonKey(b2)) Pair(mk(a2, b2), cong)
-	else {
-		swapped = mk(b2, a2);
-		com = RuProofStep(s2id_(comLemma), [], ruEqzStmt(ctx, mk(a2, b2), swapped));
-		Pair(swapped, RuProofStep(s2id_("bitri"), [cong, com], ruEqzStmt(ctx, mk(a, b), swapped)));
+ruCanonKey(f : RuPForm) -> string {
+	lpad(i2s(ruCanonSize(f)), "0", 6) + ":" + ruCanonStruct(f);
+}
+
+// Normalise an ∧/∨ whose operands are already canon'd: LEFT-associate (a∧(b1∧b2) → (a∧b1)∧b2 via
+// bicomi(anass)) recursively, and sort adjacent operands so a literal precedes its negation. Returns
+// (nf, proof (a⊕b)↔nf). Left-association is what brings a contradiction pair together: P∧(Q∧¬(P∧Q))
+// → (P∧Q)∧¬(P∧Q), which pm3.24 then closes.
+ruCanonBinNF(ctx : RuKEmitCtx, isAnd : bool, a : RuPForm, b : RuPForm) -> Pair<RuPForm, RuProofTree> {
+	mk     = \x : RuPForm, y : RuPForm -> if (isAnd) RuPAnd(x, y) else RuPOr(x, y);
+	assocL = if (isAnd) "anass" else "orass";
+	comL   = if (isAnd) "ancom" else "orcom";
+	bi1L   = if (isAnd) "anbi1i" else "orbi1i";
+	bSplit = if (isAnd) switch (b) { RuPAnd(b1, b2): Some(Pair(b1, b2)); default: None(); }
+	                    else switch (b) { RuPOr(b1, b2):  Some(Pair(b1, b2)); default: None(); };
+	switch (bSplit) {
+		Some(bp): {
+			b1 = bp.first; b2 = bp.second;
+			anassInst = RuProofStep(s2id_(assocL), [], ruEqzStmt(ctx, mk(mk(a, b1), b2), mk(a, mk(b1, b2))));
+			rot   = RuProofStep(s2id_("bicomi"), [anassInst], ruEqzStmt(ctx, mk(a, mk(b1, b2)), mk(mk(a, b1), b2)));
+			nfL   = ruCanonBinNF(ctx, isAnd, a, b1);          // (L, (a⊕b1)↔L)
+			congL = RuProofStep(s2id_(bi1L), [nfL.second], ruEqzStmt(ctx, mk(mk(a, b1), b2), mk(nfL.first, b2)));
+			nfW   = ruCanonBinNF(ctx, isAnd, nfL.first, b2);  // (nf, (L⊕b2)↔nf)
+			step1 = RuProofStep(s2id_("bitri"), [rot, congL], ruEqzStmt(ctx, mk(a, mk(b1, b2)), mk(nfL.first, b2)));
+			Pair(nfW.first, RuProofStep(s2id_("bitri"), [step1, nfW.second], ruEqzStmt(ctx, mk(a, mk(b1, b2)), nfW.first)));
+		}
+		None():
+			if (ruCanonKey(a) <= ruCanonKey(b)) Pair(mk(a, b), RuProofStep(s2id_("biid"), [], ruEqzStmt(ctx, mk(a, b), mk(a, b))))
+			else Pair(mk(b, a), RuProofStep(s2id_(comL), [], ruEqzStmt(ctx, mk(a, b), mk(b, a))));
 	}
+}
+
+// Canonicalise children, then normalise the binary node (left-assoc + sort).
+ruCanonBin(ctx : RuKEmitCtx, isAnd : bool, congLemma : string, a : RuPForm, b : RuPForm) -> Pair<RuPForm, RuProofTree> {
+	mk = \x : RuPForm, y : RuPForm -> if (isAnd) RuPAnd(x, y) else RuPOr(x, y);
+	ra = ruCanonRw(ctx, a); rb = ruCanonRw(ctx, b);
+	cong = RuProofStep(s2id_(congLemma), [ra.second, rb.second], ruEqzStmt(ctx, mk(a, b), mk(ra.first, rb.first)));
+	nf = ruCanonBinNF(ctx, isAnd, ra.first, rb.first);
+	if (mk(ra.first, rb.first) == nf.first) Pair(nf.first, cong)
+	else Pair(nf.first, RuProofStep(s2id_("bitri"), [cong, nf.second], ruEqzStmt(ctx, mk(a, b), nf.first)));
 }
 
 ruCanonRw(ctx : RuKEmitCtx, form : RuPForm) -> Pair<RuPForm, RuProofTree> {
@@ -364,8 +408,8 @@ ruCanonRw(ctx : RuKEmitCtx, form : RuPForm) -> Pair<RuPForm, RuProofTree> {
 		RuPTrue():    Pair(form, refl(form));
 		RuPFalse():   Pair(form, refl(form));
 		RuPNot(a):    { ra = ruCanonRw(ctx, a); Pair(RuPNot(ra.first), RuProofStep(s2id_("notbii"), [ra.second], ruEqzStmt(ctx, RuPNot(a), RuPNot(ra.first)))); }
-		RuPAnd(a, b): ruCanonBin(ctx, "anbi12i", "ancom", \x, y -> RuPAnd(x, y), a, b);
-		RuPOr(a, b):  ruCanonBin(ctx, "orbi12i", "orcom", \x, y -> RuPOr(x, y), a, b);
+		RuPAnd(a, b): ruCanonBin(ctx, true,  "anbi12i", a, b);
+		RuPOr(a, b):  ruCanonBin(ctx, false, "orbi12i", a, b);
 		RuPImp(a, b): { ra = ruCanonRw(ctx, a); rb = ruCanonRw(ctx, b); Pair(RuPImp(ra.first, rb.first), RuProofStep(s2id_("imbi12i"), [ra.second, rb.second], ruEqzStmt(ctx, form, RuPImp(ra.first, rb.first)))); }
 		RuPIff(a, b): { ra = ruCanonRw(ctx, a); rb = ruCanonRw(ctx, b); Pair(RuPIff(ra.first, rb.first), RuProofStep(s2id_("bibi12i"), [ra.second, rb.second], ruEqzStmt(ctx, form, RuPIff(ra.first, rb.first)))); }
 	}
