@@ -1,0 +1,109 @@
+import ru/prover/core/env;
+import ru/prover/core/prove;
+import ru/prover/core/expand;
+import ru/prover/core/task;
+import ru/prover/core/controls;
+import ru/prover/tactics/breadth_first;
+import ru/prover/tactics/combinators;
+import ru/prover/tactics/equalizer;
+import ru/prover/tactics/unfold;
+import ru/prover/tactics/propositional;
+import ru/unify/index;
+import ru/proof_tree;
+import ru/verify/math;
+import base/ids;
+
+// The Checker tactic's domain layer: the orthogonal goal-refinement PHASES (strip-forall, eq-rewrite)
+// and the residual closer. The generic refinement combinator (RuRefiner / ruRefine) lives in
+// combinators.flow; the thin DSL builders (`refine(...)`, `checker`) live in dsl.flow. So the
+// dependency flows one way: dsl -> checker -> combinators (mirroring how seq is wired).
+
+export {
+	// The limited propositional-lemma scope the residual BFS may use (kept small on purpose).
+	ruCheckerPropScope() -> [int];
+
+	// Prove `hyps ⊢ goal` by bounded BFS restricted to `scope`, returning the found proof TREE. A
+	// self-contained prover run on a CONCRETE goal — no free witness variable ever reaches search.
+	ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int,
+		hyps : [RuExp], goal : RuExp, scope : [int], md : int, ms : int, limit : double) -> Maybe<RuProofTree>;
+
+	// The orthogonal Checker phases, as refiners, + the name registry that `refine(...)` resolves against.
+	ruStripForallRefiner(stmtClass : int) -> RuRefiner;
+	ruEqRewriteRefiner(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp]) -> RuRefiner;
+	ruRefinerByName(name : string, em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp]) -> Maybe<RuRefiner>;
+	ruRefinerNames() -> [string];
+}
+
+ruCheckerPropScope() -> [int] {
+	map(["mpbi", "mpbir", "biimpi", "biimpri", "ax-mp", "syl", "jca", "simpl", "simpr",
+		"pm3.2i", "pm3.24", "exmid", "id", "con2i", "notnotr", "pm2.21i", "jaoi", "orcd", "olcd",
+		"pm2.21", "imp", "ex", "biid", "mtbi", "mtbir", "sylib", "sylibr", "con3i", "notnoti"], s2id_);
+}
+
+ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int,
+	hyps : [RuExp], goal : RuExp, scope : [int], md : int, ms : int, limit : double) -> Maybe<RuProofTree> {
+	// Index ONLY the scope lemmas (tiny) — the whitelist restricts search to them anyway, and rebuilding
+	// the full 5000+ index on every checker invocation is far too costly.
+	scopeSet = buildSet(scope);
+	index = foldTree(math.decls.assertions, ruMakeIndex(), \__, ass, acc ->
+		if (containsSet(scopeSet, ass.info.id)) ruSetIndex(ruExp(ass.infer.prop.exps[0]), ass, acc) else acc);
+	captured : ref Maybe<RuProofTree> = ref None();
+	goalStep = RuStep(-1, ruStepLemma, [], RuStmt(stmtClass, [goal], -1), ruNoProof, "", -1);
+	premises = mapi(hyps, \i, h -> RuHyp(i, RuStmt(stmtClass, [h], -1), -1));
+	// `info` MUST be the outer theorem's info so the precedence check (ruDeclInfoPreceeds) admits the
+	// same foundation assertions the theorem itself may use.
+	task  = RuProverTask(info, ruDoneTactic, "checker-residual", makeTree(), premises, goalStep);
+	penv0 = ruInitProverEnv(task, math, env, index, limit);
+	orig  = penv0.fns.onProof;   // keep the default (stores into tree.proofs so ruProve terminates)
+	penv  = RuProverEnv(penv0 with
+		fns = RuProverFuncs(penv0.fns with onProof = \t -> { if (^captured == None()) captured := Some(t); orig(t); })
+	);
+	penv.whitelist := scope;
+	penv.tactic := Some(ruBoundedBFSTactic(md, ms));
+	ruProve(ruExpandHyp(penv.tree.root, penv));
+	// The captured tree's stmts are const-encoded (the default onProof unconsts before storing); do the
+	// same so they match the foundation's normal encoding when assembled into the outer proof.
+	maybeMap(^captured, \t -> ruCheckerUnconstTree(penv0.fns.unconst, t));
+}
+
+ruCheckerUnconstTree(unconst : (RuExp) -> RuExp, t : RuProofTree) -> RuProofTree {
+	uncStmt = \s : RuStmt -> RuStmt(s with exps = map(s.exps, \e -> unconst(ruExp(e))));
+	switch (t) {
+		RuProofHyp(i, stmt):       RuProofHyp(i, uncStmt(stmt));
+		RuProofStep(a, ch, stmt):  RuProofStep(a, map(ch, \c -> ruCheckerUnconstTree(unconst, c)), uncStmt(stmt));
+	}
+}
+
+// Phase 1: strip the leading ∀-chain; validation re-quantifies the matrix proof with ax-gen.
+ruStripForallRefiner(stmtClass : int) -> RuRefiner {
+	RuRefiner("strip-forall", \goal -> {
+		sp = ruStripForall(goal);   // (matrix, [the quantified levels, innermost first])
+		Some(RuRefineStep([sp.first],
+			\proofs -> fold(sp.second, proofs[0], \acc, lvl ->
+				RuProofStep(s2id_("ax-gen"), [acc], RuStmt(stmtClass, [lvl], -1))),
+			makeSet()));
+	});
+}
+
+// Phase 2: unfold + canonicalise the matrix to a residual; validation combines via mpbir (or is the
+// identity when nothing rewrote), carrying the rewrite's DV provisos.
+ruEqRewriteRefiner(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp]) -> RuRefiner {
+	RuRefiner("eq-rewrite", \goal -> {
+		rw = ruEqualizerRewrite(em, conn, wff, stmtClass, hyps, goal);
+		Some(RuRefineStep([rw.residual],
+			\proofs -> switch (rw.proof) {
+				None():        proofs[0];   // nothing rewrote: residual proof IS the goal proof
+				Some(rwProof): RuProofStep(s2id_("mpbir"), [proofs[0], rwProof], RuStmt(stmtClass, [goal], -1));
+			},
+			rw.disjs));
+	});
+}
+
+// Resolve a refiner NAME (a `refine(...)` argument) to its RuRefiner.
+ruRefinerByName(name : string, em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp]) -> Maybe<RuRefiner> {
+	if (name == "strip-forall") Some(ruStripForallRefiner(stmtClass))
+	else if (name == "eq-rewrite") Some(ruEqRewriteRefiner(em, conn, wff, stmtClass, hyps))
+	else None();
+}
+
+ruRefinerNames() -> [string] { ["strip-forall", "eq-rewrite"] }
