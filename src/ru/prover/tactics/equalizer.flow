@@ -295,9 +295,16 @@ ruEqualizerRewrite(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass :
 		});
 	goalForm = ruPAtomize(conn, goal);
 	rw       = ruEqzRw(ctx, factMap, makeSet(), goalForm);   // (goal', goal ↔ goal')
-	goal2Exp = ruKForm2Exp(ctx, rw.first);
-	if (rw.first == goalForm) Pair(goal2Exp, None())         // nothing rewrote: residual = goal
-	else Pair(goal2Exp, Some(rw.second));
+	canon    = ruCanonRw(ctx, rw.first);                     // (goal'', goal' ↔ goal'') — normal form
+	goal3    = canon.first;
+	goal3Exp = ruKForm2Exp(ctx, goal3);
+	if (goal3 == goalForm) Pair(goal3Exp, None())            // nothing changed: residual = goal
+	else {
+		proof = if (rw.first == goalForm) canon.second                 // only canonicalisation changed it
+			else if (goal3 == rw.first) rw.second                      // only the unfold rewrite changed it
+			else RuProofStep(s2id_("bitri"), [rw.second, canon.second], ruEqzStmt(ctx, goalForm, goal3));
+		Pair(goal3Exp, Some(proof));
+	}
 }
 
 ruStripForall(e : RuExp) -> Pair<RuExp, [RuExp]> {
@@ -313,5 +320,49 @@ ruProofTreeAssertions(t : RuProofTree) -> [int] {
 	switch (t) {
 		RuProofHyp(__, __): [];
 		RuProofStep(ass, children, __): concat([ass], concatA(map(children, ruProofTreeAssertions)));
+	}
+}
+
+// ---- canonicalising rewrite (normal form for the residual BFS) --------------
+// Sort the operands of every ∧/∨ so a literal precedes its negation: ¬(¬B∧B) → ¬(B∧¬B), which
+// pm3.24 closes directly (no mpbir/ancom free-var search). Returns (canonForm, proof form↔canonForm).
+// Mizar's ¬∧ normal form otherwise leaves the residual in shapes backward BFS cannot assemble.
+
+ruCanonKey(f : RuPForm) -> string {
+	switch (f) {
+		RuPAtom(k):    k;
+		RuPNot(a):     ruCanonKey(a) + "~";          // ¬X sorts right after X
+		RuPAnd(a, b):  "(" + ruCanonKey(a) + "&" + ruCanonKey(b) + ")";
+		RuPOr(a, b):   "(" + ruCanonKey(a) + "|" + ruCanonKey(b) + ")";
+		RuPImp(a, b):  "(" + ruCanonKey(a) + ">" + ruCanonKey(b) + ")";
+		RuPIff(a, b):  "(" + ruCanonKey(a) + "=" + ruCanonKey(b) + ")";
+		RuPTrue():     "T";
+		RuPFalse():    "F";
+	}
+}
+
+ruCanonBin(ctx : RuKEmitCtx, congLemma : string, comLemma : string, mk : (RuPForm, RuPForm) -> RuPForm, a : RuPForm, b : RuPForm) -> Pair<RuPForm, RuProofTree> {
+	ra = ruCanonRw(ctx, a); rb = ruCanonRw(ctx, b);
+	a2 = ra.first; b2 = rb.first;
+	cong = RuProofStep(s2id_(congLemma), [ra.second, rb.second], ruEqzStmt(ctx, mk(a, b), mk(a2, b2)));
+	if (ruCanonKey(a2) <= ruCanonKey(b2)) Pair(mk(a2, b2), cong)
+	else {
+		swapped = mk(b2, a2);
+		com = RuProofStep(s2id_(comLemma), [], ruEqzStmt(ctx, mk(a2, b2), swapped));
+		Pair(swapped, RuProofStep(s2id_("bitri"), [cong, com], ruEqzStmt(ctx, mk(a, b), swapped)));
+	}
+}
+
+ruCanonRw(ctx : RuKEmitCtx, form : RuPForm) -> Pair<RuPForm, RuProofTree> {
+	refl = \f -> RuProofStep(s2id_("biid"), [], ruEqzStmt(ctx, f, f));
+	switch (form) {
+		RuPAtom(__):  Pair(form, refl(form));
+		RuPTrue():    Pair(form, refl(form));
+		RuPFalse():   Pair(form, refl(form));
+		RuPNot(a):    { ra = ruCanonRw(ctx, a); Pair(RuPNot(ra.first), RuProofStep(s2id_("notbii"), [ra.second], ruEqzStmt(ctx, RuPNot(a), RuPNot(ra.first)))); }
+		RuPAnd(a, b): ruCanonBin(ctx, "anbi12i", "ancom", \x, y -> RuPAnd(x, y), a, b);
+		RuPOr(a, b):  ruCanonBin(ctx, "orbi12i", "orcom", \x, y -> RuPOr(x, y), a, b);
+		RuPImp(a, b): { ra = ruCanonRw(ctx, a); rb = ruCanonRw(ctx, b); Pair(RuPImp(ra.first, rb.first), RuProofStep(s2id_("imbi12i"), [ra.second, rb.second], ruEqzStmt(ctx, form, RuPImp(ra.first, rb.first)))); }
+		RuPIff(a, b): { ra = ruCanonRw(ctx, a); rb = ruCanonRw(ctx, b); Pair(RuPIff(ra.first, rb.first), RuProofStep(s2id_("bibi12i"), [ra.second, rb.second], ruEqzStmt(ctx, form, RuPIff(ra.first, rb.first)))); }
 	}
 }
