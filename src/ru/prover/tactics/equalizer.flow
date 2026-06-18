@@ -283,6 +283,66 @@ ruEqualizerProve(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : i
 	}
 }
 
+// ---- rewrite under quantifier binders (albii/exbii lift) --------------------
+
+// Membership/relation/df-ex unfold of a SINGLE expression (no binder descent, no canon): returns
+// (exp', proof exp ↔ exp'). Used to rewrite a quantifier body before lifting via albii/exbii.
+ruEqMembRewriteExp(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, exp : RuExp) -> Pair<RuExp, RuProofTree> {
+	facts = concatA([
+		ruUnfoldFacts(em.math, em.env, stmtClass, [exp]),
+		ruRelUnfoldFacts(em.math, em.env, stmtClass, [exp]),
+		ruDfExUnfoldFacts(em.math, em.env, stmtClass, [exp])
+	]);
+	atomNodes = fold(map(facts, \f -> f.first), ruPAtomNodes(conn, exp),
+		\acc, e -> mergeTree(acc, ruPAtomNodes(conn, e)));
+	ctx = RuKEmitCtx(conn, wff, stmtClass, atomNodes, makeTree());
+	factMap = fold(facts, makeTree(), \acc, f ->
+		switch (ruPAtomize(conn, f.first)) {
+			RuPIff(lhs, rhs): switch (lhs) { RuPAtom(k): setTree(acc, k, RuEqzFact(rhs, f.second)); default: acc; };
+			default: acc;
+		});
+	rw = ruEqzRw(ctx, factMap, makeSet(), ruPAtomize(conn, exp));
+	Pair(ruKForm2Exp(ctx, rw.first), rw.second);
+}
+
+// All subexpressions whose ROOT rule is `rootId`.
+ruEqRootSubs(e : RuExp, rootId : int) -> [RuExp] {
+	nodes = e.nodes;
+	filtermap(enumFromTo(0, length(nodes) - 1), \i ->
+		switch (nodes[i]) {
+			RuRuleNode(it, __): if (ruIdType2Id(it) == rootId) Some(RuExp(subrange(nodes, i, ruEqSpan(nodes, i) - i), -1)) else None();
+			RuVar(__, __): None();
+		});
+}
+
+// For every `∀v B` / `∃v B` subexpr in `exps` whose body B has unfoldable membership, the congruence
+// fact `∀v B ↔ ∀v B'` (B → B' the body unfold, lifted by albii / exbii). Lets the equalizer rewrite
+// a quantified atom — e.g. eq0's ∀x¬(x∈A∩B) into the goal's ∀x¬((x∈A)∧(x∈B)).
+ruBinderBridgeFacts(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, exps : [RuExp]) -> [Pair<RuExp, RuProofTree>] {
+	walId = s2id("wal"); wexId = s2id("wex"); wbId = s2id("wb");
+	atoms = concatA(map(exps, \e -> concat(ruEqRootSubs(e, walId), ruEqRootSubs(e, wexId))));
+	seen = ref makeSet();
+	filtermap(atoms, \q -> {
+		key = ruEqKey(q);
+		if (containsSet(^seen, key)) None()
+		else {
+			seen := insertSet(^seen, key);
+			head = ruEqHead(q);
+			m    = ruEqSpan(q.nodes, 1);                                   // end of the bound-var subtree
+			vExp = RuExp(subrange(q.nodes, 1, m - 1), -1);                 // the bound var
+			body = RuExp(subrange(q.nodes, m, length(q.nodes) - m), -1);
+			bRw  = ruEqMembRewriteExp(em, conn, wff, stmtClass, body);
+			if (bRw.first == body) None()                                  // nothing to unfold in the body
+			else {
+				q2   = ruEqMkRule(head, wff, [vExp, bRw.first]);           // ∀v B' / ∃v B'
+				lift = if (head == walId) "albii" else "exbii";
+				fact = ruEqMkRule(wbId, wff, [q, q2]);                     // ∀v B ↔ ∀v B'
+				Some(Pair(fact, RuProofStep(s2id_(lift), [bRw.second], RuStmt(stmtClass, [fact], -1))));
+			}
+		}
+	});
+}
+
 // ---- directed structure for the open-residual `checker` tactic --------------
 
 ruEqualizerRewrite(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp) -> RuEqRewrite {
