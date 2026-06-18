@@ -20,6 +20,17 @@ from `$RUSSELL_MATH`, so you never pass `math=`.
 Phase (b) — adding an inline tactic to each `?` step — is a manual edit of the
 `.ru` file (no script).
 
+## Analysis tools
+
+- `prove_env_axioms.sh` — turn each leftover env `axiom` of `mizar/<module>.ru`
+  into an OPEN theorem and try to prove it from the foundation alone (each in
+  isolation), reporting which are redundant (derivable) vs genuinely new. Uses a
+  generous BFS budget (tunable via `MD`/`MS`/`FC` env vars). Probes are left in
+  `/tmp/prove_env_<module>/` for manual re-runs.
+    `scripts/translate/mizar/prove_env_axioms.sh xb1 60s 1`
+- `prove_probe.rus` — helper invoked by the above: read one probe `.ru` and prove
+  one target (also usable directly to retry a single axiom with custom settings).
+
 ## Temporary / debug scripts
 
 Put throwaway debugging scripts in `tmp/` — it is git-ignored, so they are easy to
