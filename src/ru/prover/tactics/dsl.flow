@@ -64,6 +64,13 @@ export {
 
 	// Parse + build in one call.
 	ruParseAndBuildTactic(src : string, ctx : RuTacticContext) -> Maybe<RuTacticBuilder>;
+
+	// A goal refiner (the orthogonal phases the `checker` tactic is composed from): reduce `goal` to
+	// `subgoals` + a `validate` that lifts their proofs back to a proof of `goal`, discharging `disjs`
+	// (DV provisos the lifting introduces). The connective glue lives in `validate` with CONCRETE
+	// statements — constructed, never searched.
+	RuRefineStep(subgoals : [RuExp], validate : ([RuProofTree]) -> RuProofTree, disjs : Set<RuDisj>);
+	RuRefiner(name : string, refine : (RuExp) -> Maybe<RuRefineStep>);
 }
 
 ruStaticTacticBuilder(t : RuProverTactic) -> RuTacticBuilder { RuTacticBuilder(\penv -> Pair(penv, t)) }
@@ -532,13 +539,60 @@ ruCheckerUnconstTree(unconst : (RuExp) -> RuExp, t : RuProofTree) -> RuProofTree
 	}
 }
 
+// ---- goal refiners: the orthogonal phases the checker is composed from -------
+// A refiner reduces `goal` to `subgoals` and provides a `validate` that lifts proofs of the subgoals
+// back to a proof of `goal`, discharging `disjs` (DV provisos the lifting introduces). The connective
+// glue (ax-gen, mpbir) lives in `validate` with CONCRETE statements — it is constructed, never
+// searched — which is exactly why the phases compose without the free-variable blow-up that a
+// backward-search `seq` would hit. None = the refiner cannot handle this goal.
+// Run the pipeline: refine `goal` left-to-right (each refiner refines the subgoals the previous left),
+// close the leaves with `close`, then run the validations bottom-up. Returns (proof, all DV provisos).
+ruRefine(refiners : [RuRefiner], goal : RuExp, close : (RuExp) -> Maybe<Pair<RuProofTree, Set<RuDisj>>>) -> Maybe<Pair<RuProofTree, Set<RuDisj>>> {
+	if (refiners == []) close(goal)
+	else switch (refiners[0].refine(goal)) {
+		None(): None();
+		Some(step): {
+			subs = map(step.subgoals, \sg -> ruRefine(tail(refiners), sg, close));
+			if (!forall(subs, isSome)) None()
+			else {
+				results = map(subs, \s -> either(s, Pair(RuProofHyp(0, ruNoStmt), makeSet())));
+				proofs  = map(results, \r -> r.first);
+				disjs   = fold(results, step.disjs, \acc, r -> mergeSets(acc, r.second));
+				Some(Pair(step.validate(proofs), disjs));
+			}
+		}
+	}
+}
+
+// Phase 1: strip the leading ∀-chain; validation re-quantifies the matrix proof with ax-gen.
+ruStripForallRefiner(stmtClass : int) -> RuRefiner {
+	RuRefiner("strip-forall", \goal -> {
+		sp = ruStripForall(goal);   // (matrix, [the quantified levels, innermost first])
+		Some(RuRefineStep([sp.first],
+			\proofs -> fold(sp.second, proofs[0], \acc, lvl ->
+				RuProofStep(s2id_("ax-gen"), [acc], RuStmt(stmtClass, [lvl], -1))),
+			makeSet()));
+	});
+}
+
+// Phase 2: unfold + canonicalise the matrix to a residual; validation combines via mpbir (or is the
+// identity when nothing rewrote), carrying the rewrite's DV provisos.
+ruEqRewriteRefiner(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp]) -> RuRefiner {
+	RuRefiner("eq-rewrite", \goal -> {
+		rw = ruEqualizerRewrite(em, conn, wff, stmtClass, hyps, goal);
+		Some(RuRefineStep([rw.residual],
+			\proofs -> switch (rw.proof) {
+				None():        proofs[0];   // nothing rewrote: residual proof IS the goal proof
+				Some(rwProof): RuProofStep(s2id_("mpbir"), [proofs[0], rwProof], RuStmt(stmtClass, [goal], -1));
+			},
+			rw.disjs));
+	});
+}
+
 // checker(max-depth=D, max-size=S): the Checker tactic — directed structure + limited BFS, no Kalmár.
-// (1) strip the goal's leading ∀, (2) unfold compound membership atoms + rewrite the matrix to base
-// atoms via the equalizer's linear biconditional congruence (concrete proof of matrix↔goal'),
-// (3) prove the CONCRETE residual goal' with a bounded BFS over a small propositional scope (a
-// self-contained sub-proof — no free var, no explosion), (4) ASSEMBLE the result directly:
-// ax-gen×N( mpbir(<residual proof>, <rewrite proof>) ), and inject it. Everything but the residual is
-// constructed, so search only ever sees a concrete propositional goal.
+// Composed from orthogonal refiners: strip-forall ∘ eq-rewrite, with the leaf (the concrete residual)
+// closed by a bounded BFS over a small propositional scope. The refiners construct all connective glue
+// (ax-gen / mpbir) with concrete statements, so search only ever sees a concrete propositional goal.
 ruDslBuildChecker(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
 	md = ruDslGetInt(ast, "max-depth", 0, 8);
 	ms = ruDslGetInt(ast, "max-size",  1, 65536);
@@ -549,27 +603,18 @@ ruDslBuildChecker(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBui
 		goalExp   = ruExp(goalStmt.exps[0]);
 		hypExps   = map(task.premises, \p -> ruExp(p.stmt.exps[0]));
 		stmtClass = goalStmt.class;
-		conn      = ruPConnectives();
-		wff       = tp2id_("wff");
-		stripped  = ruStripForall(goalExp);
-		matrix    = stripped.first;
-		intermeds = stripped.second;   // ax-gen conclusions, innermost first (… up to the goal)
-		rw        = ruEqualizerRewrite(RuEnvMath(ctx.math, ctx.env), conn, wff, stmtClass, hypExps, matrix);
-		residual  = rw.residual;
-		switch (ruCheckerResidual(ctx.math, ctx.env, task.info, stmtClass, hypExps, residual, ruCheckerPropScope(), md, ms, tl)) {
-			None(): Pair(penv, ruDoneTactic);  // residual not closed: no-op, composes before a fallback
-			Some(residualTree): {
-				// combine the residual proof with the rewrite via mpbir (proves the matrix), or use it
-				// directly when nothing rewrote; then wrap nGen ax-gen steps to re-quantify.
-				matrixStep : RuProofTree = switch (rw.proof) {
-					None():        residualTree;
-					Some(rwProof): RuProofStep(s2id_("mpbir"), [residualTree, rwProof], RuStmt(stmtClass, [matrix], -1));
-				};
-				full = fold(intermeds, matrixStep, \acc, intExpr ->
-					RuProofStep(s2id_("ax-gen"), [acc], RuStmt(stmtClass, [intExpr], -1)));
-				// declare the rewrite's disjoint-variable provisos (e.g. eq0's disjointed(A x)).
-				Pair(penv, ruKalmarDirectTactic(RuProof(RuVarsDisjs(makeTree(), rw.disjs), ruMakeLinearProof(full), -1)));
-			}
+		em        = RuEnvMath(ctx.math, ctx.env);
+		refiners  = [
+			ruStripForallRefiner(stmtClass),
+			ruEqRewriteRefiner(em, ruPConnectives(), tp2id_("wff"), stmtClass, hypExps)
+		];
+		// leaf closer: prove the concrete residual by limited BFS (it introduces no extra DV provisos).
+		close = \g -> maybeMap(
+			ruCheckerResidual(ctx.math, ctx.env, task.info, stmtClass, hypExps, g, ruCheckerPropScope(), md, ms, tl),
+			\t -> Pair(t, makeSet()));
+		switch (ruRefine(refiners, goalExp, close)) {
+			None(): Pair(penv, ruDoneTactic);   // not closed: no-op, composes before a fallback
+			Some(pd): Pair(penv, ruKalmarDirectTactic(RuProof(RuVarsDisjs(makeTree(), pd.second), ruMakeLinearProof(pd.first), -1)));
 		}
 	}))
 }
