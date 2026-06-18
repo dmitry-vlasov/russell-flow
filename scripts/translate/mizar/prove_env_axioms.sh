@@ -35,7 +35,7 @@ TAC="${TAC:-checker}"   # tactic (checker = directed Checker tactic; empty = pla
 ST="${ST:-0}"           # steps mode (0 = prove the whole statement; needed for DV provisos)
 MATH="${RUSSELL_MATH:-$HOME/dev/math}"
 ART="$MATH/mizar/$MODULE.ru"
-WORK="/tmp/prove_env_$MODULE"
+WORK="${WORK:-/tmp/prove_env_$MODULE}"   # override e.g. WORK=~/dev/math/mizar/probes for a permanent dir
 
 command -v russellj >/dev/null 2>&1 && RJ="russellj" || RJ="$(cd "$(dirname "$0")/../../.." && pwd)/bin/russellj"
 [ -f "$ART" ] || { echo "no article: $ART (run translate/mizar/translate first)"; exit 1; }
