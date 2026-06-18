@@ -5,6 +5,7 @@ import ru/proof_tree;
 import ru/subst;
 import ru/util/exp;
 import ru/util/src2s;
+import ru/util/disjs;
 import ru/verify/math;
 import base/ids;
 import ds/set;
@@ -27,6 +28,14 @@ export {
 	// `(A = B) ↔ (A ⊆ B ∧ B ⊆ A)` (no quantifier — stays propositional, ⊆ kept as atoms). Lets the
 	// equalizer rewrite an equality atom to its subset-antisymmetry form. Used by the checker only.
 	ruRelUnfoldFacts(math : RuMath, env : RuEnv, stmtClass : int, exps : [RuExp]) -> [Pair<RuExp, RuProofTree>];
+
+	// Existential/emptiness unfold: for every quantified atom `∀v¬(v∈X)` in `exps` (matching eq0's
+	// RHS), the eq0 fact `(X = ∅) ↔ ∀v¬(v∈X)` — instantiated with the SAME bound var v as the goal
+	// uses (eq0's x is a setvar metavar), so the equalizer can rewrite `X=∅` to the goal's own
+	// quantified atom. Lets `X≠∅ → ∃x x∈X` style axioms reduce to a propositional contradiction.
+	// Returns the eq0 facts AND the disjoint-variable provisos they require (eq0's disjointed(A x)
+	// instantiated), which the caller must declare in the assembled proof.
+	ruExistUnfoldFacts(math : RuMath, env : RuEnv, stmtClass : int, exps : [RuExp]) -> Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>>;
 
 	// The unfold-assisted prop closer as a tactic: gather unfold facts for hyps ⊢ goal, build the
 	// Kalmár skeleton over hyps + facts, splice each fact's hyp-leaf with its proof, inject the
@@ -219,6 +228,49 @@ ruRelUnfoldFacts(math : RuMath, env : RuEnv, stmtClass : int, exps : [RuExp]) ->
 					}
 				}
 			});
+		}
+	}
+}
+
+// Second child subtree of a binary-rooted RuExp (root at 0, child0 at 1, child1 after child0).
+ruUChild1(e : RuExp) -> RuExp {
+	nodes = e.nodes;
+	s0 = ruUSpanEnd(nodes, 1);          // end of child0
+	end = ruUSpanEnd(nodes, s0);
+	RuExp(subrange(nodes, s0, end - s0), -1);
+}
+
+ruExistUnfoldFacts(math : RuMath, env : RuEnv, stmtClass : int, exps : [RuExp]) -> Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>> {
+	walId = s2id("wal");
+	switch (lookupTree(math.decls.assertions, s2id_("eq0"))) {
+		None(): Pair([], makeSet());
+		Some(ass): {
+			inf  = ruMembInfer(ass);
+			prop = ruExp(inf.prop.exps[0]);                 // wb( (A=∅), ∀x¬(x∈A) )
+			rhs  = ruUChild1(prop);                         // ∀x¬(x∈A)
+			atoms = concatA(map(exps, \e -> ruURootAtoms(e, walId)));
+			seen = ref makeSet();
+			disjs = ref makeSet();
+			facts = filtermap(atoms, \q -> {
+				key = ruUKey(q);
+				if (containsSet(^seen, key)) None()
+				else {
+					seen := insertSet(^seen, key);
+					switch (ruMatchExp(q, rhs, math, env)) {   // binds A and x:=goal's bound var
+						None(): None();
+						Some(sub): {
+							inst = ruApplySubst(prop, sub);    // (X=∅) ↔ ∀v¬(v∈X)  (v = goal's bound var)
+							// eq0's disjointed(A x), instantiated, must be declared by the caller.
+							switch (ruComputeDisjs(sub, inf.vars.disjs, RuDisjsInherent(makeSet()))) {
+								RuDisjsInherent(ds): disjs := mergeSets(^disjs, ds);
+								RuDisjViolation(__, __): {};
+							}
+							Some(Pair(inst, RuProofStep(s2id_("eq0"), [], RuStmt(stmtClass, [inst], -1))));
+						}
+					}
+				}
+			});
+			Pair(facts, ^disjs);
 		}
 	}
 }

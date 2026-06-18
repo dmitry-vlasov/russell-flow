@@ -31,6 +31,8 @@ RELDEPTH="${3:-1}"
 MD="${MD:-10}"          # BFS max depth
 MS="${MS:-1000000}"     # BFS max size
 FC="${FC:-2}"           # forward-closure depth
+TAC="${TAC:-checker}"   # tactic (checker = directed Checker tactic; empty = plain bounded BFS)
+ST="${ST:-0}"           # steps mode (0 = prove the whole statement; needed for DV provisos)
 MATH="${RUSSELL_MATH:-$HOME/dev/math}"
 ART="$MATH/mizar/$MODULE.ru"
 WORK="/tmp/prove_env_$MODULE"
@@ -88,9 +90,9 @@ prov=0; tot=0
 for n in $NAMES; do
     tot=$((tot + 1))
     got=$("$RJ" no-server=1 translate/mizar/prove_probe \
-            file="$WORK/$n.ru" target="$n" rel="$RELDEPTH" tl="$TLIMIT" md="$MD" ms="$MS" fc="$FC" \
-          2>/dev/null | grep -oE "PROBE_RESULT $n proved=[0-9]+" | grep -oE "[0-9]+$" || echo 0)
-    if [ "${got:-0}" -ge 1 ]; then printf "  PROVABLE      %s\n" "$n"; prov=$((prov + 1));
-    else                          printf "  not provable  %s\n" "$n"; fi
+            file="$WORK/$n.ru" target="$n" rel="$RELDEPTH" tl="$TLIMIT" md="$MD" ms="$MS" fc="$FC" tac="$TAC" st="$ST" \
+          2>/dev/null | grep -oE "PROBE_RESULT $n proved=1 verify=true" | head -1)
+    if [ -n "$got" ]; then printf "  PROVABLE      %s\n" "$n"; prov=$((prov + 1));
+    else                   printf "  not provable  %s\n" "$n"; fi
 done
 echo "=== $prov / $tot provable from the foundation (probes in $WORK/) ==="
