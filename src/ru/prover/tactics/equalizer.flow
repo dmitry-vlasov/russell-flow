@@ -31,8 +31,10 @@ export {
 	// disjoint-variable provisos the rewrite proof needs (from eq0 etc.). No Kalmár — the residual is
 	// left for a bounded BFS to close.
 	RuEqRewrite(residual : RuExp, proof : Maybe<RuProofTree>, disjs : Set<RuDisj>);
+	// `nnf` = push negation to negation-normal-form in the canon pass (De Morgan). OFF keeps ¬(∧/∨)
+	// intact for pm3.24 contradiction-pair closing; the checker tries OFF first, ON as a fallback.
 	ruEqualizerRewrite(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int,
-		hyps : [RuExp], goal : RuExp) -> RuEqRewrite;
+		hyps : [RuExp], goal : RuExp, nnf : bool) -> RuEqRewrite;
 
 	// Strip a leading chain of universal quantifiers (wal): returns (matrix, intermediates), where
 	// intermediates are the quantified exprs each ax-gen step concludes, INNERMOST first (… up to the
@@ -384,7 +386,7 @@ ruBinderBridgeFacts(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass 
 
 // ---- directed structure for the open-residual `checker` tactic --------------
 
-ruEqualizerRewrite(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp) -> RuEqRewrite {
+ruEqualizerRewrite(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, nnf : bool) -> RuEqRewrite {
 	// membership unfold (elun/elin/…) + relation unfold (= via eqss → ⊆∧⊆) + existential unfold
 	// (X=∅ via eq0 → the goal's own ∀v¬(v∈X) atom; carries its DV provisos).
 	exps0 = arrayPush(hyps, goal);
@@ -406,7 +408,7 @@ ruEqualizerRewrite(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass :
 		});
 	goalForm = ruPAtomize(conn, goal);
 	rw       = ruEqzRw(ctx, factMap, makeSet(), goalForm);   // (goal', goal ↔ goal')
-	canon    = ruCanonRw(ctx, rw.first);                     // (goal'', goal' ↔ goal'') — normal form
+	canon    = ruCanonRw(ctx, rw.first, nnf);                // (goal'', goal' ↔ goal'') — normal form
 	goal3    = canon.first;
 	goal3Exp = ruKForm2Exp(ctx, goal3);
 	if (goal3 == goalForm) RuEqRewrite(goal3Exp, None(), disjs)   // nothing changed: residual = goal
@@ -499,47 +501,50 @@ ruCanonBinNF(ctx : RuKEmitCtx, isAnd : bool, a : RuPForm, b : RuPForm) -> Pair<R
 }
 
 // Canonicalise children, then normalise the binary node (left-assoc + sort).
-ruCanonBin(ctx : RuKEmitCtx, isAnd : bool, congLemma : string, a : RuPForm, b : RuPForm) -> Pair<RuPForm, RuProofTree> {
+ruCanonBin(ctx : RuKEmitCtx, isAnd : bool, congLemma : string, a : RuPForm, b : RuPForm, nnf : bool) -> Pair<RuPForm, RuProofTree> {
 	mk = \x : RuPForm, y : RuPForm -> if (isAnd) RuPAnd(x, y) else RuPOr(x, y);
-	ra = ruCanonRw(ctx, a); rb = ruCanonRw(ctx, b);
+	ra = ruCanonRw(ctx, a, nnf); rb = ruCanonRw(ctx, b, nnf);
 	cong = RuProofStep(s2id_(congLemma), [ra.second, rb.second], ruEqzStmt(ctx, mk(a, b), mk(ra.first, rb.first)));
 	nf = ruCanonBinNF(ctx, isAnd, ra.first, rb.first);
 	if (mk(ra.first, rb.first) == nf.first) Pair(nf.first, cong)
 	else Pair(nf.first, RuProofStep(s2id_("bitri"), [cong, nf.second], ruEqzStmt(ctx, mk(a, b), nf.first)));
 }
 
-ruCanonRw(ctx : RuKEmitCtx, form : RuPForm) -> Pair<RuPForm, RuProofTree> {
+// `nnf` = push negation inward (De Morgan + double-neg). OFF keeps a ¬(∧/∨) intact (for pm3.24
+// contradiction-pair closing); the checker runs nnf=false first, then nnf=true as a fallback.
+ruCanonRw(ctx : RuKEmitCtx, form : RuPForm, nnf : bool) -> Pair<RuPForm, RuProofTree> {
 	refl = \f -> RuProofStep(s2id_("biid"), [], ruEqzStmt(ctx, f, f));
 	switch (form) {
 		RuPAtom(__):  Pair(form, refl(form));
 		RuPTrue():    Pair(form, refl(form));
 		RuPFalse():   Pair(form, refl(form));
-		// Push negation inward toward NEGATION NORMAL FORM (De Morgan + double-neg) so a goal like
-		// ¬(¬a∧(¬b∧¬c)) converges to the hyp's shape a∨(b∨c). De Morgan is applied to the RAW operands
-		// (then the result is canon'd recursively) — NOT after canon: canon-first would group/keep a
-		// contradiction pair P∧¬P that pm3.24 wants, but the env-axiom ¬∧-biconditionals that rely on
-		// that are a separate workload; for the article GAPS the raw-De-Morgan form converges more.
+		// With nnf ON: push negation inward toward NEGATION NORMAL FORM (De Morgan + double-neg) so a goal
+		// like ¬(¬a∧(¬b∧¬c)) converges to the hyp's shape a∨(b∨c). De Morgan is applied to the RAW
+		// operands (then canon'd recursively). With nnf OFF: leave a ¬(∧/∨) intact (just recurse + notbii)
+		// so a contradiction pair ¬(P∧¬P) survives for pm3.24. The checker tries OFF first, ON as fallback.
 		RuPNot(a): {
 			deMorgan = \lemma : string, inner : RuPForm -> {
 				dm = RuProofStep(s2id_(lemma), [], ruEqzStmt(ctx, form, inner));   // ¬(x⊕y) ↔ inner
-				rc = ruCanonRw(ctx, inner);
+				rc = ruCanonRw(ctx, inner, nnf);
 				Pair(rc.first, if (inner == rc.first) dm else RuProofStep(s2id_("bitri"), [dm, rc.second], ruEqzStmt(ctx, form, rc.first)));
 			};
-			switch (a) {
+			recurseNot = \ -> { ra = ruCanonRw(ctx, a, nnf); Pair(RuPNot(ra.first), RuProofStep(s2id_("notbii"), [ra.second], ruEqzStmt(ctx, RuPNot(a), RuPNot(ra.first)))); };
+			if (!nnf) recurseNot()
+			else switch (a) {
 				RuPAnd(x, y): deMorgan("ianor", RuPOr(RuPNot(x), RuPNot(y)));   // ¬(x∧y) ↔ (¬x∨¬y)
 				RuPOr(x, y):  deMorgan("ioran", RuPAnd(RuPNot(x), RuPNot(y)));  // ¬(x∨y) ↔ (¬x∧¬y)
 				RuPNot(b): {                                                    // ¬¬b ↔ b
 					nn = RuProofStep(s2id_("notnotb"), [], ruEqzStmt(ctx, b, RuPNot(RuPNot(b))));   // b ↔ ¬¬b
 					dn = RuProofStep(s2id_("bicomi"), [nn], ruEqzStmt(ctx, form, b));                // ¬¬b ↔ b
-					rc = ruCanonRw(ctx, b);
+					rc = ruCanonRw(ctx, b, nnf);
 					Pair(rc.first, if (b == rc.first) dn else RuProofStep(s2id_("bitri"), [dn, rc.second], ruEqzStmt(ctx, form, rc.first)));
 				}
-				default: { ra = ruCanonRw(ctx, a); Pair(RuPNot(ra.first), RuProofStep(s2id_("notbii"), [ra.second], ruEqzStmt(ctx, RuPNot(a), RuPNot(ra.first)))); }
+				default: recurseNot();
 			};
 		}
-		RuPAnd(a, b): ruCanonBin(ctx, true,  "anbi12i", a, b);
-		RuPOr(a, b):  ruCanonBin(ctx, false, "orbi12i", a, b);
-		RuPImp(a, b): { ra = ruCanonRw(ctx, a); rb = ruCanonRw(ctx, b); Pair(RuPImp(ra.first, rb.first), RuProofStep(s2id_("imbi12i"), [ra.second, rb.second], ruEqzStmt(ctx, form, RuPImp(ra.first, rb.first)))); }
-		RuPIff(a, b): { ra = ruCanonRw(ctx, a); rb = ruCanonRw(ctx, b); Pair(RuPIff(ra.first, rb.first), RuProofStep(s2id_("bibi12i"), [ra.second, rb.second], ruEqzStmt(ctx, form, RuPIff(ra.first, rb.first)))); }
+		RuPAnd(a, b): ruCanonBin(ctx, true,  "anbi12i", a, b, nnf);
+		RuPOr(a, b):  ruCanonBin(ctx, false, "orbi12i", a, b, nnf);
+		RuPImp(a, b): { ra = ruCanonRw(ctx, a, nnf); rb = ruCanonRw(ctx, b, nnf); Pair(RuPImp(ra.first, rb.first), RuProofStep(s2id_("imbi12i"), [ra.second, rb.second], ruEqzStmt(ctx, form, RuPImp(ra.first, rb.first)))); }
+		RuPIff(a, b): { ra = ruCanonRw(ctx, a, nnf); rb = ruCanonRw(ctx, b, nnf); Pair(RuPIff(ra.first, rb.first), RuProofStep(s2id_("bibi12i"), [ra.second, rb.second], ruEqzStmt(ctx, form, RuPIff(ra.first, rb.first)))); }
 	}
 }
