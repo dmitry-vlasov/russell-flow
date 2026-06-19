@@ -26,7 +26,7 @@ export {
 	// Prove `hyps ⊢ goal` by bounded BFS restricted to `scope`, returning the found proof TREE. A
 	// self-contained prover run on a CONCRETE goal — no free witness variable ever reaches search.
 	ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int,
-		hyps : [RuExp], goal : RuExp, scope : [int], md : int, ms : int, limit : double) -> Maybe<RuProofTree>;
+		hyps : [RuExp], goal : RuExp, scope : [int], md : int, ms : int, limit : double) -> Maybe<RuRefineResult>;
 
 	// The orthogonal Checker phases, as refiners, + the name registry that `refine(...)` resolves against.
 	ruStripForallRefiner(stmtClass : int) -> RuRefiner;
@@ -42,7 +42,22 @@ ruCheckerPropScope() -> [int] {
 }
 
 ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int,
-	hyps : [RuExp], goal : RuExp, scope : [int], md : int, ms : int, limit : double) -> Maybe<RuProofTree> {
+	hyps : [RuExp], goal : RuExp, scope : [int], md : int, ms : int, limit : double) -> Maybe<RuRefineResult> {
+	em = RuEnvMath(math, env); conn = ruPConnectives(); wff = tp2id_("wff");
+	nh = length(hyps);
+	// HYP-REWRITING: unfold each hyp the same way the goal was unfolded, so a gap like
+	// `x∈(A∪B) ⊢ (x∈A)∨(x∈B)` connects (the hyp is rewritten to the goal's normal form). A hyp that
+	// changes becomes a DERIVED premise `hyp'`, proven from the real hyp by mpbi(hyp, hyp↔hyp').
+	hRw = map(hyps, \h -> ruEqualizerRewrite(em, conn, wff, stmtClass, [], h));
+	changed = filtermapi(hyps, \i, __ -> switch (hRw[i].proof) { None(): None(); Some(p): Some(Pair(i, p)); });
+	derivedHyps = map(changed, \c -> hRw[c.first].residual);
+	derivedProofs = map(changed, \c -> {
+		i = c.first;
+		RuProofStep(s2id_("mpbi"),
+			[RuProofHyp(i, RuStmt(stmtClass, [hyps[i]], -1)), c.second],   // ph=hyp_i, (ph↔ps)=hyp_i↔hyp_i'
+			RuStmt(stmtClass, [hRw[i].residual], -1));                      // ⊢ hyp_i'
+	});
+	hypDisjs = fold(changed, makeSet(), \acc, c -> mergeSets(acc, hRw[c.first].disjs));
 	// Index ONLY the scope lemmas (tiny) — the whitelist restricts search to them anyway, and rebuilding
 	// the full 5000+ index on every checker invocation is far too costly.
 	scopeSet = buildSet(scope);
@@ -50,7 +65,11 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 		if (containsSet(scopeSet, ass.info.id)) ruSetIndex(ruExp(ass.infer.prop.exps[0]), ass, acc) else acc);
 	captured : ref Maybe<RuProofTree> = ref None();
 	goalStep = RuStep(-1, ruStepLemma, [], RuStmt(stmtClass, [goal], -1), ruNoProof, "", -1);
-	premises = mapi(hyps, \i, h -> RuHyp(i, RuStmt(stmtClass, [h], -1), -1));
+	// premises: the real hyps (0..nh-1) then the derived, unfolded hyps (nh..).
+	premises = concat(
+		mapi(hyps, \i, h -> RuHyp(i, RuStmt(stmtClass, [h], -1), -1)),
+		mapi(derivedHyps, \j, h -> RuHyp(nh + j, RuStmt(stmtClass, [h], -1), -1))
+	);
 	// `info` MUST be the outer theorem's info so the precedence check (ruDeclInfoPreceeds) admits the
 	// same foundation assertions the theorem itself may use.
 	task  = RuProverTask(info, ruDoneTactic, "checker-residual", makeTree(), premises, goalStep);
@@ -62,9 +81,12 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 	penv.whitelist := scope;
 	penv.tactic := Some(ruBoundedBFSTactic(md, ms));
 	ruProve(ruExpandHyp(penv.tree.root, penv));
-	// The captured tree's stmts are const-encoded (the default onProof unconsts before storing); do the
-	// same so they match the foundation's normal encoding when assembled into the outer proof.
-	maybeMap(^captured, \t -> ruCheckerUnconstTree(penv0.fns.unconst, t));
+	// Unconst the captured tree (the default onProof unconsts before storing), then splice each derived
+	// premise's leaf (index ≥ nh) with its mpbi derivation. Carry the hyps' DV provisos out.
+	maybeMap(^captured, \t -> {
+		unc = ruCheckerUnconstTree(penv0.fns.unconst, t);
+		RuRefineResult(ruUnfoldSplice(unc, nh, derivedProofs), hypDisjs);
+	});
 }
 
 ruCheckerUnconstTree(unconst : (RuExp) -> RuExp, t : RuProofTree) -> RuProofTree {
@@ -100,11 +122,34 @@ ruEqRewriteRefiner(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass :
 	});
 }
 
+// Phase between strip-forall and eq-rewrite: if the goal is a `⊆` / set-`=` relation, REDUCE it via
+// ssriv/eqriv to a fresh-setvar membership subgoal `(v∈A)→(v∈B)` / `(v∈A)↔(v∈B)`, which then flows to
+// eq-rewrite (membership unfold) + the bounded BFS closer — no Kalmár, so proofs stay small. Non-
+// relation goals pass through unchanged. This unlocks the ⊆/= gaps the prop-only residual can't.
+ruRelIntroRefiner(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp]) -> RuRefiner {
+	wssId = s2id("wss"); wceqId = s2id("wceq");
+	passthru = \goal -> Some(RuRefineStep([goal], \proofs -> proofs[0], makeSet()));
+	RuRefiner("rel-intro", \goal -> {
+		head = ruEqHead(goal);
+		if (head != wssId && head != wceqId) passthru(goal)
+		else {
+			// Reduce `A⊆B` / `A=B` to the fresh-setvar membership subgoal `(v∈A)→(v∈B)` / `(v∈A)↔(v∈B)`,
+			// wrapped by ssriv/eqriv. The subgoal flows to eq-rewrite (membership unfold) + the BFS closer —
+			// no Kalmár, so the proof stays small.
+			r = ruEqualizerRelSubgoal(em, conn, wff, stmtClass, hyps, goal, head == wssId);
+			Some(RuRefineStep([r.subgoal],
+				\proofs -> RuProofStep(r.lemma, [proofs[0]], RuStmt(stmtClass, [goal], -1)),
+				r.disjs));
+		};
+	});
+}
+
 // Resolve a refiner NAME (a `refine(...)` argument) to its RuRefiner.
 ruRefinerByName(name : string, em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp]) -> Maybe<RuRefiner> {
 	if (name == "strip-forall") Some(ruStripForallRefiner(stmtClass))
+	else if (name == "rel-intro") Some(ruRelIntroRefiner(em, conn, wff, stmtClass, hyps))
 	else if (name == "eq-rewrite") Some(ruEqRewriteRefiner(em, conn, wff, stmtClass, hyps))
 	else None();
 }
 
-ruRefinerNames() -> [string] { ["strip-forall", "eq-rewrite"] }
+ruRefinerNames() -> [string] { ["strip-forall", "rel-intro", "eq-rewrite"] }

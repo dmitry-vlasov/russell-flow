@@ -39,6 +39,15 @@ export {
 	// original goal). Empty list = no leading ∀.
 	ruStripForall(e : RuExp) -> Pair<RuExp, [RuExp]>;
 
+	// Goal-side ⊆/= reduction (no Kalmár): reduce `A⊆B` / `A=B` to a fresh-setvar membership subgoal
+	// `(v∈A)→(v∈B)` / `(v∈A)↔(v∈B)` + the wrapper lemma (ssriv/eqriv) + fresh var + DV provisos.
+	RuEqRelReduce(subgoal : RuExp, lemma : int, fresh : RuVar, disjs : Set<RuDisj>);
+	ruEqualizerRelSubgoal(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int,
+		hyps : [RuExp], goal : RuExp, isSubset : bool) -> RuEqRelReduce;
+
+	// Root rule id of an expression (the relation/connective head), e.g. wss / wceq.
+	ruEqHead(e : RuExp) -> int;
+
 	// All assertion ids occurring in a proof tree (to whitelist a follow-proof replay).
 	ruProofTreeAssertions(t : RuProofTree) -> [int];
 }
@@ -211,8 +220,28 @@ ruEqFreshSetvar(used : Set<int>, setvarT : int, i : int) -> RuVar {
 	if (containsSet(used, id)) ruEqFreshSetvar(used, setvarT, i + 1) else RuVar(id, setvarT);
 }
 
-// Goal-side ⊆/= : prove `A⊆B` / `A=B` from the membership subgoal over a fresh setvar.
-ruEqualizerGoalRel(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, isSubset : bool) -> Maybe<RuProverTactic> {
+// Goal-side ⊆/= REDUCTION (no Kalmár): for goal `A⊆B` / `A=B`, build the fresh-setvar membership
+// subgoal `(v∈A)→(v∈B)` / `(v∈A)↔(v∈B)` plus the wrapper lemma (ssriv/eqriv), the fresh var, and the
+// disjoint-variable provisos (fresh ⫬ each theorem var). The caller proves the subgoal however it
+// likes (the checker uses membership-unfold + a bounded BFS) and wraps with `lemma`.
+RuEqRelReduce(subgoal : RuExp, lemma : int, fresh : RuVar, disjs : Set<RuDisj>);
+ruEqualizerRelSubgoal(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, isSubset : bool) -> RuEqRelReduce {
+	ar = ruEqArgs(goal); a = ar.first; b = ar.second;
+	wcelId = s2id("wcel"); wiId = s2id("wi"); wbId = s2id("wb"); setvarT = tp2id_("setvar"); classT = tp2id_("class");
+	tvars = ruEqVarsOf(arrayPush(hyps, goal));
+	fresh = ruEqFreshSetvar(buildSet(map(tvars, \v -> v.id)), setvarT, 0);
+	cvNode = ruMakeRuleNode(ruSuperTypeName(classT, setvarT), classT, 1, 1);
+	freshExp = RuExp([cvNode, fresh], -1);
+	memb = \s -> ruEqMkRule(wcelId, wff, [freshExp, s]);
+	subgoal = if (isSubset) ruEqMkRule(wiId, wff, [memb(a), memb(b)]) else ruEqMkRule(wbId, wff, [memb(a), memb(b)]);
+	RuEqRelReduce(subgoal, if (isSubset) s2id_("ssriv") else s2id_("eqriv"), fresh,
+		buildSet(map(tvars, \v -> RuDisj(fresh, v))));
+}
+
+// Goal-side ⊆/= : prove `A⊆B` / `A=B` from the membership subgoal over a fresh setvar. Returns the
+// proof TREE + its disjoint-variable provisos (fresh ⫬ each theorem var, for ssriv/eqriv). The
+// `checker`'s rel-intro refiner consumes this directly; the tactic wrapper below keeps the old API.
+ruEqualizerGoalRelTree(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, isSubset : bool) -> Maybe<Pair<RuProofTree, Set<RuDisj>>> {
 	ar = ruEqArgs(goal); a = ar.first; b = ar.second;
 	wcelId = s2id("wcel"); wiId = s2id("wi"); wbId = s2id("wb"); setvarT = tp2id_("setvar"); classT = tp2id_("class");
 	tvars = ruEqVarsOf(arrayPush(hyps, goal));
@@ -228,12 +257,22 @@ ruEqualizerGoalRel(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass :
 		Some(subTree): {
 			lemmaId  = if (isSubset) s2id_("ssriv") else s2id_("eqriv");
 			goalTree = RuProofStep(lemmaId, [subTree], RuStmt(stmtClass, [goal], -1));
-			// fresh setvar + disjoint(fresh, v) for every theorem var v (covers ssriv/eqriv's provisos).
-			varsTree = fold(arrayPush(tvars, fresh), makeTree(), \acc, v -> setTree(acc, v.id, v));
+			// disjoint(fresh, v) for every theorem var v (covers ssriv/eqriv's provisos).
 			disjs    = buildSet(map(tvars, \v -> RuDisj(fresh, v)));
-			Some(ruKalmarDirectTactic(RuProof(RuVarsDisjs(varsTree, disjs), ruMakeLinearProof(goalTree), -1)));
+			Some(Pair(goalTree, disjs));
 		}
 	}
+}
+
+ruEqualizerGoalRel(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, isSubset : bool) -> Maybe<RuProverTactic> {
+	tvars = ruEqVarsOf(arrayPush(hyps, goal));
+	maybeMap(ruEqualizerGoalRelTree(em, conn, wff, stmtClass, hyps, goal, isSubset), \p -> {
+		// fresh setvar + theorem vars, for the standalone proof's var table.
+		setvarT = tp2id_("setvar");
+		fresh = ruEqFreshSetvar(buildSet(map(tvars, \v -> v.id)), setvarT, 0);
+		varsTree = fold(arrayPush(tvars, fresh), makeTree(), \acc, v -> setTree(acc, v.id, v));
+		ruKalmarDirectTactic(RuProof(RuVarsDisjs(varsTree, p.second), ruMakeLinearProof(p.first), -1));
+	});
 }
 
 ruEqualizerProve(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp) -> Maybe<RuProofTree> {
