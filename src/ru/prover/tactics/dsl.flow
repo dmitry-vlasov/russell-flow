@@ -410,7 +410,7 @@ ruTacticHelp() -> [Pair<string, string>] {
 		Pair("ap(a, child, ...)",            "replay a positional proof TREE (assertion + ordered children / prem)"),
 		Pair("prop",                         "propositional closer: unfold membership atoms + Kalmar certificate"),
 		Pair("def-close",                    "definitional closure: refine(strip-forall, rel-intro, eq-rewrite) then engine-replay/inject"),
-		Pair("refine(r1, ..., max-depth=, max-size=)", "compose goal refiners + a residual closer into a guide, then realize it"),
+		Pair("refine(r1, ..., max-depth=, max-size=, closer=<tactic>)", "compose goal refiners + a residual closer (default bounded-bfs; closer= swaps the strategy) into a guide, then realize it"),
 		Pair("linear-guided(max-size, attempts)", "guide search by linear goal->premise chains from the corpus"),
 		Pair("follow-proof(theorem)",        "replay a named theorem's stored proof tree (diagnostic)"),
 		Pair("oracle(max-true, max-false)",  "drive search by the theorem's own proof tree via unify stubs"),
@@ -534,13 +534,33 @@ ruDslBuildProp(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilde
 
 
 // Build the refine pipeline tactic from a list of refiner names: compose the refiners, close the
-// concrete residual with bounded BFS over the small propositional scope. Shared by `refine(...)` and
-// `checker`. Budget args (named): max-depth / max-size / time-limit drive the residual BFS.
+// concrete residual with the CLOSER tactic over the small propositional scope. Shared by `refine(...)`
+// and `def-close`. Budget args (named): max-depth / max-size / time-limit size the DEFAULT closer
+// (bounded-bfs); `closer=<tactic>` swaps in any search strategy over the scope, e.g.
+// `def-close(closer=top-n-bfs(3,6,4096))`.
 ruDslRefineTactic(refinerNames : [string], ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
 	md = ruDslGetInt(ast, "max-depth", 99, 6);
 	ms = ruDslGetInt(ast, "max-size",  99, 4096);
 	tl = i2d(ruDslGetInt(ast, "time-limit", 99, 60));
+	// `closer=<tactic>` (named-only; pos 99 = never matches a refiner): the residual search strategy.
+	// Default is bounded-bfs(md,ms). We store the closer's AST and REBUILD it fresh on every mkCloser()
+	// call below: a closer carries internal ref-state (e.g. bounded-bfs's delta snapshot) that must not
+	// leak across the per-residual / nnf-off-then-on sub-proves.
+	closerAstMb : Maybe<RuTacticAst> = switch (ruDslGetArg(ast, "closer", 99)) {
+		None(): None();
+		Some(v): switch (v) {
+			RuTacticValAst(sub): Some(sub);
+			RuTacticValLit(__):  None();
+		}
+	};
 	Some(RuTacticBuilder(\penv -> {
+		mkCloser = \ -> switch (closerAstMb) {
+			Some(sub): switch (ruBuildTacticFromAst(sub, ctx)) {
+				Some(b): (b.build(penv)).second;
+				None():  ruBoundedBFSTactic(md, ms);
+			};
+			None():  ruBoundedBFSTactic(md, ms);
+		};
 		task      = penv.conf.task;
 		goalStmt  = task.goal.stmt;
 		goalExp   = ruExp(goalStmt.exps[0]);
@@ -553,7 +573,7 @@ ruDslRefineTactic(refinerNames : [string], ast : RuTacticAst, ctx : RuTacticCont
 		// eq-rewrite refiner + the hyp-rewriting closer use the same canon mode.
 		attempt = \nnf : bool -> {
 			refiners = filtermap(refinerNames, \nm -> ruRefinerByName(nm, em, conn, wff, stmtClass, hypExps, nnf));
-			close    = \g -> ruCheckerResidual(ctx.math, ctx.env, task.info, stmtClass, hypExps, g, ruCheckerPropScope(), md, ms, tl, nnf);
+			close    = \g -> ruCheckerResidual(ctx.math, ctx.env, task.info, stmtClass, hypExps, g, ruCheckerPropScope(), mkCloser, tl, nnf);
 			ruRefine(refiners, goalExp, close);
 		};
 		// nnf=false first (keeps ¬(P∧¬P) for pm3.24), nnf=true as a fallback (De Morgan for the
