@@ -235,6 +235,10 @@ ruProveTheoremSteps(
 	fixCls = \s : RuStmt -> RuStmt(s with class = scls);
 	steps  = map(th.proof.steps, \st -> RuStep(st with stmt = fixCls(st.stmt)));
 	premHyps = map(hyps, \h -> RuHyp(h.ind, fixCls(h.stmt), h.pos));
+	// Accumulate theorem-var disjoint provisos that normalizing a gap proof pushes out of the sub-proof
+	// (both ends are theorem vars, so they belong on the theorem, not the lemma) — promoted to the
+	// inference below, else the verifier rejects them ("restrictions not present in inherited").
+	promoted_disjs : ref Set<RuDisj> = ref makeSet();
 	acc = foldi(steps, Pair([], 0), \i, ac : Pair<[RuStep], int>, step -> {
 		done    = ac.first;
 		nclosed = ac.second;
@@ -264,7 +268,11 @@ ruProveTheoremSteps(
 					// equalizer's goal-side ⊆/= unfold) land IN the sub-proof's vars — the verifier
 					// checks a lemma step's sub-proof with only its own vars, not the outer theorem's.
 					tmpTh = RuTheorem(th.info, RuInference(ruEmptyVarsDisjs, premises2hyps(premises), step.stmt), makeSet(), pf);
-					subProof = ruNormalizeTheoremVarsDisjs(tmpTh).proof;
+					normTh = ruNormalizeTheoremVarsDisjs(tmpTh);
+					subProof = normTh.proof;
+					// Capture the DVs normalization moved to the inference (those over step vars, which are
+					// theorem/premise vars) so a theorem-var DV the proof needs isn't silently dropped.
+					promoted_disjs := mergeSets(^promoted_disjs, normTh.infer.vars.disjs);
 					// Reject pathologically large proofs (the Kalmár closer is exponential — a single
 					// goal can blow up to thousands of opaque steps, which bloats the file and overflows
 					// the writer). Such a step is left OPEN rather than installed. max_steps<=0 = no cap.
@@ -293,10 +301,19 @@ ruProveTheoremSteps(
 			}
 		}
 	});
-	Pair(
-		RuTheorem(th with proof = RuProof(th.proof with steps = acc.first)),
-		Pair(acc.second, length(steps))
+	new_proof = RuProof(th.proof with steps = acc.first);
+	// Promote the captured DVs that are OVER THEOREM VARS into the theorem's inference. A DV between two
+	// theorem vars — e.g. eq0 forcing disjointed(x4 x7) in t7_xboole_0, inherent to the statement — must
+	// be DECLARED on the theorem (the sub-proof can't hold it: x4/x7 aren't in its frame) or the verifier
+	// rejects it. Fresh-var DVs are excluded (both ends must be theorem vars; those stay in the sub-proof).
+	th_var_set = ruAssertion2Vars(th);
+	promoted = filterSet(^promoted_disjs,
+		\d -> containsSet(th_var_set, d.v1) && containsSet(th_var_set, d.v2));
+	new_th = RuTheorem(th with
+		infer = RuInference(th.infer with vars = RuVarsDisjs(th.infer.vars.vars, mergeSets(th.infer.vars.disjs, promoted))),
+		proof = new_proof
 	);
+	Pair(new_th, Pair(acc.second, length(steps)));
 }
 
 // Premises (hyps ++ prior steps) re-expressed as positional hyps for the standalone sub-proof.
