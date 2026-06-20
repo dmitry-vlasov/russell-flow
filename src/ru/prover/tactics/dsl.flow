@@ -421,6 +421,7 @@ ruTacticHelp() -> [Pair<string, string>] {
 		Pair("limited(t, time=, applied=, produced=, size=)", "run t under wall-clock / step / size caps"),
 		Pair("focus(selector, t)",           "restrict t to the subtrees rooted at the selector's seeds"),
 		Pair("track(selector, t)",           "restrict t to EXACTLY the selector's props each step (e.g. replay a guide)"),
+		Pair("scoped(scope, t)",             "restrict candidate rules to <scope> (a named scope like prop-scope, or an inline assertion list), then run t"),
 		// selectors (used inside focus/track)
 		Pair("<selector> all",               "every open leaf (no restriction)"),
 		Pair("<selector> replay",            "props matching the guide/stored proof, by assertion id, level by level"),
@@ -472,6 +473,7 @@ ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTactic
 	else if (n == "limited")         ruDslBuildLimited(ast, ctx)
 	else if (n == "focus")           ruDslBuildFocus(ast, ctx)
 	else if (n == "track")           ruDslBuildTrack(ast, ctx)
+	else if (n == "scoped")          ruDslBuildScoped(ast, ctx)
 	else {
 		ctx.env.out.error("tactic DSL: unknown atom '" + ast.name + "'\n" + ruTacticHelp2s(), []);
 		None();
@@ -593,10 +595,12 @@ ruDslRefineTactic(refinerNames : [string], ast : RuTacticAst, ctx : RuTacticCont
 			//      this when stage 1 left tree.proofs empty, so there is zero capability loss vs pure
 			//      injection; injected proofs still pass the verify-before-install net in ruProveTheoremSteps.
 			Some(pd): {
-				penv.whitelist := uniq(ruApTreeAssertions(pd.proof));
+				guideAss = uniq(ruApTreeAssertions(pd.proof));
+				penv.whitelist := guideAss;
 				track  = ruTrackTactic(ruReplaySelector(pd.proof), ruBreadthFirstTactic);
 				inject = ruKalmarDirectTactic(RuProof(RuVarsDisjs(makeTree(), pd.disjs), ruMakeLinearProof(pd.proof), -1));
-				Pair(penv, ruSequenceTactic([track, inject]));
+				scopeStr = "[" + strGlue(map(guideAss, id2s), ", ") + "]";
+				Pair(penv, ruScopedTactic(scopeStr, ruSequenceTactic([track, inject])));
 			}
 		}
 	}))
@@ -645,9 +649,11 @@ ruDslBuildApply(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuild
 		// default 16384, override with a trailing positional integer.
 		ms = if (lits != []) s2i(lits[0]) else ruDslGetInt(ast, "max-size", 99, 16384);
 		md = ruDslGetInt(ast, "max-depth", 99, 12);
+		// apply(a1,...,ak) == scoped([a1,...,ak], bounded-bfs(md,ms)) — the whitelist restriction is now
+		// the visible `scoped` combinator (faithful toString).
 		Some(RuTacticBuilder(\penv -> {
 			penv.whitelist := aids;
-			Pair(penv, ruBoundedBFSTactic(md, ms));
+			Pair(penv, ruScopedTactic("[" + strGlue(names, ", ") + "]", ruBoundedBFSTactic(md, ms)));
 		}));
 	}
 }
@@ -698,7 +704,7 @@ ruDslBuildAp(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder>
 				wl   = uniq(ruApTreeAssertions(skel));
 				Some(RuTacticBuilder(\penv -> {
 					penv.whitelist := wl;
-					Pair(penv, ruFollowProofTactic(skel));
+					Pair(penv, ruScopedTactic("[" + strGlue(map(wl, id2s), ", ") + "]", ruFollowProofTactic(skel)));
 				}));
 			}
 		}
@@ -922,6 +928,43 @@ ruDslBuildFocus(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuild
 
 ruDslBuildTrack(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
 	ruDslBuildFocusLike(ast, ctx, "track", ruTrackTactic)
+}
+
+// Named scopes: a short alias for a fixed assertion set, so `scoped(prop-scope, ...)` stays readable.
+ruNamedScope(name : string) -> Maybe<[int]> {
+	if (name == "prop-scope") Some(ruCheckerPropScope())
+	else None();
+}
+
+// scoped(<scope>, <tactic>): restrict candidate generation to <scope> (a named scope like `prop-scope`,
+// or an inline list of assertion names), then run <tactic>. The LAST positional is the tactic; every
+// preceding positional is the scope spec. Lifts the old `penv.whitelist :=` side-effect into a visible
+// combinator: the whitelist is set on the prove env at build time, and ruScopedTactic carries the scope
+// into toString. `apply(...)` and def-close's realizer are expressed through this.
+ruDslBuildScoped(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+	poss = ruDslPositional(ast);
+	n = length(poss);
+	if (n < 2) {
+		ctx.env.out.error("tactic DSL: scoped(<scope>, <tactic>) needs a scope and a tactic", []);
+		None();
+	} else {
+		scopeNames = filtermap(take(poss, n - 1), \v -> switch (v) {
+			RuTacticValAst(sub): if (sub.name != "") Some(sub.name) else None();
+			RuTacticValLit(__):  None();
+		});
+		resolved = if (length(scopeNames) == 1) switch (ruNamedScope(scopeNames[0])) {
+			Some(ids): Pair(scopeNames[0], ids);
+			None():    Pair("[" + strGlue(scopeNames, ", ") + "]", map(scopeNames, s2id_));
+		} else Pair("[" + strGlue(scopeNames, ", ") + "]", map(scopeNames, s2id_));
+		switch (ruDslGetTacticBuilder(ast, n - 1, ctx)) {
+			None(): None();
+			Some(innerBuilder): Some(RuTacticBuilder(\penv -> {
+				penv.whitelist := resolved.second;
+				p = innerBuilder.build(penv);
+				Pair(p.first, ruScopedTactic(resolved.first, p.second));
+			}));
+		}
+	}
 }
 
 ruDslBuildLimited(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
