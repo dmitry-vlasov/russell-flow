@@ -409,12 +409,16 @@ ruTacticHelp() -> [Pair<string, string>] {
 		Pair("apply(a1, ..., ak)",           "restrict candidate rules to the named assertions, then bounded bfs"),
 		Pair("ap(a, child, ...)",            "replay a positional proof TREE (assertion + ordered children / prem)"),
 		Pair("prop",                         "propositional closer: unfold membership atoms + Kalmar certificate"),
-		Pair("def-close",                    "definitional closure: refine(strip-forall, rel-intro, eq-rewrite) then engine-replay/inject"),
-		Pair("refine(r1, ..., max-depth=, max-size=, closer=<tactic>)", "compose goal refiners + a residual closer (default bounded-bfs; closer= swaps the strategy) into a guide, then realize it"),
+		Pair("def-close",                    "definitional closure: seq(replay(refine(...)), inject(refine(...))) over the full refiner set, nnf off then on"),
 		Pair("linear-guided(max-size, attempts)", "guide search by linear goal->premise chains from the corpus"),
 		Pair("follow-proof(theorem)",        "replay a named theorem's stored proof tree (diagnostic)"),
 		Pair("oracle(max-true, max-false)",  "drive search by the theorem's own proof tree via unify stubs"),
-		Pair("inject",                       "install an already-constructed proof directly (no search)"),
+		// realizers (take a guide-expression)
+		Pair("replay(<guide>)",              "reconstruct the guide through the engine (track + replay selector); valid by construction"),
+		Pair("inject(<guide>)",              "install the guide's constructed proof directly (no search); the engine-bypass fallback"),
+		// guide-expressions (a VALUE yielding a proof guide; consumed by replay/inject, not runnable alone)
+		Pair("refine(r1, ..., max-depth=, max-size=, nnf=on, closer=<tactic>)", "GUIDE: compose goal refiners + a residual closer (default bounded-bfs; closer= swaps strategy) into a proof tree"),
+		Pair("stored",                       "GUIDE: the theorem's own stored proof tree (replay(stored) reconstructs an existing proof)"),
 		// combinators
 		Pair("seq(t1, t2, ...)",             "run t1; on Done without a proof, fall through to t2, ... (first that closes wins)"),
 		Pair("loop(body, max-iters=N)",      "re-run body while it makes progress, up to N iterations"),
@@ -424,7 +428,6 @@ ruTacticHelp() -> [Pair<string, string>] {
 		Pair("scoped(scope, t)",             "restrict candidate rules to <scope> (a named scope like prop-scope, or an inline assertion list), then run t"),
 		// selectors (used inside focus/track)
 		Pair("<selector> all",               "every open leaf (no restriction)"),
-		Pair("<selector> replay",            "props matching the guide/stored proof, by assertion id, level by level"),
 		Pair("<selector> frontier",          "candidate props at the frontier where the guide diverges from the tree"),
 		Pair("<selector> leaf(id) / assertion(name)", "a single prop by id / all props applying a named assertion")
 	]
@@ -464,7 +467,8 @@ ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTactic
 	else if (n == "ap")              ruTagBuilder("ap", ruDslBuildAp(ast, ctx))
 	else if (n == "prop")            ruTagBuilder("prop", ruDslBuildProp(ast, ctx))
 	else if (n == "def-close" || n == "checker") ruTagBuilder("def-close", ruDslBuildDefClose(ast, ctx))
-	else if (n == "refine")          ruTagBuilder("refine", ruDslBuildRefine(ast, ctx))
+	else if (n == "replay")          ruDslBuildRealizer(ast, ctx, "replay", ruReplayRealize)
+	else if (n == "inject")          ruDslBuildRealizer(ast, ctx, "inject", ruInjectRealize)
 	else if (n == "linear-guided")   ruTagBuilder("linear-guided", ruDslBuildLinearGuided(ast, ctx))
 	else if (n == "follow-proof")    ruTagBuilder("follow-proof", ruDslBuildFollowProof(ast, ctx))
 	else if (n == "oracle")          ruTagBuilder("oracle", ruDslBuildOracle(ast))
@@ -535,27 +539,21 @@ ruDslBuildProp(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilde
 }
 
 
-// Build the refine pipeline tactic from a list of refiner names: compose the refiners, close the
-// concrete residual with the CLOSER tactic over the small propositional scope. Shared by `refine(...)`
-// and `def-close`. Budget args (named): max-depth / max-size / time-limit size the DEFAULT closer
-// (bounded-bfs); `closer=<tactic>` swaps in any search strategy over the scope, e.g.
-// `def-close(closer=top-n-bfs(3,6,4096))`.
-ruDslRefineTactic(refinerNames : [string], ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
-	md = ruDslGetInt(ast, "max-depth", 99, 6);
-	ms = ruDslGetInt(ast, "max-size",  99, 4096);
-	tl = i2d(ruDslGetInt(ast, "time-limit", 99, 60));
-	// `closer=<tactic>` (named-only; pos 99 = never matches a refiner): the residual search strategy.
-	// Default is bounded-bfs(md,ms). We store the closer's AST and REBUILD it fresh on every mkCloser()
-	// call below: a closer carries internal ref-state (e.g. bounded-bfs's delta snapshot) that must not
-	// leak across the per-residual / nnf-off-then-on sub-proves.
-	closerAstMb : Maybe<RuTacticAst> = switch (ruDslGetArg(ast, "closer", 99)) {
-		None(): None();
-		Some(v): switch (v) {
-			RuTacticValAst(sub): Some(sub);
-			RuTacticValLit(__):  None();
-		}
-	};
-	Some(RuTacticBuilder(\penv -> {
+// ---- guide-expressions: a tactic VALUE that yields a proof guide (not a runnable tactic) ----
+// A guide-expression evaluates (at build time, against the prover env / goal) to a proof TREE plus its
+// DV provisos. It is consumed by a REALIZER tactic: replay(<guide>) reconstructs it through the engine,
+// inject(<guide>) installs it directly. `refine(...)` and `stored` are the guide-expressions.
+RuGuideBuilder(toString : string, build : (RuProverEnv) -> Maybe<RuRefineResult>);
+
+// A guide-builder for the refiner pipeline with a FIXED nnf mode: compose the named refiners, close the
+// residual with the closer tactic (default bounded-bfs(md,ms)) over the prop scope. `closer=<tactic>`
+// swaps the residual search strategy; it is REBUILT fresh per residual (its delta-snapshot ref must not
+// leak across sub-proves).
+ruRefineGuideBuilder(refinerNames : [string], md : int, ms : int, tl : double, closerAstMb : Maybe<RuTacticAst>, nnf : bool, ctx : RuTacticContext) -> RuGuideBuilder {
+	nnfStr    = if (nnf) ", nnf=on" else "";
+	closerStr = switch (closerAstMb) { Some(sub): ", closer=" + sub.name + "(...)"; None(): ""; };
+	gstr      = "refine(" + strGlue(refinerNames, ", ") + nnfStr + closerStr + ")";
+	RuGuideBuilder(gstr, \penv -> {
 		mkCloser = \ -> switch (closerAstMb) {
 			Some(sub): switch (ruBuildTacticFromAst(sub, ctx)) {
 				Some(b): (b.build(penv)).second;
@@ -571,61 +569,110 @@ ruDslRefineTactic(refinerNames : [string], ast : RuTacticAst, ctx : RuTacticCont
 		em        = RuEnvMath(ctx.math, ctx.env);
 		conn      = ruPConnectives();
 		wff       = tp2id_("wff");
-		// Run the whole refinement for a given NNF mode (De Morgan off / on). Built per-attempt so the
-		// eq-rewrite refiner + the hyp-rewriting closer use the same canon mode.
-		attempt = \nnf : bool -> {
-			refiners = filtermap(refinerNames, \nm -> ruRefinerByName(nm, em, conn, wff, stmtClass, hypExps, nnf));
-			close    = \g -> ruCheckerResidual(ctx.math, ctx.env, task.info, stmtClass, hypExps, g, ruCheckerPropScope(), mkCloser, tl, nnf);
-			ruRefine(refiners, goalExp, close);
-		};
-		// nnf=false first (keeps ¬(P∧¬P) for pm3.24), nnf=true as a fallback (De Morgan for the
-		// disjunction-convergence gaps) — the `seq` idea, internal to def-close.
-		result = switch (attempt(false)) { Some(r): Some(r); None(): attempt(true); };
-		switch (result) {
-			None(): Pair(penv, ruDoneTactic);   // not closed: no-op, composes before a fallback
-			// The refiners produce a COMPLETE proof TREE — the engine-built residual plus the refiner glue
-			// (ax-gen / mpbir / ssriv wraps, mpbi derived-hyp splices). We close in two composable stages:
-			//   1. track(replay, bfs) — hand the tree to the REAL engine as a replay guide so it RECONSTRUCTS
-			//      the proof by backward search, validating every glue step by construction and deriving the
-			//      DV provisos itself. This is the composable, self-checking path and it closes the great
-			//      majority of guides (incl. all the ⊆/= article gaps def-close is for). The whitelist keeps
-			//      the eager expansion focused on the guide's own assertions.
-			//   2. ruKalmarDirectTactic — inject the constructed proof directly, as a FALLBACK for the guide
-			//      shapes the replay engine does not reconstruct within budget. ruSequenceTactic only reaches
-			//      this when stage 1 left tree.proofs empty, so there is zero capability loss vs pure
-			//      injection; injected proofs still pass the verify-before-install net in ruProveTheoremSteps.
-			Some(pd): {
-				guideAss = uniq(ruApTreeAssertions(pd.proof));
-				penv.whitelist := guideAss;
-				track  = ruTrackTactic(ruReplaySelector(pd.proof), ruBreadthFirstTactic);
-				inject = ruKalmarDirectTactic(RuProof(RuVarsDisjs(makeTree(), pd.disjs), ruMakeLinearProof(pd.proof), -1));
-				scopeStr = "[" + strGlue(map(guideAss, id2s), ", ") + "]";
-				Pair(penv, ruScopedTactic(scopeStr, ruSequenceTactic([track, inject])));
-			}
-		}
-	}))
+		refiners  = filtermap(refinerNames, \nm -> ruRefinerByName(nm, em, conn, wff, stmtClass, hypExps, nnf));
+		close     = \g -> ruCheckerResidual(ctx.math, ctx.env, task.info, stmtClass, hypExps, g, ruCheckerPropScope(), mkCloser, tl, nnf);
+		ruRefine(refiners, goalExp, close);
+	});
 }
 
-// refine(<refiner>, ..., max-depth=D, max-size=S): compose goal refiners (positional, in order) +
-// limited-BFS residual closer. The Checker tactic, decomposed at the syntax level:
-//   refine(strip-forall, eq-rewrite)   ==  checker
-//   refine(eq-rewrite)                  ==  unfold + BFS, no ∀-strip
-//   refine()                            ==  just the residual BFS
-ruDslBuildRefine(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+// The `refine(r1, ..., max-depth=, max-size=, nnf=on, closer=<tactic>)` guide-expression (positional
+// refiner names; named budget/nnf/closer args). NOT a runnable tactic — wrap it in replay(...) / inject(...).
+ruDslRefineGuide(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuGuideBuilder> {
 	poss  = ruDslPositional(ast);
 	names = filtermap(poss, \v -> switch (v) { RuTacticValAst(sub): if (sub.name != "") Some(sub.name) else None(); RuTacticValLit(__): None(); });
 	unknown = filter(names, \nm -> !exists(ruRefinerNames(), \k -> k == nm));
 	if (unknown != []) {
 		ctx.env.out.error("tactic DSL: unknown refiner(s) " + strGlue(unknown, ", ") + " (known: " + strGlue(ruRefinerNames(), ", ") + ")", []);
 		None();
-	} else ruDslRefineTactic(names, ast, ctx);
+	} else {
+		md  = ruDslGetInt(ast, "max-depth", 99, 6);
+		ms  = ruDslGetInt(ast, "max-size",  99, 4096);
+		tl  = i2d(ruDslGetInt(ast, "time-limit", 99, 60));
+		nnf = ruDslGetString(ast, "nnf", 99, "off") == "on";
+		closerAstMb = switch (ruDslGetArg(ast, "closer", 99)) {
+			None(): None();
+			Some(v): switch (v) { RuTacticValAst(sub): Some(sub); RuTacticValLit(__): None(); };
+		};
+		Some(ruRefineGuideBuilder(names, md, ms, tl, closerAstMb, nnf, ctx));
+	}
 }
 
-// def-close == refine(strip-forall, rel-intro, eq-rewrite) — definitional unfolding of goal+hyps to a
-// propositional residual, then engine reconstruction. Kept as convenient sugar over the full refiner set.
-// (`checker` is retained as a deprecated alias in the dispatch above.)
+// The `stored` guide-expression: the theorem's own stored proof tree, so `replay(stored)` reconstructs
+// an existing proof via the engine (the former `track(replay, bfs)`).
+ruDslStoredGuide(ctx : RuTacticContext) -> RuGuideBuilder {
+	RuGuideBuilder("stored", \penv ->
+		switch (lookupTree(ctx.math.decls.assertions, penv.conf.task.info.id)) {
+			Some(ass): switch (ass) {
+				RuTheorem(__, __, __, __): Some(RuRefineResult(ruTheoremProofTree(ass, ctx.math), makeSet()));
+				default: None();
+			}
+			None(): None();
+		}
+	);
+}
+
+// Dispatch a guide-EXPRESSION (consumed by replay/inject), distinct from the tactic dispatch.
+ruBuildGuideFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuGuideBuilder> {
+	if (ast.name == "refine")      ruDslRefineGuide(ast, ctx)
+	else if (ast.name == "stored") Some(ruDslStoredGuide(ctx))
+	else {
+		ctx.env.out.error("tactic DSL: '" + ast.name + "' is not a guide-expression (expected refine(...) or stored)", []);
+		None();
+	}
+}
+
+// Realizers: turn a built guide into a tactic. replay reconstructs it via the engine (track + replay
+// selector); inject installs it directly. Both relabel to the guide-expression level so toString reads
+// `replay(refine(...))` / `inject(refine(...))`.
+ruReplayRealize(gstr : string, g : RuRefineResult) -> RuProverTactic {
+	ruLabeledTactic("replay(" + gstr + ")", ruTrackTactic(ruReplaySelector(g.proof), ruBreadthFirstTactic));
+}
+ruInjectRealize(gstr : string, g : RuRefineResult) -> RuProverTactic {
+	ruLabeledTactic("inject(" + gstr + ")", ruKalmarDirectTactic(RuProof(RuVarsDisjs(makeTree(), g.disjs), ruMakeLinearProof(g.proof), -1)));
+}
+
+// replay(<guide>) / inject(<guide>): the realizer tactic atoms. The guide-expression is evaluated at
+// build time; if it yields no guide the realizer is a no-op (so it composes in a seq fallback).
+ruDslBuildRealizer(ast : RuTacticAst, ctx : RuTacticContext, name : string, realize : (string, RuRefineResult) -> RuProverTactic) -> Maybe<RuTacticBuilder> {
+	poss = ruDslPositional(ast);
+	if (poss == []) {
+		ctx.env.out.error("tactic DSL: " + name + "(<guide>) needs a guide-expression (refine(...) or stored)", []);
+		None();
+	} else switch (poss[0]) {
+		RuTacticValLit(s): { ctx.env.out.error("tactic DSL: " + name + " expects a guide-expression, got literal " + s, []); None(); }
+		RuTacticValAst(sub): switch (ruBuildGuideFromAst(sub, ctx)) {
+			None(): None();
+			Some(gb): Some(RuTacticBuilder(\penv -> switch (gb.build(penv)) {
+				Some(g): Pair(penv, realize(gb.toString, g));
+				None():  Pair(penv, ruLabeledTactic(name + "(" + gb.toString + ")", ruDoneTactic));
+			}));
+		}
+	}
+}
+
+// def-close == seq(replay(refine(...)), inject(refine(...)) [, nnf=on variants]) over the full refiner
+// set: try engine reconstruction first, direct injection as fallback, nnf off then (only if off built no
+// guide) on. Sugar — the round-tripping expansion is what its toString prints. (`checker` is an alias.)
 ruDslBuildDefClose(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
-	ruDslRefineTactic(ruRefinerNames(), ast, ctx);
+	md  = ruDslGetInt(ast, "max-depth", 99, 6);
+	ms  = ruDslGetInt(ast, "max-size",  99, 4096);
+	tl  = i2d(ruDslGetInt(ast, "time-limit", 99, 60));
+	closerAstMb = switch (ruDslGetArg(ast, "closer", 99)) {
+		None(): None();
+		Some(v): switch (v) { RuTacticValAst(sub): Some(sub); RuTacticValLit(__): None(); };
+	};
+	gbOff = ruRefineGuideBuilder(ruRefinerNames(), md, ms, tl, closerAstMb, false, ctx);
+	gbOn  = ruRefineGuideBuilder(ruRefinerNames(), md, ms, tl, closerAstMb, true,  ctx);
+	realizers = \gb : RuGuideBuilder, gd : Maybe<RuRefineResult> -> switch (gd) {
+		Some(g): [ruReplayRealize(gb.toString, g), ruInjectRealize(gb.toString, g)];
+		None():  [];
+	};
+	Some(RuTacticBuilder(\penv -> {
+		gdOff = gbOff.build(penv);
+		offT  = realizers(gbOff, gdOff);
+		onT   = if (gdOff != None()) [] else realizers(gbOn, gbOn.build(penv));
+		Pair(penv, ruSequenceTactic(concat(offT, onT)));
+	}));
 }
 
 // apply(<assertion>, ..., max-depth=D, max-size=S): restrict backward search to ONLY the named
@@ -868,13 +915,7 @@ ruDslBuildSelector(ast : RuTacticAst, penv : RuProverEnv, ctx : RuTacticContext)
 			ruAllSelector
 		}
 	}
-	else if (n == "replay") switch (ruDslTaskProofTree(penv, ctx)) {
-		Some(pt): ruReplaySelector(pt);
-		None(): {
-			ctx.env.out.error("tactic DSL: 'replay' selector — prover task is not a theorem; using 'all'", []);
-			ruAllSelector
-		}
-	}
+	// (the former `replay` selector is superseded by the `replay(stored)` realizer tactic)
 	else if (n == "leaf") {
 		id = ruDslGetInt(ast, "id", 0, -1);
 		RuNodeSelector("leaf(" + i2s(id) + ")", \tree ->
