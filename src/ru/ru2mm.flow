@@ -71,9 +71,10 @@ ru2mm(math : RuMath, uniq_turnstile : bool, env : RuEnv, info_source : (string, 
 		);
 		pairs2tree(super_array);
 	}
+	const_renames = ruComputeConstRenames(math);
 	srcs = mapTree(math.sources, \src -> {
 		src_timer = ruMakeTimer();
-		mm_src = ruSource2mm(src, turnstile, math, env, var_renames, sup_renames, var_typesetting);
+		mm_src = ruSource2mm(src, turnstile, math, env, var_renames, sup_renames, var_typesetting, const_renames);
 		// Per-source progress; nop unless the script supplied an info-source lambda.
 		info_source(src.info.module, ruTimePassed2s(src_timer));
 		mm_src;
@@ -117,17 +118,38 @@ ruDoMakeTurnstile(turnstile : int, consts : Set<int>) -> int {
 	}
 }
 
+// Metamath keeps math symbols (constants) and statement labels in DISJOINT namespaces. A constant's
+// mm symbol is its ascii (else its id); when that string equals an assertion/rule label — e.g. the
+// empty-set attribute whose ascii is `empty` clashing with the foundation theorem `empty` — Metamath
+// rejects the file. Build a rename map (const id -> mm symbol id) that appends `_` to any colliding
+// symbol until it is free (so ascii `empty` becomes `empty_`, which is exactly its Russell symbol).
+// Only colliding constants get an entry; everything else keeps its natural symbol, so corpora without
+// such a clash (set.mm, kore) are byte-for-byte unchanged.
+ruMmFreshSym(sym : int, taken : Set<int>) -> int {
+	if (containsSet(taken, sym)) ruMmFreshSym(s2id(id2s(sym) + "_"), taken) else sym;
+}
+
+ruComputeConstRenames(math : RuMath) -> Tree<int, int> {
+	labels0 = foldTree(math.decls.assertions, makeSet(), \id, __, acc -> insertSet(acc, id));
+	labels  = foldTree(math.decls.lang.rules, labels0, \id, __, acc -> insertSet(acc, id));
+	foldTree(math.decls.lang.consts, makeTree(), \id, c, acc -> {
+		sym = if (c.ascii != -1) c.ascii else c.info.id;
+		if (containsSet(labels, sym)) setTree(acc, id, ruMmFreshSym(sym, labels)) else acc;
+	});
+}
+
 ruSource2mm(
-	src : RuSource, turnstile : int, math : RuMath, env : RuEnv, 
-	var_renames : Tree<int, int>, 
+	src : RuSource, turnstile : int, math : RuMath, env : RuEnv,
+	var_renames : Tree<int, int>,
 	sup_renames : Tree<int, int>,
-	var_typesetting : Tree<int, int>
+	var_typesetting : Tree<int, int>,
+	const_renames : Tree<int, int>
 ) -> MmSource {
 	timer = ruMakeTimer();
 	ret = MmSource(
 		map(src.imports, \imp -> MmImport(imp.id)),
-		concatA(ruConcurrent(map(src.decls, \decl -> \env1 -> 
-			ruDecl2mm(decl, turnstile, math, env1, var_renames, sup_renames, var_typesetting)
+		concatA(ruConcurrent(map(src.decls, \decl -> \env1 ->
+			ruDecl2mm(decl, turnstile, math, env1, var_renames, sup_renames, var_typesetting, const_renames)
 		), env)),
 		ruNewFileInfo(src.info.module, env.conf, ".mm")
 	);
@@ -160,12 +182,13 @@ ruComment2mm(comm : RuComment, math : RuMath, env : RuEnv) -> MmComment {
 }
 
 ruDecl2mm(
-	decl : RuDecl, turnstile : int, math : RuMath, env : RuEnv, 
-	var_renames : Tree<int, int>, 
+	decl : RuDecl, turnstile : int, math : RuMath, env : RuEnv,
+	var_renames : Tree<int, int>,
 	sup_renames : Tree<int, int>,
-	var_typesetting : Tree<int, int>
+	var_typesetting : Tree<int, int>,
+	const_renames : Tree<int, int>
 ) -> [MmDecl] {
-	const2mm = \c -> if (c.ascii != -1) c.ascii else c.info.id;
+	const2mm = \c -> lookupTreeDef(const_renames, c.info.id, if (c.ascii != -1) c.ascii else c.info.id);
 	term2mm = \t -> map(t.nodes, 
 		\s -> switch (s) {
 			RuVar(id,__): 
@@ -211,7 +234,7 @@ ruDecl2mm(
 					maybeMap(
 						lookupTree(math.decls.lang.rules, ruSuperTypeName(super, info.id)),
 						\r ->
-							ruDecl2mm(r, turnstile, math, env, var_renames, sup_renames, var_typesetting)
+							ruDecl2mm(r, turnstile, math, env, var_renames, sup_renames, var_typesetting, const_renames)
 					)
 				))
 			))
