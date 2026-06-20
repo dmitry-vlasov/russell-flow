@@ -624,16 +624,21 @@ ruBuildGuideFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuGuideBu
 // Realizers: turn a built guide into a tactic. replay reconstructs it via the engine (track + replay
 // selector); inject installs it directly. Both relabel to the guide-expression level so toString reads
 // `replay(refine(...))` / `inject(refine(...))`.
-ruReplayRealize(gstr : string, g : RuRefineResult) -> RuProverTactic {
+ruReplayRealize(penv : RuProverEnv, gstr : string, g : RuRefineResult) -> RuProverTactic {
+	// replay scopes candidate generation to the guide's OWN assertions — without it the engine explores
+	// the whole foundation at every expansion and times out. The scope is internal to replay (derived
+	// from the guide), so it stays out of toString. (def-close builds at most one replay per prove —
+	// lazy nnf — so this single-whitelist set never conflicts.)
+	penv.whitelist := uniq(ruApTreeAssertions(g.proof));
 	ruLabeledTactic("replay(" + gstr + ")", ruTrackTactic(ruReplaySelector(g.proof), ruBreadthFirstTactic));
 }
-ruInjectRealize(gstr : string, g : RuRefineResult) -> RuProverTactic {
+ruInjectRealize(penv : RuProverEnv, gstr : string, g : RuRefineResult) -> RuProverTactic {
 	ruLabeledTactic("inject(" + gstr + ")", ruKalmarDirectTactic(RuProof(RuVarsDisjs(makeTree(), g.disjs), ruMakeLinearProof(g.proof), -1)));
 }
 
 // replay(<guide>) / inject(<guide>): the realizer tactic atoms. The guide-expression is evaluated at
 // build time; if it yields no guide the realizer is a no-op (so it composes in a seq fallback).
-ruDslBuildRealizer(ast : RuTacticAst, ctx : RuTacticContext, name : string, realize : (string, RuRefineResult) -> RuProverTactic) -> Maybe<RuTacticBuilder> {
+ruDslBuildRealizer(ast : RuTacticAst, ctx : RuTacticContext, name : string, realize : (RuProverEnv, string, RuRefineResult) -> RuProverTactic) -> Maybe<RuTacticBuilder> {
 	poss = ruDslPositional(ast);
 	if (poss == []) {
 		ctx.env.out.error("tactic DSL: " + name + "(<guide>) needs a guide-expression (refine(...) or stored)", []);
@@ -643,7 +648,7 @@ ruDslBuildRealizer(ast : RuTacticAst, ctx : RuTacticContext, name : string, real
 		RuTacticValAst(sub): switch (ruBuildGuideFromAst(sub, ctx)) {
 			None(): None();
 			Some(gb): Some(RuTacticBuilder(\penv -> switch (gb.build(penv)) {
-				Some(g): Pair(penv, realize(gb.toString, g));
+				Some(g): Pair(penv, realize(penv, gb.toString, g));
 				None():  Pair(penv, ruLabeledTactic(name + "(" + gb.toString + ")", ruDoneTactic));
 			}));
 		}
@@ -661,16 +666,19 @@ ruDslBuildDefClose(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBu
 		None(): None();
 		Some(v): switch (v) { RuTacticValAst(sub): Some(sub); RuTacticValLit(__): None(); };
 	};
+	// inject=off → replay-only (drop the injection fallback). Used to measure how complete replay is.
+	includeInject = ruDslGetString(ast, "inject", 99, "on") != "off";
 	gbOff = ruRefineGuideBuilder(ruRefinerNames(), md, ms, tl, closerAstMb, false, ctx);
 	gbOn  = ruRefineGuideBuilder(ruRefinerNames(), md, ms, tl, closerAstMb, true,  ctx);
-	realizers = \gb : RuGuideBuilder, gd : Maybe<RuRefineResult> -> switch (gd) {
-		Some(g): [ruReplayRealize(gb.toString, g), ruInjectRealize(gb.toString, g)];
+	realizers = \penv2 : RuProverEnv, gb : RuGuideBuilder, gd : Maybe<RuRefineResult> -> switch (gd) {
+		Some(g): if (includeInject) [ruReplayRealize(penv2, gb.toString, g), ruInjectRealize(penv2, gb.toString, g)]
+		         else [ruReplayRealize(penv2, gb.toString, g)];
 		None():  [];
 	};
 	Some(RuTacticBuilder(\penv -> {
 		gdOff = gbOff.build(penv);
-		offT  = realizers(gbOff, gdOff);
-		onT   = if (gdOff != None()) [] else realizers(gbOn, gbOn.build(penv));
+		offT  = realizers(penv, gbOff, gdOff);
+		onT   = if (gdOff != None()) [] else realizers(penv, gbOn, gbOn.build(penv));
 		Pair(penv, ruSequenceTactic(concat(offT, onT)));
 	}));
 }
