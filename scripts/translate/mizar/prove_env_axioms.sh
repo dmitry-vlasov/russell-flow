@@ -31,7 +31,7 @@ RELDEPTH="${3:-1}"
 MD="${MD:-10}"          # BFS max depth
 MS="${MS:-1000000}"     # BFS max size
 FC="${FC:-2}"           # forward-closure depth
-TAC="${TAC:-checker}"   # tactic (checker = directed Checker tactic; empty = plain bounded BFS)
+TAC="${TAC:-def-close}"   # tactic (def-close = definitional-closure tactic; empty = plain bounded BFS)
 ST="${ST:-0}"           # steps mode (0 = prove the whole statement; needed for DV provisos)
 MATH="${RUSSELL_MATH:-$HOME/dev/math}"
 ART="$MATH/mizar/$MODULE.ru"

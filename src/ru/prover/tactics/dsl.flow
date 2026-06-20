@@ -392,6 +392,48 @@ ruTagBuilder(tag : string, mb : Maybe<RuTacticBuilder>) -> Maybe<RuTacticBuilder
 	}))
 }
 
+// Per-KIND documentation for the tactic atoms and combinators — what each one DOES, for users to
+// consult (e.g. surfaced on an unknown-atom error). This is the component-level `description`, distinct
+// from a tactic instance's `toString` (its faithful per-instance serialization). Each entry is
+// (DSL signature, one-line semantics).
+ruTacticHelp() -> [Pair<string, string>] {
+	[
+		// atoms
+		Pair("bfs",                          "breadth-first search: expand every open leaf each step (complete, unbounded)"),
+		Pair("bounded-bfs(max-depth, max-size)", "bfs capped by added depth/size; stops when the budget is spent"),
+		Pair("top-n-bfs(n, max-depth, max-size)", "bfs expanding only the n most-specific leaves each step"),
+		Pair("uq(rank, max-depth, max-size)", "unification-quality beam: expand the rank best-fitting leaves"),
+		Pair("done / giveup",                "terminate immediately (a no-op; composes as a seq fallback sentinel)"),
+		Pair("spr(attempts, max-size)",      "sub-proof replay: replay held-out corpus sub-proofs as guides"),
+		Pair("ml(top-k, max-depth, max-size)", "ML-ranked premise selection driving bounded bfs"),
+		Pair("apply(a1, ..., ak)",           "restrict candidate rules to the named assertions, then bounded bfs"),
+		Pair("ap(a, child, ...)",            "replay a positional proof TREE (assertion + ordered children / prem)"),
+		Pair("prop",                         "propositional closer: unfold membership atoms + Kalmar certificate"),
+		Pair("def-close",                    "definitional closure: refine(strip-forall, rel-intro, eq-rewrite) then engine-replay/inject"),
+		Pair("refine(r1, ..., max-depth=, max-size=)", "compose goal refiners + a residual closer into a guide, then realize it"),
+		Pair("linear-guided(max-size, attempts)", "guide search by linear goal->premise chains from the corpus"),
+		Pair("follow-proof(theorem)",        "replay a named theorem's stored proof tree (diagnostic)"),
+		Pair("oracle(max-true, max-false)",  "drive search by the theorem's own proof tree via unify stubs"),
+		Pair("inject",                       "install an already-constructed proof directly (no search)"),
+		// combinators
+		Pair("seq(t1, t2, ...)",             "run t1; on Done without a proof, fall through to t2, ... (first that closes wins)"),
+		Pair("loop(body, max-iters=N)",      "re-run body while it makes progress, up to N iterations"),
+		Pair("limited(t, time=, applied=, produced=, size=)", "run t under wall-clock / step / size caps"),
+		Pair("focus(selector, t)",           "restrict t to the subtrees rooted at the selector's seeds"),
+		Pair("track(selector, t)",           "restrict t to EXACTLY the selector's props each step (e.g. replay a guide)"),
+		// selectors (used inside focus/track)
+		Pair("<selector> all",               "every open leaf (no restriction)"),
+		Pair("<selector> replay",            "props matching the guide/stored proof, by assertion id, level by level"),
+		Pair("<selector> frontier",          "candidate props at the frontier where the guide diverges from the tree"),
+		Pair("<selector> leaf(id) / assertion(name)", "a single prop by id / all props applying a named assertion")
+	]
+}
+
+ruTacticHelp2s() -> string {
+	"available tactic components (consult `description`):\n" +
+	strGlue(map(ruTacticHelp(), \p -> "  " + p.first + "\n      " + p.second), "\n")
+}
+
 ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
 	n = ast.name;
 	// Ground atoms are tagged with their atom name; combinators (seq/loop/
@@ -420,7 +462,7 @@ ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTactic
 	else if (n == "apply")           ruTagBuilder("apply", ruDslBuildApply(ast, ctx))
 	else if (n == "ap")              ruTagBuilder("ap", ruDslBuildAp(ast, ctx))
 	else if (n == "prop")            ruTagBuilder("prop", ruDslBuildProp(ast, ctx))
-	else if (n == "checker")         ruTagBuilder("checker", ruDslBuildChecker(ast, ctx))
+	else if (n == "def-close" || n == "checker") ruTagBuilder("def-close", ruDslBuildDefClose(ast, ctx))
 	else if (n == "refine")          ruTagBuilder("refine", ruDslBuildRefine(ast, ctx))
 	else if (n == "linear-guided")   ruTagBuilder("linear-guided", ruDslBuildLinearGuided(ast, ctx))
 	else if (n == "follow-proof")    ruTagBuilder("follow-proof", ruDslBuildFollowProof(ast, ctx))
@@ -431,7 +473,7 @@ ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTactic
 	else if (n == "focus")           ruDslBuildFocus(ast, ctx)
 	else if (n == "track")           ruDslBuildTrack(ast, ctx)
 	else {
-		ctx.env.out.error("tactic DSL: unknown atom '" + ast.name + "'", []);
+		ctx.env.out.error("tactic DSL: unknown atom '" + ast.name + "'\n" + ruTacticHelp2s(), []);
 		None();
 	}
 }
@@ -515,11 +557,27 @@ ruDslRefineTactic(refinerNames : [string], ast : RuTacticAst, ctx : RuTacticCont
 			ruRefine(refiners, goalExp, close);
 		};
 		// nnf=false first (keeps ¬(P∧¬P) for pm3.24), nnf=true as a fallback (De Morgan for the
-		// disjunction-convergence gaps) — the `seq` idea, internal to the checker.
+		// disjunction-convergence gaps) — the `seq` idea, internal to def-close.
 		result = switch (attempt(false)) { Some(r): Some(r); None(): attempt(true); };
 		switch (result) {
 			None(): Pair(penv, ruDoneTactic);   // not closed: no-op, composes before a fallback
-			Some(pd): Pair(penv, ruKalmarDirectTactic(RuProof(RuVarsDisjs(makeTree(), pd.disjs), ruMakeLinearProof(pd.proof), -1)));
+			// The refiners produce a COMPLETE proof TREE — the engine-built residual plus the refiner glue
+			// (ax-gen / mpbir / ssriv wraps, mpbi derived-hyp splices). We close in two composable stages:
+			//   1. track(replay, bfs) — hand the tree to the REAL engine as a replay guide so it RECONSTRUCTS
+			//      the proof by backward search, validating every glue step by construction and deriving the
+			//      DV provisos itself. This is the composable, self-checking path and it closes the great
+			//      majority of guides (incl. all the ⊆/= article gaps def-close is for). The whitelist keeps
+			//      the eager expansion focused on the guide's own assertions.
+			//   2. ruKalmarDirectTactic — inject the constructed proof directly, as a FALLBACK for the guide
+			//      shapes the replay engine does not reconstruct within budget. ruSequenceTactic only reaches
+			//      this when stage 1 left tree.proofs empty, so there is zero capability loss vs pure
+			//      injection; injected proofs still pass the verify-before-install net in ruProveTheoremSteps.
+			Some(pd): {
+				penv.whitelist := uniq(ruApTreeAssertions(pd.proof));
+				track  = ruTrackTactic(ruReplaySelector(pd.proof), ruBreadthFirstTactic);
+				inject = ruKalmarDirectTactic(RuProof(RuVarsDisjs(makeTree(), pd.disjs), ruMakeLinearProof(pd.proof), -1));
+				Pair(penv, ruSequenceTactic([track, inject]));
+			}
 		}
 	}))
 }
@@ -539,8 +597,10 @@ ruDslBuildRefine(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuil
 	} else ruDslRefineTactic(names, ast, ctx);
 }
 
-// checker == refine(strip-forall, eq-rewrite) — kept as convenient sugar.
-ruDslBuildChecker(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+// def-close == refine(strip-forall, rel-intro, eq-rewrite) — definitional unfolding of goal+hyps to a
+// propositional residual, then engine reconstruction. Kept as convenient sugar over the full refiner set.
+// (`checker` is retained as a deprecated alias in the dispatch above.)
+ruDslBuildDefClose(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
 	ruDslRefineTactic(ruRefinerNames(), ast, ctx);
 }
 
