@@ -11,6 +11,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.ExecutionException;
 
 
 public class RussellTimed extends NativeHost {
@@ -116,9 +117,27 @@ public class RussellTimed extends NativeHost {
 			return future.get((long)time_limit, TimeUnit.MILLISECONDS);
 		} catch (TimeoutException e) {
 			future.cancel(true);  // interrupt the lambda so its finally block runs and stops the timer
+			return defval;        // genuine timeout: the task is still running, give up waiting
+		} catch (InterruptedException e) {
+			// This (calling) thread was interrupted while waiting — propagate the interrupt flag and
+			// treat as a timeout outcome (a higher-level timer is shutting us down).
+			Thread.currentThread().interrupt();
 			return defval;
-		} catch (Exception e) {
-			return defval;
+		} catch (ExecutionException e) {
+			// The timed task itself threw. If it was interrupted by OUR timeout timer, that is a
+			// genuine timeout — return defval. Any OTHER throwable is a real bug and MUST be
+			// propagated to the calling (main) thread, never silently swallowed.
+			Throwable cause = e.getCause();
+			if (cause instanceof InterruptedException) {
+				return defval;
+			}
+			if (cause instanceof RuntimeException) {
+				throw (RuntimeException) cause;
+			}
+			if (cause instanceof Error) {
+				throw (Error) cause;
+			}
+			throw new RuntimeException("Exception in timed task", cause != null ? cause : e);
 		}
 	}
 /*
@@ -144,6 +163,53 @@ public class RussellTimed extends NativeHost {
 		}
 	}
 */
+	// Like the stdlib `concurrent`, but a worker exception is PROPAGATED to the calling (main)
+	// thread instead of being printStackTrace'd and swallowed (which silently returns a partial/
+	// empty result array and hides real bugs). OutOfMemoryError still hard-exits (unrecoverable).
+	@SuppressWarnings("unchecked")
+	public static final Object[] concurrentStrict(Object threadPool, Object[] tasks) {
+		List<Callable<Object>> tasks2 = new ArrayList<Callable<Object>>();
+		for (int i = 0; i < tasks.length; i++) {
+			Func0<Object> task = (Func0<Object>) tasks[i];
+			tasks2.add(new Callable<Object>() {
+				@Override
+				public Object call() throws Exception {
+					try {
+						Object result = task.invoke();
+						FlowRuntime.eventLoop();
+						return result;
+					} catch (OutOfMemoryError e) {
+						System.exit(255);
+						return null;
+					}
+				}
+			});
+		}
+
+		Object[] resArr = new Object[0];
+		try {
+			List<Object> res = new ArrayList<Object>();
+			ExecutorService threadPool2 = (ExecutorService) threadPool;
+			for (Future<Object> future : threadPool2.invokeAll(tasks2)) {
+				res.add(future.get());
+			}
+			resArr = res.toArray();
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+		} catch (ExecutionException e) {
+			// A worker task threw — propagate it to the main thread rather than swallow.
+			Throwable cause = e.getCause();
+			if (cause instanceof RuntimeException) {
+				throw (RuntimeException) cause;
+			}
+			if (cause instanceof Error) {
+				throw (Error) cause;
+			}
+			throw new RuntimeException("Exception in concurrent task", cause != null ? cause : e);
+		}
+		return resArr;
+	}
+
 	@SuppressWarnings("unchecked")
 	public static final Object[] concurrentTimeout(Object[] tasks, double global_limeout) {
 
