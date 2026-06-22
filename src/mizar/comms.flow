@@ -7,8 +7,11 @@ import mizar/notation;
 import mptp/src;
 import mptp/mptp2ru;
 import ru/parse/exps/sources;
+import ru/parse/load;
+import ru/cache/cache;
 import ru/util/src2s;
 import ru/util/exp;
+import base/util/fs;
 
 // Commands for the Mizar analyzed-XML front-end. The proof corpus lives in the MML
 // dir as per-article `.xml` (+ `.atr` for constructor resolution). Milestone 1:
@@ -192,11 +195,30 @@ ruRunMizarToRu(unit : RuUnit) -> Maybe<RuState> {
 		Some(p): switch (mizArticleTheorems(p.first, mizFile(unit, article, "miz"), sig)) {
 			None(): { env.out.error("mizar-to-ru: no <Article> root in " + article + ".xml", []); None(); }
 			Some(thms): {
+				eth  = mizEth(unit, article);
+				depAids0 = if (eth != "") mizEnvAids(eth) else [];
+				// AUTO-LOAD already-translated dependency articles (their .ru lives next to the output
+				// module) so the cited theorems come from `import`, not re-inlined axioms. No-op for a
+				// dependency that isn't translated yet (its env axioms then fall back to foundation dedup).
+				stateD = ruMizLoadDeps(state, env, depAids0, ruDirName(module));
 				// Import the foundation by its ACTUAL loaded source id (read-from-disk module
 				// ids may be path-qualified), exactly as mptp-to-ru does.
-				found_id = foldTree(state.ru, s2id(foundation), \id, s, acc ->
+				found_id = foldTree(stateD.ru, s2id(foundation), \id, s, acc ->
 					if (s.info.module == foundation || endsWith(s.info.module, "/" + foundation)) s.info.id else acc);
-				eth  = mizEth(unit, article);
+				// Direct dependencies: each article aid cited in the .eth becomes an `import` of that
+				// article's already-loaded .ru (module == aid). The cited theorems/defs then come FROM
+				// the imported article (deduped below by name), never re-inlined as axioms here. An aid
+				// that isn't loaded (e.g. fully covered by the foundation) simply yields no import — its
+				// env axioms fall back to the foundation-canonical dedup.
+				// Each dependency article cited in the .eth becomes an `import` of its already-loaded
+				// source (resolved by aid == its module). Load the dependency the same way as the
+				// foundation — `read-ru <path>` before translating this article — so its self-id is in
+				// the same (resolvable-on-read-back) form as the foundation's, and the cited theorems
+				// come FROM the import (deduped below by name) rather than re-inlined as axioms here.
+				depIds  = filtermap(depAids0, \aid ->
+					foldTree(stateD.ru, None(), \id, s, acc ->
+						if (s.info.module == aid || endsWith(s.info.module, "/" + aid)) Some(s.info.id) else acc));
+				importIds = concat([found_id], depIds);
 				syms = mizParseNotation(mizFile(unit, article, "eno"), mizFile(unit, article, "frm"), mizFile(unit, article, "dcx"));
 				// env theorems as commented axioms (available premises for the open steps).
 				// srcOf resolves the DEFINING article's (.miz, .xml) so each carries its surface text.
@@ -215,7 +237,7 @@ ruRunMizarToRu(unit : RuUnit) -> Maybe<RuState> {
 					else mptpProofTheorem(t.name, t.ref, [], [t.statement]));
 				// every emitted form contributes to the symbol signature.
 				sigForms = concat(envForms, concatA(map(thms, \t -> arrayPush(concat(t.hyps, t.steps), t.statement))));
-				src = mptpArticleSource(TptpSource([], ruNoFileInfo), sigForms, concat(envDecls, articleDecls), found_id, module, state.conf,
+				src = mptpArticleSource(TptpSource([], ruNoFileInfo), sigForms, concat(envDecls, articleDecls), importIds, module, state.conf,
 					\name -> lookupTreeDef(notationMap, name, ""), emit);
 				err = ref 0;
 				env1 = ruAddErrCounter2Env(env, err);
@@ -224,15 +246,21 @@ ruRunMizarToRu(unit : RuUnit) -> Maybe<RuState> {
 					env.out.error("mizar-to-ru: failed to parse '" + module + "' against '" + foundation + "' (load the foundation first via read-ru)", []);
 					None();
 				} else {
-					dedup = ruMizDedupEnvAxioms(articleSrc, ruMizFoundationCanon(state));
+					// First drop anything already provided by an IMPORTED article (env theorems/defs,
+					// shared operator rules/consts/congruences) — those now come via `import`. Then drop
+					// any remaining env axiom that matches the foundation canonically (covers a dependency
+					// aid with no translated .ru of its own).
+					dedupImp = ruMizDedupImported(articleSrc, ruMizLoadedDeclIds(stateD));
+						dedup = ruMizDedupEnvAxioms(dedupImp.first, ruMizFoundationCanon(stateD));
 						articleSrc1 = dedup.first;
 						nproofs = length(filter(thms, \t -> length(t.steps) > 1));
+						ndropped = dedupImp.second + dedup.second;
 					env.out.println("mizar-to-ru: '" + module + "' = " + i2s(length(thms)) + " theorems (" +
 						i2s(nproofs) + " with multi-step proofs)" +
-						(if (envDecls == []) "" else " + " + i2s(length(envDecls)) + " env axioms") +
-							(if (dedup.second == 0) "" else " (" + i2s(dedup.second) + " redundant axioms dropped — already in foundation)") +
+						(if (depIds == []) "" else " importing " + i2s(length(depIds)) + " dependency article(s)") +
+							(if (ndropped == 0) "" else " (" + i2s(ndropped) + " decls dropped — provided by imports/foundation)") +
 							" importing '" + foundation + "'");
-					Some(RuState(state with ru = setTree(state.ru, articleSrc1.info.id, articleSrc1)));
+					Some(RuState(stateD with ru = setTree(stateD.ru, articleSrc1.info.id, articleSrc1)));
 				}
 			}
 		}
@@ -310,6 +338,45 @@ ruMizDedupEnvAxioms(src : RuSource, foundation : Set<string>) -> Pair<RuSource, 
 	kept = filter(src.decls, \d -> switch (d) {
 		RuAxiom(__, infer): !containsSet(foundation, ruMizCanonForm(infer.prop));
 		default: true;
+	});
+	Pair(RuSource(src with decls = kept), length(src.decls) - length(kept));
+}
+
+// The ids of every declaration in the already-loaded sources (foundation + the dependency
+// articles read in before this one). Used to drop anything we'd otherwise re-emit that an
+// import already provides.
+ruMizLoadedDeclIds(state : RuState) -> Set<int> {
+	foldTree(state.ru, makeSet(), \__, s, acc ->
+		fold(s.decls, acc, \ac, d -> insertSet(ac, d.info.id)));
+}
+
+// Load the already-translated dependency articles (`<dir>/<aid>.ru`) into the state, so the article
+// being translated can `import` them. A dependency already loaded, or not yet translated (no .ru on
+// disk), is skipped. Mirrors how `read-ru` loads a file (ruLoadAllInfo + ruCollectMathFast).
+ruMizLoadDeps(state : RuState, env : RuEnv, depAids : [string], dir : string) -> RuState {
+	fold(depAids, state, \st, aid -> {
+		already = exists(getTreeValues(st.ru), \s -> s.info.module == aid || endsWith(s.info.module, "/" + aid));
+		path = dir + "/" + aid + ".ru";
+		if (already || !fileExists(path)) st
+		else {
+			module = ruTrimPath(path, st.conf, ".ru");
+			loaded = ruLoadAllInfo(env, s2id(module), \id -> ruCacheGet(id, true, env), nop2, nop2);
+			switch (maybeBind(loaded, \srcs -> ruCollectMathFast(srcs, env))) {
+				Some(math): RuState(st with ru = mergeTree(st.ru, math.sources));
+				None():     st;
+			}
+		}
+	});
+}
+
+// Drop every NON-theorem decl (env axiom, operator rule/const, congruence, definition) whose name
+// is already declared in an imported source — it now comes via `import`, so re-declaring it would be
+// a duplicate. The article's OWN theorems (RuTheorem) are always kept (they are this article's work
+// and are never present in an import). Returns the filtered source and the number dropped.
+ruMizDedupImported(src : RuSource, importedIds : Set<int>) -> Pair<RuSource, int> {
+	kept = filter(src.decls, \d -> switch (d) {
+		RuTheorem(__, __, __, __): true;
+		default:                   !containsSet(importedIds, d.info.id);
 	});
 	Pair(RuSource(src with decls = kept), length(src.decls) - length(kept));
 }
