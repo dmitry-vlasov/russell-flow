@@ -274,7 +274,20 @@ mizTheorem(sig : MizSig, lines : [string], aid : string, idx : int, thm : MizXml
 					Some(proof): {
 						w = mizWalkProof(sig, proof);
 						if (w.steps == []) Some(MizThm(name, ref, [], [statement], statement, w.unhandled))
-						else Some(MizThm(name, ref, map(w.hyps, mizResugar), map(w.steps, mizResugar), statement, w.unhandled));
+						else {
+							hyps0  = map(w.hyps, mizResugar);
+							steps0 = map(w.steps, mizResugar);
+							// Break bound/free variable collisions: a `given`/`consider` witness const and
+							// the bound var of the existential it is eliminated from share one Mizar vid
+							// (both → "X<vid>"). Russell silently drops a hyp whose var is BOTH bound (in one
+							// form) and free (in another), so alpha-rename every bound var to a name disjoint
+							// from all variables of the theorem.
+							avoid = ref buildSet(concatA(map(concat(hyps0, arrayPush(steps0, statement)), mizFormAllVars)));
+							ctr = ref 0;
+							hyps1  = map(hyps0,  \h -> mizFreshenBound(h, avoid, ctr));
+							steps1 = map(steps0, \s -> mizFreshenBound(s, avoid, ctr));
+							Some(MizThm(name, ref, hyps1, steps1, statement, w.unhandled));
+						}
 					}
 				}
 			}
@@ -301,6 +314,16 @@ mizWalkItem(sig : MizSig, w : MizWalk, item : MizXml) -> MizWalk {
 	} else if (tag == "Assume") {
 		hs = filtermap(item.kids, \k -> if (k.tag == "Proposition" && k.kids != []) Some(mizForm(sig, [], k.kids[0])) else None());
 		MizWalk(concat(w.hyps, hs), w.steps, w.unhandled);
+	} else if (tag == "Given" || tag == "Consider") {
+		// `given x such that P` (the existential HYPOTHESIS of an iff-backward direction) and
+		// `consider x such that P` (∃-elimination): both introduce a witness variable and an
+		// existential/witness proposition. Adopt every <Proposition> as a hypothesis and each
+		// witness var's <Typ vid=…> as a type-guard hypothesis. Dropping these (the old behaviour,
+		// they fell through to `unhandled`) lost the assumption and made the extracted theorem
+		// unconditional — and often FALSE, e.g. XBOOLE_0:3 became `¬(X∩Y=∅)` with no hypothesis.
+		hs = filtermap(item.kids, \k -> if (k.tag == "Proposition" && k.kids != []) Some(mizForm(sig, [], k.kids[0])) else None());
+		gs = filtermap(item.kids, \k -> if (k.tag == "Typ" && mizAttr(k, "vid") != "" && !mizIsRootSort(sig, k)) Some(mizTypePred(sig, k, TptpVar("X" + mizAttr(k, "vid")))) else None());
+		MizWalk(concatA([w.hyps, hs, gs]), w.steps, w.unhandled);
 	} else if (tag == "Conclusion") {
 		mizAddStep(sig, w, mizFindFirst(item.kids, "Proposition"));
 	} else if (tag == "Proposition") {
@@ -316,6 +339,70 @@ mizAddStep(sig : MizSig, w : MizWalk, mprop : Maybe<MizXml>) -> MizWalk {
 	switch (mprop) {
 		None(): w;
 		Some(prop): if (prop.kids == []) w else MizWalk(w.hyps, arrayPush(w.steps, mizForm(sig, [], prop.kids[0])), w.unhandled);
+	}
+}
+
+// Alpha-rename every quantifier-bound variable to a fresh name disjoint from `avoid` (all
+// variable names of the theorem). Mizar gives an existential's bound var and the witness
+// const it is eliminated to (`given`/`consider`) the SAME vid → same "X<vid>", so the bound
+// var collides with the free witness var. Russell accepts a var that is only-bound OR
+// only-free, but silently DROPS a hyp whose var is both bound (in one form) and free (in
+// another). Freshening the bound occurrence removes the collision without changing meaning.
+mizFreshenBound(f : TptpForm, avoid : ref Set<string>, ctr : ref int) -> TptpForm {
+	switch (f) {
+		TptpPred(__, __):  f;
+		TptpEq(__, __):    f;
+		TptpNeg(g):        TptpNeg(mizFreshenBound(g, avoid, ctr));
+		TptpBin(op, l, r): TptpBin(op, mizFreshenBound(l, avoid, ctr), mizFreshenBound(r, avoid, ctr));
+		TptpQuant(op, vars, body): {
+			ren     = fold(vars, makeTree(), \acc, v -> setTree(acc, v, mizFreshVar(avoid, ctr)));
+			newvars = map(vars, \v -> lookupTreeDef(ren, v, v));
+			TptpQuant(op, newvars, mizFreshenBound(mizRenameFree(body, ren), avoid, ctr));
+		}
+	}
+}
+
+mizFreshVar(avoid : ref Set<string>, ctr : ref int) -> string {
+	ctr := ^ctr + 1;
+	nm = "X" + i2s(900 + ^ctr);
+	if (containsSet(^avoid, nm)) mizFreshVar(avoid, ctr)
+	else { avoid := insertSet(^avoid, nm); nm; }
+}
+
+mizRenameFree(f : TptpForm, ren : Tree<string, string>) -> TptpForm {
+	switch (f) {
+		TptpPred(n, args): TptpPred(n, map(args, \t -> mizRenameTerm(t, ren)));
+		TptpEq(l, r):      TptpEq(mizRenameTerm(l, ren), mizRenameTerm(r, ren));
+		TptpNeg(g):        TptpNeg(mizRenameFree(g, ren));
+		TptpBin(op, l, r): TptpBin(op, mizRenameFree(l, ren), mizRenameFree(r, ren));
+		// inner binder of the same name shadows the outer rename — drop it in the body
+		TptpQuant(op, vars, body): TptpQuant(op, vars, mizRenameFree(body, fold(vars, ren, \acc, v -> removeFromTree(acc, v))));
+	}
+}
+
+mizRenameTerm(t : TptpTerm, ren : Tree<string, string>) -> TptpTerm {
+	switch (t) {
+		TptpVar(nm):       TptpVar(lookupTreeDef(ren, nm, nm));
+		TptpApp(nm, args): TptpApp(nm, map(args, \a -> mizRenameTerm(a, ren)));
+	}
+}
+
+// Every variable name (free and bound) appearing in a form — used to pick fresh, collision-
+// free bound-var names in mizFreshenBound.
+mizFormAllVars(f : TptpForm) -> [string] {
+	switch (f) {
+		TptpPred(__, args): concatA(map(args, mizTermAllVars));
+		TptpEq(l, r):       concat(mizTermAllVars(l), mizTermAllVars(r));
+		TptpNeg(g):         mizFormAllVars(g);
+		TptpBin(__, l, r):  concat(mizFormAllVars(l), mizFormAllVars(r));
+		TptpQuant(__, vs, body): concat(vs, mizFormAllVars(body));
+	}
+}
+
+mizTermAllVars(t : TptpTerm) -> [string] {
+	switch (t) {
+		TptpVar(nm):       [nm];
+		TptpApp(__, args): concatA(map(args, mizTermAllVars));
 	}
 }
 
