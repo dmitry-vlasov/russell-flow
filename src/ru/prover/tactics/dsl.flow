@@ -65,6 +65,11 @@ export {
 
 	// Parse + build in one call.
 	ruParseAndBuildTactic(src : string, ctx : RuTacticContext) -> Maybe<RuTacticBuilder>;
+
+	// Human-readable tactic-component help for the `tactic` command: the whole annotated list when `name`
+	// is empty, else the components whose signature matches `name` (case-insensitive substring), or a
+	// not-found note followed by the full list.
+	ruTacticHelpLookup(name : string) -> string;
 }
 
 ruStaticTacticBuilder(t : RuProverTactic) -> RuTacticBuilder { RuTacticBuilder(\penv -> Pair(penv, t)) }
@@ -392,49 +397,116 @@ ruTagBuilder(tag : string, mb : Maybe<RuTacticBuilder>) -> Maybe<RuTacticBuilder
 	}))
 }
 
-// Per-KIND documentation for the tactic atoms and combinators — what each one DOES, for users to
-// consult (e.g. surfaced on an unknown-atom error). This is the component-level `description`, distinct
-// from a tactic instance's `toString` (its faithful per-instance serialization). Each entry is
-// (DSL signature, one-line semantics).
-ruTacticHelp() -> [Pair<string, string>] {
+// Per-component documentation for the tactic DSL — what each one DOES, grouped by CATEGORY, for users
+// to consult (the `tactic` command; also surfaced on an unknown-atom error). This is the component-level
+// `description`, distinct from a tactic instance's `toString` (its faithful per-instance serialization).
+// Categories: atoms (runnable search/closers), refiners (goal reducers used inside refine), guides
+// (values yielding a proof guide), realizers (run a guide through the engine), combinators (compose
+// tactics), selectors (pick props inside focus/track).
+RuTacticDoc(category : string, sig : string, help : string, params : [Pair<string, string>]);
+
+ruTacticDocs() -> [RuTacticDoc] {
+	p  = \nm, h -> Pair(nm, h);
+	d  = \cat, sig, help -> RuTacticDoc(cat, sig, help, []);            // no parameters
+	dp = \cat, sig, help, ps -> RuTacticDoc(cat, sig, help, ps);        // with parameters
+	// shared parameter descriptions (the two budget caps every bounded search shares; ruDeltaKeepExpanding)
+	md = p("max-depth", "cap on tree depth from the root (absolute)");
+	ms = p("max-size",  "cap on nodes ADDED since the tactic started (a delta, not the total)");
 	[
-		// atoms
-		Pair("bfs",                          "breadth-first search: expand every open leaf each step (complete, unbounded)"),
-		Pair("bounded-bfs(max-depth, max-size)", "bfs capped by added depth/size; stops when the budget is spent"),
-		Pair("top-n-bfs(n, max-depth, max-size)", "bfs expanding only the n most-specific leaves each step"),
-		Pair("uq(rank, max-depth, max-size)", "unification-quality beam: expand the rank best-fitting leaves"),
-		Pair("done / giveup",                "terminate immediately (a no-op; composes as a seq fallback sentinel)"),
-		Pair("spr(attempts, max-size)",      "sub-proof replay: replay held-out corpus sub-proofs as guides"),
-		Pair("ml(top-k, max-depth, max-size)", "ML-ranked premise selection driving bounded bfs"),
-		Pair("apply(a1, ..., ak)",           "restrict candidate rules to the named assertions, then bounded bfs"),
-		Pair("ap(a, child, ...)",            "replay a positional proof TREE (assertion + ordered children / prem)"),
-		Pair("prop",                         "propositional closer: unfold membership atoms + Kalmar certificate"),
-		Pair("def-close",                    "definitional closure: replay(refine(...)) over the full refiner set, nnf off then on"),
-		Pair("linear-guided(max-size, attempts)", "guide search by linear goal->premise chains from the corpus"),
-		Pair("follow-proof(theorem)",        "replay a named theorem's stored proof tree (diagnostic)"),
-		Pair("oracle(max-true, max-false)",  "drive search by the theorem's own proof tree via unify stubs"),
-		// realizers (take a guide-expression)
-		Pair("replay(<guide>)",              "reconstruct the guide through the engine (track + replay selector); valid by construction"),
-		// guide-expressions (a VALUE yielding a proof guide; consumed by replay, not runnable alone)
-		Pair("refine(r1, ..., max-depth=, max-size=, nnf=on, closer=<tactic>)", "GUIDE: compose goal refiners + a residual closer (default bounded-bfs; closer= swaps strategy) into a proof tree"),
-		Pair("stored",                       "GUIDE: the theorem's own stored proof tree (replay(stored) reconstructs an existing proof)"),
+		d ("atoms", "bfs",                          "breadth-first search: expand every open leaf each step (complete, UNBOUNDED — use bounded-bfs to cap)"),
+		dp("atoms", "bounded-bfs(max-depth, max-size)", "bfs that stops once it hits the depth or added-node cap", [md, ms]),
+		dp("atoms", "top-n-bfs(n, max-depth, max-size)", "bounded bfs that expands only the n most-specifically-unified leaves each round", [p("n", "leaves expanded per round (those whose unifier bound the most; pre-sorted by substitution size)"), md, ms]),
+		d ("atoms", "done / giveup",                "terminate immediately (a no-op; composes as a seq fallback sentinel)"),
+		dp("atoms", "spr(attempts, max-size)",      "sub-proof replay: replay held-out corpus sub-proofs as guides", [p("attempts", "how many held-out corpus sub-proofs to try as guides"), ms]),
+		dp("atoms", "ml(top-k, max-depth, max-size)", "ML-ranked premise selection driving bounded bfs", [p("top-k", "how many top-ranked premises to feed the bounded bfs"), md, ms]),
+		dp("atoms", "apply(a1, ..., ak)",           "restrict candidate rules to the named assertions, then bounded bfs", [p("a1 ... ak", "assertion names the search may use (plus the task premises)")]),
+		dp("atoms", "ap(a, child, ...)",            "replay a positional proof tree: assertion `a` applied at the goal, each child proving a premise in order", [p("a", "the assertion applied at this node"), p("child ...", "each child: a nested ap(...) or `prem` (a premise discharged by a hyp / prior step)")]),
+		d ("atoms", "kalmar-closer",                "propositional closer: unfold membership atoms + Kalmar certificate [PRUNE-CANDIDATE]"),
+		dp("atoms", "def-close",                    "definitional closure: replay(refine(...)) over the full refiner set, nnf off then on", [md, ms, p("time-limit", "per-step time budget"), p("closer", "residual closer tactic (default bounded-bfs)")]),
+		dp("atoms", "linear-guided(max-size, attempts)", "guide search by linear goal->premise chains from the corpus", [ms, p("attempts", "how many goal->premise chains to try")]),
+		dp("atoms", "follow-proof(theorem)",        "replay a named theorem's stored proof tree (diagnostic)", [p("theorem", "name of the theorem whose stored proof tree to replay")]),
+		dp("atoms", "oracle(max-true-props, ...)",  "drive search by the theorem's own proof tree (oracle stubs map proof nodes onto prover props)", [p("max-true-props", "oracle-mapped props expanded per iteration (negative = unlimited)"), p("max-false-props", "non-oracle-mapped leaves expanded per iteration (negative = unlimited)"), p("max-variants", "assertion-unification variants offered: the oracle's + N fallbacks (negative = oracle only)"), p("max-proofs", "premise-proof variants offered: the oracle's + N fallbacks (negative = oracle only)")]),
+		// refiners — goal reducers composed inside refine(...); not runnable standalone
+		d ("refiners", "strip-forall",              "strip the leading ∀-chain; the matrix proof is re-quantified with ax-gen"),
+		d ("refiners", "rel-intro",                 "reduce a ⊆ / set-= goal to a fresh-setvar membership subgoal via ssriv/eqriv"),
+		d ("refiners", "eq-rewrite",                "unfold compound membership atoms + canonicalize by biconditional congruence to a residual"),
+		// guides — a VALUE yielding a proof guide; consumed by replay, not runnable alone
+		dp("guides", "refine(r1, ..., nnf=on, closer=<t>)", "compose goal refiners + a residual closer (default bounded-bfs; closer= swaps it) into a proof tree", [p("r1 ...", "refiner names to compose (strip-forall, rel-intro, eq-rewrite)"), p("nnf", "on = canonicalize to negation-normal-form (De Morgan)"), p("closer", "residual closer tactic (default bounded-bfs)"), md, ms]),
+		d ("guides", "stored",                      "the theorem's own stored proof tree (replay(stored) reconstructs an existing proof)"),
+		// realizers — run a guide through the engine
+		dp("realizers", "replay(<guide>)",          "reconstruct the guide through the engine (track + replay selector); valid by construction", [p("<guide>", "a guide-expression to reconstruct: refine(...) or stored")]),
 		// combinators
-		Pair("seq(t1, t2, ...)",             "run t1; on Done without a proof, fall through to t2, ... (first that closes wins)"),
-		Pair("loop(body, max-iters=N)",      "re-run body while it makes progress, up to N iterations"),
-		Pair("limited(t, time=, applied=, produced=, size=)", "run t under wall-clock / step / size caps"),
-		Pair("focus(selector, t)",           "restrict t to the subtrees rooted at the selector's seeds"),
-		Pair("track(selector, t)",           "restrict t to EXACTLY the selector's props each step (e.g. replay a guide)"),
-		Pair("scoped(scope, t)",             "restrict candidate rules to <scope> (a named scope like prop-scope, or an inline assertion list), then run t"),
-		// selectors (used inside focus/track)
-		Pair("<selector> all",               "every open leaf (no restriction)"),
-		Pair("<selector> frontier",          "candidate props at the frontier where the guide diverges from the tree"),
-		Pair("<selector> leaf(id) / assertion(name)", "a single prop by id / all props applying a named assertion")
+		dp("combinators", "seq(t1, t2, ...)",       "run t1; on Done without a proof, fall through to t2, ... (first that closes wins)", [p("t1, t2, ...", "sub-tactics tried in order; the first to find a proof wins")]),
+		dp("combinators", "loop(body, max-iters=N)", "re-run body while it makes progress, up to N iterations", [p("body", "the tactic to repeat"), p("max-iters", "max iterations (stops early if a round makes no progress)")]),
+		dp("combinators", "limited(t, time=, applied=, produced=, size=)", "run t under wall-clock / step / size caps", [p("t", "the tactic to cap"), p("time", "wall-clock ms budget"), p("applied", "max assertion applications"), p("produced", "max props produced"), p("size", "max tree size")]),
+		dp("combinators", "focus(selector, t)",     "restrict t to the subtrees rooted at the selector's seeds", [p("selector", "which props/seeds to focus on (see selectors)"), p("t", "tactic run on the selected subtrees")]),
+		dp("combinators", "track(selector, t)",     "restrict t to EXACTLY the selector's props each step (e.g. replay a guide)", [p("selector", "which props to keep each step (see selectors)"), p("t", "tactic restricted to them")]),
+		dp("combinators", "scoped(scope, t)",       "restrict candidate rules to <scope>, then run t", [p("scope", "a named scope (e.g. prop-scope) or an inline assertion list"), p("t", "tactic run under that rule restriction")]),
+		// selectors — pick props inside focus(...) / track(...)
+		d ("selectors", "all",                      "every open leaf (no restriction)"),
+		d ("selectors", "frontier",                 "candidate props at the frontier where the guide diverges from the tree"),
+		dp("selectors", "leaf(id) / assertion(name)", "a single prop by id / all props applying a named assertion", [p("id", "a prop id (leaf selector)"), p("name", "an assertion name (assertion selector)")])
 	]
 }
 
+// The distinct categories, in listing order.
+ruTacticCategories() -> [string] { uniq(map(ruTacticDocs(), \d -> d.category)) }
+
+// Render docs as the standard 3-column help table (Component | Category | Help), like `help all`.
+ruTacticDocsTable(docs : [RuTacticDoc]) -> string {
+	stringTable2s([
+		map(docs, \d -> d.sig),
+		map(docs, \d -> d.category),
+		map(docs, \d -> d.help)
+	], Some(["Component", "Category", "Help"]));
+}
+
+// Detailed single-component view, mirroring `help <command>` (ruCommInfo2s): labelled vertical sections,
+// including a Parameters table (like `help`'s Arguments) for components that take parameters.
+ruTacticDoc2s(d : RuTacticDoc) -> string {
+	"Component:\n\t" + d.sig + "\n" +
+	"Category:\n\t" + d.category + "\n" +
+	"Description:\n" + strIndent(d.help) + "\n" +
+	(if (d.params == []) "" else
+		"Parameters:\n" + strIndent(stringTable2s([
+			map(d.params, \pp -> pp.first),
+			map(d.params, \pp -> pp.second)
+		], Some(["Name", "Help"]))) + "\n");
+}
+
+// Does `nm` name the LEADING component of `sig`? (sig starts with nm at a token boundary: end, '(', ' ',
+// or '/'.) Lets an exact name like `apply` win over substring siblings (`apply`/`ap`), `bfs` over
+// `bounded-bfs`, etc., selecting a single component for the detailed view.
+ruTacticPrimaryMatch(sig : string, nm : string) -> bool {
+	s = toLowerCase(sig);
+	startsWith(s, nm) && (strlen(s) == strlen(nm) || {
+		c = substring(s, strlen(nm), 1);
+		c == "(" || c == " " || c == "/";
+	});
+}
+
 ruTacticHelp2s() -> string {
-	"available tactic components (consult `description`):\n" +
-	strGlue(map(ruTacticHelp(), \p -> "  " + p.first + "\n      " + p.second), "\n")
+	// ruTacticDocsTable (stringTable2s) already starts on a fresh line, so the header takes no trailing \n.
+	"Tactic components (categories: " + strGlue(ruTacticCategories(), ", ") +
+	"; `tactic name=<component|category>` for details):" + ruTacticDocsTable(ruTacticDocs());
+}
+
+// Lookup for the `tactic` command: empty -> full table; a CATEGORY name -> that category's components;
+// otherwise a case-insensitive substring match on the component signature; else not-found + full table.
+ruTacticHelpLookup(name : string) -> string {
+	docs = ruTacticDocs();
+	nm   = toLowerCase(trim2(name, " "));
+	if (nm == "") ruTacticHelp2s()
+	else if (exists(docs, \dc -> toLowerCase(dc.category) == nm)) ruTacticDocsTable(filter(docs, \dc -> toLowerCase(dc.category) == nm))
+	else {
+		// Prefer an exact leading-name hit (apply over apply/ap, bfs over bounded-bfs); fall back to
+		// substring. A single match → detailed `help <command>`-style view; several → the table.
+		exact   = filter(docs, \dc -> ruTacticPrimaryMatch(dc.sig, nm));
+		matches = if (length(exact) == 1) exact else filter(docs, \dc -> strContains(toLowerCase(dc.sig), nm));
+		if (matches == []) "no tactic component or category matching '" + name + "'\n" + ruTacticHelp2s()
+		else if (length(matches) == 1) ruTacticDoc2s(matches[0])
+		else ruTacticDocsTable(matches);
+	}
 }
 
 ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
@@ -455,7 +527,6 @@ ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTactic
 		ms = ruDslGetInt(ast, "max-size",  2, 4096);
 		ruTagBuilder("top-n-bfs", Some(ruStaticTacticBuilder(ruTopNBFSTactic(nn, md, ms))));
 	}
-	else if (n == "unif-quality" || n == "uq") ruTagBuilder("uq", ruDslBuildUnifQuality(ast))
 	else if (n == "spr")             ruTagBuilder("spr", ruDslBuildSpr(ast, ctx))
 	else if (n == "fragment-replay") {
 		ctx.env.out.error("tactic DSL: 'fragment-replay' is removed; use 'spr' instead (spr subsumes fragment replay and is more general)", []);
@@ -464,7 +535,7 @@ ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTactic
 	else if (n == "ml")              ruTagBuilder("ml", ruDslBuildMl(ast, ctx))
 	else if (n == "apply")           ruTagBuilder("apply", ruDslBuildApply(ast, ctx))
 	else if (n == "ap")              ruTagBuilder("ap", ruDslBuildAp(ast, ctx))
-	else if (n == "prop")            ruTagBuilder("prop", ruDslBuildProp(ast, ctx))
+	else if (n == "kalmar-closer")   ruTagBuilder("kalmar-closer", ruDslBuildKalmarCloser(ast, ctx))
 	else if (n == "def-close" || n == "checker") ruTagBuilder("def-close", ruDslBuildDefClose(ast, ctx))
 	else if (n == "replay")          ruDslBuildRealizer(ast, ctx, "replay", ruReplayRealize)
 	else if (n == "linear-guided")   ruTagBuilder("linear-guided", ruDslBuildLinearGuided(ast, ctx))
@@ -480,13 +551,6 @@ ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTactic
 		ctx.env.out.error("tactic DSL: unknown atom '" + ast.name + "'\n" + ruTacticHelp2s(), []);
 		None();
 	}
-}
-
-ruDslBuildUnifQuality(ast : RuTacticAst) -> Maybe<RuTacticBuilder> {
-	n  = ruDslGetInt(ast, "rank",      0, 10);
-	md = ruDslGetInt(ast, "max-depth", 1, 2);
-	ms = ruDslGetInt(ast, "max-size",  2, 32);
-	Some(ruStaticTacticBuilder(ruUnifQualityTactic(n, md, ms)))
 }
 
 ruDslBuildSpr(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
@@ -517,18 +581,29 @@ ruDslBuildMl(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder>
 	}
 }
 
-// The propositional closer (`prop`): unfold the goal/hyps' compound membership atoms (instantiating
-// the foundation's elun/eldif/elsymdif/… membership lemmas), then build the Kalmár certificate for
-// hyps + those facts ⊢ goal and install it directly (no backward search). A no-op (ruDoneTactic) when
-// the goal is not a propositional consequence, so it composes in a seq(...) before a fallback.
-ruDslBuildProp(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+// PRUNE-CANDIDATE: see the family note in kalmar.flow. This atom is the ONLY live entry to the Kalmár
+// subsystem and NO active workflow invokes it (def-close closes residuals with bounded-bfs). Kept for now
+// as the explicit propositional closer; revisit once the bounded-bfs closer's coverage is confirmed.
+// The propositional closer (`kalmar-closer`): unfold the goal/hyps' compound membership atoms
+// (instantiating the foundation's elun/eldif/elsymdif/… membership lemmas), rewrite the goal to base
+// atoms by congruence, then close the residual `hyps + facts ⊢ goal'` with the Kalmár certificate
+// TACTIC — driven through the prover by ruRunCloser, not called as a bare procedure. A no-op
+// (ruDoneTactic) when the goal is not a propositional consequence, so it composes in a seq(...) before a
+// fallback. The residual closer is injected (RuEqCloser.mkCloser), defaulting to Kalmár here.
+ruDslBuildKalmarCloser(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
 	Some(RuTacticBuilder(\penv -> {
 		task     = penv.conf.task;
 		goalStmt = task.goal.stmt;
 		goalExp  = ruExp(goalStmt.exps[0]);
 		hypExps  = map(task.premises, \p -> ruExp(p.stmt.exps[0]));
 		conn     = ruPConnectives();
-		tactic   = switch (ruEqualizerPropTactic(RuEnvMath(ctx.math, ctx.env), conn, tp2id_("wff"), goalStmt.class, hypExps, goalExp)) {
+		wff      = tp2id_("wff");
+		// Default residual closer = the Kalmár certificate tactic for that concrete (premises ⊢ goal').
+		// It installs the certificate (no search), so its time/size budgets are non-binding; ruRunCloser
+		// recovers the installed proof tree. ruDoneTactic when goal' is not a propositional consequence.
+		clo = RuEqCloser(task.info, ruCheckerPropScope(), 60000.0,
+			\prems, g -> either(ruKalmarTactic(conn, wff, goalStmt.class, prems, g, 1000000), ruDoneTactic));
+		tactic = switch (ruEqualizerPropTactic(RuEnvMath(ctx.math, ctx.env), conn, wff, goalStmt.class, hypExps, goalExp, clo)) {
 			Some(t): t;
 			None():  ruDoneTactic;
 		};
@@ -812,7 +887,12 @@ ruDslBuildOracle(ast : RuTacticAst) -> Maybe<RuTacticBuilder> {
 					th = ass;
 					mapping : ref Tree<RuProverProp, RuProofStep> = ref makeTree();
 					root_ass = lookupTreeDef(penv.math.decls.assertions, ruProofQedStep(proof).assertion, ruNoAxiom);
-					tactic = ruReproveOracleTactic(th, penv.math, mapping, max_true, max_false, penv.env);
+					// Relabel with ALL four params (the underlying tactic only carries max_true/max_false;
+					// max_variants/max_proofs live in the unify-fn overrides, so its own toString omits them).
+					tactic = ruLabeledTactic(
+						"oracle(" + i2s(max_true) + ", " + i2s(max_false) + ", " + i2s(max_variants) + ", " + i2s(max_proofs) + ")",
+						ruReproveOracleTactic(th, penv.math, mapping, max_true, max_false, penv.env)
+					);
 					new_penv = RuProverEnv(penv with
 						fns = RuProverFuncs(penv.fns with
 							unifyAssertion = ruReproveOracleUnifyAssertion(

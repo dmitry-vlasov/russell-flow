@@ -8,6 +8,7 @@ import ru/prover/tactics/combinators;
 import ru/prover/tactics/equalizer;
 import ru/prover/tactics/unfold;
 import ru/prover/tactics/propositional;
+import ru/prover/tactics/closer;
 import ru/unify/index;
 import ru/proof_tree;
 import ru/verify/math;
@@ -63,43 +64,15 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 			RuStmt(stmtClass, [hRw[i].residual], -1));                      // ⊢ hyp_i'
 	});
 	hypDisjs = fold(changed, makeSet(), \acc, c -> mergeSets(acc, hRw[c.first].disjs));
-	// Index ONLY the scope lemmas (tiny) — the whitelist restricts search to them anyway, and rebuilding
-	// the full 5000+ index on every checker invocation is far too costly.
-	scopeSet = buildSet(scope);
-	index = foldTree(math.decls.assertions, ruMakeIndex(), \__, ass, acc ->
-		if (containsSet(scopeSet, ass.info.id)) ruSetIndex(ruExp(ass.infer.prop.exps[0]), ass, acc) else acc);
-	captured : ref Maybe<RuProofTree> = ref None();
-	goalStep = RuStep(-1, ruStepLemma, [], RuStmt(stmtClass, [goal], -1), ruNoProof, "", -1);
 	// premises: the real hyps (0..nh-1) then the derived, unfolded hyps (nh..).
 	premises = concat(
 		mapi(hyps, \i, h -> RuHyp(i, RuStmt(stmtClass, [h], -1), -1)),
 		mapi(derivedHyps, \j, h -> RuHyp(nh + j, RuStmt(stmtClass, [h], -1), -1))
 	);
-	// `info` MUST be the outer theorem's info so the precedence check (ruDeclInfoPreceeds) admits the
-	// same foundation assertions the theorem itself may use.
-	task  = RuProverTask(info, ruDoneTactic, "checker-residual", makeTree(), premises, goalStep);
-	penv0 = ruInitProverEnv(task, math, env, index, limit);
-	orig  = penv0.fns.onProof;   // keep the default (stores into tree.proofs so ruProve terminates)
-	penv  = RuProverEnv(penv0 with
-		fns = RuProverFuncs(penv0.fns with onProof = \t -> { if (^captured == None()) captured := Some(t); orig(t); })
-	);
-	penv.whitelist := scope;
-	penv.tactic := Some(mkCloser());
-	ruProve(ruExpandHyp(penv.tree.root, penv));
-	// Unconst the captured tree (the default onProof unconsts before storing), then splice each derived
+	// Drive the closer (a fresh one per call) over `scope` on `premises ⊢ goal`, then splice each derived
 	// premise's leaf (index ≥ nh) with its mpbi derivation. Carry the hyps' DV provisos out.
-	maybeMap(^captured, \t -> {
-		unc = ruCheckerUnconstTree(penv0.fns.unconst, t);
-		RuRefineResult(ruUnfoldSplice(unc, nh, derivedProofs), hypDisjs);
-	});
-}
-
-ruCheckerUnconstTree(unconst : (RuExp) -> RuExp, t : RuProofTree) -> RuProofTree {
-	uncStmt = \s : RuStmt -> RuStmt(s with exps = map(s.exps, \e -> unconst(ruExp(e))));
-	switch (t) {
-		RuProofHyp(i, stmt):       RuProofHyp(i, uncStmt(stmt));
-		RuProofStep(a, ch, stmt):  RuProofStep(a, map(ch, \c -> ruCheckerUnconstTree(unconst, c)), uncStmt(stmt));
-	}
+	maybeMap(ruRunCloser(math, env, info, stmtClass, premises, goal, scope, mkCloser(), limit),
+		\unc -> RuRefineResult(ruUnfoldSplice(unc, nh, derivedProofs), hypDisjs));
 }
 
 // Phase 1: strip the leading ∀-chain; validation re-quantifies the matrix proof with ax-gen. Declines

@@ -1,0 +1,73 @@
+import ru/prover/core/env;
+import ru/prover/core/prove;
+import ru/prover/core/expand;
+import ru/prover/core/task;
+import ru/prover/core/controls;
+import ru/unify/index;
+import ru/proof_tree;
+import ru/subst;
+import ru/verify/math;
+import base/ids;
+
+// A self-contained sub-prove driven by a CLOSER tactic: run `closer` on `premises ⊢ goal` (search
+// restricted to `scope`) and return the proof TREE it produces. The single primitive both the refiner's
+// residual closer (ruCheckerResidual) and the equalizer's propositional close use, so any tactic — a
+// SEARCH closer (bounded-bfs) or a CERTIFICATE closer (the Kalmár install tactic) — plugs in uniformly.
+//
+// Two capture paths, because the two closer shapes report differently:
+//   - a SEARCH closer reaches the goal through the engine, which fires fns.onProof with the (const-form)
+//     proof tree — captured below and unconsted.
+//   - an INSTALL closer (ruInstallProofTactic) writes a linear RuProof straight into tree.proofs and
+//     terminates without firing onProof — so reconstruct the tree from that linear proof
+//     (ruDoTheoremProofTree). The installed proof is already real-form, so it is NOT unconsted.
+// RuProofTree is a fully-expanded tree (no sharing), so the install path's tree→linear→tree round-trip
+// returns an equivalent tree — at most two extra O(size) walks, no blow-up.
+export {
+	ruRunCloser(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int,
+		premises : [RuHyp], goal : RuExp, scope : [int], closer : RuProverTactic, limit : double) -> Maybe<RuProofTree>;
+
+	// Unconst every stmt of a captured (const-form) proof tree. Lives here because both the residual
+	// closer and the equalizer recover trees from the prover and must strip its const wrappers.
+	ruCheckerUnconstTree(unconst : (RuExp) -> RuExp, t : RuProofTree) -> RuProofTree;
+}
+
+ruRunCloser(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int,
+	premises : [RuHyp], goal : RuExp, scope : [int], closer : RuProverTactic, limit : double) -> Maybe<RuProofTree> {
+	// Index ONLY the scope lemmas (tiny) — the whitelist restricts search to them anyway.
+	scopeSet = buildSet(scope);
+	index = foldTree(math.decls.assertions, ruMakeIndex(), \__, ass, acc ->
+		if (containsSet(scopeSet, ass.info.id)) ruSetIndex(ruExp(ass.infer.prop.exps[0]), ass, acc) else acc);
+	captured : ref Maybe<RuProofTree> = ref None();
+	goalStep = RuStep(-1, ruStepLemma, [], RuStmt(stmtClass, [goal], -1), ruNoProof, "", -1);
+	// `info` MUST be the outer theorem's info so the precedence check (ruDeclInfoPreceeds) admits the
+	// same foundation assertions the theorem itself may use.
+	task  = RuProverTask(info, ruDoneTactic, "closer", makeTree(), premises, goalStep);
+	penv0 = ruInitProverEnv(task, math, env, index, limit);
+	orig  = penv0.fns.onProof;   // keep the default (stores into tree.proofs so ruProve terminates)
+	penv  = RuProverEnv(penv0 with
+		fns = RuProverFuncs(penv0.fns with onProof = \t -> { if (^captured == None()) captured := Some(t); orig(t); })
+	);
+	penv.whitelist := scope;
+	penv.tactic := Some(closer);
+	ruProve(ruExpandHyp(penv.tree.root, penv));
+	switch (^captured) {
+		Some(t): Some(ruCheckerUnconstTree(penv0.fns.unconst, t));   // search closer: const-form
+		None(): {                                                    // install closer: linear, real-form
+			pr = ^(penv.tree.proofs);
+			if (pr == []) None()
+			else {
+				steps = pr[0].steps;
+				if (steps == []) None()
+				else Some(ruDoTheoremProofTree(steps, premises, math, length(steps) - 1));
+			}
+		}
+	}
+}
+
+ruCheckerUnconstTree(unconst : (RuExp) -> RuExp, t : RuProofTree) -> RuProofTree {
+	uncStmt = \s : RuStmt -> RuStmt(s with exps = map(s.exps, \e -> unconst(ruExp(e))));
+	switch (t) {
+		RuProofHyp(i, stmt):       RuProofHyp(i, uncStmt(stmt));
+		RuProofStep(a, ch, stmt):  RuProofStep(a, map(ch, \c -> ruCheckerUnconstTree(unconst, c)), uncStmt(stmt));
+	}
+}
