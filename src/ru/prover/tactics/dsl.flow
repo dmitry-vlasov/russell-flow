@@ -12,6 +12,7 @@ import ru/prover/tactics/kalmar;
 import ru/prover/tactics/unfold;
 import ru/prover/tactics/equalizer;
 import ru/prover/tactics/refiners;
+import ru/prover/tactics/presets;
 import ru/prover/tactics/linear_guided;
 import ru/prover/ml/premise_selector;
 import ru/prover/tactics/oracle;
@@ -317,6 +318,23 @@ ruDslPositional(ast : RuTacticAst) -> [RuTacticVal] {
 	)
 }
 
+// Serialize a parsed tactic AST back to its DSL string. Inverse of ruParseTacticDsl (re-parses to the
+// same AST). Used to (a) label or-else alternatives without building them, and (b) splice a `closer=`
+// sub-tactic into a preset expansion.
+ruTacticVal2s(v : RuTacticVal) -> string {
+	switch (v) {
+		RuTacticValAst(a): ruTacticAst2s(a);
+		RuTacticValLit(s): s;
+	}
+}
+ruTacticAst2s(ast : RuTacticAst) -> string {
+	if (ast.args == []) ast.name
+	else ast.name + "(" + strGlue(map(ast.args, \arg -> switch (arg) {
+		RuTacticArgPos(v):      ruTacticVal2s(v);
+		RuTacticArgNamed(n, v): n + "=" + ruTacticVal2s(v);
+	}), ", ") + ")";
+}
+
 ruDslGetArg(ast : RuTacticAst, name : string, pos_idx : int) -> Maybe<RuTacticVal> {
 	named = filtermap(ast.args, \arg ->
 		switch (arg) {
@@ -425,7 +443,6 @@ ruTacticDocs() -> [RuTacticDoc] {
 			"Score every open leaf with the loaded ML models (feature / medoid / LGG / k-NN) and expand the frontier in best-first order. The pure ML-ranked expander, unbounded on its own — wrap in `limited` for the usual bounded top-k beam:\n  limited(ml, batch=k, size=N, depth=D)\nNeeds an ML selector in context (load-ml=1 / learn-assertions). (`apply` was removed: write `scoped(a1, …, ak, <search>)`.)"),
 		dp("atoms", "ap(a, child, ...)",            "replay a positional proof tree: assertion `a` applied at the goal, each child proving a premise in order", [p("a", "the assertion applied at this node"), p("child ...", "each child: a nested ap(...) or `prem` (a premise discharged by a hyp / prior step)")]),
 		d ("atoms", "kalmar-closer",                "propositional closer: unfold membership atoms + Kalmar certificate [PRUNE-CANDIDATE]"),
-		dp("atoms", "def-close",                    "definitional closure: replay(refine(...)) over the full refiner set, nnf off then on", [md, ms, p("time-limit", "per-step time budget"), p("closer", "residual closer tactic (default bounded-bfs)")]),
 		dp("atoms", "linear-guided(attempts)", "guide search by linear goal->premise chains from the corpus (unbounded; wrap in limited)", [p("attempts", "how many goal->premise chains to try")]),
 		dp("atoms", "follow-proof(theorem)",        "replay a named theorem's stored proof tree (diagnostic)", [p("theorem", "name of the theorem whose stored proof tree to replay")]),
 		dp("atoms", "oracle(max-true-props, ...)",  "drive search by the theorem's own proof tree (oracle stubs map proof nodes onto prover props)", [p("max-true-props", "oracle-mapped props expanded per iteration (negative = unlimited)"), p("max-false-props", "non-oracle-mapped leaves expanded per iteration (negative = unlimited)"), p("max-variants", "assertion-unification variants offered: the oracle's + N fallbacks (negative = oracle only)"), p("max-proofs", "premise-proof variants offered: the oracle's + N fallbacks (negative = oracle only)")]),
@@ -439,12 +456,15 @@ ruTacticDocs() -> [RuTacticDoc] {
 		// realizers — run a guide through the engine
 		dp("realizers", "replay(<guide>)",          "reconstruct the guide through the engine (track + replay selector); valid by construction", [p("<guide>", "a guide-expression to reconstruct: refine(...) or stored")]),
 		// combinators
-		dp("combinators", "seq(t1, t2, ...)",       "run t1; on Done without a proof, fall through to t2, ... (first that closes wins)", [p("t1, t2, ...", "sub-tactics tried in order; the first to find a proof wins")]),
+		dp("combinators", "seq(t1, t2, ...)",       "run t1; on Done without a proof, fall through to t2, ... (first that closes wins); built EAGERLY, threads env", [p("t1, t2, ...", "sub-tactics tried in order; the first to find a proof wins")]),
+		dp("combinators", "or-else(t1, t2, ...)",   "lazy alternation: like seq but each alternative is BUILT only when the previous finishes without a proof (so an expensive guide build is skipped when an earlier one closes)", [p("t1, t2, ...", "alternatives tried in order; later ones are built only if earlier ones fail")]),
 		dp("combinators", "loop(body, max-iters=N)", "re-run body while it makes progress, up to N iterations", [p("body", "the tactic to repeat"), p("max-iters", "max iterations (stops early if a round makes no progress)")]),
 		dp("combinators", "limited(t, time=, size=, depth=, batch=)", "run t under wall-clock / step / size / depth caps, optionally pacing its expansion (see Parameters for the full arg list)", [p("t", "the tactic to cap"), p("time", "wall-clock ms budget"), p("applied", "max assertion applications"), p("produced", "max props produced"), p("size", "max tree size (absolute)"), p("depth", "max tree depth from the root (absolute)"), p("batch", "expand at most this many leafs/round (0 = whole frontier); a non-zero batch keeps a size cap strict")]),
 		dp("combinators", "focus(selector, t)",     "restrict t to the subtrees rooted at the selector's seeds", [p("selector", "which props/seeds to focus on (see selectors)"), p("t", "tactic run on the selected subtrees")]),
 		dp("combinators", "track(selector, t)",     "restrict t to EXACTLY the selector's props each step (e.g. replay a guide)", [p("selector", "which props to keep each step (see selectors)"), p("t", "tactic restricted to them")]),
 		dp("combinators", "scoped(scope, t)",       "restrict candidate rules to <scope>, then run t", [p("scope", "a named scope (e.g. prop-scope) or an inline assertion list"), p("t", "tactic run under that rule restriction")]),
+		// presets — NAMED COMPOSITIONS of the primitives above (sugar, not atoms); each expands to a DSL string
+		dp("presets", "def-close(max-depth, max-size, time-limit, closer)", "definitional closure (PRESET = a composition, not an atom): or-else(replay(refine(strip-forall, rel-intro, eq-rewrite)), replay(refine(..., nnf=on))) — the refiner guide, falling back to its De Morgan variant", [md, ms, p("time-limit", "per-step build budget (seconds)"), p("closer", "residual closer tactic (default bounded-bfs)")]),
 		// selectors — pick props inside focus(...) / track(...)
 		d ("selectors", "all",                      "every open leaf (no restriction)"),
 		d ("selectors", "frontier",                 "candidate props at the frontier where the guide diverges from the tree"),
@@ -531,19 +551,45 @@ ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTactic
 	// (scoped's scope is the leading positional names, the last positional is any search tactic).
 	else if (n == "ap")              ruTagBuilder("ap", ruDslBuildAp(ast, ctx))
 	else if (n == "kalmar-closer")   ruTagBuilder("kalmar-closer", ruDslBuildKalmarCloser(ast, ctx))
-	else if (n == "def-close" || n == "checker") ruTagBuilder("def-close", ruDslBuildDefClose(ast, ctx))
 	else if (n == "replay")          ruDslBuildRealizer(ast, ctx, "replay", ruReplayRealize)
 	else if (n == "linear-guided")   ruTagBuilder("linear-guided", ruDslBuildLinearGuided(ast, ctx))
 	else if (n == "follow-proof")    ruTagBuilder("follow-proof", ruDslBuildFollowProof(ast, ctx))
 	else if (n == "oracle")          ruTagBuilder("oracle", ruDslBuildOracle(ast))
 	else if (n == "seq")             ruDslBuildSeq(ast, ctx)
+	else if (n == "or-else")         ruDslBuildOrElse(ast, ctx)
 	else if (n == "loop")            ruDslBuildLoop(ast, ctx)
 	else if (n == "limited")         ruDslBuildLimited(ast, ctx)
 	else if (n == "focus")           ruDslBuildFocus(ast, ctx)
 	else if (n == "track")           ruDslBuildTrack(ast, ctx)
 	else if (n == "scoped")          ruDslBuildScoped(ast, ctx)
+	// PRESETS (named compositions, NOT atoms — see presets.flow): expand to a DSL string, then build it.
+	else if (exists(ruPresetNames(), \p -> p == n)) ruBuildPreset(ast, ctx)
 	else {
 		ctx.env.out.error("tactic DSL: unknown atom '" + ast.name + "'\n" + ruTacticHelp2s(), []);
+		None();
+	}
+}
+
+// Build a PRESET: read its args, hand them to the pure expansion (presets.flow) to get a tactic-DSL
+// string, then parse + build that string. The preset name never reaches the atom dispatch — it IS its
+// expansion. Keeping the (per-preset) arg-reading here is the only glue; the composition lives in
+// presets.flow.
+ruBuildPreset(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+	n = ast.name;
+	if (n == "def-close") {
+		md = ruDslGetInt(ast, "max-depth",  99, 6);
+		ms = ruDslGetInt(ast, "max-size",   99, 4096);
+		tl = ruDslGetInt(ast, "time-limit", 99, 60);
+		closerStr = switch (ruDslGetArg(ast, "closer", 99)) {
+			None(): "";
+			Some(v): switch (v) {
+				RuTacticValAst(sub): ", closer=" + ruTacticAst2s(sub);
+				RuTacticValLit(__):  "";
+			};
+		};
+		ruParseAndBuildTactic(ruDefCloseExpansion(md, ms, tl, closerStr), ctx);
+	} else {
+		ctx.env.out.error("tactic DSL: '" + n + "' is registered as a preset but has no expansion", []);
 		None();
 	}
 }
@@ -730,32 +776,14 @@ ruDslBuildRealizer(ast : RuTacticAst, ctx : RuTacticContext, name : string, real
 	}
 }
 
-// def-close == replay(refine(...)) [, nnf=on variant] over the full refiner set: build the guide by
-// goal-refinement, then have the engine reconstruct it (sound, precedence-checked); nnf off then (only
-// if off built no guide) on. Sugar — the round-tripping expansion is what its toString prints.
-// (`checker` is an alias.) The old `inject` direct-install fallback was removed: it was capability-
-// redundant with replay (0 inject-only theorems) and bypassed the engine's soundness/precedence checks.
-ruDslBuildDefClose(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
-	md  = ruDslGetInt(ast, "max-depth", 99, 6);
-	ms  = ruDslGetInt(ast, "max-size",  99, 4096);
-	tl  = i2d(ruDslGetInt(ast, "time-limit", 99, 60));
-	closerAstMb = switch (ruDslGetArg(ast, "closer", 99)) {
-		None(): None();
-		Some(v): switch (v) { RuTacticValAst(sub): Some(sub); RuTacticValLit(__): None(); };
-	};
-	gbOff = ruRefineGuideBuilder(ruRefinerNames(), md, ms, tl, closerAstMb, false, ctx);
-	gbOn  = ruRefineGuideBuilder(ruRefinerNames(), md, ms, tl, closerAstMb, true,  ctx);
-	realizers = \penv2 : RuProverEnv, gb : RuGuideBuilder, gd : Maybe<RuRefineResult> -> switch (gd) {
-		Some(g): [ruReplayRealize(penv2, gb.toString, g)];
-		None():  [];
-	};
-	Some(RuTacticBuilder(\penv -> {
-		gdOff = gbOff.build(penv);
-		offT  = realizers(penv, gbOff, gdOff);
-		onT   = if (gdOff != None()) [] else realizers(penv, gbOn, gbOn.build(penv));
-		Pair(penv, ruSequenceTactic(concat(offT, onT)));
-	}));
-}
+// `def-close` is now a PRESET (presets.flow), not an atom: it expands to
+//   or-else( replay(refine(strip-forall, rel-intro, eq-rewrite,         budget)),
+//            replay(refine(strip-forall, rel-intro, eq-rewrite, nnf=on, budget)) )
+// — the same composition the old hand-written builder assembled (build a goal-refinement guide, then have
+// the engine reconstruct it: sound, precedence-checked), but expressed purely from primitives. The lazy
+// nnf=on fallback (build the second guide only if the first finds no proof) is now the `or-else`
+// combinator, not bespoke control flow. See ruBuildPreset / ruDefCloseExpansion. (The old `inject`
+// direct-install path was removed earlier: redundant with replay and unsound.)
 
 // ap(<assertion>, <child0>, <child1>, ...): the POSITIONAL, structure-carrying apply — a proof
 // TREE, not a rule set. The assertion is applied at the goal; each child proves the corresponding
@@ -920,6 +948,27 @@ ruDslBuildSeq(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder
 			});
 			Pair(folded.first, ruSequenceTactic(folded.second))
 		}));
+	}
+}
+
+// or-else(t1, t2, ...): lazy alternation. Each alternative's BUILDER is constructed now (cheap — for
+// replay(refine(...)) this captures the guide-builder WITHOUT building the guide), but its actual
+// .build(penv) is deferred into a thunk, so an expensive alternative is built only when or-else reaches
+// it (i.e. only if the earlier ones finished without a proof). Labels come from re-serializing the child
+// AST, so the whole or-else(...) toString is available without building anything.
+ruDslBuildOrElse(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+	poss = ruDslPositional(ast);
+	pairsMb = map(poss, \v -> switch (v) {
+		RuTacticValAst(sub): maybeMap(ruBuildTacticFromAst(sub, ctx), \b -> Pair(ruTacticAst2s(sub), b));
+		RuTacticValLit(s): { ctx.env.out.error("tactic DSL: or-else alternative must be a tactic, got literal '" + s + "'", []); None(); };
+	});
+	if (poss == []) { ctx.env.out.error("tactic DSL: or-else needs at least one alternative", []); None(); }
+	else if (exists(pairsMb, isNone)) None()
+	else {
+		pairs = filtermap(pairsMb, \m -> m);
+		Some(RuTacticBuilder(\penv ->
+			Pair(penv, ruOrElseTactic(map(pairs, \pr -> Pair(pr.first, \ -> (pr.second.build(penv)).second))))
+		));
 	}
 }
 

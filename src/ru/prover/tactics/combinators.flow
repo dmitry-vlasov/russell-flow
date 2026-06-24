@@ -19,6 +19,15 @@ export {
 	// when a proof is found.
 	ruLoopWhileProgressTactic(builder : () -> RuProverTactic, max_iters : int) -> RuProverTactic;
 
+	// Or-else (lazy alternation): try the alternatives in order. Each is a (toString-label, builder
+	// THUNK) pair; the thunk is invoked — i.e. the alternative is BUILT — only when the previous one
+	// finishes without a proof. The first proof wins; the search stops immediately. Unlike `seq` (which
+	// takes already-built tactics and threads env stage→stage), or-else builds each alternative lazily
+	// from the same captured base env, so an expensive-to-build alternative (e.g. a guide constructed by
+	// refine/replay) is never built unless it is actually reached. This is what lets `def-close` be the
+	// pure composition or-else(replay(refine(...)), replay(refine(..., nnf=on))) with no wasted builds.
+	ruOrElseTactic(alts : [Pair<string, () -> RuProverTactic>]) -> RuProverTactic;
+
 	// Limit wrapper: terminates the inner tactic when any of the limits are
 	// exceeded.  All limits are optional: pass 0 to disable.
 	//   time_limit     — wall-clock cutoff (ms; 0 disables)
@@ -189,6 +198,32 @@ ruLoopHelper(
 ruLoopWhileProgressTactic(builder : () -> RuProverTactic, max_iters : int) -> RuProverTactic {
 	if (max_iters <= 0) ruDoneTactic
 	else ruLoopHelper(builder, builder(), max_iters, -1)
+}
+
+// `fullStr` is the whole or-else(...) serialization (all alternatives' labels), computed once and kept
+// constant across switches; `current` is the built alternative now running; `rest` are the not-yet-built
+// alternatives' thunks. On RuTacticDone WITHOUT a proof we build the next thunk lazily and switch to it.
+ruOrElseHelper(fullStr : string, current : RuProverTactic, rest : [() -> RuProverTactic]) -> RuProverTactic {
+	RuProverTactic(fullStr, current.tag,
+		\tree ->
+			if (length(^(tree.proofs)) > 0) RuTacticDone()
+			else switch (current.step(tree)) {
+				RuTacticExpand(leafs): RuTacticExpand(leafs);
+				RuTacticSwitch(next):  RuTacticSwitch(ruOrElseHelper(fullStr, next, rest));
+				RuTacticDone():
+					if (rest == []) RuTacticDone()
+					else RuTacticSwitch(ruOrElseHelper(fullStr, (rest[0])(), tail(rest)));
+			},
+		current.keep_expanding
+	)
+}
+
+ruOrElseTactic(alts : [Pair<string, () -> RuProverTactic>]) -> RuProverTactic {
+	if (alts == []) ruDoneTactic
+	else {
+		fullStr = "or-else(" + strGlue(map(alts, \a -> a.first), ", ") + ")";
+		ruOrElseHelper(fullStr, (alts[0].second)(), map(tail(alts), \a -> a.second));
+	}
 }
 
 ruLimitedTactic(
