@@ -89,7 +89,7 @@ These are the leaves of any tactic expression. Each lists positional parameters 
 |------|---------|
 | `seq(t1, t2, …)` | Run `t1` to completion, then `t2`, then `t3`, ... When a sub-tactic returns `Done`, the sequence advances; when all are done, the whole `seq` is done. |
 | `loop(body, max-iters)` | Each iteration calls `body` as a *fresh* tactic (so state-carrying tactics start over), runs it to completion, and checks whether the tree grew. Re-runs until no progress, `max-iters` reached, or a proof is found. |
-| `limited(inner, time, applied, produced)` | Wraps `inner` with cutoffs: wall-clock time, number of `step` invocations, total leaves produced. A limit of `0` disables that particular check. |
+| `limited(t, time=, size=, depth=, batch=)` | Wraps `t` with cutoffs (omit/`0` disables each): `time` wall-clock budget, `size` nodes added since the tactic started (a delta), `depth` absolute tree depth. `batch` paces expansion to N leafs/round — a non-zero `batch` is what keeps a `size` cap strict. Prefer named args. |
 
 Two notes on `seq`:
 
@@ -170,7 +170,7 @@ reprove
 `limited` is the standard way to attach a budget to any inner tactic:
 
 ```
-reprove tactic="limited(bounded-bfs(5, 4096), 5s, 0, 0)"
+reprove tactic="limited(bfs, time=5s, size=4096, depth=5, batch=16)"
 ```
 
 ---
@@ -187,11 +187,11 @@ with `$arg` placeholders:
     @help { Sub-proof replay with a BFS fallback. ...full description... }
     @arg attempts   { corpus sub-proofs to try per leaf. @defval 3 }
     @arg max-size   { per-stage node cap. @defval 4096 }
-    @category presets
+    @category derived
 */
-limited(loop(seq(limited(spr($attempts), 0,0,0, $max-size, 0,0),
-                 limited(bfs, 0,0,0, $max-size, $max-depth, 16)), $max-iters),
-        0,0,0, $total-size)
+limited(loop(seq(limited(spr($attempts), size=$max-size),
+                 limited(bfs, size=$max-size, depth=$max-depth, batch=16)), $max-iters),
+        size=$total-size)
 ```
 
 **Referencing them.** Anywhere a tactic string is accepted (`prove`/`reprove` `tactic=`), you may pass
@@ -208,7 +208,7 @@ expansion happens *before* the `spr`/`linear-guided` step-index decision, so a `
 still gets the corpus index built. Files are re-read each use (no caching), matching `.rus` scripts.
 
 **Discovery.** `tactic` lists the file tactics under a "File tactics" heading; `tactic name=<x>` prints a
-`.tac` file's `@help` + `@arg` table. Shipped presets: `def-close`, `spr-bfs`, `linear-bfs`.
+`.tac` file's `@help` + `@arg` table. Shipped derived tactics: `def-close`, `spr-bfs`, `linear-bfs`.
 
 To add a composition, drop a new `.tac` file under `tactics/` — no rebuild needed (the body is parsed at
 runtime). Add a new *primitive* in code instead (see below) only when it cannot be expressed as a

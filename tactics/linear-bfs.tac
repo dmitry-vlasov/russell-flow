@@ -25,9 +25,9 @@ limited(
 	loop(
 		seq(
 			linear-guided($attempts),
-			limited(bfs, 0, 0, 0, $max-size, $max-depth, 16)
+			limited(bfs, size=$max-size, depth=$max-depth, batch=16)
 		),
 		$max-iters
 	),
-	0, 0, 0, $total-size
+	size=$total-size
 )
