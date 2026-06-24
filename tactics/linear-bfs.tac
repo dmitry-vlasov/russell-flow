@@ -19,7 +19,7 @@
 	@arg max-depth  { BFS-fallback depth cap. @defval 5 }
 	@arg max-iters  { outer loop iterations over linear-guided+bfs (stops early on no progress). @defval 1 }
 	@arg total-size { global node-count cap on the whole strategy. @defval 10000 }
-	@category presets
+	@category derived
 */
 limited(
 	loop(

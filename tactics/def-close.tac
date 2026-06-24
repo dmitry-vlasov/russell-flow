@@ -21,7 +21,7 @@
 	@arg max-depth  { cap on the guide's tree depth from the root. @defval 6 }
 	@arg max-size   { cap on the guide's tree size. @defval 4096 }
 	@arg time-limit { per-step build budget, in seconds. @defval 60 }
-	@category presets
+	@category derived
 */
 or-else(
 	replay(refine(strip-forall, rel-intro, eq-rewrite,         max-depth=$max-depth, max-size=$max-size, time-limit=$time-limit)),
