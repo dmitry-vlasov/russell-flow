@@ -421,8 +421,8 @@ ruTacticDocs() -> [RuTacticDoc] {
 			"Complete breadth-first search: expands the ENTIRE open frontier each round, with no bound (it stops only when a proof is found). The pure frontier expander — the base used by replay/compress and the prover default.\nTo bound it, wrap in `limited`:\n  limited(bfs, size=N, depth=D, batch=16)  — the former `bounded-bfs` (strict delta node/depth cap)\n  limited(bfs, size=N, depth=D, batch=n)   — a top-n beam (the n most-specifically-unified leaves per round)"),
 		d ("atoms", "done / giveup",                "terminate immediately (a no-op; composes as a seq fallback sentinel)"),
 		dp("atoms", "spr(attempts, max-size)",      "sub-proof replay: replay held-out corpus sub-proofs as guides", [p("attempts", "how many held-out corpus sub-proofs to try as guides"), ms]),
-		dp("atoms", "ml(top-k, max-depth, max-size)", "ML-ranked premise selection driving bounded bfs", [p("top-k", "how many top-ranked premises to feed the bounded bfs"), md, ms]),
-		dp("atoms", "apply(a1, ..., ak)",           "restrict candidate rules to the named assertions, then bounded bfs", [p("a1 ... ak", "assertion names the search may use (plus the task premises)")]),
+		df("atoms", "ml",                           "expand the frontier in ML-ranked order (the ML analogue of bfs)",
+			"Score every open leaf with the loaded ML models (feature / medoid / LGG / k-NN) and expand the frontier in best-first order. The pure ML-ranked expander, unbounded on its own — wrap in `limited` for the usual bounded top-k beam:\n  limited(ml, batch=k, size=N, depth=D)\nNeeds an ML selector in context (load-ml=1 / learn-assertions). (`apply` was removed: write `scoped(a1, …, ak, <search>)`.)"),
 		dp("atoms", "ap(a, child, ...)",            "replay a positional proof tree: assertion `a` applied at the goal, each child proving a premise in order", [p("a", "the assertion applied at this node"), p("child ...", "each child: a nested ap(...) or `prem` (a premise discharged by a hyp / prior step)")]),
 		d ("atoms", "kalmar-closer",                "propositional closer: unfold membership atoms + Kalmar certificate [PRUNE-CANDIDATE]"),
 		dp("atoms", "def-close",                    "definitional closure: replay(refine(...)) over the full refiner set, nnf off then on", [md, ms, p("time-limit", "per-step time budget"), p("closer", "residual closer tactic (default bounded-bfs)")]),
@@ -527,7 +527,8 @@ ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTactic
 		None()
 	}
 	else if (n == "ml")              ruTagBuilder("ml", ruDslBuildMl(ast, ctx))
-	else if (n == "apply")           ruTagBuilder("apply", ruDslBuildApply(ast, ctx))
+	// `apply` removed — it was scoped + a hidden bfs; write scoped(a1, …, ak, <search>) instead
+	// (scoped's scope is the leading positional names, the last positional is any search tactic).
 	else if (n == "ap")              ruTagBuilder("ap", ruDslBuildAp(ast, ctx))
 	else if (n == "kalmar-closer")   ruTagBuilder("kalmar-closer", ruDslBuildKalmarCloser(ast, ctx))
 	else if (n == "def-close" || n == "checker") ruTagBuilder("def-close", ruDslBuildDefClose(ast, ctx))
@@ -566,12 +567,7 @@ ruDslBuildSpr(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder
 ruDslBuildMl(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
 	switch (ctx.selector) {
 		None(): { ctx.env.out.error("tactic DSL: ml needs an ML selector in context (load-ml=1 or run learn-assertions first)", []); None() }
-		Some(sel): {
-			top_k     = ruDslGetInt(ast, "top-k",     0, 5);
-			max_depth = ruDslGetInt(ast, "max-depth", 1, 7);
-			max_size  = ruDslGetInt(ast, "max-size",  2, 10000);
-			Some(ruStaticTacticBuilder(ruMlTactic(sel, top_k, max_depth, max_size)));
-		}
+		Some(sel): Some(ruStaticTacticBuilder(ruMlTactic(sel)));   // bounds/beam via limited(ml, batch=k, …)
 	}
 }
 
@@ -760,36 +756,6 @@ ruDslBuildDefClose(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBu
 		onT   = if (gdOff != None()) [] else realizers(penv, gbOn, gbOn.build(penv));
 		Pair(penv, ruSequenceTactic(concat(offT, onT)));
 	}));
-}
-
-// apply(<assertion>, ..., max-depth=D, max-size=S): restrict backward search to ONLY the named
-// assertions (engine `whitelist`) + the task premises, then run bounded BFS. The engine does the
-// unification, premise-threading and var-witnessing; restricting the rule set keeps the found proof
-// compact and human-shaped (it can use only those lemmas). With one name it is the rigid lattice
-// atom; with several it is the multi-variant generalization `apply[a1,...,ak]`.
-ruDslBuildApply(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
-	// Positional args: assertion names are bare idents incl. dotted/digit-leading ones (parsed as
-	// 0-arg asts: 0ss, pm3.2i); a bare integer literal is an optional max-size override (the CLI/.rus
-	// arg layer can't pass `max-size=N`, so allow it positionally). E.g. apply(mpbi,elun,ssel,16384).
-	poss  = ruDslPositional(ast);
-	names = filtermap(poss, \v -> switch (v) { RuTacticValAst(sub): if (sub.name != "") Some(sub.name) else None(); RuTacticValLit(__): None(); });
-	lits  = filtermap(poss, \v -> switch (v) { RuTacticValLit(s): Some(s); RuTacticValAst(__): None(); });
-	if (names == []) {
-		ctx.env.out.error("tactic DSL: apply(<assertion>, ...) needs at least one assertion name", []);
-		None();
-	} else {
-		aids = map(names, s2id_);
-		// directed search over a small rule set wants a generous size budget (ax-mp branches widely);
-		// default 16384, override with a trailing positional integer.
-		ms = if (lits != []) s2i(lits[0]) else ruDslGetInt(ast, "max-size", 99, 16384);
-		md = ruDslGetInt(ast, "max-depth", 99, 12);
-		// apply(a1,...,ak) == scoped([a1,...,ak], bounded-bfs(md,ms)) — the whitelist restriction is now
-		// the visible `scoped` combinator (faithful toString).
-		Some(RuTacticBuilder(\penv -> {
-			penv.whitelist := aids;
-			Pair(penv, ruScopedTactic("[" + strGlue(names, ", ") + "]", ruLimitedTactic(ruBreadthFirstTactic, 0.0, 0, 0, ms, md, ruSearchBatch)));
-		}));
-	}
 }
 
 // ap(<assertion>, <child0>, <child1>, ...): the POSITIONAL, structure-carrying apply — a proof
