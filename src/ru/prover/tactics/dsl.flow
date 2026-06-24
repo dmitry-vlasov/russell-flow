@@ -2,6 +2,7 @@ import ru/prover/core/env;
 import ru/prover/core/prove;
 import ru/prover/core/expand;
 import ru/prover/core/util;
+import ru/prover/core/controls;
 import ru/prover/tactics/subproof_replay;
 import ru/prover/tactics/breadth_first;
 import ru/prover/tactics/combinators;
@@ -403,17 +404,21 @@ ruTagBuilder(tag : string, mb : Maybe<RuTacticBuilder>) -> Maybe<RuTacticBuilder
 // Categories: atoms (runnable search/closers), refiners (goal reducers used inside refine), guides
 // (values yielding a proof guide), realizers (run a guide through the engine), combinators (compose
 // tactics), selectors (pick props inside focus/track).
-RuTacticDoc(category : string, sig : string, help : string, params : [Pair<string, string>]);
+// `help` is the SHORT one-liner (the `tactic` table); `full` is the longer description shown by
+// `tactic name=<component>` (empty = reuse `help`). `params` documents the arguments.
+RuTacticDoc(category : string, sig : string, help : string, full : string, params : [Pair<string, string>]);
 
 ruTacticDocs() -> [RuTacticDoc] {
 	p  = \nm, h -> Pair(nm, h);
-	d  = \cat, sig, help -> RuTacticDoc(cat, sig, help, []);            // no parameters
-	dp = \cat, sig, help, ps -> RuTacticDoc(cat, sig, help, ps);        // with parameters
+	d  = \cat, sig, help -> RuTacticDoc(cat, sig, help, "", []);            // short help only
+	dp = \cat, sig, help, ps -> RuTacticDoc(cat, sig, help, "", ps);        // short help + params
+	df = \cat, sig, help, full -> RuTacticDoc(cat, sig, help, full, []);    // short help + full description
 	// shared parameter descriptions (the two budget caps every bounded search shares; ruDeltaKeepExpanding)
 	md = p("max-depth", "cap on tree depth from the root (absolute)");
 	ms = p("max-size",  "cap on nodes ADDED since the tactic started (a delta, not the total)");
 	[
-		d ("atoms", "bfs",                          "breadth-first search: expand the open frontier each round (complete, UNBOUNDED — wrap in limited(…) to cap; limited(bfs, size=, depth=, batch=16) is the old bounded-bfs)"),
+		df("atoms", "bfs",                          "breadth-first search: expand the whole open frontier each round (unbounded)",
+			"Complete breadth-first search: expands the ENTIRE open frontier each round, with no bound (it stops only when a proof is found). The pure frontier expander — the base used by replay/compress and the prover default.\nTo bound it, wrap in `limited`:\n  limited(bfs, size=N, depth=D, batch=16)  — the former `bounded-bfs` (strict delta node/depth cap)\n  limited(bfs, size=N, depth=D, batch=n)   — a top-n beam (the n most-specifically-unified leaves per round)"),
 		d ("atoms", "done / giveup",                "terminate immediately (a no-op; composes as a seq fallback sentinel)"),
 		dp("atoms", "spr(attempts, max-size)",      "sub-proof replay: replay held-out corpus sub-proofs as guides", [p("attempts", "how many held-out corpus sub-proofs to try as guides"), ms]),
 		dp("atoms", "ml(top-k, max-depth, max-size)", "ML-ranked premise selection driving bounded bfs", [p("top-k", "how many top-ranked premises to feed the bounded bfs"), md, ms]),
@@ -436,7 +441,7 @@ ruTacticDocs() -> [RuTacticDoc] {
 		// combinators
 		dp("combinators", "seq(t1, t2, ...)",       "run t1; on Done without a proof, fall through to t2, ... (first that closes wins)", [p("t1, t2, ...", "sub-tactics tried in order; the first to find a proof wins")]),
 		dp("combinators", "loop(body, max-iters=N)", "re-run body while it makes progress, up to N iterations", [p("body", "the tactic to repeat"), p("max-iters", "max iterations (stops early if a round makes no progress)")]),
-		dp("combinators", "limited(t, time=, applied=, produced=, size=, depth=, batch=)", "run t under wall-clock / step / size / depth caps, optionally pacing its expansion", [p("t", "the tactic to cap"), p("time", "wall-clock ms budget"), p("applied", "max assertion applications"), p("produced", "max props produced"), p("size", "max tree size (absolute)"), p("depth", "max tree depth from the root (absolute)"), p("batch", "expand at most this many leafs/round (0 = whole frontier); a non-zero batch keeps a size cap strict")]),
+		dp("combinators", "limited(t, time=, size=, depth=, batch=)", "run t under wall-clock / step / size / depth caps, optionally pacing its expansion (see Parameters for the full arg list)", [p("t", "the tactic to cap"), p("time", "wall-clock ms budget"), p("applied", "max assertion applications"), p("produced", "max props produced"), p("size", "max tree size (absolute)"), p("depth", "max tree depth from the root (absolute)"), p("batch", "expand at most this many leafs/round (0 = whole frontier); a non-zero batch keeps a size cap strict")]),
 		dp("combinators", "focus(selector, t)",     "restrict t to the subtrees rooted at the selector's seeds", [p("selector", "which props/seeds to focus on (see selectors)"), p("t", "tactic run on the selected subtrees")]),
 		dp("combinators", "track(selector, t)",     "restrict t to EXACTLY the selector's props each step (e.g. replay a guide)", [p("selector", "which props to keep each step (see selectors)"), p("t", "tactic restricted to them")]),
 		dp("combinators", "scoped(scope, t)",       "restrict candidate rules to <scope>, then run t", [p("scope", "a named scope (e.g. prop-scope) or an inline assertion list"), p("t", "tactic run under that rule restriction")]),
@@ -464,7 +469,7 @@ ruTacticDocsTable(docs : [RuTacticDoc]) -> string {
 ruTacticDoc2s(d : RuTacticDoc) -> string {
 	"Component:\n\t" + d.sig + "\n" +
 	"Category:\n\t" + d.category + "\n" +
-	"Description:\n" + strIndent(d.help) + "\n" +
+	"Description:\n" + strIndent(if (d.full != "") d.full else d.help) + "\n" +
 	(if (d.params == []) "" else
 		"Parameters:\n" + strIndent(stringTable2s([
 			map(d.params, \pp -> pp.first),
@@ -616,12 +621,15 @@ ruRefineGuideBuilder(refinerNames : [string], md : int, ms : int, tl : double, c
 	closerStr = switch (closerAstMb) { Some(sub): ", closer=" + sub.name + "(...)"; None(): ""; };
 	gstr      = "refine(" + strGlue(refinerNames, ", ") + nnfStr + closerStr + ")";
 	RuGuideBuilder(gstr, \penv -> {
+		// Default residual closer = strict delta-bounded BFS = limited(bfs, size=ms, depth=md, batch=16).
+		// `closer=<tactic>` overrides it (the residual search strategy is pluggable; bfs is just the default).
+		defaultCloser = \ -> ruLimitedTactic(ruBreadthFirstTactic, 0.0, 0, 0, ms, md, ruSearchBatch);
 		mkCloser = \ -> switch (closerAstMb) {
 			Some(sub): switch (ruBuildTacticFromAst(sub, ctx)) {
 				Some(b): (b.build(penv)).second;
-				None():  ruBoundedBFSTactic(md, ms);
+				None():  defaultCloser();
 			};
-			None():  ruBoundedBFSTactic(md, ms);
+			None():  defaultCloser();
 		};
 		task      = penv.conf.task;
 		goalStmt  = task.goal.stmt;
@@ -779,7 +787,7 @@ ruDslBuildApply(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuild
 		// the visible `scoped` combinator (faithful toString).
 		Some(RuTacticBuilder(\penv -> {
 			penv.whitelist := aids;
-			Pair(penv, ruScopedTactic("[" + strGlue(names, ", ") + "]", ruBoundedBFSTactic(md, ms)));
+			Pair(penv, ruScopedTactic("[" + strGlue(names, ", ") + "]", ruLimitedTactic(ruBreadthFirstTactic, 0.0, 0, 0, ms, md, ruSearchBatch)));
 		}));
 	}
 }

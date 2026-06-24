@@ -1,6 +1,8 @@
 import ru/prover/tactics/oracle;
 import ru/prover/core/prove;
+import ru/prover/core/controls;
 import ru/prover/tactics/breadth_first;
+import ru/prover/tactics/combinators;
 import ru/prover/ml/premise_selector;
 import ru/map_decls;
 import comm;
@@ -9,7 +11,7 @@ export {
 	ruCommEvalTactic : RuComm;
 }
 
-RuTacticBenchmarkResult(
+RuEvalTacticResult(
 	steps_total   : int,
 	steps_covered : int,
 	output_total  : int
@@ -18,7 +20,7 @@ RuTacticBenchmarkResult(
 ruCommEvalTactic = RuComm(
 	RuCommInfo(
 		"eval-tactic", "prover",
-		"measure tactic recall: fraction of proof steps where oracle prop appears in tactic output",
+		"measure a tactic's step-level recall: walk each theorem's existing proof and report the fraction of steps whose correct next move is in the tactic's candidate output (no full search run)",
 		"target", true, false,
 		concat([
 			RuCommArg("target",    true, "the target: a theorem, file or all", "all"),
@@ -33,10 +35,10 @@ ruCommEvalTactic = RuComm(
 			RuCommArg("normalize", true, "ml: z-score normalize each component before combining (0/1)", "1")
 		], ruMapFnCommArgs), []
 	),
-	ruRunBenchmarkTactic
+	ruRunEvalTactic
 );
 
-ruRunBenchmarkTactic(unit : RuUnit) -> Maybe<RuState> {
+ruRunEvalTactic(unit : RuUnit) -> Maybe<RuState> {
 	env    = ruUnitEnv(unit);
 	state  = unit.state;
 	math   = ruMathFromSources(state.ru, env);
@@ -59,7 +61,7 @@ ruRunBenchmarkTactic(unit : RuUnit) -> Maybe<RuState> {
 
 		candidate_tactic =
 			if (tactic_name == "bfs") {
-				ruBoundedBFSTactic(max_depth, max_size);
+				ruLimitedTactic(ruBreadthFirstTactic, 0.0, 0, 0, max_size, max_depth, ruSearchBatch);   // strict bounded BFS
 			} else if (tactic_name == "ml") {
 				base_sel  = either(base_sel_loaded, ruLoadMlSelector(state.conf));
 				w_feat    = ruTaskDoubleArg(unit.task, "w-feat",   1.0);
@@ -70,18 +72,18 @@ ruRunBenchmarkTactic(unit : RuUnit) -> Maybe<RuState> {
 				sel = RuMlSelector(base_sel with w_feat = w_feat, w_medoid = w_medoid, w_lgg = w_lgg, w_knn = w_knn, normalize = normalize);
 				ruMlTactic(sel, top_k, max_depth, max_size);
 			} else {
-				ruTopNBFSTactic(top_k, max_depth, max_size);
+				ruLimitedTactic(ruBreadthFirstTactic, 0.0, 0, 0, max_size, max_depth, top_k);   // top-k beam (bfs-top)
 			};
 
 		processed_count = ref 0;
 		inc_processed   = ruAtomicIntInc(processed_count);
 		index   = ruMakeIndexForTarget(target, math, env);
-		results : ConcurHashMap<int, RuTacticBenchmarkResult> = makeConcurHashMap(idfn);
+		results : ConcurHashMap<int, RuEvalTacticResult> = makeConcurHashMap(idfn);
 
 		bench_fn = \decl : RuDecl, time_limit : double, env1 : RuEnv -> {
 			th = cast(decl : RuDecl -> RuTheorem);
 			if (ruTheoremIsProved(th)) {
-				r = ruBenchmarkTacticTheorem(th, index, candidate_tactic, time_limit, math, env1);
+				r = ruEvalTacticTheorem(th, index, candidate_tactic, time_limit, math, env1);
 				setConcurHashMap(results, th.info.id, r);
 				inc_processed(1);
 							}
@@ -101,10 +103,10 @@ ruRunBenchmarkTactic(unit : RuUnit) -> Maybe<RuState> {
 			)
 		);
 
-		zero = RuTacticBenchmarkResult(0, 0, 0);
+		zero = RuEvalTacticResult(0, 0, 0);
 		totals = fold(keysConcurHashMap(results), zero, \acc, id -> {
 			r = getConcurHashMap(results, id, zero);
-			RuTacticBenchmarkResult(
+			RuEvalTacticResult(
 				acc.steps_total   + r.steps_total,
 				acc.steps_covered + r.steps_covered,
 				acc.output_total  + r.output_total
@@ -130,14 +132,14 @@ ruRunBenchmarkTactic(unit : RuUnit) -> Maybe<RuState> {
 	}
 }
 
-ruBenchmarkTacticTheorem(
+ruEvalTacticTheorem(
 	th               : RuTheorem,
 	index            : RuIndex<RuAssertion>,
 	candidate_tactic : RuProverTactic,
 	time_limit       : double,
 	math             : RuMath,
 	env              : RuEnv
-) -> RuTacticBenchmarkResult {
+) -> RuEvalTacticResult {
 	mapping      = ref makeTree();
 	oracle_tactic = ruReproveOracleTactic(th, math, mapping, 1, 0, env);
 
@@ -175,5 +177,5 @@ ruBenchmarkTacticTheorem(
 	penv0 = ruInitProverEnv(prover_task, math, env, index, time_limit);
 	penv1 = ruExpandHyp(penv0.tree.root, penv0);
 	ruProveSequential(penv1);
-	RuTacticBenchmarkResult(^steps_total, ^steps_covered, ^output_total)
+	RuEvalTacticResult(^steps_total, ^steps_covered, ^output_total)
 }
