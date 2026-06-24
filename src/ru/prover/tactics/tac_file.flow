@@ -1,0 +1,82 @@
+import script/doc;
+import script/load;
+import base/util/str;
+
+// File-based tactics (`*.tac`), the tactic analogue of `.rus` scripts: a leading `/** ... */` metadata
+// block (parsed by the SAME parser scripts use — @help/@arg/@defval/@category) followed by a tactic-DSL
+// body with `$arg` placeholders. Found by relative path under `tactics/` (mirroring `scripts/`). This is a
+// LEAF module — it depends only on the script doc parser + file helpers, never on the prover's tactic
+// builder — so the new prover->script edge introduces no import cycle.
+
+export {
+	// A loaded .tac file: parsed metadata (RuCommInfo carries @help / @arg / @defval / @category) and the
+	// raw tactic-DSL body (with `$arg` placeholders still present — substitution happens at build time).
+	RuTacFile(info : RuCommInfo, body : string);
+
+	// Resolve a .tac reference (relative path, no extension) to its absolute file path. Mirrors
+	// ruFindScript: root = getRussellDir()/tactics, extension `.tac`, with cwd / workingDir overrides.
+	ruFindTactic(name : string, env : RuEnv) -> Maybe<string>;
+
+	// Load + split a .tac file into (metadata, body). None if the reference does not resolve.
+	ruLoadTacFile(name : string, env : RuEnv) -> Maybe<RuTacFile>;
+
+	// Split a .tac source into its leading /** ... */ doc block (parsed via ruParseScriptDoc) and the body.
+	ruSplitTacDoc(name : string, source : string) -> RuTacFile;
+
+	// All .tac files under tactics/, recursively, loaded — for help/discovery listing.
+	ruLoadAllTactics(env : RuEnv) -> [RuTacFile];
+}
+
+ruFindTactic(name : string, env : RuEnv) -> Maybe<string> {
+	tactics_dir = getRussellDir() + "/" + "tactics";
+	// Same candidate order + !isDirectory guards as ruFindScript (script/load.flow).
+	if (fileExists(name) && !isDirectory(name)) Some(name)
+	else if (fileExists(name + ".tac")) Some(name + ".tac")
+	else if (fileExists(env.conf.workingDir + "/" + name) && !isDirectory(env.conf.workingDir + "/" + name)) Some(env.conf.workingDir + "/" + name)
+	else if (fileExists(pathCombine(env.conf.workingDir, name + ".tac"))) Some(pathCombine(env.conf.workingDir, name + ".tac"))
+	else if (fileExists(tactics_dir + "/" + name) && !isDirectory(tactics_dir + "/" + name)) Some(tactics_dir + "/" + name)
+	else if (fileExists(tactics_dir + "/" + name + ".tac")) Some(tactics_dir + "/" + name + ".tac")
+	else None();
+}
+
+ruSplitTacDoc(name : string, source : string) -> RuTacFile {
+	s = ltrim2(source, " \t\r\n");
+	body_after = \close -> trim2(substring(s, close + 2, strlen(s) - (close + 2)), " \t\r\n");
+	if (startsWith(s, "/**")) {
+		close = strIndexOf(s, "*/");
+		if (close < 0) RuTacFile(ruParseScriptDoc(name, ""), trim2(source, " \t\r\n"))
+		// interior between `/**` and `*/` — exactly what ruParseScriptDoc / the script doc grammar expects.
+		else RuTacFile(ruParseScriptDoc(name, substring(s, 3, close - 3)), body_after(close));
+	} else if (startsWith(s, "/*")) {
+		// a plain (non-doc) /* */ comment: strip it from the body, no metadata.
+		close = strIndexOf(s, "*/");
+		if (close < 0) RuTacFile(ruParseScriptDoc(name, ""), trim2(source, " \t\r\n"))
+		else RuTacFile(ruParseScriptDoc(name, ""), body_after(close));
+	} else RuTacFile(ruParseScriptDoc(name, ""), trim2(source, " \t\r\n"));
+}
+
+ruLoadTacFile(name : string, env : RuEnv) -> Maybe<RuTacFile> {
+	maybeMap(ruFindTactic(name, env), \path -> {
+		tf = ruSplitTacDoc(name, getFileContent(path));
+		if (ruVerbose(env.conf) >= 3) env.out.println("\tTactic '" + name + "' loaded from " + path);
+		tf;
+	});
+}
+
+ruLoadAllTactics(env : RuEnv) -> [RuTacFile] {
+	tactics_dir = pathCombine(getRussellDir(), "tactics");
+	filtermap(ruTacFilesRec(tactics_dir, ""), \name -> ruLoadTacFile(name, env));
+}
+
+// All .tac files under `dir`, returned as reference names (relative, '/'-separated, extension stripped —
+// e.g. "test/spr-loop"), recursing into subdirectories.
+ruTacFilesRec(dir : string, prefix : string) -> [string] {
+	if (!fileExists(dir)) []
+	else concatA(map(readDirectory(dir), \entry -> {
+		full = pathCombine(dir, entry);
+		rel  = if (prefix == "") entry else prefix + "/" + entry;
+		if (isDirectory(full)) ruTacFilesRec(full, rel)
+		else if (endsWith(entry, ".tac")) [changeFileExt(rel, "")]
+		else [];
+	}));
+}

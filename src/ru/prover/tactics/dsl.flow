@@ -12,13 +12,14 @@ import ru/prover/tactics/kalmar;
 import ru/prover/tactics/unfold;
 import ru/prover/tactics/equalizer;
 import ru/prover/tactics/refiners;
-import ru/prover/tactics/presets;
+import ru/prover/tactics/tac_file;
 import ru/prover/tactics/linear_guided;
 import ru/prover/ml/premise_selector;
 import ru/prover/tactics/oracle;
 import ru/unify/index;
 import ru/verify/math;
 import ru/proof_tree;
+import base/util/str;
 
 export {
 	// Context passed to atomic-tactic builders that need access to the math
@@ -67,6 +68,19 @@ export {
 
 	// Parse + build in one call.
 	ruParseAndBuildTactic(src : string, ctx : RuTacticContext) -> Maybe<RuTacticBuilder>;
+
+	// Expand any `.tac` file reference in a tactic= source to its DSL body (recursively, to a fixpoint);
+	// inline tactics and unknown atoms are returned unchanged. env-only so prove/reprove can call it for
+	// the step-index scan before a RuTacticContext exists.
+	ruResolveTacticSource(src : string, env : RuEnv) -> string;
+
+	// Is `n` a built-in tactic name (atom/combinator handled inline by the dispatch)? A built-in always
+	// wins over a same-named `.tac` file. Used by resolution and by the `tactic` help command.
+	ruIsBuiltinTacticName(n : string) -> bool;
+
+	// Render the file-based (`.tac`) tactics under tactics/ as the same 3-column table the built-ins use
+	// (Component | Category | Help, one-line summaries) — for the `tactic` command listing.
+	ruFileTacticsTable(env : RuEnv) -> string;
 
 	// Human-readable tactic-component help for the `tactic` command: the whole annotated list when `name`
 	// is empty, else the components whose signature matches `name` (case-insensitive substring), or a
@@ -466,10 +480,9 @@ ruTacticDocs() -> [RuTacticDoc] {
 		dp("combinators", "focus(selector, t)",     "restrict t to the subtrees rooted at the selector's seeds", [p("selector", "which props/seeds to focus on (see selectors)"), p("t", "tactic run on the selected subtrees")]),
 		dp("combinators", "track(selector, t)",     "restrict t to EXACTLY the selector's props each step (e.g. replay a guide)", [p("selector", "which props to keep each step (see selectors)"), p("t", "tactic restricted to them")]),
 		dp("combinators", "scoped(scope, t)",       "restrict candidate rules to <scope>, then run t", [p("scope", "a named scope (e.g. prop-scope) or an inline assertion list"), p("t", "tactic run under that rule restriction")]),
-		// presets — NAMED COMPOSITIONS of the primitives above (sugar, not atoms); each expands to a DSL string
-		dpf("presets", "def-close(max-depth, max-size, time-limit, closer)", "definitional closure: refiner-guide proof + De Morgan fallback (PRESET, not an atom)",
-			"A PRESET -- a named composition of primitives, not a primitive atom. Expands to:\n  or-else(\n    replay(refine(strip-forall, rel-intro, eq-rewrite,         <budget>)),\n    replay(refine(strip-forall, rel-intro, eq-rewrite, nnf=on, <budget>)) )\nBuild a goal-refinement guide (strip the leading forall, reduce a subset/= goal to a membership subgoal, unfold + canonicalize compound membership atoms) and have the engine reconstruct it -- sound and precedence-checked. If that finds no proof, retry with De Morgan (nnf=on) canonicalization; the nnf=on guide is built lazily (only on first failure) via or-else. max-depth/max-size/time-limit bound the BUILD-TIME guide construction (a wrapping limited, which bounds runtime engine steps, cannot reach them); closer overrides the residual closer (default bounded-bfs).",
-			[md, ms, p("time-limit", "per-step build budget (seconds)"), p("closer", "residual closer tactic (default bounded-bfs)")]),
+		// Named COMPOSITIONS (def-close, spr-bfs, linear-bfs, ...) are now file-based `.tac` tactics under
+		// tactics/, not built-in components — `tactic` lists them separately and `tactic name=<x>` shows
+		// their @help/@arg metadata.
 		// selectors — pick props inside focus(...) / track(...)
 		d ("selectors", "all",                      "every open leaf (no restriction)"),
 		d ("selectors", "frontier",                 "candidate props at the frontier where the guide diverges from the tree"),
@@ -590,34 +603,11 @@ ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTactic
 	else if (n == "focus")           ruDslBuildFocus(ast, ctx)
 	else if (n == "track")           ruDslBuildTrack(ast, ctx)
 	else if (n == "scoped")          ruDslBuildScoped(ast, ctx)
-	// PRESETS (named compositions, NOT atoms — see presets.flow): expand to a DSL string, then build it.
-	else if (exists(ruPresetNames(), \p -> p == n)) ruBuildPreset(ast, ctx)
+	// File-based tactics (presets) are resolved UPSTREAM in ruParseAndBuildTactic / ruResolveTacticSource
+	// (a `.tac` reference is expanded to its DSL body before this dispatch runs), so by here `n` is either a
+	// built-in or a genuine unknown.
 	else {
 		ctx.env.out.error("tactic DSL: unknown atom '" + ast.name + "'\n" + ruTacticHelp2s(), []);
-		None();
-	}
-}
-
-// Build a PRESET: read its args, hand them to the pure expansion (presets.flow) to get a tactic-DSL
-// string, then parse + build that string. The preset name never reaches the atom dispatch — it IS its
-// expansion. Keeping the (per-preset) arg-reading here is the only glue; the composition lives in
-// presets.flow.
-ruBuildPreset(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
-	n = ast.name;
-	if (n == "def-close") {
-		md = ruDslGetInt(ast, "max-depth",  99, 6);
-		ms = ruDslGetInt(ast, "max-size",   99, 4096);
-		tl = ruDslGetInt(ast, "time-limit", 99, 60);
-		closerStr = switch (ruDslGetArg(ast, "closer", 99)) {
-			None(): "";
-			Some(v): switch (v) {
-				RuTacticValAst(sub): ", closer=" + ruTacticAst2s(sub);
-				RuTacticValLit(__):  "";
-			};
-		};
-		ruParseAndBuildTactic(ruDefCloseExpansion(md, ms, tl, closerStr), ctx);
-	} else {
-		ctx.env.out.error("tactic DSL: '" + n + "' is registered as a preset but has no expansion", []);
 		None();
 	}
 }
@@ -804,14 +794,13 @@ ruDslBuildRealizer(ast : RuTacticAst, ctx : RuTacticContext, name : string, real
 	}
 }
 
-// `def-close` is now a PRESET (presets.flow), not an atom: it expands to
+// `def-close` is now a file-based tactic (tactics/def-close.tac), not an atom: it expands to
 //   or-else( replay(refine(strip-forall, rel-intro, eq-rewrite,         budget)),
 //            replay(refine(strip-forall, rel-intro, eq-rewrite, nnf=on, budget)) )
-// — the same composition the old hand-written builder assembled (build a goal-refinement guide, then have
-// the engine reconstruct it: sound, precedence-checked), but expressed purely from primitives. The lazy
-// nnf=on fallback (build the second guide only if the first finds no proof) is now the `or-else`
-// combinator, not bespoke control flow. See ruBuildPreset / ruDefCloseExpansion. (The old `inject`
-// direct-install path was removed earlier: redundant with replay and unsound.)
+// — a composition expressed purely from primitives (build a goal-refinement guide, then have the engine
+// reconstruct it: sound, precedence-checked). The lazy nnf=on fallback (build the second guide only if the
+// first finds no proof) is the `or-else` combinator. Resolution: ruResolveTacticSource → ruLoadTacFile.
+// (The old `inject` direct-install path was removed earlier: redundant with replay and unsound.)
 
 // ap(<assertion>, <child0>, <child1>, ...): the POSITIONAL, structure-carrying apply — a proof
 // TREE, not a rule set. The assertion is applied at the goal; each child proves the corresponding
@@ -1161,8 +1150,117 @@ ruDslBuildLimited(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBui
 }
 
 ruParseAndBuildTactic(src : string, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
-	switch (ruParseTacticDsl(src, ctx.env)) {
+	// Expand any .tac file reference to its DSL body FIRST, then parse + build as usual.
+	switch (ruParseTacticDsl(ruResolveTacticSource(src, ctx.env), ctx.env)) {
 		Some(ast): ruBuildTacticFromAst(ast, ctx);
 		None(): None();
 	}
+}
+
+// The names ruBuildTacticFromAst dispatches inline (atoms + combinators). KEEP IN SYNC with the dispatch
+// above. Used to decide whether a tactic= head is a built-in (→ inline) or a candidate .tac file ref:
+// a built-in always wins over a same-named file.
+ruBuiltinTacticNames() -> [string] {
+	["bfs", "done", "giveup", "spr", "fragment-replay", "ml", "ap", "kalmar-closer", "replay",
+	 "linear-guided", "follow-proof", "oracle", "seq", "or-else", "loop", "limited", "focus", "track", "scoped"]
+}
+ruIsBuiltinTacticName(n : string) -> bool { exists(ruBuiltinTacticNames(), \b -> b == n) }
+
+// Expand a tactic= source string: if its head names a `.tac` file (a path with '/', or a bare non-built-in
+// name that resolves under tactics/), load the file, bind the invocation's args to its @arg declarations
+// (named-or-positional, @defval fallback), substitute `$arg` placeholders into the body, and recurse to a
+// fixpoint (a body may reference another file). Inline tactics (head is a built-in) and unknown atoms are
+// returned UNCHANGED — so the normal parse/build path and its errors are untouched. env-only (no ctx) so
+// prove/reprove can call it for the step-index scan before a context exists.
+ruResolveTacticSource(src : string, env : RuEnv) -> string {
+	ruResolveTacticSrc(src, env, [], 0)
+}
+
+ruResolveTacticSrc(src0 : string, env : RuEnv, visited : [string], depth : int) -> string {
+	// ruParseTacticDsl strips surrounding quotes; do the same here so head detection / file lookup match.
+	src = {
+		t = trim2(src0, " \t\r\n");
+		if (strlen(t) >= 2 && getCharCodeAt(t, 0) == 34 && getCharCodeAt(t, strlen(t) - 1) == 34) substring(t, 1, strlen(t) - 2) else t;
+	};
+	if (depth > 32) { env.out.error("tactic resolution too deep (cyclic .tac reference?): " + src, []); src0 }
+	else {
+		lp   = strIndexOf(src, "(");
+		head = trim2(if (lp < 0) src else substring(src, 0, lp), " \t\r\n");
+		if (head == "" || ruIsBuiltinTacticName(head)) src   // inline tactic → unchanged
+		else {
+			isPath = strContains(head, "/");
+			switch (ruFindTactic(head, env)) {
+				None(): {
+					// A '/'-path that doesn't resolve is clearly a bad file ref; a bare name is just an
+					// unknown atom — let the normal parse/build path report it.
+					if (isPath) env.out.error("tactic file not found: '" + head + "' (looked under <cwd>, workingDir, tactics/)", []);
+					src0;
+				}
+				Some(path): {
+					if (exists(visited, \v -> v == path)) { env.out.error("tactic .tac cycle detected at '" + head + "'", []); src0 }
+					else switch (ruLoadTacFile(head, env)) {
+						None(): { env.out.error("tactic file not found: '" + head + "'", []); src0 }
+						Some(tf): {
+							// Parse the invocation's arg list by replacing the (possibly '/'-containing) head
+							// with a dummy identifier, so named/positional/nested-tactic args parse uniformly.
+							astMb = if (lp < 0) Some(RuTacticAst("d", [])) else ruParseTacticDsl("d" + substring(src, lp, strlen(src) - lp), env);
+							switch (astMb) {
+								None(): src0;   // arg-list parse error already reported
+								Some(ast): {
+									if (tf.body == "") { env.out.error("tactic file '" + head + "' has no tactic body", []); src0 }
+									else ruResolveTacticSrc(ruBindTacArgs(head, tf, ast, env), env, concat(visited, [path]), depth + 1);
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// Bind a .tac file's @arg declarations to an invocation AST's args (named-or-positional, @defval fallback)
+// and substitute the `$arg` placeholders in its body. Substitution keys are sorted longest-first so `$max`
+// never clobbers `$max-depth`.
+ruBindTacArgs(name : string, tf : RuTacFile, ast : RuTacticAst, env : RuEnv) -> string {
+	npos = length(ruDslPositional(ast));
+	if (npos > length(tf.info.args))
+		env.out.error("tactic '" + name + "': " + i2s(npos) + " positional args given but only " + i2s(length(tf.info.args)) + " declared", []);
+	bindings = mapi(tf.info.args, \i, arg -> Pair(arg.name, switch (ruDslGetArg(ast, arg.name, i)) {
+		Some(v): ruTacticVal2s(v);
+		None():
+			if (!arg.optional && arg.defval == "") { env.out.error("tactic '" + name + "': missing required argument '" + arg.name + "'", []); "" }
+			else arg.defval;
+	}));
+	if (!strContains(tf.body, "$")) tf.body
+	else {
+		btree = pairs2tree(bindings);
+		subst = concatA(map(sortCustom(map(bindings, \b -> b.first), idfn, false),
+			\key -> ["$" + key, lookupTreeDef(btree, key, "")]));
+		// Iterate to a fixpoint: a @defval may itself reference another arg (e.g. closer's default uses
+		// $max-size/$max-depth), so one pass can leave placeholders the next pass resolves. Bounded so a
+		// self-referential value can't loop forever.
+		ruSubstFixpoint(tf.body, subst, 8);
+	}
+}
+
+ruSubstFixpoint(body : string, subst : [string], fuel : int) -> string {
+	if (fuel <= 0 || !strContains(body, "$")) body
+	else {
+		next = strReplaces(body, subst);
+		if (next == body) body else ruSubstFixpoint(next, subst, fuel - 1);
+	}
+}
+
+// First non-blank line of a help string (the one-line summary for the listing).
+ruFirstHelpLine(help : string) -> string {
+	ls = filter(strSplit(help, "\n"), \l -> trim2(l, " \t\r\n") != "");
+	if (ls == []) "" else trim2(ls[0], " \t\r\n");
+}
+
+ruFileTacticsTable(env : RuEnv) -> string {
+	tacs = ruLoadAllTactics(env);
+	if (tacs == []) "\t(no .tac files under tactics/)"
+	else ruTacticDocsTable(map(tacs, \tf ->
+		RuTacticDoc(if (tf.info.category == "") "file" else tf.info.category, tf.info.name, ruFirstHelpLine(tf.info.help), "", [])));
 }

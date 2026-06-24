@@ -175,6 +175,47 @@ reprove tactic="limited(bounded-bfs(5, 4096), 5s, 0, 0)"
 
 ---
 
+## File-based tactics (`.tac`)
+
+Named *compositions* of the primitives above live as files under the top-level `tactics/` directory, with
+the extension `.tac` — the tactic analogue of `.rus` scripts. A `.tac` file is a metadata comment block
+(the **same** `@help` / `@arg` / `@defval` / `@category` syntax scripts use) followed by a tactic-DSL body
+with `$arg` placeholders:
+
+```
+/**
+    @help { Sub-proof replay with a BFS fallback. ...full description... }
+    @arg attempts   { corpus sub-proofs to try per leaf. @defval 3 }
+    @arg max-size   { per-stage node cap. @defval 4096 }
+    @category presets
+*/
+limited(loop(seq(limited(spr($attempts), 0,0,0, $max-size, 0,0),
+                 limited(bfs, 0,0,0, $max-size, $max-depth, 16)), $max-iters),
+        0,0,0, $total-size)
+```
+
+**Referencing them.** Anywhere a tactic string is accepted (`prove`/`reprove` `tactic=`), you may pass
+either an inline DSL body (as before) **or** a `.tac` reference — a relative path under `tactics/`
+(extension omitted), optionally with arguments: `tactic=spr-bfs`, `tactic=spr-bfs(5)`,
+`tactic=spr-bfs(attempts=5, max-iters=3)`, `tactic=subdir/my-tactic`.
+
+**Resolution** (`ruResolveTacticSource` in `dsl.flow`): the head name is looked up; a **built-in**
+atom/combinator is used inline (built-ins always win over a same-named file), otherwise — if the name
+contains `/` or resolves to a `tactics/<name>.tac` file — the file is loaded, its `@arg`s are bound from
+the invocation (named-or-positional, `@defval` fallback), `$arg` placeholders are substituted (to a
+fixpoint, so a default may reference another arg), and the resulting DSL body is parsed and built. The
+expansion happens *before* the `spr`/`linear-guided` step-index decision, so a `.tac` whose body uses them
+still gets the corpus index built. Files are re-read each use (no caching), matching `.rus` scripts.
+
+**Discovery.** `tactic` lists the file tactics under a "File tactics" heading; `tactic name=<x>` prints a
+`.tac` file's `@help` + `@arg` table. Shipped presets: `def-close`, `spr-bfs`, `linear-bfs`.
+
+To add a composition, drop a new `.tac` file under `tactics/` — no rebuild needed (the body is parsed at
+runtime). Add a new *primitive* in code instead (see below) only when it cannot be expressed as a
+composition.
+
+---
+
 ## Adding a new atom
 
 The DSL atom registry is the `if/else` chain in `ruBuildTacticFromAst` (in `src/ru/prover/tactics/dsl.flow`). To add a new atom:
