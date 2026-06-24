@@ -1,6 +1,11 @@
 # The Russell Tactics Language
 
-Russell's proof-search engine is driven by **tactics** — small composable strategies that decide which leaves of the proof tree to expand next, when to stop, and when to hand off to a different sub-strategy. Tactics can be built in code, but the easiest way to experiment with them is the **tactic DSL**, a small string-based language passed via the `tactic=` argument of the `reprove` command (and a few other commands that wrap the prover).
+Russell's proof-search engine is driven by **tactics** — small composable strategies that decide which leaves of the proof tree to expand next, when to stop, and when to hand off to a different sub-strategy. Tactics can be built in code, but the easiest way to experiment with them is the **tactic DSL**, a small string-based language passed via the `tactic=` argument of `reprove` / `prove` (and a few other commands that wrap the prover).
+
+> The authoritative, always-current list of tactic components is the `tactic` command:
+> `russellj tactic` lists every component (grouped by category) plus the file-based derived tactics;
+> `russellj tactic name=<x>` shows one component's full description and parameters. This document explains
+> the model; when in doubt, trust `tactic`.
 
 ---
 
@@ -9,14 +14,12 @@ Russell's proof-search engine is driven by **tactics** — small composable stra
 The proof-search engine knows only one type: `RuProverTactic`. Earlier, complex strategies were assembled in Flow code by chaining combinators (`ruSequenceTactic`, `ruLoopWhileProgressTactic`, `ruSubproofReplayTactic`, …). That required recompiling for every experiment. The DSL exposes the same combinators and atomic tactics as a string syntax, so a strategy can be tuned per-invocation:
 
 ```
-reprove target=all tactic="seq(
-    uq(10, 2, 32),
-    loop(
-        seq(spr(3, 4096), bounded-bfs(5, 4096)),
-        3
-    )
-)"
+reprove target=all tactic="loop(seq(limited(spr(3), size=4096),
+                                     limited(bfs, size=4096, depth=5, batch=16)), 3)"
 ```
+
+And recurring strategies can be saved as **derived tactics** (`.tac` files) and referenced by name — the
+example above is exactly the shipped `spr-bfs` tactic, so the same run is just `tactic="spr-bfs(3)"`.
 
 ---
 
@@ -26,156 +29,96 @@ reprove target=all tactic="seq(
 tactic   ::= name ( '(' arg ( ',' arg )* ')' )?
 arg      ::= name '=' value         (named)
            | value                  (positional)
-value    ::= number-or-duration
+value    ::= literal
            | tactic
-literal  ::= '-'? digits ( 's' | 'ms' | 'm' | 'h' )?
+literal  ::= '-'? digits ( 's' | 'ms' | 'm' | 'h' )?   (an int, optionally a duration)
 ```
 
-- Names use letters, digits, underscores and hyphens (so `bounded-bfs`, `max-size` are valid identifiers).
-- Whitespace (spaces, tabs, newlines) is freely interleaved between tokens — multi-line tactics with indentation work the same as single-line ones.
-- A literal is a non-negative or negative integer optionally followed by a duration suffix (`60s`, `5m`, `1500ms`).
+- Names use letters, digits, underscores, hyphens and dots (so `linear-guided`, `max-size`, `pm3.2i` are valid identifiers).
+- Whitespace (spaces, tabs, newlines) is freely interleaved — multi-line, indented tactics work the same as single-line ones.
 - A bare identifier without parentheses is a zero-arg tactic (`bfs`).
-- Inside a `.rus` script, the `tactic=` value is normally double-quoted. The DSL parser strips one pair of surrounding quotes.
+- Every parameter can be passed positionally or by name (`limited(bfs, size=4096)` ≡ `limited(bfs, 0, 4096)`); named args are clearer and order-independent.
+- An argument value can itself be a tactic (nesting): `limited(bfs, …)`, `seq(spr(3), bfs)`.
+- Inside a `.rus` script the `tactic=` value is normally double-quoted; the DSL parser strips one pair of surrounding quotes.
 
 ### Substitution
 
-Russell `.rus` scripts substitute `$varname` inside argument values before they reach the DSL parser. So:
+Russell `.rus` scripts substitute `$varname` inside argument values before they reach the DSL parser:
 
 ```
-@arg attempts { @defval 1 }
+@arg attempts { @defval 3 }
 @arg max-size { @defval 4096 }
 ...
-reprove tactic="spr($attempts, $max-size)";
+reprove tactic="limited(spr($attempts), size=$max-size)";
 ```
 
-works as long as `attempts` and `max-size` are in `state.vars` (either passed on the CLI when invoking `run-script`, or set by earlier statements). `@arg` defaults are *not* auto-populated into vars — you still have to pass them on the command line, or default them in script logic.
+works as long as `attempts` / `max-size` are in `state.vars` (passed on the CLI, or set by earlier statements). Note: a `.rus` command-arg value **may contain `=`** (so named-arg tactic strings work as `tactic="…"`); historically it could not, which is why older scripts used positional tactics.
 
 ---
 
-## Atomic tactics
+## Tactic components
 
-These are the leaves of any tactic expression. Each lists positional parameters in order; all parameters can also be passed by name.
+Components are grouped into categories (the same grouping `tactic` prints). Below is the model; see
+`tactic name=<x>` for exact parameters.
 
-### Generic search
+### Atoms — the irreducible leaves
 
-| Atom | Positional params | Description |
-|------|-------------------|-------------|
-| `bfs` | (none) | Breadth-first expansion of every open leaf, no resource limits. Use only inside `limited(...)`. |
-| `done`, `giveup` | (none) | Sentinel: terminate immediately. |
-| `bounded-bfs(max-depth, max-size)` | depth, size | BFS bounded by tree depth and total node count. |
-| `top-n-bfs(n, max-depth, max-size)` | n, depth, size | BFS but expanding only the first `n` leaves per round. |
-| `unif-quality(rank, max-depth, max-size)` (alias `uq`) | rank, depth, size | Beam over the most-specific leaves first (specificity is encoded as insertion order, set in `expand.flow`). When `rank <= 0` returns `Done` immediately, so `seq()` skips it cleanly. |
+| Atom | Meaning |
+|------|---------|
+| `bfs` | Breadth-first expansion of the whole open frontier. Complete but unbounded — wrap in `limited`. |
+| `done` / `giveup` | Sentinel: terminate immediately. |
+| `spr(attempts)` | Sub-proof replay: replay up to `attempts` held-out corpus sub-proofs as guides. Unbounded; wrap in `limited`. Needs the corpus step index (built automatically — see below). |
+| `linear-guided(attempts)` | Replay corpus goal→premise spines (`attempts` chains). Only replays the spine; off-spine goals fall to the next stage (so it needs a BFS fallback, e.g. `seq(linear-guided(3), limited(bfs,…))`). Needs the step index. |
+| `ml` | Expand the frontier in ML-ranked (best-first) order — the ML analogue of `bfs`. Needs an ML selector (`load-ml=1`). Bound/beam via `limited(ml, batch=k, size=, depth=)`. |
+| `ap(a, child, …)` | Replay a positional proof **tree**: assertion `a` applied at the goal, each child proving a premise (a nested `ap(…)` or the leaf `prem`). Deterministic; the structure-carrying atom. |
+| `oracle(max-true-props, max-false-props, max-variants, max-proofs)` | Drive the search by the theorem's own stored proof tree (oracle stubs map proof nodes onto prover props). Used by the round-trip reprovability test. |
+| `follow-proof(theorem)` | Replay a named theorem's stored proof tree (diagnostic). |
+| `kalmar-closer` | Propositional closer: unfold membership atoms + a Kalmár certificate. `[PRUNE-CANDIDATE]` — no active workflow invokes it. |
 
-### Corpus-guided
+### Refiners — goal reducers (composed inside `refine(…)`, not runnable standalone)
 
-| Atom | Positional params | Needs in context |
-|------|-------------------|------------------|
-| `spr(attempts, max-size)` | attempts per leaf, follow-proof budget | Step index (built automatically by `reprove` when the tactic string mentions `spr`). Subsumes the removed `fragment-replay` atom. |
-| `linear-guided(max-size, attempts)` | follow-proof budget, attempts | Step index (built automatically when the tactic string mentions `linear-guided`). Replays corpus goal→premise spines. |
-| `follow-proof(theorem)` | theorem name | The named theorem must exist in the corpus and its proof tree must not introduce new hyps (so this is mostly useful for SPR-style sub-proofs). |
+| Refiner | Meaning |
+|---------|---------|
+| `strip-forall` | Strip the leading ∀-chain; the matrix proof is re-quantified with `ax-gen`. |
+| `rel-intro` | Reduce a `⊆` / set-`=` goal to a fresh-setvar membership subgoal (via `ssriv`/`eqriv`). |
+| `eq-rewrite` | Unfold compound membership atoms + canonicalize by biconditional congruence to a residual. |
 
-### Heuristic / specialised
+### Guides — a value yielding a proof guide (consumed by a realizer)
 
-| Atom | Positional params | Needs in context |
-|------|-------------------|------------------|
-| `ml(top-k, max-depth, max-size)` | top-k, depth, size | The ML selector — enabled with `load-ml=1` on the command. |
-| `oracle(max-true, max-false, max-variants, max-proofs)` | as named | Mutates `penv.fns` to install oracle-aware unifiers, then drives the search by the original proof tree of the theorem being proved. Used by the round-trip reprovability test. |
+| Guide | Meaning |
+|-------|---------|
+| `refine(r1, …, nnf=on, closer=<t>)` | Compose goal refiners + a residual closer (default: a bounded BFS) into a candidate proof tree. `nnf=on` canonicalizes to negation-normal-form. |
+| `stored` | The theorem's own stored proof tree (`replay(stored)` reconstructs an existing proof). |
 
----
+### Realizers — run a guide through the engine
 
-## Combinators
+| Realizer | Meaning |
+|----------|---------|
+| `replay(<guide>)` | Reconstruct the guide through the engine (track + replay selector). Valid by construction — sound and precedence-checked. |
+
+### Combinators
 
 | Form | Meaning |
 |------|---------|
-| `seq(t1, t2, …)` | Run `t1` to completion, then `t2`, then `t3`, ... When a sub-tactic returns `Done`, the sequence advances; when all are done, the whole `seq` is done. |
-| `loop(body, max-iters)` | Each iteration calls `body` as a *fresh* tactic (so state-carrying tactics start over), runs it to completion, and checks whether the tree grew. Re-runs until no progress, `max-iters` reached, or a proof is found. |
-| `limited(t, time=, size=, depth=, batch=)` | Wraps `t` with cutoffs (omit/`0` disables each): `time` wall-clock budget, `size` nodes added since the tactic started (a delta), `depth` absolute tree depth. `batch` paces expansion to N leafs/round — a non-zero `batch` is what keeps a `size` cap strict. Prefer named args. |
+| `seq(t1, t2, …)` | Run `t1`; on `Done` without a proof, fall through to `t2`, … (first that closes wins). Built eagerly; threads env stage→stage. |
+| `or-else(t1, t2, …)` | Lazy alternation: like `seq`, but each alternative is **built** only when the previous finishes without a proof — so an expensive guide build is skipped when an earlier one closes. |
+| `loop(body, max-iters=N)` | Each iteration runs a **fresh** `body` to completion; repeats while the tree grows, up to `N` iters (or until proved). |
+| `limited(t, time=, size=, depth=, batch=)` | Wrap `t` with cutoffs (omit/`0` disables each): `time` wall-clock, `size` nodes added since the tactic started (a *delta*), `depth` absolute tree depth. `batch` paces expansion to N leafs/round — a non-zero `batch` is what keeps a `size` cap **strict**. |
+| `scoped(scope, t)` | Restrict candidate rules to `<scope>` (a named scope or an inline assertion list), then run `t`. |
+| `focus(selector, t)` | Restrict `t` to the subtrees rooted at the selector's seeds. |
+| `track(selector, t)` | Restrict `t` to exactly the selector's props each step (e.g. replay a guide). |
 
-Two notes on `seq`:
+### Selectors — pick props inside `focus(…)` / `track(…)`
 
-- A sub-tactic's `keep_expanding` predicate is what the engine checks per-leaf during a *batch* expansion. `seq` delegates to its currently-active sub-tactic; when the sub-tactic returns `Done` and `seq` switches to the next, the new sub-tactic's `keep_expanding` takes over.
-- Sub-tactics that modify the prover env (`linear-guided`, `oracle`) thread their env changes through `seq`: each sub-tactic builder is invoked with the env produced by the previous one.
+`all` (every open leaf), `frontier` (where the guide diverges from the tree), `leaf(id)` (one prop), `assertion(name)` (all props applying a named assertion).
 
-`loop` rebuilds its `body` on every iteration. That means `loop(seq(spr(3, 4096), bounded-bfs(5, 4096)), 3)` constructs three brand-new `spr` + BFS instances, each with fresh `attempts_remaining` and `pending_steps` refs — the iteration counter is the only state that persists.
-
----
-
-## How `reprove` uses the DSL
-
-The universal `reprove` command:
-
-1. Parses `tactic="…"` (if non-empty) into a `RuTacticBuilder` — a closure `(RuProverEnv) -> (RuProverEnv, RuProverTactic)`.
-2. Constructs the per-theorem prover env with a placeholder tactic.
-3. Calls `builder.build(penv)` to get both the real tactic and an (optionally modified) env back.
-4. Stores the tactic on the env and runs the search.
-
-Atoms that need state from the env (`linear-guided`, `oracle`) close over the result of step 2 inside their builder; atoms that don't (everything else) are produced statically. The combinators (`seq`, `loop`, `limited`) thread builders so env modifications propagate correctly through chains.
-
-The `step_index` (used by `spr` and `linear-guided`) is built lazily — only when the substring `spr` or `linear-guided` appears in the tactic string — because on the full `set` corpus it takes seconds and gigabytes of RAM.
-
-### Default
-
-When `tactic=""` (the default), `reprove` runs `bounded-bfs(max-depth, max-size)` with the values from the command's own `max-depth` / `max-size` args. This makes `reprove` a drop-in replacement for the old `reprove-dumb` command.
-
-### Context flags
-
-These `reprove` arguments enable atoms that need extra data:
-
-| Argument | Effect |
-|----------|--------|
-| `load-ml=1` | Load the per-assertion ML selector → enables `ml`. |
-| `strict-fail=1` | After the run, `ruCrash` if any theorem was not reproved. Used by the CI round-trip test. |
-
-The `step_index` for `spr`/`linear-guided` is detected automatically by substring; nothing else is needed.
+Notes:
+- `seq` delegates `keep_expanding` to its currently-active sub-tactic, and threads env modifications (`linear-guided`, `oracle` close over the previous stage's env).
+- `loop` rebuilds its `body` each iteration, so state-carrying tactics (`spr`'s `attempts_remaining`, etc.) reset — only the iteration counter persists.
 
 ---
 
-## Examples
-
-### Old commands as DSL strings
-
-| Removed command | Equivalent `reprove` invocation |
-|-----------------|--------------------------------|
-| `reprove-dumb` | `reprove tactic="bounded-bfs(5, 4096)"` (or just omit `tactic=`) |
-| `reprove-fragments` | `reprove tactic="spr(3, 4096)"` |
-| `reprove-ml` | `reprove load-ml=1 tactic="ml(5, 7, 10000)"` |
-| `reprove-linear` | `reprove tactic="linear-guided(4096, 3)"` |
-| `reprove-oracle` | `reprove strict-fail=1 tactic="oracle(-1, -1)"` |
-
-### Combined SPR + BFS
-
-The strategy that earlier required Flow-level code (`ruCombinedStrategy`):
-
-```
-reprove
-    target=all
-    max-depth=5
-    max-size=4096
-    attempts=3
-    time-limit=60s
-    tactic="seq(
-        uq(10, 2, 32),
-        loop(
-            seq(
-                spr(3, 4096),
-                bounded-bfs(5, 4096)
-            ),
-            3
-        )
-    )";
-```
-
-### Time-bounded BFS for compression
-
-`limited` is the standard way to attach a budget to any inner tactic:
-
-```
-reprove tactic="limited(bfs, time=5s, size=4096, depth=5, batch=16)"
-```
-
----
-
-## File-based tactics (`.tac`)
+## Derived tactics (`.tac`)
 
 Named *compositions* of the primitives above live as files under the top-level `tactics/` directory, with
 the extension `.tac` — the tactic analogue of `.rus` scripts. A `.tac` file is a metadata comment block
@@ -207,12 +150,71 @@ fixpoint, so a default may reference another arg), and the resulting DSL body is
 expansion happens *before* the `spr`/`linear-guided` step-index decision, so a `.tac` whose body uses them
 still gets the corpus index built. Files are re-read each use (no caching), matching `.rus` scripts.
 
-**Discovery.** `tactic` lists the file tactics under a "File tactics" heading; `tactic name=<x>` prints a
-`.tac` file's `@help` + `@arg` table. Shipped derived tactics: `def-close`, `spr-bfs`, `linear-bfs`.
+> Caveat: a `@defval` value cannot contain spaces (the doc-comment grammar captures one whitespace-
+> delimited token) — keep defaults single-token, e.g. `@defval limited(bfs,size=4096)` (no spaces).
+
+**Discovery.** `tactic` lists the file tactics under a "Derived tactics" heading; `tactic name=<x>` prints a
+`.tac` file's `@help` + `@arg` table; `tactic derived` lists the `derived` category. Shipped derived
+tactics: `def-close`, `spr-bfs`, `linear-bfs`.
 
 To add a composition, drop a new `.tac` file under `tactics/` — no rebuild needed (the body is parsed at
-runtime). Add a new *primitive* in code instead (see below) only when it cannot be expressed as a
-composition.
+runtime). Add a new *primitive* in code instead (see "Adding a new atom") only when it cannot be expressed
+as a composition.
+
+---
+
+## How `reprove` / `prove` use the DSL
+
+The prover commands:
+
+1. Expand any `.tac` reference and parse `tactic="…"` (if non-empty) into a `RuTacticBuilder` — a closure `(RuProverEnv) -> (RuProverEnv, RuProverTactic)`.
+2. Construct the per-theorem prover env with a placeholder tactic.
+3. Call `builder.build(penv)` to get both the real tactic and an (optionally modified) env back.
+4. Store the tactic on the env and run the search.
+
+Atoms that need state from the env (`linear-guided`, `oracle`) close over the result of step 2 inside their builder; the rest are produced statically. The combinators thread builders so env modifications propagate through chains.
+
+The `step_index` (used by `spr` / `linear-guided`) is built lazily — only when the *resolved* tactic source contains `spr` or `linear-guided` — because on the full `set` corpus it takes seconds and gigabytes of RAM. Resolution happens before this check, so a `.tac` whose body uses them still triggers it.
+
+### Default
+
+When `tactic=""` (the default), the prover runs a strict bounded BFS — `limited(bfs, size=max-size, depth=max-depth, batch=16)` — with the values from the command's own `max-depth` / `max-size` args.
+
+### Context flags
+
+| `reprove` argument | Effect |
+|----------|--------|
+| `load-ml=1` | Load the per-assertion ML selector → enables the `ml` atom. |
+| `strict-fail=1` | After the run, `ruCrash` if any theorem was not reproved (CI / regression mode). |
+| `coverage=1` | Measure proof-step coverage from the search tree inline. |
+
+---
+
+## Examples
+
+```
+# strict bounded BFS (the default; explicit form)
+reprove tactic="limited(bfs, size=4096, depth=5, batch=16)"
+
+# sub-proof replay with a BFS fallback — inline, then via the derived tactic
+reprove tactic="loop(seq(limited(spr(3), size=4096), limited(bfs, size=4096, depth=5, batch=16)), 3)"
+reprove tactic="spr-bfs(3)"
+
+# premise-spine replay with a BFS fallback (derived)
+reprove tactic="linear-bfs(attempts=3)"
+
+# ML-ranked beam
+reprove load-ml=1 tactic="limited(ml, batch=5, size=10000, depth=7)"
+
+# drive the search by each theorem's own proof (round-trip test)
+reprove strict-fail=1 tactic="oracle(-1, -1)"
+
+# definitional closure (the Mizar-import workhorse; a derived tactic)
+prove target=all steps=1 tactic="def-close"
+
+# time-bounded BFS for compression
+reprove tactic="limited(bfs, time=5s, size=4096, depth=5, batch=16)"
+```
 
 ---
 
@@ -220,9 +222,9 @@ composition.
 
 The DSL atom registry is the `if/else` chain in `ruBuildTacticFromAst` (in `src/ru/prover/tactics/dsl.flow`). To add a new atom:
 
-1. Pick a name (e.g. `myatom`) and a `ruDslBuildMyAtom(ast, ctx)` helper that returns `Maybe<RuTacticBuilder>`.
-2. In the helper, extract args with `ruDslGetInt` / `ruDslGetDuration` / `ruDslGetTacticBuilder`.
+1. Pick a name (e.g. `myatom`) and a `ruDslBuildMyAtom(ast, ctx)` helper returning `Maybe<RuTacticBuilder>`.
+2. In the helper, extract args with `ruDslGetInt` / `ruDslGetDuration` / `ruDslGetTacticBuilder` (named-or-positional via `ruDslGetArg`).
 3. Build either a static tactic (`ruStaticTacticBuilder(t)`) or, if you need the env, a deferred builder (`RuTacticBuilder(\penv -> Pair(penv, t))`).
-4. Add `else if (n == "myatom") ruDslBuildMyAtom(ast, ctx)` to the dispatch chain.
+4. Add `else if (n == "myatom") ruDslBuildMyAtom(ast, ctx)` to the dispatch chain, and a `ruTacticDocs()` entry so `tactic` documents it. If it should win over a same-named `.tac` file, add it to `ruBuiltinTacticNames`.
 
-If the atom needs ambient data not already in `RuTacticContext`, extend that record (and update the call sites in `reprove.flow` and the other prover commands that build a `RuTacticContext`, e.g. `prove.flow` / `annotate_proof.flow`).
+If the atom needs ambient data not in `RuTacticContext`, extend that record (and the call sites in `reprove.flow` / `prove.flow` / `annotate_proof.flow`). **Prefer a derived `.tac` tactic** (no code, no rebuild) whenever the new tactic is a *composition* of existing primitives.

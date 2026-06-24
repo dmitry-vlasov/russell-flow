@@ -115,15 +115,18 @@ The companion `keep_expanding` predicate is checked **per-prop during parallel b
 
 ### Primitives
 
-The tactic library in [`src/ru/prover/tactics/`](../src/ru/prover/tactics/) contains a flat catalogue of building blocks: breadth-first search (`bfs`, `bounded-bfs`, `top-n-bfs`, `unif-quality`), follow-proof replay (`follow_proof`), corpus-guided fragment lookup (`subproof_replay`, `fragment_replay`), oracle-guided search (`oracle`), ML-guided premise selection (`ml`), and linear-guided search over fragment-backed completions (`linear-guided`).
+The tactic library in [`src/ru/prover/tactics/`](../src/ru/prover/tactics/) is a catalogue of orthogonal *primitives* that compose: the pure breadth-first expander (`bfs`, [`breadth_first.flow`](../src/ru/prover/tactics/breadth_first.flow); bounds come from the `limited` combinator, not separate atoms), corpus-guided sub-proof replay (`spr`, [`subproof_replay.flow`](../src/ru/prover/tactics/subproof_replay.flow)), linear goal→premise spine replay (`linear-guided`), oracle-guided search (`oracle`), ML-ranked expansion (`ml`), positional proof-tree replay (`ap`), follow-proof replay (`follow_proof`), and the goal-refinement set (`refine` over the `strip-forall`/`rel-intro`/`eq-rewrite` refiners) realized soundly through the engine by `replay`. Named *compositions* of these primitives are file-based **derived tactics** (`tactics/*.tac`, e.g. `def-close`, `spr-bfs`, `linear-bfs`). See [tactics-language.md](tactics-language.md) for the full vocabulary (or run `tactic`).
 
 ### Combinators
 
-Three combinators ([`combinators.flow`](../src/ru/prover/tactics/combinators.flow)) compose tactics into larger strategies:
+The combinators ([`combinators.flow`](../src/ru/prover/tactics/combinators.flow)) compose tactics into larger strategies:
 
-- `ruSequenceTactic([t1, t2, …])` — runs each tactic in turn; advances on `Done`, swaps in place on `Switch`.
+- `ruSequenceTactic([t1, t2, …])` — runs each tactic in turn; advances on `Done`, swaps in place on `Switch`. (DSL: `seq`.)
+- `ruOrElseTactic([…])` — lazy alternation: like `seq`, but builds each alternative only when the previous finishes without a proof (so an expensive guide build is skipped when an earlier one closes). (DSL: `or-else`.)
 - `ruIterateTactic(driver)` — calls `driver(tree)` to produce a fresh sub-tactic on every iteration; re-enters when the sub-tactic finishes, which is how SPR properly exhausts its attempts/pending queue.
-- `ruLoopWhileProgressTactic(builder, max_iters)` — rebuilds the inner tactic on each iteration (so state-carrying tactics reset) and re-runs while the proof tree keeps growing.
+- `ruLoopWhileProgressTactic(builder, max_iters)` — rebuilds the inner tactic on each iteration (so state-carrying tactics reset) and re-runs while the proof tree keeps growing. (DSL: `loop`.)
+- `ruLimitedTactic(t, time, …, size, depth, batch)` — the single strict limiter: wall-clock / size-delta / depth caps, with `batch` pacing that keeps a size cap strict. (DSL: `limited`.)
+- plus `scoped` / `focus` / `track` (candidate-rule and sub-frontier restriction).
 
 A `ruLimitedTactic(inner, time, applied, produced)` wrapper attaches per-tactic budget limits.
 
@@ -163,15 +166,15 @@ The prover is split between the engine (in [`src/ru/prover/core/`](../src/ru/pro
 
 | File | Role |
 |------|------|
-| `src/ru/prover/tactics/breadth_first.flow` | BFS and its bounded / top-N / unif-quality variants |
+| `src/ru/prover/tactics/breadth_first.flow` | Pure breadth-first frontier expander (`bfs`); bounds come from `limited`, not separate atoms |
 | `src/ru/prover/tactics/follow_proof.flow` | Replay a known proof sub-tree |
-| `src/ru/prover/tactics/linear_guided.flow` | Fragment-completion linear search |
+| `src/ru/prover/tactics/linear_guided.flow` | Linear goal→premise spine replay |
 | `src/ru/prover/tactics/subproof_replay.flow` | Corpus-guided proof-step replay (SPR) |
-| `src/ru/prover/tactics/fragment_replay.flow` | Corpus-guided fragment replay |
 | `src/ru/prover/tactics/oracle.flow` | Oracle-guided reprover; overrides `penv.fns` on init |
-| `src/ru/prover/tactics/combinators.flow` | `seq`, `iterate`, `loop`, `limited` |
-| `src/ru/prover/tactics/combined.flow` | Convenience composition of unif-quality + SPR + BFS |
-| `src/ru/prover/tactics/dsl.flow` | Parser and builder for the [tactics DSL](tactics-language.md) |
+| `src/ru/prover/tactics/refiners.flow` | Goal refiners (`strip-forall`/`rel-intro`/`eq-rewrite`) composed by `refine` |
+| `src/ru/prover/tactics/combinators.flow` | `seq`, `or-else`, `iterate`, `loop`, `limited`, `scoped`, `focus`, `track` |
+| `src/ru/prover/tactics/dsl.flow` | Parser, builder, and `.tac` resolution for the [tactics DSL](tactics-language.md) |
+| `src/ru/prover/tactics/tac_file.flow` | Loader for file-based derived tactics (`tactics/*.tac`) |
 
 ### Key types
 

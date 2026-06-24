@@ -219,7 +219,7 @@ Common `reprove` arguments:
 
 | Argument | Default | Effect |
 |----------|---------|--------|
-| `tactic` | `""` (bounded-bfs) | Tactic DSL expression. See [tactics-language.md](tactics-language.md). |
+| `tactic` | `""` (strict bounded BFS = `limited(bfs, size=max-size, depth=max-depth, batch=16)`) | Tactic DSL expression or a `.tac` derived-tactic reference. See [tactics-language.md](tactics-language.md). |
 | `max-depth`, `max-size` | `5`, `4096` | Bounds for the default tactic. |
 | `time-limit` | `60s` | Per-theorem wall-clock limit. |
 | `job-time-limit` | `""` | Total wall-clock cap (default: `n*time-limit/p`). |

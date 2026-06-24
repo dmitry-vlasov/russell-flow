@@ -14,6 +14,7 @@ The implementation is written in [Flow9](https://github.com/area9innovation/flow
 | [Scripting Language](docs/scripting-language.md) | Built-in scripting language for automating operations on theorem bases |
 | [Metamath Translation](docs/metamath-translation.md) | Translating between Metamath (`.mm`) and Russell (`.ru`) formats |
 | [Proof Search Algorithm](docs/proof-search-algorithm.md) | Backward-chaining proof search, Proof Variant Trees, oracle-guided reproof |
+| [Tactics Language](docs/tactics-language.md) | The tactic DSL (atoms + combinators) and file-based derived tactics (`.tac`) that drive proof search |
 | [Unification Algorithms](docs/unification-algorithms.md) | Trie-indexed matching, multi-index unification, substitution composition |
 | [Unilambda](docs/unilambda.md) | Bidirectional, non-deterministic language on the Russell kernel: `eval` (verify) and `uneval` (narrowing/proof search) |
 | [Algorithm Paper](docs/proof_search_algo.pdf) | Theoretical basis: "Proof Search Algorithm in Pure Logical Framework" |
@@ -120,6 +121,9 @@ russellj reprove/oracle afile=set-50000
 # Optimize a theorem base (shorten proofs, minimize hypotheses)
 russellj refactor/optimize
 
+# List the available proof tactics (atoms, combinators, derived .tac tactics)
+russellj tactic
+
 # Run an arbitrary script
 russellj scripts/translate/mm2ru.rus afile=set-100000
 ```
@@ -159,6 +163,8 @@ bin/            Executable scripts (russellj, russell_lsp, etc.)
 docs/           Documentation
 resources/      VSCode extension
 scripts/        .rus automation scripts (mm2ru, optimize, reprove, etc.)
+tactics/        .tac derived tactics — named, documented compositions of prover
+                primitives (def-close, spr-bfs, linear-bfs), referenced by name
 src/            Flow9 source code
   ru/           Russell language implementation
   mm/           Metamath parser and translator
