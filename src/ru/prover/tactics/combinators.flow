@@ -24,15 +24,23 @@ export {
 	//   time_limit     — wall-clock cutoff (ms; 0 disables)
 	//   applied_limit  — number of step invocations
 	//   produced_limit — total leafs emitted by the inner tactic
-	//   size_limit     — GLOBAL tree-size cap; useful as a safety net when
-	//                    the inner tactic uses delta-based budgets and you
-	//                    still want a hard ceiling on the overall PVT
+	//   size_limit     — cap on nodes ADDED since this tactic started (a delta, snapshotted on the first
+	//                    step; 0 disables). Delta (not absolute) so a size-capped tactic re-run inside a
+	//                    loop gets its full budget each pass — what `bounded-bfs` relies on.
+	//   depth_limit    — max tree depth from the root (absolute; 0 disables)
+	//   batch          — pace the inner tactic's expansion to at most this many leafs per round
+	//                    (0 = pass the whole frontier through). A non-zero batch is what keeps a
+	//                    size cap STRICT: the engine expands a round's batch concurrently, so capping
+	//                    the batch bounds the per-round overshoot. `bounded-bfs(md,ms)` is exactly
+	//                    `limited(bfs, size=ms, depth=md, batch=ruSearchBatch)`.
 	ruLimitedTactic(
 		inner          : RuProverTactic,
 		time_limit     : double,
 		applied_limit  : int,
 		produced_limit : int,
-		size_limit     : int
+		size_limit     : int,
+		depth_limit    : int,
+		batch          : int
 	) -> RuProverTactic;
 
 	// Force `tag` onto `inner` and every successor it switches into, so the
@@ -188,27 +196,37 @@ ruLimitedTactic(
 	time_limit     : double,
 	applied_limit  : int,
 	produced_limit : int,
-	size_limit     : int
+	size_limit     : int,
+	depth_limit    : int,
+	batch          : int
 ) -> RuProverTactic {
 	applied  : ref int = ref 0;
 	produced : ref int = ref 0;
+	initial_size : ref int = ref (-1);
 	timer = ruMakeLimitedTimer(time_limit);
-	over_limit = \tree : RuProverTree ->
+	over_limit = \tree : RuProverTree -> {
+		cur = ruProverTreeSize(tree);
+		if (^initial_size < 0) initial_size := cur;   // snapshot at the tactic's first step → delta base
 		(time_limit > 0.0 && ruTimeIsOver(timer)) ||
 		(applied_limit > 0 && ^applied > applied_limit) ||
 		(produced_limit > 0 && ^produced > produced_limit) ||
-		(size_limit > 0 && ruProverTreeSize(tree) > size_limit);
-	RuProverTactic("limited(" + inner.toString + ", time=" + d2s(time_limit) + ", applied=" + i2s(applied_limit) + ", produced=" + i2s(produced_limit) + ", size=" + i2s(size_limit) + ")", inner.tag,
+		(size_limit > 0 && (cur - ^initial_size) > size_limit) ||   // DELTA: nodes ADDED since the tactic started
+		(depth_limit > 0 && ruProverTreeDepth(tree) > depth_limit)
+	};
+	RuProverTactic("limited(" + inner.toString + ", time=" + d2s(time_limit) + ", applied=" + i2s(applied_limit) + ", produced=" + i2s(produced_limit) + ", size=" + i2s(size_limit) + ", depth=" + i2s(depth_limit) + ", batch=" + i2s(batch) + ")", inner.tag,
 		\tree -> {
 			if (over_limit(tree)) RuTacticDone()
 			else {
 				applied := ^applied + 1;
 				switch (inner.step(tree)) {
 					RuTacticDone(): RuTacticDone();
-					RuTacticSwitch(next): RuTacticSwitch(ruLimitedTactic(next, time_limit, applied_limit, produced_limit, size_limit));
+					RuTacticSwitch(next): RuTacticSwitch(ruLimitedTactic(next, time_limit, applied_limit, produced_limit, size_limit, depth_limit, batch));
 					RuTacticExpand(leafs): {
-						produced := ^produced + length(leafs);
-						RuTacticExpand(leafs);
+						// pace to `batch` leafs/round (the rest stay in tree.leafs, re-offered) so a size cap
+						// stays strict — the engine expands a round's batch concurrently. batch=0 = whole frontier.
+						paced = if (batch > 0) take(leafs, batch) else leafs;
+						produced := ^produced + length(paced);
+						RuTacticExpand(paced);
 					}
 				}
 			}
