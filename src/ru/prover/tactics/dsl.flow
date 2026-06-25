@@ -9,6 +9,7 @@ import ru/prover/tactics/combinators;
 import ru/prover/tactics/focus;
 import ru/prover/tactics/follow_proof;
 import ru/prover/tactics/kalmar;
+import ru/prover/tactics/hilbert;
 import ru/prover/tactics/unfold;
 import ru/prover/tactics/equalizer;
 import ru/prover/tactics/refiners;
@@ -458,6 +459,7 @@ ruTacticDocs() -> [RuTacticDoc] {
 			"Score every open leaf with the loaded ML models (feature / medoid / LGG / k-NN) and expand the frontier in best-first order. The pure ML-ranked expander, unbounded on its own — wrap in `limited` for the usual bounded top-k beam:\n  limited(ml, batch=k, size=N, depth=D)\nNeeds an ML selector in context (load-ml=1 / learn-assertions). (`apply` was removed: write `scoped(a1, …, ak, <search>)`.)"),
 		dp("atoms", "ap(a, child, ...)",            "replay a positional proof tree: assertion `a` applied at the goal, each child proving a premise in order", [p("a", "the assertion applied at this node"), p("child ...", "each child: a nested ap(...) or `prem` (a premise discharged by a hyp / prior step)")]),
 		d ("atoms", "kalmar-closer",                "propositional closer: unfold membership atoms + Kalmar certificate [PRUNE-CANDIDATE]"),
+		d ("atoms", "checker",                      "Mizar-style refutation closer: unfold membership atoms + fresh Hilbert certificate (hilbert.flow)"),
 		dp("atoms", "linear-guided(attempts)", "guide search by linear goal->premise chains from the corpus (unbounded; wrap in limited)", [p("attempts", "how many goal->premise chains to try")]),
 		dp("atoms", "follow-proof(theorem)",        "replay a named theorem's stored proof tree (diagnostic)", [p("theorem", "name of the theorem whose stored proof tree to replay")]),
 		dp("atoms", "oracle(max-true-props, ...)",  "drive search by the theorem's own proof tree (oracle stubs map proof nodes onto prover props)", [p("max-true-props", "oracle-mapped props expanded per iteration (negative = unlimited)"), p("max-false-props", "non-oracle-mapped leaves expanded per iteration (negative = unlimited)"), p("max-variants", "assertion-unification variants offered: the oracle's + N fallbacks (negative = oracle only)"), p("max-proofs", "premise-proof variants offered: the oracle's + N fallbacks (negative = oracle only)")]),
@@ -593,6 +595,7 @@ ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTactic
 	// (scoped's scope is the leading positional names, the last positional is any search tactic).
 	else if (n == "ap")              ruTagBuilder("ap", ruDslBuildAp(ast, ctx))
 	else if (n == "kalmar-closer")   ruTagBuilder("kalmar-closer", ruDslBuildKalmarCloser(ast, ctx))
+	else if (n == "checker")         ruTagBuilder("checker", ruDslBuildCheckerCloser(ast, ctx))
 	else if (n == "replay")          ruDslBuildRealizer(ast, ctx, "replay", ruReplayRealize)
 	else if (n == "linear-guided")   ruTagBuilder("linear-guided", ruDslBuildLinearGuided(ast, ctx))
 	else if (n == "follow-proof")    ruTagBuilder("follow-proof", ruDslBuildFollowProof(ast, ctx))
@@ -657,6 +660,37 @@ ruDslBuildKalmarCloser(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTact
 		// recovers the installed proof tree. ruDoneTactic when goal' is not a propositional consequence.
 		clo = RuEqCloser(task.info, ruCheckerPropScope(), 60000.0,
 			\prems, g -> either(ruKalmarTactic(conn, wff, goalStmt.class, prems, g, 1000000), ruDoneTactic));
+		tactic = switch (ruEqualizerPropTactic(RuEnvMath(ctx.math, ctx.env), conn, wff, goalStmt.class, hypExps, goalExp, clo)) {
+			Some(t): t;
+			None():  ruDoneTactic;
+		};
+		Pair(penv, tactic);
+	}))
+}
+
+// The propositional CHECKER (`checker`): the Mizar-style refutation closer. Same equalizer unfold-with-
+// proof front-end as kalmar-closer (membership unfold + congruence), but the residual `hyps ⊢ goal'` is
+// discharged by the FRESH Kalmár-free Hilbert certificate emitter (hilbert.flow) — a deduction-form proof
+// over the rich propositional library, verified by construction. A no-op (ruDoneTactic) when goal' is not
+// a propositional consequence, so it composes in seq(...) after structural refiners (e.g. strip-forall).
+ruDslBuildCheckerCloser(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+	Some(RuTacticBuilder(\penv -> {
+		task     = penv.conf.task;
+		goalStmt = task.goal.stmt;
+		goalExp  = ruExp(goalStmt.exps[0]);
+		hypExps  = map(task.premises, \p -> ruExp(p.stmt.exps[0]));
+		conn     = ruPConnectives();
+		wff      = tp2id_("wff");
+		// Residual closer = the Hilbert certificate for the concrete (premises ⊢ goal'); installs the proof
+		// (no search). ruDoneTactic when goal' is a hyp or not a propositional consequence.
+		clo = RuEqCloser(task.info, ruCheckerPropScope(), 60000.0,
+			\prems, g -> switch (ruHilbertCertificate(conn, wff, goalStmt.class, prems, g)) {
+				Some(tree): switch (tree) {
+					RuProofStep(__, __, __): ruInstallProofTactic(RuProof(ruEmptyVarsDisjs, ruMakeLinearProof(tree), -1));
+					RuProofHyp(__, __):      ruDoneTactic;   // goal' is a hypothesis — the engine closes it
+				};
+				None(): ruDoneTactic;
+			});
 		tactic = switch (ruEqualizerPropTactic(RuEnvMath(ctx.math, ctx.env), conn, wff, goalStmt.class, hypExps, goalExp, clo)) {
 			Some(t): t;
 			None():  ruDoneTactic;
@@ -1162,7 +1196,7 @@ ruParseAndBuildTactic(src : string, ctx : RuTacticContext) -> Maybe<RuTacticBuil
 // above. Used to decide whether a tactic= head is a built-in (→ inline) or a candidate .tac file ref:
 // a built-in always wins over a same-named file.
 ruBuiltinTacticNames() -> [string] {
-	["bfs", "done", "giveup", "spr", "fragment-replay", "ml", "ap", "kalmar-closer", "replay",
+	["bfs", "done", "giveup", "spr", "fragment-replay", "ml", "ap", "kalmar-closer", "checker", "replay",
 	 "linear-guided", "follow-proof", "oracle", "seq", "or-else", "loop", "limited", "focus", "track", "scoped"]
 }
 ruIsBuiltinTacticName(n : string) -> bool { exists(ruBuiltinTacticNames(), \b -> b == n) }
