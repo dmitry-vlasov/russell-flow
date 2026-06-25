@@ -8,6 +8,14 @@ from `$RUSSELL_MATH`, so you never pass `math=`.
 
 ## Permanent scripts
 
+- `pipeline.rus` — **one-shot**: translate + prove + verify for ONE article in a
+  single launch (skips the manual phase (b); a command-level tactic proves every
+  gap). This is the easiest way to reproduce the whole pipeline:
+    `russellj no-server=1 mem=16g translate/mizar/pipeline article=xboole_1`
+  Requires `mizar/miz_set.ru`, the article's already-translated deps in `mizar/`,
+  and the analyzed `MML/mml/<article>.{xml,atr,eth}`. Default tactic is
+  `def-close-checker` (the A-map auto-prover incl. the Kalmár-free checker). The
+  per-article result = the article's theorems absent from the `not proved:` list.
 - `regen_foundation.rus` — rebuild `mizar/miz_set.ru` from the set.mm library
   (run from `$RUSSELL_MATH/set/`).
 - `translate.rus` — (phase a) Mizar article → A-map skeleton `mizar/<module>.ru`
@@ -17,8 +25,20 @@ from `$RUSSELL_MATH`, so you never pass `math=`.
 - `translate_flat.rus` — legacy: translate against the FLAT `miz_logic` foundation
   (pre-A-map). Kept for comparison.
 
+The three explicit phases (translate → manual phase (b) edit → prove) are still
+available separately; `pipeline.rus` just chains (a) and (c) for convenience.
 Phase (b) — adding an inline tactic to each `?` step — is a manual edit of the
 `.ru` file (no script).
+
+## Dependency order
+
+An article translates against its already-translated deps, so translate in
+dependency order, e.g.:
+```
+for a in tarski xboole_0 xboole_1; do
+  russellj no-server=1 mem=16g translate/mizar/pipeline article=$a
+done
+```
 
 ## Analysis tools
 
