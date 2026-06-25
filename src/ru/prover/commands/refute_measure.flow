@@ -1,27 +1,58 @@
 import ru/prover/tactics/refute;
-import ru/prover/tactics/equalizer;   // ruStripForall
-import ru/util/math;                  // ruMathFromSources
-import ru/util/exp;                   // ruExp
+import ru/prover/tactics/hilbert;
+import ru/prover/tactics/propositional;   // ruPAtoms
+import ru/prover/tactics/equalizer;       // ruStripForall
+import ru/proof_tree;                      // ruMakeLinearProof
+import ru/verify/theorem;                  // ruVerifyTheorem / ruIsVerified
+import ru/util/math;                       // ruMathFromSources
+import ru/util/exp;                        // ruExp, ruIdType2Type
 import comm;
 
-// PHASE 1 measurement (project_mizar_proving_stats): for each theorem of `module` in the loaded base,
-// decide `hyps |- prop` with the refutation decider (ruRefuteEntails) and report which it would close.
-// Read-only oracle measure — NO proofs produced — to estimate the ceiling of the Mizar-style checker
-// before building certificate extraction. Usage: read miz_set + the article, then
-//   refute-gaps module=xboole_1
+// PHASE 1/2 measurement (project_mizar_proving_stats): for each theorem of `module` in the loaded base,
+//   refuted = the refutation decider (ruRefuteEntails) accepts it,
+//   derived = the G3cp sequent prover (ruRefuteDerive) finds a derivation (must equal refuted),
+//   proved  = the deduction-form Hilbert emitter (ruHilbertProve) builds a proof of the propositional
+//             core that VERIFIES (ruVerifyTheorem) — i.e. a genuine, replay-able certificate.
+// Read miz_set + the article, then:  refute-gaps module=xboole_1
 export {
 	ruCommRefuteGaps : RuComm;
 }
 
+RuRfStats(refuted : [string], derived : [string], invalid : [string], proved : [string]);
+
 ruCommRefuteGaps = RuComm(
 	RuCommInfo(
 		"refute-gaps", "prover",
-		"PHASE-1 oracle: count theorems of module=<m> the refutation decider would close (no proofs)",
+		"PHASE 1/2 oracle: of module=<m>, count theorems refuted / G3cp-derived / Hilbert-proved+verified",
 		"module", false, false,
 		[RuCommArg("module", true, "article suffix, e.g. xboole_1 (matches theorem names *_<module>)", "")], []
 	),
 	ruRunRefuteGaps
 );
+
+// Build the propositional core as a self-contained wff-variable theorem and try to verify a Hilbert proof.
+// `wff`/`stmtClass` are the real loaded ids (derived from the theorem in the caller).
+ruRefuteProve(hypForms : [RuPForm], goalForm : RuPForm, wff : int, stmtClass : int, math : RuMath, env : RuEnv, name : string) -> bool {
+	atoms = set2array(fold(hypForms, ruPAtoms(goalForm), \acc, h -> mergeSets(acc, ruPAtoms(h))));
+	// each distinct atom -> a fresh wff variable (the core is a pure propositional schema).
+	atomVar = foldi(atoms, makeTree(), \i, acc, a -> setTree(acc, a, s2id("vh" + i2s(i))));
+	atomNodes = foldTree(atomVar, makeTree(), \a, vid, acc -> setTree(acc, a, [RuVar(vid, wff)]));
+	ctx = ruHCtx(wff, stmtClass, atomNodes);
+	switch (ruHilbertProve(ctx, hypForms, goalForm)) {
+		None(): false;
+		Some(tree): {
+			varsTree = foldTree(atomVar, makeTree(), \__, vid, acc -> setTree(acc, vid, RuVar(vid, wff)));
+			hyps  = mapi(hypForms, \i, h -> RuHyp(i, ruHStmt(ctx, h), -1));
+			infer = RuInference(RuVarsDisjs(varsTree, makeSet()), hyps, ruHStmt(ctx, goalForm));
+			th = RuTheorem(
+				RuDeclInfo(s2id("htest_" + name), -1, [], -1),
+				infer, makeSet(),
+				RuProof(ruEmptyVarsDisjs, ruMakeLinearProof(tree), -1)
+			);
+			ruIsVerified(ruVerifyTheorem(th, math, env));
+		}
+	}
+}
 
 ruRunRefuteGaps(unit : RuUnit) -> Maybe<RuState> {
 	env    = ruUnitEnv(unit);
@@ -29,31 +60,38 @@ ruRunRefuteGaps(unit : RuUnit) -> Maybe<RuState> {
 	module = ruTaskStringArg(unit.task, "module", "");
 	math   = ruMathFromSources(state.ru, env);
 	suffix = "_" + module;
-	// (refuted-by-decider, derived-by-sequent-prover, derivation-invalid) per theorem of the module.
-	acc0 = Triple([], [], []);
-	res = foldTree(math.decls.assertions, acc0, \id, ass, acc -> switch (ass) {
+	res = foldTree(math.decls.assertions, RuRfStats([], [], [], []), \id, ass, acc -> switch (ass) {
 		RuTheorem(info, infer, __, __): {
 			name = id2s(info.id);
 			if (!endsWith(name, suffix)) acc
 			else {
 				hyps = map(infer.hyps, \h -> ruExp(h.stmt.exps[0]));
-				goal = ruStripForall(ruExp(infer.prop.exps[0])).first;
-				refuted = if (ruRefuteEntails(hyps, goal)) concat(acc.first, [name]) else acc.first;
+				propExp = ruExp(infer.prop.exps[0]);
+				goal = ruStripForall(propExp).first;
+				// wff type + turnstile class from the real loaded math (NOT the memoized id helpers).
+				wff = if (propExp.nodes == []) -1 else switch (propExp.nodes[0]) { RuRuleNode(it, __): ruIdType2Type(it); RuVar(__, t): t; };
+				stmtClass = infer.prop.class;
+				isRef   = ruRefuteEntails(hyps, goal);
+				refuted = if (isRef) concat(acc.refuted, [name]) else acc.refuted;
+				forms   = ruRefuteForms(hyps, goal);
+				// only attempt a certificate for VALID (refuted) goals — the emitter can't prove the rest.
+				proved  = if (isRef && ruRefuteProve(forms.first, forms.second, wff, stmtClass, math, env, name)) concat(acc.proved, [name]) else acc.proved;
 				switch (ruRefuteDerive(hyps, goal)) {
-					None(): Triple(refuted, acc.second, acc.third);
-					Some(deriv): Triple(refuted, concat(acc.second, [name]),
-						if (ruPDerivValid(deriv)) acc.third else concat(acc.third, [name]));
+					None(): RuRfStats(refuted, acc.derived, acc.invalid, proved);
+					Some(deriv): RuRfStats(refuted, concat(acc.derived, [name]),
+						if (ruPDerivValid(deriv)) acc.invalid else concat(acc.invalid, [name]), proved);
 				}
 			}
 		}
 		default: acc;
 	});
 	env.out.println("REFUTE-GAPS module=" + module
-		+ " refuted=" + i2s(length(res.first))
-		+ " derived=" + i2s(length(res.second))
-		+ " invalid-derivation=" + i2s(length(res.third)));
-	env.out.println("  refuted: " + strGlue(sort(res.first), ", "));
-	env.out.println("  derived: " + strGlue(sort(res.second), ", "));
-	if (res.third != []) env.out.println("  INVALID: " + strGlue(sort(res.third), ", "));
+		+ " refuted=" + i2s(length(res.refuted))
+		+ " derived=" + i2s(length(res.derived))
+		+ " invalid-derivation=" + i2s(length(res.invalid))
+		+ " proved=" + i2s(length(res.proved)));
+	env.out.println("  proved: " + strGlue(sort(res.proved), ", "));
+	missing = filter(res.refuted, \r -> !contains(res.proved, r));
+	env.out.println("  refuted-but-not-proved: " + strGlue(sort(missing), ", "));
 	Some(state);
 }

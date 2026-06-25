@@ -1,0 +1,304 @@
+import ru/prover/tactics/propositional;
+import ru/proof_tree;
+
+// PHASE 2, step 2 of the fresh (Kalmár-free) certificate generator (project_mizar_proving_stats).
+// A deduction-form Hilbert proof EMITTER over the propositional core: given `hyps |- goal` (as RuPForms
+// whose atoms realize to real wff via `atomNodes`), it BUILDS an RuProofTree applying the foundation's
+// rich propositional library. NOT a truth-table construction — it is goal-directed natural deduction in
+// the standard set.mm deduction form `(W -> phi)` (W = the conjunction of introduced assumptions):
+//   * forward saturation : ∧-elim (simpld/simprd) + modus ponens when the antecedent is already known
+//   * backward structural: ∧R (jca), →R (ex / deduction theorem), ∨R (orcd/olcd)
+//   * refutation clash   : a context proving both A and ¬A discharges ANY goal (pm2.21 ∘ syl/mpd)
+//   * bounded →L         : prove a missing antecedent, then mpd, retry
+// Best-effort + ALWAYS sound: every node is a real lemma application, so the caller verifies the result
+// (ruVerifyTheorem) — incompleteness only loses coverage, never soundness. Lemma schemas are exact
+// (ax-mp, jca, simpl/simpr/simpld/simprd, ex, adantr, a1i, id, orc/olc/orcd/olcd, mpd, syl, pm2.21,
+// pm3.2i — see the recon in the commit msg / project memory).
+
+export {
+	RuHCtx(conn : RuPConnectives, wff : int, stmtClass : int, atomNodes : Tree<string, [RuExpNode]>);
+	// `wff` (the wff type id) and `stmtClass` (the |- turnstile id) MUST come from the loaded math — derive
+	// them from a real expression (ruIdType2Type of a connective node / the prop's class), never from the
+	// memoized ruIdWff/ruIdTurnstile helpers (they cache -1 if interned before the library loads).
+	ruHCtx(wff : int, stmtClass : int, atomNodes : Tree<string, [RuExpNode]>) -> RuHCtx;
+	// A deduction-form Hilbert proof of `hyps |- goal`, or None if the emitter can't build one.
+	ruHilbertProve(ctx : RuHCtx, hyps : [RuPForm], goal : RuPForm) -> Maybe<RuProofTree>;
+	// Realize a propositional form as a statement `|- f` (for building the hyps/conclusion of a test theorem).
+	ruHStmt(ctx : RuHCtx, f : RuPForm) -> RuStmt;
+}
+
+// a proof fragment: `tree` proves `|- und(curAmb, content)` for the ambient in force at its creation.
+RuHF(content : RuPForm, tree : RuProofTree);
+
+ruHCtx(wff : int, stmtClass : int, atomNodes : Tree<string, [RuExpNode]>) -> RuHCtx {
+	RuHCtx(ruPConnectives(), wff, stmtClass, atomNodes);
+}
+
+// ---- RuPForm -> RuExp / RuStmt (own copy; mirrors the kalmar pattern, no kalmar dependency) ----
+ruHForm2Nodes(ctx : RuHCtx, f : RuPForm) -> [RuExpNode] {
+	bin = \rule, a, b -> {
+		an = ruHForm2Nodes(ctx, a);
+		bn = ruHForm2Nodes(ctx, b);
+		concat([ruMakeRuleNode(rule, ctx.wff, 2, length(an) + length(bn))], concat(an, bn));
+	};
+	switch (f) {
+		RuPAtom(k):   lookupTreeDef(ctx.atomNodes, k, []);
+		RuPNot(a): { an = ruHForm2Nodes(ctx, a); concat([ruMakeRuleNode(ctx.conn.wn, ctx.wff, 1, length(an))], an); }
+		RuPImp(a, b): bin(ctx.conn.wi, a, b);
+		RuPIff(a, b): bin(ctx.conn.wb, a, b);
+		RuPAnd(a, b): bin(ctx.conn.wa, a, b);
+		RuPOr(a, b):  bin(ctx.conn.wo, a, b);
+		// NB: ruPConnectives stores wtru/wfal as the SYMBOLS (⊤ / F.), not the rule names — the nullary
+		// wff constants are built by the rules `wtru` / `wfal`, so use those ids here.
+		RuPTrue():    [ruMakeRuleNode(s2id_("wtru"), ctx.wff, 0, 0)];
+		RuPFalse():   [ruMakeRuleNode(s2id_("wfal"), ctx.wff, 0, 0)];
+	}
+}
+ruHStmt(ctx : RuHCtx, f : RuPForm) -> RuStmt { RuStmt(ctx.stmtClass, [RuExp(ruHForm2Nodes(ctx, f), -1)], -1); }
+// a single proof node: lemma `name` applied to `kids`, concluding `|- concl`.
+ruHStep(ctx : RuHCtx, name : string, kids : [RuProofTree], concl : RuPForm) -> RuProofTree {
+	RuProofStep(s2id_(name), kids, ruHStmt(ctx, concl));
+}
+ruHUnd(amb : Maybe<RuPForm>, f : RuPForm) -> RuPForm { switch (amb) { None(): f; Some(w): RuPImp(w, f); } }
+
+// ---- forward saturation ----------------------------------------------------
+ruHFind(facts : [RuHF], f : RuPForm) -> Maybe<RuHF> { find(facts, \fc -> fc.content == f); }
+
+// one derivation pass: ∧-elim on every conjunction fact + MP on every implication fact whose antecedent is known.
+ruHForward(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF]) -> [RuHF] {
+	concatA(map(facts, \f ->
+		switch (f.content) {
+			RuPAnd(a, b): [ruHConjElim(ctx, amb, f, a, b, true), ruHConjElim(ctx, amb, f, a, b, false)];
+			RuPIff(a, b): [ruHIffElim(ctx, amb, f, a, b, true), ruHIffElim(ctx, amb, f, a, b, false)];
+			RuPImp(a, b): switch (ruHCheapProve(ctx, amb, facts, a)) { Some(fa): [ruHModus(ctx, amb, fa, f, a, b)]; None(): []; };
+			RuPNot(a): switch (a) { RuPNot(x): [ruHNotNot(ctx, amb, f, x)]; default: []; };  // ¬¬x ⊢ x
+			default: [];
+		}
+	));
+}
+// from a fact proving (A∧B), extract A (left) or B (right).
+ruHConjElim(ctx : RuHCtx, amb : Maybe<RuPForm>, f : RuHF, a : RuPForm, b : RuPForm, left : bool) -> RuHF {
+	tgt = if (left) a else b;
+	switch (amb) {
+		None():  RuHF(tgt, ruHStep(ctx, "ax-mp", [f.tree, ruHStep(ctx, if (left) "simpl" else "simpr", [], RuPImp(RuPAnd(a, b), tgt))], tgt));
+		Some(w): RuHF(tgt, ruHStep(ctx, if (left) "simpld" else "simprd", [f.tree], RuPImp(w, tgt)));
+	}
+}
+// from a fact proving (A↔B), extract (A→B) (fwd) or (B→A).
+ruHIffElim(ctx : RuHCtx, amb : Maybe<RuPForm>, f : RuHF, a : RuPForm, b : RuPForm, fwd : bool) -> RuHF {
+	tgt = if (fwd) RuPImp(a, b) else RuPImp(b, a);
+	switch (amb) {
+		None():  RuHF(tgt, ruHStep(ctx, "ax-mp", [f.tree, ruHStep(ctx, if (fwd) "biimp" else "biimpr", [], RuPImp(RuPIff(a, b), tgt))], tgt));
+		Some(w): RuHF(tgt, ruHStep(ctx, if (fwd) "biimpd" else "biimprd", [f.tree], RuPImp(w, tgt)));
+	}
+}
+// from facts proving A and (A→B), derive B.
+ruHModus(ctx : RuHCtx, amb : Maybe<RuPForm>, fa : RuHF, fimp : RuHF, a : RuPForm, b : RuPForm) -> RuHF {
+	switch (amb) {
+		None():  RuHF(b, ruHStep(ctx, "ax-mp", [fa.tree, fimp.tree], b));
+		Some(w): RuHF(b, ruHStep(ctx, "mpd", [fa.tree, fimp.tree], RuPImp(w, b)));  // (W→A),(W→(A→B)) ⊢ (W→B)
+	}
+}
+// cheap (non-recursive) antecedent derivation: a is a known fact, or a disjunction with a known disjunct
+// (∨-intro), or a conjunction of knowns (∧-intro). Lets saturation FIRE an implication fact `(a→b)` whose
+// antecedent isn't literally present (e.g. derive `p∨q` from `p` to apply `((p∨q)→r)`). No recursion.
+ruHCheapProve(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], a : RuPForm) -> Maybe<RuHF> {
+	switch (ruHFind(facts, a)) {
+		Some(f): Some(f);
+		None(): switch (a) {
+			RuPOr(x, y): switch (ruHFind(facts, x)) {
+				Some(fx): Some(ruHOrIntro(ctx, amb, fx, x, y, true));
+				None(): switch (ruHFind(facts, y)) { Some(fy): Some(ruHOrIntro(ctx, amb, fy, x, y, false)); None(): None(); };
+			};
+			RuPAnd(x, y): switch (ruHFind(facts, x)) {
+				Some(fx): switch (ruHFind(facts, y)) { Some(fy): Some(ruHAndIntro(ctx, amb, fx, fy, x, y)); None(): None(); };
+				None(): None();
+			};
+			default: None();
+		};
+	}
+}
+ruHOrIntro(ctx : RuHCtx, amb : Maybe<RuPForm>, fx : RuHF, x : RuPForm, y : RuPForm, left : bool) -> RuHF {
+	disj = RuPOr(x, y);
+	switch (amb) {
+		None():  RuHF(disj, ruHStep(ctx, "ax-mp", [fx.tree, ruHStep(ctx, if (left) "orc" else "olc", [], RuPImp(if (left) x else y, disj))], disj));
+		Some(w): RuHF(disj, ruHStep(ctx, if (left) "orcd" else "olcd", [fx.tree], RuPImp(w, disj)));
+	}
+}
+ruHAndIntro(ctx : RuHCtx, amb : Maybe<RuPForm>, fx : RuHF, fy : RuHF, x : RuPForm, y : RuPForm) -> RuHF {
+	conj = RuPAnd(x, y);
+	switch (amb) {
+		None():  RuHF(conj, ruHStep(ctx, "pm3.2i", [fx.tree, fy.tree], conj));
+		Some(w): RuHF(conj, ruHStep(ctx, "jca", [fx.tree, fy.tree], RuPImp(w, conj)));
+	}
+}
+// from a fact proving ¬¬x, derive x (notnotr).
+ruHNotNot(ctx : RuHCtx, amb : Maybe<RuPForm>, f : RuHF, x : RuPForm) -> RuHF {
+	nnr = ruHStep(ctx, "notnotr", [], RuPImp(RuPNot(RuPNot(x)), x));   // (¬¬x → x), closed
+	switch (amb) {
+		None():  RuHF(x, ruHStep(ctx, "ax-mp", [f.tree, nnr], x));
+		Some(w): RuHF(x, ruHStep(ctx, "syl", [f.tree, nnr], RuPImp(w, x)));  // (W→¬¬x),(¬¬x→x) ⊢ (W→x)
+	}
+}
+ruHSaturate(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], rounds : int) -> [RuHF] {
+	if (rounds <= 0) facts
+	else {
+		derived = ruHForward(ctx, amb, facts);
+		fresh   = filter(derived, \d -> !exists(facts, \f -> f.content == d.content));
+		if (fresh == []) facts else ruHSaturate(ctx, amb, concat(facts, fresh), rounds - 1);
+	}
+}
+
+// ---- refutation clash: a contradictory context proves anything ----
+ruHFindContra(facts : [RuHF]) -> Maybe<RuPForm> {
+	fold(facts, None(), \acc, f -> switch (acc) { Some(__): acc; None():
+		switch (f.content) { RuPNot(a): if (ruHFind(facts, a) != None()) Some(a) else None(); default: None(); }; });
+}
+ruHExFalso(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], a : RuPForm, goal : RuPForm) -> RuHF {
+	fa  = either(ruHFind(facts, a), RuHF(a, ruNoProofTree)).tree;
+	fna = either(ruHFind(facts, RuPNot(a)), RuHF(RuPNot(a), ruNoProofTree)).tree;
+	pm  = ruHStep(ctx, "pm2.21", [], RuPImp(RuPNot(a), RuPImp(a, goal)));   // (¬A→(A→goal)), closed
+	switch (amb) {
+		None(): {
+			impAG = ruHStep(ctx, "ax-mp", [fna, pm], RuPImp(a, goal));       // (A→goal)
+			RuHF(goal, ruHStep(ctx, "ax-mp", [fa, impAG], goal));
+		}
+		Some(w): {
+			sylr = ruHStep(ctx, "syl", [fna, pm], RuPImp(w, RuPImp(a, goal)));  // (W→(A→goal))
+			RuHF(goal, ruHStep(ctx, "mpd", [fa, sylr], RuPImp(w, goal)));        // (W→goal)
+		}
+	}
+}
+
+// ⊥ in context proves any goal, via falim (F. → goal).
+ruHFalsum(ctx : RuHCtx, amb : Maybe<RuPForm>, fbot : RuHF, goal : RuPForm) -> RuHF {
+	fal = ruHStep(ctx, "falim", [], RuPImp(RuPFalse(), goal));   // (F. → goal), closed
+	switch (amb) {
+		None():  RuHF(goal, ruHStep(ctx, "ax-mp", [fbot.tree, fal], goal));
+		Some(w): RuHF(goal, ruHStep(ctx, "syl", [fbot.tree, fal], RuPImp(w, goal)));  // (W→F.),(F.→goal) ⊢ (W→goal)
+	}
+}
+
+// ---- the prover ------------------------------------------------------------
+ruHProve(ctx : RuHCtx, amb : Maybe<RuPForm>, facts0 : [RuHF], goal : RuPForm, fuel : int) -> Maybe<RuHF> {
+	if (fuel <= 0) None()
+	else {
+		facts = ruHSaturate(ctx, amb, facts0, 8);
+		direct = ruHFind(facts, goal);
+		bot    = ruHFind(facts, RuPFalse());
+		contra = ruHFindContra(facts);
+		if (direct != None()) direct
+		else if (bot != None()) maybeMap(bot, \fbot -> ruHFalsum(ctx, amb, fbot, goal))  // ⊥ ⊢ anything (falim)
+		else if (contra != None()) maybeMap(contra, \a -> ruHExFalso(ctx, amb, facts, a, goal))
+		else {
+			structural = switch (goal) {
+				RuPAnd(a, b): ruHAndR(ctx, amb, facts, a, b, fuel);
+				RuPImp(a, b): ruHImpR(ctx, amb, facts, a, b, fuel);
+				RuPOr(a, b):  ruHOrR(ctx, amb, facts, a, b, fuel);
+				RuPIff(a, b): ruHIffR(ctx, amb, facts, a, b, fuel);
+				default:      None();
+			};
+			// backward chaining (ruHImpL) is OFF for now — saturation + structural + clash cover the
+			// bulk; the recursive goal-retry risks exponential blow-up. Re-enable bounded if needed.
+			switch (structural) { Some(r): Some(r); None(): None(); };
+		}
+	}
+}
+ruHAndR(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], a : RuPForm, b : RuPForm, fuel : int) -> Maybe<RuHF> {
+	switch (ruHProve(ctx, amb, facts, a, fuel - 1)) { None(): None(); Some(pa):
+		switch (ruHProve(ctx, amb, facts, b, fuel - 1)) { None(): None(); Some(pb): {
+			conj = RuPAnd(a, b);
+			Some(switch (amb) {
+				None():  RuHF(conj, ruHStep(ctx, "pm3.2i", [pa.tree, pb.tree], conj));
+				Some(w): RuHF(conj, ruHStep(ctx, "jca", [pa.tree, pb.tree], RuPImp(w, conj)));
+			});
+		}; };
+	};
+}
+ruHImpR(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], a : RuPForm, b : RuPForm, fuel : int) -> Maybe<RuHF> {
+	imp = RuPImp(a, b);
+	switch (amb) {
+		None(): {
+			// introduce A: lift every fact `|- f` to `(A→f)` (a1i), add `(A→A)` (id), prove B under Some(A).
+			lifted = map(facts, \f -> RuHF(f.content, ruHStep(ctx, "a1i", [f.tree], RuPImp(a, f.content))));
+			facts2 = concat(lifted, [RuHF(a, ruHStep(ctx, "id", [], RuPImp(a, a)))]);
+			maybeMap(ruHProve(ctx, Some(a), facts2, b, fuel - 1), \pb -> RuHF(imp, pb.tree));  // pb proves (A→B)
+		}
+		Some(w): {
+			neww = RuPAnd(w, a);
+			lifted = map(facts, \f -> RuHF(f.content, ruHStep(ctx, "adantr", [f.tree], RuPImp(neww, f.content))));
+			facts2 = concat(lifted, [RuHF(a, ruHStep(ctx, "simpr", [], RuPImp(neww, a)))]);
+			maybeMap(ruHProve(ctx, Some(neww), facts2, b, fuel - 1),
+				\pb -> RuHF(imp, ruHStep(ctx, "ex", [pb.tree], RuPImp(w, imp))));  // ((W∧A)→B) ⊢ (W→(A→B))
+		}
+	}
+}
+ruHOrR(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], a : RuPForm, b : RuPForm, fuel : int) -> Maybe<RuHF> {
+	disj = RuPOr(a, b);
+	tryDisj = \side, x, lemmaD, lemma0 -> maybeMap(ruHProve(ctx, amb, facts, x, fuel - 1), \px ->
+		switch (amb) {
+			None():  RuHF(disj, ruHStep(ctx, "ax-mp", [px.tree, ruHStep(ctx, lemma0, [], RuPImp(x, disj))], disj));
+			Some(w): RuHF(disj, ruHStep(ctx, lemmaD, [px.tree], RuPImp(w, disj)));
+		});
+	switch (tryDisj(true, a, "orcd", "orc")) { Some(r): Some(r); None(): tryDisj(false, b, "olcd", "olc"); };
+}
+ruHIffR(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], a : RuPForm, b : RuPForm, fuel : int) -> Maybe<RuHF> {
+	switch (ruHProve(ctx, amb, facts, RuPImp(a, b), fuel - 1)) { None(): None(); Some(pab):
+		switch (ruHProve(ctx, amb, facts, RuPImp(b, a), fuel - 1)) { None(): None(); Some(pba): {
+			iff = RuPIff(a, b);
+			Some(switch (amb) {
+				None():  RuHF(iff, ruHStep(ctx, "impbii", [pab.tree, pba.tree], iff));
+				Some(w): RuHF(iff, ruHStep(ctx, "impbid", [pab.tree, pba.tree], RuPImp(w, iff)));
+			});
+		}; };
+	};
+}
+// backward chaining: find an implication fact whose antecedent we can prove, derive its consequent, retry.
+ruHImpL(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], goal : RuPForm, fuel : int) -> Maybe<RuHF> {
+	imps = filter(facts, \f -> switch (f.content) { RuPImp(__, b): ruHFind(facts, b) == None(); default: false; });
+	fold(imps, None(), \acc, f -> switch (acc) { Some(__): acc; None():
+		switch (f.content) { RuPImp(a, b):
+			switch (ruHProve(ctx, amb, facts, a, fuel - 1)) {
+				None(): None();
+				Some(pa): {
+					fb = ruHModus(ctx, amb, pa, f, a, b);
+					ruHProve(ctx, amb, concat(facts, [fb]), goal, fuel - 1);
+				}
+			};
+			default: None();
+		};
+	});
+}
+
+// Refutation (Mizar's method): assume ¬goal, saturate the context to a contradiction (A and ¬A both
+// derived), then conclude goal via pm2.65i (⊢ ¬¬goal) and notnotr (¬¬goal → goal). Handles the negation-
+// wrapped goals the translator emits (`A implies B` ⇒ `¬(A ∧ ¬B)`), which the direct prover rejects.
+ruHRefute(ctx : RuHCtx, hypFacts : [RuHF], goal : RuPForm) -> Maybe<RuProofTree> {
+	ng = RuPNot(goal);
+	lifted = map(hypFacts, \f -> RuHF(f.content, ruHStep(ctx, "a1i", [f.tree], RuPImp(ng, f.content))));
+	facts = concat(lifted, [RuHF(ng, ruHStep(ctx, "id", [], RuPImp(ng, ng)))]);
+	sat = ruHSaturate(ctx, Some(ng), facts, 16);
+	// the clash: a complementary pair (φ, ¬φ) where ¬φ is a saturated fact and φ is provable in context.
+	// φ may be a literal already present, or an implication we must derive (e.g. ¬(p→r) clashes with the
+	// derivable (p→r)). Build ¬¬goal via pm2.65i, then goal via notnotr.
+	mkClash = \fphiTree, fnphiTree, phi -> {
+		nng = ruHStep(ctx, "pm2.65i", [fphiTree, fnphiTree], RuPNot(ng));   // (ng→φ),(ng→¬φ) ⊢ ¬ng = ¬¬goal
+		ruHStep(ctx, "ax-mp", [nng, ruHStep(ctx, "notnotr", [], RuPImp(RuPNot(ng), goal))], goal);
+	};
+	negs = filtermap(sat, \f -> switch (f.content) { RuPNot(phi): Some(Pair(phi, f.tree)); default: None(); });
+	fold(negs, None(), \acc, np -> switch (acc) { Some(__): acc; None(): {
+		phi = np.first;
+		switch (ruHProve(ctx, Some(ng), sat, phi, 32)) {     // try to derive φ (structurally) → clash with ¬φ
+			Some(fphi): Some(mkClash(fphi.tree, np.second, phi));
+			None(): None();
+		}
+	}; });
+}
+
+ruHilbertProve(ctx : RuHCtx, hyps : [RuPForm], goal : RuPForm) -> Maybe<RuProofTree> {
+	hypFacts = mapi(hyps, \i, h -> RuHF(h, RuProofHyp(i, ruHStmt(ctx, h))));
+	switch (ruHProve(ctx, None(), hypFacts, goal, 48)) {
+		Some(r): Some(r.tree);
+		None():  ruHRefute(ctx, hypFacts, goal);
+	}
+}
