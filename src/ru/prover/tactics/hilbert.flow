@@ -182,6 +182,37 @@ ruHMembGoal(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], key : string, fu
 	}
 }
 
+// deneg: a Mizar implication arrives NEGATION-wrapped as `¬(A∧¬B)` (or `¬(A∧X)`); convert it to the
+// implication `A→B` (iman) / `A→¬X` (imnan) and prove THAT — the emitter's direct →R + ⊆/=/∈ bridge path
+// (which already closes implication-form goals like t10/t18) handles it, where the bare ¬-goal would only
+// reach the weaker refutation/case-split path. Nested `¬(A∧(B∧¬C))` peels one layer → `A→¬(B∧¬C)` → recurse.
+ruHDeneg(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], inner : RuPForm, fuel : int) -> Maybe<RuHF> {
+	switch (inner) {
+		RuPAnd(a, b): {
+			di = switch (b) { RuPNot(c): Pair(RuPImp(a, c), "iman"); default: Pair(RuPImp(a, RuPNot(b)), "imnan"); };
+			impForm = di.first; goal = RuPNot(inner);
+			maybeMap(ruHProve(ctx, amb, facts, impForm, fuel - 1), \pi -> {
+				iff = ruHStep(ctx, di.second, [], RuPIff(impForm, goal));   // (A→…) ↔ ¬(A∧…)
+				switch (amb) {
+					None():  RuHF(goal, ruHStep(ctx, "mpbi", [pi.tree, iff], goal));
+					Some(w): RuHF(goal, ruHStep(ctx, "sylib", [pi.tree, iff], RuPImp(w, goal)));
+				};
+			});
+		}
+		default: None();
+	}
+}
+
+// e∈∅ is false (noel: ¬(A∈∅)) — derive ¬(e∈∅) so the contradiction-closure discharges the goal.
+ruHNoel(ctx : RuHCtx, amb : Maybe<RuPForm>, key : string) -> RuHF {
+	notAtom = RuPNot(RuPAtom(key));
+	noelInst = ruHStep(ctx, "noel", [], notAtom);   // closed ¬(e∈∅)
+	switch (amb) {
+		None():  RuHF(notAtom, noelInst);
+		Some(w): RuHF(notAtom, ruHStep(ctx, "a1i", [noelInst], RuPImp(w, notAtom)));   // |-¬(e∈∅) ⊢ (W→¬(e∈∅))
+	}
+}
+
 // ---- forward saturation ----------------------------------------------------
 ruHFind(facts : [RuHF], f : RuPForm) -> Maybe<RuHF> { find(facts, \fc -> fc.content == f); }
 
@@ -198,7 +229,7 @@ ruHForward(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF]) -> [RuHF] {
 			RuPAtom(k): {
 				ea = ruHAtomExp(ctx, k); h = ruEqHead(ea);
 				if (h == ruHwss() && witnesses != []) ruHRelInst(ctx, amb, f, k, witnesses)
-				else if (h == ruHwcel()) { ar = ruEqArgs(ea); switch (ruHMembUnfold(ctx, ar.first, ar.second)) { Some(p): [ruHMembFact(ctx, amb, f, k, p.first, p.second)]; None(): []; }; }
+				else if (h == ruHwcel()) { ar = ruEqArgs(ea); if (ruEqHead(ar.second) == s2id_("c0")) [ruHNoel(ctx, amb, k)] else switch (ruHMembUnfold(ctx, ar.first, ar.second)) { Some(p): [ruHMembFact(ctx, amb, f, k, p.first, p.second)]; None(): []; }; }
 				else [];
 			};
 			default: [];
@@ -327,6 +358,7 @@ ruHProve(ctx : RuHCtx, amb : Maybe<RuPForm>, facts0 : [RuHF], goal : RuPForm, fu
 				RuPIff(a, b): ruHIffR(ctx, amb, facts, a, b, fuel);
 				RuPAtom(k):   if (ruEqHead(ruHAtomExp(ctx, k)) == ruHwcel()) ruHMembGoal(ctx, amb, facts, k, fuel)  // e∈compound → unfold
 				              else ruHRelGoal(ctx, amb, facts, k, fuel);  // ⊆/= goal → membership (ssriv/ssrdv); else None
+				RuPNot(inner): ruHDeneg(ctx, amb, facts, inner, fuel);  // ¬(A∧¬B) → A→B (iman) so it takes the implication path
 				default:      None();
 			};
 			// last resort: classical case-split (bounded by ctx.splitBudget). Backward chaining (ruHImpL)
