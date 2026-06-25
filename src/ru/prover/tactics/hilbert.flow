@@ -140,6 +140,48 @@ ruHRelGoal(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], key : string, fue
 	}
 }
 
+// ---- ∈-over-operation unfold (the bridge introduces fresh-witness `v∈(compound)` the equalizer front-
+// end never sees; unfold it here to the boolean / ⊆ / = core the emitter handles). Both directions of the
+// el-lemma ↔: fact `v∈S` → RHS (mpbi/sylib); goal `v∈S` → prove RHS then LHS (mpbir/sylibr). ---------
+ruHUnaryArg(set : RuExp) -> RuExp { RuExp(tail(set.nodes), -1); }   // operand of a unary head (𝒫A, {A})
+ruHRegAtom(ctx : RuHCtx, ex : RuExp) -> RuPForm {                   // register an expr's nodes, atomize
+	ctx.atomNodes := mergeTree(^(ctx.atomNodes), ruPAtomNodes(ctx.conn, ex));
+	ruPAtomize(ctx.conn, ex);
+}
+// element `e` (class) ∈ a COMPOUND `set` → (unfolded RHS form, el-lemma name). None for a base set.
+ruHMembUnfold(ctx : RuHCtx, e : RuExp, set : RuExp) -> Maybe<Pair<RuPForm, string>> {
+	h = ruEqHead(set);
+	memb = \x -> ruHRegAtom(ctx, ruHMkExp(ruHwcel(), ctx.wff, [e, x]));
+	if (h == s2id_("cun"))       { a = ruEqArgs(set); Some(Pair(RuPOr(memb(a.first), memb(a.second)), "elun")); }
+	else if (h == s2id_("cin"))  { a = ruEqArgs(set); Some(Pair(RuPAnd(memb(a.first), memb(a.second)), "elin")); }
+	else if (h == s2id_("cdif")) { a = ruEqArgs(set); Some(Pair(RuPAnd(memb(a.first), RuPNot(memb(a.second))), "eldif")); }
+	else if (h == s2id_("cpw"))  Some(Pair(ruHRegAtom(ctx, ruHMkExp(ruHwss(), ctx.wff, [e, ruHUnaryArg(set)])), "velpw"))   // e⊆A
+	else if (h == s2id_("csn"))  Some(Pair(ruHRegAtom(ctx, ruHMkExp(ruHwceq(), ctx.wff, [e, ruHUnaryArg(set)])), "velsn"))  // e=A
+	else None();
+}
+// from a fact `e∈S` derive its unfold RHS via the el-lemma iff (mpbi bare / sylib in deduction form).
+ruHMembFact(ctx : RuHCtx, amb : Maybe<RuPForm>, f : RuHF, key : string, rhs : RuPForm, lemma : string) -> RuHF {
+	iff = ruHStep(ctx, lemma, [], RuPIff(RuPAtom(key), rhs));
+	switch (amb) {
+		None():  RuHF(rhs, ruHStep(ctx, "mpbi", [f.tree, iff], rhs));
+		Some(w): RuHF(rhs, ruHStep(ctx, "sylib", [f.tree, iff], RuPImp(w, rhs)));
+	}
+}
+// prove a GOAL `e∈S` (compound) by proving its unfold RHS, then mpbir/sylibr back to `e∈S`.
+ruHMembGoal(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], key : string, fuel : int) -> Maybe<RuHF> {
+	ea = ruHAtomExp(ctx, key); args = ruEqArgs(ea);
+	switch (ruHMembUnfold(ctx, args.first, args.second)) {
+		None(): None();
+		Some(p): maybeMap(ruHProve(ctx, amb, facts, p.first, fuel - 1), \sub -> {
+			iff = ruHStep(ctx, p.second, [], RuPIff(RuPAtom(key), p.first));
+			switch (amb) {
+				None():  RuHF(RuPAtom(key), ruHStep(ctx, "mpbir", [sub.tree, iff], RuPAtom(key)));
+				Some(w): RuHF(RuPAtom(key), ruHStep(ctx, "sylibr", [sub.tree, iff], RuPImp(w, RuPAtom(key))));
+			};
+		});
+	}
+}
+
 // ---- forward saturation ----------------------------------------------------
 ruHFind(facts : [RuHF], f : RuPForm) -> Maybe<RuHF> { find(facts, \fc -> fc.content == f); }
 
@@ -153,7 +195,12 @@ ruHForward(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF]) -> [RuHF] {
 			RuPIff(a, b): [ruHIffElim(ctx, amb, f, a, b, true), ruHIffElim(ctx, amb, f, a, b, false)];
 			RuPImp(a, b): switch (ruHCheapProve(ctx, amb, facts, a)) { Some(fa): [ruHModus(ctx, amb, fa, f, a, b)]; None(): []; };
 			RuPNot(a): switch (a) { RuPNot(x): [ruHNotNot(ctx, amb, f, x)]; default: []; };  // ¬¬x ⊢ x
-			RuPAtom(k): if (witnesses != [] && ruEqHead(ruHAtomExp(ctx, k)) == ruHwss()) ruHRelInst(ctx, amb, f, k, witnesses) else [];
+			RuPAtom(k): {
+				ea = ruHAtomExp(ctx, k); h = ruEqHead(ea);
+				if (h == ruHwss() && witnesses != []) ruHRelInst(ctx, amb, f, k, witnesses)
+				else if (h == ruHwcel()) { ar = ruEqArgs(ea); switch (ruHMembUnfold(ctx, ar.first, ar.second)) { Some(p): [ruHMembFact(ctx, amb, f, k, p.first, p.second)]; None(): []; }; }
+				else [];
+			};
 			default: [];
 		}
 	));
@@ -278,7 +325,8 @@ ruHProve(ctx : RuHCtx, amb : Maybe<RuPForm>, facts0 : [RuHF], goal : RuPForm, fu
 				RuPImp(a, b): ruHImpR(ctx, amb, facts, a, b, fuel);
 				RuPOr(a, b):  ruHOrR(ctx, amb, facts, a, b, fuel);
 				RuPIff(a, b): ruHIffR(ctx, amb, facts, a, b, fuel);
-				RuPAtom(k):   ruHRelGoal(ctx, amb, facts, k, fuel);  // ⊆/= goal → membership (ssriv/ssrdv); else None
+				RuPAtom(k):   if (ruEqHead(ruHAtomExp(ctx, k)) == ruHwcel()) ruHMembGoal(ctx, amb, facts, k, fuel)  // e∈compound → unfold
+				              else ruHRelGoal(ctx, amb, facts, k, fuel);  // ⊆/= goal → membership (ssriv/ssrdv); else None
 				default:      None();
 			};
 			// last resort: classical case-split (bounded by ctx.splitBudget). Backward chaining (ruHImpL)
