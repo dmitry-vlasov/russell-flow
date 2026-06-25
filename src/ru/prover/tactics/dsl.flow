@@ -677,29 +677,25 @@ ruDslBuildCheckerCloser(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTac
 	Some(RuTacticBuilder(\penv -> {
 		task     = penv.conf.task;
 		goalStmt = task.goal.stmt;
-		goalExp  = ruExp(goalStmt.exps[0]);
+		stmtClass = goalStmt.class;
+		sp       = ruStripForall(ruExp(goalStmt.exps[0]));   // peel ∀ (re-quantified by ax-gen below)
+		body     = sp.first;
 		hypExps  = map(task.premises, \p -> ruExp(p.stmt.exps[0]));
 		conn     = ruPConnectives();
 		wff      = tp2id_("wff");
 		em       = RuEnvMath(ctx.math, ctx.env);
-		install  = \pr : Pair<RuProofTree, RuVarsDisjs> -> ruInstallProofTactic(RuProof(pr.second, ruMakeLinearProof(pr.first), -1));
-		// FIRST run the Hilbert emitter DIRECTLY on the goal: its refutation + deneg + ⊆/=/∈ bridge handle
-		// the negation-wrapped goals (`¬(H∧¬G)`) the equalizer front-end does NOT pass through to its closer
-		// (why ¬-form ⊆-transitivity like t1 didn't transfer). Fall back to the equalizer path otherwise.
-		direct = switch (ruHilbertCertificate(em, conn, wff, goalStmt.class, hypExps, goalExp)) {
-			Some(pr): switch (pr.first) { RuProofStep(__, __, __): Some(install(pr)); RuProofHyp(__, __): None(); };
-			None(): None();
-		};
-		tactic = switch (direct) {
-			Some(t): t;
-			None(): {
-				clo = RuEqCloser(task.info, ruCheckerPropScope(), 60000.0,
-					\prems, g -> switch (ruHilbertCertificate(em, conn, wff, goalStmt.class, prems, g)) {
-						Some(pr): switch (pr.first) { RuProofStep(__, __, __): install(pr); RuProofHyp(__, __): ruDoneTactic; };
-						None(): ruDoneTactic;
-					});
-				switch (ruEqualizerPropTactic(em, conn, wff, goalStmt.class, hypExps, goalExp, clo)) { Some(t): t; None(): ruDoneTactic; };
+		// STANDALONE INSTALL tactic (not a search/replay closer): strip ∀, prove the body with the Hilbert
+		// emitter (refutation + deneg + ⊆/=/∈ bridge + membership unfold), re-quantify with ax-gen, and
+		// INSTALL the proof directly. Direct install (not replay(refine(closer=…))) is essential: the replay
+		// realizer re-derives via the engine and can't reconstruct the emitter's ssrdv/deneg steps, losing
+		// the ¬-form ⊆-transitivity class (t1 etc.). prove.flow re-verifies installed proofs, so it stays sound.
+		axgen = \tree -> fold(sp.second, tree, \acc, lvl -> RuProofStep(s2id_("ax-gen"), [acc], RuStmt(stmtClass, [lvl], -1)));
+		tactic = switch (ruHilbertCertificate(em, conn, wff, stmtClass, hypExps, body)) {
+			Some(pr): switch (pr.first) {
+				RuProofStep(__, __, __): ruInstallProofTactic(RuProof(pr.second, ruMakeLinearProof(axgen(pr.first)), -1));
+				RuProofHyp(__, __):      ruDoneTactic;   // body IS a hypothesis — the engine closes it
 			};
+			None(): ruDoneTactic;
 		};
 		Pair(penv, tactic);
 	}))
