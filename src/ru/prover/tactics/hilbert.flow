@@ -382,7 +382,13 @@ ruHProve(ctx : RuHCtx, amb : Maybe<RuPForm>, facts0 : [RuHF], goal : RuPForm, fu
 			};
 			// last resort: classical case-split (bounded by ctx.splitBudget). Backward chaining (ruHImpL)
 			// stays removed — cheap antecedent derivation in saturation covers the ∨ cases.
-			switch (structural) { Some(r): Some(r); None(): ruHCaseSplit(ctx, amb, facts, goal, fuel); };
+			switch (structural) {
+				Some(r): Some(r);
+				None(): switch (ruHDisjElim(ctx, amb, facts, goal, fuel)) {   // ∨-elim on a disjunction FACT (jaoi/mpjaodan)
+					Some(r): Some(r);
+					None(): ruHCaseSplit(ctx, amb, facts, goal, fuel);
+				};
+			};
 		}
 	}
 }
@@ -434,6 +440,51 @@ ruHIffR(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], a : RuPForm, b : RuP
 			});
 		}; };
 	};
+}
+// prove `goal` assuming `a`; the returned tree proves `(a→goal)` (amb None) / `((W∧a)→goal)` (amb Some).
+// (the disjunction-elim branches; same lifting as ruHImpR but the conclusion is `goal`, not an implication.)
+ruHProveUnder(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], a : RuPForm, goal : RuPForm, fuel : int) -> Maybe<RuHF> {
+	switch (amb) {
+		None(): {
+			lifted = map(facts, \f -> RuHF(f.content, ruHStep(ctx, "a1i", [f.tree], RuPImp(a, f.content))));
+			facts2 = concat(lifted, [RuHF(a, ruHStep(ctx, "id", [], RuPImp(a, a)))]);
+			ruHProve(ctx, Some(a), facts2, goal, fuel);   // proves (a→goal)
+		}
+		Some(w): {
+			neww = RuPAnd(w, a);
+			lifted = map(facts, \f -> RuHF(f.content, ruHStep(ctx, "adantr", [f.tree], RuPImp(neww, f.content))));
+			facts2 = concat(lifted, [RuHF(a, ruHStep(ctx, "simpr", [], RuPImp(neww, a)))]);
+			ruHProve(ctx, Some(neww), facts2, goal, fuel);   // proves ((W∧a)→goal)
+		}
+	}
+}
+// ∨-elimination on a disjunction FACT `A∨B`: prove the goal under A and under B, combine (jaoi / mpjaodan).
+// The disjunction is dropped in the branches (subsumed by the assumed disjunct) so it can't re-split forever.
+ruHDisjElim(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], goal : RuPForm, fuel : int) -> Maybe<RuHF> {
+	if (fuel <= 0 || ^(ctx.splitBudget) <= 0) None()   // bounded by the shared budget — branches re-saturate (exponential)
+	else {
+		dj = find(facts, \f -> switch (f.content) { RuPOr(__, __): true; default: false; });
+		switch (dj) {
+			None(): None();
+			Some(df): switch (df.content) {
+				RuPOr(a, b): {
+					ctx.splitBudget := ^(ctx.splitBudget) - 1;
+					rest = filter(facts, \f -> f.content != df.content);
+					switch (ruHProveUnder(ctx, amb, rest, a, goal, fuel - 1)) {
+						None(): None();
+						Some(pa): switch (ruHProveUnder(ctx, amb, rest, b, goal, fuel - 1)) {
+							None(): None();
+							Some(pb): Some(switch (amb) {
+								None():  RuHF(goal, ruHStep(ctx, "ax-mp", [df.tree, ruHStep(ctx, "jaoi", [pa.tree, pb.tree], RuPImp(RuPOr(a, b), goal))], goal));
+								Some(w): RuHF(goal, ruHStep(ctx, "mpjaodan", [pa.tree, pb.tree, df.tree], RuPImp(w, goal)));
+							});
+						};
+					};
+				}
+				default: None();
+			};
+		}
+	}
 }
 // classical case-split (pm2.61): pick an undecided atom p, prove the goal under p and under ¬p, combine.
 // The completing rule for classical propositional logic; bounded by ctx.splitBudget (shared, total).
