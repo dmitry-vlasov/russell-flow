@@ -1,4 +1,6 @@
 import ru/prover/tactics/propositional;
+import ru/prover/tactics/equalizer;   // ruEqualizerRelSubgoal (fresh-setvar membership subgoal + DV)
+import ru/prover/tactics/unfold;      // RuEnvMath
 import ru/proof_tree;
 
 // PHASE 2, step 2 of the fresh (Kalmár-free) certificate generator (project_mizar_proving_stats).
@@ -16,35 +18,42 @@ import ru/proof_tree;
 // pm3.2i — see the recon in the commit msg / project memory).
 
 export {
-	// splitBudget: a shared TOTAL budget for classical case-splits (pm2.61) across the whole proof — a ref
-	// so every ctx copy shares it (bounds the 2^n blow-up without threading a per-call counter).
-	RuHCtx(conn : RuPConnectives, wff : int, stmtClass : int, atomNodes : Tree<string, [RuExpNode]>, splitBudget : ref int);
+	// State that the FIRST-ORDER ⊆/= handling mutates as it proves (refs are shared across all ctx copies):
+	//   atomNodes  — grows as ssrdv/sseld introduce fresh-witness membership atoms (key → real nodes)
+	//   splitBudget — total classical case-split budget (bounds pm2.61 2^n blow-up)
+	//   disjs/freshVars — the disjoint-variable provisos + fresh setvars the ssrdv steps require; the caller
+	//     MUST fold these into the installed RuProof.vars, else verification fails on a DV violation
+	//   em — RuEnvMath, for ruEqualizerRelSubgoal (the ⊆/= goal reduction's fresh-var + DV machinery)
+	RuHCtx(conn : RuPConnectives, wff : int, stmtClass : int, atomNodes : ref Tree<string, [RuExpNode]>,
+		splitBudget : ref int, disjs : ref Set<RuDisj>, freshVars : ref [RuVar], em : RuEnvMath);
 	// `wff` (the wff type id) and `stmtClass` (the |- turnstile id) MUST come from the loaded math — derive
 	// them from a real expression (ruIdType2Type of a connective node / the prop's class), never from the
 	// memoized ruIdWff/ruIdTurnstile helpers (they cache -1 if interned before the library loads).
-	ruHCtx(wff : int, stmtClass : int, atomNodes : Tree<string, [RuExpNode]>) -> RuHCtx;
+	ruHCtx(em : RuEnvMath, wff : int, stmtClass : int, atomNodes : Tree<string, [RuExpNode]>) -> RuHCtx;
 	// A deduction-form Hilbert proof of `hyps |- goal`, or None if the emitter can't build one.
 	ruHilbertProve(ctx : RuHCtx, hyps : [RuPForm], goal : RuPForm) -> Maybe<RuProofTree>;
 	// Realize a propositional form as a statement `|- f` (for building the hyps/conclusion of a test theorem).
 	ruHStmt(ctx : RuHCtx, f : RuPForm) -> RuStmt;
-	// Build a certificate for an ALREADY-membership-level residual `hyps |- goal` (the equalizer's output):
-	// atomize over the real subexpr nodes (so atoms realize to actual expressions) and run the emitter.
-	// This is the equalizer's RuEqCloser slot — the goal-aware residual closer that closes real gaps.
-	ruHilbertCertificate(conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp) -> Maybe<RuProofTree>;
+	// Build a certificate for a residual `hyps |- goal` (the equalizer's output): atomize over the real
+	// subexpr nodes (atoms realize to actual expressions) and run the emitter. Returns the proof TREE plus
+	// the RuVarsDisjs (fresh setvars + DV provisos) the caller must attach to the installed RuProof.
+	ruHilbertCertificate(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp) -> Maybe<Pair<RuProofTree, RuVarsDisjs>>;
 }
 
-ruHilbertCertificate(conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp) -> Maybe<RuProofTree> {
+ruHilbertCertificate(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp) -> Maybe<Pair<RuProofTree, RuVarsDisjs>> {
 	atomNodes = fold(hyps, ruPAtomNodes(conn, goal), \acc, h -> mergeTree(acc, ruPAtomNodes(conn, h)));
 	hypForms  = map(hyps, \h -> ruPAtomize(conn, h));
 	goalForm  = ruPAtomize(conn, goal);
-	ruHilbertProve(RuHCtx(conn, wff, stmtClass, atomNodes, ref 6), hypForms, goalForm);
+	ctx = ruHCtx(em, wff, stmtClass, atomNodes);
+	maybeMap(ruHilbertProve(ctx, hypForms, goalForm), \tree ->
+		Pair(tree, RuVarsDisjs(fold(^(ctx.freshVars), makeTree(), \acc, v -> setTree(acc, v.id, v)), ^(ctx.disjs))));
 }
 
 // a proof fragment: `tree` proves `|- und(curAmb, content)` for the ambient in force at its creation.
 RuHF(content : RuPForm, tree : RuProofTree);
 
-ruHCtx(wff : int, stmtClass : int, atomNodes : Tree<string, [RuExpNode]>) -> RuHCtx {
-	RuHCtx(ruPConnectives(), wff, stmtClass, atomNodes, ref 6);
+ruHCtx(em : RuEnvMath, wff : int, stmtClass : int, atomNodes : Tree<string, [RuExpNode]>) -> RuHCtx {
+	RuHCtx(ruPConnectives(), wff, stmtClass, ref atomNodes, ref 6, ref makeSet(), ref [], em);
 }
 
 // ---- RuPForm -> RuExp / RuStmt (own copy; mirrors the kalmar pattern, no kalmar dependency) ----
@@ -55,7 +64,7 @@ ruHForm2Nodes(ctx : RuHCtx, f : RuPForm) -> [RuExpNode] {
 		concat([ruMakeRuleNode(rule, ctx.wff, 2, length(an) + length(bn))], concat(an, bn));
 	};
 	switch (f) {
-		RuPAtom(k):   lookupTreeDef(ctx.atomNodes, k, []);
+		RuPAtom(k):   lookupTreeDef(^(ctx.atomNodes), k, []);
 		RuPNot(a): { an = ruHForm2Nodes(ctx, a); concat([ruMakeRuleNode(ctx.conn.wn, ctx.wff, 1, length(an))], an); }
 		RuPImp(a, b): bin(ctx.conn.wi, a, b);
 		RuPIff(a, b): bin(ctx.conn.wb, a, b);
@@ -74,17 +83,77 @@ ruHStep(ctx : RuHCtx, name : string, kids : [RuProofTree], concl : RuPForm) -> R
 }
 ruHUnd(amb : Maybe<RuPForm>, f : RuPForm) -> RuPForm { switch (amb) { None(): f; Some(w): RuPImp(w, f); } }
 
+// ---- FIRST-ORDER ⊆/= bridge (ssrdv/ssriv goal reduction + sseld/ssel fact instantiation) -----------
+// The membership unfold WITH PROOF: a ⊆ GOAL `A⊆B` reduces to a fresh-witness membership subgoal
+// `(v∈A→v∈B)` (ssriv bare / ssrdv in deduction form), and a ⊆ FACT `A⊆B` instantiates to `(e∈A→e∈B)`
+// at each witness e in scope (ssel bare / sseld in deduction form). This is what transfers the emitter's
+// propositional power onto real ⊆/=-structured gaps — the conclusion's quantifier is handled by ssrdv's
+// ∀-intro (fresh v + DV via ruEqualizerRelSubgoal), the hyps' by sseld's ∀-inst.
+ruHwss() -> int { s2id_("wss"); }
+ruHwceq() -> int { s2id_("wceq"); }
+ruHwcel() -> int { s2id_("wcel"); }
+// the RuExp realized for atom `key` (its real subexpression nodes).
+ruHAtomExp(ctx : RuHCtx, key : string) -> RuExp { RuExp(lookupTreeDef(^(ctx.atomNodes), key, []), -1); }
+// build an n-ary rule application expression.
+ruHMkExp(rule : int, typ : int, args : [RuExp]) -> RuExp {
+	an = concatA(map(args, \a -> a.nodes));
+	RuExp(concat([ruMakeRuleNode(rule, typ, length(args), length(an))], an), -1);
+}
+// the element exprs (CLASS, already coerced) of the membership-atom facts — the witnesses for sseld.
+ruHWitnesses(ctx : RuHCtx, facts : [RuHF]) -> [RuExp] {
+	filtermap(facts, \f -> switch (f.content) {
+		RuPAtom(k): { e = ruHAtomExp(ctx, k); if (ruEqHead(e) == ruHwcel()) Some(ruEqArgs(e).first) else None(); };
+		default: None();
+	});
+}
+// instantiate a ⊆ FACT `A⊆B` (content RuPAtom(key)) at each witness e → `(e∈A→e∈B)` via ssel/sseld.
+ruHRelInst(ctx : RuHCtx, amb : Maybe<RuPForm>, f : RuHF, key : string, witnesses : [RuExp]) -> [RuHF] {
+	sub = ruHAtomExp(ctx, key); ar = ruEqArgs(sub); a = ar.first; b = ar.second;
+	map(witnesses, \e -> {
+		implExp = ruHMkExp(s2id_("wi"), ctx.wff, [ruHMkExp(ruHwcel(), ctx.wff, [e, a]), ruHMkExp(ruHwcel(), ctx.wff, [e, b])]);
+		ctx.atomNodes := mergeTree(^(ctx.atomNodes), ruPAtomNodes(ctx.conn, implExp));
+		content = ruPAtomize(ctx.conn, implExp);   // (e∈A → e∈B)
+		switch (amb) {
+			None():  RuHF(content, ruHStep(ctx, "ax-mp", [f.tree, ruHStep(ctx, "ssel", [], RuPImp(f.content, content))], content));
+			Some(w): RuHF(content, ruHStep(ctx, "sseld", [f.tree], RuPImp(w, content)));   // (W→A⊆B) ⊢ (W→(e∈A→e∈B))
+		};
+	});
+}
+// reduce a ⊆/= GOAL atom to its fresh-witness membership subgoal, prove it, wrap with ssriv/ssrdv (eqriv/eqrdv).
+ruHRelGoal(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], key : string, fuel : int) -> Maybe<RuHF> {
+	goalExp = ruHAtomExp(ctx, key); head = ruEqHead(goalExp);
+	isSubset = head == ruHwss(); isEq = head == ruHwceq();
+	if (!isSubset && !isEq) None()
+	else {
+		ambExps = switch (amb) { None(): []; Some(w): [RuExp(ruHForm2Nodes(ctx, w), -1)]; };   // W's vars → DV
+		red = ruEqualizerRelSubgoal(ctx.em, ctx.conn, ctx.wff, ctx.stmtClass, ambExps, goalExp, isSubset);
+		ctx.atomNodes := mergeTree(^(ctx.atomNodes), ruPAtomNodes(ctx.conn, red.subgoal));
+		ctx.disjs     := mergeSets(^(ctx.disjs), red.disjs);
+		ctx.freshVars := arrayPush(^(ctx.freshVars), red.fresh);
+		subForm = ruPAtomize(ctx.conn, red.subgoal);
+		lemma = switch (amb) {
+			None():  if (isSubset) "ssriv" else "eqriv";
+			Some(__): if (isSubset) "ssrdv" else "eqrdv";
+		};
+		maybeMap(ruHProve(ctx, amb, facts, subForm, fuel - 1), \sub ->
+			RuHF(RuPAtom(key), ruHStep(ctx, lemma, [sub.tree], ruHUnd(amb, RuPAtom(key)))));
+	}
+}
+
 // ---- forward saturation ----------------------------------------------------
 ruHFind(facts : [RuHF], f : RuPForm) -> Maybe<RuHF> { find(facts, \fc -> fc.content == f); }
 
-// one derivation pass: ∧-elim on every conjunction fact + MP on every implication fact whose antecedent is known.
+// one derivation pass: ∧-elim on every conjunction fact + MP on every implication fact whose antecedent is
+// known + ⊆-fact instantiation (sseld/ssel) at every membership witness in scope.
 ruHForward(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF]) -> [RuHF] {
+	witnesses = ruHWitnesses(ctx, facts);
 	concatA(map(facts, \f ->
 		switch (f.content) {
 			RuPAnd(a, b): [ruHConjElim(ctx, amb, f, a, b, true), ruHConjElim(ctx, amb, f, a, b, false)];
 			RuPIff(a, b): [ruHIffElim(ctx, amb, f, a, b, true), ruHIffElim(ctx, amb, f, a, b, false)];
 			RuPImp(a, b): switch (ruHCheapProve(ctx, amb, facts, a)) { Some(fa): [ruHModus(ctx, amb, fa, f, a, b)]; None(): []; };
 			RuPNot(a): switch (a) { RuPNot(x): [ruHNotNot(ctx, amb, f, x)]; default: []; };  // ¬¬x ⊢ x
+			RuPAtom(k): if (witnesses != [] && ruEqHead(ruHAtomExp(ctx, k)) == ruHwss()) ruHRelInst(ctx, amb, f, k, witnesses) else [];
 			default: [];
 		}
 	));
@@ -209,6 +278,7 @@ ruHProve(ctx : RuHCtx, amb : Maybe<RuPForm>, facts0 : [RuHF], goal : RuPForm, fu
 				RuPImp(a, b): ruHImpR(ctx, amb, facts, a, b, fuel);
 				RuPOr(a, b):  ruHOrR(ctx, amb, facts, a, b, fuel);
 				RuPIff(a, b): ruHIffR(ctx, amb, facts, a, b, fuel);
+				RuPAtom(k):   ruHRelGoal(ctx, amb, facts, k, fuel);  // ⊆/= goal → membership (ssriv/ssrdv); else None
 				default:      None();
 			};
 			// last resort: classical case-split (bounded by ctx.splitBudget). Backward chaining (ruHImpL)
