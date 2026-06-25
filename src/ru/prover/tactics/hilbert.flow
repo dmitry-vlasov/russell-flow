@@ -20,12 +20,15 @@ import ru/proof_tree;
 export {
 	// State that the FIRST-ORDER ⊆/= handling mutates as it proves (refs are shared across all ctx copies):
 	//   atomNodes  — grows as ssrdv/sseld introduce fresh-witness membership atoms (key → real nodes)
-	//   splitBudget — total classical case-split budget (bounds pm2.61 2^n blow-up)
+	//   splitBudget — per-PATH classical-split DEPTH budget, RESTORED on a failed branch (backtracking DFS):
+	//     bounds how deep nested case-splits/∨-elims may stack along ONE proof path (the 2^n exponent).
+	//   globalSplits — TOTAL split attempts across the whole proof, NEVER restored: a hard work cap that
+	//     bounds the backtracking blow-up (branching^depth) so a single gap can't run away under a time limit.
 	//   disjs/freshVars — the disjoint-variable provisos + fresh setvars the ssrdv steps require; the caller
 	//     MUST fold these into the installed RuProof.vars, else verification fails on a DV violation
 	//   em — RuEnvMath, for ruEqualizerRelSubgoal (the ⊆/= goal reduction's fresh-var + DV machinery)
 	RuHCtx(conn : RuPConnectives, wff : int, stmtClass : int, atomNodes : ref Tree<string, [RuExpNode]>,
-		splitBudget : ref int, disjs : ref Set<RuDisj>, freshVars : ref [RuVar], em : RuEnvMath);
+		splitBudget : ref int, globalSplits : ref int, disjs : ref Set<RuDisj>, freshVars : ref [RuVar], em : RuEnvMath);
 	// `wff` (the wff type id) and `stmtClass` (the |- turnstile id) MUST come from the loaded math — derive
 	// them from a real expression (ruIdType2Type of a connective node / the prop's class), never from the
 	// memoized ruIdWff/ruIdTurnstile helpers (they cache -1 if interned before the library loads).
@@ -53,7 +56,7 @@ ruHilbertCertificate(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass
 RuHF(content : RuPForm, tree : RuProofTree);
 
 ruHCtx(em : RuEnvMath, wff : int, stmtClass : int, atomNodes : Tree<string, [RuExpNode]>) -> RuHCtx {
-	RuHCtx(ruPConnectives(), wff, stmtClass, ref atomNodes, ref 6, ref makeSet(), ref [], em);
+	RuHCtx(ruPConnectives(), wff, stmtClass, ref atomNodes, ref 6, ref 400, ref makeSet(), ref [], em);
 }
 
 // ---- RuPForm -> RuExp / RuStmt (own copy; mirrors the kalmar pattern, no kalmar dependency) ----
@@ -385,25 +388,28 @@ ruHProve(ctx : RuHCtx, amb : Maybe<RuPForm>, facts0 : [RuHF], goal : RuPForm, fu
 		else if (bot != None()) maybeMap(bot, \fbot -> ruHFalsum(ctx, amb, fbot, goal))  // ⊥ ⊢ anything (falim)
 		else if (contra != None()) maybeMap(contra, \a -> ruHExFalso(ctx, amb, facts, a, goal))
 		else {
-			structural = switch (goal) {
-				RuPAnd(a, b): ruHAndR(ctx, amb, facts, a, b, fuel);
-				RuPImp(a, b): ruHImpR(ctx, amb, facts, a, b, fuel);
-				RuPOr(a, b):  ruHOrR(ctx, amb, facts, a, b, fuel);
-				RuPIff(a, b): ruHIffR(ctx, amb, facts, a, b, fuel);
-				RuPAtom(k):   if (ruEqHead(ruHAtomExp(ctx, k)) == ruHwcel()) ruHMembGoal(ctx, amb, facts, k, fuel)  // e∈compound → unfold
-				              else ruHRelGoal(ctx, amb, facts, k, fuel);  // ⊆/= goal → membership (ssriv/ssrdv); else None
-				RuPNot(inner): ruHDeneg(ctx, amb, facts, inner, fuel);  // ¬(A∧¬B) → A→B (iman) so it takes the implication path
-				default:      None();
-			};
-			// last resort: classical case-split (bounded by ctx.splitBudget). Backward chaining (ruHImpL)
-			// stays removed — cheap antecedent derivation in saturation covers the ∨ cases.
-			switch (structural) {
-				Some(r): Some(r);
-				None(): switch (ruHDisjElim(ctx, amb, facts, goal, fuel)) {   // ∨-elim on a disjunction FACT (jaoi/mpjaodan)
+				// ∨-elim on a disjunction FACT, tried BEFORE the structural rules: eliminating a known disjunction is
+				// productive whenever one is in scope, and doing it first stops ruHOrR (∨R) from burning the work
+				// budget on deep case-split sub-proofs while trying to prove a disjunct directly (the ∨-assoc waste).
+				switch (ruHDisjElim(ctx, amb, facts, goal, fuel)) {
 					Some(r): Some(r);
-					None(): ruHCaseSplit(ctx, amb, facts, goal, fuel);
+					None(): {
+						structural = switch (goal) {
+							RuPAnd(a, b): ruHAndR(ctx, amb, facts, a, b, fuel);
+							RuPImp(a, b): ruHImpR(ctx, amb, facts, a, b, fuel);
+							RuPOr(a, b):  ruHOrR(ctx, amb, facts, a, b, fuel);
+							RuPIff(a, b): ruHIffR(ctx, amb, facts, a, b, fuel);
+							RuPAtom(k):   if (ruEqHead(ruHAtomExp(ctx, k)) == ruHwcel()) ruHMembGoal(ctx, amb, facts, k, fuel)  // e∈compound → unfold
+							              else ruHRelGoal(ctx, amb, facts, k, fuel);  // ⊆/= goal → membership (ssriv/ssrdv); else None
+							RuPNot(inner): ruHDeneg(ctx, amb, facts, inner, fuel);  // ¬(A∧¬B) → A→B (iman) so it takes the implication path
+							default:      None();
+						};
+						switch (structural) {
+							Some(r): Some(r);
+							None(): ruHCaseSplit(ctx, amb, facts, goal, fuel);   // classical case-split: last resort (bounded)
+						};
+					};
 				};
-			};
 		}
 	}
 }
@@ -476,25 +482,28 @@ ruHProveUnder(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], a : RuPForm, g
 // ∨-elimination on a disjunction FACT `A∨B`: prove the goal under A and under B, combine (jaoi / mpjaodan).
 // The disjunction is dropped in the branches (subsumed by the assumed disjunct) so it can't re-split forever.
 ruHDisjElim(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], goal : RuPForm, fuel : int) -> Maybe<RuHF> {
-	if (fuel <= 0 || ^(ctx.splitBudget) <= 0) None()   // bounded by the shared budget — branches re-saturate (exponential)
+	if (fuel <= 0 || ^(ctx.splitBudget) <= 0 || ^(ctx.globalSplits) <= 0) None()   // per-path depth + global work cap
 	else {
 		dj = find(facts, \f -> switch (f.content) { RuPOr(__, __): true; default: false; });
 		switch (dj) {
 			None(): None();
 			Some(df): switch (df.content) {
 				RuPOr(a, b): {
-					ctx.splitBudget := ^(ctx.splitBudget) - 1;
+					// Restore the budget on wholesale failure: a failed exploration must NOT permanently
+					// starve sibling/parent attempts (only SUCCESSFUL splits count against the shared
+					// budget) — else deep ∨-assoc cores fail spuriously after probing burns the budget.
+					saved = ^(ctx.splitBudget);
+					ctx.splitBudget := saved - 1;
+					ctx.globalSplits := ^(ctx.globalSplits) - 1;   // global cap: consumed even on failure (no restore)
 					rest = filter(facts, \f -> f.content != df.content);
-					switch (ruHProveUnder(ctx, amb, rest, a, goal, fuel - 1)) {
+					result = switch (ruHProveUnder(ctx, amb, rest, a, goal, fuel - 1)) {
 						None(): None();
-						Some(pa): switch (ruHProveUnder(ctx, amb, rest, b, goal, fuel - 1)) {
-							None(): None();
-							Some(pb): Some(switch (amb) {
-								None():  RuHF(goal, ruHStep(ctx, "ax-mp", [df.tree, ruHStep(ctx, "jaoi", [pa.tree, pb.tree], RuPImp(RuPOr(a, b), goal))], goal));
-								Some(w): RuHF(goal, ruHStep(ctx, "mpjaodan", [pa.tree, pb.tree, df.tree], RuPImp(w, goal)));
-							});
-						};
+						Some(pa): maybeMap(ruHProveUnder(ctx, amb, rest, b, goal, fuel - 1), \pb -> switch (amb) {
+							None():  RuHF(goal, ruHStep(ctx, "ax-mp", [df.tree, ruHStep(ctx, "jaoi", [pa.tree, pb.tree], RuPImp(RuPOr(a, b), goal))], goal));
+							Some(w): RuHF(goal, ruHStep(ctx, "mpjaodan", [pa.tree, pb.tree, df.tree], RuPImp(w, goal)));
+						});
 					};
+					switch (result) { None(): { ctx.splitBudget := saved; None(); } Some(__): result; };
 				}
 				default: None();
 			};
@@ -504,24 +513,24 @@ ruHDisjElim(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], goal : RuPForm, 
 // classical case-split (pm2.61): pick an undecided atom p, prove the goal under p and under ¬p, combine.
 // The completing rule for classical propositional logic; bounded by ctx.splitBudget (shared, total).
 ruHCaseSplit(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], goal : RuPForm, fuel : int) -> Maybe<RuHF> {
-	if (^(ctx.splitBudget) <= 0) None()
+	if (^(ctx.splitBudget) <= 0 || ^(ctx.globalSplits) <= 0) None()
 	else {
 		keys = set2array(fold(facts, ruPAtoms(goal), \acc, f -> mergeSets(acc, ruPAtoms(f.content))));
 		undecided = filter(keys, \k -> ruHFind(facts, RuPAtom(k)) == None() && ruHFind(facts, RuPNot(RuPAtom(k))) == None());
 		if (undecided == []) None()
 		else {
 			p = RuPAtom(undecided[0]);
-			ctx.splitBudget := ^(ctx.splitBudget) - 1;
-			switch (ruHProve(ctx, amb, facts, RuPImp(p, goal), fuel - 1)) {            // (p → goal)
+			saved = ^(ctx.splitBudget);
+			ctx.splitBudget := saved - 1;
+			ctx.globalSplits := ^(ctx.globalSplits) - 1;   // global cap: consumed even on failure (no restore)
+			result = switch (ruHProve(ctx, amb, facts, RuPImp(p, goal), fuel - 1)) {            // (p → goal)
 				None(): None();
-				Some(pPos): switch (ruHProve(ctx, amb, facts, RuPImp(RuPNot(p), goal), fuel - 1)) {  // (¬p → goal)
-					None(): None();
-					Some(pNeg): Some(switch (amb) {
-						None():  RuHF(goal, ruHStep(ctx, "pm2.61i", [pPos.tree, pNeg.tree], goal));
-						Some(w): RuHF(goal, ruHStep(ctx, "pm2.61d", [pPos.tree, pNeg.tree], RuPImp(w, goal)));
-					});
-				};
-			}
+				Some(pPos): maybeMap(ruHProve(ctx, amb, facts, RuPImp(RuPNot(p), goal), fuel - 1), \pNeg -> switch (amb) {  // (¬p → goal)
+					None():  RuHF(goal, ruHStep(ctx, "pm2.61i", [pPos.tree, pNeg.tree], goal));
+					Some(w): RuHF(goal, ruHStep(ctx, "pm2.61d", [pPos.tree, pNeg.tree], RuPImp(w, goal)));
+				});
+			};
+			switch (result) { None(): { ctx.splitBudget := saved; None(); } Some(__): result; }
 		}
 	}
 }
