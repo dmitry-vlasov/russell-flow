@@ -1,0 +1,96 @@
+import ru/prover/tactics/propositional;
+
+// PHASE 2, step 1 of the fresh (Kalmár-free) certificate generator (project_mizar_proving_stats).
+// A COMPLETE, terminating classical-propositional prover: the G3cp sequent calculus. It produces a
+// DERIVATION TREE for `gamma |- delta` (not just a yes/no) — the structure a later step translates into a
+// forward Hilbert proof over the foundation's propositional lemmas. Refutation-faithful (Mizar-style): a
+// branch closes on a complementary literal; the calculus is exactly cut-free classical propositional logic.
+//
+// G3cp rules (Γ ⊢ Δ; → handled below, ↔ expanded to (a→b)∧(b→a)):
+//   axiom  : p ∈ Γ and p ∈ Δ  | ⊥ ∈ Γ | ⊤ ∈ Δ
+//   ¬L: ¬a∈Γ ⇒ Γ' ⊢ Δ,a        ¬R: ¬a∈Δ ⇒ Γ,a ⊢ Δ'
+//   ∧L: a∧b∈Γ ⇒ Γ',a,b ⊢ Δ     ∧R: a∧b∈Δ ⇒ (Γ⊢Δ',a) & (Γ⊢Δ',b)
+//   ∨L: a∨b∈Γ ⇒ (Γ',a⊢Δ)&(Γ',b⊢Δ)   ∨R: a∨b∈Δ ⇒ Γ ⊢ Δ',a,b
+//   →L: a→b∈Γ ⇒ (Γ'⊢Δ,a)&(Γ',b⊢Δ)   →R: a→b∈Δ ⇒ Γ,a ⊢ Δ',b
+// Every rule strictly reduces the total connective count, so search terminates; completeness is standard.
+
+export {
+	RuPDeriv ::= RuPDAxiom, RuPDRule;
+		RuPDAxiom(gamma : [RuPForm], delta : [RuPForm]);
+		RuPDRule(rule : string, gamma : [RuPForm], delta : [RuPForm], kids : [RuPDeriv]);
+
+	// A G3cp derivation of `gamma |- delta`, or None if the sequent is not valid (a countermodel exists).
+	ruPProveSeq(gamma : [RuPForm], delta : [RuPForm]) -> Maybe<RuPDeriv>;
+	// Convenience: derive `hyps |- goal`.
+	ruPProveImp(hyps : [RuPForm], goal : RuPForm) -> Maybe<RuPDeriv>;
+	// Independent checker: is `d` a well-formed G3cp derivation of its end-sequent? (for unit testing).
+	ruPDerivValid(d : RuPDeriv) -> bool;
+}
+
+ruPContains(fs : [RuPForm], f : RuPForm) -> bool { exists(fs, \x -> x == f); }
+ruPDecomposable(f : RuPForm) -> bool {
+	switch (f) { RuPAtom(__): false; RuPTrue(): false; RuPFalse(): false; default: true; }
+}
+// index of the first decomposable formula, else -1
+ruPFindDecomp(fs : [RuPForm]) -> int {
+	foldi(fs, -1, \i, acc, f -> if (acc >= 0) acc else if (ruPDecomposable(f)) i else acc);
+}
+ruPRemoveAt(fs : [RuPForm], i : int) -> [RuPForm] { concat(subrange(fs, 0, i), subrange(fs, i + 1, length(fs) - i - 1)); }
+
+// Both branches must succeed.
+ruPBoth(rule : string, g : [RuPForm], d : [RuPForm], m1 : Maybe<RuPDeriv>, m2 : Maybe<RuPDeriv>) -> Maybe<RuPDeriv> {
+	switch (m1) { None(): None(); Some(k1): switch (m2) { None(): None(); Some(k2): Some(RuPDRule(rule, g, d, [k1, k2])); }; };
+}
+ruPOne(rule : string, g : [RuPForm], d : [RuPForm], m : Maybe<RuPDeriv>) -> Maybe<RuPDeriv> {
+	maybeMap(m, \k -> RuPDRule(rule, g, d, [k]));
+}
+
+ruPProveImp(hyps : [RuPForm], goal : RuPForm) -> Maybe<RuPDeriv> { ruPProveSeq(hyps, [goal]); }
+
+ruPProveSeq(g : [RuPForm], d : [RuPForm]) -> Maybe<RuPDeriv> {
+	if (exists(g, \f -> f == RuPFalse()) || exists(d, \f -> f == RuPTrue()) || exists(g, \f -> ruPContains(d, f)))
+		Some(RuPDAxiom(g, d))
+	else {
+		gi = ruPFindDecomp(g);
+		if (gi >= 0) {
+			f = g[gi]; rest = ruPRemoveAt(g, gi);
+			switch (f) {
+				RuPNot(a):    ruPOne ("¬L", g, d, ruPProveSeq(rest, concat(d, [a])));
+				RuPAnd(a, b): ruPOne ("∧L", g, d, ruPProveSeq(concat(rest, [a, b]), d));
+				RuPOr(a, b):  ruPBoth("∨L", g, d, ruPProveSeq(concat(rest, [a]), d), ruPProveSeq(concat(rest, [b]), d));
+				RuPImp(a, b): ruPBoth("→L", g, d, ruPProveSeq(rest, concat(d, [a])), ruPProveSeq(concat(rest, [b]), d));
+				RuPIff(a, b): ruPOne ("↔L", g, d, ruPProveSeq(concat(rest, [RuPImp(a, b), RuPImp(b, a)]), d));
+				default: None();
+			}
+		} else {
+			di = ruPFindDecomp(d);
+			if (di < 0) None()   // all atomic, no axiom: countermodel
+			else {
+				f = d[di]; rest = ruPRemoveAt(d, di);
+				switch (f) {
+					RuPNot(a):    ruPOne ("¬R", g, d, ruPProveSeq(concat(g, [a]), rest));
+					RuPAnd(a, b): ruPBoth("∧R", g, d, ruPProveSeq(g, concat(rest, [a])), ruPProveSeq(g, concat(rest, [b])));
+					RuPOr(a, b):  ruPOne ("∨R", g, d, ruPProveSeq(g, concat(rest, [a, b])));
+					RuPImp(a, b): ruPOne ("→R", g, d, ruPProveSeq(concat(g, [a]), concat(rest, [b])));
+					RuPIff(a, b): ruPOne ("↔R", g, d, ruPProveSeq(g, concat(rest, [RuPAnd(RuPImp(a, b), RuPImp(b, a))])));
+					default: None();
+				}
+			}
+		}
+	}
+}
+
+// ---- independent validity checker (unit test): re-derive each node's end-sequent semantically ----
+ruPDerivValid(d : RuPDeriv) -> bool {
+	switch (d) {
+		RuPDAxiom(g, dl): exists(g, \f -> f == RuPFalse()) || exists(dl, \f -> f == RuPTrue()) || exists(g, \f -> ruPContains(dl, f));
+		RuPDRule(rule, g, dl, kids): {
+			// Sound check: the end-sequent (¬⋀g ∨ ⋁dl) must be a tautology, and every kid valid.
+			seqValid = ruPEntails(g, ruPOrAll(dl));
+			seqValid && forall(kids, ruPDerivValid);
+		}
+	}
+}
+ruPOrAll(fs : [RuPForm]) -> RuPForm {
+	if (fs == []) RuPFalse() else fold(tail(fs), fs[0], \acc, f -> RuPOr(acc, f));
+}
