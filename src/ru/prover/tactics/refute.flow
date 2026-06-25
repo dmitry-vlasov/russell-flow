@@ -1,0 +1,80 @@
+import ru/prover/tactics/propositional;
+import ru/prover/tactics/equalizer;
+
+// PHASE 1 of the Mizar-style "checker" closer (see project_mizar_proving_stats): a REFUTATION DECIDER.
+// It answers only valid/invalid (NO proof certificate yet) so we can measure how many gaps this approach
+// could close before investing in certificate extraction.
+//
+// Algorithm (a single-witness specialisation of Mizar's negate→DNF→equalizer→unifier):
+//   to decide `hyps |- goal`, unfold every relational atom (⊆ / = / ∈, over the set builders ∪ ∩ ∖ ∅)
+//   to BASE membership atoms `e ∈ x` at a single shared witness, then run COMPLETE propositional
+//   entailment (propositional.flow's ruPEntails, a 2^n valuation). A ⊆ becomes an implication and a =
+//   an iff at the witness (extensionality); ∪/∩/∖/∅ unfold by elun/elin/eldif/noel. This already
+//   captures the wall classes — ⊆-transitivity, monotone implications, and propositional/equality
+//   tautologies — because once unfolded they ARE propositional tautologies over the base atoms.
+//   Single-witness is sound but incomplete (theorems needing two distinct element witnesses are missed);
+//   that is fine for a ceiling estimate.
+
+export {
+	// Does `hyps` entail `goal`, by the single-witness membership-unfold + propositional decision above?
+	ruRefuteEntails(hyps : [RuExp], goal : RuExp) -> bool;
+}
+
+RuRfIds(wss : int, wceq : int, wcel : int, cun : int, cin : int, cdif : int, c0 : int);
+ruRfIds() -> RuRfIds { RuRfIds(s2id("wss"), s2id("wceq"), s2id("wcel"), s2id("cun"), s2id("cin"), s2id("cdif"), s2id("c0")) }
+
+ruRfNodeKey(n : RuExpNode) -> string {
+	switch (n) {
+		RuVar(id, t):        "V" + i2s(id) + "#" + i2s(t);
+		RuRuleNode(it, __):  "R" + i2s(ruIdType2Id(it));
+	}
+}
+ruRfKey(e : RuExp) -> string { strGlue(map(e.nodes, ruRfNodeKey), ",") }
+
+// `elem ∈ setExp`, unfolded to base membership props via elun/elin/eldif/noel.
+ruMemberOf(ids : RuRfIds, elemKey : string, setExp : RuExp) -> RuPForm {
+	h = ruEqHead(setExp);
+	if (h == ids.c0) RuPFalse()                                                    // e ∈ ∅  ≡  ⊥  (noel)
+	else if (h == ids.cun) { a = ruEqArgs(setExp); RuPOr (ruMemberOf(ids, elemKey, a.first), ruMemberOf(ids, elemKey, a.second)); }
+	else if (h == ids.cin) { a = ruEqArgs(setExp); RuPAnd(ruMemberOf(ids, elemKey, a.first), ruMemberOf(ids, elemKey, a.second)); }
+	else if (h == ids.cdif){ a = ruEqArgs(setExp); RuPAnd(ruMemberOf(ids, elemKey, a.first), RuPNot(ruMemberOf(ids, elemKey, a.second))); }
+	else RuPAtom(elemKey + "∈" + ruRfKey(setExp));                                 // base set: opaque membership atom
+}
+
+// Replace each relational atom (⊆ / = / ∈) of a propositional skeleton with its membership unfolding.
+ruRfUnfold(ids : RuRfIds, witness : string, atomNodes : Tree<string, [RuExpNode]>, f : RuPForm) -> RuPForm {
+	rec = \g -> ruRfUnfold(ids, witness, atomNodes, g);
+	switch (f) {
+		RuPAtom(key): {
+			switch (lookupTree(atomNodes, key)) {
+				None(): f;
+				Some(nodes): {
+					e = RuExp(nodes, -1);
+					h = ruEqHead(e);
+					if (h == ids.wss)  { a = ruEqArgs(e); RuPImp(ruMemberOf(ids, witness, a.first), ruMemberOf(ids, witness, a.second)); }      // A⊆B at witness
+					else if (h == ids.wceq) { a = ruEqArgs(e); RuPIff(ruMemberOf(ids, witness, a.first), ruMemberOf(ids, witness, a.second)); } // A=B (extensionality)
+					else if (h == ids.wcel) { a = ruEqArgs(e); ruMemberOf(ids, ruRfKey(a.first), a.second); }                                  // t∈S: unfold S at element t
+					else f;
+				}
+			}
+		}
+		RuPNot(a):    RuPNot(rec(a));
+		RuPImp(a, b): RuPImp(rec(a), rec(b));
+		RuPIff(a, b): RuPIff(rec(a), rec(b));
+		RuPAnd(a, b): RuPAnd(rec(a), rec(b));
+		RuPOr(a, b):  RuPOr(rec(a), rec(b));
+		RuPTrue():    f;
+		RuPFalse():   f;
+	}
+}
+
+ruRfForm(ids : RuRfIds, conn : RuPConnectives, witness : string, e : RuExp) -> RuPForm {
+	ruRfUnfold(ids, witness, ruPAtomNodes(conn, e), ruPAtomize(conn, e));
+}
+
+ruRefuteEntails(hyps : [RuExp], goal : RuExp) -> bool {
+	ids = ruRfIds(); conn = ruPConnectives(); w = "$w";
+	hypForms = map(hyps, \h -> ruRfForm(ids, conn, w, h));
+	goalForm = ruRfForm(ids, conn, w, goal);
+	ruPEntails(hypForms, goalForm);
+}
