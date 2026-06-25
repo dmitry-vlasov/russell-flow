@@ -16,7 +16,9 @@ import ru/proof_tree;
 // pm3.2i — see the recon in the commit msg / project memory).
 
 export {
-	RuHCtx(conn : RuPConnectives, wff : int, stmtClass : int, atomNodes : Tree<string, [RuExpNode]>);
+	// splitBudget: a shared TOTAL budget for classical case-splits (pm2.61) across the whole proof — a ref
+	// so every ctx copy shares it (bounds the 2^n blow-up without threading a per-call counter).
+	RuHCtx(conn : RuPConnectives, wff : int, stmtClass : int, atomNodes : Tree<string, [RuExpNode]>, splitBudget : ref int);
 	// `wff` (the wff type id) and `stmtClass` (the |- turnstile id) MUST come from the loaded math — derive
 	// them from a real expression (ruIdType2Type of a connective node / the prop's class), never from the
 	// memoized ruIdWff/ruIdTurnstile helpers (they cache -1 if interned before the library loads).
@@ -35,14 +37,14 @@ ruHilbertCertificate(conn : RuPConnectives, wff : int, stmtClass : int, hyps : [
 	atomNodes = fold(hyps, ruPAtomNodes(conn, goal), \acc, h -> mergeTree(acc, ruPAtomNodes(conn, h)));
 	hypForms  = map(hyps, \h -> ruPAtomize(conn, h));
 	goalForm  = ruPAtomize(conn, goal);
-	ruHilbertProve(RuHCtx(conn, wff, stmtClass, atomNodes), hypForms, goalForm);
+	ruHilbertProve(RuHCtx(conn, wff, stmtClass, atomNodes, ref 6), hypForms, goalForm);
 }
 
 // a proof fragment: `tree` proves `|- und(curAmb, content)` for the ambient in force at its creation.
 RuHF(content : RuPForm, tree : RuProofTree);
 
 ruHCtx(wff : int, stmtClass : int, atomNodes : Tree<string, [RuExpNode]>) -> RuHCtx {
-	RuHCtx(ruPConnectives(), wff, stmtClass, atomNodes);
+	RuHCtx(ruPConnectives(), wff, stmtClass, atomNodes, ref 6);
 }
 
 // ---- RuPForm -> RuExp / RuStmt (own copy; mirrors the kalmar pattern, no kalmar dependency) ----
@@ -209,9 +211,9 @@ ruHProve(ctx : RuHCtx, amb : Maybe<RuPForm>, facts0 : [RuHF], goal : RuPForm, fu
 				RuPIff(a, b): ruHIffR(ctx, amb, facts, a, b, fuel);
 				default:      None();
 			};
-			// backward chaining (ruHImpL) is OFF for now — saturation + structural + clash cover the
-			// bulk; the recursive goal-retry risks exponential blow-up. Re-enable bounded if needed.
-			switch (structural) { Some(r): Some(r); None(): None(); };
+			// last resort: classical case-split (bounded by ctx.splitBudget). Backward chaining (ruHImpL)
+			// stays removed — cheap antecedent derivation in saturation covers the ∨ cases.
+			switch (structural) { Some(r): Some(r); None(): ruHCaseSplit(ctx, amb, facts, goal, fuel); };
 		}
 	}
 }
@@ -264,21 +266,29 @@ ruHIffR(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], a : RuPForm, b : RuP
 		}; };
 	};
 }
-// backward chaining: find an implication fact whose antecedent we can prove, derive its consequent, retry.
-ruHImpL(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], goal : RuPForm, fuel : int) -> Maybe<RuHF> {
-	imps = filter(facts, \f -> switch (f.content) { RuPImp(__, b): ruHFind(facts, b) == None(); default: false; });
-	fold(imps, None(), \acc, f -> switch (acc) { Some(__): acc; None():
-		switch (f.content) { RuPImp(a, b):
-			switch (ruHProve(ctx, amb, facts, a, fuel - 1)) {
+// classical case-split (pm2.61): pick an undecided atom p, prove the goal under p and under ¬p, combine.
+// The completing rule for classical propositional logic; bounded by ctx.splitBudget (shared, total).
+ruHCaseSplit(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], goal : RuPForm, fuel : int) -> Maybe<RuHF> {
+	if (^(ctx.splitBudget) <= 0) None()
+	else {
+		keys = set2array(fold(facts, ruPAtoms(goal), \acc, f -> mergeSets(acc, ruPAtoms(f.content))));
+		undecided = filter(keys, \k -> ruHFind(facts, RuPAtom(k)) == None() && ruHFind(facts, RuPNot(RuPAtom(k))) == None());
+		if (undecided == []) None()
+		else {
+			p = RuPAtom(undecided[0]);
+			ctx.splitBudget := ^(ctx.splitBudget) - 1;
+			switch (ruHProve(ctx, amb, facts, RuPImp(p, goal), fuel - 1)) {            // (p → goal)
 				None(): None();
-				Some(pa): {
-					fb = ruHModus(ctx, amb, pa, f, a, b);
-					ruHProve(ctx, amb, concat(facts, [fb]), goal, fuel - 1);
-				}
-			};
-			default: None();
-		};
-	});
+				Some(pPos): switch (ruHProve(ctx, amb, facts, RuPImp(RuPNot(p), goal), fuel - 1)) {  // (¬p → goal)
+					None(): None();
+					Some(pNeg): Some(switch (amb) {
+						None():  RuHF(goal, ruHStep(ctx, "pm2.61i", [pPos.tree, pNeg.tree], goal));
+						Some(w): RuHF(goal, ruHStep(ctx, "pm2.61d", [pPos.tree, pNeg.tree], RuPImp(w, goal)));
+					});
+				};
+			}
+		}
+	}
 }
 
 // Refutation (Mizar's method): assume ¬goal, saturate the context to a contradiction (A and ¬A both
