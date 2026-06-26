@@ -2,7 +2,7 @@
 	@help {
 		FULL Mizar → Russell → Metamath pipeline for ONE article in a single launch:
 		  (a) translate the analyzed Mizar XML into an A-map Russell skeleton (open `?` steps),
-		  (c) prove the open by-gaps with a tactic (in parallel),
+		  (c) prove the open by-gaps with a tactic,
 		  (d) linearize the proofs (inline all lemmas into one flat proof per theorem),
 		  (e) optimize the proofs (refactor/optimize.rus transforms: drop duplicate/unused, shorten),
 		  (f) write the completed `.ru` and verify every proof against the Russell kernel,
@@ -27,13 +27,18 @@
 	@arg article { Mizar article name, e.g. xboole_1 — also the generated module name }
 	@arg tac     { proving tactic (def-close-checker = A-map auto-prover incl. the Kalmar-free checker) @defval def-close-checker }
 	@arg tl      { per-step time limit @defval 10s }
-	@arg par     { 1 = prove theorems in parallel (faster); 0 = sequential (a few more gaps close, slower) @defval 1 }
+	@arg par     { 0 = sequential (default, reliable); 1 = parallel (experimental — does not persist under thread contention) @defval 0 }
 	@arg opttl   { time budget for the proof-shortening optimization pass @defval 60s }
+	@arg lin     { 1 = linearize proofs (inline lemmas) before optimizing; 0 = skip (default — slow + huge on deep checker proofs; the Metamath export linearizes internally anyway) @defval 0 }
+	@arg opt     { 1 = optimize proofs (drop duplicate/unused, shorten) before export; 0 = skip (default — currently can break refs that the Metamath export needs) @defval 0 }
+	@arg v       { output level: 0 silent, 1 phase lines + prove summary (default), 2 also a ✓/✗ line per theorem @defval 1 }
 */
 
 mdir  := (math + "/MML/mml");
 found := (math + "/mizar/miz_set.ru");
 outd  := (math + "/mizar");
+talk  := (a2i(v) >= 1);   // print the script's own phase lines only when not silent
+conf-set verb=$v;         // conf.verb drives every command's output (prove report, …)
 // `module` is a NAME, not a path — ru-root (=outd) supplies the directory; the article's file becomes
 // pathCombine(ru-root, mod + ".ru"). (An absolute path here would double against ru-root.) Using the
 // bare name also makes the in-memory source id = s2id(mod), so `prove target=$mod` selects exactly this
@@ -49,34 +54,41 @@ conf-set import-roots=$math;
 // ---- phase (a): analyzed Mizar XML -> A-map skeleton (every by-gap an OPEN `?` step) ----
 read-ru file=$found;
 mizar-to-ru article=$article dir=$mdir foundation=miz_set module=$mod proofs=1;
-	print ("[a] translated " + article + " -> " + outf);
+	if (talk) { print ("[a] translated " + article + " -> " + outf); }
 
 // ---- phase (c): prove the article's open `?` steps (bounded + scoped: relevance-depth=0; the
 // whole-foundation BFS would overflow the 2^20 rule-id space). target=$mod = just this article.
-// par=1 (default): prove concurrently (much faster). progress=1: a line per theorem as it finishes
-// — ✓ proved / ✗ open / · already closed, with steps + time. ----
-prove target=$mod steps=1 tactic=$tac relevance-depth=0 exclude-disjointed=0 time-limit=$tl max-depth=8 max-size=65536 forward-closure-depth=0 parallel=$par progress=1;
-	print ("[c] proved the open by-gaps of " + article + " with tactic: " + tac);
+// The prove command reports per conf.verb AFTER all theorems finish (proved count read from the
+// final verified math — exact). par=0 sequential by default (par=1 parallel is experimental). ----
+prove target=$mod steps=1 tactic=$tac relevance-depth=0 exclude-disjointed=0 time-limit=$tl max-depth=8 max-size=65536 forward-closure-depth=0 parallel=$par;
+	if (talk) { print ("[c] proved the open by-gaps of " + article + " with tactic: " + tac); }
 
-// ---- (d) linearize: inline every lemma sub-proof into one flat proof per theorem ----
-linearize-proofs target=$mod;
-	print ("[d] linearized proofs (lemmas inlined): " + linearize-proofs.linearized-theorems + " theorems");
+// ---- (d) linearize (opt-in, lin=1): inline every lemma sub-proof into one flat proof per theorem.
+// Off by default — merging the checker's deeply-nested lemma proofs produces very large flat proofs
+// that are slow to verify; the Metamath export (phase g) linearizes internally regardless. ----
+if (lin == "1") {
+	linearize-proofs target=$mod;
+	if (talk) { print ("[d] linearized proofs (lemmas inlined): " + linearize-proofs.linearized-theorems + " theorems"); }
+} else { }
 
-// ---- (e) optimize the proofs (the transforms from refactor/optimize.rus, scoped to this article):
-// drop duplicate/unused steps + unused hyps, then shorten. remove-trivial-theorems is intentionally
-// OMITTED — it would delete article theorems that the Metamath export needs. ----
-remove-duplicate-steps target=$mod;
-remove-unused-steps target=$mod;
-remove-unused-hyps target=$mod;
-shorten-proofs target=$mod time-limit=$opttl;
-	print ("[e] optimized: shortened " + shorten-proofs.shortened-steps + " steps in " + shorten-proofs.shortened-theorems + " theorems");
+// ---- (e) optimize (opt-in, opt=1): the transforms from refactor/optimize.rus, scoped to this article
+// (drop duplicate/unused steps + unused hyps, then shorten; remove-trivial-theorems is omitted — it
+// would delete article theorems the export needs). Off by default — it currently can leave step refs
+// that the Metamath export (phase g) chokes on. ----
+if (opt == "1") {
+	remove-duplicate-steps target=$mod;
+	remove-unused-steps target=$mod;
+	remove-unused-hyps target=$mod;
+	shorten-proofs target=$mod time-limit=$opttl;
+	if (talk) { print ("[e] optimized: shortened " + shorten-proofs.shortened-steps + " steps in " + shorten-proofs.shortened-theorems + " theorems"); }
+} else { }
 
 // ---- (f) persist the linearized + optimized proofs, then re-verify against the Russell kernel ----
 write-ru target=$mod;
-	print ("[f] wrote completed proofs -> " + outf);
-	print "[f] verifying all Russell proofs against the kernel ...";
+	if (talk) { print ("[f] wrote completed proofs -> " + outf); }
+	if (talk) { print "[f] verifying all Russell proofs against the kernel ..."; }
 verify;
-	print ("[f] Russell verify (all proofs valid): " + verify.success);
+	if (talk) { print ("[f] Russell verify (all proofs valid): " + verify.success); }
 
 // ---- (g) close the loop: translate to Metamath (written in the SAME dir as the article) and verify
 // with the external Metamath checker. Still-open theorems become axioms so the .mm export stays
@@ -85,12 +97,12 @@ mmout  := outd;
 mmroot := (mod + "_root");
 conf-set mm-root=$mmout;
 unproven-to-axioms;
-	print ("[g] open theorems -> axioms: " + unproven-to-axioms.converted);
+	if (talk) { print ("[g] open theorems -> axioms: " + unproven-to-axioms.converted); }
 ru-comments2ascii;
 ru-to-mm;
 clear-math what=ru;
 mm-extract-vars;
 write-mm file=$mod monolithic=$mmroot strip-comments=0;
-	print ("[g] wrote Metamath -> " + mmout + "/" + mmroot + ".mm");
+	if (talk) { print ("[g] wrote Metamath -> " + mmout + "/" + mmroot + ".mm"); }
 verify-mm $mmout/$mmroot.mm;
-	print ("[g] Metamath verify done (look for 'All proofs in the database were verified' above)");
+	if (talk) { print ("[g] Metamath verify done (look for 'All proofs in the database were verified' above)"); }

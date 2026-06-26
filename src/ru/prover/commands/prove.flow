@@ -40,8 +40,8 @@ ruCommProve = RuComm(
 			RuCommArg("relevance-tolerance",   true,  "SInE trigger tolerance (>=1; higher = more premises kept)",                        "1.2"),
 			RuCommArg("relevance-ubiq",        true,  "fraction of assertions a symbol must hit to count as ubiquitous logical glue",     "0.4"),
 			RuCommArg("exclude-disjointed",    true,  "drop disjoint-variable theorems from scope (efficiency; soundness is type-level)", "1"),
-			RuCommArg("parallel",              true,  "1 = prove theorems in parallel (faster for many small gaps); 0 = sequential outer traversal (default; avoids nested thread-pool contention when the tactic is internally concurrent)", "0"),
-			RuCommArg("progress",              true,  "1 = print a line as each theorem finishes (status + steps + time)", "0")
+			RuCommArg("parallel",              true,  "1 = prove theorems in parallel (experimental — limited by nested thread-pool contention); 0 = sequential (default, reliable)", "0"),
+			RuCommArg("progress",              true,  "override verbosity for the after-all report (else conf.verb): 0 none, 1 summary, 2 a ✓/✗ line per theorem", "")
 		], ruMapFnCommArgs), []
 	),
 	ruRunProve
@@ -108,7 +108,6 @@ ruRunProve(unit : RuUnit) -> Maybe<RuState> {
 
 		per_th_ms      = ruParseTime(ruTaskStringArg(task, "time-limit", "60s"));
 		steps_mode     = ruTaskBoolArg(task, "steps", false);
-		show_progress  = ruTaskBoolArg(task, "progress", false);
 		proved_count   = ref 0;
 		finished_count = ref 0;
 		steps_closed   = ref 0;
@@ -137,11 +136,6 @@ ruRunProve(unit : RuUnit) -> Maybe<RuState> {
 				inc_finished(1);
 				add_closed(nclosed); add_total(ntotal);
 				if (ntotal > 0 && nclosed == ntotal) { inc_proved(1); push_proved(th.info.id); };
-				if (show_progress) {
-					mark = if (ntotal == 0) "·" else if (nclosed == ntotal) "✓" else "✗";
-					detail = if (ntotal == 0) "already closed" else i2s(nclosed) + "/" + i2s(ntotal) + " steps, " + ruTimePassed2s(th_timer);
-					env1.out.println("  " + mark + " " + id2s(th.info.id) + "   (" + detail + ")");
-				};
 				// No outer normalize: each gap proof is normalized self-contained inside
 				// ruProveTheoremSteps, so its fresh vars/disjs stay in the lemma sub-proof.
 				RuMappedDecl(true, nclosed > 0, th2);
@@ -163,32 +157,39 @@ ruRunProve(unit : RuUnit) -> Maybe<RuState> {
 				Some(proof): {
 					inc_proved(1);
 					push_proved(th.info.id);
-					if (show_progress) env1.out.println("  ✓ " + id2s(th.info.id) + "   (" + ruTimePassed2s(th_timer) + ")");
 					proved_th = ruNormalizeTheoremVarsDisjs(RuTheorem(th with proof = proof));
 										RuMappedDecl(true, true, proved_th);
 				}
 				None(): {
-					if (show_progress) env1.out.println("  ✗ " + id2s(th.info.id) + "   (" + ruTimePassed2s(th_timer) + ")");
 										RuMappedDecl(true, false, decl);
 				}
 			}
 			}
 		};
 
-		// parallel=1: prove theorems concurrently at the outer level — pass the task through
-		// unchanged (faster for many small gaps, e.g. a Mizar article). The tactic may itself use
-		// the internal concurrent prover, so this oversubscribes the pool, but for small gaps the
-		// outer parallelism wins. parallel=0 (default): ruProve uses ruConcurrent internally, so
-		// running theorems concurrently causes nested thread-pool contention — force sequential
-		// outer traversal via -seq and scale the total budget by min(n, nProc) so each theorem
-		// still gets ≈ per_th_ms (the same throughput the old concurrent dispatch gave, without OOM).
+		// In BOTH modes the per-theorem budget must stay ≈ per_th_ms, and the JOB timer must be long
+		// enough for the whole run to finish — else ruConcurrent's timer cuts in-flight theorems, whose
+		// worker threads keep running and print their result AFTER the summary (and are lost from the
+		// count). ruMapDeclsConcurrentlyAll gives a theorem slice = job * nproc / n (measure is uniform
+		// for prove), so set the job timer = per_th_ms * n / nproc to hand each theorem ≈ per_th_ms.
+		//   parallel=1: outer-concurrent (faster for many small gaps; may oversubscribe the pool since
+		//     the tactic can be internally concurrent too).
+		//   parallel=0 (default elsewhere): force sequential outer traversal (-seq) to avoid nested
+		//     thread-pool contention; same per-theorem budget via min(n, nProc) scaling.
 		run_parallel   = ruTaskIntArg(task, "parallel", 0) > 0;
-		dispatch_task  = if (run_parallel) task else {
-			n_theorems     = length(filter(ruTargetDecls(target, math, env), ruDeclIsTheorem));
-			n_par          = availableProcessors();
-			computed_total = per_th_ms * i2d(min(max(1, n_theorems), n_par));
-			job_limit_str  = ruTaskStringArg(task, "job-time-limit", "");
-			total_ms       = if (job_limit_str != "" && job_limit_str != "no") min(computed_total, ruParseTime(job_limit_str)) else computed_total;
+		n_theorems     = length(filter(ruTargetDecls(target, math, env), ruDeclIsTheorem));
+		n_par          = availableProcessors();
+		job_limit_str  = ruTaskStringArg(task, "job-time-limit", "");
+		cap_job        = \ms -> if (job_limit_str != "" && job_limit_str != "no") min(ms, ruParseTime(job_limit_str)) else ms;
+		dispatch_task  = if (run_parallel) {
+			// slice = job * nproc / n is the effective per-theorem budget (the tactic does not self-limit;
+			// it runs until ruEvalTimed3 stops it at the slice). job timer = per_th_ms * n / nproc gives
+			// slice ≈ per_th_ms. The count and progress are taken from the FINAL math state below, not the
+			// racy ref counters, so retries / abandoned-thread prints can't corrupt the reported result.
+			job_ms = cap_job(per_th_ms * i2d(max(1, n_theorems)) / i2d(max(1, n_par)));
+			RuTask(task with args = setTree(task.args, "time-limit", ruTime2s(job_ms)));
+		} else {
+			total_ms = cap_job(per_th_ms * i2d(min(max(1, n_theorems), n_par)));
 			RuTask(task with args =
 				setTree(
 					setTree(task.args, "target", ruTaskStringArg(task, "target", "all") + "-seq"),
@@ -210,25 +211,41 @@ ruRunProve(unit : RuUnit) -> Maybe<RuState> {
 				prove_fn
 			)
 		);
-		// Compute not-proved as started − proved (catches both search failures
-		// and theorems that timed out before prove_fn could complete).
-		if (steps_mode) {
-			st = ^steps_total; sc = ^steps_closed;
-			env.out.println("prove steps: closed " + i2s(sc) + "/" + i2s(st) + " steps = " +
-				i2s(if (st == 0) 0 else 100 * sc / st) + "%, " + i2s(^proved_count) + " theorems fully proved");
+		// Report from the FINAL math state, not the racy ref counters: in parallel mode the retry loop can
+		// re-run a theorem and an abandoned worker thread can bump the refs late, so proved_count /
+		// started_ids over-count. The installed math is the ground truth — a theorem is proved iff all its
+		// gaps are closed there — so the reported result is correct no matter how the threads interleaved.
+		// The target's decls are captured at parse time (pre-proving), so look each theorem ID up in the
+		// FINAL math's decl tree to read its true post-prove state.
+		target_ids = map(filter(ruTargetDecls(target, math, env), ruDeclIsTheorem), \d -> d.info.id);
+		final_decls = ruDeclsTree(ruMathFromSources(new_state.ru, env).decls);
+		is_proved_id = \id -> switch (lookupTree(final_decls, id)) {
+			Some(d): ruDeclIsTheorem(d) && ruTheoremIsProved(cast(d : RuDecl -> RuTheorem));
+			None(): false;
 		};
-		proved_set = buildSet(^proved_ids);
-		not_proved = set2array(fold(^started_ids, makeSet(), \acc, id ->
-			if (containsSet(proved_set, id)) acc else insertSet(acc, id)
-		));
-				if (not_proved != []) {
-			// One theorem per line — a single comma-joined line is unreadable for a whole article.
-			env.out.error("prove: not proved (" + i2s(length(not_proved)) + "):\n" +
-				strGlue(map(not_proved, \id -> "    " + id2s(id)), "\n"), []);
-		}
+		n_proved   = length(filter(target_ids, is_proved_id));
+		not_proved = filter(target_ids, \id -> !is_proved_id(id));
+		// Verbosity for the report, printed HERE (main thread, after every theorem has finished — no
+		// stragglers): the `progress` arg overrides; else conf.verb (unset → 1). 0 = silent, 1 = summary
+		// + the not-proved list, 2 = also a ✓/✗ line per theorem.
+		prog_arg = ruTaskStringArg(task, "progress", "");
+		verb_opt = ruOptsString(conf.opts, "verb", ruOptsString(conf.opts, "verbose", ""));
+		level    = if (prog_arg != "") s2i(prog_arg) else if (verb_opt != "") s2i(verb_opt) else if (conf.verbose >= 0) conf.verbose else 1;
+		if (level >= 2) {
+			iter(target_ids, \id -> env.out.println("  " + (if (is_proved_id(id)) "✓" else "✗") + " " + id2s(id)));
+		};
+		if (level >= 1) {
+			st = ^steps_total; sc = ^steps_closed;
+			env.out.println("prove: " + i2s(n_proved) + "/" + i2s(length(target_ids)) + " theorems proved" +
+				(if (!steps_mode || st == 0) "" else " (" + i2s(sc) + "/" + i2s(st) + " gap-steps closed)"));
+			if (not_proved != []) {
+				env.out.println("not proved (" + i2s(length(not_proved)) + "):\n" +
+					strGlue(map(not_proved, \id -> "    " + id2s(id)), "\n"));
+			};
+		};
 		Some(RuState(new_state with
 			vars = setTree(new_state.vars, "prove", pairs2tree([
-				Pair("proved-count",    flow(^proved_count)),
+				Pair("proved-count",    flow(n_proved)),
 				Pair("failed-count",    flow(length(not_proved))),
 				Pair("failed-theorems", flow(map(not_proved, id2s)))
 			]))
