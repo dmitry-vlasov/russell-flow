@@ -1,5 +1,10 @@
 # Russell Flow
 
+## Communication
+- Keep answers brief and clear.
+- Use simple words and plain vocabulary.
+- No idioms.
+
 ## Stack
 - Language: Flow9 (functional, statically typed) → compiled to `src/russell.jar`
 - Math formats: Russell `.ru` (native) and Metamath `.mm`
