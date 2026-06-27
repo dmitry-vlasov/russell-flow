@@ -459,7 +459,8 @@ ruTacticDocs() -> [RuTacticDoc] {
 			"Score every open leaf with the loaded ML models (feature / medoid / LGG / k-NN) and expand the frontier in best-first order. The pure ML-ranked expander, unbounded on its own — wrap in `limited` for the usual bounded top-k beam:\n  limited(ml, batch=k, size=N, depth=D)\nNeeds an ML selector in context (load-ml=1 / learn-assertions). (`apply` was removed: write `scoped(a1, …, ak, <search>)`.)"),
 		dp("atoms", "ap(a, child, ...)",            "replay a positional proof tree: assertion `a` applied at the goal, each child proving a premise in order", [p("a", "the assertion applied at this node"), p("child ...", "each child: a nested ap(...) or `prem` (a premise discharged by a hyp / prior step)")]),
 		d ("atoms", "kalmar-closer",                "propositional closer: unfold membership atoms + Kalmar certificate [PRUNE-CANDIDATE]"),
-		dp("atoms", "checker(closer=<tactic>)",     "Mizar-style refutation closer: unfold membership atoms + fresh Hilbert certificate (hilbert.flow); on emitter failure runs the optional closer= finisher", [p("closer", "fallback tactic when the emitter cannot certify (e.g. limited(bfs,...)); omit for a no-op")]),
+		d ("atoms", "hilbert",                      "the Hilbert-certificate emitter PRIMITIVE: unfold membership atoms + fresh refutation certificate (hilbert.flow), installed directly; no-op when the gap is not certifiable. Composable in any combinator."),
+		dp("atoms", "checker(closer=<tactic>)",     "Mizar-style refutation-closer PRESET = hilbert + an optional fallback finisher; checker(closer=X) == or-else(hilbert, X)", [p("closer", "fallback tactic when the emitter cannot certify (e.g. limited(bfs,...)); omit for a no-op")]),
 		dp("atoms", "linear-guided(attempts)", "guide search by linear goal->premise chains from the corpus (unbounded; wrap in limited)", [p("attempts", "how many goal->premise chains to try")]),
 		dp("atoms", "follow-proof(theorem)",        "replay a named theorem's stored proof tree (diagnostic)", [p("theorem", "name of the theorem whose stored proof tree to replay")]),
 		dp("atoms", "oracle(max-true-props, ...)",  "drive search by the theorem's own proof tree (oracle stubs map proof nodes onto prover props)", [p("max-true-props", "oracle-mapped props expanded per iteration (negative = unlimited)"), p("max-false-props", "non-oracle-mapped leaves expanded per iteration (negative = unlimited)"), p("max-variants", "assertion-unification variants offered: the oracle's + N fallbacks (negative = oracle only)"), p("max-proofs", "premise-proof variants offered: the oracle's + N fallbacks (negative = oracle only)")]),
@@ -596,6 +597,7 @@ ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTactic
 	else if (n == "ap")              ruTagBuilder("ap", ruDslBuildAp(ast, ctx))
 	else if (n == "kalmar-closer")   ruTagBuilder("kalmar-closer", ruDslBuildKalmarCloser(ast, ctx))
 	else if (n == "checker")         ruTagBuilder("checker", ruDslBuildCheckerCloser(ast, ctx))
+	else if (n == "hilbert")         ruTagBuilder("hilbert", ruDslBuildHilbert(ast, ctx))
 	else if (n == "replay")          ruDslBuildRealizer(ast, ctx, "replay", ruReplayRealize)
 	else if (n == "linear-guided")   ruTagBuilder("linear-guided", ruDslBuildLinearGuided(ast, ctx))
 	else if (n == "follow-proof")    ruTagBuilder("follow-proof", ruDslBuildFollowProof(ast, ctx))
@@ -668,21 +670,15 @@ ruDslBuildKalmarCloser(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTact
 	}))
 }
 
-// The propositional CHECKER (`checker`): the Mizar-style refutation closer. Same equalizer unfold-with-
-// proof front-end as kalmar-closer (membership unfold + congruence), but the residual `hyps ⊢ goal'` is
-// discharged by the FRESH Kalmár-free Hilbert certificate emitter (hilbert.flow) — a deduction-form proof
-// over the rich propositional library, verified by construction. A no-op (ruDoneTactic) when goal' is not
-// a propositional consequence, so it composes in seq(...) after structural refiners (e.g. strip-forall).
-ruDslBuildCheckerCloser(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
-	// MODULARITY #1 — `closer=<tactic>`: the pluggable FINISHER run when the Hilbert emitter cannot certify
-	// the gap (refuted-but-emitter-incomplete, or outside the emitter's reach). Default = none → ruDoneTactic
-	// (a no-op, so bare `checker` is unchanged and keeps composing in or-else(...)). With a closer,
-	// `checker(closer=limited(bfs,...))` tries the emitter first and the given search second, as ONE atom —
-	// the seam where a bounded BFS, spr, or a future witness/∃ tactic plugs in.
-	closerAstMb = switch (ruDslGetArg(ast, "closer", 99)) {
-		None(): None();
-		Some(v): switch (v) { RuTacticValAst(sub): Some(sub); RuTacticValLit(__): None(); };
-	};
+// MODULARITY #2 — the Hilbert emitter as a composable PRIMITIVE (`hilbert`). strip ∀, prove the body with
+// the fresh Kalmár-free certificate emitter (hilbert.flow: refutation + deneg + ⊆/=/∈ bridge + membership
+// unfold — a deduction-form proof over the rich propositional library, verified by construction), re-quantify
+// with ax-gen, and INSTALL directly. Direct install (not replay(refine(closer=…))) is essential: the replay
+// realizer re-derives via the engine and can't reconstruct the emitter's interleaved ssrdv/deneg bridge steps,
+// losing the ¬-form ⊆-transitivity class (t1 etc.). prove.flow re-verifies installed proofs, so it stays sound.
+// On emitter failure run `closerAstMb` (the pluggable finisher), else ruDoneTactic (a no-op that composes in
+// or-else/seq). `hilbert` passes None; `checker(closer=X)` passes X — so `checker(closer=X)` ≡ or-else(hilbert,X).
+ruBuildHilbertEmitter(closerAstMb : Maybe<RuTacticAst>, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
 	Some(RuTacticBuilder(\penv -> {
 		task     = penv.conf.task;
 		goalStmt = task.goal.stmt;
@@ -694,7 +690,7 @@ ruDslBuildCheckerCloser(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTac
 		wff      = tp2id_("wff");
 		em       = RuEnvMath(ctx.math, ctx.env);
 		// The fallback finisher, REBUILT fresh per call (a closer's internal delta-snapshot ref must not leak
-		// across sub-proves); runs on the full prover env/goal. None → ruDoneTactic (preserves old behavior).
+		// across sub-proves); runs on the full prover env/goal. None → ruDoneTactic (the bare-primitive case).
 		runCloser = \ -> switch (closerAstMb) {
 			Some(sub): switch (ruBuildTacticFromAst(sub, ctx)) {
 				Some(b): (b.build(penv)).second;
@@ -702,11 +698,6 @@ ruDslBuildCheckerCloser(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTac
 			};
 			None(): ruDoneTactic;
 		};
-		// STANDALONE INSTALL tactic (not a search/replay closer): strip ∀, prove the body with the Hilbert
-		// emitter (refutation + deneg + ⊆/=/∈ bridge + membership unfold), re-quantify with ax-gen, and
-		// INSTALL the proof directly. Direct install (not replay(refine(closer=…))) is essential: the replay
-		// realizer re-derives via the engine and can't reconstruct the emitter's ssrdv/deneg steps, losing
-		// the ¬-form ⊆-transitivity class (t1 etc.). prove.flow re-verifies installed proofs, so it stays sound.
 		axgen = \tree -> fold(sp.second, tree, \acc, lvl -> RuProofStep(s2id_("ax-gen"), [acc], RuStmt(stmtClass, [lvl], -1)));
 		tactic = switch (ruHilbertCertificate(em, conn, wff, stmtClass, hypExps, body)) {
 			Some(pr): switch (pr.first) {
@@ -717,6 +708,26 @@ ruDslBuildCheckerCloser(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTac
 		};
 		Pair(penv, tactic);
 	}))
+}
+
+// `hilbert`: the bare emitter primitive (no fallback), composable in any combinator — or-else(hilbert, bfs),
+// seq(some-refiner, hilbert), first(hilbert, kalmar-closer), … It also accepts closer= for symmetry.
+ruDslBuildHilbert(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+	ruBuildHilbertEmitter(ruDslCloserArg(ast), ctx)
+}
+
+// `checker(closer=<tactic>)`: the Mizar-style refutation-closer PRESET = the hilbert emitter plus a pluggable
+// fallback finisher (MODULARITY #1). checker(closer=X) ≡ or-else(hilbert, X); bare `checker` ≡ `hilbert`.
+ruDslBuildCheckerCloser(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+	ruBuildHilbertEmitter(ruDslCloserArg(ast), ctx)
+}
+
+// extract the optional `closer=<tactic>` AST from an atom invocation (shared by hilbert / checker).
+ruDslCloserArg(ast : RuTacticAst) -> Maybe<RuTacticAst> {
+	switch (ruDslGetArg(ast, "closer", 99)) {
+		None(): None();
+		Some(v): switch (v) { RuTacticValAst(sub): Some(sub); RuTacticValLit(__): None(); };
+	}
 }
 
 
@@ -1216,7 +1227,7 @@ ruParseAndBuildTactic(src : string, ctx : RuTacticContext) -> Maybe<RuTacticBuil
 // above. Used to decide whether a tactic= head is a built-in (→ inline) or a candidate .tac file ref:
 // a built-in always wins over a same-named file.
 ruBuiltinTacticNames() -> [string] {
-	["bfs", "done", "giveup", "spr", "fragment-replay", "ml", "ap", "kalmar-closer", "checker", "replay",
+	["bfs", "done", "giveup", "spr", "fragment-replay", "ml", "ap", "kalmar-closer", "checker", "hilbert", "replay",
 	 "linear-guided", "follow-proof", "oracle", "seq", "or-else", "loop", "limited", "focus", "track", "scoped"]
 }
 ruIsBuiltinTacticName(n : string) -> bool { exists(ruBuiltinTacticNames(), \b -> b == n) }
