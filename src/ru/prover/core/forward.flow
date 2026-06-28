@@ -1,6 +1,7 @@
 import ru/prover/core/env;
 import ru/prover/core/tree;
 import ru/prover/core/proofs;
+import ru/prover/core/util;
 
 // ---------------------------------------------------------------------------
 // P1 of bidirectional search: a DYNAMIC forward front, grown one node per call.
@@ -29,20 +30,10 @@ import ru/prover/core/proofs;
 // forward parent chain, so the sentinel top is safe.
 // ---------------------------------------------------------------------------
 
-export {
-	RuProverForward(
-		// Produced facts keyed by expression: dedup during growth and the
-		// lookup structure a P2 join will poll.
-		index    : RuIndex<RuProverExp>,
-		// Facts created but not yet forward-expanded (the frontier).
-		front    : [RuProverExp],
-		// Single-hypothesis assertions keyed by their hypothesis expression,
-		// giving ruUnifyIndex a head-symbol pre-filter for free.
-		hypIndex : RuIndex<RuAssertion>,
-		// Structural keys of every fact seen, to avoid re-deriving duplicates.
-		seen     : Set<string>
-	);
+// RuProverForward is defined in core/env.flow (so RuProverEnv can hold one
+// without a circular import); this module provides its operations.
 
+export {
 	// Seed the front with the task premises (each paired with its theorem-hyp
 	// index) and build the single-hyp assertion index. assertions is the same
 	// index ruInitProverEnv is handed.
@@ -112,6 +103,19 @@ export {
 	// hypothesis reference (so a forward proof can never reference a backward
 	// node, which is WHY the front is acyclic by construction).
 	ruForwardFactSound(fact : RuProverExp) -> bool;
+
+	// ----- P2b: wire the proof-carrying front into the live engine ------------
+	// If forward-search-depth > 0 in the task args, build the proof-carrying
+	// forward front (to that depth, capped by forward-search-size) and install it
+	// in prover_env.forwardFront, so the backward splice in expand.flow can close
+	// leaves with forward-derived proofs. A no-op when the flag is 0 — then the
+	// engine is byte-identical to today. Must be called AFTER prover_env is fully
+	// constructed (it grows the front through prover_env's ruAddProof).
+	ruMaybeBuildForwardFront(
+		prover_env : RuProverEnv,
+		task       : RuProverTask,
+		assertions : RuIndex<RuAssertion>
+	) -> void;
 }
 
 ruInitProverForward(
@@ -359,5 +363,33 @@ ruProofTreeGrounded(t : RuProofTree) -> bool {
 	switch (t) {
 		RuProofHyp(ind, __):       ind >= 0;
 		RuProofStep(__, kids, __): forall(kids, ruProofTreeGrounded);
+	}
+}
+
+ruMaybeBuildForwardFront(
+	prover_env : RuProverEnv,
+	task       : RuProverTask,
+	assertions : RuIndex<RuAssertion>
+) -> void {
+	depth = {
+		v = lookupTreeDef(task.args, "forward-search-depth", "0");
+		if (runtimeValueType(v) == "int") cast(v : flow -> int) else s2i(cast(v : flow -> string));
+	};
+	if (depth > 0) {
+		size = {
+			v = lookupTreeDef(task.args, "forward-search-size", "2048");
+			if (runtimeValueType(v) == "int") cast(v : flow -> int) else s2i(cast(v : flow -> string));
+		};
+		// Same const form prover_env.math uses (ruConstProverTask is deterministic),
+		// so seeds / proofs live in the prover's variable space.
+		c_task = ruConstProverTask(task, prover_env.math);
+		fwd0 = ruInitProverForwardProved(c_task.const.premises, assertions, prover_env.math, prover_env.env);
+		final_fwd = foldRange(1, depth, fwd0, \fwd, __ ->
+			fold(fwd.front, RuProverForward(fwd with front = []), \st, fact ->
+				if (ruIndexDataCount(st.index) >= size) st
+				else ruExpandForwardProved(st, fact, prover_env).first
+			)
+		);
+		prover_env.forwardFront := Some(final_fwd);
 	}
 }
