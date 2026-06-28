@@ -104,6 +104,11 @@ export {
 	// node, which is WHY the front is acyclic by construction).
 	ruForwardFactSound(fact : RuProverExp) -> bool;
 
+	// Number of steps in a fact's (first) proof tree — a uniform "shallowness"
+	// measure for ordering join candidates (works for both single- and multi-hyp
+	// facts, unlike the dep-key count which a multi-hyp fact leaves empty).
+	ruForwardProofSize(fact : RuProverExp) -> int;
+
 	// ----- P2b: wire the proof-carrying front into the live engine ------------
 	// If forward-search-depth > 0 in the task args, build the proof-carrying
 	// forward front (to that depth, capped by forward-search-size) and install it
@@ -138,7 +143,14 @@ ruInitProverForward(
 	);
 	seen0 = fold(seed_facts, makeSet(), \acc, f -> insertSet(acc, ruExpKey(ruExp(f.stmt.exps[0]))));
 	idx0  = fold(seed_facts, ruMakeIndex(), \acc, f -> ruSetIndex(ruExp(f.stmt.exps[0]), f, acc));
-	RuProverForward(idx0, seed_facts, hyp_index, seen0);
+	RuProverForward(idx0, seed_facts, hyp_index, ruMakeIndex(), seen0);
+}
+
+// A bare metavariable hypothesis (the whole expr is a single variable node)
+// matches every fact, so it must NOT be a forward trigger — it is filled from
+// the front instead. Anything with structure (or a nullary constant) is fine.
+ruHypIsBareVar(h : RuExp) -> bool {
+	length(h.nodes) == 1 && switch (h.nodes[0]) { RuVar(__, __): true; default: false; };
 }
 
 ruExpandForward(
@@ -199,6 +211,7 @@ ruExpandForward(
 							ruSetIndex(conc_exp, produced_fact, st.index),
 							arrayPush(st.front, produced_fact),
 							st.hypIndex,
+							st.multiHyp,
 							insertSet(st.seen, key)
 						),
 						arrayPush(produced, produced_fact)
@@ -220,6 +233,15 @@ ruInitProverForwardProved(
 		h = ass.infer.hyps[0];
 		ruSetIndex(ruExp(h.stmt.exps[0]), ass, acc);
 	});
+	// Multi-hyp (>=2) assertions: index each rule-headed hyp by its expression,
+	// paired with its position, as a forward trigger.
+	multi_asses = filter(ruIndexValues(assertions), \ass -> length(ass.infer.hyps) >= 2);
+	multi_index = fold(multi_asses, ruMakeIndex(), \acc, ass ->
+		foldi(ass.infer.hyps, acc, \i, ac, h -> {
+			he = ruExp(h.stmt.exps[0]);
+			if (ruHypIsBareVar(he)) ac else ruSetIndex(he, RuFwdHyp(ass, i), ac);
+		})
+	);
 	// Each premise seeds a forward "top" carrying a trivial proof variant: a
 	// RuProverProofTop hypothesis reference (ruMakeProofTree -> RuProofHyp(ind)).
 	// premise.ind is the theorem-hyp index the verifier expects.
@@ -230,7 +252,24 @@ ruInitProverForwardProved(
 	});
 	seen0 = fold(seed_facts, makeSet(), \acc, f -> insertSet(acc, ruExpKey(ruExp(f.stmt.exps[0]))));
 	idx0  = fold(seed_facts, ruMakeIndex(), \acc, f -> ruSetIndex(ruExp(f.stmt.exps[0]), f, acc));
-	RuProverForward(idx0, seed_facts, hyp_index, seen0);
+	RuProverForward(idx0, seed_facts, hyp_index, multi_index, seen0);
+}
+
+// Add one produced fact to the front: index it, push to the frontier and the
+// produced list, mark its key seen.
+ruFwdRegister(
+	st : RuProverForward, produced : [RuProverExp],
+	pf : RuProverExp, conc_exp : RuExp, key : string
+) -> Pair<RuProverForward, [RuProverExp]> {
+	Pair(
+		RuProverForward(
+			ruSetIndex(conc_exp, pf, st.index),
+			arrayPush(st.front, pf),
+			st.hypIndex, st.multiHyp,
+			insertSet(st.seen, key)
+		),
+		arrayPush(produced, pf)
+	);
 }
 
 ruExpandForwardProved(
@@ -242,7 +281,7 @@ ruExpandForwardProved(
 	env  = prover_env.env;
 	fact_exp = ruExp(fact.stmt.exps[0]);
 	candidates = ruUnifyIndex(fact_exp, fwd.hypIndex, ruEmptySubst, math, env);
-	fold(candidates, Pair(fwd, []), \acc, cand -> {
+	after_single = fold(candidates, Pair(fwd, []), \acc, cand -> {
 		st        = acc.first;
 		produced  = acc.second;
 		assertion = cand.data;
@@ -316,15 +355,59 @@ ruExpandForwardProved(
 							)
 						)
 					);
-					Pair(
-						RuProverForward(
-							ruSetIndex(conc_exp, produced_fact, st.index),
-							arrayPush(st.front, produced_fact),
-							st.hypIndex,
-							insertSet(st.seen, key)
-						),
-						arrayPush(produced, produced_fact)
-					);
+					ruFwdRegister(st, produced, produced_fact, conc_exp, key);
+				}
+			}
+		}
+	});
+	// ----- multi-hypothesis (n = 2) forward step: forward modus ponens etc. ---
+	// Trigger on a rule-headed hyp i of a 2-hyp assertion matched by `fact`; fill
+	// the OTHER hyp from the front; emit the conclusion. The proof is built
+	// directly from the two input facts' proof trees (the same engine mechanism
+	// the static forward closure uses, ruSpliceForwardWitness), stored as a
+	// RuProverProofForward — premise-grounded, so still acyclic by construction.
+	multi_cands = ruUnifyIndex(fact_exp, fwd.multiHyp, ruEmptySubst, math, env);
+	fold(multi_cands, after_single, \acc, cand -> {
+		fh = cand.data;
+		assertion = fh.assertion;
+		i = fh.pos;
+		hyps = assertion.infer.hyps;
+		if (length(hyps) != 2 || sizeVector(fact.proofs) == 0) acc else {
+			j = 1 - i;
+			a_vars   = ruAssertion2Vars(assertion);
+			fresh_sub = ruMakeFresherSubst(set2array(a_vars), prover_env.fns.fresher);
+			fresh_i = ruApplySubst(ruExp(hyps[i].stmt.exps[0]), fresh_sub);
+			fresh_j = ruApplySubst(ruExp(hyps[j].stmt.exps[0]), fresh_sub);
+			fresh_c = ruApplySubst(ruExp(assertion.infer.prop.exps[0]), fresh_sub);
+			switch (ruUnifyExps([fresh_i, fact_exp], ruEmptySubst, math, env)) {
+				None(): acc;
+				Some(sigma): {
+					f_tree  = ruMakeProofTree(vector2array(fact.proofs)[0]);
+					search_j = ruApplySubst(fresh_j, sigma);
+					matches  = ruUnifyIndex(search_j, acc.first.index, ruEmptySubst, math, env);
+					capped   = if (length(matches) > 8) take(matches, 8) else matches;
+					fold(capped, acc, \acc2, mj -> {
+						st2 = acc2.first;
+						produced2 = acc2.second;
+						gfact = mj.data;
+						tau   = mj.sub;
+						if (sizeVector(gfact.proofs) == 0) acc2 else {
+							conc = ruApplySubst(ruApplySubst(fresh_c, sigma), tau);
+							key  = ruExpKey(conc);
+							if (containsSet(st2.seen, key)) acc2 else {
+								g_tree = ruMakeProofTree(vector2array(gfact.proofs)[0]);
+								// Both inputs' proofs, specialised by tau to the final binding.
+								tree_i = ruApplySubst2ProofNode(tau, f_tree);
+								tree_j = ruApplySubst2ProofNode(tau, g_tree);
+								kids   = if (i == 0) [tree_i, tree_j] else [tree_j, tree_i];
+								conc_stmt = RuStmt(assertion.infer.prop with exps = [conc]);
+								proof_tree = RuProofStep(assertion.info.id, kids, conc_stmt);
+								pf = RuProverExp(0, makeVector(4), conc_stmt, makeVector(0), ruNoProverProp);
+								pushVector(pf.proofs, RuProverProofForward(pf, conc_stmt, ruUnsafeCompose(sigma, tau), proof_tree));
+								ruFwdRegister(st2, produced2, pf, conc, key);
+							}
+						}
+					});
 				}
 			}
 		}
@@ -364,6 +447,11 @@ ruProofTreeGrounded(t : RuProofTree) -> bool {
 		RuProofHyp(ind, __):       ind >= 0;
 		RuProofStep(__, kids, __): forall(kids, ruProofTreeGrounded);
 	}
+}
+
+ruForwardProofSize(fact : RuProverExp) -> int {
+	if (sizeVector(fact.proofs) == 0) 0
+	else length(ruProofTreeSteps(ruMakeProofTree(vector2array(fact.proofs)[0])));
 }
 
 ruMaybeBuildForwardFront(
