@@ -1,0 +1,304 @@
+import ru/prover/core/env;
+import ru/prover/core/tree;
+import ru/prover/core/proofs;
+
+// ---------------------------------------------------------------------------
+// P1 of bidirectional search: a DYNAMIC forward front, grown one node per call.
+//
+// This is the structural mirror of ruExpandHyp (core/expand.flow). Where
+// ruExpandHyp matches a GOAL against assertion CONCLUSIONS and fans the
+// assertion's hypotheses into child subgoals, ruExpandForward matches a known
+// FACT against assertion HYPOTHESES and emits the assertion's CONCLUSION as a
+// new derived fact. Same `unify -> substitute -> emit` primitive, same node
+// records (RuProverProp / RuProverExp) — see [[engine-owns-proofs]].
+//
+// SCOPE OF P1 (deliberately minimal, fully additive):
+//   - single-hypothesis assertions only;
+//   - builds PVT STRUCTURE + a forward index, NO proof variants and NO
+//     propagation (a fresh forward node has nothing below it, so nothing
+//     propagates — eager propagation fires only at a JOIN, which is P2);
+//   - lives in its own module and is not wired into RuProverEnv, so with the
+//     forward front unused the engine is byte-for-byte today's engine
+//     (the additivity invariant).
+//
+// ORIENTATION. A produced fact is a forward "top" (like the backward ROOT it
+// has no consumer yet), so its RuProverExp.parent is the ruNoProverProp
+// sentinel. The derivation step propA links downward: propA.parent = the
+// produced fact, propA.children = [the input fact]. P2 wires the join and the
+// upward propagation that this orientation enables; until then nothing walks a
+// forward parent chain, so the sentinel top is safe.
+// ---------------------------------------------------------------------------
+
+export {
+	RuProverForward(
+		// Produced facts keyed by expression: dedup during growth and the
+		// lookup structure a P2 join will poll.
+		index    : RuIndex<RuProverExp>,
+		// Facts created but not yet forward-expanded (the frontier).
+		front    : [RuProverExp],
+		// Single-hypothesis assertions keyed by their hypothesis expression,
+		// giving ruUnifyIndex a head-symbol pre-filter for free.
+		hypIndex : RuIndex<RuAssertion>,
+		// Structural keys of every fact seen, to avoid re-deriving duplicates.
+		seen     : Set<string>
+	);
+
+	// Seed the front with the task premises (each paired with its theorem-hyp
+	// index) and build the single-hyp assertion index. assertions is the same
+	// index ruInitProverEnv is handed.
+	ruInitProverForward(
+		premises   : [Pair<RuExp, int>],
+		assertions : RuIndex<RuAssertion>,
+		math       : RuMath,
+		env        : RuEnv
+	) -> RuProverForward;
+
+	// Expand ONE forward fact: match it against every single-hyp assertion
+	// hypothesis and emit the resulting conclusions as new facts. Returns the
+	// updated front state; the second component is the freshly produced facts
+	// (so a caller / test can inspect exactly what this one step derived).
+	ruExpandForward(
+		fwd        : RuProverForward,
+		fact       : RuProverExp,
+		fresher    : (RuVar) -> RuVar,
+		idxer      : () -> int,
+		math       : RuMath,
+		env        : RuEnv
+	) -> Pair<RuProverForward, [RuProverExp]>;
+
+	// ----- P2: forward proof building + the join -----------------------------
+	// Same as ruInitProverForward, but each premise seed carries a real proof
+	// variant (a RuProverProofTop hypothesis reference), so ruExpandForwardProved
+	// can chain proofs through ruAddProof. cpremises must be in the prover's
+	// const form (the form prover_env.math uses).
+	ruInitProverForwardProved(
+		cpremises  : [RuPremise],
+		assertions : RuIndex<RuAssertion>,
+		math       : RuMath,
+		env        : RuEnv
+	) -> RuProverForward;
+
+	// Like ruExpandForward, but additionally BUILDS each produced fact's proof
+	// variants by routing the input fact's proofs through the engine's ruAddProof
+	// (no hand-built proofs — the law-abiding path). The produced fact ends up
+	// with RuProverProofStmt variants in its .proofs, ready to be grafted at a
+	// join. Needs a real RuProverEnv for ruAddProof / fresher / idxer.
+	ruExpandForwardProved(
+		fwd        : RuProverForward,
+		fact       : RuProverExp,
+		prover_env : RuProverEnv
+	) -> Pair<RuProverForward, [RuProverExp]>;
+}
+
+ruInitProverForward(
+	premises   : [Pair<RuExp, int>],
+	assertions : RuIndex<RuAssertion>,
+	math       : RuMath,
+	env        : RuEnv
+) -> RuProverForward {
+	one_hyp_asses = filter(ruIndexValues(assertions), \ass ->
+		length(ass.infer.hyps) == 1
+	);
+	hyp_index = fold(one_hyp_asses, ruMakeIndex(), \acc, ass -> {
+		h = ass.infer.hyps[0];
+		ruSetIndex(ruExp(h.stmt.exps[0]), ass, acc);
+	});
+	// Each premise becomes a forward "top": a RuProverExp with the premise's
+	// theorem-hyp index as `ind`, no proofs (P1), no children, sentinel parent.
+	seed_facts = map(premises, \p ->
+		RuProverExp(p.second, makeVector(0), RuStmt(ruNoStmt with exps = [p.first]), makeVector(0), ruNoProverProp)
+	);
+	seen0 = fold(seed_facts, makeSet(), \acc, f -> insertSet(acc, ruExpKey(ruExp(f.stmt.exps[0]))));
+	idx0  = fold(seed_facts, ruMakeIndex(), \acc, f -> ruSetIndex(ruExp(f.stmt.exps[0]), f, acc));
+	RuProverForward(idx0, seed_facts, hyp_index, seen0);
+}
+
+ruExpandForward(
+	fwd     : RuProverForward,
+	fact    : RuProverExp,
+	fresher : (RuVar) -> RuVar,
+	idxer   : () -> int,
+	math    : RuMath,
+	env     : RuEnv
+) -> Pair<RuProverForward, [RuProverExp]> {
+	fact_exp = ruExp(fact.stmt.exps[0]);
+	// Head-symbol prefilter via the hyp index. The candidate subs use the
+	// assertion's ORIGINAL var ids, which may COLLIDE with the fact's own vars
+	// (assertions and a raw fact draw from the same id space). So we do NOT use
+	// those subs directly: like ruIterAssertionsForFact, we freshen the
+	// assertion's vars FIRST, then re-unify the fresh hyp against the fact. This
+	// keeps the assertion var namespace disjoint from the fact's, avoiding the
+	// variable capture that over-specialises the conclusion. (ruExpandHyp can
+	// freshen AFTER only because the backward prover runs on const-form goals
+	// whose vars never collide with assertion vars — a forward primitive must
+	// not assume that.)
+	candidates = ruUnifyIndex(fact_exp, fwd.hypIndex, ruEmptySubst, math, env);
+	fold(candidates, Pair(fwd, []), \acc, cand -> {
+		st        = acc.first;
+		produced  = acc.second;
+		assertion = cand.data;
+		a_vars    = ruAssertion2Vars(assertion);
+		fresh_sub = ruMakeFresherSubst(set2array(a_vars), fresher);
+		fresh_hyp = ruApplySubst(ruExp(assertion.infer.hyps[0].stmt.exps[0]), fresh_sub);
+		switch (ruUnifyExps([fresh_hyp, fact_exp], ruEmptySubst, math, env)) {
+			None(): acc;
+			Some(step_sub): {
+				// conclusion under fresh_sub then step_sub (= closure's new_exp).
+				conc_exp = ruApplySubst(ruApplySubst(ruExp(assertion.infer.prop.exps[0]), fresh_sub), step_sub);
+				key = ruExpKey(conc_exp);
+				if (containsSet(st.seen, key)) acc else {
+					// Bindings stored for P2 proof building (conclusion itself is
+					// authoritative in the stmt; sub/outer get validated at P2):
+					// outer = original assertion var -> value (fresh_sub then step_sub),
+					// sub   = the residual fresh/fact-var bindings.
+					effective = ruUnsafeCompose(fresh_sub, step_sub);
+					outer = ruFilterSub(effective, \v, __ ->  containsSet(a_vars, v));
+					sub   = ruFilterSub(step_sub,  \v, __ -> !containsSet(a_vars, v));
+					produced_fact = RuProverExp(
+						0, makeVector(0),
+						RuStmt(assertion.infer.prop with exps = [conc_exp]),
+						makeVector(1), ruNoProverProp
+					);
+					propA = RuProverProp(
+						idxer(), assertion, makeVector(0),
+						sub, outer, makeVector(1),
+						produced_fact, ref ""
+					);
+					pushVector(propA.children, fact);
+					pushVector(produced_fact.children, propA);
+					Pair(
+						RuProverForward(
+							ruSetIndex(conc_exp, produced_fact, st.index),
+							arrayPush(st.front, produced_fact),
+							st.hypIndex,
+							insertSet(st.seen, key)
+						),
+						arrayPush(produced, produced_fact)
+					);
+				}
+			}
+		}
+	});
+}
+
+ruInitProverForwardProved(
+	cpremises  : [RuPremise],
+	assertions : RuIndex<RuAssertion>,
+	math       : RuMath,
+	env        : RuEnv
+) -> RuProverForward {
+	one_hyp_asses = filter(ruIndexValues(assertions), \ass -> length(ass.infer.hyps) == 1);
+	hyp_index = fold(one_hyp_asses, ruMakeIndex(), \acc, ass -> {
+		h = ass.infer.hyps[0];
+		ruSetIndex(ruExp(h.stmt.exps[0]), ass, acc);
+	});
+	// Each premise seeds a forward "top" carrying a trivial proof variant: a
+	// RuProverProofTop hypothesis reference (ruMakeProofTree -> RuProofHyp(ind)).
+	// premise.ind is the theorem-hyp index the verifier expects.
+	seed_facts = map(cpremises, \p -> {
+		sf = RuProverExp(p.ind, makeVector(4), p.stmt, makeVector(0), ruNoProverProp);
+		pushVector(sf.proofs, RuProverProofTop(sf, p.stmt, p, ruEmptySubst));
+		sf;
+	});
+	seen0 = fold(seed_facts, makeSet(), \acc, f -> insertSet(acc, ruExpKey(ruExp(f.stmt.exps[0]))));
+	idx0  = fold(seed_facts, ruMakeIndex(), \acc, f -> ruSetIndex(ruExp(f.stmt.exps[0]), f, acc));
+	RuProverForward(idx0, seed_facts, hyp_index, seen0);
+}
+
+ruExpandForwardProved(
+	fwd        : RuProverForward,
+	fact       : RuProverExp,
+	prover_env : RuProverEnv
+) -> Pair<RuProverForward, [RuProverExp]> {
+	math = prover_env.math;
+	env  = prover_env.env;
+	fact_exp = ruExp(fact.stmt.exps[0]);
+	candidates = ruUnifyIndex(fact_exp, fwd.hypIndex, ruEmptySubst, math, env);
+	fold(candidates, Pair(fwd, []), \acc, cand -> {
+		st        = acc.first;
+		produced  = acc.second;
+		assertion = cand.data;
+		a_vars    = ruAssertion2Vars(assertion);
+		fresh_sub = ruMakeFresherSubst(set2array(a_vars), prover_env.fns.fresher);
+		fresh_hyp = ruApplySubst(ruExp(assertion.infer.hyps[0].stmt.exps[0]), fresh_sub);
+		switch (ruUnifyExps([fresh_hyp, fact_exp], ruEmptySubst, math, env)) {
+			None(): acc;
+			Some(step_sub): {
+				conc_exp = ruApplySubst(ruApplySubst(ruExp(assertion.infer.prop.exps[0]), fresh_sub), step_sub);
+				key = ruExpKey(conc_exp);
+				if (containsSet(st.seen, key)) acc else {
+					// ruMakeProofTree rebuilds a non-root step's stmt as
+					// applySubst(assertion.prop, ruUnsafeCompose(prop.outer, theta)).
+					// We store prop.outer as the FULLY RESOLVED assertion-var bindings
+					// (assertion var -> its value in the conclusion) and leave prop.sub
+					// empty so theta is empty — then the rebuild is just
+					// applySubst(prop, outer) = conc_exp, exactly. Crucially the
+					// resolved values are computed with sequential ruApplySubst (which
+					// chases fresh_sub then step_sub), NOT ruUnsafeCompose: the latter
+					// applies via ruApplySubstVars, which does not chase a fresh
+					// placeholder produced here into its step_sub binding, leaving the
+					// rebuilt step with unresolved fresh vars. (The backward engine
+					// avoids this because its placeholders are resolved by child-proof
+					// thetas, not by a self-composed sub.)
+					outer = fold(set2array(a_vars), ruEmptySubst, \osub, v ->
+						either(
+							ruAdd2Subst(osub, v, ruApplySubst(ruApplySubst(RuExp([v], -1), fresh_sub), step_sub)),
+							osub
+						)
+					);
+					// step_sub can also bind the FACT's own vars (when the assertion's
+					// hyp is more specific than the fact, the forward step SPECIALISES
+					// the fact). Those bindings must reach the child proof so it proves
+					// the specialised fact — carry them in prop.sub, which ruAddProof
+					// folds into theta and ruMakeProofTree applies to the children.
+					// Dropping them makes ruAddProof's check_consistent reject the
+					// proof (the unspecialised fact no longer matches the hyp).
+					fact_vars = ruStmt2Vars(fact.stmt);
+					sub = ruFilterSub(step_sub, \v, __ -> containsSet(fact_vars, v));
+					produced_fact = RuProverExp(
+						0, makeVector(4),
+						RuStmt(assertion.infer.prop with exps = [conc_exp]),
+						makeVector(1), ruNoProverProp
+					);
+					propA = RuProverProp(
+						prover_env.fns.idxer(), assertion, makeVector(4),
+						sub, outer, makeVector(1),
+						produced_fact, ref ""
+					);
+					pushVector(propA.children, fact);
+					pushVector(produced_fact.children, propA);
+					// Build proofs the law-abiding way: route every proof variant of
+					// the input fact through ruAddProof, which builds propA's variants
+					// via the engine's substitution-unification (trivial here: single
+					// child, so each input variant yields one prop variant).
+					iterVector(fact.proofs, \pv -> ruAddProof(propA, pv, prover_env));
+					// Lift propA's prop-variants to produced_fact hyp-variants. This is
+					// the ruBuildPropProofs construction (proofs.flow) but STOPPED at
+					// produced_fact: we must NOT climb past it into the ruNoProverProp
+					// sentinel (that would reach the sentinel root and emit a bogus
+					// proof). The join (caller) is what connects produced_fact upward.
+					iterVector(propA.proofs, \pp ->
+						pushVector(produced_fact.proofs,
+							RuProverProofStmt(
+								produced_fact,
+								RuStmt(produced_fact.stmt with
+									exps = map(produced_fact.stmt.exps, \ex -> ruApplySubst(ruExp(ex), pp.sub))
+								),
+								pp.sub, pp
+							)
+						)
+					);
+					Pair(
+						RuProverForward(
+							ruSetIndex(conc_exp, produced_fact, st.index),
+							arrayPush(st.front, produced_fact),
+							st.hypIndex,
+							insertSet(st.seen, key)
+						),
+						arrayPush(produced, produced_fact)
+					);
+				}
+			}
+		}
+	});
+}
