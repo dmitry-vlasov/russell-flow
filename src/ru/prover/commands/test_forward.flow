@@ -1,0 +1,113 @@
+import ru/prover/core/forward;
+import ru/prover/core/util;
+import ru/util/target;
+import comm;
+
+// P1 cross-check: drive the dynamic forward front (ruExpandForward) and the
+// static forward closure (ruBuildForwardClosure) from IDENTICAL raw inputs
+// (one theorem's hypotheses as premises, the target assertion index) and assert
+// they derive the SAME set of fact expressions at depth=depth. This validates
+// that the new node-building forward expansion mirrors the proven closure
+// builder fact-for-fact, without yet touching the live engine (additivity).
+
+export {
+	ruCommTestForward : RuComm;
+}
+
+ruCommTestForward = RuComm(
+	RuCommInfo(
+		"test/forward", "prover",
+		"P1 cross-check: dynamic ruExpandForward vs static ruBuildForwardClosure on a theorem's premises",
+		"target", true, false,
+		[
+			RuCommArg("target", true, "a single theorem to take premises from", "all"),
+			RuCommArg("depth",  true, "forward depth to compare", "2"),
+			RuCommArg("size",   true, "closure size cap", "4096"),
+			RuCommArg("dump",   true, "1 = print the symmetric-difference expressions", "0")
+		], []
+	),
+	ruRunTestForward
+);
+
+// Alpha-invariant structural key: rename variables to canonical indices in
+// first-occurrence order, so facts that differ ONLY by fresh-var ids (the two
+// engines freshen with different id schemes) compare equal. Rule nodes and var
+// TYPES are kept verbatim.
+ruExpAlphaKey(e : RuExp) -> string {
+	m    = ref makeTree();
+	next = ref 0;
+	strGlue(map(e.nodes, \n -> switch (n) {
+		RuRuleNode(it, al): "r" + i2s(it) + ":" + i2s(al);
+		RuVar(id, type): {
+			ci = switch (lookupTree(^m, id)) {
+				Some(x): x;
+				None(): { x = ^next; m := setTree(^m, id, x); next := x + 1; x };
+			};
+			"v" + i2s(ci) + ":" + i2s(type);
+		};
+	}), " ");
+}
+
+ruRunTestForward(unit : RuUnit) -> Maybe<RuState> {
+	env   = ruUnitEnv(unit);
+	task  = unit.task;
+	state = unit.state;
+	math  = ruMathFromSources(state.ru, env);
+	target = ruDetermineTarget(task, math, env);
+	depth = ruTaskIntArg(task, "depth", 2);
+	size  = ruTaskIntArg(task, "size", 4096);
+
+	theorems = filtermap(ruTargetDecls(target, math, env), ruDecl2Theorem);
+	if (theorems == []) {
+		env.out.error("test/forward: target has no theorem", []);
+		Some(state);
+	} else {
+		th = theorems[0];
+		index = ruMakeIndexForTarget(target, math, env);
+		premises = mapi(th.infer.hyps, \i, h -> Pair(ruExp(h.stmt.exps[0]), i));
+
+		fresh_id = ref 0;
+		inc_fresh = ruAtomicIntAdd(fresh_id);
+		fresher = \v : RuVar -> RuVar(s2id(id2s(v.id) + "_tf" + i2s(inc_fresh(1))), v.type);
+		node_id = ref 0;
+		inc_node = ruAtomicIntAdd(node_id);
+		idxer = \ -> inc_node(1);
+
+		// Static reference: the existing, trusted forward closure.
+		closure = ruBuildForwardClosure(premises, index, fresher, math, env, depth, size);
+		closure_map = fold(ruIndexValues(closure), makeTree(), \acc, f -> setTree(acc, ruExpAlphaKey(f.exp), f.exp));
+		closure_keys = buildSet(getTreeKeys(closure_map));
+
+		// Dynamic: seed the front, then expand every frontier fact `depth` times.
+		fwd0 = ruInitProverForward(premises, index, math, env);
+		final_fwd = foldRange(1, depth, fwd0, \fwd, __ -> {
+			fold(fwd.front, RuProverForward(fwd with front = []), \st, fact ->
+				ruExpandForward(st, fact, fresher, idxer, math, env).first
+			)
+		});
+		dyn_map = fold(ruIndexValues(final_fwd.index), makeTree(), \acc, f -> setTree(acc, ruExpAlphaKey(ruExp(f.stmt.exps[0])), ruExp(f.stmt.exps[0])));
+		dyn_keys = buildSet(getTreeKeys(dyn_map));
+
+		only_closure = differenceSets(closure_keys, dyn_keys);
+		only_dyn     = differenceSets(dyn_keys, closure_keys);
+		ok = sizeSet(only_closure) == 0 && sizeSet(only_dyn) == 0;
+
+		if (ruTaskIntArg(task, "dump", 0) > 0) {
+			iter(take(set2array(only_closure), 12), \k ->
+				env.out.println("  only_closure: " + ru2s(lookupTreeDef(closure_map, k, ruNoExp), math)));
+			iter(take(set2array(only_dyn), 12), \k ->
+				env.out.println("  only_dynamic: " + ru2s(lookupTreeDef(dyn_map, k, ruNoExp), math)));
+		}
+
+		env.out.println(
+			"test/forward: theorem=" + id2s(th.info.id) +
+			" depth=" + i2s(depth) +
+			"  closure=" + i2s(sizeSet(closure_keys)) +
+			" dynamic=" + i2s(sizeSet(dyn_keys)) +
+			"  only_closure=" + i2s(sizeSet(only_closure)) +
+			" only_dynamic=" + i2s(sizeSet(only_dyn)) +
+			"  => " + (if (ok) "MATCH" else "MISMATCH")
+		);
+		Some(state);
+	}
+}
