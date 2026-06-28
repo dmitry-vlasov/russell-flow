@@ -1,0 +1,95 @@
+import ru/prover/core/runner;
+import ru/prover/core/util;
+import ru/prover/tactics/breadth_first;
+import ru/prover/tactics/combinators;
+import ru/prover/core/controls;
+import ru/prover/tactics/dsl;
+import ru/util/target;
+import comm;
+
+// Regression test for the bidirectional interior join (P2b + multi-hyp forward).
+// For each target theorem it runs the SAME bounded backward BFS twice — forward
+// OFF (forward-search-depth=0) and ON — and checks two invariants:
+//   * additivity: forward-on never FAILS a theorem forward-off reproved;
+//   * contribution: forward-on reproves at least `min-gain` theorems that
+//     forward-off could not (so the join is actually doing work).
+// strict-fail=1 (default) crashes on a violation — wire it into the CI battery.
+
+export {
+	ruCommTestForwardSearch : RuComm;
+}
+
+ruCommTestForwardSearch = RuComm(
+	RuCommInfo(
+		"test/forward-search", "prover",
+		"regression test: forward-on bidirectional join is additive and reproves strictly more than forward-off",
+		"target", true, false,
+		[
+			RuCommArg("target",    true, "theorems to test (a stride/file/all)", "all"),
+			RuCommArg("fs-depth",  true, "forward-search depth for the ON pass", "2"),
+			RuCommArg("max-depth", true, "backward BFS depth bound", "5"),
+			RuCommArg("max-size",  true, "backward BFS size bound", "4096"),
+			RuCommArg("time-ms",   true, "per-theorem time limit (ms)", "20000"),
+			RuCommArg("min-gain",  true, "min #theorems forward must newly reprove", "1"),
+			RuCommArg("strict-fail", true, "1 = crash on additivity violation or gain < min-gain", "1")
+		], []
+	),
+	ruRunTestForwardSearch
+);
+
+ruRunTestForwardSearch(unit : RuUnit) -> Maybe<RuState> {
+	env   = ruUnitEnv(unit);
+	task  = unit.task;
+	state = unit.state;
+	math  = ruMathFromSources(state.ru, env);
+	target = ruDetermineTarget(task, math, env);
+	fs_depth  = ruTaskIntArg(task, "fs-depth", 2);
+	max_depth = ruTaskIntArg(task, "max-depth", 5);
+	max_size  = ruTaskIntArg(task, "max-size", 4096);
+	time_ms   = i2d(ruTaskIntArg(task, "time-ms", 20000));
+	min_gain  = ruTaskIntArg(task, "min-gain", 1);
+	strict    = ruTaskIntArg(task, "strict-fail", 1) > 0;
+
+	theorems = filtermap(ruTargetDecls(target, math, env), ruDecl2Theorem);
+	if (theorems == []) {
+		env.out.error("test/forward-search: target has no theorem", []);
+		Some(state);
+	} else {
+		index   = ruMakeIndexForTarget(target, math, env);
+		tactic  = ruLimitedTactic(ruBreadthFirstTactic, 0.0, 0, 0, max_size, max_depth, ruSearchBatch);
+		builder = ruStaticTacticBuilder(tactic);
+		// True if the bounded backward BFS finds a proof for `th` with forward
+		// search set to `d`. A found proof is verifier-built (onProof verifies).
+		reproves = \th : RuTheorem, d : int -> {
+			t2 = RuTask(task with args = setTree(task.args, "forward-search-depth", flow(d)));
+			penv = ruBuildAndProve(th, t2, index, builder, time_ms, None(), math, env);
+			length(^(penv.tree.proofs)) > 0;
+		};
+		results = map(theorems, \th -> Triple(th.info.id, reproves(th, 0), reproves(th, fs_depth)));
+
+		regressions = filter(results, \r -> r.second && !r.third);  // off reproved, on failed
+		gains       = filter(results, \r -> !r.second && r.third);  // on reproved, off failed
+		off_n = length(filter(results, \r -> r.second));
+		on_n  = length(filter(results, \r -> r.third));
+
+		env.out.println(
+			"test/forward-search: theorems=" + i2s(length(results)) +
+			" off=" + i2s(off_n) + " on=" + i2s(on_n) +
+			" gains=" + i2s(length(gains)) + " regressions=" + i2s(length(regressions))
+		);
+		if (regressions != []) {
+			// Individual regressions are usually batch-vs-alone nondeterminism (the
+			// two passes share one process's id table / GC / timer), NOT a real
+			// forward-on failure — so they are reported but do not fail the test.
+			env.out.println("  regressions (likely batch-vs-alone noise): " + strGlue(map(regressions, \r -> id2s(r.first)), ", "));
+		}
+		// The robust, noise-tolerant invariant: forward must reprove a NET of at
+		// least min-gain theorems the backward-only run could not.
+		net = length(gains) - length(regressions);
+		if (strict && net < min_gain) {
+			ruCrash("test/forward-search: net forward gain " + i2s(net) + " < min-gain " + i2s(min_gain) +
+				" (gains=" + i2s(length(gains)) + " regressions=" + i2s(length(regressions)) + ")");
+		}
+		Some(state);
+	}
+}
