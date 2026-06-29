@@ -121,6 +121,14 @@ export {
 		task       : RuProverTask,
 		assertions : RuIndex<RuAssertion>
 	) -> void;
+
+	// Apply an assertion to n given fact E-nodes (one per hypothesis, in order),
+	// no front search — the top-down oracle uses this to replay a proof forward.
+	ruApplyForwardOn(
+		assertion : RuAssertion,
+		facts     : [RuProverExp],
+		prover_env : RuProverEnv
+	) -> Maybe<RuProverExp>;
 }
 
 ruInitProverForward(
@@ -277,6 +285,70 @@ ruProofTreeRoot(t : RuProofTree) -> RuExp {
 	switch (t) {
 		RuProofStep(__, __, st): ruExp(st.exps[0]);
 		RuProofHyp(__, st):       ruExp(st.exps[0]);
+	}
+}
+
+// Apply `assertion` to n GIVEN fact E-nodes (one per hypothesis, in order),
+// producing the conclusion fact — the same complete application as ruApplyForward
+// but with every hypothesis supplied directly (no front search). Used by the
+// top-down oracle to replay a proof forward. ruAddProof builds the one consistent
+// substitution across all n hypotheses; None if the facts don't fit / aren't
+// consistent. (Builds the conclusion's expression + proof substitution.)
+ruApplyForwardOn(
+	assertion : RuAssertion,
+	facts     : [RuProverExp],
+	prover_env : RuProverEnv
+) -> Maybe<RuProverExp> {
+	math = prover_env.math;
+	env  = prover_env.env;
+	hyps = assertion.infer.hyps;
+	n = length(hyps);
+	if (length(facts) != n) None() else {
+		a_vars = ruAssertion2Vars(assertion);
+		fresh_sub = fold(set2array(a_vars), ruEmptySubst, \fs, v ->
+			either(ruAdd2Subst(fs, v, RuExp([prover_env.fns.fresher(v)], -1)), fs)
+		);
+		fresh_hyps = map(hyps, \h -> ruApplySubst(ruExp(h.stmt.exps[0]), fresh_sub));
+		conc_tmpl  = ruApplySubst(ruExp(assertion.infer.prop.exps[0]), fresh_sub);
+		cnode = RuProverExp(0, makeVector(2), RuStmt(assertion.infer.prop with exps = [conc_tmpl]), makeVector(1), ruNoProverProp);
+		prop  = RuProverProp(prover_env.fns.idxer(), assertion, makeVector(4), ruEmptySubst, fresh_sub, makeVector(n), cnode, ref "");
+		pushVector(cnode.children, prop);
+		hyp_nodes = mapi(hyps, \j, h -> {
+			hn = RuProverExp(j, makeVector(4), RuStmt(h.stmt with exps = [fresh_hyps[j]]), makeVector(0), prop);
+			pushVector(prop.children, hn);
+			hn;
+		});
+		// Graft each given fact onto its hypothesis (match it to the hyp pattern).
+		all_fit = foldi(facts, true, \j, ok, fct -> {
+			if (!ok || sizeVector(fct.proofs) == 0) false else
+			switch (ruUnifyExps([fresh_hyps[j], ruExp(fct.stmt.exps[0])], ruEmptySubst, math, env)) {
+				None(): false;
+				Some(sigma): {
+					closing = RuStmt(hyp_nodes[j].stmt with exps = [ruApplySubst(fresh_hyps[j], sigma)]);
+					gtree = ruApplySubst2ProofNode(sigma, ruMakeProofTree(vector2array(fct.proofs)[0]));
+					pushVector(hyp_nodes[j].proofs, RuProverProofForward(hyp_nodes[j], closing, sigma, gtree));
+					true;
+				}
+			}
+		});
+		if (!all_fit) None() else {
+			if (n == 0) {
+				// 0-hypothesis assertion (an axiom): trivially proved, as the
+				// backward engine does for an arity-0 prop.
+				pushVector(prop.proofs, RuProverProofProp(prop, prop.sub, []));
+			} else {
+				iterVector(hyp_nodes[0].proofs, \g -> ruAddProof(prop, g, prover_env));
+			}
+			if (sizeVector(prop.proofs) == 0) None() else {
+				pp = vector2array(prop.proofs)[0];
+				conc = ruProofTreeRoot(ruMakeProofTree(pp));
+				conc_stmt = RuStmt(assertion.infer.prop with exps = [conc]);
+				pf = RuProverExp(0, makeVector(4), conc_stmt, makeVector(1), ruNoProverProp);
+				pushVector(pf.children, prop);
+				pushVector(pf.proofs, RuProverProofStmt(pf, conc_stmt, pp.sub, pp));
+				Some(pf);
+			}
+		}
 	}
 }
 
