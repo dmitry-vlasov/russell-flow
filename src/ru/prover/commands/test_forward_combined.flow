@@ -1,0 +1,144 @@
+import ru/prover/core/env;
+import ru/prover/core/expand;
+import ru/prover/core/prove;
+import ru/prover/core/forward;
+import ru/prover/core/util;
+import ru/prover/tactics/dsl;
+import ru/util/target;
+import ru/util/utils;
+import ru/proof_tree;
+import comm;
+
+// COMBINED oracle: the GENERAL bidirectional algorithm, no cut, no depth limit.
+// Level-2 fairly interleaves the two directions — one backward round (the oracle
+// expanding from the goal) then revealing one forward fact (derived from the
+// premises) — and Level-1's UNIVERSAL JOIN (both ways) connects them wherever a
+// forward fact meets a backward subgoal. A backward subgoal checks the forward
+// front (expand.flow); a revealed forward fact checks the backward front
+// (ruReverseJoin). They meet in the middle on their own; nothing chooses where.
+// onProof verifies the assembled proof. The combinatorial explosion of MP/cut is
+// the Level-2 selection's concern; Level-1 just expands and joins.
+
+export {
+	ruCommTestForwardCombined : RuComm;
+}
+
+// Forward-derive every proof node's fact (post-order, premises up) via the engine,
+// recording them in derivation order — the order the combined loop reveals them.
+ruCombinedDerive(node : RuProofTree, seeds : [RuProverExp], acc : ref [RuProverExp], prover_env : RuProverEnv) -> Maybe<RuProverExp> {
+	switch (node) {
+		RuProofHyp(h, __): if (h >= 0 && h < length(seeds)) Some(seeds[h]) else None();
+		RuProofStep(aid, children, __): {
+			cf = map(children, \c -> ruCombinedDerive(c, seeds, acc, prover_env));
+			facts = filtermap(cf, idfn);
+			if (length(facts) != length(cf)) None()
+			else {
+				res = ruApplyForwardOn(lookupTreeDef(prover_env.math.decls.assertions, aid, ruNoAxiom), facts, prover_env);
+				maybeApply(res, \f -> refArrayPush(acc, f));
+				res;
+			}
+		}
+	}
+}
+
+// Reveal one forward fact to the join: add it to the forward front and discharge
+// any backward subgoal it already covers (the reverse trigger).
+ruCombinedReveal(prover_env : RuProverEnv, pf : RuProverExp) -> void {
+	pf_exp = ruExp(pf.stmt.exps[0]);
+	maybeApply(^(prover_env.forwardFront), \front ->
+		prover_env.forwardFront := Some(RuProverForward(front with
+			index = ruSetIndex(pf_exp, pf, front.index),
+			seen  = insertSet(front.seen, ruExpKey(pf_exp))
+		))
+	);
+	ruReverseJoin(pf, prover_env);
+}
+
+// Fair interleave: one backward round, then reveal one forward fact, until proved.
+ruCombinedLoop(prover_env : RuProverEnv, facts : [RuProverExp], i : int, fuel : int) -> RuProverEnv {
+	if (ruTreeIsProved(prover_env.tree) || fuel <= 0) prover_env
+	else {
+		br = ruProveOneRound(prover_env);
+		benv = br.first;
+		if (ruTreeIsProved(benv.tree)) benv
+		else if (i < length(facts)) {
+			ruCombinedReveal(benv, facts[i]);
+			ruCombinedLoop(benv, facts, i + 1, fuel - 1);
+		} else if (br.second) {
+			ruCombinedLoop(benv, facts, i, fuel - 1);   // no more facts; keep going backward
+		} else {
+			benv;                                       // stuck
+		}
+	}
+}
+
+ruCommTestForwardCombined = RuComm(
+	RuCommInfo(
+		"test/forward-combined", "prover",
+		"combined oracle: fairly interleave backward + forward, meeting at the universal join; verify",
+		"target", true, false,
+		[
+			RuCommArg("target", true, "theorems to reconstruct", "all"),
+			RuCommArg("strict-fail", true, "1 = crash if any combined reconstruction fails", "0")
+		], []
+	),
+	ruRunTestForwardCombined
+);
+
+ruRunTestForwardCombined(unit : RuUnit) -> Maybe<RuState> {
+	env   = ruUnitEnv(unit);
+	task  = unit.task;
+	state = unit.state;
+	math  = ruMathFromSources(state.ru, env);
+	target = ruDetermineTarget(task, math, env);
+	theorems = filter(filtermap(ruTargetDecls(target, math, env), ruDecl2Theorem), ruTheoremIsProved);
+	if (theorems == []) {
+		env.out.error("test/forward-combined: target has no theorem", []);
+		Some(state);
+	} else {
+	one = \th : RuTheorem -> {
+		index = ruMakeIndexForTarget(RuTargetDecl(th), math, env);
+		prover_task = RuProverTask(th.info, ruDoneTactic, id2s(th.info.id), task.args, th.infer.hyps, ruProofQedStep(th.proof));
+		penv_pre = ruInitProverEnv(prover_task, math, env, index, 60000.0);
+		// Enable the universal join: install an (initially empty) forward front so
+		// backward subgoals get registered, and the reverse join is live.
+		penv_pre.forwardFront := Some(RuProverForward(ruMakeIndex(), [], ruMakeIndex(), ruMakeIndex(), makeSet()));
+		c_task    = ruConstProverTask(prover_task, math);
+		cpremises = c_task.const.premises;
+
+		// Forward facts to reveal, in premises-up order.
+		fwd0  = ruInitProverForwardProved(cpremises, index, penv_pre.math, env);
+		acc : ref [RuProverExp] = ref [];
+		ignore = ruCombinedDerive(ruTheoremProofTree(th, math), fwd0.front, acc, penv_pre);
+		facts = ^acc;
+
+		// Backward oracle + the interleave.
+		ctx = RuTacticContext(math, env, None(), None());
+		result = switch (ruParseAndBuildTactic("oracle(-1, -1)", ctx)) {
+			None(): "ORACLE-BUILD-FAILED";
+			Some(builder): {
+				built = builder.build(penv_pre);
+				penv0 = built.first;
+				penv0.tactic := Some(built.second);
+				penv1 = ruExpandHyp(penv0.tree.root, penv0);
+				penv  = ruCombinedLoop(penv1, facts, 0, length(facts) + 5000);
+				if (length(^(penv.tree.proofs)) > 0) "RECONSTRUCTED+VERIFIED" else "NOT-RECONSTRUCTED";
+			}
+		};
+		Pair(th.info.id, result);
+	};
+	results = map(theorems, one);
+	ok  = filter(results, \r -> r.second == "RECONSTRUCTED+VERIFIED");
+	bad = filter(results, \r -> r.second != "RECONSTRUCTED+VERIFIED");
+	if (length(theorems) == 1) {
+		env.out.println("test/forward-combined: theorem=" + id2s(results[0].first) + "  => " + results[0].second);
+	} else {
+		env.out.println("test/forward-combined: " + i2s(length(ok)) + "/" + i2s(length(results)) + " reconstructed+verified");
+		iter(take(bad, 12), \r -> env.out.println("  NOT-RECONSTRUCTED: " + id2s(r.first) + " => " + r.second));
+	};
+	if (ruTaskIntArg(task, "strict-fail", 0) > 0 && bad != []) {
+		ruCrash("test/forward-combined: failed for " + i2s(length(bad)) + " theorem(s)");
+	}
+	Some(state);
+	}
+}
