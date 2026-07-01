@@ -130,9 +130,13 @@ export {
 		prover_env : RuProverEnv
 	) -> Maybe<RuProverExp>;
 
-	// Universal join, forward->backward: discharge every open backward subgoal a
-	// new forward fact covers. Used by the combined driver after revealing a fact.
-	ruReverseJoin(pf : RuProverExp, prover_env : RuProverEnv) -> void;
+	// Universal join, forward->backward: discharge the open backward subgoal a new
+	// forward fact covers, at the SAME proof-DAG path (empty path = no positional
+	// constraint). Used by the combined driver after revealing a fact.
+	ruReverseJoin(pf : RuProverExp, path : string, prover_env : RuProverEnv) -> void;
+
+	// Positional proof-DAG path of a backward node (hypothesis-index sequence).
+	ruNodePath(h : RuProverHyp) -> string;
 }
 
 ruInitProverForward(
@@ -155,7 +159,7 @@ ruInitProverForward(
 	);
 	seen0 = fold(seed_facts, makeSet(), \acc, f -> insertSet(acc, ruExpKey(ruExp(f.stmt.exps[0]))));
 	idx0  = fold(seed_facts, ruMakeIndex(), \acc, f -> ruSetIndex(ruExp(f.stmt.exps[0]), f, acc));
-	RuProverForward(idx0, seed_facts, hyp_index, ruMakeIndex(), seen0);
+	RuProverForward(idx0, seed_facts, hyp_index, ruMakeIndex(), seen0, makeTree());
 }
 
 // A bare metavariable hypothesis (the whole expr is a single variable node)
@@ -224,7 +228,8 @@ ruExpandForward(
 							arrayPush(st.front, produced_fact),
 							st.hypIndex,
 							st.multiHyp,
-							insertSet(st.seen, key)
+							insertSet(st.seen, key),
+							st.pathIndex
 						),
 						arrayPush(produced, produced_fact)
 					);
@@ -264,7 +269,7 @@ ruInitProverForwardProved(
 	});
 	seen0 = fold(seed_facts, makeSet(), \acc, f -> insertSet(acc, ruExpKey(ruExp(f.stmt.exps[0]))));
 	idx0  = fold(seed_facts, ruMakeIndex(), \acc, f -> ruSetIndex(ruExp(f.stmt.exps[0]), f, acc));
-	RuProverForward(idx0, seed_facts, hyp_index, multi_index, seen0);
+	RuProverForward(idx0, seed_facts, hyp_index, multi_index, seen0, makeTree());
 }
 
 // Add one produced fact to the front: index it, push to the frontier and the
@@ -278,7 +283,8 @@ ruFwdRegister(
 			ruSetIndex(conc_exp, pf, st.index),
 			arrayPush(st.front, pf),
 			st.hypIndex, st.multiHyp,
-			insertSet(st.seen, key)
+			insertSet(st.seen, key),
+			st.pathIndex
 		),
 		arrayPush(produced, pf)
 	);
@@ -445,7 +451,7 @@ ruApplyForward(
 			pushVector(pf.proofs, RuProverProofStmt(pf, conc_stmt, pp.sub, pp));
 			// Universal join, forward side: this new fact checks the backward front
 			// and discharges any matching open backward subgoal.
-			ruReverseJoin(pf, prover_env);
+			ruReverseJoin(pf, "", prover_env);
 			ruFwdRegister(st2, prod2, pf, conc, key);
 		}
 	});
@@ -456,22 +462,42 @@ ruApplyForward(
 // backward front; every open backward subgoal it covers is discharged by grafting
 // pf's proof (specialised to the subgoal), feeding ruAddProof, and propagating the
 // result up the backward tree. Guarded by ruJoinAcyclic.
-ruReverseJoin(pf : RuProverExp, prover_env : RuProverEnv) -> void {
+// The POSITIONAL path of a backward node in the proof DAG: the sequence of
+// hypothesis indices from the root. Because the oracle expands hyp i of a prop to
+// realise proof-DAG child i, this path is exactly the node's proof-DAG position,
+// derivable from the PVT structure alone. The completeness-test join uses it to
+// connect corresponding nodes (see ruReverseJoin/P2b).
+ruNodePath(h : RuProverHyp) -> string {
+	switch (h) {
+		RuProverRoot(__, __, __):             "";
+		RuProverExp(ind, __, __, __, prop):   ruNodePath(prop.parent) + "/" + i2s(ind);
+	}
+}
+
+// `path` is the forward fact's proof-DAG path (empty = no positional constraint, for
+// the forward-search feature). When non-empty, only the subgoal at the SAME path is
+// closed — exact positional correspondence, not mere unification.
+ruReverseJoin(pf : RuProverExp, path : string, prover_env : RuProverEnv) -> void {
 	pf_exp = ruExp(pf.stmt.exps[0]);
 	matches = ruUnifyIndex(pf_exp, ^(prover_env.backwardFront), ruEmptySubst, prover_env.math, prover_env.env);
 	iter(matches, \u -> {
 		subgoal = u.data;
 		sigma = u.sub;
-		if (ruJoinAcyclic(pf, ruExpKey(ruExp(subgoal.stmt.exps[0])))) {
+		if ((path == "" || ruNodePath(subgoal) == path) && ruJoinAcyclic(pf, ruExpKey(ruExp(subgoal.stmt.exps[0])))) {
 			parent = subgoal.parent;
 			iterVector(pf.proofs, \pv -> {
 				closing = RuStmt(subgoal.stmt with exps = map(subgoal.stmt.exps, \ex -> ruApplySubst(ruExp(ex), sigma)));
 				spliced = ruApplySubst2ProofNode(sigma, ruMakeProofTree(pv));
 				fwdProof = RuProverProofForward(subgoal, closing, sigma, spliced);
-				pushVector(subgoal.proofs, fwdProof);
-				n0 = sizeVector(parent.proofs);
-				ruAddProof(parent, fwdProof, prover_env);
-				ruBuildPropProofs(parent, vectorTailFrom(parent.proofs, n0), prover_env);
+				// Variant admission (inert by default): the completeness-test oracle
+				// dedups (a forward graft equal to backward's proof is NOT emitted twice
+				// — the ADDITIVE invariant) and bounds the node to `limit`.
+				if (prover_env.fns.keepVariant(fwdProof)) {
+					pushVector(subgoal.proofs, fwdProof);
+					n0 = sizeVector(parent.proofs);
+					ruAddProof(parent, fwdProof, prover_env);
+					ruBuildPropProofs(parent, vectorTailFrom(parent.proofs, n0), prover_env);
+				} else {};
 			});
 		}
 	});
