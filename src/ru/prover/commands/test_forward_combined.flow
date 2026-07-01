@@ -23,18 +23,98 @@ export {
 	ruCommTestForwardCombined : RuComm;
 }
 
-// Forward-derive every proof node's fact (post-order, premises up) via the engine,
-// recording them in derivation order — the order the combined loop reveals them.
-ruCombinedDerive(node : RuProofTree, seeds : [RuProverExp], acc : ref [RuProverExp], prover_env : RuProverEnv) -> Maybe<RuProverExp> {
+// --- Bidirectional oracle tactic: per-node variant dedup + limit -----------------
+// The completeness-test oracle installs `keepVariant` (fns hook) to enforce the
+// ADDITIVE invariant (each proof variant emitted once — top-down and bottom-up
+// never duplicate) and bound each node to `limit` variants while always keeping the
+// target proof. limit=1 = strict one-proof-per-node. A variant is keyed by its
+// proof-tree SIGNATURE; a node by identity.
+
+// VARIABLE-CANONICAL key for an expression: variables are renumbered by first
+// occurrence within the (sub)tree being keyed (shared ctx/cnt refs), so the same
+// proof shape keys identically regardless of the specific const/fresh var ids the
+// search happened to use — the search proof and the raw target proof then match, and
+// structurally-equal variants dedup. `ctx` maps original var id -> canonical id.
+ruExpCanonKey(e : RuExp, ctx : ref Tree<int, int>, cnt : ref int) -> string {
+	strGlue(map(e.nodes, \n -> switch (n) {
+		RuRuleNode(it, al): "r" + i2s(it) + "_" + i2s(al);
+		RuVar(vid, __): "v" + i2s(switch (lookupTree(^ctx, vid)) {
+			Some(c): c;
+			None(): { c = ^cnt; cnt := ^cnt + 1; ctx := setTree(^ctx, vid, c); c; };
+		});
+	}), ",")
+}
+
+// Signature of a proof (sub)tree: assertion-id skeleton + each leaf premise's
+// expression, with variables canonicalised consistently across the whole subtree.
+// Same signature ⇔ same proof variant. `unc` un-constifies leaves.
+ruProofTreeSig(t : RuProofTree, unc : (RuExp) -> RuExp) -> string {
+	ctx = ref makeTree(); cnt = ref 0;
+	ruProofTreeSigC(t, unc, ctx, cnt);
+}
+ruProofTreeSigC(t : RuProofTree, unc : (RuExp) -> RuExp, ctx : ref Tree<int, int>, cnt : ref int) -> string {
+	switch (t) {
+		RuProofStep(aid, ch, __): "(" + i2s(aid) + concatStrings(map(ch, \c -> ruProofTreeSigC(c, unc, ctx, cnt))) + ")";
+		RuProofHyp(__, stmt):     "[" + ruExpCanonKey(unc(ruExp(stmt.exps[0])), ctx, cnt) + "]";
+	}
+}
+// Var-canonical key for a single expression (fresh ctx).
+ruExpRawKey(e : RuExp) -> string {
+	ruExpCanonKey(e, ref makeTree(), ref 0);
+}
+
+// Identity of the node a proof variant is stored on (so the budget is per-node).
+ruProofHypKey(h : RuProverHyp) -> string {
+	switch (h) {
+		RuProverExp(ind, __, __, __, parent): "E" + i2s(parent.id) + "_" + i2s(ind);
+		RuProverRoot(__, __, __):             "R";
+	}
+}
+ruProofNodeKey(p : RuProverProof) -> string {
+	switch (p) {
+		RuProverProofProp(node, __, __):        "P" + i2s(node.id);
+		RuProverProofTop(node, __, __, __):     ruProofHypKey(node);
+		RuProverProofStmt(node, __, __, __):    ruProofHypKey(node);
+		RuProverProofForward(node, __, __, __): ruProofHypKey(node);
+	}
+}
+
+// The keepVariant hook. With the POSITIONAL path join providing the correct forward
+// fact per node and the oracle bounding backward branching, the gate only has to (1)
+// DEDUP by canonical proof signature — the ADDITIVE invariant, so top-down and
+// bottom-up proofs of a node collapse to one instance — and (2) keep at most `limit`
+// distinct variants per node. limit=1 ⇒ strict one-proof-per-node.
+RuVariantGate(
+	seen    : ref Tree<string, Set<string>>,  // node-key -> variant-keys kept (canonical)
+	limit   : int,
+	unconst : (RuExp) -> RuExp
+);
+ruMakeVariantGate(th : RuTheorem, math : RuMath, limit : int, unconst : (RuExp) -> RuExp) -> RuVariantGate {
+	RuVariantGate(ref makeTree(), limit, unconst);
+}
+ruVariantGateKeep(g : RuVariantGate, p : RuProverProof) -> bool {
+	vk = ruProofTreeSig(ruMakeProofTree(p), g.unconst);
+	nk = ruProofNodeKey(p);
+	seen = lookupTreeDef(^(g.seen), nk, makeSet());
+	if (containsSet(seen, vk)) false            // dedup (additive)
+	else if (sizeSet(seen) >= g.limit) false    // per-node limit
+	else { g.seen := setTree(^(g.seen), nk, insertSet(seen, vk)); true; }
+}
+
+// Forward-derive every proof node's fact (post-order, premises up), tagging each with
+// its proof-DAG PATH (child-index sequence). The path is how the join later connects
+// this fact to the backward subgoal at the SAME node (ruNodePath). Recorded in
+// derivation order — the order the combined loop reveals them.
+ruCombinedDerive(node : RuProofTree, path : string, seeds : [RuProverExp], acc : ref [Pair<RuProverExp, string>], prover_env : RuProverEnv) -> Maybe<RuProverExp> {
 	switch (node) {
 		RuProofHyp(h, __): if (h >= 0 && h < length(seeds)) Some(seeds[h]) else None();
 		RuProofStep(aid, children, __): {
-			cf = map(children, \c -> ruCombinedDerive(c, seeds, acc, prover_env));
+			cf = mapi(children, \i, c -> ruCombinedDerive(c, path + "/" + i2s(i), seeds, acc, prover_env));
 			facts = filtermap(cf, idfn);
 			if (length(facts) != length(cf)) None()
 			else {
 				res = ruApplyForwardOn(lookupTreeDef(prover_env.math.decls.assertions, aid, ruNoAxiom), facts, prover_env);
-				maybeApply(res, \f -> refArrayPush(acc, f));
+				maybeApply(res, \f -> refArrayPush(acc, Pair(f, path)));
 				res;
 			}
 		}
@@ -43,26 +123,27 @@ ruCombinedDerive(node : RuProofTree, seeds : [RuProverExp], acc : ref [RuProverE
 
 // Reveal one forward fact to the join: add it to the forward front and discharge
 // any backward subgoal it already covers (the reverse trigger).
-ruCombinedReveal(prover_env : RuProverEnv, pf : RuProverExp) -> void {
+ruCombinedReveal(prover_env : RuProverEnv, pf : RuProverExp, path : string) -> void {
 	pf_exp = ruExp(pf.stmt.exps[0]);
 	maybeApply(^(prover_env.forwardFront), \front ->
 		prover_env.forwardFront := Some(RuProverForward(front with
-			index = ruSetIndex(pf_exp, pf, front.index),
-			seen  = insertSet(front.seen, ruExpKey(pf_exp))
+			index     = ruSetIndex(pf_exp, pf, front.index),
+			seen      = insertSet(front.seen, ruExpKey(pf_exp)),
+			pathIndex = setTree(front.pathIndex, path, pf)   // positional correspondence
 		))
 	);
-	ruReverseJoin(pf, prover_env);
+	ruReverseJoin(pf, path, prover_env);
 }
 
 // Fair interleave: one backward round, then reveal one forward fact, until proved.
-ruCombinedLoop(prover_env : RuProverEnv, facts : [RuProverExp], i : int, fuel : int) -> RuProverEnv {
-	if (ruTreeIsProved(prover_env.tree) || fuel <= 0) prover_env
+ruCombinedLoop(prover_env : RuProverEnv, facts : [Pair<RuProverExp, string>], i : int, fuel : int) -> RuProverEnv {
+	if (ruTreeIsProved(prover_env.tree) || fuel <= 0 || ruTimeIsOver(prover_env.conf.timer)) prover_env
 	else {
 		br = ruProveOneRound(prover_env);
 		benv = br.first;
 		if (ruTreeIsProved(benv.tree)) benv
 		else if (i < length(facts)) {
-			ruCombinedReveal(benv, facts[i]);
+			ruCombinedReveal(benv, facts[i].first, facts[i].second);
 			ruCombinedLoop(benv, facts, i + 1, fuel - 1);
 		} else if (br.second) {
 			ruCombinedLoop(benv, facts, i, fuel - 1);   // no more facts; keep going backward
@@ -79,6 +160,8 @@ ruCommTestForwardCombined = RuComm(
 		"target", true, false,
 		[
 			RuCommArg("target", true, "theorems to reconstruct", "all"),
+			RuCommArg("limit", true, "per-node proof-variant limit (1 = strict unique; N = N variants incl. target; 0 = off)", "1"),
+			RuCommArg("nojoin", true, "DBG: 1 = disable the universal join (pure backward oracle)", "0"),
 			RuCommArg("strict-fail", true, "1 = crash if any combined reconstruction fails", "0")
 		], []
 	),
@@ -99,22 +182,35 @@ ruRunTestForwardCombined(unit : RuUnit) -> Maybe<RuState> {
 	one = \th : RuTheorem -> {
 		index = ruMakeIndexForTarget(RuTargetDecl(th), math, env);
 		prover_task = RuProverTask(th.info, ruDoneTactic, id2s(th.info.id), task.args, th.infer.hyps, ruProofQedStep(th.proof));
-		penv_pre = ruInitProverEnv(prover_task, math, env, index, 60000.0);
+		penv_pre0 = ruInitProverEnv(prover_task, math, env, index, 60000.0);
 		// Enable the universal join: install an (initially empty) forward front so
 		// backward subgoals get registered, and the reverse join is live.
-		penv_pre.forwardFront := Some(RuProverForward(ruMakeIndex(), [], ruMakeIndex(), ruMakeIndex(), makeSet()));
+		// DBG: nojoin=1 disables the join (pure backward oracle) to isolate the source.
+		if (ruTaskStringArg(task, "nojoin", "") == "1") {} else
+		penv_pre0.forwardFront := Some(RuProverForward(ruMakeIndex(), [], ruMakeIndex(), ruMakeIndex(), makeSet(), makeTree()));
+		// Install the variant gate (dedup + per-node limit; limit=1 = strict unique).
+		// Inert when limit<=0. Shared refs → one gate per theorem, active throughout.
+		limit = ruTaskIntArg(task, "limit", 1);
+		penv_pre = if (limit <= 0) penv_pre0 else {
+			gate = ruMakeVariantGate(th, math, limit, penv_pre0.fns.unconst);
+			RuProverEnv(penv_pre0 with fns = RuProverFuncs(penv_pre0.fns with keepVariant = \p -> ruVariantGateKeep(gate, p)));
+		};
 		c_task    = ruConstProverTask(prover_task, math);
 		cpremises = c_task.const.premises;
 
 		// Forward facts to reveal, in premises-up order.
 		fwd0  = ruInitProverForwardProved(cpremises, index, penv_pre.math, env);
-		acc : ref [RuProverExp] = ref [];
-		ignore = ruCombinedDerive(ruTheoremProofTree(th, math), fwd0.front, acc, penv_pre);
+		acc : ref [Pair<RuProverExp, string>] = ref [];
+		ignore = ruCombinedDerive(ruTheoremProofTree(th, math), "", fwd0.front, acc, penv_pre);
 		facts = ^acc;
 
-		// Backward oracle + the interleave.
+		// Backward oracle + the interleave. max_variants=max_proofs=limit so the
+		// backward oracle itself expands each node via at most `limit` assertions
+		// (the target's first); the gate then dedups the forward join. limit=1 ⇒ one
+		// backward variant per node.
 		ctx = RuTacticContext(math, env, None(), None());
-		result = switch (ruParseAndBuildTactic("oracle(-1, -1)", ctx)) {
+		ostr = if (limit <= 0) "oracle(-1, -1)" else "oracle(-1, -1, " + i2s(limit) + ", " + i2s(limit) + ")";
+		result = switch (ruParseAndBuildTactic(ostr, ctx)) {
 			None(): "ORACLE-BUILD-FAILED";
 			Some(builder): {
 				built = builder.build(penv_pre);

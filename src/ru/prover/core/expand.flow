@@ -134,14 +134,15 @@ ruExpandProp(prop : RuProverProp, prover_env : RuProverEnv) -> RuProverEnv {
 						])
 					));
 				}
-				top_proofs = makeVector(length(unified));
 				iter(unified, \unif -> {
 					all_exps = mapi(exs, \j, ex_j -> if (j == 0) unif.expr else ruApplySubst(ex_j, unif.sub));
 					hypProof = RuProverProofTop(hyp, RuStmt(h.stmt with exps = all_exps), unif.data, unif.sub);
-					pushVector(top_proofs, hypProof);
-					ruAddProof(prop, hypProof, acc);
+					// Variant admission (inert by default) — dedup + per-node limit.
+					if (prover_env.fns.keepVariant(hypProof)) {
+						pushVector(hyp.proofs, hypProof);
+						ruAddProof(prop, hypProof, acc);
+					} else {};
 				});
-				appendVector(hyp.proofs, top_proofs);
 				// Forward-closure splice: any leaf that unifies with a fact in the
 				// shallow forward closure can be closed here, without further
 				// backward expansion, by splicing the cached witness.
@@ -167,16 +168,17 @@ ruExpandProp(prop : RuProverProp, prover_env : RuProverEnv) -> RuProverEnv {
 				fwd_cap = 4;
 				fwd_unified = if (length(fwd_sorted) > fwd_cap) take(fwd_sorted, fwd_cap) else fwd_sorted;
 				if (fwd_unified != []) {
-					fwd_proofs = makeVector(length(fwd_unified));
 					iter(fwd_unified, \unif -> {
 						all_exps = mapi(exs, \j, ex_j -> if (j == 0) unif.expr else ruApplySubst(ex_j, unif.sub));
 						closing_stmt = RuStmt(h.stmt with exps = all_exps);
 						spliced = ruSpliceForwardWitness(unif.data.witness, closing_stmt, unif.sub, prover_env.math);
 						fwdProof = RuProverProofForward(hyp, closing_stmt, unif.sub, spliced);
-						pushVector(fwd_proofs, fwdProof);
-						ruAddProof(prop, fwdProof, acc);
+						// Variant admission (inert by default) — dedup + per-node limit.
+						if (prover_env.fns.keepVariant(fwdProof)) {
+							pushVector(hyp.proofs, fwdProof);
+							ruAddProof(prop, fwdProof, acc);
+						} else {};
 					});
-					appendVector(hyp.proofs, fwd_proofs);
 				}
 					// P2b: dynamic forward-front interior join. When a proof-carrying
 					// forward front is installed (forward-search-depth > 0), close this
@@ -190,16 +192,25 @@ ruExpandProp(prop : RuProverProp, prover_env : RuProverEnv) -> RuProverEnv {
 					// when no front is installed -- the engine is then unchanged.
 					maybeApply(^(prover_env.forwardFront), \front -> {
 						leaf_key = ruExpKey(ruExp(hyp.stmt.exps[0]));
-						fwd_join_all = ruUnifyIndex(ruExp(hyp.stmt.exps[0]), front.index, ruEmptySubst, prover_env.math, prover_env.env);
-						// Prefer the SHALLOWEST forward facts (smallest proofs), mirroring
-						// the static-closure splice. Without this, a deeper front (higher
-						// forward-search-depth) lets large facts crowd out the shallow one
-						// that actually closes the leaf, costing proofs under a bounded
-						// budget. Keyed on proof size so single- and multi-hyp facts are
-						// ordered uniformly (a multi-hyp fact has an empty dep-key set).
-						fwd_join_sorted = sortCustom(fwd_join_all, \u -> ruForwardProofSize(u.data), true);
-						fwd_join = if (length(fwd_join_sorted) > 4) take(fwd_join_sorted, 4) else fwd_join_sorted;
-						join_proofs = makeVector(0);
+						leaf_exp = ruExp(hyp.stmt.exps[0]);
+						// POSITIONAL join when the path index is populated (completeness
+						// test): the single forward fact derived at THIS leaf's proof-DAG
+						// path (ruNodePath) — exact correspondence, no spurious unifiers.
+						// Otherwise (forward-search feature) fall back to the shallowest
+						// unifying facts (capped), keyed on proof size.
+						fwd_join = if (sizeTree(front.pathIndex) > 0) {
+							switch (lookupTree(front.pathIndex, ruNodePath(hyp))) {
+								None(): [];
+								Some(fact): eitherMap(
+									ruUnifyExps([leaf_exp, ruExp(fact.stmt.exps[0])], ruEmptySubst, prover_env.math, prover_env.env),
+									\s -> [RuUnified(s, fact, ruApplySubst(leaf_exp, s))], []
+								);
+							}
+						} else {
+							fwd_join_all = ruUnifyIndex(leaf_exp, front.index, ruEmptySubst, prover_env.math, prover_env.env);
+							fwd_join_sorted = sortCustom(fwd_join_all, \u -> ruForwardProofSize(u.data), true);
+							if (length(fwd_join_sorted) > 4) take(fwd_join_sorted, 4) else fwd_join_sorted;
+						};
 						iter(fwd_join, \u -> {
 							fwd_node = u.data;
 							if (ruJoinAcyclic(fwd_node, leaf_key)) {
@@ -208,12 +219,16 @@ ruExpandProp(prop : RuProverProp, prover_env : RuProverEnv) -> RuProverEnv {
 								iterVector(fwd_node.proofs, \pv -> {
 									spliced = ruApplySubst2ProofNode(u.sub, ruMakeProofTree(pv));
 									fwdProof = RuProverProofForward(hyp, closing_stmt, u.sub, spliced);
-									pushVector(join_proofs, fwdProof);
-									ruAddProof(prop, fwdProof, acc);
+									// Variant admission (inert by default): dedup so a P2b graft
+									// equal to backward's proof is NOT emitted twice (ADDITIVE),
+									// and bound the node to `limit`.
+									if (prover_env.fns.keepVariant(fwdProof)) {
+										pushVector(hyp.proofs, fwdProof);
+										ruAddProof(prop, fwdProof, acc);
+									} else {};
 								});
 							}
 						});
-						appendVector(hyp.proofs, join_proofs);
 					});
 				t2 = ruMakeTimer();
 				ret = ruExpandHyp(hyp, acc);
