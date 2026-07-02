@@ -11,17 +11,17 @@ import base/concurrent;
 import comm;
 
 // COMBINED oracle: the GENERAL bidirectional algorithm, no cut, no depth limit.
-// The two directions MEET IN THE MIDDLE at a frontier depth D (frontier arg, default
-// maxDepth/2). The BACKWARD oracle expands the goal down through the top D levels
-// (proving the upper half by ordinary decomposition); the FORWARD facts are revealed
-// only for nodes at depth >= D, so Level-1's POSITIONAL join (expand.flow P2b) closes
-// each branch AT the frontier with the forward subproof of that node (the lower half).
-// Forward proofs propagate UP through the backward structure to the root. Neither side
-// proves a node the other proves — they meet, they do not overlap. That ADDITIVE
-// invariant is asserted by keepVariant (crash on a duplicate variant). onProof verifies
-// the assembled proof. frontier=0 reveals everything (forward-dominant, backward builds
-// only the top structure); a frontier past the proof depth reveals nothing (pure
-// backward oracle). The MP/cut explosion is Level-2's concern; Level-1 expands and joins.
+// The two directions are INTERLEAVED, one wave each per round (ruCombinedLoop): the
+// FORWARD front grows upward from the premises (one deeper-to-shallower level of facts
+// revealed per round) while the BACKWARD oracle expands the goal downward (one round of
+// subgoal decomposition). They MEET IN THE MIDDLE on their own — Level-1's POSITIONAL
+// join (expand.flow P2b) closes a backward subgoal the moment it is created at a depth
+// the forward front has already reached, grafting that node's forward subproof; there
+// the backward search stops and the forward proofs propagate UP to the root. Nothing
+// chooses where they meet — it emerges from the interleaving. Neither side proves a node
+// the other proves: that ADDITIVE invariant is asserted by keepVariant (crash on a
+// duplicate variant). onProof verifies the assembled proof. The MP/cut explosion is
+// Level-2's concern; Level-1 just expands and joins.
 
 export {
 	ruCommTestForwardCombined : RuComm;
@@ -95,16 +95,35 @@ ruCombinedDerive(node : RuProofTree, path : [int], seeds : [RuProverExp], acc : 
 	}
 }
 
-// Run backward rounds until the goal is proved. All forward facts are pre-revealed
-// into the front before the loop, so the positional P2b join closes each subgoal at
-// creation and there is nothing to reveal here — the loop just drives the backward
-// structure and the propagation.
-ruCombinedLoop(prover_env : RuProverEnv, fuel : int) -> RuProverEnv {
+// Add one level of forward facts to the installed front: the unification index, the
+// seen-set, and the positional pathIndex the P2b join reads. forwardFront is a shared
+// ref, so this grows the front the running backward rounds already see.
+ruCombinedReveal(prover_env : RuProverEnv, level : [Pair<RuProverExp, [int]>]) -> void {
+	old = eitherMap(^(prover_env.forwardFront), idfn,
+		RuProverForward(ruMakeIndex(), [], ruMakeIndex(), ruMakeIndex(), makeSet(), makeTree()));
+	prover_env.forwardFront := Some(fold(level, old, \fr, fp -> {
+		fe = ruExp(fp.first.stmt.exps[0]);
+		RuProverForward(fr with
+			index     = ruSetIndex(fe, fp.first, fr.index),
+			seen      = insertSet(fr.seen, ruExpKey(fe)),
+			pathIndex = setTree(fr.pathIndex, fp.second, fp.first)
+		);
+	}));
+}
+
+// Interleave the two directions, one wave each per round: reveal the next-deepest level
+// of forward facts (the forward front grows UPWARD from the premises), then run one
+// backward round (the goal's frontier grows DOWNWARD). The two waves cross in the MIDDLE
+// on their own — the positional P2b join closes a subgoal the moment backward creates it
+// at a depth the forward front has already reached, and there the backward search stops.
+// No depth is chosen; the meeting point emerges from the interleaving.
+ruCombinedLoop(prover_env : RuProverEnv, levels : [[Pair<RuProverExp, [int]>]], fuel : int) -> RuProverEnv {
 	if (ruTreeIsProved(prover_env.tree) || fuel <= 0 || ruTimeIsOver(prover_env.conf.timer)) prover_env
 	else {
+		rest = if (levels == []) [] else { ruCombinedReveal(prover_env, levels[0]); tail(levels); };
 		br = ruProveOneRound(prover_env);
 		if (ruTreeIsProved(br.first.tree) || !br.second) br.first
-		else ruCombinedLoop(br.first, fuel - 1);
+		else ruCombinedLoop(br.first, rest, fuel - 1);
 	}
 }
 
@@ -116,7 +135,6 @@ ruCommTestForwardCombined = RuComm(
 		[
 			RuCommArg("target", true, "theorems to reconstruct", "all"),
 			RuCommArg("limit", true, "per-node proof-variant limit (1 = strict unique; N = N variants incl. target; 0 = off)", "1"),
-			RuCommArg("frontier", true, "meet-in-the-middle depth: backward proves the top D levels, forward the rest (-1 = maxDepth/2; N = fixed D; 0 = forward-dominant)", "-1"),
 			RuCommArg("threads", true, "worker threads (0 = all cores)", "0"),
 			RuCommArg("nojoin", true, "DBG: 1 = disable the universal join (pure backward oracle)", "0"),
 			RuCommArg("strict-fail", true, "1 = crash if any combined reconstruction fails", "0")
@@ -144,8 +162,8 @@ ruRunTestForwardCombined(unit : RuUnit) -> Maybe<RuState> {
 		penv_pre0 = ruInitProverEnv(prover_task, math, e, index, 60000.0);
 		// Install the variant gate: it ASSERTS the additive invariant (crash if any
 		// node's proof is emitted twice). Inert when limit<=0. Shared refs → one gate
-		// per theorem, active throughout. The forward front is installed below, once
-		// all facts are derived (nojoin=1 leaves it uninstalled = pure backward oracle).
+		// per theorem, active throughout. The forward front is revealed level by level
+		// below (nojoin=1 leaves it uninstalled = pure backward oracle).
 		limit = ruTaskIntArg(task, "limit", 1);
 		penv_pre = if (limit <= 0) penv_pre0 else {
 			gate = ruMakeVariantGate();
@@ -160,35 +178,22 @@ ruRunTestForwardCombined(unit : RuUnit) -> Maybe<RuState> {
 		ignore = ruCombinedDerive(ruTheoremProofTree(th, math), [], fwd0.front, acc, penv_pre);
 		facts = ^acc;
 
-		// MEET IN THE MIDDLE. Reveal a forward fact only for nodes at depth >= the
-		// frontier D (path length = proof-DAG depth). The backward oracle then expands
-		// the TOP D levels itself (subgoals above D see no fact, so they are decomposed),
-		// and the POSITIONAL P2b join closes each branch AT the frontier with its forward
-		// fact (which carries the whole subproof below D). So backward proves the upper
-		// half and forward the lower half — they MEET at D, with no node proved by both
-		// (the ADDITIVE invariant, checked by keepVariant).
-		//   frontier=-1 (default): D = maxDepth/2, a balanced split per theorem
-		//   frontier=N            : fixed D=N (top N levels backward)
-		//   frontier=0            : reveal all => forward-dominant (backward builds only structure)
-		maxDepth   = fold(facts, 0, \m, fp -> max(m, length(fp.second)));
-		frontierArg = ruTaskIntArg(task, "frontier", -1);
-		frontierD  = if (frontierArg >= 0) frontierArg else maxDepth / 2;
-		revealed   = filter(facts, \fp -> length(fp.second) >= frontierD);
-		front_all = fold(revealed, RuProverForward(ruMakeIndex(), [], ruMakeIndex(), ruMakeIndex(), makeSet(), makeTree()),
-			\fr, fp -> {
-				fe = ruExp(fp.first.stmt.exps[0]);
-				RuProverForward(fr with
-					index     = ruSetIndex(fe, fp.first, fr.index),
-					seen      = insertSet(fr.seen, ruExpKey(fe)),
-					pathIndex = setTree(fr.pathIndex, fp.second, fp.first)
-				);
-			}
-		);
-		if (ruTaskStringArg(task, "nojoin", "") == "1") {} else penv_pre.forwardFront := Some(front_all);
+		// Group the facts into levels by proof-DAG depth, DEEPEST first: the order the
+		// forward front is revealed, one level per backward round (ruCombinedLoop). The
+		// deepest level is revealed here, before the first (root) expansion, so the front
+		// is installed and the positional P2b join is active from the start; the loop
+		// reveals the shallower levels as the backward frontier descends to meet them.
+		maxDepth = fold(facts, 0, \m, fp -> max(m, length(fp.second)));
+		levels = filtermap(enumFromTo(0, maxDepth), \i -> {
+			lv = filter(facts, \fp -> length(fp.second) == maxDepth - i);
+			if (lv == []) None() else Some(lv);
+		});
+		join_on = ruTaskStringArg(task, "nojoin", "") != "1" && levels != [];
+		if (join_on) ruCombinedReveal(penv_pre, levels[0]) else {};
+		rest_levels = if (join_on) tail(levels) else [];
 
-		// Backward oracle drives the structure; max_variants=max_proofs=limit bounds
-		// its per-node branching. All joining is done at subgoal creation (P2b), so the
-		// loop just runs backward rounds — no lazy reveal.
+		// The backward oracle drives the structure; max_variants=max_proofs=limit bounds
+		// its per-node branching. The loop interleaves a forward reveal with each round.
 		ctx = RuTacticContext(math, e, None(), None());
 		ostr = if (limit <= 0) "oracle(-1, -1)" else "oracle(-1, -1, " + i2s(limit) + ", " + i2s(limit) + ")";
 		result = switch (ruParseAndBuildTactic(ostr, ctx)) {
@@ -198,7 +203,7 @@ ruRunTestForwardCombined(unit : RuUnit) -> Maybe<RuState> {
 				penv0 = built.first;
 				penv0.tactic := Some(built.second);
 				penv1 = ruExpandHyp(penv0.tree.root, penv0);
-				penv  = ruCombinedLoop(penv1, length(facts) + 5000);
+				penv  = ruCombinedLoop(penv1, rest_levels, length(facts) + 5000);
 				if (length(^(penv.tree.proofs)) > 0) "RECONSTRUCTED+VERIFIED" else "NOT-RECONSTRUCTED";
 			}
 		};
