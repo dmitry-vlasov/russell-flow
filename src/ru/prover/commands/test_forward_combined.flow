@@ -11,14 +11,17 @@ import base/concurrent;
 import comm;
 
 // COMBINED oracle: the GENERAL bidirectional algorithm, no cut, no depth limit.
-// Level-2 fairly interleaves the two directions — one backward round (the oracle
-// expanding from the goal) then revealing one forward fact (derived from the
-// premises) — and Level-1's UNIVERSAL JOIN (both ways) connects them wherever a
-// forward fact meets a backward subgoal. A backward subgoal checks the forward
-// front (expand.flow); a revealed forward fact checks the backward front
-// (ruReverseJoin). They meet in the middle on their own; nothing chooses where.
-// onProof verifies the assembled proof. The combinatorial explosion of MP/cut is
-// the Level-2 selection's concern; Level-1 just expands and joins.
+// The two directions MEET IN THE MIDDLE at a frontier depth D (frontier arg, default
+// maxDepth/2). The BACKWARD oracle expands the goal down through the top D levels
+// (proving the upper half by ordinary decomposition); the FORWARD facts are revealed
+// only for nodes at depth >= D, so Level-1's POSITIONAL join (expand.flow P2b) closes
+// each branch AT the frontier with the forward subproof of that node (the lower half).
+// Forward proofs propagate UP through the backward structure to the root. Neither side
+// proves a node the other proves — they meet, they do not overlap. That ADDITIVE
+// invariant is asserted by keepVariant (crash on a duplicate variant). onProof verifies
+// the assembled proof. frontier=0 reveals everything (forward-dominant, backward builds
+// only the top structure); a frontier past the proof depth reveals nothing (pure
+// backward oracle). The MP/cut explosion is Level-2's concern; Level-1 expands and joins.
 
 export {
 	ruCommTestForwardCombined : RuComm;
@@ -113,6 +116,7 @@ ruCommTestForwardCombined = RuComm(
 		[
 			RuCommArg("target", true, "theorems to reconstruct", "all"),
 			RuCommArg("limit", true, "per-node proof-variant limit (1 = strict unique; N = N variants incl. target; 0 = off)", "1"),
+			RuCommArg("frontier", true, "meet-in-the-middle depth: backward proves the top D levels, forward the rest (-1 = maxDepth/2; N = fixed D; 0 = forward-dominant)", "-1"),
 			RuCommArg("threads", true, "worker threads (0 = all cores)", "0"),
 			RuCommArg("nojoin", true, "DBG: 1 = disable the universal join (pure backward oracle)", "0"),
 			RuCommArg("strict-fail", true, "1 = crash if any combined reconstruction fails", "0")
@@ -156,12 +160,21 @@ ruRunTestForwardCombined(unit : RuUnit) -> Maybe<RuState> {
 		ignore = ruCombinedDerive(ruTheoremProofTree(th, math), [], fwd0.front, acc, penv_pre);
 		facts = ^acc;
 
-		// Reveal ALL forward facts up front, keyed by proof-DAG path. The POSITIONAL
-		// P2b join then closes each backward subgoal at CREATION with its own forward
-		// fact, and the backward search stops there (does not re-prove it). So forward
-		// provides the proofs and backward only builds structure — a clean ADDITIVE
-		// split where no node is proved by both sides (verified by keepVariant).
-		front_all = fold(facts, RuProverForward(ruMakeIndex(), [], ruMakeIndex(), ruMakeIndex(), makeSet(), makeTree()),
+		// MEET IN THE MIDDLE. Reveal a forward fact only for nodes at depth >= the
+		// frontier D (path length = proof-DAG depth). The backward oracle then expands
+		// the TOP D levels itself (subgoals above D see no fact, so they are decomposed),
+		// and the POSITIONAL P2b join closes each branch AT the frontier with its forward
+		// fact (which carries the whole subproof below D). So backward proves the upper
+		// half and forward the lower half — they MEET at D, with no node proved by both
+		// (the ADDITIVE invariant, checked by keepVariant).
+		//   frontier=-1 (default): D = maxDepth/2, a balanced split per theorem
+		//   frontier=N            : fixed D=N (top N levels backward)
+		//   frontier=0            : reveal all => forward-dominant (backward builds only structure)
+		maxDepth   = fold(facts, 0, \m, fp -> max(m, length(fp.second)));
+		frontierArg = ruTaskIntArg(task, "frontier", -1);
+		frontierD  = if (frontierArg >= 0) frontierArg else maxDepth / 2;
+		revealed   = filter(facts, \fp -> length(fp.second) >= frontierD);
+		front_all = fold(revealed, RuProverForward(ruMakeIndex(), [], ruMakeIndex(), ruMakeIndex(), makeSet(), makeTree()),
 			\fr, fp -> {
 				fe = ruExp(fp.first.stmt.exps[0]);
 				RuProverForward(fr with
