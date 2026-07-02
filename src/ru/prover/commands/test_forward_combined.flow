@@ -7,6 +7,7 @@ import ru/prover/tactics/dsl;
 import ru/util/target;
 import ru/util/utils;
 import ru/proof_tree;
+import base/concurrent;
 import comm;
 
 // COMBINED oracle: the GENERAL bidirectional algorithm, no cut, no depth limit.
@@ -161,6 +162,7 @@ ruCommTestForwardCombined = RuComm(
 		[
 			RuCommArg("target", true, "theorems to reconstruct", "all"),
 			RuCommArg("limit", true, "per-node proof-variant limit (1 = strict unique; N = N variants incl. target; 0 = off)", "1"),
+			RuCommArg("threads", true, "worker threads (0 = all cores)", "0"),
 			RuCommArg("nojoin", true, "DBG: 1 = disable the universal join (pure backward oracle)", "0"),
 			RuCommArg("strict-fail", true, "1 = crash if any combined reconstruction fails", "0")
 		], []
@@ -179,10 +181,12 @@ ruRunTestForwardCombined(unit : RuUnit) -> Maybe<RuState> {
 		env.out.error("test/forward-combined: target has no theorem", []);
 		Some(state);
 	} else {
-	one = \th : RuTheorem -> {
-		index = ruMakeIndexForTarget(RuTargetDecl(th), math, env);
+	// Per-theorem worker; reconstructions are independent, so theorems run
+	// concurrently over a per-worker RuEnv `e`.
+	one = \th : RuTheorem, e : RuEnv -> {
+		index = ruMakeIndexForTarget(RuTargetDecl(th), math, e);
 		prover_task = RuProverTask(th.info, ruDoneTactic, id2s(th.info.id), task.args, th.infer.hyps, ruProofQedStep(th.proof));
-		penv_pre0 = ruInitProverEnv(prover_task, math, env, index, 60000.0);
+		penv_pre0 = ruInitProverEnv(prover_task, math, e, index, 60000.0);
 		// Enable the universal join: install an (initially empty) forward front so
 		// backward subgoals get registered, and the reverse join is live.
 		// DBG: nojoin=1 disables the join (pure backward oracle) to isolate the source.
@@ -199,7 +203,7 @@ ruRunTestForwardCombined(unit : RuUnit) -> Maybe<RuState> {
 		cpremises = c_task.const.premises;
 
 		// Forward facts to reveal, in premises-up order.
-		fwd0  = ruInitProverForwardProved(cpremises, index, penv_pre.math, env);
+		fwd0  = ruInitProverForwardProved(cpremises, index, penv_pre.math, e);
 		acc : ref [Pair<RuProverExp, string>] = ref [];
 		ignore = ruCombinedDerive(ruTheoremProofTree(th, math), "", fwd0.front, acc, penv_pre);
 		facts = ^acc;
@@ -208,7 +212,7 @@ ruRunTestForwardCombined(unit : RuUnit) -> Maybe<RuState> {
 		// backward oracle itself expands each node via at most `limit` assertions
 		// (the target's first); the gate then dedups the forward join. limit=1 ⇒ one
 		// backward variant per node.
-		ctx = RuTacticContext(math, env, None(), None());
+		ctx = RuTacticContext(math, e, None(), None());
 		ostr = if (limit <= 0) "oracle(-1, -1)" else "oracle(-1, -1, " + i2s(limit) + ", " + i2s(limit) + ")";
 		result = switch (ruParseAndBuildTactic(ostr, ctx)) {
 			None(): "ORACLE-BUILD-FAILED";
@@ -223,7 +227,12 @@ ruRunTestForwardCombined(unit : RuUnit) -> Maybe<RuState> {
 		};
 		Pair(th.info.id, result);
 	};
-	results = map(theorems, one);
+	threads = ruTaskIntArg(task, "threads", 0);  // 0 = auto (all cores)
+	results = ruConcurrentLimited(
+		map(theorems, \th -> \e -> one(th, e)),
+		if (threads <= 0) 1000 else threads,
+		env
+	);
 	ok  = filter(results, \r -> r.second == "RECONSTRUCTED+VERIFIED");
 	bad = filter(results, \r -> r.second != "RECONSTRUCTED+VERIFIED");
 	if (length(theorems) == 1) {
