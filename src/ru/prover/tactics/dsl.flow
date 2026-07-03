@@ -1287,16 +1287,14 @@ ruResolveTacticSrc(src0 : string, env : RuEnv, visited : [string], depth : int) 
 	else {
 		lp   = strIndexOf(src, "(");
 		head = trim2(if (lp < 0) src else substring(src, 0, lp), " \t\r\n");
-		if (head == "" || ruIsBuiltinTacticName(head)) src   // inline tactic → unchanged
-		else {
-			isPath = strContains(head, "/");
+		isPath = strContains(head, "/");
+		// The head is a FILE reference iff it is a path, OR a bare name that is not a built-in atom and
+		// resolves to a `.tac` file. Built-in names win over a same-named file. A path never matches a
+		// built-in name, so paths are always treated as file refs.
+		headIsFile = head != "" && (isPath || !ruIsBuiltinTacticName(head)) && ruFindTactic(head, env) != None();
+		if (headIsFile) {
 			switch (ruFindTactic(head, env)) {
-				None(): {
-					// A '/'-path that doesn't resolve is clearly a bad file ref; a bare name is just an
-					// unknown atom — let the normal parse/build path report it.
-					if (isPath) env.out.error("tactic file not found: '" + head + "' (looked under <cwd>, workingDir, tactics/)", []);
-					src0;
-				}
+				None(): src0;  // unreachable (headIsFile guaranteed Some) — satisfies the exhaustive switch
 				Some(path): {
 					if (exists(visited, \v -> v == path)) { env.out.error("tactic .tac cycle detected at '" + head + "'", []); src0 }
 					else switch (ruLoadTacFile(head, env)) {
@@ -1315,6 +1313,47 @@ ruResolveTacticSrc(src0 : string, env : RuEnv, visited : [string], depth : int) 
 						}
 					}
 				}
+			}
+		} else if (isPath) {
+			// A '/'-path that doesn't resolve is clearly a bad file ref.
+			env.out.error("tactic file not found: '" + head + "' (looked under <cwd>, workingDir, tactics/)", []);
+			src0;
+		} else {
+			// Head is a built-in (or an unknown bare atom the build path will report). It may still carry
+			// NESTED `.tac` references as arguments (e.g. or-else(replay(...), checker-engine, checker)) —
+			// resolve those by walking the parsed AST. Bare nested refs parse as 0-arg atoms; the walk
+			// expands any whose name resolves to a file. (Nested '/'-paths don't parse and aren't supported.)
+			switch (ruParseTacticDsl(src, env)) {
+				None(): src;  // unparseable — leave for the build path to report
+				Some(ast): {
+					resolved = RuTacticAst(ast.name, map(ast.args, \arg -> ruResolveTacticArg(arg, env, visited, depth)));
+					// No nested ref expanded → return the ORIGINAL string verbatim (zero serialization drift
+					// for every existing inline tactic); only re-serialize when the walk actually changed it.
+					if (resolved == ast) src else ruTacticAst2s(resolved);
+				}
+			}
+		}
+	}
+}
+
+// Recursively resolve `.tac` references inside a tactic argument's value.
+ruResolveTacticArg(arg : RuTacticArg, env : RuEnv, visited : [string], depth : int) -> RuTacticArg {
+	switch (arg) {
+		RuTacticArgPos(v):      RuTacticArgPos(ruResolveTacticVal(v, env, visited, depth));
+		RuTacticArgNamed(n, v): RuTacticArgNamed(n, ruResolveTacticVal(v, env, visited, depth));
+	}
+}
+
+ruResolveTacticVal(v : RuTacticVal, env : RuEnv, visited : [string], depth : int) -> RuTacticVal {
+	switch (v) {
+		RuTacticValLit(__): v;
+		RuTacticValAst(a): {
+			// Serialize the sub-AST and route it back through the string resolver, so file-expansion,
+			// cycle detection and arg-binding all share the one code path; then re-parse the result.
+			resolvedStr = ruResolveTacticSrc(ruTacticAst2s(a), env, visited, depth + 1);
+			switch (ruParseTacticDsl(resolvedStr, env)) {
+				Some(ra): RuTacticValAst(ra);
+				None():   v;  // resolved to something unparseable — leave the original
 			}
 		}
 	}
