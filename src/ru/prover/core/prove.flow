@@ -14,6 +14,11 @@ export {
 	// an already-parallel context (e.g. ruMapFnComm per-theorem workers).
 	ruProveSequential(prover_env : RuProverEnv) -> RuProverEnv;
 	ruProveProp(prop : RuProverProp, prover_env : RuProverEnv) -> RuProverEnv;
+	// One sequential backward round (the body of ruProveSequential without the
+	// recursion): pull the next batch of props from the tactic, expand them, merge.
+	// Returns the new env and whether anything was expanded. For drivers (e.g. the
+	// combined oracle) that interleave backward rounds with forward derivation.
+	ruProveOneRound(prover_env : RuProverEnv) -> Pair<RuProverEnv, bool>;
 }
 
 ruInitProver(
@@ -25,6 +30,7 @@ ruInitProver(
 ) -> RuProverEnv {
 	prover_env = ruInitProverEnv(task, math, env, asses, ms_time_limit);
 	prover_env.tactic := Some(prover_env.conf.task.tactic);
+	ruMaybeBuildForwardFront(prover_env, task, asses);
 	ruExpandHyp(prover_env.tree.root, prover_env);
 }
 
@@ -111,6 +117,45 @@ ruProve(prover_env : RuProverEnv) -> RuProverEnv {
 			)
 		);
 		ruProve(new_env);
+	}
+}
+
+ruProveOneRound(prover_env : RuProverEnv) -> Pair<RuProverEnv, bool> {
+	to_expand0 = filtermap(^(prover_env.toExpand), \ind ->
+		lookupTree(prover_env.tree.leafs, ind)
+	);
+	prover_env.toExpand := [];
+	to_expand_and_env =
+		if (length(to_expand0) > 0) Pair(prover_env, to_expand0)
+		else ruRunTacticStep(prover_env);
+	env_after_step = to_expand_and_env.first;
+	to_expand = to_expand_and_env.second;
+	if (to_expand == []) Pair(env_after_step, false)
+	else {
+		to_expand_removed = fold(to_expand, env_after_step.tree.leafs, \acc, prop ->
+			removeFromTree(acc, prop.id)
+		);
+		env1 = RuProverEnv(env_after_step with
+			tree = RuProverTree(env_after_step.tree with leafs = to_expand_removed)
+		);
+		env1_expanded = ruSequential(
+			map(to_expand, \prop -> \env2 ->
+				switch (^(env1.tactic)) {
+					Some(tac): if (tac.keep_expanding(env1.tree)) ruProveProp(prop, RuProverEnv(env1 with env = env2)) else env1;
+					None(): env1;
+				}
+			),
+			env1.env
+		);
+		new_env = fold(env1_expanded, env1, \acc, e ->
+			RuProverEnv(acc with
+				tree = RuProverTree(acc.tree with
+					leafs = mergeTree(acc.tree.leafs, e.tree.leafs),
+					nodes = mergeTree(acc.tree.nodes, e.tree.leafs)
+				)
+			)
+		);
+		Pair(new_env, true);
 	}
 }
 
