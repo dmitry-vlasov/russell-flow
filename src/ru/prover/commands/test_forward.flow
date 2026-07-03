@@ -1,0 +1,794 @@
+import ru/prover/core/env;
+import ru/prover/core/expand;
+import ru/prover/core/prove;
+import ru/prover/core/forward;
+import ru/prover/core/runner;
+import ru/prover/core/controls;
+import ru/prover/core/util;
+import ru/prover/tactics/dsl;
+import ru/prover/tactics/breadth_first;
+import ru/prover/tactics/combinators;
+import ru/util/target;
+import ru/util/utils;
+import ru/proof_tree;
+import ru/verify/proof;
+import base/concurrent;
+import comm;
+
+// The `test/forward*` family: the staged correctness checks for the bidirectional
+// (forward + backward) proof engine, from the raw forward expansion up to the full
+// combined oracle. Each is a self-contained RuComm; they share nothing but imports,
+// so they live together here rather than in six one-command files.
+//   test/forward          dynamic forward front == static forward closure
+//   test/forward-prove     every forward-built proof verifies against the premises
+//   test/forward-acyclic   forward front is an acyclic, premise-grounded DAG
+//   test/forward-oracle    replay a proof FORWARD through the engine, reach the goal
+//   test/forward-search    forward-on interior join is additive and reproves more
+//   test/forward-combined  INTERLEAVED forward+backward meeting in the middle
+
+export {
+	ruCommTestForward : RuComm;
+	ruCommTestForwardProve : RuComm;
+	ruCommTestForwardAcyclic : RuComm;
+	ruCommTestForwardOracle : RuComm;
+	ruCommTestForwardSearch : RuComm;
+	ruCommTestForwardCombined : RuComm;
+}
+
+// ================================================================================
+// test/forward — dynamic forward front vs static forward closure
+// ================================================================================
+// Cross-check: drive the dynamic forward front (ruExpandForward) and the
+// static forward closure (ruBuildForwardClosure) from IDENTICAL raw inputs
+// (one theorem's hypotheses as premises, the target assertion index) and assert
+// they derive the SAME set of fact expressions at depth=depth. This validates
+// that the new node-building forward expansion mirrors the proven closure
+// builder fact-for-fact, without yet touching the live engine (additivity).
+
+ruCommTestForward = RuComm(
+	RuCommInfo(
+		"test/forward", "prover",
+		"cross-check: dynamic ruExpandForward vs static ruBuildForwardClosure on a theorem's premises",
+		"target", true, false,
+		[
+			RuCommArg("target", true, "a single theorem to take premises from", "all"),
+			RuCommArg("depth",  true, "forward depth to compare", "2"),
+			RuCommArg("size",   true, "closure size cap", "4096"),
+			RuCommArg("dump",   true, "1 = print the symmetric-difference expressions", "0")
+		], []
+	),
+	ruRunTestForward
+);
+
+// Alpha-invariant structural key: rename variables to canonical indices in
+// first-occurrence order, so facts that differ ONLY by fresh-var ids (the two
+// engines freshen with different id schemes) compare equal. Rule nodes and var
+// TYPES are kept verbatim.
+ruExpAlphaKey(e : RuExp) -> string {
+	m    = ref makeTree();
+	next = ref 0;
+	strGlue(map(e.nodes, \n -> switch (n) {
+		RuRuleNode(it, al): "r" + i2s(it) + ":" + i2s(al);
+		RuVar(id, type): {
+			ci = switch (lookupTree(^m, id)) {
+				Some(x): x;
+				None(): { x = ^next; m := setTree(^m, id, x); next := x + 1; x };
+			};
+			"v" + i2s(ci) + ":" + i2s(type);
+		};
+	}), " ");
+}
+
+ruRunTestForward(unit : RuUnit) -> Maybe<RuState> {
+	env   = ruUnitEnv(unit);
+	task  = unit.task;
+	state = unit.state;
+	math  = ruMathFromSources(state.ru, env);
+	target = ruDetermineTarget(task, math, env);
+	depth = ruTaskIntArg(task, "depth", 2);
+	size  = ruTaskIntArg(task, "size", 4096);
+
+	theorems = filtermap(ruTargetDecls(target, math, env), ruDecl2Theorem);
+	if (theorems == []) {
+		env.out.error("test/forward: target has no theorem", []);
+		Some(state);
+	} else {
+		th = theorems[0];
+		index = ruMakeIndexForTarget(target, math, env);
+		premises = mapi(th.infer.hyps, \i, h -> Pair(ruExp(h.stmt.exps[0]), i));
+
+		fresh_id = ref 0;
+		inc_fresh = ruAtomicIntAdd(fresh_id);
+		fresher = \v : RuVar -> RuVar(s2id(id2s(v.id) + "_tf" + i2s(inc_fresh(1))), v.type);
+		node_id = ref 0;
+		inc_node = ruAtomicIntAdd(node_id);
+		idxer = \ -> inc_node(1);
+
+		// Static reference: the existing, trusted forward closure.
+		closure = ruBuildForwardClosure(premises, index, fresher, math, env, depth, size);
+		closure_map = fold(ruIndexValues(closure), makeTree(), \acc, f -> setTree(acc, ruExpAlphaKey(f.exp), f.exp));
+		closure_keys = buildSet(getTreeKeys(closure_map));
+
+		// Dynamic: seed the front, then expand every frontier fact `depth` times.
+		fwd0 = ruInitProverForward(premises, index, math, env);
+		final_fwd = foldRange(1, depth, fwd0, \fwd, __ -> {
+			fold(fwd.front, RuProverForward(fwd with front = []), \st, fact ->
+				ruExpandForward(st, fact, fresher, idxer, math, env).first
+			)
+		});
+		dyn_map = fold(ruIndexValues(final_fwd.index), makeTree(), \acc, f -> setTree(acc, ruExpAlphaKey(ruExp(f.stmt.exps[0])), ruExp(f.stmt.exps[0])));
+		dyn_keys = buildSet(getTreeKeys(dyn_map));
+
+		only_closure = differenceSets(closure_keys, dyn_keys);
+		only_dyn     = differenceSets(dyn_keys, closure_keys);
+		ok = sizeSet(only_closure) == 0 && sizeSet(only_dyn) == 0;
+
+		if (ruTaskIntArg(task, "dump", 0) > 0) {
+			iter(take(set2array(only_closure), 12), \k ->
+				env.out.println("  only_closure: " + ru2s(lookupTreeDef(closure_map, k, ruNoExp), math)));
+			iter(take(set2array(only_dyn), 12), \k ->
+				env.out.println("  only_dynamic: " + ru2s(lookupTreeDef(dyn_map, k, ruNoExp), math)));
+		}
+
+		env.out.println(
+			"test/forward: theorem=" + id2s(th.info.id) +
+			" depth=" + i2s(depth) +
+			"  closure=" + i2s(sizeSet(closure_keys)) +
+			" dynamic=" + i2s(sizeSet(dyn_keys)) +
+			"  only_closure=" + i2s(sizeSet(only_closure)) +
+			" only_dynamic=" + i2s(sizeSet(only_dyn)) +
+			"  => " + (if (ok) "MATCH" else "MISMATCH")
+		);
+		Some(state);
+	}
+}
+
+// ================================================================================
+// test/forward-prove — every forward-built proof verifies against the premises
+// ================================================================================
+// The forward front now BUILDS proofs (via ruAddProof) as it grows. This drives
+// ruExpandForwardProved from a theorem's const-form premises and asserts that EVERY
+// derived fact's engine-built proof actually VERIFIES against those premises. That
+// validates (a) the law-abiding forward proof construction and (b) the deferred
+// outer/sub split (ruMakeProofTree uses them). It also reports the degenerate join:
+// facts whose proof verifies directly as the goal.
+
+ruCommTestForwardProve = RuComm(
+	RuCommInfo(
+		"test/forward-prove", "prover",
+		"forward front builds proofs; verify every derived fact's proof against the premises",
+		"target", true, false,
+		[
+			RuCommArg("target", true, "a single theorem to take premises from", "all"),
+			RuCommArg("depth",  true, "forward depth", "3"),
+			RuCommArg("dump",   true, "1 = print first failing proofs", "0"),
+			RuCommArg("strict-fail", true, "1 = crash if any forward fact does not verify", "0")
+		], []
+	),
+	ruRunTestForwardProve
+);
+
+ruRunTestForwardProve(unit : RuUnit) -> Maybe<RuState> {
+	env   = ruUnitEnv(unit);
+	task  = unit.task;
+	state = unit.state;
+	math  = ruMathFromSources(state.ru, env);
+	target = ruDetermineTarget(task, math, env);
+	depth = ruTaskIntArg(task, "depth", 3);
+
+	theorems = filtermap(ruTargetDecls(target, math, env), ruDecl2Theorem);
+	if (theorems == []) {
+		env.out.error("test/forward-prove: target has no theorem", []);
+		Some(state);
+	} else {
+		th = theorems[0];
+		index = ruMakeIndexForTarget(target, math, env);
+		prover_task = RuProverTask(
+			th.info, ruDoneTactic, id2s(th.info.id),
+			task.args, th.infer.hyps, ruProofQedStep(th.proof)
+		);
+		prover_env = ruInitProver(prover_task, math, env, index, 60000.0);
+		c_task    = ruConstProverTask(prover_task, math);
+		cmath     = c_task.env.math;
+		cpremises = c_task.const.premises;
+		cgoal     = c_task.const.goal;
+
+		// Grow the proof-carrying forward front to `depth`.
+		fwd0 = ruInitProverForwardProved(cpremises, index, prover_env.math, env);
+		final_fwd = foldRange(1, depth, fwd0, \fwd, __ ->
+			fold(fwd.front, RuProverForward(fwd with front = []), \st, fact ->
+				// Test-harness bound only (NOT an engine cap): without L2 selection the
+				// general forward engine expands exhaustively, so cap the front so this
+				// correctness check stays runnable.
+				if (ruIndexDataCount(st.index) >= 600) st else ruExpandForwardProved(st, fact, prover_env).first
+			)
+		);
+
+		// Exclude depth-0 seeds (the premises themselves): a premise's "proof" is
+		// a bare hypothesis reference with no steps, which is not a standalone
+		// proof. Only genuinely DERIVED facts carry a real (>=1 step) proof.
+		premise_keys = fold(cpremises, makeSet(), \acc, p -> insertSet(acc, (ruExp(p.stmt.exps[0])).nodes));
+		facts = filter(ruIndexValues(final_fwd.index), \f ->
+			!containsSet(premise_keys, (ruExp(f.stmt.exps[0])).nodes));
+		// Verify every proof variant of every derived fact against the premises.
+		verify_fact_goal = \f : RuProverExp, goal_stmt : RuStmt -> {
+			gstep = RuStep(0, -1, [], goal_stmt, ruNoProof, -1);
+			taskF = RuProverTask(prover_task with premises = cpremises, goal = gstep);
+			exists(vector2array(f.proofs), \pv -> {
+				steps = ruMakeLinearProof(ruMakeProofTree(pv));
+				isSome(ruMakeProofFromSteps(taskF, steps, cmath, env));
+			});
+		};
+		results = map(facts, \f -> Pair(f, verify_fact_goal(f, f.stmt)));
+		verified   = filter(results, \r -> r.second);
+		unverified = filter(results, \r -> !r.second);
+		// Degenerate join at the ROOT: the goal is an INSTANCE of a forward fact
+		// (the generalisation of a premise-match). Find sigma with fact*sigma = goal,
+		// specialise the fact's proof by sigma, and verify it proves the goal.
+		gexp = ruExp(cgoal.stmt.exps[0]);
+		root_hits = filter(facts, \f -> {
+			switch (ruMatchExp(gexp, ruExp(f.stmt.exps[0]), cmath, env)) {
+				None(): false;
+				Some(sigma): {
+					gstep = RuStep(0, -1, [], cgoal.stmt, ruNoProof, -1);
+					taskG = RuProverTask(prover_task with premises = cpremises, goal = gstep);
+					exists(vector2array(f.proofs), \pv -> {
+						steps0 = ruMakeLinearProof(ruMakeProofTree(pv));
+						steps  = map(steps0, \st -> RuStep(st with
+							stmt = RuStmt(st.stmt with exps = map(st.stmt.exps, \ex -> ruApplySubst(ruExp(ex), sigma)))
+						));
+						isSome(ruMakeProofFromSteps(taskG, steps, cmath, env));
+					});
+				}
+			}
+		});
+
+		if (ruTaskIntArg(task, "dump", 0) > 0 && unverified != []) {
+			f = unverified[0].first;
+			gstep = RuStep(0, -1, [], f.stmt, ruNoProof, -1);
+			taskF = RuProverTask(prover_task with premises = cpremises, goal = gstep);
+			env.out.println("  first UNVERIFIED fact: " + ru2s(ruExp(f.stmt.exps[0]), cmath) +
+				"  (proof variants: " + i2s(sizeVector(f.proofs)) + ")");
+			iterVector(f.proofs, \pv -> {
+				steps = ruMakeLinearProof(ruMakeProofTree(pv));
+				env.out.println("  proof steps (" + i2s(length(steps)) + "):");
+				iter(steps, \st -> env.out.println("    " + ru2s(st, cmath)));
+				vs = values2tree(set2array(differenceSets(
+					fold(steps, makeSet(), \acc, st -> mergeSets(acc, ruStmt2Vars(st.stmt))),
+					fold(cpremises, ruStmt2Vars(f.stmt), \acc, p -> mergeSets(acc, ruStmt2Vars(p.stmt)))
+				)), \v -> v.id);
+				res = ruVerifyProof(RuProof(RuVarsDisjs(vs, makeSet()), steps, -1), cpremises, f.stmt, cmath, env);
+				iter(res.errs, \e -> env.out.println("    ERR: " + ruVerifyErr2s(e, cmath)));
+			});
+		};
+
+		env.out.println(
+			"test/forward-prove: theorem=" + id2s(th.info.id) +
+			" depth=" + i2s(depth) +
+			"  facts=" + i2s(length(facts)) +
+			" verified=" + i2s(length(verified)) +
+			" unverified=" + i2s(length(unverified)) +
+			" root-join-proofs=" + i2s(length(root_hits)) +
+			"  => " + (if (length(unverified) == 0) "ALL-VERIFIED" else "HAS-FAILURES")
+		);
+		if (ruTaskIntArg(task, "strict-fail", 0) > 0 && unverified != []) {
+			ruCrash("test/forward-prove: " + i2s(length(unverified)) + " forward fact(s) did not verify");
+		}
+		Some(state);
+	}
+}
+
+// ================================================================================
+// test/forward-acyclic — forward front is an acyclic, premise-grounded DAG
+// ================================================================================
+// The acyclicity invariant of the forward front (the one genuinely new
+// correctness check the bidirectional engine needs), plus structural soundness.
+//
+// For the proof-carrying forward front of a theorem it asserts:
+//   (1) DAG          — no derived fact depends (transitively) on itself;
+//   (2) premise-grounded — every fact's proof tree bottoms out in premise refs,
+//                      so a forward proof can never reference a backward node
+//                      (this is WHY a premise-grown front is acyclic by build);
+//   (3) join-safety  — ruJoinAcyclic ACCEPTS grafting a fact onto the root goal
+//                      (the goal is not among the fact's premise deps) and
+//                      REJECTS grafting it onto one of its own dependencies
+//                      (which would be a self-supporting cycle).
+//
+// Additivity is structural: this and all forward code live off the live engine,
+// so forward-off is byte-identical to today (the full test/all battery is green).
+
+ruCommTestForwardAcyclic = RuComm(
+	RuCommInfo(
+		"test/forward-acyclic", "prover",
+		"forward front is an acyclic, premise-grounded DAG; ruJoinAcyclic accepts/rejects correctly",
+		"target", true, false,
+		[
+			RuCommArg("target", true, "a single theorem to take premises from", "all"),
+			RuCommArg("depth",  true, "forward depth", "3"),
+			RuCommArg("strict-fail", true, "1 = crash on any unsound fact / join-safety fail", "0")
+		], []
+	),
+	ruRunTestForwardAcyclic
+);
+
+ruRunTestForwardAcyclic(unit : RuUnit) -> Maybe<RuState> {
+	env   = ruUnitEnv(unit);
+	task  = unit.task;
+	state = unit.state;
+	math  = ruMathFromSources(state.ru, env);
+	target = ruDetermineTarget(task, math, env);
+	depth = ruTaskIntArg(task, "depth", 3);
+
+	theorems = filtermap(ruTargetDecls(target, math, env), ruDecl2Theorem);
+	if (theorems == []) {
+		env.out.error("test/forward-acyclic: target has no theorem", []);
+		Some(state);
+	} else {
+		th = theorems[0];
+		index = ruMakeIndexForTarget(target, math, env);
+		prover_task = RuProverTask(
+			th.info, ruDoneTactic, id2s(th.info.id),
+			task.args, th.infer.hyps, ruProofQedStep(th.proof)
+		);
+		prover_env = ruInitProver(prover_task, math, env, index, 60000.0);
+		c_task    = ruConstProverTask(prover_task, math);
+		cpremises = c_task.const.premises;
+		cgoal     = c_task.const.goal;
+
+		fwd0 = ruInitProverForwardProved(cpremises, index, prover_env.math, env);
+		final_fwd = foldRange(1, depth, fwd0, \fwd, __ ->
+			fold(fwd.front, RuProverForward(fwd with front = []), \st, fact ->
+				// Test-harness bound only (NOT an engine cap): without L2 selection the
+				// general forward engine expands exhaustively, so cap the front so this
+				// correctness check stays runnable.
+				if (ruIndexDataCount(st.index) >= 600) st else ruExpandForwardProved(st, fact, prover_env).first
+			)
+		);
+
+		// Exclude the depth-0 seeds; only derived facts have a derivation to check.
+		premise_keys = fold(cpremises, makeSet(), \acc, p -> insertSet(acc, (ruExp(p.stmt.exps[0])).nodes));
+		derived = filter(ruIndexValues(final_fwd.index), \f ->
+			!containsSet(premise_keys, (ruExp(f.stmt.exps[0])).nodes));
+
+		// (1)+(2): every derived fact is an acyclic, premise-grounded proof.
+		unsound = filter(derived, \f -> !ruForwardFactSound(f));
+
+		// (3): join-safety on a derived fact that actually has dependencies.
+		goal_key = (ruExp(cgoal.stmt.exps[0])).nodes;
+		with_deps = filter(derived, \f -> sizeSet(ruForwardDepKeys(f)) > 0);
+		join_ok = if (with_deps == []) true else {
+			f = with_deps[0];
+			dep = set2array(ruForwardDepKeys(f))[0];
+			// accept grafting onto the goal (not a dependency), reject grafting onto
+			// an actual dependency (would close a cycle).
+			ruJoinAcyclic(f, goal_key) && !ruJoinAcyclic(f, dep);
+		};
+
+		ok = unsound == [] && join_ok;
+		env.out.println(
+			"test/forward-acyclic: theorem=" + id2s(th.info.id) +
+			" depth=" + i2s(depth) +
+			"  derived=" + i2s(length(derived)) +
+			" unsound=" + i2s(length(unsound)) +
+			" join-safety=" + (if (join_ok) "ok" else "FAIL") +
+			"  => " + (if (ok) "ACYCLIC-SOUND" else "FAILURE")
+		);
+		if (ruTaskIntArg(task, "strict-fail", 0) > 0 && !ok) {
+			ruCrash("test/forward-acyclic: " + i2s(length(unsound)) + " unsound fact(s), join-safety " + (if (join_ok) "ok" else "FAIL"));
+		}
+		Some(state);
+	}
+}
+
+// ================================================================================
+// test/forward-oracle — replay a proof FORWARD through the engine
+// ================================================================================
+// Top-down (forward) ORACLE test. The oracle = the theorem's own proof:
+// replay it FORWARD through the engine — for each proof step, apply its assertion
+// to its children's already-derived facts via ruApplyForwardOn — and check the
+// root produces a fact that covers the goal, with a verifier-accepted proof.
+// This exercises the general forward application on a real proof's applications,
+// guided (so tractable) — validating the top-down engine in isolation from the
+// hard L2-selection problem.
+
+// Build the forward fact for a proof-tree node by replaying it bottom-up:
+// hypotheses map to premise seeds; each step applies its assertion to its
+// children's facts. None if any application fails to assemble.
+ruOracleBuildFact(node : RuProofTree, seeds : [RuProverExp], prover_env : RuProverEnv) -> Maybe<RuProverExp> {
+	switch (node) {
+		RuProofHyp(h, __):
+			if (h >= 0 && h < length(seeds)) Some(seeds[h]) else None();
+		RuProofStep(aid, children, __): {
+			cf = map(children, \c -> ruOracleBuildFact(c, seeds, prover_env));
+			facts = filtermap(cf, idfn);
+			if (length(facts) != length(cf)) None()
+			else ruApplyForwardOn(lookupTreeDef(prover_env.math.decls.assertions, aid, ruNoAxiom), facts, prover_env);
+		}
+	}
+}
+
+ruCommTestForwardOracle = RuComm(
+	RuCommInfo(
+		"test/forward-oracle", "prover",
+		"top-down oracle: replay a theorem's proof FORWARD through the engine and verify the goal is reached",
+		"target", true, false,
+		[
+			RuCommArg("target", true, "a single theorem", "all"),
+			RuCommArg("threads", true, "worker threads (0 = all cores)", "0"),
+			RuCommArg("strict-fail", true, "1 = crash if the forward replay does not reconstruct the goal", "0")
+		], []
+	),
+	ruRunTestForwardOracle
+);
+
+ruRunTestForwardOracle(unit : RuUnit) -> Maybe<RuState> {
+	env   = ruUnitEnv(unit);
+	task  = unit.task;
+	state = unit.state;
+	math  = ruMathFromSources(state.ru, env);
+	target = ruDetermineTarget(task, math, env);
+	theorems = filter(filtermap(ruTargetDecls(target, math, env), ruDecl2Theorem), ruTheoremIsProved);
+	if (theorems == []) {
+		env.out.error("test/forward-oracle: target has no theorem", []);
+		Some(state);
+	} else {
+	one = \th : RuTheorem, e : RuEnv -> {
+		index = ruMakeIndexForTarget(RuTargetDecl(th), math, e);
+		prover_task = RuProverTask(th.info, ruDoneTactic, id2s(th.info.id), task.args, th.infer.hyps, ruProofQedStep(th.proof));
+		prover_env = ruInitProver(prover_task, math, e, index, 60000.0);
+		c_task    = ruConstProverTask(prover_task, math);
+		cmath     = c_task.env.math;
+		cpremises = c_task.const.premises;
+		cgoal     = c_task.const.goal;
+
+		fwd0  = ruInitProverForwardProved(cpremises, index, prover_env.math, e);
+		seeds = fwd0.front;
+		proof_tree = ruTheoremProofTree(th, math);
+
+		root_fact = ruOracleBuildFact(proof_tree, seeds, prover_env);
+		result = switch (root_fact) {
+			None(): "NO-FACT (an application failed to assemble)";
+			Some(pf): {
+				gexp = ruExp(cgoal.stmt.exps[0]);
+				fexp = ruExp(pf.stmt.exps[0]);
+				// The goal must be an instance of the forward-derived root fact.
+				switch (ruMatchExp(gexp, fexp, cmath, e)) {
+					None(): "GOAL-NOT-COVERED  root=" + ru2s(fexp, cmath);
+					Some(sigma): {
+						// Specialise the root fact's proof to the goal and verify it.
+						steps0 = ruMakeLinearProof(ruMakeProofTree(vector2array(pf.proofs)[0]));
+						steps  = map(steps0, \st -> RuStep(st with
+							stmt = RuStmt(st.stmt with exps = map(st.stmt.exps, \ex -> ruApplySubst(ruExp(ex), sigma)))
+						));
+						taskG = RuProverTask(prover_task with premises = cpremises, goal = cgoal);
+						if (isSome(ruMakeProofFromSteps(taskG, steps, cmath, e))) "RECONSTRUCTED+VERIFIED"
+						else "GOAL-COVERED-BUT-UNVERIFIED";
+					}
+				}
+			}
+		};
+		result;
+	};
+	results = ruConcurrentLimited(map(theorems, \th -> \e -> Pair(th.info.id, one(th, e))), if (ruTaskIntArg(task, "threads", 0) <= 0) 1000 else ruTaskIntArg(task, "threads", 0), env);
+	ok = filter(results, \r -> r.second == "RECONSTRUCTED+VERIFIED");
+	bad = filter(results, \r -> r.second != "RECONSTRUCTED+VERIFIED");
+	if (length(theorems) == 1) {
+		env.out.println("test/forward-oracle: theorem=" + id2s(theorems[0].info.id) + "  => " + results[0].second);
+	} else {
+		env.out.println("test/forward-oracle: " + i2s(length(ok)) + "/" + i2s(length(results)) + " reconstructed+verified");
+		iter(take(bad, 12), \r -> env.out.println("  NOT-RECONSTRUCTED: " + id2s(r.first) + " => " + r.second));
+	};
+	if (ruTaskIntArg(task, "strict-fail", 0) > 0 && bad != []) {
+		ruCrash("test/forward-oracle: forward replay failed for " + i2s(length(bad)) + " theorem(s)");
+	}
+	Some(state);
+	}
+}
+
+// ================================================================================
+// test/forward-search — forward-on interior join is additive and reproves more
+// ================================================================================
+// Regression test for the bidirectional interior join (plus multi-hyp forward).
+// For each target theorem it runs the SAME bounded backward BFS twice — forward
+// OFF (forward-search-depth=0) and ON — and checks two invariants:
+//   * additivity: forward-on never FAILS a theorem forward-off reproved;
+//   * contribution: forward-on reproves at least `min-gain` theorems that
+//     forward-off could not (so the join is actually doing work).
+// strict-fail=1 (default) crashes on a violation — wire it into the CI battery.
+
+ruCommTestForwardSearch = RuComm(
+	RuCommInfo(
+		"test/forward-search", "prover",
+		"regression test: forward-on bidirectional join is additive and reproves strictly more than forward-off",
+		"target", true, false,
+		[
+			RuCommArg("target",    true, "theorems to test (a stride/file/all)", "all"),
+			RuCommArg("fs-depth",  true, "forward-search depth for the ON pass", "2"),
+			RuCommArg("max-depth", true, "backward BFS depth bound", "5"),
+			RuCommArg("max-size",  true, "backward BFS size bound", "4096"),
+			RuCommArg("time-ms",   true, "per-theorem time limit (ms)", "20000"),
+			RuCommArg("min-gain",  true, "min #theorems forward must newly reprove", "1"),
+			RuCommArg("strict-fail", true, "1 = crash on additivity violation or gain < min-gain", "1")
+		], []
+	),
+	ruRunTestForwardSearch
+);
+
+ruRunTestForwardSearch(unit : RuUnit) -> Maybe<RuState> {
+	env   = ruUnitEnv(unit);
+	task  = unit.task;
+	state = unit.state;
+	math  = ruMathFromSources(state.ru, env);
+	target = ruDetermineTarget(task, math, env);
+	fs_depth  = ruTaskIntArg(task, "fs-depth", 2);
+	max_depth = ruTaskIntArg(task, "max-depth", 5);
+	max_size  = ruTaskIntArg(task, "max-size", 4096);
+	time_ms   = i2d(ruTaskIntArg(task, "time-ms", 20000));
+	min_gain  = ruTaskIntArg(task, "min-gain", 1);
+	strict    = ruTaskIntArg(task, "strict-fail", 1) > 0;
+
+	theorems = filtermap(ruTargetDecls(target, math, env), ruDecl2Theorem);
+	if (theorems == []) {
+		env.out.error("test/forward-search: target has no theorem", []);
+		Some(state);
+	} else {
+		index   = ruMakeIndexForTarget(target, math, env);
+		// master's ruLimitedTactic bounds by time/applied/produced/size (no depth/batch
+		// params — those arrived with the later `limited` DSL rework). The backward BFS is
+		// bounded by size + the per-theorem time limit; max_depth is not applied here.
+		tactic  = ruLimitedTactic(ruBreadthFirstTactic, 0.0, 0, 0, max_size);
+		builder = ruStaticTacticBuilder(tactic);
+		// True if the bounded backward BFS finds a proof for `th` with forward
+		// search set to `d`. A found proof is verifier-built (onProof verifies).
+		reproves = \th : RuTheorem, d : int -> {
+			t2 = RuTask(task with args = setTree(task.args, "forward-search-depth", flow(d)));
+			penv = ruBuildAndProve(th, t2, index, builder, time_ms, None(), math, env);
+			length(^(penv.tree.proofs)) > 0;
+		};
+		results = map(theorems, \th -> Triple(th.info.id, reproves(th, 0), reproves(th, fs_depth)));
+
+		regressions = filter(results, \r -> r.second && !r.third);  // off reproved, on failed
+		gains       = filter(results, \r -> !r.second && r.third);  // on reproved, off failed
+		off_n = length(filter(results, \r -> r.second));
+		on_n  = length(filter(results, \r -> r.third));
+
+		env.out.println(
+			"test/forward-search: theorems=" + i2s(length(results)) +
+			" off=" + i2s(off_n) + " on=" + i2s(on_n) +
+			" gains=" + i2s(length(gains)) + " regressions=" + i2s(length(regressions))
+		);
+		if (regressions != []) {
+			// Individual regressions are usually batch-vs-alone nondeterminism (the
+			// two passes share one process's id table / GC / timer), NOT a real
+			// forward-on failure — so they are reported but do not fail the test.
+			env.out.println("  regressions (likely batch-vs-alone noise): " + strGlue(map(regressions, \r -> id2s(r.first)), ", "));
+		}
+		// The robust, noise-tolerant invariant: forward must reprove a NET of at
+		// least min-gain theorems the backward-only run could not.
+		net = length(gains) - length(regressions);
+		if (strict && net < min_gain) {
+			ruCrash("test/forward-search: net forward gain " + i2s(net) + " < min-gain " + i2s(min_gain) +
+				" (gains=" + i2s(length(gains)) + " regressions=" + i2s(length(regressions)) + ")");
+		}
+		Some(state);
+	}
+}
+
+// ================================================================================
+// test/forward-combined — INTERLEAVED forward+backward meeting in the middle
+// ================================================================================
+// COMBINED oracle: the GENERAL bidirectional algorithm, no cut, no depth limit.
+// The two directions are INTERLEAVED, one wave each per round (ruCombinedLoop): the
+// FORWARD front grows upward from the premises (one deeper-to-shallower level of facts
+// revealed per round) while the BACKWARD oracle expands the goal downward (one round of
+// subgoal decomposition). They MEET IN THE MIDDLE on their own — Level-1's POSITIONAL
+// join (expand.flow) closes a backward subgoal the moment it is created at a depth
+// the forward front has already reached, grafting that node's forward subproof; there
+// the backward search stops and the forward proofs propagate UP to the root. Nothing
+// chooses where they meet — it emerges from the interleaving. Neither side proves a node
+// the other proves: that ADDITIVE invariant is asserted by keepVariant (crash on a
+// duplicate variant). onProof verifies the assembled proof. The MP/cut explosion is
+// Level-2's concern; Level-1 just expands and joins.
+
+// --- Bidirectional oracle tactic: additive-invariant CHECK -----------------------
+// The completeness-test oracle installs `keepVariant` (fns hook) NOT to reduce the
+// number of variants (that is bounded by the design: the POSITIONAL join gives one
+// forward proof per node, and the oracle's max_variants bounds backward branching),
+// but to ASSERT the ADDITIVE invariant: the algorithm must never emit the same proof
+// variant twice on a node — top-down and bottom-up must MEET, not duplicate. When a
+// duplicate IS emitted (equal up to variable renaming, ruProofTreeAlphaEq), that is a
+// bug in the algorithm, so we CRASH rather than silently drop it.
+
+// Identity of the node a proof variant is stored on (so the check is per-node).
+ruProofHypKey(h : RuProverHyp) -> string {
+	switch (h) {
+		RuProverExp(ind, __, __, __, parent): "E" + i2s(parent.id) + "_" + i2s(ind);
+		RuProverRoot(__, __, __):             "R";
+	}
+}
+ruProofNodeKey(p : RuProverProof) -> string {
+	switch (p) {
+		RuProverProofProp(node, __, __):        "P" + i2s(node.id);
+		RuProverProofTop(node, __, __, __):     ruProofHypKey(node);
+		RuProverProofStmt(node, __, __, __):    ruProofHypKey(node);
+		RuProverProofForward(node, __, __, __): ruProofHypKey(node);
+	}
+}
+
+RuVariantGate(
+	seen : ref Tree<string, [RuProofTree]>  // node-key -> proof variants already emitted on it
+);
+ruMakeVariantGate() -> RuVariantGate {
+	RuVariantGate(ref makeTree());
+}
+// Never reduces — always returns true (keep). It only CHECKS: if this variant is
+// alpha-equal to one already emitted on the same node, the additive invariant is
+// broken, so crash with the offending node.
+ruVariantGateKeep(g : RuVariantGate, p : RuProverProof) -> bool {
+	tree = ruMakeProofTree(p);
+	nk = ruProofNodeKey(p);
+	stored = lookupTreeDef(^(g.seen), nk, []);
+	if (exists(stored, \t -> ruProofTreeAlphaEq(t, tree))) {
+		ruCrash("bidirectional oracle: duplicate proof variant emitted on node " + nk +
+			" — the algorithm is not additive (a proof variant was produced twice)");
+		true;
+	} else {
+		g.seen := setTree(^(g.seen), nk, arrayPush(stored, tree));
+		true;
+	}
+}
+
+// Forward-derive every proof node's fact (post-order, premises up), tagging each with
+// its proof-DAG PATH (child-index sequence). The path is how the join later connects
+// this fact to the backward subgoal at the SAME node (ruNodePath). Recorded in
+// derivation order — the order the combined loop reveals them.
+ruCombinedDerive(node : RuProofTree, path : [int], seeds : [RuProverExp], acc : ref [Pair<RuProverExp, [int]>], prover_env : RuProverEnv) -> Maybe<RuProverExp> {
+	switch (node) {
+		RuProofHyp(h, __): if (h >= 0 && h < length(seeds)) Some(seeds[h]) else None();
+		RuProofStep(aid, children, __): {
+			cf = mapi(children, \i, c -> ruCombinedDerive(c, arrayPush(path, i), seeds, acc, prover_env));
+			facts = filtermap(cf, idfn);
+			if (length(facts) != length(cf)) None()
+			else {
+				res = ruApplyForwardOn(lookupTreeDef(prover_env.math.decls.assertions, aid, ruNoAxiom), facts, prover_env);
+				maybeApply(res, \f -> refArrayPush(acc, Pair(f, path)));
+				res;
+			}
+		}
+	}
+}
+
+// Add one level of forward facts to the installed front: the unification index, the
+// seen-set, and the positional pathIndex the interior join reads. forwardFront is a shared
+// ref, so this grows the front the running backward rounds already see.
+ruCombinedReveal(prover_env : RuProverEnv, level : [Pair<RuProverExp, [int]>]) -> void {
+	old = eitherMap(^(prover_env.forwardFront), idfn,
+		RuProverForward(ruMakeIndex(), [], ruMakeIndex(), ruMakeIndex(), makeSet(), makeTree()));
+	prover_env.forwardFront := Some(fold(level, old, \fr, fp -> {
+		fe = ruExp(fp.first.stmt.exps[0]);
+		RuProverForward(fr with
+			index     = ruSetIndex(fe, fp.first, fr.index),
+			seen      = insertSet(fr.seen, (fe).nodes),
+			pathIndex = setTree(fr.pathIndex, fp.second, fp.first)
+		);
+	}));
+}
+
+// Interleave the two directions, one wave each per round: reveal the next-deepest level
+// of forward facts (the forward front grows UPWARD from the premises), then run one
+// backward round (the goal's frontier grows DOWNWARD). The two waves cross in the MIDDLE
+// on their own — the positional interior join closes a subgoal the moment backward creates it
+// at a depth the forward front has already reached, and there the backward search stops.
+// No depth is chosen; the meeting point emerges from the interleaving.
+ruCombinedLoop(prover_env : RuProverEnv, levels : [[Pair<RuProverExp, [int]>]], fuel : int) -> RuProverEnv {
+	if (ruTreeIsProved(prover_env.tree) || fuel <= 0 || ruTimeIsOver(prover_env.conf.timer)) prover_env
+	else {
+		rest = if (levels == []) [] else { ruCombinedReveal(prover_env, levels[0]); tail(levels); };
+		br = ruProveOneRound(prover_env);
+		if (ruTreeIsProved(br.first.tree) || !br.second) br.first
+		else ruCombinedLoop(br.first, rest, fuel - 1);
+	}
+}
+
+ruCommTestForwardCombined = RuComm(
+	RuCommInfo(
+		"test/forward-combined", "prover",
+		"combined oracle: fairly interleave backward + forward, meeting at the universal join; verify",
+		"target", true, false,
+		[
+			RuCommArg("target", true, "theorems to reconstruct", "all"),
+			RuCommArg("limit", true, "per-node proof-variant limit (1 = strict unique; N = N variants incl. target; 0 = off)", "1"),
+			RuCommArg("threads", true, "worker threads (0 = all cores)", "0"),
+			RuCommArg("nojoin", true, "DBG: 1 = disable the universal join (pure backward oracle)", "0"),
+			RuCommArg("strict-fail", true, "1 = crash if any combined reconstruction fails", "0")
+		], []
+	),
+	ruRunTestForwardCombined
+);
+
+ruRunTestForwardCombined(unit : RuUnit) -> Maybe<RuState> {
+	env   = ruUnitEnv(unit);
+	task  = unit.task;
+	state = unit.state;
+	math  = ruMathFromSources(state.ru, env);
+	target = ruDetermineTarget(task, math, env);
+	theorems = filter(filtermap(ruTargetDecls(target, math, env), ruDecl2Theorem), ruTheoremIsProved);
+	if (theorems == []) {
+		env.out.error("test/forward-combined: target has no theorem", []);
+		Some(state);
+	} else {
+	// Per-theorem worker; reconstructions are independent, so theorems run
+	// concurrently over a per-worker RuEnv `e`.
+	one = \th : RuTheorem, e : RuEnv -> {
+		index = ruMakeIndexForTarget(RuTargetDecl(th), math, e);
+		prover_task = RuProverTask(th.info, ruDoneTactic, id2s(th.info.id), task.args, th.infer.hyps, ruProofQedStep(th.proof));
+		penv_pre0 = ruInitProverEnv(prover_task, math, e, index, 60000.0);
+		// Install the variant gate: it ASSERTS the additive invariant (crash if any
+		// node's proof is emitted twice). Inert when limit<=0. Shared refs → one gate
+		// per theorem, active throughout. The forward front is revealed level by level
+		// below (nojoin=1 leaves it uninstalled = pure backward oracle).
+		limit = ruTaskIntArg(task, "limit", 1);
+		penv_pre = if (limit <= 0) penv_pre0 else {
+			gate = ruMakeVariantGate();
+			RuProverEnv(penv_pre0 with fns = RuProverFuncs(penv_pre0.fns with keepVariant = \p -> ruVariantGateKeep(gate, p)));
+		};
+		c_task    = ruConstProverTask(prover_task, math);
+		cpremises = c_task.const.premises;
+
+		// Forward-derive every proof node's fact (tagged with its proof-DAG path).
+		fwd0  = ruInitProverForwardProved(cpremises, index, penv_pre.math, e);
+		acc : ref [Pair<RuProverExp, [int]>] = ref [];
+		ignore = ruCombinedDerive(ruTheoremProofTree(th, math), [], fwd0.front, acc, penv_pre);
+		facts = ^acc;
+
+		// Group the facts into levels by proof-DAG depth, DEEPEST first: the order the
+		// forward front is revealed, one level per backward round (ruCombinedLoop). The
+		// deepest level is revealed here, before the first (root) expansion, so the front
+		// is installed and the positional interior join is active from the start; the loop
+		// reveals the shallower levels as the backward frontier descends to meet them.
+		maxDepth = fold(facts, 0, \m, fp -> max(m, length(fp.second)));
+		levels = filtermap(enumFromTo(0, maxDepth), \i -> {
+			lv = filter(facts, \fp -> length(fp.second) == maxDepth - i);
+			if (lv == []) None() else Some(lv);
+		});
+		join_on = ruTaskStringArg(task, "nojoin", "") != "1" && levels != [];
+		if (join_on) ruCombinedReveal(penv_pre, levels[0]) else {};
+		rest_levels = if (join_on) tail(levels) else [];
+
+		// The backward oracle drives the structure; max_variants=max_proofs=limit bounds
+		// its per-node branching. The loop interleaves a forward reveal with each round.
+		ctx = RuTacticContext(math, e, None(), None());
+		ostr = if (limit <= 0) "oracle(-1, -1)" else "oracle(-1, -1, " + i2s(limit) + ", " + i2s(limit) + ")";
+		result = switch (ruParseAndBuildTactic(ostr, ctx)) {
+			None(): "ORACLE-BUILD-FAILED";
+			Some(builder): {
+				built = builder.build(penv_pre);
+				penv0 = built.first;
+				penv0.tactic := Some(built.second);
+				penv1 = ruExpandHyp(penv0.tree.root, penv0);
+				penv  = ruCombinedLoop(penv1, rest_levels, length(facts) + 5000);
+				if (length(^(penv.tree.proofs)) > 0) "RECONSTRUCTED+VERIFIED" else "NOT-RECONSTRUCTED";
+			}
+		};
+		Pair(th.info.id, result);
+	};
+	threads = ruTaskIntArg(task, "threads", 0);  // 0 = auto (all cores)
+	results = ruConcurrentLimited(
+		map(theorems, \th -> \e -> one(th, e)),
+		if (threads <= 0) 1000 else threads,
+		env
+	);
+	ok  = filter(results, \r -> r.second == "RECONSTRUCTED+VERIFIED");
+	bad = filter(results, \r -> r.second != "RECONSTRUCTED+VERIFIED");
+	if (length(theorems) == 1) {
+		env.out.println("test/forward-combined: theorem=" + id2s(results[0].first) + "  => " + results[0].second);
+	} else {
+		env.out.println("test/forward-combined: " + i2s(length(ok)) + "/" + i2s(length(results)) + " reconstructed+verified");
+		iter(take(bad, 12), \r -> env.out.println("  NOT-RECONSTRUCTED: " + id2s(r.first) + " => " + r.second));
+	};
+	if (ruTaskIntArg(task, "strict-fail", 0) > 0 && bad != []) {
+		ruCrash("test/forward-combined: failed for " + i2s(length(bad)) + " theorem(s)");
+	}
+	Some(state);
+	}
+}

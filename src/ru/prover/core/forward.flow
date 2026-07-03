@@ -1,0 +1,588 @@
+import ru/prover/core/env;
+import ru/prover/core/tree;
+import ru/prover/core/proofs;
+import ru/prover/core/util;
+
+// ---------------------------------------------------------------------------
+// Bidirectional search: a DYNAMIC forward front, grown one node per call.
+//
+// This is the structural mirror of ruExpandHyp (core/expand.flow). Where
+// ruExpandHyp matches a GOAL against assertion CONCLUSIONS and fans the
+// assertion's hypotheses into child subgoals, ruExpandForward matches a known
+// FACT against assertion HYPOTHESES and emits the assertion's CONCLUSION as a
+// new derived fact. Same `unify -> substitute -> emit` primitive, same node
+// records (RuProverProp / RuProverExp) — see [[engine-owns-proofs]].
+//
+// SCOPE OF THIS LAYER (deliberately minimal, fully additive):
+//   - single-hypothesis assertions only;
+//   - builds PVT STRUCTURE + a forward index, NO proof variants and NO
+//     propagation (a fresh forward node has nothing below it, so nothing
+//     propagates — eager propagation fires only at a JOIN, wired by the
+//     proof-building layer below);
+//   - lives in its own module and is not wired into RuProverEnv, so with the
+//     forward front unused the engine is byte-for-byte today's engine
+//     (the additivity invariant).
+//
+// ORIENTATION. A produced fact is a forward "top" (like the backward ROOT it
+// has no consumer yet), so its RuProverExp.parent is the ruNoProverProp
+// sentinel. The derivation step propA links downward: propA.parent = the
+// produced fact, propA.children = [the input fact]. The proof-building layer wires
+// the join and the upward propagation that this orientation enables; until then
+// nothing walks a forward parent chain, so the sentinel top is safe.
+// ---------------------------------------------------------------------------
+
+// RuProverForward is defined in core/env.flow (so RuProverEnv can hold one
+// without a circular import); this module provides its operations.
+
+export {
+	// Seed the front with the task premises (each paired with its theorem-hyp
+	// index) and build the single-hyp assertion index. assertions is the same
+	// index ruInitProverEnv is handed.
+	ruInitProverForward(
+		premises   : [Pair<RuExp, int>],
+		assertions : RuIndex<RuAssertion>,
+		math       : RuMath,
+		env        : RuEnv
+	) -> RuProverForward;
+
+	// Expand ONE forward fact: match it against every single-hyp assertion
+	// hypothesis and emit the resulting conclusions as new facts. Returns the
+	// updated front state; the second component is the freshly produced facts
+	// (so a caller / test can inspect exactly what this one step derived).
+	ruExpandForward(
+		fwd        : RuProverForward,
+		fact       : RuProverExp,
+		fresher    : (RuVar) -> RuVar,
+		idxer      : () -> int,
+		math       : RuMath,
+		env        : RuEnv
+	) -> Pair<RuProverForward, [RuProverExp]>;
+
+	// ----- forward proof building + the join -----------------------------
+	// Same as ruInitProverForward, but each premise seed carries a real proof
+	// variant (a RuProverProofTop hypothesis reference), so ruExpandForwardProved
+	// can chain proofs through ruAddProof. cpremises must be in the prover's
+	// const form (the form prover_env.math uses).
+	ruInitProverForwardProved(
+		cpremises  : [RuPremise],
+		assertions : RuIndex<RuAssertion>,
+		math       : RuMath,
+		env        : RuEnv
+	) -> RuProverForward;
+
+	// Like ruExpandForward, but additionally BUILDS each produced fact's proof
+	// variants by routing the input fact's proofs through the engine's ruAddProof
+	// (no hand-built proofs — the law-abiding path). The produced fact ends up
+	// with RuProverProofStmt variants in its .proofs, ready to be grafted at a
+	// join. Needs a real RuProverEnv for ruAddProof / fresher / idxer.
+	ruExpandForwardProved(
+		fwd        : RuProverForward,
+		fact       : RuProverExp,
+		prover_env : RuProverEnv
+	) -> Pair<RuProverForward, [RuProverExp]>;
+
+	// ----- acyclicity (the one genuinely new correctness check) -----------
+	// The dependency set of a forward fact: the node-lists (RuExp.nodes, compared
+	// structurally by the Set) of every INPUT fact used, transitively, to derive it —
+	// down to the premise seeds. A premise seed has no inputs, so its dep set is empty.
+	// Walks the node structure (produced fact -> its prop -> the prop's input fact -> ...).
+	ruForwardDepKeys(fact : RuProverExp) -> Set<[RuExpNode]>;
+
+	// The join-safety predicate. A join grafts forward fact `fact`'s proof onto a
+	// backward node whose statement has key `target_key`. That is acyclic iff the
+	// forward derivation does NOT already depend on the target — otherwise the
+	// grafted proof would (transitively) depend on the very node it is proving,
+	// i.e. a self-supporting cycle. This is the one new check the bidirectional
+	// engine needs; everything else reuses the existing acyclic-by-construction
+	// machinery. (Forward facts grown only from premises are premise-grounded, so
+	// this always holds for them; the check earns its keep once forward nodes can
+	// be seeded from backward-discovered subgoals.)
+	ruJoinAcyclic(fact : RuProverExp, target_key : [RuExpNode]) -> bool;
+
+	// Structural soundness of a built fact: (a) DAG — the fact does not depend on
+	// itself; (b) premise-grounded — every leaf of its proof tree is a premise
+	// hypothesis reference (so a forward proof can never reference a backward
+	// node, which is WHY the front is acyclic by construction).
+	ruForwardFactSound(fact : RuProverExp) -> bool;
+
+	// Number of steps in a fact's (first) proof tree — a uniform "shallowness"
+	// measure for ordering join candidates (works for both single- and multi-hyp
+	// facts, unlike the dep-key count which a multi-hyp fact leaves empty).
+	ruForwardProofSize(fact : RuProverExp) -> int;
+
+	// ----- wire the proof-carrying front into the live engine ------------
+	// If forward-search-depth > 0 in the task args, build the proof-carrying
+	// forward front (to that depth, capped by forward-search-size) and install it
+	// in prover_env.forwardFront, so the backward splice in expand.flow can close
+	// leaves with forward-derived proofs. A no-op when the flag is 0 — then the
+	// engine is byte-identical to today. Must be called AFTER prover_env is fully
+	// constructed (it grows the front through prover_env's ruAddProof).
+	ruMaybeBuildForwardFront(
+		prover_env : RuProverEnv,
+		task       : RuProverTask,
+		assertions : RuIndex<RuAssertion>
+	) -> void;
+
+	// Apply an assertion to n given fact E-nodes (one per hypothesis, in order),
+	// no front search — the top-down oracle uses this to replay a proof forward.
+	ruApplyForwardOn(
+		assertion : RuAssertion,
+		facts     : [RuProverExp],
+		prover_env : RuProverEnv
+	) -> Maybe<RuProverExp>;
+
+	// Universal join, forward->backward: discharge every open backward subgoal a new
+	// forward fact covers (forward-search feature).
+	ruReverseJoin(pf : RuProverExp, prover_env : RuProverEnv) -> void;
+
+	// Positional proof-DAG path of a backward node (hypothesis-index sequence).
+	ruNodePath(h : RuProverHyp) -> [int];
+}
+
+ruInitProverForward(
+	premises   : [Pair<RuExp, int>],
+	assertions : RuIndex<RuAssertion>,
+	math       : RuMath,
+	env        : RuEnv
+) -> RuProverForward {
+	one_hyp_asses = filter(ruIndexValues(assertions), \ass ->
+		length(ass.infer.hyps) == 1
+	);
+	hyp_index = fold(one_hyp_asses, ruMakeIndex(), \acc, ass -> {
+		h = ass.infer.hyps[0];
+		ruSetIndex(ruExp(h.stmt.exps[0]), ass, acc);
+	});
+	// Each premise becomes a forward "top": a RuProverExp with the premise's
+	// theorem-hyp index as `ind`, no proofs yet, no children, sentinel parent.
+	seed_facts = map(premises, \p ->
+		RuProverExp(p.second, makeVector(0), RuStmt(ruNoStmt with exps = [p.first]), makeVector(0), ruNoProverProp)
+	);
+	seen0 = fold(seed_facts, makeSet(), \acc, f -> insertSet(acc, (ruExp(f.stmt.exps[0])).nodes));
+	idx0  = fold(seed_facts, ruMakeIndex(), \acc, f -> ruSetIndex(ruExp(f.stmt.exps[0]), f, acc));
+	RuProverForward(idx0, seed_facts, hyp_index, ruMakeIndex(), seen0, makeTree());
+}
+
+// A bare metavariable hypothesis (the whole expr is a single variable node)
+// matches every fact, so it must NOT be a forward trigger — it is filled from
+// the front instead. Anything with structure (or a nullary constant) is fine.
+ruHypIsBareVar(h : RuExp) -> bool {
+	length(h.nodes) == 1 && switch (h.nodes[0]) { RuVar(__, __): true; default: false; };
+}
+
+ruExpandForward(
+	fwd     : RuProverForward,
+	fact    : RuProverExp,
+	fresher : (RuVar) -> RuVar,
+	idxer   : () -> int,
+	math    : RuMath,
+	env     : RuEnv
+) -> Pair<RuProverForward, [RuProverExp]> {
+	fact_exp = ruExp(fact.stmt.exps[0]);
+	// Head-symbol prefilter via the hyp index. The candidate subs use the
+	// assertion's ORIGINAL var ids, which may COLLIDE with the fact's own vars
+	// (assertions and a raw fact draw from the same id space). So we do NOT use
+	// those subs directly: like ruIterAssertionsForFact, we freshen the
+	// assertion's vars FIRST, then re-unify the fresh hyp against the fact. This
+	// keeps the assertion var namespace disjoint from the fact's, avoiding the
+	// variable capture that over-specialises the conclusion. (ruExpandHyp can
+	// freshen AFTER only because the backward prover runs on const-form goals
+	// whose vars never collide with assertion vars — a forward primitive must
+	// not assume that.)
+	candidates = ruUnifyIndex(fact_exp, fwd.hypIndex, ruEmptySubst, math, env);
+	fold(candidates, Pair(fwd, []), \acc, cand -> {
+		st        = acc.first;
+		produced  = acc.second;
+		assertion = cand.data;
+		a_vars    = ruAssertion2Vars(assertion);
+		fresh_sub = ruMakeFresherSubst(set2array(a_vars), fresher);
+		fresh_hyp = ruApplySubst(ruExp(assertion.infer.hyps[0].stmt.exps[0]), fresh_sub);
+		switch (ruUnifyExps([fresh_hyp, fact_exp], ruEmptySubst, math, env)) {
+			None(): acc;
+			Some(step_sub): {
+				// conclusion under fresh_sub then step_sub (= closure's new_exp).
+				conc_exp = ruApplySubst(ruApplySubst(ruExp(assertion.infer.prop.exps[0]), fresh_sub), step_sub);
+				key = (conc_exp).nodes;
+				if (containsSet(st.seen, key)) acc else {
+					// Bindings stored for proof building (conclusion itself is
+					// authoritative in the stmt; sub/outer get validated when the join builds the proof):
+					// outer = original assertion var -> value (fresh_sub then step_sub),
+					// sub   = the residual fresh/fact-var bindings.
+					effective = ruUnsafeCompose(fresh_sub, step_sub);
+					outer = ruFilterSub(effective, \v, __ ->  containsSet(a_vars, v));
+					sub   = ruFilterSub(step_sub,  \v, __ -> !containsSet(a_vars, v));
+					produced_fact = RuProverExp(
+						0, makeVector(0),
+						RuStmt(assertion.infer.prop with exps = [conc_exp]),
+						makeVector(1), ruNoProverProp
+					);
+					propA = RuProverProp(
+						idxer(), assertion, makeVector(0),
+						sub, outer, makeVector(1),
+						produced_fact, ref ""
+					);
+					pushVector(propA.children, fact);
+					pushVector(produced_fact.children, propA);
+					Pair(
+						RuProverForward(
+							ruSetIndex(conc_exp, produced_fact, st.index),
+							arrayPush(st.front, produced_fact),
+							st.hypIndex,
+							st.multiHyp,
+							insertSet(st.seen, key),
+							st.pathIndex
+						),
+						arrayPush(produced, produced_fact)
+					);
+				}
+			}
+		}
+	});
+}
+
+ruInitProverForwardProved(
+	cpremises  : [RuPremise],
+	assertions : RuIndex<RuAssertion>,
+	math       : RuMath,
+	env        : RuEnv
+) -> RuProverForward {
+	one_hyp_asses = filter(ruIndexValues(assertions), \ass -> length(ass.infer.hyps) == 1);
+	hyp_index = fold(one_hyp_asses, ruMakeIndex(), \acc, ass -> {
+		h = ass.infer.hyps[0];
+		ruSetIndex(ruExp(h.stmt.exps[0]), ass, acc);
+	});
+	// Multi-hyp (>=2) assertions: index each rule-headed hyp by its expression,
+	// paired with its position, as a forward trigger.
+	multi_asses = filter(ruIndexValues(assertions), \ass -> length(ass.infer.hyps) >= 2);
+	multi_index = fold(multi_asses, ruMakeIndex(), \acc, ass ->
+		foldi(ass.infer.hyps, acc, \i, ac, h -> {
+			he = ruExp(h.stmt.exps[0]);
+			if (ruHypIsBareVar(he)) ac else ruSetIndex(he, RuFwdHyp(ass, i), ac);
+		})
+	);
+	// Each premise seeds a forward "top" carrying a trivial proof variant: a
+	// RuProverProofTop hypothesis reference (ruMakeProofTree -> RuProofHyp(ind)).
+	// premise.ind is the theorem-hyp index the verifier expects.
+	seed_facts = map(cpremises, \p -> {
+		sf = RuProverExp(p.ind, makeVector(4), p.stmt, makeVector(0), ruNoProverProp);
+		pushVector(sf.proofs, RuProverProofTop(sf, p.stmt, p, ruEmptySubst));
+		sf;
+	});
+	seen0 = fold(seed_facts, makeSet(), \acc, f -> insertSet(acc, (ruExp(f.stmt.exps[0])).nodes));
+	idx0  = fold(seed_facts, ruMakeIndex(), \acc, f -> ruSetIndex(ruExp(f.stmt.exps[0]), f, acc));
+	RuProverForward(idx0, seed_facts, hyp_index, multi_index, seen0, makeTree());
+}
+
+// Add one produced fact to the front: index it, push to the frontier and the
+// produced list, mark its key seen.
+ruFwdRegister(
+	st : RuProverForward, produced : [RuProverExp],
+	pf : RuProverExp, conc_exp : RuExp, key : [RuExpNode]
+) -> Pair<RuProverForward, [RuProverExp]> {
+	Pair(
+		RuProverForward(
+			ruSetIndex(conc_exp, pf, st.index),
+			arrayPush(st.front, pf),
+			st.hypIndex, st.multiHyp,
+			insertSet(st.seen, key),
+			st.pathIndex
+		),
+		arrayPush(produced, pf)
+	);
+}
+
+// Root (conclusion) expression of a proof tree.
+ruProofTreeRoot(t : RuProofTree) -> RuExp {
+	switch (t) {
+		RuProofStep(__, __, st): ruExp(st.exps[0]);
+		RuProofHyp(__, st):       ruExp(st.exps[0]);
+	}
+}
+
+// Apply `assertion` to n GIVEN fact E-nodes (one per hypothesis, in order),
+// producing the conclusion fact — the same complete application as ruApplyForward
+// but with every hypothesis supplied directly (no front search). Used by the
+// top-down oracle to replay a proof forward. ruAddProof builds the one consistent
+// substitution across all n hypotheses; None if the facts don't fit / aren't
+// consistent. (Builds the conclusion's expression + proof substitution.)
+ruApplyForwardOn(
+	assertion : RuAssertion,
+	facts     : [RuProverExp],
+	prover_env : RuProverEnv
+) -> Maybe<RuProverExp> {
+	math = prover_env.math;
+	env  = prover_env.env;
+	hyps = assertion.infer.hyps;
+	n = length(hyps);
+	if (length(facts) != n) None() else {
+		a_vars = ruAssertion2Vars(assertion);
+		fresh_sub = fold(set2array(a_vars), ruEmptySubst, \fs, v ->
+			either(ruAdd2Subst(fs, v, RuExp([prover_env.fns.fresher(v)], -1)), fs)
+		);
+		fresh_hyps = map(hyps, \h -> ruApplySubst(ruExp(h.stmt.exps[0]), fresh_sub));
+		conc_tmpl  = ruApplySubst(ruExp(assertion.infer.prop.exps[0]), fresh_sub);
+		cnode = RuProverExp(0, makeVector(2), RuStmt(assertion.infer.prop with exps = [conc_tmpl]), makeVector(1), ruNoProverProp);
+		prop  = RuProverProp(prover_env.fns.idxer(), assertion, makeVector(4), ruEmptySubst, fresh_sub, makeVector(n), cnode, ref "");
+		pushVector(cnode.children, prop);
+		hyp_nodes = mapi(hyps, \j, h -> {
+			hn = RuProverExp(j, makeVector(4), RuStmt(h.stmt with exps = [fresh_hyps[j]]), makeVector(0), prop);
+			pushVector(prop.children, hn);
+			hn;
+		});
+		// Graft each given fact onto its hypothesis (match it to the hyp pattern).
+		all_fit = foldi(facts, true, \j, ok, fct -> {
+			if (!ok || sizeVector(fct.proofs) == 0) false else
+			switch (ruUnifyExps([fresh_hyps[j], ruExp(fct.stmt.exps[0])], ruEmptySubst, math, env)) {
+				None(): false;
+				Some(sigma): {
+					closing = RuStmt(hyp_nodes[j].stmt with exps = [ruApplySubst(fresh_hyps[j], sigma)]);
+					gtree = ruApplySubst2ProofNode(sigma, ruMakeProofTree(vector2array(fct.proofs)[0]));
+					pushVector(hyp_nodes[j].proofs, RuProverProofForward(hyp_nodes[j], closing, sigma, gtree));
+					true;
+				}
+			}
+		});
+		if (!all_fit) None() else {
+			if (n == 0) {
+				// 0-hypothesis assertion (an axiom): trivially proved, as the
+				// backward engine does for an arity-0 prop.
+				pushVector(prop.proofs, RuProverProofProp(prop, prop.sub, []));
+			} else {
+				iterVector(hyp_nodes[0].proofs, \g -> ruAddProof(prop, g, prover_env));
+			}
+			if (sizeVector(prop.proofs) == 0) None() else {
+				pp = vector2array(prop.proofs)[0];
+				conc = ruProofTreeRoot(ruMakeProofTree(pp));
+				conc_stmt = RuStmt(assertion.infer.prop with exps = [conc]);
+				pf = RuProverExp(0, makeVector(4), conc_stmt, makeVector(1), ruNoProverProp);
+				pushVector(pf.children, prop);
+				pushVector(pf.proofs, RuProverProofStmt(pf, conc_stmt, pp.sub, pp));
+				Some(pf);
+			}
+		}
+	}
+}
+
+// One assertion application, the SAME complete unit for every arity: apply
+// `assertion` to its n hypotheses and produce one P-node + one conclusion fact
+// E-node holding the obtained expression and the proof (substitution). The
+// trigger `fact` discharges hypothesis `trig`; the other hypotheses are
+// discharged from the existing fact front. ruAddProof builds the single
+// substitution that consistently instantiates the assertion across all n
+// hypotheses (its substitution-unification IS the consistency check) — no
+// per-arity code, no soundness gate, no caps. Conclusions whose hypotheses are
+// not all present as facts simply do not assemble (ruAddProof yields nothing).
+ruApplyForward(
+	st : RuProverForward, produced : [RuProverExp],
+	fact : RuProverExp, fact_exp : RuExp,
+	assertion : RuAssertion, trig : int,
+	prover_env : RuProverEnv
+) -> Pair<RuProverForward, [RuProverExp]> {
+	math = prover_env.math;
+	env  = prover_env.env;
+	hyps = assertion.infer.hyps;
+	n = length(hyps);
+	a_vars = ruAssertion2Vars(assertion);
+	// Freshen the assertion vars to placeholders (disjoint from any fact's vars).
+	// Built via ruAdd2Subst (NOT ruMakeFresherSubst): the latter stores each
+	// entry's var-set as the ORIGINAL var id, so ruApplySubstVars — used by
+	// ruUnsafeCompose inside ruMakeProofTree — won't chase the fresh placeholder
+	// into its binding, leaving unresolved placeholders in the conclusion.
+	fresh_sub = fold(set2array(a_vars), ruEmptySubst, \fs, v ->
+		either(ruAdd2Subst(fs, v, RuExp([prover_env.fns.fresher(v)], -1)), fs)
+	);
+	fresh_hyps = map(hyps, \h -> ruApplySubst(ruExp(h.stmt.exps[0]), fresh_sub));
+	conc_tmpl  = ruApplySubst(ruExp(assertion.infer.prop.exps[0]), fresh_sub);
+	// The P-node, anchored at its conclusion E-node. outer = the placeholders,
+	// resolved by the children's substitutions inside ruAddProof / ruMakeProofTree;
+	// sub = empty.
+	cnode = RuProverExp(0, makeVector(2), RuStmt(assertion.infer.prop with exps = [conc_tmpl]), makeVector(1), ruNoProverProp);
+	prop  = RuProverProp(prover_env.fns.idxer(), assertion, makeVector(4), ruEmptySubst, fresh_sub, makeVector(n), cnode, ref "");
+	pushVector(cnode.children, prop);
+	// The n hypothesis E-nodes.
+	hyp_nodes = mapi(hyps, \j, h -> {
+		hn = RuProverExp(j, makeVector(4), RuStmt(h.stmt with exps = [fresh_hyps[j]]), makeVector(0), prop);
+		pushVector(prop.children, hn);
+		hn;
+	});
+	// Discharge each hypothesis from the fact front. Match the trigger first to
+	// get sigma, then CONSTRAIN the other hypotheses' searches by sigma (the
+	// trigger fixes part of the substitution — exactly as the backward engine
+	// creates its hyps with the goal-match binding already applied). This loses
+	// no valid application (every one consistent with `fact` at trig agrees with
+	// sigma) and keeps the front search tractable. Each discharge grafts the
+	// fact's proof onto the hypothesis E-node carrying its full match sub; the
+	// grafts all share sigma, so ruAddProof's substitution-unification combines
+	// them into the one consistent binding.
+	maybeApply(ruUnifyExps([fresh_hyps[trig], fact_exp], ruEmptySubst, math, env), \sigma -> {
+		iteri(hyp_nodes, \j, hn -> {
+			matches = if (j == trig) {
+				[RuUnified(sigma, fact, ruApplySubst(fresh_hyps[trig], sigma))];
+			} else {
+				map(ruUnifyIndex(ruApplySubst(fresh_hyps[j], sigma), st.index, ruEmptySubst, math, env),
+					\u -> RuUnified(ruUnsafeCompose(sigma, u.sub), u.data, u.expr));
+			};
+			iter(matches, \u -> {
+				gfact = u.data; gsub = u.sub;
+				if (sizeVector(gfact.proofs) > 0) {
+					// One proof per matched fact suffices: downstream only needs the
+					// fact derived, and distinct proofs of the SAME fact would only
+					// multiply ruAddProof's cartesian without adding reachable
+					// conclusions.
+					closing = RuStmt(hn.stmt with exps = [ruApplySubst(fresh_hyps[j], gsub)]);
+					gtree = ruApplySubst2ProofNode(gsub, ruMakeProofTree(vector2array(gfact.proofs)[0]));
+					pushVector(hn.proofs, RuProverProofForward(hn, closing, gsub, gtree));
+				}
+			});
+		});
+		// Assemble: ruAddProof builds prop's proof variants (the consistent
+		// combinations). Call it per proof of the trigger hypothesis — it reads
+		// the other hypotheses' stored proofs and unifies their substitutions.
+		iterVector(hyp_nodes[trig].proofs, \g -> ruAddProof(prop, g, prover_env));
+	});
+	// Each assembled variant is one conclusion fact.
+	fold(vector2array(prop.proofs), Pair(st, produced), \acc, pp -> {
+		st2 = acc.first; prod2 = acc.second;
+		conc = ruProofTreeRoot(ruMakeProofTree(pp));
+		key  = (conc).nodes;
+		if (containsSet(st2.seen, key)) acc else {
+			conc_stmt = RuStmt(assertion.infer.prop with exps = [conc]);
+			pf = RuProverExp(0, makeVector(4), conc_stmt, makeVector(1), ruNoProverProp);
+			pushVector(pf.children, prop);
+			pushVector(pf.proofs, RuProverProofStmt(pf, conc_stmt, pp.sub, pp));
+			// Universal join, forward side: this new fact checks the backward front
+			// and discharges any matching open backward subgoal.
+			ruReverseJoin(pf, prover_env);
+			ruFwdRegister(st2, prod2, pf, conc, key);
+		}
+	});
+}
+
+// The POSITIONAL path of a backward node in the proof DAG: the sequence of
+// hypothesis indices from the root. Because the oracle expands hyp i of a prop to
+// realise proof-DAG child i, this path is exactly the node's proof-DAG position,
+// derivable from the PVT structure alone. The completeness-test join (in
+// expand.flow) uses it to close a subgoal with the forward fact at the same node.
+ruNodePath(h : RuProverHyp) -> [int] {
+	switch (h) {
+		RuProverRoot(__, __, __):             [];
+		RuProverExp(ind, __, __, __, prop):   arrayPush(ruNodePath(prop.parent), ind);
+	}
+}
+
+// Universal join, forward->backward (symmetric counterpart of the backward splice
+// in expand.flow). A newly created forward fact `pf` is matched against the backward
+// front; every open backward subgoal it covers is discharged by grafting pf's proof
+// (specialised to the subgoal), feeding ruAddProof, and propagating up. Guarded by
+// ruJoinAcyclic. Used by the forward-search feature; the completeness-test combined
+// oracle joins positionally at subgoal creation instead.
+ruReverseJoin(pf : RuProverExp, prover_env : RuProverEnv) -> void {
+	pf_exp = ruExp(pf.stmt.exps[0]);
+	matches = ruUnifyIndex(pf_exp, ^(prover_env.backwardFront), ruEmptySubst, prover_env.math, prover_env.env);
+	iter(matches, \u -> {
+		subgoal : RuProverExp = u.data;
+		sigma = u.sub;
+		if (ruJoinAcyclic(pf, (ruExp(subgoal.stmt.exps[0])).nodes)) {
+			parent = subgoal.parent;
+			iterVector(pf.proofs, \pv -> {
+				closing = RuStmt(subgoal.stmt with exps = map(subgoal.stmt.exps, \ex -> ruApplySubst(ruExp(ex), sigma)));
+				spliced = ruApplySubst2ProofNode(sigma, ruMakeProofTree(pv));
+				fwdProof = RuProverProofForward(subgoal, closing, sigma, spliced);
+				// Variant admission (inert by default): the completeness-test oracle
+				// dedups (a forward graft equal to backward's proof is NOT emitted twice
+				// — the ADDITIVE invariant) and bounds the node to `limit`.
+				if (prover_env.fns.keepVariant(fwdProof)) {
+					pushVector(subgoal.proofs, fwdProof);
+					n0 = sizeVector(parent.proofs);
+					ruAddProof(parent, fwdProof, prover_env);
+					ruBuildPropProofs(parent, vectorTailFrom(parent.proofs, n0), prover_env);
+				} else {};
+			});
+		}
+	});
+}
+
+ruExpandForwardProved(
+	fwd        : RuProverForward,
+	fact       : RuProverExp,
+	prover_env : RuProverEnv
+) -> Pair<RuProverForward, [RuProverExp]> {
+	math = prover_env.math;
+	env  = prover_env.env;
+	fact_exp = ruExp(fact.stmt.exps[0]);
+	// Trigger set: every (assertion, rule-headed-hypothesis-position) the fact can
+	// fill. hypIndex covers single-hyp assertions (position 0); multiHyp covers the
+	// rule-headed hypotheses of >=2-hyp assertions. Both feed the SAME application.
+	single = map(ruUnifyIndex(fact_exp, fwd.hypIndex, ruEmptySubst, math, env), \u -> RuFwdHyp(u.data, 0));
+	multi  = map(ruUnifyIndex(fact_exp, fwd.multiHyp, ruEmptySubst, math, env), \u -> u.data);
+	fold(concat(single, multi), Pair(fwd, []), \acc, fh ->
+		ruApplyForward(acc.first, acc.second, fact, fact_exp, fh.assertion, fh.pos, prover_env)
+	);
+}
+
+// Walk the derivation: a produced fact's children are its producing props; a
+// prop's children are its input facts; recurse into those. Collect the input
+// facts' keys (NOT the fact's own — that is the thing being derived).
+ruForwardDepKeys(fact : RuProverExp) -> Set<[RuExpNode]> {
+	foldVector(fact.children, makeSet(), \acc, prop ->
+		foldVector(prop.children, acc, \acc2, input ->
+			mergeSets(
+				insertSet(acc2, (ruExp(input.stmt.exps[0])).nodes),
+				ruForwardDepKeys(input)
+			)
+		)
+	);
+}
+
+ruJoinAcyclic(fact : RuProverExp, target_key : [RuExpNode]) -> bool {
+	!containsSet(ruForwardDepKeys(fact), target_key);
+}
+
+ruForwardFactSound(fact : RuProverExp) -> bool {
+	dag = ruJoinAcyclic(fact, (ruExp(fact.stmt.exps[0])).nodes);
+	// Premise-grounded: every proof variant's tree bottoms out in RuProofHyp
+	// leaves only (premise references) — no dangling / non-premise leaf.
+	grounded = foldVector(fact.proofs, true, \acc, pv ->
+		acc && ruProofTreeGrounded(ruMakeProofTree(pv))
+	);
+	dag && grounded;
+}
+
+ruProofTreeGrounded(t : RuProofTree) -> bool {
+	switch (t) {
+		RuProofHyp(ind, __):       ind >= 0;
+		RuProofStep(__, kids, __): forall(kids, ruProofTreeGrounded);
+	}
+}
+
+ruForwardProofSize(fact : RuProverExp) -> int {
+	if (sizeVector(fact.proofs) == 0) 0
+	else length(ruProofTreeSteps(ruMakeProofTree(vector2array(fact.proofs)[0])));
+}
+
+ruMaybeBuildForwardFront(
+	prover_env : RuProverEnv,
+	task       : RuProverTask,
+	assertions : RuIndex<RuAssertion>
+) -> void {
+	depth = {
+		v = lookupTreeDef(task.args, "forward-search-depth", "0");
+		if (runtimeValueType(v) == "int") cast(v : flow -> int) else s2i(cast(v : flow -> string));
+	};
+	if (depth > 0) {
+		size = {
+			v = lookupTreeDef(task.args, "forward-search-size", "2048");
+			if (runtimeValueType(v) == "int") cast(v : flow -> int) else s2i(cast(v : flow -> string));
+		};
+		// Same const form prover_env.math uses (ruConstProverTask is deterministic),
+		// so seeds / proofs live in the prover's variable space.
+		c_task = ruConstProverTask(task, prover_env.math);
+		fwd0 = ruInitProverForwardProved(c_task.const.premises, assertions, prover_env.math, prover_env.env);
+		final_fwd = foldRange(1, depth, fwd0, \fwd, __ ->
+			fold(fwd.front, RuProverForward(fwd with front = []), \st, fact ->
+				if (ruIndexDataCount(st.index) >= size) st
+				else ruExpandForwardProved(st, fact, prover_env).first
+			)
+		);
+		prover_env.forwardFront := Some(final_fwd);
+	}
+}
