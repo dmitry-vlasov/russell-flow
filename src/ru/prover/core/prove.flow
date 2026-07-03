@@ -58,27 +58,57 @@ ruProveProp(prop : RuProverProp, prover_env : RuProverEnv) -> RuProverEnv {
 	env1;
 }
 
-// Pulls the next batch of leafs to expand from the current tactic, applying
-// the tactic's step protocol: Done terminates, Switch swaps the tactic and
-// retries, Expand returns the leafs.  Returns Pair(updated env, leafs).
-// If leafs is [] the caller should treat the env's tactic as None and stop.
-ruRunTacticStep(prover_env : RuProverEnv) -> Pair<RuProverEnv, [RuProverProp]> {
+// Resolves the current tactic's next actionable step: Switch swaps the tactic and
+// retries; Done clears the tactic and reports RuTacticExpand([]) (the "stop"
+// signal); Expand / ExpandForward pass through. Returns Pair(updated env, step)
+// where step is always RuTacticExpand(leafs) (backward) or RuTacticExpandForward()
+// (advance the forward front one wave). An empty Expand([]) means stop.
+ruRunTacticStep(prover_env : RuProverEnv) -> Pair<RuProverEnv, RuProverTacticStep> {
 	switch (^(prover_env.tactic)) {
 		Some(tactic): {
 			switch (tactic.step(prover_env.tree)) {
 				RuTacticDone(): {
 					prover_env.tactic := None();
-					Pair(prover_env, []);
+					Pair(prover_env, RuTacticExpand([]));
 				}
 				RuTacticSwitch(next): {
 					prover_env.tactic := Some(next);
 					ruRunTacticStep(prover_env);
 				}
-				RuTacticExpand(leafs): Pair(prover_env, leafs);
+				RuTacticExpand(leafs):    Pair(prover_env, RuTacticExpand(leafs));
+				RuTacticExpandForward():  Pair(prover_env, RuTacticExpandForward());
 			}
 		}
-		None(): Pair(prover_env, []);
+		None(): Pair(prover_env, RuTacticExpand([]));
 	}
+}
+
+// Expand a batch of backward leafs and merge the results back into the tree,
+// respecting the current tactic's keep_expanding budget. `parallel` picks
+// ruConcurrent (top-level) vs ruSequential (nested / one-round). Shared by all
+// three drive loops so the expansion body stays in one place.
+ruExpandLeafsInto(env_after_step : RuProverEnv, to_expand : [RuProverProp], parallel : bool) -> RuProverEnv {
+	to_expand_removed = fold(to_expand, env_after_step.tree.leafs, \acc, prop ->
+		removeFromTree(acc, prop.id)
+	);
+	env1 = RuProverEnv(env_after_step with
+		tree = RuProverTree(env_after_step.tree with leafs = to_expand_removed)
+	);
+	workers = map(to_expand, \prop -> \env2 ->
+		switch (^(env1.tactic)) {
+			Some(tac): if (tac.keep_expanding(env1.tree)) ruProveProp(prop, RuProverEnv(env1 with env = env2)) else env1;
+			None(): env1;
+		}
+	);
+	env1_expanded = if (parallel) ruConcurrent(workers, env1.env) else ruSequential(workers, env1.env);
+	fold(env1_expanded, env1, \acc, e ->
+		RuProverEnv(acc with
+			tree = RuProverTree(acc.tree with
+				leafs = mergeTree(acc.tree.leafs, e.tree.leafs),
+				nodes = mergeTree(acc.tree.nodes, e.tree.leafs)
+			)
+		)
+	);
 }
 
 ruProve(prover_env : RuProverEnv) -> RuProverEnv {
@@ -86,37 +116,22 @@ ruProve(prover_env : RuProverEnv) -> RuProverEnv {
 		lookupTree(prover_env.tree.leafs, ind)
 	);
 	prover_env.toExpand := [];
-	to_expand_and_env =
-		if (length(to_expand0) > 0) Pair(prover_env, to_expand0)
-		else ruRunTacticStep(prover_env);
-	env_after_step = to_expand_and_env.first;
-	to_expand = to_expand_and_env.second;
-	if (to_expand == []) env_after_step
-	else {
-		to_expand_removed = fold(to_expand, env_after_step.tree.leafs, \acc, prop ->
-			removeFromTree(acc, prop.id)
-		);
-		env1 = RuProverEnv(env_after_step with
-			tree = RuProverTree(env_after_step.tree with leafs = to_expand_removed)
-		);
-		env1_expanded = ruConcurrent(
-			map(to_expand, \prop -> \env2 ->
-				switch (^(env1.tactic)) {
-					Some(tac): if (tac.keep_expanding(env1.tree)) ruProveProp(prop, RuProverEnv(env1 with env = env2)) else env1;
-					None(): env1;
-				}
-			),
-			env1.env
-		);
-		new_env = fold(env1_expanded, env1, \acc, e ->
-			RuProverEnv(acc with
-				tree = RuProverTree(acc.tree with
-					leafs = mergeTree(acc.tree.leafs, e.tree.leafs),
-					nodes = mergeTree(acc.tree.nodes, e.tree.leafs)
-				)
-			)
-		);
-		ruProve(new_env);
+	if (length(to_expand0) > 0) {
+		ruProve(ruExpandLeafsInto(prover_env, to_expand0, true));
+	} else {
+		step_res = ruRunTacticStep(prover_env);
+		env_a    = step_res.first;
+		switch (step_res.second) {
+			RuTacticExpand(leafs):
+				if (leafs == []) env_a
+				else ruProve(ruExpandLeafsInto(env_a, leafs, true));
+			// A forward wave is one L1 round: advance the front; if it produced new
+			// facts (and no proof yet), loop back to the tactic for the next round.
+			RuTacticExpandForward():
+				if (ruRunForwardWave(env_a)) ruProve(env_a) else env_a;
+			RuTacticSwitch(__): env_a;   // resolved inside ruRunTacticStep — unreachable
+			RuTacticDone():     env_a;   // resolved inside ruRunTacticStep — unreachable
+		}
 	}
 }
 
@@ -125,37 +140,19 @@ ruProveOneRound(prover_env : RuProverEnv) -> Pair<RuProverEnv, bool> {
 		lookupTree(prover_env.tree.leafs, ind)
 	);
 	prover_env.toExpand := [];
-	to_expand_and_env =
-		if (length(to_expand0) > 0) Pair(prover_env, to_expand0)
-		else ruRunTacticStep(prover_env);
-	env_after_step = to_expand_and_env.first;
-	to_expand = to_expand_and_env.second;
-	if (to_expand == []) Pair(env_after_step, false)
-	else {
-		to_expand_removed = fold(to_expand, env_after_step.tree.leafs, \acc, prop ->
-			removeFromTree(acc, prop.id)
-		);
-		env1 = RuProverEnv(env_after_step with
-			tree = RuProverTree(env_after_step.tree with leafs = to_expand_removed)
-		);
-		env1_expanded = ruSequential(
-			map(to_expand, \prop -> \env2 ->
-				switch (^(env1.tactic)) {
-					Some(tac): if (tac.keep_expanding(env1.tree)) ruProveProp(prop, RuProverEnv(env1 with env = env2)) else env1;
-					None(): env1;
-				}
-			),
-			env1.env
-		);
-		new_env = fold(env1_expanded, env1, \acc, e ->
-			RuProverEnv(acc with
-				tree = RuProverTree(acc.tree with
-					leafs = mergeTree(acc.tree.leafs, e.tree.leafs),
-					nodes = mergeTree(acc.tree.nodes, e.tree.leafs)
-				)
-			)
-		);
-		Pair(new_env, true);
+	if (length(to_expand0) > 0) {
+		Pair(ruExpandLeafsInto(prover_env, to_expand0, false), true);
+	} else {
+		step_res = ruRunTacticStep(prover_env);
+		env_a    = step_res.first;
+		switch (step_res.second) {
+			RuTacticExpand(leafs):
+				if (leafs == []) Pair(env_a, false)
+				else Pair(ruExpandLeafsInto(env_a, leafs, false), true);
+			RuTacticExpandForward(): Pair(env_a, ruRunForwardWave(env_a));
+			RuTacticSwitch(__): Pair(env_a, false);   // unreachable
+			RuTacticDone():     Pair(env_a, false);   // unreachable
+		}
 	}
 }
 
@@ -164,36 +161,19 @@ ruProveSequential(prover_env : RuProverEnv) -> RuProverEnv {
 		lookupTree(prover_env.tree.leafs, ind)
 	);
 	prover_env.toExpand := [];
-	to_expand_and_env =
-		if (length(to_expand0) > 0) Pair(prover_env, to_expand0)
-		else ruRunTacticStep(prover_env);
-	env_after_step = to_expand_and_env.first;
-	to_expand = to_expand_and_env.second;
-	if (to_expand == []) env_after_step
-	else {
-		to_expand_removed = fold(to_expand, env_after_step.tree.leafs, \acc, prop ->
-			removeFromTree(acc, prop.id)
-		);
-		env1 = RuProverEnv(env_after_step with
-			tree = RuProverTree(env_after_step.tree with leafs = to_expand_removed)
-		);
-		env1_expanded = ruSequential(
-			map(to_expand, \prop -> \env2 ->
-				switch (^(env1.tactic)) {
-					Some(tac): if (tac.keep_expanding(env1.tree)) ruProveProp(prop, RuProverEnv(env1 with env = env2)) else env1;
-					None(): env1;
-				}
-			),
-			env1.env
-		);
-		new_env = fold(env1_expanded, env1, \acc, e ->
-			RuProverEnv(acc with
-				tree = RuProverTree(acc.tree with
-					leafs = mergeTree(acc.tree.leafs, e.tree.leafs),
-					nodes = mergeTree(acc.tree.nodes, e.tree.leafs)
-				)
-			)
-		);
-		ruProveSequential(new_env);
+	if (length(to_expand0) > 0) {
+		ruProveSequential(ruExpandLeafsInto(prover_env, to_expand0, false));
+	} else {
+		step_res = ruRunTacticStep(prover_env);
+		env_a    = step_res.first;
+		switch (step_res.second) {
+			RuTacticExpand(leafs):
+				if (leafs == []) env_a
+				else ruProveSequential(ruExpandLeafsInto(env_a, leafs, false));
+			RuTacticExpandForward():
+				if (ruRunForwardWave(env_a)) ruProveSequential(env_a) else env_a;
+			RuTacticSwitch(__): env_a;   // unreachable
+			RuTacticDone():     env_a;   // unreachable
+		}
 	}
 }
