@@ -1240,17 +1240,58 @@ ruDslBuildOrElse(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuil
 			trace = \ -> if (ctx.env.conf.verbose >= 3) {
 				ctx.env.out.println("  or-else stage nodes: " + ruPvtStageStats2s(labels));
 			} else {};
-			Pair(penv, ruOrElseTactic(mapi(pairs, \i, pr ->
-				Pair(pr.first, \ -> {
-					if (i > 0) trace() else {};
-					reset();
-					// own the tag from BUILD on: stage builders create nodes too
-					// (seeding, refiners) — they belong to this stage, not to the
-					// previous one whose tag would otherwise still be installed
-					tag = ruPvtNewTag(labels, parentTag, pr.first);
-					labels.stage := tag;
-					ruStampingTactic((pr.second.build(penv)).second, labels, tag);
-				}))))
+			// RESUMABILITY (label phase 3): per-stage SAVED fronts + a stable tag.
+			// A stage's search state is (its labeled tree nodes) + (its forward /
+			// backward fronts): the nodes stay in the tree and stay visible under
+			// the REUSED tag; the fronts are saved when the NEXT stage starts (the
+			// env still holds them then) and restored on re-entry — the builder's
+			// seeding is a no-op on an installed front, so a resumed stage
+			// continues its waves/search where it stopped, under a fresh slice.
+			stageTags  : ref Tree<int, int> = ref makeTree();
+			stageState : ref Tree<int, Pair<Maybe<RuProverForward>, RuIndex<RuProverExp>>> = ref makeTree();
+			stageTag = \i : int, name : string -> switch (lookupTree(^stageTags, i)) {
+				Some(t): t;
+				None(): {
+					t = ruPvtNewTag(labels, parentTag, name);
+					stageTags := setTree(^stageTags, i, t);
+					t;
+				}
+			};
+			saveStage = \i : int ->
+				stageState := setTree(^stageState, i, Pair(^(penv.forwardFront), ^(penv.backwardFront)));
+			mkThunk = \i : int, pr : Pair<string, RuTacticBuilder> -> Pair(pr.first, \ -> {
+				if (i > 0) { saveStage(i - 1); trace(); } else {};
+				reset();
+				switch (lookupTree(^stageState, i)) {
+					None(): {};
+					Some(st8): {
+						penv.forwardFront := st8.first;
+						penv.backwardFront := st8.second;
+						penv.waveGain := -1;  // resumed front: no stale stuck-signal
+					}
+				}
+				// own the tag from BUILD on: stage builders create nodes too
+				// (seeding, refiners) — they belong to this stage, not to the
+				// previous one whose tag would otherwise still be installed
+				tag = stageTag(i, pr.first);
+				labels.stage := tag;
+				ruStampingTactic((pr.second.build(penv)).second, labels, tag);
+			});
+			lastIdx = length(pairs) - 1;
+			mkRound = \round : int -> {
+				if (round > 0) saveStage(lastIdx) else {};  // the round ends inside the last stage
+				ruOrElseTactic(mapi(pairs, mkThunk));
+			};
+			retry = ruDslGetInt(ast, "retry", 1000, 0);
+			// round progress: backward tree growth + the stages' forward-front growth
+			metric = \tree : RuProverTree -> sizeTree(tree.nodes) + sizeTree(tree.leafs)
+				+ foldTree(^stageState, 0, \__, st8, ac -> ac + switch (st8.first) {
+					None(): 0;
+					Some(fwd): ruIndexDataCount(fwd.index);
+				});
+			Pair(penv,
+				if (retry <= 0) mkRound(0)
+				else ruRetryRoundsTactic(mkRound, 0, retry, metric))
 		}));
 	}
 }
