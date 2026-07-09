@@ -76,6 +76,13 @@ public class RussellTimed extends NativeHost {
 	private static final int NTHREDS = Runtime.getRuntime().availableProcessors();
 	private static ExecutorService threadpool = Executors.newFixedThreadPool(NTHREDS, daemonFactory("russell-worker"));
 
+	// The flow-level ru_thread_pool (base/concurrent.flow): DAEMON workers, unlike the
+	// stdlib newThreadPool — its non-daemon threads keep the JVM alive as a zombie after
+	// a propagated exception kills main (crash text stuck in the block-buffered pipe).
+	public static final Object newDaemonThreadPool(int threadsCount) {
+		return Executors.newFixedThreadPool(threadsCount, daemonFactory("russell-pool"));
+	}
+
 	private static final ScheduledFuture<?> startInterruptTimer(TaskTimer task) {
 		return getTimer().scheduleAtFixedRate(task, 0, 100, TimeUnit.MILLISECONDS);
 	}
