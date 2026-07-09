@@ -32,7 +32,12 @@ export {
 		math       : RuMath,
 		env        : RuEnv,
 		step_index : Maybe<RuIndex<Pair<int,int>>>,
-		selector   : Maybe<RuMlSelector>
+		selector   : Maybe<RuMlSelector>,
+		// The per-prove-step PVT label store (labels.flow, an L2 mechanism): the
+		// OUTERMOST or-else creates it and threads it down, so nested or-elses
+		// share one store with parent-linked stage tags, and any consumer
+		// (refiners, selection) can consult visibility. None outside an or-else.
+		labels     : Maybe<RuPvtLabels>
 	);
 
 	// The DSL produces a "tactic builder": a closure invoked once the
@@ -655,8 +660,37 @@ ruDslBuildSpr(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder
 ruDslBuildForward(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
 	Some(RuTacticBuilder(\penv -> {
 		ruSeedForwardFront(penv);
-		Pair(penv, ruForwardTactic);
+		Pair(penv, ruForwardFrontTactic(penv));
 	}))
+}
+
+// The env-aware `forward` tactic: polls the front (read-only, the sanctioned L2
+// polling) and CONCLUDES (Done) once the frontier is exhausted, so enclosing
+// combinators (loop, or-else) get their turn. The bare ruForwardTactic constant
+// cannot see the front and requests waves unconditionally — inside an or-else
+// that silently starved every later stage (the prove loop used to end outright
+// on a dry wave; see ruProveRec's dry-wave re-consult).
+ruForwardFrontTactic(penv : RuProverEnv) -> RuProverTactic {
+	RuProverTactic("forward", "forward",
+		\tree ->
+			if (length(^(tree.proofs)) > 0) RuTacticDone()
+			else switch (^(penv.forwardFront)) {
+				None(): RuTacticDone();  // no front installed — nothing to advance
+				Some(fwd): {
+					// conclude on an EXHAUSTED front or a STUCK wave (zero gain:
+					// dry, size-capped or timed out) — the enclosing combinator
+					// (loop/or-else) then gets its turn instead of spinning
+					if (fwd.front == [] || ^(penv.waveGain) == 0) {
+						if (penv.env.conf.verbose >= 4) {
+							penv.env.out.println("  forward tactic Done: front=" + i2s(length(fwd.front)) + " waveGain=" + i2s(^(penv.waveGain)));
+						} else {};
+						RuTacticDone();
+					}
+					else RuTacticExpandForward();
+				}
+			},
+		ruTreeNotProved
+	);
 }
 
 // `assume-neg(<tactic>)`: the refutation-setup COMBINATOR (checker-decomposition candidate A). It is a
@@ -1161,8 +1195,13 @@ ruDslBuildSeq(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder
 // AST, so the whole or-else(...) toString is available without building anything.
 ruDslBuildOrElse(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
 	poss = ruDslPositional(ast);
+	// ONE label store per prove step: the outermost or-else creates it; nested
+	// or-elses (and every builder below them) receive it through the context.
+	created = isNone(ctx.labels);
+	labels = either(ctx.labels, ruMakePvtLabels());
+	ctx2 = RuTacticContext(ctx with labels = Some(labels));
 	pairsMb = map(poss, \v -> switch (v) {
-		RuTacticValAst(sub): maybeMap(ruBuildTacticFromAst(sub, ctx), \b -> Pair(ruTacticAst2s(sub), b));
+		RuTacticValAst(sub): maybeMap(ruBuildTacticFromAst(sub, ctx2), \b -> Pair(ruTacticAst2s(sub), b));
 		RuTacticValLit(s): { ctx.env.out.error("tactic DSL: or-else alternative must be a tactic, got literal '" + s + "'", []); None(); };
 	});
 	if (poss == []) { ctx.env.out.error("tactic DSL: or-else needs at least one alternative", []); None(); }
@@ -1188,19 +1227,19 @@ ruDslBuildOrElse(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuil
 				penv.refute := rf0;      penv.ordered := od0;
 				penv.instantiate := it0; penv.admitJoin := aj0;
 			};
-			// STAGE PROVENANCE (L2 node labels, labels.flow): each alternative's
-			// tactic is wrapped in a stamping decorator, so every PVT node carries
-			// the tag of the stage it was expanded for. First consumer of the label
-			// mechanism; visibility/resumability build on the same stamps.
-			labels = ruMakePvtLabels();
+			// STAGE PROVENANCE + VISIBILITY (L2 node labels, labels.flow): each
+			// alternative's tactic is wrapped in the stamping decorator — every
+			// PVT node carries the tag of the stage it was expanded for, and a
+			// stage's SELECTION never expands a foreign stage's nodes (the foreign
+			// work stays in the tree; L1 propagation across labels = free meets).
+			// The store is per prove step: only the OUTERMOST or-else resets it.
+			if (created) ruPvtReset(labels) else {};
+			// sibling stages parent to the stage enclosing THIS or-else (the tag
+			// active now, at builder time) — not to whichever sibling ran before
+			parentTag = ^(labels.stage);
 			trace = \ -> if (ctx.env.conf.verbose >= 3) {
 				ctx.env.out.println("  or-else stage nodes: " + ruPvtStageStats2s(labels));
 			} else {};
-			// Phase-1 gate: stamping scans the node ids per step (O(tree) via
-			// getTreeKeys) — fine for tracing, too hot for production trees.
-			// Phase 2 (visibility) needs an efficient new-node feed before the
-			// gate can drop.
-			stamping = ctx.env.conf.verbose >= 3;
 			Pair(penv, ruOrElseTactic(mapi(pairs, \i, pr ->
 				Pair(pr.first, \ -> {
 					if (i > 0) trace() else {};
@@ -1208,9 +1247,9 @@ ruDslBuildOrElse(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuil
 					// own the tag from BUILD on: stage builders create nodes too
 					// (seeding, refiners) — they belong to this stage, not to the
 					// previous one whose tag would otherwise still be installed
-					labels.stage := i + 1;
-					built = (pr.second.build(penv)).second;
-					if (stamping) ruStampingTactic(built, labels, i + 1, pr.first) else built;
+					tag = ruPvtNewTag(labels, parentTag, pr.first);
+					labels.stage := tag;
+					ruStampingTactic((pr.second.build(penv)).second, labels, tag);
 				}))))
 		}));
 	}

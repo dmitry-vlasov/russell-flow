@@ -112,23 +112,37 @@ ruExpandLeafsInto(env_after_step : RuProverEnv, to_expand : [RuProverProp], para
 }
 
 ruProve(prover_env : RuProverEnv) -> RuProverEnv {
+	ruProveRec(prover_env, false);
+}
+
+ruProveRec(prover_env : RuProverEnv, dry : bool) -> RuProverEnv {
 	to_expand0 = filtermap(^(prover_env.toExpand), \ind ->
 		lookupTree(prover_env.tree.leafs, ind)
 	);
 	prover_env.toExpand := [];
 	if (length(to_expand0) > 0) {
-		ruProve(ruExpandLeafsInto(prover_env, to_expand0, true));
+		ruProveRec(ruExpandLeafsInto(prover_env, to_expand0, true), false);
 	} else {
 		step_res = ruRunTacticStep(prover_env);
 		env_a    = step_res.first;
 		switch (step_res.second) {
 			RuTacticExpand(leafs):
 				if (leafs == []) env_a
-				else ruProve(ruExpandLeafsInto(env_a, leafs, true));
+				else ruProveRec(ruExpandLeafsInto(env_a, leafs, true), false);
 			// A forward wave is one L1 round: advance the front; if it produced new
 			// facts (and no proof yet), loop back to the tactic for the next round.
+			// A DRY wave must NOT end the prove loop outright: the tactic gets one
+			// more consult so a combinator can conclude (Done) or switch to its
+			// next alternative — otherwise a wave stage drying inside an or-else
+			// silently aborts every later stage (measured: the eq-first pipeline
+			// collapsed 79→26 because def-close never ran; the batch-vs-alone gap
+			// had the same cause — checker-eq never ran behind checker-mizar's dry
+			// wave). Two consecutive dry rounds terminate: a bare `forward` atom
+			// that keeps requesting waves on a dry front must not spin.
 			RuTacticExpandForward():
-				if (ruRunForwardWave(env_a)) ruProve(env_a) else env_a;
+				if (ruRunForwardWave(env_a)) ruProveRec(env_a, false)
+				else if (!dry) ruProveRec(env_a, true)
+				else env_a;
 			RuTacticSwitch(__): env_a;   // resolved inside ruRunTacticStep — unreachable
 			RuTacticDone():     env_a;   // resolved inside ruRunTacticStep — unreachable
 		}
@@ -136,6 +150,10 @@ ruProve(prover_env : RuProverEnv) -> RuProverEnv {
 }
 
 ruProveOneRound(prover_env : RuProverEnv) -> Pair<RuProverEnv, bool> {
+	ruProveOneRoundRec(prover_env, false);
+}
+
+ruProveOneRoundRec(prover_env : RuProverEnv, dry : bool) -> Pair<RuProverEnv, bool> {
 	to_expand0 = filtermap(^(prover_env.toExpand), \ind ->
 		lookupTree(prover_env.tree.leafs, ind)
 	);
@@ -149,7 +167,12 @@ ruProveOneRound(prover_env : RuProverEnv) -> Pair<RuProverEnv, bool> {
 			RuTacticExpand(leafs):
 				if (leafs == []) Pair(env_a, false)
 				else Pair(ruExpandLeafsInto(env_a, leafs, false), true);
-			RuTacticExpandForward(): Pair(env_a, ruRunForwardWave(env_a));
+			// dry wave: re-consult the tactic once (see ruProveRec) — a combinator
+			// must get the chance to switch stages; two dry rounds terminate.
+			RuTacticExpandForward():
+				if (ruRunForwardWave(env_a)) Pair(env_a, true)
+				else if (!dry) ruProveOneRoundRec(env_a, true)
+				else Pair(env_a, false);
 			RuTacticSwitch(__): Pair(env_a, false);   // unreachable
 			RuTacticDone():     Pair(env_a, false);   // unreachable
 		}
@@ -157,21 +180,29 @@ ruProveOneRound(prover_env : RuProverEnv) -> Pair<RuProverEnv, bool> {
 }
 
 ruProveSequential(prover_env : RuProverEnv) -> RuProverEnv {
+	ruProveSequentialRec(prover_env, false);
+}
+
+ruProveSequentialRec(prover_env : RuProverEnv, dry : bool) -> RuProverEnv {
 	to_expand0 = filtermap(^(prover_env.toExpand), \ind ->
 		lookupTree(prover_env.tree.leafs, ind)
 	);
 	prover_env.toExpand := [];
 	if (length(to_expand0) > 0) {
-		ruProveSequential(ruExpandLeafsInto(prover_env, to_expand0, false));
+		ruProveSequentialRec(ruExpandLeafsInto(prover_env, to_expand0, false), false);
 	} else {
 		step_res = ruRunTacticStep(prover_env);
 		env_a    = step_res.first;
 		switch (step_res.second) {
 			RuTacticExpand(leafs):
 				if (leafs == []) env_a
-				else ruProveSequential(ruExpandLeafsInto(env_a, leafs, false));
+				else ruProveSequentialRec(ruExpandLeafsInto(env_a, leafs, false), false);
+			// dry wave: re-consult the tactic once (see ruProveRec) — a combinator
+			// must get the chance to switch stages; two dry rounds terminate.
 			RuTacticExpandForward():
-				if (ruRunForwardWave(env_a)) ruProveSequential(env_a) else env_a;
+				if (ruRunForwardWave(env_a)) ruProveSequentialRec(env_a, false)
+				else if (!dry) ruProveSequentialRec(env_a, true)
+				else env_a;
 			RuTacticSwitch(__): env_a;   // unreachable
 			RuTacticDone():     env_a;   // unreachable
 		}

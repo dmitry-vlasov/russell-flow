@@ -7,57 +7,113 @@ import base/env;
 // Level 1 (expansion, propagation, dedup, unification, joins) never sees them —
 // the store is a side index over node ids, not a field the engine touches.
 //
-// First consumer: STAGE PROVENANCE in or-else. Each alternative's tactic is
-// wrapped in a stamping decorator; nodes the engine creates on behalf of a
-// stage get that stage's tag. Attribution: the engine expands BETWEEN tactic
-// steps, so at the start of every step the wrapper stamps all nodes above the
-// watermark with the tag of the stage that made the PREVIOUS expansion request
-// (held in `stage`), then installs its own tag.
+// ONE store per prove step, threaded to every builder through RuTacticContext:
+// the OUTERMOST or-else creates it, nested or-elses reuse it. Stage tags are
+// allocated from the store and PARENT-LINKED (a nested or-else's stages are
+// children of the stage that was active when they were built), so lineage is
+// a parent-chain walk.
 //
-// Later consumers (the design, see the mizar-plan-progress memory):
-//  - VISIBILITY: a stage's selection ignores foreign-labeled nodes (a pure
-//    L2 selection policy — the failed attempt's junk stops confusing the next
-//    stage without discarding it);
-//  - RESUMABILITY: re-entering a stage's tag with a fresh budget continues
-//    from its explored region instead of starting from zero.
+// Consumers:
+//  - PROVENANCE (phase 1): every node carries the tag of the stage whose
+//    expansion request created it. Attribution: the engine expands BETWEEN
+//    tactic steps, so at the start of every step the wrapper stamps the new
+//    frontier with the tag of the PREVIOUS requester (held in `stage`), then
+//    installs its own tag. New nodes always surface in tree.leafs first
+//    (every prop passes through the frontier exactly once), so the scan is
+//    frontier-sized, not tree-sized.
+//  - VISIBILITY (phase 2): a stage's SELECTION ignores foreign-labeled nodes —
+//    the decorator drops them from the Expand response. Visible = unstamped
+//    (created before/outside the or-else) or stamped within the consumer's
+//    lineage. A failed sibling's junk stops steering the next stage, yet all
+//    its work stays in the tree (L1 propagation across labels = free meets).
+//  - RESUMABILITY (phase 3, planned): re-entering a stage's tag with a fresh
+//    budget continues from its explored region instead of starting over.
 
 export {
 	RuPvtLabels(
-		stage     : ref int,             // tag of the stage whose expansion request is in flight (0 = none)
+		stage     : ref int,               // tag of the stage whose expansion request is in flight (0 = none)
+		nextTag   : ref int,               // tag allocator
+		parents   : ref Tree<int, int>,    // tag -> tag active when it was allocated (lineage)
 		names     : ref Tree<int, string>, // tag -> display name (for traces)
-		stamps    : ref Tree<int, int>,  // node id -> tag of the stage that created it
-		watermark : ref int              // highest node id already stamped
+		stamps    : ref Tree<int, int>,    // node id -> tag of the stage that created it
+		watermark : ref int                // highest node id already stamped
 	);
 
 	ruMakePvtLabels() -> RuPvtLabels;
 
-	// Stamp every tree node above the watermark with the CURRENT `stage` tag
-	// (they were created by the engine for that stage's last request), advance
-	// the watermark, and return how many nodes were stamped.
+	// Clear per-step state (stamps, watermark, tags). The store object itself is
+	// captured by builders at AST time and lives across prove steps — the
+	// outermost or-else resets it when its builder runs (once per step).
+	ruPvtReset(labels : RuPvtLabels) -> void;
+
+	// Allocate a stage tag under an explicit parent (the tag active when the
+	// enclosing or-else was built — sibling stages share that parent).
+	ruPvtNewTag(labels : RuPvtLabels, parent : int, name : string) -> int;
+
+	// Stamp every NEW frontier node (id above the watermark) with the current
+	// `stage` tag; advance the watermark. Returns how many were stamped.
 	ruPvtStampNew(labels : RuPvtLabels, tree : RuProverTree) -> int;
+
+	// Is a node visible to a consumer stage? Unstamped nodes (created before or
+	// outside the or-else) are visible to everyone; stamped nodes are visible
+	// iff their tag lies in the consumer's lineage (itself or a descendant).
+	ruPvtVisible(labels : RuPvtLabels, consumer : int, node_id : int) -> bool;
 
 	// Per-stage created-node counts, for traces: "stage-name=count, ...".
 	ruPvtStageStats2s(labels : RuPvtLabels) -> string;
 
-	// Wrap a stage tactic with provenance stamping under `tag`/`name`.
-	// Pure decoration: steps, switches and responses pass through untouched.
-	ruStampingTactic(inner : RuProverTactic, labels : RuPvtLabels, tag : int, name : string) -> RuProverTactic;
+	// Wrap a stage tactic with provenance stamping + selection visibility under
+	// `tag`. Expansion requests are filtered to visible nodes; a stage whose
+	// entire selection is foreign is Done (its visible frontier is exhausted).
+	ruStampingTactic(inner : RuProverTactic, labels : RuPvtLabels, tag : int) -> RuProverTactic;
 }
 
 ruMakePvtLabels() -> RuPvtLabels {
-	RuPvtLabels(ref 0, ref makeTree(), ref makeTree(), ref -1);
+	RuPvtLabels(ref 0, ref 1, ref makeTree(), ref makeTree(), ref makeTree(), ref -1);
+}
+
+ruPvtReset(labels : RuPvtLabels) -> void {
+	labels.stage := 0;
+	labels.nextTag := 1;
+	labels.parents := makeTree();
+	labels.names := makeTree();
+	labels.stamps := makeTree();
+	labels.watermark := -1;
+}
+
+ruPvtNewTag(labels : RuPvtLabels, parent : int, name : string) -> int {
+	tag = ^(labels.nextTag);
+	labels.nextTag := tag + 1;
+	labels.parents := setTree(^(labels.parents), tag, parent);
+	labels.names := setTree(^(labels.names), tag, name);
+	tag;
 }
 
 ruPvtStampNew(labels : RuPvtLabels, tree : RuProverTree) -> int {
 	tag = ^(labels.stage);
 	wm = ^(labels.watermark);
-	// node ids grow monotonically; everything above the watermark is new
-	new_ids = filter(getTreeKeys(tree.nodes), \id -> id > wm);
+	// every prop passes through tree.leafs before expansion — scanning the
+	// frontier catches each node exactly once and stays cheap
+	new_ids = filter(getTreeKeys(tree.leafs), \id -> id > wm);
 	if (new_ids == []) 0
 	else {
 		iter(new_ids, \id -> labels.stamps := setTree(^(labels.stamps), id, tag));
 		labels.watermark := either(maxA(new_ids), wm);
 		length(new_ids);
+	}
+}
+
+// does `tag` lie in `consumer`'s lineage (equal to it, or a descendant of it)?
+ruPvtInLineage(labels : RuPvtLabels, consumer : int, tag : int) -> bool {
+	if (tag == consumer) true
+	else if (tag <= 0) false
+	else ruPvtInLineage(labels, consumer, lookupTreeDef(^(labels.parents), tag, 0));
+}
+
+ruPvtVisible(labels : RuPvtLabels, consumer : int, node_id : int) -> bool {
+	switch (lookupTree(^(labels.stamps), node_id)) {
+		None(): true;   // pre-existing / outside the or-else — visible to all
+		Some(tag): ruPvtInLineage(labels, consumer, tag);
 	}
 }
 
@@ -68,8 +124,7 @@ ruPvtStageStats2s(labels : RuPvtLabels) -> string {
 		lookupTreeDef(^(labels.names), p.first, i2s(p.first)) + "=" + i2s(p.second)), ", ");
 }
 
-ruStampingTactic(inner : RuProverTactic, labels : RuPvtLabels, tag : int, name : string) -> RuProverTactic {
-	labels.names := setTree(^(labels.names), tag, name);
+ruStampingTactic(inner : RuProverTactic, labels : RuPvtLabels, tag : int) -> RuProverTactic {
 	RuProverTactic(inner.toString, inner.tag,
 		\tree -> {
 			// attribute the engine's latest expansions to their requester,
@@ -77,9 +132,16 @@ ruStampingTactic(inner : RuProverTactic, labels : RuPvtLabels, tag : int, name :
 			ruPvtStampNew(labels, tree);
 			labels.stage := tag;
 			switch (inner.step(tree)) {
-				RuTacticExpand(leafs): RuTacticExpand(leafs);
+				RuTacticExpand(leafs): {
+					// VISIBILITY: never expand a foreign stage's nodes. The
+					// foreign work stays in the tree (free meets via L1
+					// propagation) — it just cannot steer THIS stage's search.
+					visible = filter(leafs, \l -> ruPvtVisible(labels, tag, l.id));
+					if (visible == [] && leafs != []) RuTacticDone()
+					else RuTacticExpand(visible);
+				}
 				RuTacticExpandForward(): RuTacticExpandForward();
-				RuTacticSwitch(next): RuTacticSwitch(ruStampingTactic(next, labels, tag, name));
+				RuTacticSwitch(next): RuTacticSwitch(ruStampingTactic(next, labels, tag));
 				RuTacticDone(): RuTacticDone();
 			}
 		},
