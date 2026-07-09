@@ -51,7 +51,7 @@ russellj no-server=1 mem=12g test/prover/mizar/00_baseline module=xboole_1 tac=d
 | 03_normalize.rus | P3 | normalize lemmas load-bearing (frame+clash alone fails both goals) | PASSES |
 | 04_skolemize.rus | P4 | exists-scope load-bearing; TWO-eigenvar goal; verify checks DV threading | PASSES |
 | 05_cluster.rus | P5 | cluster-scope load-bearing (⊆-chain; membership rounding) | PASSES |
-| 06_mizar_xboole.rus | P6 | or-else(def-close-checker, checker-mizar) ≥ floor on xboole_1 + verify | PASSES — **73/117** with the bidirectional MEET (was 70: first whole-theorem gains of the law-abiding composition); run with floor=73 |
+| 06_mizar_xboole.rus | P6 | or-else(def-close-checker, checker-mizar) ≥ floor on xboole_1 + verify | PASSES — **75/117** (70 install-era → 73 meet → 75 Equalizer identity base + symbol filter); run with floor=75 |
 | 07_orthogonal_only.rus | P7 | corpus closes with install atoms REMOVED | — |
 | 08_instantiate.rus | Unifier | `instantiate` closes a one-step ∀-at-a-term instance; control (no frame) fails; verifies | PASSES |
 | 09_congruence.rus | Equalizer | congruence-scope + identity-instance seeding close set-algebra equalities (direct + chained); controls fail; verify | PASSES |
