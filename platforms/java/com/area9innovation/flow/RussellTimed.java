@@ -12,6 +12,7 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ThreadFactory;
 
 
 public class RussellTimed extends NativeHost {
@@ -34,30 +35,46 @@ public class RussellTimed extends NativeHost {
 		}
 	}
 
-	private static ConcurrentHashMap<Long, ScheduledExecutorService> timers = 
+	// DAEMON worker threads: the JVM exits when the last NON-daemon thread ends,
+	// and these pools are never shut down explicitly - so with default (non-daemon)
+	// workers an UNCAUGHT exception killing main left the JVM alive forever at 0%
+	// CPU, with the crash text trapped in the block-buffered stdout: a crash
+	// masquerading as a silent hang with empty output. The pool tasks are pure
+	// computation (no graceful drain needed), so daemon workers are safe: when
+	// main dies, the process exits and the exception is printed.
+	private static ThreadFactory daemonFactory(String name) {
+		final java.util.concurrent.atomic.AtomicInteger n = new java.util.concurrent.atomic.AtomicInteger(0);
+		return r -> {
+			Thread t = new Thread(r, name + "-" + n.incrementAndGet());
+			t.setDaemon(true);
+			return t;
+		};
+	}
+
+	private static ConcurrentHashMap<Long, ScheduledExecutorService> timers =
 		new ConcurrentHashMap<Long, ScheduledExecutorService>();
 
 	private static ScheduledExecutorService getTimer() {
 		long thread_id = Thread.currentThread().getId();
 		if (!timers.containsKey(thread_id)) {
-			timers.put(thread_id, Executors.newSingleThreadScheduledExecutor());
+			timers.put(thread_id, Executors.newSingleThreadScheduledExecutor(daemonFactory("russell-timer")));
 		}
 		return timers.get(thread_id);
 	}
 
-	private static ConcurrentHashMap<Long, ExecutorService> executors = 
+	private static ConcurrentHashMap<Long, ExecutorService> executors =
 		new ConcurrentHashMap<Long, ExecutorService>();
 
 	private static ExecutorService getExecutor() {
 		long thread_id = Thread.currentThread().getId();
 		if (!executors.containsKey(thread_id)) {
-			executors.put(thread_id, Executors.newSingleThreadExecutor());
+			executors.put(thread_id, Executors.newSingleThreadExecutor(daemonFactory("russell-timed")));
 		}
 		return executors.get(thread_id);
 	}
 
 	private static final int NTHREDS = Runtime.getRuntime().availableProcessors();
-	private static ExecutorService threadpool = Executors.newFixedThreadPool(NTHREDS);
+	private static ExecutorService threadpool = Executors.newFixedThreadPool(NTHREDS, daemonFactory("russell-worker"));
 
 	private static final ScheduledFuture<?> startInterruptTimer(TaskTimer task) {
 		return getTimer().scheduleAtFixedRate(task, 0, 100, TimeUnit.MILLISECONDS);
