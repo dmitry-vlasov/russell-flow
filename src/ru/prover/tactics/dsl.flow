@@ -453,6 +453,12 @@ ruTacticDocs() -> [RuTacticDoc] {
 	[
 		df("atoms", "forward",                      "forward search: advance the whole forward front one wave each round, meeting backward subgoals at joins (unbounded; wrap in limited)",
 			"The direction-orthogonal mirror of `bfs`. Instead of expanding the backward goal frontier, it advances the dynamic FORWARD front — applying assertions to known facts (premises + derived facts) to produce new facts, one wave per round. Facts meet the backward search at JOINS (a forward fact discharging an open backward subgoal), all proofs engine-built. It seeds the front from the theorem premises at build time. Stops when a proof is found or the front stops producing new facts.\nBound it by composing with `limited` (granularity is one wave):\n  limited(forward, time=30s)\nCompose with backward search for full bidirectional proving, e.g. seq(forward, bfs) or a loop alternating the two."),
+		dp("combinators", "assume-neg(<tactic>)",   "refutation FRAME: assume ¬G (seed its deduction facts), then run <tactic> to search for the contradiction; conclude G (the Mizar by-checker's method, on-engine)",
+			[p("tactic", "the inner proof-search tactic to run in the ¬G-seeded env (e.g. forward, or loop(or-else(forward, limited(bfs))))")]),
+		dp("combinators", "instantiate(<tactic>)", "forall-instantiation frame (the Mizar Unifier): seed each forall-premise instantiated at candidate terms (goal/premise subterms) via spcv chains; wrap OUTSIDE assume-neg",
+			[p("tactic", "the inner search tactic")]),
+		dp("combinators", "ordered(<tactic>)",      "ordered-saturation steering: forward waves expand their frontier smallest-first, keeping the saturation core ahead of term-growing congruence junk under a fact budget (reorders, never discards)",
+			[p("tactic", "the inner forward-saturation tactic (e.g. loop(forward, 8))")]),
 		df("atoms", "bfs",                          "breadth-first search: expand the whole open frontier each round (unbounded)",
 			"Complete breadth-first search: expands the ENTIRE open frontier each round, with no bound (it stops only when a proof is found). The pure frontier expander — the base used by replay/compress and the prover default.\nTo bound it, wrap in `limited`:\n  limited(bfs, size=N, depth=D, batch=16)  — the former `bounded-bfs` (strict delta node/depth cap)\n  limited(bfs, size=N, depth=D, batch=n)   — a top-n beam (the n most-specifically-unified leaves per round)"),
 		d ("atoms", "done / giveup",                "terminate immediately (a no-op; composes as a seq fallback sentinel)"),
@@ -587,6 +593,9 @@ ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTactic
 	// (batch=ruSearchBatch=16 for the old bounded-bfs; batch=n for the old top-n-bfs beam).
 	if (n == "bfs")              ruTagBuilder("bfs", Some(ruStaticTacticBuilder(ruBreadthFirstTactic)))
 	else if (n == "forward")     ruTagBuilder("forward", ruDslBuildForward(ast, ctx))
+	else if (n == "assume-neg")  ruTagBuilder("assume-neg", ruDslBuildAssumeNeg(ast, ctx))
+	else if (n == "ordered")     ruTagBuilder("ordered", ruDslBuildOrdered(ast, ctx))
+	else if (n == "instantiate") ruTagBuilder("instantiate", ruDslBuildInstantiate(ast, ctx))
 	else if (n == "done")        Some(ruStaticTacticBuilder(ruDoneTactic))
 	else if (n == "giveup")      Some(ruStaticTacticBuilder(ruDoneTactic))
 	else if (n == "spr")             ruTagBuilder("spr", ruDslBuildSpr(ast, ctx))
@@ -647,6 +656,88 @@ ruDslBuildForward(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBui
 		ruSeedForwardFront(penv);
 		Pair(penv, ruForwardTactic);
 	}))
+}
+
+// `assume-neg(<tactic>)`: the refutation-setup COMBINATOR (checker-decomposition candidate A). It is a
+// FRAME, not a search: it turns on refutation mode — so ruSeedForwardFront ALSO seeds the ¬G deduction facts
+// (¬G→¬G via id, ¬G→hyp_i via a1i) — installs the front, then runs the INNER tactic to do the proof search
+// in that seeded env. The inner tactic is whatever search you want over the contradiction (e.g. `forward`,
+// or `loop(or-else(forward, limited(bfs)))`); the frame is orthogonal to it. As the inner saturates under ¬G,
+// a clash (¬G→φ, ¬G→¬φ) feeds `pm2.65i` → ¬¬G, then `ax-mp` with `notnotr` → G, which joins the root. Compose
+// under a scope with the refutation lemmas: `scoped(checker-scope, assume-neg(loop(or-else(forward, limited(bfs,…)))))`.
+// L1/L2 clean: the combinator only sets up seeds + mode; the engine builds every proof (ruAddProof).
+ruDslBuildAssumeNeg(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+	switch (ruDslGetTacticBuilder(ast, 0, ctx)) {
+		None(): {
+			ctx.env.out.error("tactic DSL: assume-neg(<tactic>) needs an inner search tactic (e.g. assume-neg(forward))", []);
+			None();
+		}
+		Some(inner): Some(RuTacticBuilder(\penv -> {
+			penv.refute := true;
+			ruSeedForwardFront(penv);   // seed the ¬G deduction facts (refute mode) before the inner search runs
+			inner.build(penv);          // the inner tactic does the proof search in the ¬G-seeded env
+		}));
+	}
+}
+
+// `ordered(<tactic>)`: the ORDERED-SATURATION steering combinator (mizar-tactic-plan P2 — the one
+// new primitive of the Mizar-solver decomposition). A frame like assume-neg: it only flips the
+// env's `ordered` mode — each forward wave then expands its frontier ≺-smallest-first (term size,
+// ruRunForwardWave) so under a fact budget the small saturation core stays ahead of term-growing
+// congruence junk. Ordered rewriting as pure L2 SELECTION: facts are reordered, never discarded
+// (completeness invariant); with no budget pressure the derived fact SET is identical to FIFO.
+ruDslBuildOrdered(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+	switch (ruDslGetTacticBuilder(ast, 0, ctx)) {
+		None(): {
+			ctx.env.out.error("tactic DSL: ordered(<tactic>) needs an inner search tactic (e.g. ordered(loop(forward, 8)))", []);
+			None();
+		}
+		Some(inner): Some(RuTacticBuilder(\penv -> {
+			penv.ordered := true;
+			// The same junk-control steering applied to the MEET: admit eager
+			// reverse-joins only onto STRUCTURED subgoals. A bare-metavariable
+			// subgoal (a cut-style slot, e.g. modus ponens' minor premise) unifies
+			// with EVERY forward fact — grafting floods it with unconstrained
+			// variants (22k+ observed) while it stays closable by the backward
+			// search and by its structured sibling's joins. Nothing is discarded —
+			// pure join admission, an L2 selection policy the L1 engine only consults.
+			penv.admitJoin := \__, subgoal -> {
+				sn = (ruExp(subgoal.stmt.exps[0])).nodes;
+				!(length(sn) == 1 && switch (sn[0]) {
+					RuVar(__,__): true;
+					RuRuleNode(__,__): false;
+				});
+			};
+			inner.build(penv);
+		}));
+	}
+}
+
+// `instantiate(<tactic>)`: the ∀-INSTANTIATION frame (the Mizar Unifier, mizar-tactic-plan) — a
+// flag-only combinator like ordered: ruSeedForwardFront then ALSO seeds each ∀-premise instantiated
+// at candidate terms (class-typed subterms of goal/premises) via hand-constructed spcv chains
+// (ruSeedInstantiateFront, core/forward.flow). MUST wrap OUTSIDE assume-neg (assume-neg seeds the
+// front eagerly at build time; a later-set flag would be ignored): instantiate(assume-neg(t)).
+ruDslBuildInstantiate(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+	switch (ruDslGetTacticBuilder(ast, 0, ctx)) {
+		None(): {
+			ctx.env.out.error("tactic DSL: instantiate(<tactic>) needs an inner search tactic (e.g. instantiate(ordered(loop(forward, 8))))", []);
+			None();
+		}
+		Some(inner): Some(RuTacticBuilder(\penv -> {
+			penv.instantiate := true;
+			r = inner.build(penv);
+			// Install the forward front NOW (build time), not lazily at the first
+			// `forward` wave: a backward tactic sequenced BEFORE forward (the
+			// bidirectional meet, seq(limited(bfs), ordered(loop(forward)))) only
+			// registers its subgoals in backwardFront while a front is installed
+			// (expand.flow gates on forwardFront != None) — without this the
+			// forward-derived facts have nothing to join. A no-op when an inner
+			// assume-neg already seeded (both flags are set before it runs).
+			ruSeedForwardFront(penv);
+			r;
+		}));
+	}
 }
 
 ruDslBuildMl(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
@@ -826,7 +917,7 @@ ruDslRefineGuide(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuGuideBuild
 		scope = switch (ruNamedScope(scopeName)) {
 			Some(ids): Pair(scopeName, ids);
 			None(): {
-				ctx.env.out.error("tactic DSL: refine: unknown scope '" + scopeName + "' (known: prop-scope, checker-scope, refute-scope, exmid-scope, bridge-scope, unfold-scope); using prop-scope", []);
+				ctx.env.out.error("tactic DSL: refine: unknown scope '" + scopeName + "' (known: prop-scope, checker-scope, refute-scope, exmid-scope, bridge-scope, unfold-scope, normalize-scope); using prop-scope", []);
 				Pair("prop-scope", ruCheckerPropScope());
 			}
 		};
@@ -1198,6 +1289,16 @@ ruNamedScope(name : string) -> Maybe<[int]> {
 	else if (name == "exmid-scope")    Some(ruCheckerExmidScope())
 	else if (name == "bridge-scope")   Some(ruCheckerBridgeScope())
 	else if (name == "unfold-scope")   Some(ruCheckerUnfoldScope())
+	// Forward NNF of ¬G under its antecedent (Mizar PreCheck; mizar-tactic-plan P3).
+	else if (name == "normalize-scope") Some(ruMizarNormalizeScope())
+	// On-engine skolemization: sp/exlimiv/eximi + composers (mizar-tactic-plan P4).
+	else if (name == "exists-scope")    Some(ruMizarExistsScope())
+	// Forward cluster rounding-up: sstri/sseli (mizar-tactic-plan P5).
+	else if (name == "cluster-scope")   Some(ruMizarClusterScope())
+	// The refutational collision only: pm2.65i + notnotri (mizar-tactic-plan P6).
+	else if (name == "clash-scope")     Some(ruMizarClashScope())
+	// The Equalizer: equality composition + identity schemata (mizar-tactic-plan).
+	else if (name == "congruence-scope") Some(ruMizarCongruenceScope())
 	else None();
 }
 
@@ -1217,10 +1318,17 @@ ruDslBuildScoped(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuil
 			RuTacticValAst(sub): if (sub.name != "") Some(sub.name) else None();
 			RuTacticValLit(__):  None();
 		});
-		resolved = if (length(scopeNames) == 1) switch (ruNamedScope(scopeNames[0])) {
-			Some(ids): Pair(scopeNames[0], ids);
-			None():    Pair("[" + strGlue(scopeNames, ", ") + "]", map(scopeNames, s2id_));
-		} else Pair("[" + strGlue(scopeNames, ", ") + "]", map(scopeNames, s2id_));
+		// Each positional name is a NAMED SCOPE (expanded to its lemma set) or an assertion
+		// name — so juxtaposition is scope UNION: scoped(checker-scope, normalize-scope,
+		// conax1, <t>) works. (Previously a named scope in a multi-name list was silently
+		// treated as a nonexistent assertion.)
+		resolved = Pair(
+			if (length(scopeNames) == 1) scopeNames[0] else "[" + strGlue(scopeNames, ", ") + "]",
+			uniq(concatA(map(scopeNames, \nm -> switch (ruNamedScope(nm)) {
+				Some(ids): ids;
+				None():    [s2id_(nm)];
+			})))
+		);
 		switch (ruDslGetTacticBuilder(ast, n - 1, ctx)) {
 			None(): None();
 			Some(innerBuilder): Some(RuTacticBuilder(\penv -> {
@@ -1262,7 +1370,7 @@ ruParseAndBuildTactic(src : string, ctx : RuTacticContext) -> Maybe<RuTacticBuil
 // above. Used to decide whether a tactic= head is a built-in (→ inline) or a candidate .tac file ref:
 // a built-in always wins over a same-named file.
 ruBuiltinTacticNames() -> [string] {
-	["bfs", "forward", "done", "giveup", "spr", "fragment-replay", "ml", "ap", "kalmar-closer", "checker", "hilbert", "replay",
+	["bfs", "forward", "assume-neg", "ordered", "instantiate", "done", "giveup", "spr", "fragment-replay", "ml", "ap", "kalmar-closer", "checker", "hilbert", "replay",
 	 "linear-guided", "follow-proof", "oracle", "seq", "or-else", "loop", "limited", "focus", "track", "scoped"]
 }
 ruIsBuiltinTacticName(n : string) -> bool { exists(ruBuiltinTacticNames(), \b -> b == n) }
