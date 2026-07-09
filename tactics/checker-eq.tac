@@ -15,4 +15,4 @@
 	@arg max-iters { forward wave iterations. @defval 32 }
 	@category derived
 */
-scoped(congruence-scope, instantiate(ordered(loop(forward, $max-iters))))
+scoped(congruence-scope, relnorm-scope, instantiate(ordered(loop(forward, $max-iters))))

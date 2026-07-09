@@ -58,7 +58,7 @@ russellj no-server=1 mem=12g test/prover/mizar/00_baseline module=xboole_1 tac=d
 | 06_mizar_xboole.rus | P6 | or-else(def-close-checker, checker-mizar) ≥ floor on xboole_1 + verify | PASSES — **79/117** (70 install-era → 73 meet → 75 Equalizer identity base → 79 symbol closure + ∀-strip/ax-gen + AC-permutation family); run with floor=79 |
 | 07_orthogonal_only.rus | P7 | corpus closes with install atoms REMOVED | — |
 | 08_instantiate.rus | Unifier | `instantiate` closes a one-step ∀-at-a-term instance; control (no frame) fails; verifies | PASSES |
-| 09_congruence.rus | Equalizer | congruence-scope + identity-instance seeding close set-algebra equalities (direct + chained + ∀-wrapped + AC-collapse: cong6/cong7 = t92/t100 verbatim); controls fail; verify | PASSES |
+| 09_congruence.rus | Equalizer | congruence-scope + identity-instance seeding close set-algebra equalities (direct + chained + ∀-wrapped + AC-collapse + △-assoc mid-swaps + rel-normalize ⊆-schema close: cong6-9 = t92/t100/t91/t96 verbatim); controls fail; verify | PASSES |
 
 ## The assembly (tactics/checker-mizar.tac)
 
