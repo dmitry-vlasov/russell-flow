@@ -55,7 +55,7 @@ russellj no-server=1 mem=12g test/prover/mizar/00_baseline module=xboole_1 tac=d
 | 03_normalize.rus | P3 | normalize lemmas load-bearing (frame+clash alone fails both goals) | PASSES |
 | 04_skolemize.rus | P4 | exists-scope load-bearing; TWO-eigenvar goal; verify checks DV threading | PASSES |
 | 05_cluster.rus | P5 | cluster-scope load-bearing (⊆-chain; membership rounding) | PASSES |
-| 06_mizar_xboole.rus | P6 | or-else(def-close-checker, checker-mizar) ≥ floor on xboole_1 + verify | PASSES — **79/117** (70 install-era → 73 meet → 75 Equalizer identity base → 79 symbol closure + ∀-strip/ax-gen + AC-permutation family); run with floor=79 |
+| 06_mizar_xboole.rus | P6 | or-else(limited(def-close-checker, 4.5s), limited(checker-mizar, 2s), checker-eq) ≥ floor on xboole_1 + verify | PASSES — **79/117** incl. t91 (sliced budgets: t91 traded in for t103, whose def-close route needs 5.5-8s; no static split fits both). STAGE ORDER IS LOAD-BEARING: def-close's structural refiners need a VIRGIN tree — any wave stage running first pollutes the shared PVT and collapses def-close 79→26 (or-else env-policy state is now isolated per stage, but TREE isolation needs an engine restart facility — open design item, also blocks t96). Run with floor=79 |
 | 07_orthogonal_only.rus | P7 | corpus closes with install atoms REMOVED | — |
 | 08_instantiate.rus | Unifier | `instantiate` closes a one-step ∀-at-a-term instance; control (no frame) fails; verifies | PASSES |
 | 09_congruence.rus | Equalizer | congruence-scope + identity-instance seeding close set-algebra equalities (direct + chained + ∀-wrapped + AC-collapse + △-assoc mid-swaps + rel-normalize ⊆-schema close: cong6-9 = t92/t100/t91/t96 verbatim); controls fail; verify | PASSES |
