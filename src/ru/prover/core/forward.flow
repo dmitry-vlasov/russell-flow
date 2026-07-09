@@ -1124,13 +1124,13 @@ ruSeedIdentityFront(prover_env : RuProverEnv, c_task : RuConstAny<RuProverTask>,
 RuFwdEqIds(
 	eqtri : int, eqcomi : int, eqid : int, incom : int, uncom : int,
 	ineq1i : int, ineq2i : int, uneq1i : int, uneq2i : int, difeq1i : int, difeq2i : int,
-	cin : int, cun : int, cdif : int
+	cin : int, cun : int, cdif : int, axgen : int
 );
 ruFwdEqIds() -> RuFwdEqIds {
 	RuFwdEqIds(
 		s2id_("eqtri"), s2id_("eqcomi"), s2id_("eqid"), s2id_("incom"), s2id_("uncom"),
 		s2id_("ineq1i"), s2id_("ineq2i"), s2id_("uneq1i"), s2id_("uneq2i"), s2id_("difeq1i"), s2id_("difeq2i"),
-		s2id("cin"), s2id("cun"), s2id("cdif")
+		s2id("cin"), s2id("cun"), s2id("cdif"), s2id_("ax-gen")
 	);
 }
 
@@ -1385,33 +1385,67 @@ ruFwdEqDump(lbl : string, t : RuProofTree, d : int, prover_env : RuProverEnv) ->
 	}
 }
 
+// Strip the ∀-prefix of a CONST-task goal (each bound var is a frozen zero-arity
+// setvar node): returns (each ∀-level's full expression, outermost first; the
+// quantifier-free body). Each stripped level is re-added around the final proof
+// by an ax-gen step — ∀x…(X = Y) is the standard Mizar equality-theorem form.
+ruFwdStripWalPrefix(ids : RuFwdInstIds, nodes : [RuExpNode], acc : [[RuExpNode]]) -> Pair<[[RuExpNode]], [RuExpNode]> {
+	switch (nodes[0]) {
+		RuVar(__,__): Pair(acc, nodes);
+		RuRuleNode(idT, __): {
+			if (ruIdType2Id(idT) == ids.wal && length(nodes) > 2 && ruFwdIsSetvarNode(nodes[1], ids.setvar)) {
+				ruFwdStripWalPrefix(ids, subrange(nodes, 2, length(nodes) - 2), arrayPush(acc, nodes));
+			} else Pair(acc, nodes);
+		}
+	}
+}
+
+// SYMBOL CLOSURE for the eq-rule base (deliberately WIDER than ruSeedIdentityFront's
+// one-shot filter): an identity is admitted once its LHS class-ops are reachable;
+// its RHS ops then become reachable themselves. Definition unfolding legitimately
+// INTRODUCES symbols — dfsymdif3 rewrites a △-goal into ∪∖∩ vocabulary the goal
+// never mentions, and the ∪-side laws must follow it in. Safe here where it is
+// junk in the seeder: rewriting is deterministic (one leftmost-outermost redex per
+// step, termination by ruFwdEqRulesChecked), it feeds no wave.
+ruFwdCloseIdents(ids : RuFwdInstIds, taskOps : Set<int>, cands : [RuAssertion]) -> [RuAssertion] {
+	ops = map(cands, \a -> {
+		cn = (ruExp(a.infer.prop.exps[0])).nodes;
+		le = ruFwdSpan(cn, 1);
+		Pair(ruFwdClassOps(ids, subrange(cn, 1, le - 1)), ruFwdClassOps(ids, subrange(cn, le, length(cn) - le)));
+	});
+	closed = for(Triple(taskOps, makeSet(), true), \st -> st.third, \st ->
+		foldi(cands, Triple(st.first, st.second, false), \i, ac, __ ->
+			if (containsSet(ac.second, i)) ac
+			else if (foldSet(ops[i].first, true, \sub, op -> sub && containsSet(ac.first, op)))
+				Triple(mergeSets(ac.first, ops[i].second), insertSet(ac.second, i), true)
+			else ac));
+	filtermapi(cands, \i, a -> if (containsSet(closed.second, i)) Some(a) else None());
+}
+
 ruSeedEqNormalize(prover_env : RuProverEnv, c_task : RuConstAny<RuProverTask>, fwd : RuProverForward, asses : RuIndex<RuAssertion>) -> RuProverForward {
 	ids  = ruFwdInstIds();
 	eids = ruFwdEqIds();
 	stcl = c_task.const.goal.stmt.class;
 	goal = ruExp(c_task.const.goal.stmt.exps[0]);
 	wceq = s2id("wceq"); wff = tp2id_("wff");
-	switch (goal.nodes[0]) {
+	stripped = ruFwdStripWalPrefix(ids, goal.nodes, []);
+	body = stripped.second;
+	switch (body[0]) {
 		RuVar(__,__): fwd;
 		RuRuleNode(idT, __): {
 			if (ruIdType2Id(idT) != ids.wceq) fwd else {
-				lend = ruFwdSpan(goal.nodes, 1);
-				xs = subrange(goal.nodes, 1, lend - 1);
-				ys = subrange(goal.nodes, lend, length(goal.nodes) - lend);
-				// the same task-symbol-filtered identity set as ruSeedIdentityFront
-				taskOps = ruFwdClassOps(ids, goal.nodes);
-				idents = filter(ruIndexValues(asses), \a ->
+				lend = ruFwdSpan(body, 1);
+				xs = subrange(body, 1, lend - 1);
+				ys = subrange(body, lend, length(body) - lend);
+				cands = filter(ruIndexValues(asses), \a ->
 					length(a.infer.hyps) == 0 && {
 						cn = (ruExp(a.infer.prop.exps[0])).nodes;
 						switch (cn[0]) {
 							RuVar(__,__): false;
-							RuRuleNode(idT2, __): ruIdType2Id(idT2) == ids.wceq
-								&& forall(cn, \n -> switch (n) {
-									RuVar(__,__): true;
-									RuRuleNode(idT3, __): ruIdType2Type(idT3) != ids.cls || containsSet(taskOps, ruIdType2Id(idT3));
-								});
+							RuRuleNode(idT2, __): ruIdType2Id(idT2) == ids.wceq;
 						}
 					});
+				idents = ruFwdCloseIdents(ids, ruFwdClassOps(ids, goal.nodes), cands);
 				rules = ruFwdEqRulesChecked(ids, eids, idents, stcl);
 				nx = ruFwdNormalize(ids, eids, rules, xs, stcl, prover_env.math, prover_env.env);
 				ny = ruFwdNormalize(ids, eids, rules, ys, stcl, prover_env.math, prover_env.env);
@@ -1420,21 +1454,25 @@ ruSeedEqNormalize(prover_env : RuProverEnv, c_task : RuConstAny<RuProverTask>, f
 					switch (ny.second) { None(): {}; Some(t): ruFwdEqDump("Y", t, 0, prover_env); }
 				} else {};
 				if (nx.first != ny.first) fwd else {
+					bodyExp = RuExp(body, -1);
 					// assemble  X = Y  from  X = N (nx), Y = N (ny)
-					proof = switch (nx.second) {
+					proof0 = switch (nx.second) {
 						None(): switch (ny.second) {
-							None(): RuProofStep(eids.eqid, [], RuStmt(stcl, [goal], -1)); // X == Y syntactically
-							Some(py): RuProofStep(eids.eqcomi, [py], RuStmt(stcl, [goal], -1)); // X = N, Y -> N flipped
+							None(): RuProofStep(eids.eqid, [], RuStmt(stcl, [bodyExp], -1)); // X == Y syntactically
+							Some(py): RuProofStep(eids.eqcomi, [py], RuStmt(stcl, [bodyExp], -1)); // X = N, Y -> N flipped
 						}
 						Some(px): switch (ny.second) {
 							None(): px; // N == Y already
 							Some(py): {
 								flipped = RuProofStep(eids.eqcomi, [py],
 									RuStmt(stcl, [ruFwdMkRule(wceq, wff, [RuExp(nx.first, -1), RuExp(ys, -1)])], -1));
-								RuProofStep(eids.eqtri, [px, flipped], RuStmt(stcl, [goal], -1));
+								RuProofStep(eids.eqtri, [px, flipped], RuStmt(stcl, [bodyExp], -1));
 							}
 						}
 					};
+					// re-add the stripped ∀-prefix, innermost quantifier first
+					proof = fold(reverseA(stripped.first), proof0, \pr, qexp ->
+						RuProofStep(eids.axgen, [pr], RuStmt(stcl, [RuExp(qexp, -1)], -1)));
 					key = goal.nodes;
 					if (containsSet(fwd.seen, key)) fwd else {
 						sf = RuProverExp(-1, makeVector(4), RuStmt(stcl, [goal], -1), makeVector(0), ruNoProverProp);

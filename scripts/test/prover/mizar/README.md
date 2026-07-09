@@ -25,6 +25,10 @@ see the mizar-decision-gap memory / forward.flow, proofs.flow:121).
 - **Verify always**: soundness by the kernel, never trusted from the engine.
 - **Golden floor**: no phase may drop the pinned counts below.
 - Run from the math dir, `no-server=1`, ONE instance at a time.
+- `.rus` `@help { }` blocks must not contain literal braces — the parser ends the
+  block at the first inner `}` and every later `@defval` is silently lost (the
+  bare `russellj test/...` invocation then dies at `read-ru`: obligatory `file`
+  missing). Write lemma sets as `(a, b)` in help text, never `{a, b}`.
 
 ## Pinned golden floors (00_baseline.rus)
 
@@ -51,10 +55,10 @@ russellj no-server=1 mem=12g test/prover/mizar/00_baseline module=xboole_1 tac=d
 | 03_normalize.rus | P3 | normalize lemmas load-bearing (frame+clash alone fails both goals) | PASSES |
 | 04_skolemize.rus | P4 | exists-scope load-bearing; TWO-eigenvar goal; verify checks DV threading | PASSES |
 | 05_cluster.rus | P5 | cluster-scope load-bearing (⊆-chain; membership rounding) | PASSES |
-| 06_mizar_xboole.rus | P6 | or-else(def-close-checker, checker-mizar) ≥ floor on xboole_1 + verify | PASSES — **75/117** (70 install-era → 73 meet → 75 Equalizer identity base + symbol filter); run with floor=75 |
+| 06_mizar_xboole.rus | P6 | or-else(def-close-checker, checker-mizar) ≥ floor on xboole_1 + verify | PASSES — **79/117** (70 install-era → 73 meet → 75 Equalizer identity base → 79 symbol closure + ∀-strip/ax-gen + AC-permutation family); run with floor=79 |
 | 07_orthogonal_only.rus | P7 | corpus closes with install atoms REMOVED | — |
 | 08_instantiate.rus | Unifier | `instantiate` closes a one-step ∀-at-a-term instance; control (no frame) fails; verifies | PASSES |
-| 09_congruence.rus | Equalizer | congruence-scope + identity-instance seeding close set-algebra equalities (direct + chained); controls fail; verify | PASSES |
+| 09_congruence.rus | Equalizer | congruence-scope + identity-instance seeding close set-algebra equalities (direct + chained + ∀-wrapped + AC-collapse: cong6/cong7 = t92/t100 verbatim); controls fail; verify | PASSES |
 
 ## The assembly (tactics/checker-mizar.tac)
 
