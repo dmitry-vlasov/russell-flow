@@ -491,19 +491,57 @@ ruNodePath(h : RuProverHyp) -> [int] {
 }
 
 // Universal join, forward->backward (symmetric counterpart of the backward splice
-// in expand.flow). A newly created forward fact `pf` is matched against the backward
-// front; every open backward subgoal it covers is discharged by grafting pf's proof
-// (specialised to the subgoal), feeding ruAddProof, and propagating up. Guarded by
-// ruJoinAcyclic. Used by the forward-search feature; the completeness-test combined
-// oracle joins positionally at subgoal creation instead.
+// in expand.flow). A newly created forward fact `pf` is matched against the ROOT
+// (completing the whole proof through ruBuildRootProofs when it matches the theorem
+// statement verbatim) and against the backward front; every open backward subgoal it
+// covers is discharged by grafting pf's proof (specialised to the subgoal), feeding
+// ruAddProof, and propagating up. Guarded by ruJoinAcyclic. Used by the forward-search
+// feature; the completeness-test combined oracle joins positionally at subgoal creation.
 ruReverseJoin(pf : RuProverExp, prover_env : RuProverEnv) -> void {
 	pf_exp = ruExp(pf.stmt.exps[0]);
+	// ROOT JOIN: a forward fact that MATCHES the root statement completes the whole
+	// proof. Without this, a pure-forward tactic (e.g. assume-neg(loop(forward, N)))
+	// can derive the goal yet never conclude — backwardFront holds only the subgoal
+	// E-nodes created by backward Prop expansion (expand.flow:124), so the root itself
+	// is never joinable there. MATCH, not unify: σ binds only the fact's vars, so
+	// σ·fact = root VERBATIM — the completed proof is of the exact theorem statement
+	// (soundness invariant I2), never of a mere common specialization.
+	root = prover_env.tree.root;
+	if (length(root.stmt.exps) > 0) {
+		root_exp = ruExp(root.stmt.exps[0]);
+		switch (ruMatchExp(root_exp, pf_exp, prover_env.math, prover_env.env)) {
+			None(): {}
+			Some(rsigma): {
+				if (ruJoinAcyclic(pf, root_exp.nodes)) {
+					iterVector(pf.proofs, \pv -> {
+						spliced = ruApplySubst2ProofNode(rsigma, ruMakeProofTree(pv));
+						fwdProof = RuProverProofForward(root, RuStmt(root.stmt with exps = [root_exp]), rsigma, spliced);
+						// Same variant admission as the interior join below (inert by default).
+						if (prover_env.fns.keepVariant(fwdProof)) {
+							pushVector(root.proofs, fwdProof);
+							completed : Vector<RuProverProofHyp> = makeVector(1);
+							pushVector(completed, fwdProof);
+							ruBuildRootProofs(root, completed, prover_env);
+						} else {};
+					});
+				} else {};
+			}
+		}
+	} else {};
 	matches = ruUnifyIndex(pf_exp, ^(prover_env.backwardFront), ruEmptySubst, prover_env.math, prover_env.env);
 	iter(matches, \u -> {
 		subgoal : RuProverExp = u.data;
 		sigma = u.sub;
-		if (ruJoinAcyclic(pf, (ruExp(subgoal.stmt.exps[0])).nodes)) {
+		// Consult the L2-provided join-admission policy (prover_env.admitJoin,
+		// default admit-all): L1 stays calculus-agnostic — WHICH joins are worth
+		// grafting (e.g. declining structureless cut-slots) is an L2 selection
+		// concern, set by tactics like `ordered`.
+		if ((^(prover_env.admitJoin))(pf, subgoal) && ruJoinAcyclic(pf, (ruExp(subgoal.stmt.exps[0])).nodes)) {
 			parent = subgoal.parent;
+			if (prover_env.env.conf.verbose >= 4) {
+				prover_env.env.out.println("  reverse-join: fact " + ruSafeExp2s(pf_exp, prover_env.math.decls.lang)
+					+ " -> subgoal " + ruSafeExp2s(ruExp(subgoal.stmt.exps[0]), prover_env.math.decls.lang));
+			} else {};
 			iterVector(pf.proofs, \pv -> {
 				closing = RuStmt(subgoal.stmt with exps = map(subgoal.stmt.exps, \ex -> ruApplySubst(ruExp(ex), sigma)));
 				spliced = ruApplySubst2ProofNode(sigma, ruMakeProofTree(pv));
@@ -515,6 +553,10 @@ ruReverseJoin(pf : RuProverExp, prover_env : RuProverEnv) -> void {
 					pushVector(subgoal.proofs, fwdProof);
 					n0 = sizeVector(parent.proofs);
 					ruAddProof(parent, fwdProof, prover_env);
+					if (prover_env.env.conf.verbose >= 4) {
+						prover_env.env.out.println("    graft: parent " + id2s(parent.assertion.info.id)
+							+ " proofs " + i2s(n0) + " -> " + i2s(sizeVector(parent.proofs)));
+					} else {};
 					ruBuildPropProofs(parent, vectorTailFrom(parent.proofs, n0), prover_env);
 				} else {};
 			});
@@ -542,10 +584,15 @@ ruExpandForwardProved(
 	// reached the cap or the timer is over. A LIMIT, completeness-preserving (see
 	// ruRunForwardWave): reachable facts within the bound are still all produced.
 	size = ruForwardWaveSizeCap(prover_env);
-	fold(concat(single, multi), Pair(fwd, []), \acc, fh ->
+	res = fold(concat(single, multi), Pair(fwd, []), \acc, fh ->
 		if (ruIndexDataCount(acc.first.index) >= size || ruTimeIsOver(prover_env.conf.timer)) acc
 		else ruApplyForward(acc.first, acc.second, fact, fact_exp, fh.assertion, fh.pos, prover_env)
 	);
+	if (env.conf.verbose >= 4) {
+		env.out.println("  expand: " + ruSafeExp2s(fact_exp, math.decls.lang)
+			+ "  => " + strGlue(map(res.second, \pf -> ruSafeExp2s(ruExp(pf.stmt.exps[0]), math.decls.lang)), " | "));
+	} else {};
+	res;
 }
 
 // Walk the derivation: a produced fact's children are its producing props; a
@@ -606,14 +653,59 @@ ruMaybeBuildForwardFront(
 		// so seeds / proofs live in the prover's variable space.
 		c_task = ruConstProverTask(task, prover_env.math);
 		fwd0 = ruInitProverForwardProved(c_task.const.premises, assertions, prover_env.math, prover_env.env);
+		// Also bounded by the prover's timer (a LIMIT, completeness-preserving): without it
+		// this pre-build is UNBUDGETED — per-theorem it can grow `size` facts over the full
+		// assertion index and dwarf the prove loop's own time-limit (the forward-search test
+		// leg ran minutes per theorem against a 5s budget).
 		final_fwd = foldRange(1, depth, fwd0, \fwd, __ ->
 			fold(fwd.front, RuProverForward(fwd with front = []), \st, fact ->
-				if (ruIndexDataCount(st.index) >= size) st
+				if (ruIndexDataCount(st.index) >= size || ruTimeIsOver(prover_env.conf.timer)) st
 				else ruExpandForwardProved(st, fact, prover_env).first
 			)
 		);
 		prover_env.forwardFront := Some(final_fwd);
 	}
+}
+
+// Build an RuExp for `rule` applied to `args` (prefix form) — mirrors ruEqMkRule but stays in core
+// (forward.flow must not import the tactics layer). Used to construct the ¬G / ¬G→X refutation facts.
+ruFwdMkRule(rule : int, type : int, args : [RuExp]) -> RuExp {
+	argNodes = fold(args, [], \acc, a -> concat(acc, a.nodes));
+	RuExp(concat([ruMakeRuleNode(rule, type, length(args), length(argNodes))], argNodes), -1);
+}
+
+// Refutation seeding (the `assume-neg` atom, checker-decomposition candidate A): seed the negated-goal
+// DEDUCTION facts the install `ruHRefute` uses — `¬G→¬G` (id) and each premise lifted to `¬G→hyp_i` (a1i)
+// — so the forward wave can saturate under the assumption ¬G. Once it derives a clash (¬G→φ, ¬G→¬φ) a
+// scope `pm2.65i` application yields `¬¬G`, then `ax-mp` with `notnotr` yields `G`, which joins the root.
+// All engine-built (the seed proofs are ordinary id/a1i steps; the rest is the ordinary forward wave).
+// Const-form (c_task.const), matching the front the wave saturates over. Gated by prover_env.refute.
+ruSeedRefuteFront(prover_env : RuProverEnv, c_task : RuConstAny<RuProverTask>, fwd : RuProverForward) -> RuProverForward {
+	wff = tp2id_("wff");
+	goalExp = ruExp(c_task.const.goal.stmt.exps[0]);
+	cls     = c_task.const.goal.stmt.class;
+	ng      = ruFwdMkRule(s2id("wn"), wff, [goalExp]);        // ¬G
+	mkImp   = \a, b -> ruFwdMkRule(s2id("wi"), wff, [a, b]);
+	ngng    = mkImp(ng, ng);
+	// (statement exp, engine proof tree) for each seed fact.
+	seeds = concat(
+		[Pair(ngng, RuProofStep(s2id_("id"), [], RuStmt(cls, [ngng], -1)))],   // ⊢ ¬G→¬G  (id)
+		map(c_task.const.premises, \p -> {
+			hyp = ruExp(p.stmt.exps[0]);
+			imp = mkImp(ng, hyp);
+			Pair(imp, RuProofStep(s2id_("a1i"), [RuProofHyp(p.ind, p.stmt)], RuStmt(cls, [imp], -1)));  // hyp_i ⊢ ¬G→hyp_i (a1i)
+		})
+	);
+	fold(seeds, fwd, \st, pr -> {
+		impExp = pr.first; key = impExp.nodes;
+		if (containsSet(st.seen, key)) st
+		else {
+			stmt = RuStmt(cls, [impExp], -1);
+			sf   = RuProverExp(-1, makeVector(4), stmt, makeVector(0), ruNoProverProp);
+			pushVector(sf.proofs, RuProverProofForward(sf, stmt, ruEmptySubst, pr.second));
+			(ruFwdRegister(st, [], sf, impExp, key)).first;
+		}
+	});
 }
 
 ruSeedForwardFront(prover_env : RuProverEnv) -> void {
@@ -648,8 +740,334 @@ ruSeedForwardFront(prover_env : RuProverEnv) -> void {
 				}
 			}
 		);
-		prover_env.forwardFront := Some(fwd1);
+		// Refutation mode (assume-neg): also seed the ¬G deduction facts, so the wave can
+		// saturate under ¬G and derive G via pm2.65i + notnotr. Inert unless prover_env.refute.
+		fwd2 = if (^(prover_env.refute)) ruSeedRefuteFront(prover_env, c_task, fwd1) else fwd1;
+		// Instantiation mode (the `instantiate` atom): seed each ∀-premise INSTANTIATED at
+		// candidate terms (subterms of the goal/premises) — the Mizar Unifier as guided seeding.
+		// Also seed 0-hyp IDENTITY schemata (wceq-headed conclusions, e.g. disjdif) instantiated
+		// at the same subterms — Mizar's Equate applying its identity base (the Equalizer).
+		// Inert unless prover_env.instantiate.
+		fwd3 = if (^(prover_env.instantiate)) {
+			ruSeedIdentityFront(prover_env, c_task, ruSeedInstantiateFront(prover_env, c_task, fwd2), asses);
+		} else fwd2;
+		prover_env.forwardFront := Some(fwd3);
+		// Join-check the SEEDS: only derived facts pass through ruReverseJoin (at
+		// creation in ruApplyForward), and the dedup (`seen`) blocks re-derivation —
+		// so a seed that IS the goal (e.g. an identity instance matching the root
+		// verbatim) would never join. One pass over the initial front covers it.
+		iter(fwd3.front, \sf -> ruReverseJoin(sf, prover_env));
 	}
+}
+
+// ---------------------------------------------------------------------------
+// forall-instantiate seeding (the Mizar UNIFIER increment, mizar-tactic-plan):
+// for each ∀-premise `∀x φ` and each candidate term t (class-typed subterms of
+// the goal and premises — the same candidate source Mizar's Unifier draws on),
+// seed the INSTANCE fact φ[t/x] with a hand-constructed spcv proof:
+//
+//   bi     = the congruence chain  ⊢ (x = t) → (φ ↔ φ[t/x])
+//            (structural recursion: sseq1/2, eqeq1/2, eleq1/2 at the atoms;
+//             notbid/anbi12d/orbi12d/imbi12d/bibi12d at connectives; biidd
+//             for x-free subformulas)
+//   setn   = ⊢ t ∈ _V              (vex for setvars, unex for unions)
+//   spcv(setn, bi)                  ⊢ (∀x φ → φ[t/x])
+//   ax-mp(premise, spcv)            ⊢ φ[t/x]
+//
+// The same seeding pattern as ruSeedRefuteFront (assume-neg): the combinator
+// constructs ordinary proof TREES from foundation lemmas; the kernel verifies
+// them in the final proof. The blind wave cannot assemble these chains (the
+// schematic congruence facts starve under ground-first ordering and explode
+// unguided) — the guided TERM CHOICE here is the L2 selection that Mizar's
+// Unifier performs against its eq-classes. Bounded: at most
+// ruFwdInstCap candidates per ∀-premise (a LIMIT, completeness-preserving).
+// v1 scope: atoms with x in exactly one argument slot; no nested binders over
+// x; setness for setvars and ∪-terms — everything else is declined, never
+// mis-built.
+// ---------------------------------------------------------------------------
+
+RuFwdInstIds(
+	wff : int, cls : int, setvar : int,
+	wn : int, wi : int, wb : int, wa : int, wo : int, wal : int, wex : int,
+	wss : int, wceq : int, wcel : int, cvv : int, cun : int,
+	sseq1 : int, sseq2 : int, eqeq1 : int, eqeq2 : int, eleq1 : int, eleq2 : int,
+	notbid : int, anbi12d : int, orbi12d : int, imbi12d : int, bibi12d : int, biidd : int,
+	spcv : int, vex : int, unex : int, axmp : int
+);
+
+ruFwdInstIds() -> RuFwdInstIds {
+	RuFwdInstIds(
+		tp2id_("wff"), tp2id_("class"), tp2id_("setvar"),
+		s2id("wn"), s2id("wi"), s2id("wb"), s2id("wa"), s2id("wo"), s2id("wal"), s2id("wex"),
+		s2id("wss"), s2id("wceq"), s2id("wcel"), s2id("cvv"), s2id("cun"),
+		s2id_("sseq1"), s2id_("sseq2"), s2id_("eqeq1"), s2id_("eqeq2"), s2id_("eleq1"), s2id_("eleq2"),
+		s2id_("notbid"), s2id_("anbi12d"), s2id_("orbi12d"), s2id_("imbi12d"), s2id_("bibi12d"), s2id_("biidd"),
+		s2id_("spcv"), s2id_("vex"), s2id_("unex"), s2id_("ax-mp")
+	);
+}
+
+// End index (exclusive) of the subexpression starting at i (prefix form).
+ruFwdSpan(nodes : [RuExpNode], i : int) -> int {
+	switch (nodes[i]) {
+		RuVar(__,__): i + 1;
+		RuRuleNode(__, al): fold(enumFromTo(1, ruArityLen2Arity(al)), i + 1, \p, __ -> ruFwdSpan(nodes, p));
+	}
+}
+
+// The bound variable in the CONST task form is a zero-arity RULE node (a frozen
+// task var, printed `_x901`), not an RuVar — so occurrence tests and substitution
+// work on NODE EQUALITY, representation-agnostically.
+ruFwdContainsNode(nodes : [RuExpNode], x : RuExpNode) -> bool {
+	exists(nodes, \n -> n == x);
+}
+
+// Is this node a setvar-typed atom (an RuVar or a frozen zero-arity const)?
+ruFwdIsSetvarNode(n : RuExpNode, setvar : int) -> bool {
+	switch (n) {
+		RuVar(__, tp): tp == setvar;
+		RuRuleNode(idType, al): ruArityLen2Arity(al) == 0 && ruIdType2Type(idType) == setvar;
+	}
+}
+
+// The congruence chain: Some((φ[t/x], proof of ⊢ ante → (φ ↔ φ[t/x]))), or None
+// when the v1 fragment cannot build it (x nested inside an atom argument, under
+// a binder, or an unsupported head).
+// x = the bare bound-var node (for containment tests); xocc = its CLASS-form
+// occurrence slice (the setvar wrapped in the implicit coercion node — `setvar :
+// class` materializes as a 1-arity class rule, so x occupies 2 nodes in class slots).
+ruFwdBiChain(ids : RuFwdInstIds, ante : RuExp, x : RuExpNode, xocc : [RuExpNode], t : RuExp, body : [RuExpNode], stcl : int) -> Maybe<Pair<RuExp, RuProofTree>> {
+	ruFwdChainDbg(ids, body);
+	bodyExp = RuExp(body, -1);
+	mkStmt = \e : RuExp -> RuStmt(stcl, [e], -1);
+	biStmt = \inst : RuExp -> mkStmt(ruFwdMkRule(ids.wi, ids.wff, [ante, ruFwdMkRule(ids.wb, ids.wff, [bodyExp, inst])]));
+	if (!ruFwdContainsNode(body, x)) {
+		// x-free subformula: ⊢ ante → (φ ↔ φ) by biidd.
+		Some(Pair(bodyExp, RuProofStep(ids.biidd, [], biStmt(bodyExp))));
+	} else {
+		switch (body[0]) {
+			RuVar(__,__): None(); // a bare wff atom equal to x is not a wff — unreachable
+			RuRuleNode(idType, __): {
+				rid = ruIdType2Id(idType);
+				if (rid == ids.wn) {
+					maybeMap(ruFwdBiChain(ids, ante, x, xocc, t, tail(body), stcl), \c -> {
+						inst = ruFwdMkRule(ids.wn, ids.wff, [c.first]);
+						Pair(inst, RuProofStep(ids.notbid, [c.second], biStmt(inst)));
+					});
+				} else if (rid == ids.wi || rid == ids.wa || rid == ids.wo || rid == ids.wb) {
+					lend = ruFwdSpan(body, 1);
+					l = subrange(body, 1, lend - 1);
+					r = subrange(body, lend, length(body) - lend);
+					maybeBind(ruFwdBiChain(ids, ante, x, xocc, t, l, stcl), \cl ->
+						maybeMap(ruFwdBiChain(ids, ante, x, xocc, t, r, stcl), \cr -> {
+							inst = ruFwdMkRule(rid, ids.wff, [cl.first, cr.first]);
+							lemma = if (rid == ids.wi) ids.imbi12d else if (rid == ids.wa) ids.anbi12d
+								else if (rid == ids.wo) ids.orbi12d else ids.bibi12d;
+							Pair(inst, RuProofStep(lemma, [cl.second, cr.second], biStmt(inst)));
+						}));
+				} else if (rid == ids.wss || rid == ids.wceq || rid == ids.wcel) {
+					lend = ruFwdSpan(body, 1);
+					a = subrange(body, 1, lend - 1);
+					b = subrange(body, lend, length(body) - lend);
+					aIsX = a == xocc;
+					bIsX = b == xocc;
+					if (aIsX && !ruFwdContainsNode(b, x)) {
+						inst = ruFwdMkRule(rid, ids.wff, [t, RuExp(b, -1)]);
+						lemma = if (rid == ids.wss) ids.sseq1 else if (rid == ids.wceq) ids.eqeq1 else ids.eleq1;
+						Some(Pair(inst, RuProofStep(lemma, [], biStmt(inst))));
+					} else if (bIsX && !ruFwdContainsNode(a, x)) {
+						inst = ruFwdMkRule(rid, ids.wff, [RuExp(a, -1), t]);
+						lemma = if (rid == ids.wss) ids.sseq2 else if (rid == ids.wceq) ids.eqeq2 else ids.eleq2;
+						Some(Pair(inst, RuProofStep(lemma, [], biStmt(inst))));
+					} else None(); // x nested inside a compound argument — v1 declines
+				} else None(); // binder over x / unsupported head — v1 declines
+			}
+		}
+	}
+}
+
+ruFwdChainDbgOn : ref bool = ref false;
+ruFwdChainDbg(ids : RuFwdInstIds, body : [RuExpNode]) -> void {
+	if (^ruFwdChainDbgOn) {
+		head = switch (body[0]) {
+			RuVar(id,__): "var:" + id2s(id);
+			RuRuleNode(idType,__): "rule:" + id2s(ruIdType2Id(idType)) + " raw=" + i2s(ruIdType2Id(idType)) + " wi-id=" + i2s(ids.wi);
+		}
+		println("  biChain: head=" + head + " len=" + i2s(length(body)));
+	}
+}
+
+// ⊢ t ∈ _V : vex for a setvar, unex for a ∪-term; anything else declined.
+ruFwdSetness(ids : RuFwdInstIds, t : [RuExpNode], stcl : int) -> Maybe<RuProofTree> {
+	mkCel = \e : [RuExpNode] -> RuStmt(stcl, [ruFwdMkRule(ids.wcel, ids.wff, [RuExp(e, -1), ruFwdMkRule(ids.cvv, ids.cls, [])])], -1);
+	if (length(t) == 2 && ruFwdIsSetvarNode(t[1], ids.setvar)) Some(RuProofStep(ids.vex, [], mkCel(t)))
+	else switch (t[0]) {
+		RuVar(__,__): None();
+		RuRuleNode(idType, __): {
+			if (ruIdType2Id(idType) == ids.cun) {
+				lend = ruFwdSpan(t, 1);
+				a = subrange(t, 1, lend - 1);
+				b = subrange(t, lend, length(t) - lend);
+				maybeBind(ruFwdSetness(ids, a, stcl), \pa ->
+					maybeMap(ruFwdSetness(ids, b, stcl), \pb ->
+						RuProofStep(ids.unex, [pa, pb], mkCel(t))));
+			} else None();
+		}
+	}
+}
+
+// Class-typed candidate terms: all subexpressions of the given expressions whose
+// head is class-typed (or a bare setvar), deduped, capped.
+ruFwdInstCandidates(ids : RuFwdInstIds, exps : [RuExp], cap : int) -> [[RuExpNode]] {
+	collect = \nodes : [RuExpNode] -> {
+		doCollect = \i : int -> {
+			isCls = switch (nodes[i]) {
+				RuVar(__,__): false;
+				RuRuleNode(idType, __): ruIdType2Type(idType) == ids.cls;
+			};
+			if (isCls) [subrange(nodes, i, ruFwdSpan(nodes, i) - i)] else [];
+		}
+		concatA(mapi(nodes, \i, __ -> doCollect(i)));
+	}
+	all = concatA(map(exps, \e -> collect(e.nodes)));
+	deduped = fold(all, Pair(makeSet(), []), \acc, c ->
+		if (containsSet(acc.first, c)) acc
+		else Pair(insertSet(acc.first, c), arrayPush(acc.second, c))
+	).second;
+	take(deduped, cap);
+}
+
+ruFwdInstCap(prover_env : RuProverEnv) -> int {
+	v = lookupTreeDef(prover_env.conf.task.args, "instantiate-cap", "16");
+	if (runtimeValueType(v) == "int") cast(v : flow -> int) else s2i(cast(v : flow -> string));
+}
+
+ruSeedInstantiateFront(prover_env : RuProverEnv, c_task : RuConstAny<RuProverTask>, fwd : RuProverForward) -> RuProverForward {
+	ids  = ruFwdInstIds();
+	stcl = c_task.const.goal.stmt.class;
+	cands = ruFwdInstCandidates(ids,
+		concat([ruExp(c_task.const.goal.stmt.exps[0])], map(c_task.const.premises, \p -> ruExp(p.stmt.exps[0]))),
+		ruFwdInstCap(prover_env));
+	ruFwdChainDbgOn := prover_env.env.conf.verbose >= 5;
+	if (prover_env.env.conf.verbose >= 4) {
+		prover_env.env.out.println("instantiate: candidates=" + i2s(length(cands))
+			+ " premises=" + i2s(length(c_task.const.premises))
+			+ " wal-premises=" + i2s(length(filter(c_task.const.premises, \p -> {
+				e = ruExp(p.stmt.exps[0]);
+				switch (e.nodes[0]) {
+					RuVar(__,__): false;
+					RuRuleNode(idType, __): ruIdType2Id(idType) == ids.wal
+						&& ruFwdIsSetvarNode(e.nodes[1], ids.setvar);
+				}
+			}))));
+	} else {};
+	fold(c_task.const.premises, fwd, \st, p -> {
+		pexp = ruExp(p.stmt.exps[0]);
+		switch (pexp.nodes[0]) {
+			RuVar(__,__): st;
+			RuRuleNode(idType, __): {
+				if (ruIdType2Id(idType) != ids.wal) st else {
+					xnode = pexp.nodes[1];
+					if (!ruFwdIsSetvarNode(xnode, ids.setvar)) st else {
+						{
+							body = subrange(pexp.nodes, 2, length(pexp.nodes) - 2);
+							// The class-form occurrence of x: the implicit setvar->class
+							// coercion node followed by x. Find it in the body; a body
+							// where x never occurs in class position has nothing to
+							// instantiate structurally (v1 declines it wholesale).
+							xocc = fold(enumFromTo(0, length(body) - 2), [], \acc, i ->
+								if (acc != []) acc
+								else switch (body[i]) {
+									RuVar(__,__): acc;
+									RuRuleNode(idT, al): {
+										if (ruArityLen2Arity(al) == 1 && ruIdType2Type(idT) == ids.cls && body[i + 1] == xnode)
+											[body[i], body[i + 1]]
+										else acc;
+									}
+								});
+							fold(cands, st, \st2, t -> {
+								if (xocc == [] || ruFwdContainsNode(t, xnode)) st2 else {
+									tExp = RuExp(t, -1);
+									ante = ruFwdMkRule(ids.wceq, ids.wff, [RuExp(xocc, -1), tExp]);
+									dbg = \msg : string -> if (prover_env.env.conf.verbose >= 4) {
+										prover_env.env.out.println("instantiate: t=" + ruSafeExp2s(tExp, prover_env.math.decls.lang) + " " + msg);
+									} else {};
+									switch (ruFwdBiChain(ids, ante, xnode, xocc, tExp, body, stcl)) {
+										None(): { dbg("chain DECLINED"); st2 };
+										Some(chain): switch (ruFwdSetness(ids, t, stcl)) {
+											None(): { dbg("setness DECLINED"); st2 };
+											Some(setn): {
+												inst = chain.first;
+												key = inst.nodes;
+												if (containsSet(st2.seen, key)) st2 else {
+													spcvStmt = RuStmt(stcl, [ruFwdMkRule(ids.wi, ids.wff, [pexp, inst])], -1);
+													spcvTree = RuProofStep(ids.spcv, [setn, chain.second], spcvStmt);
+													instTree = RuProofStep(ids.axmp, [RuProofHyp(p.ind, p.stmt), spcvTree], RuStmt(stcl, [inst], -1));
+													sf = RuProverExp(-1, makeVector(4), RuStmt(stcl, [inst], -1), makeVector(0), ruNoProverProp);
+													pushVector(sf.proofs, RuProverProofForward(sf, RuStmt(stcl, [inst], -1), ruEmptySubst, instTree));
+													(ruFwdRegister(st2, [], sf, inst, key)).first;
+												}
+											}
+										}
+									}
+								}
+							});
+						}
+					}
+				}
+			}
+		}
+	});
+}
+
+// IDENTITY-INSTANCE seeding (the Equalizer half of the `instantiate` frame): for each
+// 0-hypothesis assertion in scope whose conclusion is an EQUALITY (wceq-headed identity
+// schema, e.g. disjdif ⊢(A∩(B∖A))=∅) and each class-typed candidate subterm t of the
+// goal/premises, MATCH t against the identity's LEFT side; a FULLY-GROUNDING match σ
+// seeds the instance σ·(L=R) as a fact whose proof is the one-step assertion instance
+// (RuProofStep(identity, [], stmt)) — kernel-verified like any proof. eqcomi in scope
+// covers right-side needs by flipping. Bounded by the same candidate cap; dedup by seen.
+ruSeedIdentityFront(prover_env : RuProverEnv, c_task : RuConstAny<RuProverTask>, fwd : RuProverForward, asses : RuIndex<RuAssertion>) -> RuProverForward {
+	ids  = ruFwdInstIds();
+	stcl = c_task.const.goal.stmt.class;
+	cands = ruFwdInstCandidates(ids,
+		concat([ruExp(c_task.const.goal.stmt.exps[0])], map(c_task.const.premises, \p -> ruExp(p.stmt.exps[0]))),
+		ruFwdInstCap(prover_env));
+	idents = filter(ruIndexValues(asses), \a ->
+		length(a.infer.hyps) == 0 && {
+			cn = (ruExp(a.infer.prop.exps[0])).nodes;
+			switch (cn[0]) {
+				RuVar(__,__): false;
+				RuRuleNode(idT, __): ruIdType2Id(idT) == ids.wceq;
+			}
+		});
+	fold(idents, fwd, \st, a -> {
+		concl = ruExp(a.infer.prop.exps[0]);
+		lend  = ruFwdSpan(concl.nodes, 1);
+		lhs   = RuExp(subrange(concl.nodes, 1, lend - 1), -1);
+		fold(cands, st, \st2, t -> {
+			switch (ruMatchExp(RuExp(t, -1), lhs, prover_env.math, prover_env.env)) {
+				None(): st2;
+				Some(sigma): {
+					inst = ruApplySubst(concl, sigma);
+					// Require FULL grounding: a leftover schematic var would seed a
+					// half-instantiated schema (junk the ground-first ordering exists
+					// to avoid). Declined instances stay reachable as the plain 0-hyp
+					// schematic fact (seeded by ruSeedForwardFront) — nothing lost.
+					ground = !exists(inst.nodes, \n -> switch (n) {
+						RuVar(__,__): true;
+						RuRuleNode(__,__): false;
+					});
+					key = inst.nodes;
+					if (!ground || containsSet(st2.seen, key)) st2 else {
+						tree = RuProofStep(a.info.id, [], RuStmt(stcl, [inst], -1));
+						sf = RuProverExp(-1, makeVector(4), RuStmt(stcl, [inst], -1), makeVector(0), ruNoProverProp);
+						pushVector(sf.proofs, RuProverProofForward(sf, RuStmt(stcl, [inst], -1), ruEmptySubst, tree));
+						(ruFwdRegister(st2, [], sf, inst, key)).first;
+					}
+				}
+			}
+		});
+	});
 }
 
 // Cap on total forward facts per wave: once the front index reaches it, stop expanding
@@ -682,10 +1100,62 @@ ruRunForwardWave(prover_env : RuProverEnv) -> bool {
 				size = ruForwardWaveSizeCap(prover_env);
 				if (ruIndexDataCount(fwd.index) >= size || ruTimeIsOver(prover_env.conf.timer)) false
 				else {
-					new_fwd = fold(fwd.front, RuProverForward(fwd with front = []), \st, fact ->
+					// Ordered-saturation steering (the `ordered` atom): BEST-FIRST waves.
+					// Expand only the ≺-minimal size class of the frontier and DEFER the
+					// rest to the next front, so the small saturation core (a shrinking
+					// refutation ladder, equality literals) advances wave after wave while
+					// term-GROWING congruence junk waits — per-wave sorting alone cannot do
+					// this (every wave would still expand its whole junk front before the
+					// core's next rung). A pure REORDERING across waves: deferred facts stay
+					// in the front and are expanded once the core stops shrinking — nothing
+					// is ever discarded (completeness invariant; bounds cut here exactly as
+					// they cut a FIFO wave).
+					wave = if (^(prover_env.ordered)) {
+						// ≺ = (metavar count, term size): GROUND-FIRST, then smallest. Ground
+						// facts (task constants — the ¬G deductions, premises, chain literals)
+						// carry the actual problem; schematic facts (seeded 0-hyp lemmas and
+						// their syl/mpd self-compositions — which can regenerate the whole
+						// theory as junk) stay FILL-only until nothing ground is left. The
+						// standard ground-first discipline of saturation provers.
+						// (A goal-relevance leading key was TRIED and REGRESSED: everything
+						// derived from goal-facts contains the goal, so the class stops
+						// discriminating while demoting ground-first — the selection-policy
+						// iteration for the clash chain's LARGE late rungs is open work.)
+						fkey = \f : RuProverExp -> {
+							e = ruExp(f.stmt.exps[0]);
+							nvars = fold(e.nodes, 0, \n, node -> switch (node) {
+								RuVar(__,__): n + 1;
+								RuRuleNode(__,__): n;
+							});
+							nvars * 100000 + length(e.nodes);
+						}
+						minkey = fold(fwd.front, intMax, \m, f -> min(m, fkey(f)));
+						// (An oldest-fact LIVENESS slot — E-prover's age axis — was TRIED for
+						// the large late clash rungs and REVERTED: old IMPLICATION facts
+						// explode on expansion (1 fact → +1700 via syl/ax-mp fill cartesians)
+						// and cap the index in ~16 waves. The right mechanism for the late
+						// rungs is the BIDIRECTIONAL meet: a bounded backward bfs registers
+						// ¬¬G-style subgoals in backwardFront and the forward-derived fact
+						// joins AT CREATION (ruReverseJoin) — no expansion needed. That
+						// composition currently HANGS (seq(limited(bfs), ordered(loop(forward)))
+						// at 0% CPU) — open engine bug, see mizar-plan-progress.)
+						Pair(
+							filter(fwd.front, \f -> fkey(f) == minkey),
+							filter(fwd.front, \f -> fkey(f) != minkey)
+						);
+					} else Pair(fwd.front, []);
+					new_fwd = fold(wave.first, RuProverForward(fwd with front = wave.second), \st, fact ->
 						if (ruTimeIsOver(prover_env.conf.timer)) st
 						else ruExpandForwardProved(st, fact, prover_env).first
 					);
+					if (prover_env.env.conf.verbose >= 3) {
+						prover_env.env.out.println(
+							"forward wave: front " + i2s(length(fwd.front))
+							+ " (expand " + i2s(length(wave.first)) + ") -> " + i2s(length(new_fwd.front))
+							+ ", index " + i2s(ruIndexDataCount(new_fwd.index))
+							+ (if (^(prover_env.ordered)) " (ordered)" else "")
+						);
+					} else {};
 					prover_env.forwardFront := Some(new_fwd);
 					new_fwd.front != [];
 				}
