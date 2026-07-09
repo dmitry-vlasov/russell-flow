@@ -1,0 +1,88 @@
+import ru/prover/core/controls;
+import ru/prover/core/tree;
+import base/env;
+
+// PVT NODE LABELS — a pure LEVEL-2 mechanism (engine-owns-proofs law, settled
+// 2026-07-09): labels are data ATTACHED to node ids, written and read at L2.
+// Level 1 (expansion, propagation, dedup, unification, joins) never sees them —
+// the store is a side index over node ids, not a field the engine touches.
+//
+// First consumer: STAGE PROVENANCE in or-else. Each alternative's tactic is
+// wrapped in a stamping decorator; nodes the engine creates on behalf of a
+// stage get that stage's tag. Attribution: the engine expands BETWEEN tactic
+// steps, so at the start of every step the wrapper stamps all nodes above the
+// watermark with the tag of the stage that made the PREVIOUS expansion request
+// (held in `stage`), then installs its own tag.
+//
+// Later consumers (the design, see the mizar-plan-progress memory):
+//  - VISIBILITY: a stage's selection ignores foreign-labeled nodes (a pure
+//    L2 selection policy — the failed attempt's junk stops confusing the next
+//    stage without discarding it);
+//  - RESUMABILITY: re-entering a stage's tag with a fresh budget continues
+//    from its explored region instead of starting from zero.
+
+export {
+	RuPvtLabels(
+		stage     : ref int,             // tag of the stage whose expansion request is in flight (0 = none)
+		names     : ref Tree<int, string>, // tag -> display name (for traces)
+		stamps    : ref Tree<int, int>,  // node id -> tag of the stage that created it
+		watermark : ref int              // highest node id already stamped
+	);
+
+	ruMakePvtLabels() -> RuPvtLabels;
+
+	// Stamp every tree node above the watermark with the CURRENT `stage` tag
+	// (they were created by the engine for that stage's last request), advance
+	// the watermark, and return how many nodes were stamped.
+	ruPvtStampNew(labels : RuPvtLabels, tree : RuProverTree) -> int;
+
+	// Per-stage created-node counts, for traces: "stage-name=count, ...".
+	ruPvtStageStats2s(labels : RuPvtLabels) -> string;
+
+	// Wrap a stage tactic with provenance stamping under `tag`/`name`.
+	// Pure decoration: steps, switches and responses pass through untouched.
+	ruStampingTactic(inner : RuProverTactic, labels : RuPvtLabels, tag : int, name : string) -> RuProverTactic;
+}
+
+ruMakePvtLabels() -> RuPvtLabels {
+	RuPvtLabels(ref 0, ref makeTree(), ref makeTree(), ref -1);
+}
+
+ruPvtStampNew(labels : RuPvtLabels, tree : RuProverTree) -> int {
+	tag = ^(labels.stage);
+	wm = ^(labels.watermark);
+	// node ids grow monotonically; everything above the watermark is new
+	new_ids = filter(getTreeKeys(tree.nodes), \id -> id > wm);
+	if (new_ids == []) 0
+	else {
+		iter(new_ids, \id -> labels.stamps := setTree(^(labels.stamps), id, tag));
+		labels.watermark := either(maxA(new_ids), wm);
+		length(new_ids);
+	}
+}
+
+ruPvtStageStats2s(labels : RuPvtLabels) -> string {
+	counts = foldTree(^(labels.stamps), makeTree(), \__, tag, acc ->
+		setTree(acc, tag, lookupTreeDef(acc, tag, 0) + 1));
+	strGlue(map(tree2pairs(counts), \p ->
+		lookupTreeDef(^(labels.names), p.first, i2s(p.first)) + "=" + i2s(p.second)), ", ");
+}
+
+ruStampingTactic(inner : RuProverTactic, labels : RuPvtLabels, tag : int, name : string) -> RuProverTactic {
+	labels.names := setTree(^(labels.names), tag, name);
+	RuProverTactic(inner.toString, inner.tag,
+		\tree -> {
+			// attribute the engine's latest expansions to their requester,
+			// then take ownership of the next request
+			ruPvtStampNew(labels, tree);
+			labels.stage := tag;
+			switch (inner.step(tree)) {
+				RuTacticExpand(leafs): RuTacticExpand(leafs);
+				RuTacticExpandForward(): RuTacticExpandForward();
+				RuTacticSwitch(next): RuTacticSwitch(ruStampingTactic(next, labels, tag, name));
+				RuTacticDone(): RuTacticDone();
+			}
+		},
+		inner.keep_expanding
+	);
+}
