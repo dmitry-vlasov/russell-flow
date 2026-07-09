@@ -749,7 +749,8 @@ ruSeedForwardFront(prover_env : RuProverEnv) -> void {
 		// at the same subterms — Mizar's Equate applying its identity base (the Equalizer).
 		// Inert unless prover_env.instantiate.
 		fwd3 = if (^(prover_env.instantiate)) {
-			ruSeedIdentityFront(prover_env, c_task, ruSeedInstantiateFront(prover_env, c_task, fwd2), asses);
+			ruSeedEqNormalize(prover_env, c_task,
+				ruSeedIdentityFront(prover_env, c_task, ruSeedInstantiateFront(prover_env, c_task, fwd2), asses), asses);
 		} else fwd2;
 		prover_env.forwardFront := Some(fwd3);
 		// Join-check the SEEDS: only derived facts pass through ruReverseJoin (at
@@ -1029,6 +1030,15 @@ ruSeedInstantiateFront(prover_env : RuProverEnv, c_task : RuConstAny<RuProverTas
 ruSeedIdentityFront(prover_env : RuProverEnv, c_task : RuConstAny<RuProverTask>, fwd : RuProverForward, asses : RuIndex<RuAssertion>) -> RuProverForward {
 	ids  = ruFwdInstIds();
 	stcl = c_task.const.goal.stmt.class;
+	// Seed equality identities only when the task actually CONTAINS an equality
+	// (goal or a premise): for a pure relational task (e.g. a subset goal) the
+	// identity instances are junk by construction and starve the useful chains.
+	hasEq = exists(concat([ruExp(c_task.const.goal.stmt.exps[0])], map(c_task.const.premises, \pp -> ruExp(pp.stmt.exps[0]))),
+		\e -> exists(e.nodes, \n -> switch (n) {
+			RuVar(__,__): false;
+			RuRuleNode(idT, __): ruIdType2Id(idT) == ids.wceq;
+		}));
+	if (!hasEq) fwd else {
 	cands = ruFwdInstCandidates(ids,
 		concat([ruExp(c_task.const.goal.stmt.exps[0])], map(c_task.const.premises, \p -> ruExp(p.stmt.exps[0]))),
 		ruFwdInstCap(prover_env));
@@ -1084,6 +1094,357 @@ ruSeedIdentityFront(prover_env : RuProverEnv, c_task : RuConstAny<RuProverTask>,
 			}
 		});
 	});
+	}
+}
+
+// ---------------------------------------------------------------------------
+// eq-normalize (DIRECTED equality rewriting - the deterministic Equate,
+// mizar-tactic-plan): when the GOAL is an equality X = Y, normalize BOTH sides
+// by the ORIENTED identity base and, if the normal forms coincide, seed the
+// goal fact with the constructed proof (identity instances lifted through
+// their contexts by the per-operation congruence inferences, chained by
+// eqtri) - the seed-join then closes the root. No search: this is rewriting
+// to canonical form, union-find quality, where wave saturation over the
+// term-GROWING *eq*i inferences structurally explodes.
+//
+// Orientation guards (a rule is L -> R):
+//   - vars(R) must be a subset of vars(L)  (sound direction);
+//   - COMM-shaped rules (|R| = |L|) apply only ORDER-DECREASING (the rewritten
+//     subterm strictly decreases in the node order) - no A^B <-> B^A loops;
+//   - GROWING rules (|sigma R| > |sigma L|) apply only when ELIMINATING (some
+//     class-op of L is absent from R, e.g. dfsymdif3 eliminating symdiff).
+// For each identity whose lhs head is a commutative op (cin/cun) a SWAPPED
+// variant is added mechanically (proof = eqtri(incom/uncom instance, identity
+// instance)) - deterministic coverage instead of AC-matching.
+// Rewriting is leftmost-OUTERMOST; a redex under an unliftable context
+// (csymdif has no *eq*i inferences) is skipped - outermost-first eliminates
+// the symdiff node itself before anything must lift through it.
+// ---------------------------------------------------------------------------
+
+RuFwdEqIds(
+	eqtri : int, eqcomi : int, eqid : int, incom : int, uncom : int,
+	ineq1i : int, ineq2i : int, uneq1i : int, uneq2i : int, difeq1i : int, difeq2i : int,
+	cin : int, cun : int, cdif : int
+);
+ruFwdEqIds() -> RuFwdEqIds {
+	RuFwdEqIds(
+		s2id_("eqtri"), s2id_("eqcomi"), s2id_("eqid"), s2id_("incom"), s2id_("uncom"),
+		s2id_("ineq1i"), s2id_("ineq2i"), s2id_("uneq1i"), s2id_("uneq2i"), s2id_("difeq1i"), s2id_("difeq2i"),
+		s2id("cin"), s2id("cun"), s2id("cdif")
+	);
+}
+
+// One oriented rewrite rule: lhs/rhs patterns + a proof builder for the
+// INSTANCE equality sigma(lhs) = sigma(rhs).
+RuFwdEqRule(
+	lhs : [RuExpNode],
+	rhs : [RuExpNode],
+	comm : bool,        // order-decreasing guard applies
+	grow : bool,        // |rhs| may exceed |lhs| under sigma
+	elim : bool,        // rhs drops a class-op present in lhs
+	mkProof : (RuExp, RuExp, int) -> RuProofTree  // (instLhs, instRhs, stmtClass)
+);
+
+ruFwdClassOps(ids : RuFwdInstIds, nodes : [RuExpNode]) -> Set<int> {
+	fold(nodes, makeSet(), \ac, n -> switch (n) {
+		RuVar(__,__): ac;
+		RuRuleNode(idT, __): if (ruIdType2Type(idT) == ids.cls) insertSet(ac, ruIdType2Id(idT)) else ac;
+	});
+}
+
+// node-array order for the comm guard: compare by (isVar, id, type) lexicographically.
+ruFwdNodeLess(a : [RuExpNode], b : [RuExpNode]) -> bool {
+	n = min(length(a), length(b));
+	res = fold(enumFromTo(0, n - 1), 0, \st, i ->
+		if (st != 0) st else {
+			ka = switch (a[i]) { RuVar(id, tp): Pair(id, tp); RuRuleNode(idT, __): Pair(ruIdType2Id(idT) + 1000000000, ruIdType2Type(idT)); };
+			kb = switch (b[i]) { RuVar(id, tp): Pair(id, tp); RuRuleNode(idT, __): Pair(ruIdType2Id(idT) + 1000000000, ruIdType2Type(idT)); };
+			if (ka.first != kb.first) { if (ka.first < kb.first) -1 else 1 }
+			else if (ka.second != kb.second) { if (ka.second < kb.second) -1 else 1 }
+			else 0;
+		});
+	if (res != 0) res < 0 else length(a) < length(b);
+}
+
+// Build the oriented rule set from the task-filtered identity schemata.
+ruFwdEqRules(ids : RuFwdInstIds, eids : RuFwdEqIds, idents : [RuAssertion], stcl : int) -> [RuFwdEqRule] {
+	concatA(map(idents, \a -> {
+		concl = ruExp(a.infer.prop.exps[0]);
+		lend  = ruFwdSpan(concl.nodes, 1);
+		lhs   = subrange(concl.nodes, 1, lend - 1);
+		rhs   = subrange(concl.nodes, lend, length(concl.nodes) - lend);
+		lvars = fold(lhs, makeSet(), \ac, n -> switch (n) { RuVar(id,__): insertSet(ac, id); RuRuleNode(__,__): ac; });
+		rOk   = forall(rhs, \n -> switch (n) { RuVar(id,__): containsSet(lvars, id); RuRuleNode(__,__): true; });
+		if (!rOk) [] else {
+			lops = ruFwdClassOps(ids, lhs);
+			rops = ruFwdClassOps(ids, rhs);
+			elim = foldSet(lops, false, \ac, op -> ac || !containsSet(rops, op));
+			comm = length(lhs) == length(rhs) && !elim;
+			grow = length(rhs) > length(lhs);
+			mkP  = \il : RuExp, ir : RuExp, sc : int ->
+				RuProofStep(a.info.id, [], RuStmt(sc, [ruFwdMkRule(ruFwdEqIds().eqtri, 0, [])], -1)); // placeholder, replaced below
+			// direct rule (proof = the identity instance)
+			base = RuFwdEqRule(lhs, rhs, comm, grow, elim,
+				\il, ir, sc -> RuProofStep(a.info.id, [],
+					RuStmt(sc, [ruFwdMkRule(s2id("wceq"), tp2id_("wff"), [il, ir])], -1)));
+			// swapped variant for a commutative lhs head (cin/cun): lhs' = op(b,c) -> rhs,
+			// proof = eqtri(comm-instance op(b,c)=op(c,b), identity instance).
+			swapped = switch (lhs[0]) {
+				RuVar(__,__): [];
+				RuRuleNode(idT, __): {
+					op = ruIdType2Id(idT);
+					if (op != eids.cin && op != eids.cun) [] else {
+						aend = ruFwdSpan(lhs, 1);
+						la = subrange(lhs, 1, aend - 1);
+						lb = subrange(lhs, aend, length(lhs) - aend);
+						lhs2 = concat([lhs[0]], concat(lb, la));
+						commId = if (op == eids.cin) eids.incom else eids.uncom;
+						[RuFwdEqRule(lhs2, rhs, comm, grow, elim,
+							\il, ir, sc -> {
+								// il = op(sb, sa); the comm instance flips it to op(sa, sb) = the identity's lhs instance.
+								a2 = ruFwdSpan(il.nodes, 1);
+								sb = RuExp(subrange(il.nodes, 1, a2 - 1), -1);
+								sa = RuExp(subrange(il.nodes, a2, length(il.nodes) - a2), -1);
+								flipped = ruFwdMkRule(op, tp2id_("class"), [sa, sb]);
+								wceq = s2id("wceq"); wff = tp2id_("wff");
+								commStep = RuProofStep(commId, [], RuStmt(sc, [ruFwdMkRule(wceq, wff, [il, flipped])], -1));
+								idStep   = RuProofStep(a.info.id, [], RuStmt(sc, [ruFwdMkRule(wceq, wff, [flipped, ir])], -1));
+								RuProofStep(ruFwdEqIds().eqtri, [commStep, idStep], RuStmt(sc, [ruFwdMkRule(wceq, wff, [il, ir])], -1));
+							})];
+					}
+				}
+			};
+			concat([base], swapped);
+		}
+	}));
+}
+
+// Refine the rule set: a GROWING rule survives only as DEFINITION UNFOLDING - its
+// lhs-head symbol must not occur in the rhs of any rule with a DIFFERENT lhs head
+// (same-headed permuting rules preserve the head count). Then the head count
+// strictly decreases under unfolding and never recovers: generic termination,
+// no symbol names hardcoded. Without this, mutually-eliminating distributivity
+// pairs (drop-union/add-intersect vs drop-intersect/add-union) ping-pong with
+// exponential growth.
+ruFwdEqRulesChecked(ids : RuFwdInstIds, eids : RuFwdEqIds, idents : [RuAssertion], stcl : int) -> [RuFwdEqRule] {
+	raw = ruFwdEqRules(ids, eids, idents, stcl);
+	headOf = \r : RuFwdEqRule -> switch (r.lhs[0]) {
+		RuVar(__,__): 0;
+		RuRuleNode(idT, __): ruIdType2Id(idT);
+	};
+	filtermap(raw, \r -> {
+		if (!r.grow) Some(r) else {
+			h = headOf(r);
+			unfoldOk = h != 0 && forall(raw, \r2 ->
+				headOf(r2) == h || !containsSet(ruFwdClassOps(ids, r2.rhs), h));
+			if (unfoldOk) Some(RuFwdEqRule(r with elim = true)) else None();
+		}
+	});
+}
+
+// The congruence lift lemma for rewriting arg `argIdx` of `op` (1-based); 0 = none.
+ruFwdLiftLemma(eids : RuFwdEqIds, op : int, argIdx : int) -> int {
+	if (op == eids.cin) { if (argIdx == 1) eids.ineq1i else eids.ineq2i }
+	else if (op == eids.cun) { if (argIdx == 1) eids.uneq1i else eids.uneq2i }
+	else if (op == eids.cdif) { if (argIdx == 1) eids.difeq1i else eids.difeq2i }
+	else 0;
+}
+
+// Path from the term root to position i: [(ancestor position, 1-based arg index)].
+ruFwdPathTo(term : [RuExpNode], i : int, pos : int, acc : [Pair<int, int>]) -> Maybe<[Pair<int, int>]> {
+	if (pos == i) Some(acc)
+	else switch (term[pos]) {
+		RuVar(__,__): None();
+		RuRuleNode(idT, al): {
+			arity = ruArityLen2Arity(al);
+			if (arity == 0) None() else {
+				found = fold(enumFromTo(1, arity), Pair(pos + 1, None()), \st, k -> {
+					switch (st.second) {
+						Some(__): st;
+						None(): {
+							e = ruFwdSpan(term, st.first);
+							if (i >= st.first && i < e) Pair(e, Some(Pair(st.first, k))) else Pair(e, None());
+						}
+					}
+				});
+				switch (found.second) {
+					None(): None();
+					Some(ci): ruFwdPathTo(term, i, ci.first, arrayPush(acc, Pair(pos, ci.second)));
+				}
+			}
+		}
+	}
+}
+
+// One rewrite attempt at the leftmost-outermost liftable redex.
+// Returns Some((new term nodes, proof of term = new term)) or None (normal form).
+ruFwdRewriteStep(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], term : [RuExpNode], stcl : int, math : RuMath, env : RuEnv) -> Maybe<Pair<[RuExpNode], RuProofTree>> {
+	wceq = s2id("wceq"); wff = tp2id_("wff");
+	pathTo = \i : int -> ruFwdPathTo(term, i, 0, []);
+	positions = enumFromTo(0, length(term) - 1);
+	fold(positions, None(), \found, i ->
+		switch (found) {
+			Some(__): found;
+			None(): {
+				send = ruFwdSpan(term, i);
+				sub = subrange(term, i, send - i);
+				// try rules at this position
+				hit = fold(rules, None(), \h, r -> switch (h) {
+					Some(__): h;
+					None(): switch (ruMatchExp(RuExp(sub, -1), RuExp(r.lhs, -1), math, env)) {
+						None(): None();
+						Some(sigma): {
+							irhs = ruApplySubst(RuExp(r.rhs, -1), sigma);
+							okComm = !r.comm || ruFwdNodeLess(irhs.nodes, sub);
+							okGrow = !r.grow || r.elim;
+							if (!okComm || !okGrow) None()
+							else Some(Pair(irhs.nodes, r.mkProof(RuExp(sub, -1), irhs, stcl)));
+						}
+					}
+				});
+				switch (hit) {
+					None(): None();
+					Some(hp) : {
+						switch (pathTo(i)) {
+							None(): None();
+							Some(path): {
+								// liftable path check
+								liftable = forall(path, \pe -> switch (term[pe.first]) {
+									RuVar(__,__): false;
+									RuRuleNode(idT, __): ruFwdLiftLemma(eids, ruIdType2Id(idT), pe.second) != 0;
+								});
+								if (!liftable) None() else {
+									// Splice the rewritten subtree AND recompute every ancestor's
+									// packed LEN by the size delta - node lens are subtree sizes,
+									// and stale ancestor lens after a shrinking/growing rewrite
+									// produce MALFORMED expressions (verifier walks overshoot)
+									// and false normal-form mismatches.
+									delta = length(hp.first) - (send - i);
+									ancs = buildSet(map(path, \pe -> pe.first));
+									newTerm = mapi(concat3(subrange(term, 0, i), hp.first, subrange(term, send, length(term) - send)),
+										\j, n -> if (!containsSet(ancs, j)) n else switch (n) {
+											RuVar(__,__): n;
+											RuRuleNode(idT, al): ruMakeRuleNode(ruIdType2Id(idT), ruIdType2Type(idT),
+												ruArityLen2Arity(al), ruArityLen2Len(al) + delta);
+										});
+									// Lift from the innermost ancestor to the root. Positions
+									// BELOW an ancestor are identical in term and newTerm (only
+									// the subtree at i changed), so the rewritten ancestor is
+									// simply the subtree at the SAME position in newTerm — no
+									// splice arithmetic (the previous version built malformed
+									// expressions and crashed the verifier).
+									tree = fold(reverseA(path), hp.second, \tr, pe -> {
+										anc = pe.first; idx = pe.second;
+										before = subrange(term, anc, ruFwdSpan(term, anc) - anc);
+										after  = subrange(newTerm, anc, ruFwdSpan(newTerm, anc) - anc);
+										op = switch (term[anc]) { RuVar(__,__): 0; RuRuleNode(idT,__): ruIdType2Id(idT); };
+										lift = ruFwdLiftLemma(eids, op, idx);
+										stmt = RuStmt(stcl, [ruFwdMkRule(wceq, wff, [RuExp(before, -1), RuExp(after, -1)])], -1);
+										RuProofStep(lift, [tr], stmt);
+									});
+									Some(Pair(newTerm, tree));
+								}
+							}
+						}
+					}
+				}
+			}
+		});
+}
+
+// Normalize a term: fixpoint of ruFwdRewriteStep (bounded), chaining step proofs by eqtri.
+// Returns (normal form, Some(proof of term = nf)) - None proof when already normal.
+ruFwdNormalize(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], term0 : [RuExpNode], stcl : int, math : RuMath, env : RuEnv) -> Pair<[RuExpNode], Maybe<RuProofTree>> {
+	wceq = s2id("wceq"); wff = tp2id_("wff");
+	ruFwdNormalizeRec(ids, eids, rules, term0, term0, None(), 64, stcl, math, env);
+}
+
+ruFwdNormalizeRec(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], term0 : [RuExpNode], term : [RuExpNode], acc : Maybe<RuProofTree>, fuel : int, stcl : int, math : RuMath, env : RuEnv) -> Pair<[RuExpNode], Maybe<RuProofTree>> {
+	wceq = s2id("wceq"); wff = tp2id_("wff");
+	if (fuel <= 0 || length(term) > 512) Pair(term, acc)
+	else switch (ruFwdRewriteStep(ids, eids, rules, term, stcl, math, env)) {
+		None(): Pair(term, acc);
+		Some(st): {
+			chained = switch (acc) {
+				None(): Some(st.second);
+				Some(prev): Some(RuProofStep(eids.eqtri, [prev, st.second],
+					RuStmt(stcl, [ruFwdMkRule(wceq, wff, [RuExp(term0, -1), RuExp(st.first, -1)])], -1)));
+			};
+			ruFwdNormalizeRec(ids, eids, rules, term0, st.first, chained, fuel - 1, stcl, math, env);
+		}
+	}
+}
+
+ruFwdEqDump(lbl : string, t : RuProofTree, d : int, prover_env : RuProverEnv) -> void {
+	switch (t) {
+		RuProofStep(as, ch, st2): {
+			prover_env.env.out.println("  eqnorm" + lbl + " " + i2s(d) + " " + id2s(as) + ": " + ruSafeExp2s(ruExp(st2.exps[0]), prover_env.math.decls.lang));
+			iter(ch, \c -> ruFwdEqDump(lbl, c, d + 1, prover_env));
+		}
+		RuProofHyp(__,__): {};
+	}
+}
+
+ruSeedEqNormalize(prover_env : RuProverEnv, c_task : RuConstAny<RuProverTask>, fwd : RuProverForward, asses : RuIndex<RuAssertion>) -> RuProverForward {
+	ids  = ruFwdInstIds();
+	eids = ruFwdEqIds();
+	stcl = c_task.const.goal.stmt.class;
+	goal = ruExp(c_task.const.goal.stmt.exps[0]);
+	wceq = s2id("wceq"); wff = tp2id_("wff");
+	switch (goal.nodes[0]) {
+		RuVar(__,__): fwd;
+		RuRuleNode(idT, __): {
+			if (ruIdType2Id(idT) != ids.wceq) fwd else {
+				lend = ruFwdSpan(goal.nodes, 1);
+				xs = subrange(goal.nodes, 1, lend - 1);
+				ys = subrange(goal.nodes, lend, length(goal.nodes) - lend);
+				// the same task-symbol-filtered identity set as ruSeedIdentityFront
+				taskOps = ruFwdClassOps(ids, goal.nodes);
+				idents = filter(ruIndexValues(asses), \a ->
+					length(a.infer.hyps) == 0 && {
+						cn = (ruExp(a.infer.prop.exps[0])).nodes;
+						switch (cn[0]) {
+							RuVar(__,__): false;
+							RuRuleNode(idT2, __): ruIdType2Id(idT2) == ids.wceq
+								&& forall(cn, \n -> switch (n) {
+									RuVar(__,__): true;
+									RuRuleNode(idT3, __): ruIdType2Type(idT3) != ids.cls || containsSet(taskOps, ruIdType2Id(idT3));
+								});
+						}
+					});
+				rules = ruFwdEqRulesChecked(ids, eids, idents, stcl);
+				nx = ruFwdNormalize(ids, eids, rules, xs, stcl, prover_env.math, prover_env.env);
+				ny = ruFwdNormalize(ids, eids, rules, ys, stcl, prover_env.math, prover_env.env);
+				if (prover_env.env.conf.verbose >= 4) {
+					switch (nx.second) { None(): {}; Some(t): ruFwdEqDump("X", t, 0, prover_env); }
+					switch (ny.second) { None(): {}; Some(t): ruFwdEqDump("Y", t, 0, prover_env); }
+				} else {};
+				if (nx.first != ny.first) fwd else {
+					// assemble  X = Y  from  X = N (nx), Y = N (ny)
+					proof = switch (nx.second) {
+						None(): switch (ny.second) {
+							None(): RuProofStep(eids.eqid, [], RuStmt(stcl, [goal], -1)); // X == Y syntactically
+							Some(py): RuProofStep(eids.eqcomi, [py], RuStmt(stcl, [goal], -1)); // X = N, Y -> N flipped
+						}
+						Some(px): switch (ny.second) {
+							None(): px; // N == Y already
+							Some(py): {
+								flipped = RuProofStep(eids.eqcomi, [py],
+									RuStmt(stcl, [ruFwdMkRule(wceq, wff, [RuExp(nx.first, -1), RuExp(ys, -1)])], -1));
+								RuProofStep(eids.eqtri, [px, flipped], RuStmt(stcl, [goal], -1));
+							}
+						}
+					};
+					key = goal.nodes;
+					if (containsSet(fwd.seen, key)) fwd else {
+						sf = RuProverExp(-1, makeVector(4), RuStmt(stcl, [goal], -1), makeVector(0), ruNoProverProp);
+						pushVector(sf.proofs, RuProverProofForward(sf, RuStmt(stcl, [goal], -1), ruEmptySubst, proof));
+						(ruFwdRegister(fwd, [], sf, goal, key)).first;
+					}
+				}
+			}
+		}
+	}
 }
 
 // Cap on total forward facts per wave: once the front index reaches it, stop expanding
