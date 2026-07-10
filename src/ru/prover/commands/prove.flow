@@ -34,7 +34,10 @@ ruCommProve = RuComm(
 			RuCommArg("forward-closure-size",  true,  "max number of facts in the forward closure index",                               "1024"),
 			RuCommArg("tactic",                true,  "tactic DSL expression or .tac derived-tactic ref; if empty, a strict bounded BFS (limited(bfs, size=max-size, depth=max-depth, batch=16)) is used", ""),
 			RuCommArg("steps",                 true,  "1 = prove each open `?` proof step (gap) and install it, instead of the whole statement", "0"),
-			RuCommArg("max-proof-steps",       true,  "steps mode: skip installing a gap proof larger than this many steps (0 = no cap)",        "256"),
+			// 1024, NOT 256: eq-normalize legitimately assembles 300+-step eqtri
+			// chains (t91's △-assoc = 383 steps, silently rejected at 256); the
+			// Kalmár pathology this caps is thousands of steps
+			RuCommArg("max-proof-steps",       true,  "steps mode: skip installing a gap proof larger than this many steps (0 = no cap)",        "1024"),
 			RuCommArg("min-index-rule-nodes",  true,  "min rule-node count for step index entries (1 = index all steps)",                 "1"),
 			RuCommArg("relevance-depth",       true,  "SInE premise-selection rounds (0 = off = whole foundation; 1-3 typical)",          "0"),
 			RuCommArg("relevance-tolerance",   true,  "SInE trigger tolerance (>=1; higher = more premises kept)",                        "1.2"),
@@ -131,7 +134,10 @@ ruRunProve(unit : RuUnit) -> Maybe<RuState> {
 				// Per-step proving: close each open `?` gap `(hyps + prior steps) ⊢ step.stmt`
 				// and install the found proof as a lemma step. A theorem counts as "proved"
 				// only when EVERY step closes (the verifier then sees no problem steps).
-				r = ruProveTheoremSteps(th, index, builder, ctx, capped_limit, ruTaskIntArg(task, "max-proof-steps", 256), task.args, math, env1);
+				// default 1024, NOT 256: eq-normalize legitimately assembles 300+-step
+			// eqtri chains (t91's △-assoc normalization = 383 steps, silently
+			// rejected at 256); the Kalmár pathology this caps is thousands
+			r = ruProveTheoremSteps(th, index, builder, ctx, capped_limit, ruTaskIntArg(task, "max-proof-steps", 1024), task.args, math, env1);
 				th2 = r.first; nclosed = r.second.first; ntotal = r.second.second;
 				inc_finished(1);
 				add_closed(nclosed); add_total(ntotal);
@@ -334,11 +340,22 @@ ruProveTheoremSteps(
 					// by-construction validity). Re-verify the gap proof here — the verifier re-derives it
 					// by substitution — and if it does not check, leave the step OPEN rather than install an
 					// invalid proof. So a construction bug yields "unproven", never a disproved theorem.
-					verified = length(ruVerifyTheorem(normTh, math, env).errs) == 0;
+					vres = ruVerifyTheorem(normTh, math, env);
+					verified = length(vres.errs) == 0;
+					// surface the safety-net rejections — a FOUND proof silently left
+					// open is otherwise invisible (the t91 383-step / max-steps lesson)
+					if (!verified && env.conf.verbose >= 2) {
+						env.out.println("  gap-step install REJECTED by re-verify:");
+						iter(vres.errs, \e -> env.out.println("    " + ruVerifyErr2s(e, math)));
+					} else {};
 					// Reject pathologically large proofs (the Kalmár closer is exponential — a single
 					// goal can blow up to thousands of opaque steps, which bloats the file and overflows
 					// the writer). Such a step is left OPEN rather than installed. max_steps<=0 = no cap.
-					if ((max_steps > 0 && ruProofSize(subProof) > max_steps) || !verified) Pair(arrayPush(done, step), nclosed)
+					oversized = max_steps > 0 && ruProofSize(subProof) > max_steps;
+					if (oversized && env.conf.verbose >= 2) {
+						env.out.println("  gap-step install REJECTED by size: " + i2s(ruProofSize(subProof)) + " > max-proof-steps=" + i2s(max_steps));
+					} else {};
+					if (oversized || !verified) Pair(arrayPush(done, step), nclosed)
 					else {
 						// Capture the DVs normalization moved to the inference (those over step vars, which
 						// are theorem/premise vars) so a theorem-var DV the proof needs isn't silently dropped.
