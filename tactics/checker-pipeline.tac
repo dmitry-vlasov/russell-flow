@@ -9,9 +9,15 @@
 		     where the union scope drowns them) under 1000 ms;
 		  4. checker-el (the NARROW membership-unfold refutation) with the rest.
 		Stages 2-4 close whole-or-nothing, so they cannot preempt anything (the
-		70->51 lesson). Stage order and slices are the measured optimum — see
-		scripts/test/prover/mizar/README.md and the budget-discipline notes.
+		70->51 lesson). The default slices are the measured optimum for tl=8s on
+		an otherwise idle machine — see scripts/test/prover/mizar/README.md.
+		The slices are WALL-CLOCK milliseconds: on a loaded/throttled machine
+		widen them (and tl accordingly), e.g. dc-time=9000 mizar-time=3000
+		eq-time=2000 with tl=16s.
 	}
+	@arg dc-time    { def-close-checker slice, ms @defval 4500 }
+	@arg mizar-time { checker-mizar slice, ms @defval 1500 }
+	@arg eq-time    { checker-eq slice, ms @defval 1000 }
 	@category derived
 */
-or-else(limited(def-close-checker, time=4500), limited(checker-mizar, time=1500), limited(checker-eq, time=1000), checker-el)
+or-else(limited(def-close-checker, time=$dc-time), limited(checker-mizar, time=$mizar-time), limited(checker-eq, time=$eq-time), checker-el)
