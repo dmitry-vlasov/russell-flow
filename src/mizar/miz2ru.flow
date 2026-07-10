@@ -269,6 +269,9 @@ mizTheorem(sig : MizSig, lines : [string], aid : string, idx : int, thm : MizXml
 			if (prop.kids == []) None()
 			else {
 				statement = mizResugar(mizForm(sig, [], prop.kids[0]));
+				// a bare-⊤ statement is the article `end` marker (canceled/empty
+				// theorem slot) — nothing to prove, drop it (t115_xboole_1-class)
+				if (statement == TptpPred("$true", [])) None() else
 				switch (mizFindFirst([thm], "Proof")) {
 					None(): Some(MizThm(name, ref, [], [statement], statement, []));
 					Some(proof): {
@@ -306,10 +309,11 @@ mizWalkItem(sig : MizSig, w : MizWalk, item : MizXml) -> MizWalk {
 		if (item.kids == []) w
 		else {
 			typ = item.kids[0];
-			// `let X be set/object` adds no information (root sort = whole domain): drop the hyp.
+			// `let X be set/object` adds no information (root sort = whole domain): no hyp.
+			// A NON-trivial sort or an adjective (`non empty`) becomes a guard hypothesis.
 			// X still gets declared as a theorem var wherever it actually occurs in the steps.
-			if (mizIsRootSort(sig, typ)) w
-			else MizWalk(arrayPush(w.hyps, mizTypePred(sig, typ, TptpVar("X" + mizAttr(typ, "vid")))), w.steps, w.unhandled);
+			gs = mizTypGuards(sig, typ, TptpVar("X" + mizAttr(typ, "vid")));
+			MizWalk(concat(w.hyps, gs), w.steps, w.unhandled);
 		}
 	} else if (tag == "Assume") {
 		hs = filtermap(item.kids, \k -> if (k.tag == "Proposition" && k.kids != []) Some(mizForm(sig, [], k.kids[0])) else None());
@@ -322,7 +326,7 @@ mizWalkItem(sig : MizSig, w : MizWalk, item : MizXml) -> MizWalk {
 		// they fell through to `unhandled`) lost the assumption and made the extracted theorem
 		// unconditional — and often FALSE, e.g. XBOOLE_0:3 became `¬(X∩Y=∅)` with no hypothesis.
 		hs = filtermap(item.kids, \k -> if (k.tag == "Proposition" && k.kids != []) Some(mizForm(sig, [], k.kids[0])) else None());
-		gs = filtermap(item.kids, \k -> if (k.tag == "Typ" && mizAttr(k, "vid") != "" && !mizIsRootSort(sig, k)) Some(mizTypePred(sig, k, TptpVar("X" + mizAttr(k, "vid")))) else None());
+		gs = concatA(filtermap(item.kids, \k -> if (k.tag == "Typ" && mizAttr(k, "vid") != "") Some(mizTypGuards(sig, k, TptpVar("X" + mizAttr(k, "vid")))) else None()));
 		MizWalk(concatA([w.hyps, hs, gs]), w.steps, w.unhandled);
 	} else if (tag == "Conclusion") {
 		mizAddStep(sig, w, mizFindFirst(item.kids, "Proposition"));
@@ -421,9 +425,11 @@ mizForm(sig : MizSig, env : [string], e : MizXml) -> TptpForm {
 		vname = if (vid != "") "X" + vid else "X" + i2s(length(env) + 1);
 		env2  = arrayPush(env, vname);
 		body  = mizForm(sig, env2, kids[1]);   // kids: [Typ, body]
-		// drop the trivial set/object guard → plain ∀; keep real type guards as `∀X (T X → …)`.
-		if (mizIsRootSort(sig, kids[0])) TptpQuant("forall", [vname], body)
-		else TptpQuant("forall", [vname], TptpBin("imp", mizTypePred(sig, kids[0], TptpVar(vname)), body));
+		// drop the trivial set/object guard → plain ∀; keep real type/adjective
+		// guards as `∀X (G X → …)` (a `non empty` adjective is a guard too).
+		guards = mizTypGuards(sig, kids[0], TptpVar(vname));
+		if (guards == []) TptpQuant("forall", [vname], body)
+		else TptpQuant("forall", [vname], TptpBin("imp", mizFoldAnd(guards), body));
 	} else if (e.tag == "Pred") {
 		name = mizSymName(sig, mizAttr(e, "kind"), s2i(mizAttr(e, "nr")));
 		args = map(kids, \k -> mizTerm(sig, env, k));
@@ -434,11 +440,15 @@ mizForm(sig : MizSig, env : [string], e : MizXml) -> TptpForm {
 		// misses goals with no special-case tactic. (`meets` is already normalized by Mizar to
 		// `¬ misses`, so it needs no separate rule.)
 		else if (name == "misses" && length(args) == 2) TptpEq(TptpApp("∩", args), TptpApp("∅", []))
+		// A-map fold: `A,B are_c=-comparable` is definitional notation for `A⊆B ∨ B⊆A`
+		// (XBOOLE_0:def 9) — expand like `misses`, so no opaque predicate survives.
+		else if ((name == "are_c=-comparable" || name == "r3_xboole_0") && length(args) == 2)
+			TptpBin("or", TptpPred("⊆", [args[0], args[1]]), TptpPred("⊆", [args[1], args[0]]))
 		else TptpPred(name, args);
 	} else if (e.tag == "Is") {
-		// `t is set/object` is ⊤; keep real type-membership predicates.
-		if (mizIsRootSort(sig, kids[1])) TptpPred("$true", [])
-		else mizTypePred(sig, kids[1], mizTerm(sig, env, kids[0]));   // kids: [term, Typ]
+		// `t is set/object` is ⊤; keep real type/adjective guards.  kids: [term, Typ]
+		guards = mizTypGuards(sig, kids[1], mizTerm(sig, env, kids[0]));
+		if (guards == []) TptpPred("$true", []) else mizFoldAnd(guards);
 	} else if (e.tag == "Verum") {
 		TptpPred("$true", []);
 	} else {
@@ -464,10 +474,34 @@ mizTerm(sig : MizSig, env : [string], e : MizXml) -> TptpTerm {
 	}
 }
 
-// `<Typ kind="M" nr=..>` applied to a term -> its sort predicate. Clusters
-// (adjectives) are ignored for now (empty for the foundational base types).
+// `<Typ kind="M" nr=..>` applied to a term -> its sort predicate.
 mizTypePred(sig : MizSig, typ : MizXml, t : TptpTerm) -> TptpForm {
 	TptpPred(mizSymName(sig, mizAttr(typ, "kind"), s2i(mizAttr(typ, "nr"))), [t]);
+}
+
+// The Typ's ADJECTIVE guards (`non empty set` etc.): each <Adjective nr=N
+// [value="false"]> under the Typ's <Cluster>s becomes a guard predicate on the
+// term, negated when value="false". Dropping these lost the attribute and made
+// the extracted theorem FALSE — XBOOLE_1:69 (`for A being non empty set st
+// A c= Y holds A meets Y`) became `∀A∀Y ¬(A⊆Y ∧ A∩Y=∅)`, refuted by A=∅.
+// The `empty` attribute (XBOOLE_0:def 1) A-map-folds to `t = ∅` — the same
+// policy as `misses`: no opaque predicate survives into the class layer.
+// A Typ carries two clusters (lower/upper) with the same adjectives — dedupe.
+mizTypAdjGuards(sig : MizSig, typ : MizXml, t : TptpTerm) -> [TptpForm] {
+	adjs = uniq(concatA(map(mizKidsTagged(typ, "Cluster"), \c ->
+		map(mizKidsTagged(c, "Adjective"), \a -> Pair(s2i(mizAttr(a, "nr")), mizAttr(a, "value") == "false")))));
+	map(adjs, \p -> {
+		nm = mizSymName(sig, "V", p.first);
+		pos = if (nm == "empty" || nm == "empty_" || nm == "v1_xboole_0") TptpEq(t, TptpApp("∅", [])) else TptpPred(nm, [t]);
+		if (p.second) TptpNeg(pos) else pos;
+	});
+}
+
+// ALL guards of a typed variable: the sort predicate (unless the root sort
+// set/object, coextensive with the domain) plus the adjective guards.
+mizTypGuards(sig : MizSig, typ : MizXml, t : TptpTerm) -> [TptpForm] {
+	sort = if (mizIsRootSort(sig, typ)) [] else [mizTypePred(sig, typ, t)];
+	concat(sort, mizTypAdjGuards(sig, typ, t));
 }
 
 // The ROOT sorts `set` (m2_hidden) and `object` (m1_hidden) are coextensive with the whole
