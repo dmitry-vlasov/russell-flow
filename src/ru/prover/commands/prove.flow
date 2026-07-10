@@ -11,6 +11,7 @@ import ru/prover/ml/premise_selector;
 import ru/util/normalize;
 import ru/util/src;
 import ru/util/utils;
+import ru/refactor/remove_unused_steps;
 import ru/map_decls;
 import comm;
 
@@ -288,6 +289,30 @@ ruProveTheoremSteps(
 	th : RuTheorem, index : RuIndex<RuAssertion>, builder : RuTacticBuilder, ctx : RuTacticContext,
 	limit : double, max_steps : int, args : Tree<string, flow>, math : RuMath, env : RuEnv
 ) -> Pair<RuTheorem, Pair<int, int>> {
+	// QED-FIRST: before grinding the interior gaps in order, try the FINAL step alone
+	// (hyps only, no prior steps) under a SMALL slice. A skeleton whose root closes
+	// directly — an identity instance (t97-class) or a short channel route (t67-class,
+	// whose interior even contains an UNPROVABLE translator-artifact step that would
+	// burn the whole budget first) — then completes as a single-step proof and the
+	// interior is skipped entirely. On failure the ordinary sequential fold runs, and
+	// the final step is retried there with the prior steps as premises as usual.
+	nst = length(th.proof.steps);
+	qed_open = nst > 0 && th.proof.steps[nst - 1].assertion == ruStepProblem;
+	more_open = nst > 1 && exists(take(th.proof.steps, nst - 1), \st -> st.assertion == ruStepProblem);
+	if (qed_open && more_open) {
+		// reindex the lone step to position 0 — a stale ind is later used as an ARRAY
+		// index (shorten-proofs' ruStepMinVariant walks steps[ind]) and crashes
+		thQ = RuTheorem(th with proof = RuProof(th.proof with steps = [RuStep(th.proof.steps[nst - 1] with ind = 0)]));
+		rq = ruProveTheoremStepsRun(thQ, index, builder, ctx, min(limit * 0.25, 2000.0), max_steps, args, math, env);
+		if (ruTheoremIsProved(rq.first)) rq
+		else ruProveTheoremStepsRun(th, index, builder, ctx, limit, max_steps, args, math, env);
+	} else ruProveTheoremStepsRun(th, index, builder, ctx, limit, max_steps, args, math, env);
+}
+
+ruProveTheoremStepsRun(
+	th : RuTheorem, index : RuIndex<RuAssertion>, builder : RuTacticBuilder, ctx : RuTacticContext,
+	limit : double, max_steps : int, args : Tree<string, flow>, math : RuMath, env : RuEnv
+) -> Pair<RuTheorem, Pair<int, int>> {
 	hyps  = th.infer.hyps;
 	nh    = length(hyps);
 	// Skeleton `?` step stmts carry class -1; the real statement class is the prop's (`|-`). The
@@ -297,6 +322,24 @@ ruProveTheoremSteps(
 	fixCls = \s : RuStmt -> RuStmt(s with class = scls);
 	steps  = map(th.proof.steps, \st -> RuStep(st with stmt = fixCls(st.stmt)));
 	premHyps = map(hyps, \h -> RuHyp(h.ind, fixCls(h.stmt), h.pos));
+	// EARLY QED-CONE PRUNE: a re-run over a PERSISTED partial skeleton whose FINAL
+	// step already closed (often a direct identity match — the t97-class) may be
+	// complete without its open interior steps. Prune before any proving: costless,
+	// and it cannot be cut by the per-theorem timer the way the end-of-fold prune
+	// can (the interior gap attempts burn the whole budget first).
+	nsteps0 = length(steps);
+	early = if (nsteps0 == 0 || steps[nsteps0 - 1].assertion == ruStepProblem
+			|| forall(steps, \st -> st.assertion != ruStepProblem)) None()
+		else switch (ruRemoveTheoremUnusedSteps(th, env)) {
+			Some(red): if (ruTheoremIsProved(red.smaller)) Some(red.smaller) else None();
+			None(): None();
+		};
+	switch (early) {
+		Some(pruned): {
+			nkept = length(pruned.proof.steps);
+			Pair(pruned, Pair(nkept, nkept));
+		}
+		None(): {
 	// Accumulate theorem-var disjoint provisos that normalizing a gap proof pushes out of the sub-proof
 	// (both ends are theorem vars, so they belong on the theorem, not the lemma) — promoted to the
 	// inference below, else the verifier rejects them ("restrictions not present in inherited").
@@ -402,7 +445,32 @@ ruProveTheoremSteps(
 		infer = RuInference(th.infer with vars = RuVarsDisjs(th.infer.vars.vars, mergeSets(th.infer.vars.disjs, promoted))),
 		proof = new_proof
 	);
-	Pair(new_th, Pair(acc.second, length(steps)));
+	// QED-CONE PRUNE: when the FINAL step closed (often a direct assertion match — the
+	// t97-class, whose root is literally an identity instance) but interior skeleton
+	// steps stay open, the proof may already be complete WITHOUT them: drop the steps
+	// unreachable from the QED step (reachability + RuStepRef renumbering, the same
+	// routine remove-unused-steps runs on closed theorems). Install the pruned proof
+	// only if it is then FULLY closed — a partially-closed theorem keeps its whole
+	// skeleton for later runs. Sound: every kept step's proof was re-verified above,
+	// and dropping unreferenced steps cannot invalidate the remaining derivation.
+	// (A closed LEMMA step's refs list every prior step positionally, marking them
+	// all reachable — the prune only fires when the tail cone is made of collapsed
+	// direct steps; the refs-narrowing that would generalize it is a separate change.)
+	nsteps = length(acc.first);
+	last_closed = nsteps > 0 && acc.first[nsteps - 1].assertion != ruStepProblem;
+	if (acc.second < nsteps && last_closed) {
+		switch (ruRemoveTheoremUnusedSteps(new_th, env)) {
+			Some(red): {
+				if (ruTheoremIsProved(red.smaller)) {
+					nkept = length(red.smaller.proof.steps);
+					Pair(red.smaller, Pair(nkept, nkept));
+				} else Pair(new_th, Pair(acc.second, nsteps));
+			}
+			None(): Pair(new_th, Pair(acc.second, nsteps));
+		}
+	} else Pair(new_th, Pair(acc.second, nsteps));
+		}
+	}
 }
 
 // Premises (hyps ++ prior steps) re-expressed as positional hyps for the standalone sub-proof.
