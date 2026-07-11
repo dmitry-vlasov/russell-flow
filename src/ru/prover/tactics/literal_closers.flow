@@ -2202,6 +2202,67 @@ ruFwdEq0Close(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], fact
 	}}}
 }
 
+// Parse the Mizar product-∃ ¬-goal's BODY (the part under the leading ¬):
+// ∀u∀v¬(…) over either conjunct order — (u∈B) ∧ ((v∈C) ∧ (a=〈u,v〉)) or
+// (a=〈u,v〉) ∧ ((u∈B) ∧ (v∈C)) — giving Some(Pair([a, B, C], bridge-lemma)).
+// The binders must be setvars in exactly the pattern positions, free in none
+// of a/B/C.
+ruFwdMizProdExParse(ids : RuFwdInstIds, y : [RuExpNode]) -> Maybe<Pair<[[RuExpNode]], string>> {
+	isHead = \nd : RuExpNode, w : int -> switch (nd) {
+		RuVar(__,__): false;
+		RuRuleNode(iH, __): ruIdType2Id(iH) == w;
+	};
+	ok0 = length(y) > 5 && isHead(y[0], ids.wal) && ruFwdIsSetvarNode(y[1], ids.setvar)
+		&& isHead(y[2], ids.wal) && ruFwdIsSetvarNode(y[3], ids.setvar) && isHead(y[4], ids.wn);
+	if (!ok0) None() else {
+		u = y[1];
+		v = y[3];
+		body = subrange(y, 5, length(y) - 5);
+		if (length(body) < 3 || !isHead(body[0], ids.wa)) None() else {
+			e1 = ruFwdSpan(body, 1);
+			c1 = subrange(body, 1, e1 - 1);
+			rest = subrange(body, e1, length(body) - e1);
+			if (length(rest) < 3 || !isHead(rest[0], ids.wa)) None() else {
+				e2 = ruFwdSpan(rest, 1);
+				c2 = subrange(rest, 1, e2 - 1);
+				c3 = subrange(rest, e2, length(rest) - e2);
+				// c1 = (u∈B), c2 = (v∈C), c3 = (a=〈u,v〉)
+				celOf = \c : [RuExpNode], w : RuExpNode -> {
+					okc = length(c) > 3 && isHead(c[0], ids.wcel);
+					if (!okc) None() else {
+						ee = ruFwdSpan(c, 1);
+						el = subrange(c, 1, ee - 1);
+						if (length(el) == 2 && el[1] == w) Some(subrange(c, ee, length(c) - ee)) else None();
+					}
+				};
+				eqOf = \c : [RuExpNode] -> {
+					okq = length(c) >= 3 && isHead(c[0], s2id("wceq"));
+					if (!okq) None() else {
+						e3 = ruFwdSpan(c, 1);
+						aT = subrange(c, 1, e3 - 1);
+						opT = subrange(c, e3, length(c) - e3);
+						if (length(opT) == 5 && isHead(opT[0], s2id("cop")) && opT[2] == u && opT[4] == v)
+							Some(aT) else None();
+					}
+				};
+				checkDv = \aT : [RuExpNode], bT : [RuExpNode], cT : [RuExpNode], lemma : string ->
+					if (!ruFwdContainsNode(aT, u) && !ruFwdContainsNode(aT, v)
+						&& !ruFwdContainsNode(bT, u) && !ruFwdContainsNode(bT, v)
+						&& !ruFwdContainsNode(cT, u) && !ruFwdContainsNode(cT, v))
+						Some(Pair([aT, bT, cT], lemma)) else None();
+				// order 1 (elxpmiz):  (u∈B) ∧ ((v∈C) ∧ (a=〈u,v〉))
+				o1 = maybeBind(celOf(c1, u), \bT -> maybeBind(celOf(c2, v), \cT ->
+					maybeBind(eqOf(c3), \aT -> checkDv(aT, bT, cT, "elxpmiz"))));
+				switch (o1) { Some(__): o1; None():
+					// order 2 (elxpmiz2): (a=〈u,v〉) ∧ ((u∈B) ∧ (v∈C))
+					maybeBind(eqOf(c1), \aT -> maybeBind(celOf(c2, u), \bT ->
+						maybeBind(celOf(c3, v), \cT -> checkDv(aT, bT, cT, "elxpmiz2"))));
+				}
+			}
+		}
+	}
+}
+
 // ψ → X for a single positive literal X — the clash driver's positive side.
 // Dispatch on the head: ∧ recurses (jca), ∨ by disjunct intro (orcd/olcd) or
 // the oran route, ¬Y from the neg pool / the nel02 empty-set route / clause
@@ -2310,6 +2371,21 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 					});
 				};
 				switch (ne0w) { Some(__): ne0w; None(): {
+				// (b3) THE MIZAR PRODUCT-∃ GOAL: ¬∀u∀v¬((u∈B) ∧ ((v∈C) ∧ (a=〈u,v〉)))
+				// — the translator's ¬∀∀¬ rendering of 'ex u,v st u in B & v in C &
+				// a = [u,v]' (t84/t85-class). Close ψ→(a∈(B×C)) recursively and
+				// finish by the elxpmiz bridge (miz_aux: elxp reordered + 2exnaln).
+				exg = if (depth <= 0) None() else
+					maybeBind(ruFwdMizProdExParse(ids, y), \abcL -> {
+						abc = abcL.first;
+						celE = ruFwdMkRule(ids.wcel, ids.wff, [RuExp(abc[0], -1),
+							ruFwdMkRule(s2id("cxp"), ids.cls, [RuExp(abc[1], -1), RuExp(abc[2], -1)])]);
+						maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, celE.nodes, stcl, depth - 1, path, prover_env), \pEl -> {
+							inst = RuProofStep(s2id_(abcL.second), [], RuStmt(stcl, [mkImp(celE, RuExp(x, -1))], -1));
+							RuProofStep(s2id_("syl"), [pEl, inst], RuStmt(stcl, [psiX], -1));
+						});
+					});
+				switch (exg) { Some(__): exg; None(): {
 					// (c) refute the ψ∧Y clause, export by imnani
 					if (depth <= 0) None() else {
 						synth = ruFwdMkRule(ids.wn, ids.wff,
@@ -2317,6 +2393,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 						maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, [], synth.nodes, stcl, depth - 1, path, prover_env),
 							\pc -> RuProofStep(s2id_("imnani"), [pc], RuStmt(stcl, [psiX], -1)));
 					}
+				}}
 				}}
 				}}
 				}}
@@ -3483,7 +3560,11 @@ ruSeedEqNormalize(prover_env : RuProverEnv, c_task : RuConstAny<RuProverTask>, f
 							RuVar(__,__): false;
 							RuRuleNode(idTn, __): ruIdType2Id(idTn) == wceq;
 						}) && body[length(body) - 1] == ruMakeRuleNode(s2id("c0"), ids.cls, 0, 0);
-						bare = if (!isNe0) None()
+						// the Mizar product-∃ shape ¬∀u∀v¬(…〈u,v〉…) is likewise a positive
+						// claim (t84/85-class) — its (b3) elxpmiz channel lives in litClose;
+						// the shape check is exact, so no other failing ¬-clause re-burns
+						isProdEx = isSome(ruFwdMizProdExParse(ids, subrange(body, 1, length(body) - 1)));
+						bare = if (!isNe0 && !isProdEx) None()
 							else ruFwdBareLitClose(ids, eids, rules, asses, bareFacts, premLeaves, body, stcl, 6, prover_env);
 						switch (bare) {
 							Some(pb): {
