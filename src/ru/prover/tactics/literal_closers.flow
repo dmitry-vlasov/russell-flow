@@ -1041,7 +1041,53 @@ RuFwdClsFacts(
 ruFwdEmptyClsFacts = RuFwdClsFacts([], [], [], [], [], [], [], []);
 
 ruFwdBuildClsFacts(ids : RuFwdInstIds, facts : [Pair<RuProofTree, [RuExpNode]>], stcl : int, guard : Maybe<RuExp>) -> RuFwdClsFacts {
-	fold(facts, ruFwdEmptyClsFacts, \ac, f -> ruFwdClassifyFact(ids, f, stcl, guard, ac, 4));
+	base = fold(facts, ruFwdEmptyClsFacts, \ac, f -> ruFwdClassifyFact(ids, f, stcl, guard, ac, 4));
+	// CROSS-DERIVATION (one bounded pass, no fixpoint): an el-fact x∈u whose set u
+	// equals — by a pooled eqs-fact, either orientation — an ENUMERATION/ordered-pair
+	// term T transports through eleq2 to x∈T and re-classifies: the derived fact then
+	// cascades through velsn/velpr/veltp (and the vdfop Kuratowski unfold) into the
+	// equality/case-split facts the pools otherwise miss (zfmisc_1 t93-class:
+	// x26∈x24 + x24=〈x5,x8〉 → the (x26={x5}) ∨ (x26={x5,x8}) ors-fact).
+	wrap = \e : RuExp -> switch (guard) { None(): e; Some(g): ruFwdMkRule(ids.wi, ids.wff, [g, e]) };
+	enumHead = \n : [RuExpNode] -> switch (n[0]) {
+		RuVar(__,__): false;
+		RuRuleNode(idT, __): {
+			h = ruIdType2Id(idT);
+			h == s2id("csn") || h == s2id("cpr") || h == s2id("ctp") || h == s2id("cop");
+		}
+	};
+	fold(base.el, base, \ac, f -> {
+		fn = f.second;
+		flend = ruFwdSpan(fn, 1);
+		x = subrange(fn, 1, flend - 1);
+		u = subrange(fn, flend, length(fn) - flend);
+		fold(base.eqs, ac, \ac2, q -> {
+			qn = q.second;
+			qend = ruFwdSpan(qn, 1);
+			l = subrange(qn, 1, qend - 1);
+			r = subrange(qn, qend, length(qn) - qend);
+			target = if (u == l && enumHead(r)) r else if (u == r && enumHead(l)) l else [];
+			if (target == []) ac2
+			else {
+				dE = ruFwdMkRule(ids.wcel, ids.wff, [RuExp(x, -1), RuExp(target, -1)]);
+				if (exists(ac2.el, \g -> g.second == dE.nodes)) ac2
+				else {
+					biE = ruFwdMkRule(ids.wb, ids.wff, [
+						ruFwdMkRule(ids.wcel, ids.wff, [RuExp(x, -1), RuExp(l, -1)]),
+						ruFwdMkRule(ids.wcel, ids.wff, [RuExp(x, -1), RuExp(r, -1)])]);
+					inst = RuProofStep(s2id_("eleq2"), [], RuStmt(stcl, [ruFwdMkRule(ids.wi, ids.wff, [RuExp(qn, -1), biE])], -1));
+					pBi = switch (guard) {
+						None(): RuProofStep(ids.axmp, [q.first, inst], RuStmt(stcl, [biE], -1));
+						Some(__): RuProofStep(s2id_("syl"), [q.first, inst], RuStmt(stcl, [wrap(biE)], -1));
+					};
+					mpId = if (u == l) (switch (guard) { None(): s2id_("mpbi"); Some(__): s2id_("mpbid"); })
+						else (switch (guard) { None(): s2id_("mpbir"); Some(__): s2id_("mpbird"); });
+					pD = RuProofStep(mpId, [f.first, pBi], RuStmt(stcl, [wrap(dE)], -1));
+					ruFwdClassifyFact(ids, Pair(pD, dE.nodes), stcl, guard, ac2, 4);
+				}
+			}
+		});
+	});
 }
 
 // Classify ONE fact into the pools, recursively adding the facts DERIVABLE from
@@ -1258,6 +1304,27 @@ ruFwdClassifyFact(ids : RuFwdInstIds, f : Pair<RuProofTree, [RuExpNode]>, stcl :
 								ruFwdMkRule(wceq, ids.wff, [RuExp(x, -1), RuExp(tb3, -1)])]),
 							ruFwdMkRule(wceq, ids.wff, [RuExp(x, -1), RuExp(tc3, -1)])]);
 						rec(fwdBi(f.first, curE, s2id_("veltp"), dE), dE.nodes, ac1);
+					} else if (th == s2id("cop") && length(x) == 2 && tb != [] && length(tb) == 2 && length(tc) == 2) {
+						// x ∈ 〈a,b〉 with SETVAR components: Kuratowski-unfold the pair
+						// through vdfop (〈a,b〉 = {{a},{a,b}}, 0-hyp aux instance) +
+						// eleq2, then recurse — the derived x ∈ {{a},{a,b}} cascades
+						// through velpr into the (x={a}) ∨ (x={a,b}) case-split fact
+						// (zfmisc_1 t93-class: x26 ∈ x24 = 〈x5,x8〉)
+						snE = ruFwdMkRule(csn, ids.cls, [RuExp(tb, -1)]);
+						prInE = ruFwdMkRule(s2id("cpr"), ids.cls, [RuExp(tb, -1), RuExp(tc, -1)]);
+						prE = ruFwdMkRule(s2id("cpr"), ids.cls, [snE, prInE]);
+						eqE = ruFwdMkRule(wceq, ids.wff, [RuExp(t, -1), prE]);
+						dE = mkEl(prE.nodes);
+						biE = ruFwdMkRule(ids.wb, ids.wff, [curE, dE]);
+						pEq = RuProofStep(s2id_("vdfop"), [], RuStmt(stcl, [eqE], -1));
+						pBi = RuProofStep(ids.axmp, [pEq,
+							RuProofStep(s2id_("eleq2"), [], RuStmt(stcl, [ruFwdMkRule(ids.wi, ids.wff, [eqE, biE])], -1))],
+							RuStmt(stcl, [biE], -1));
+						biArg = switch (guard) {
+							None(): pBi;
+							Some(__): RuProofStep(s2id_("a1i"), [pBi], RuStmt(stcl, [wrap(biE)], -1));
+						};
+						rec(RuProofStep(mpbi, [f.first, biArg], RuStmt(stcl, [wrap(dE)], -1)), dE.nodes, ac1);
 					} else ac1;
 				}
 			}
@@ -2317,8 +2384,24 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 									pBi = RuProofStep(s2id_("syl"), [f.first, inst], RuStmt(stcl, [mkImp(psi, biE)], -1));
 									RuProofStep(if (useMpbid) s2id_("mpbid") else s2id_("mpbird"), [po, pBi], RuStmt(stcl, [psiX], -1));
 								});
+							// SET-side transport (eleq2): the equality moves the goal's SET —
+							// close x∈other recursively, transport back (t93-class step 4:
+							// x5∈x26 under the case-fact x26={x5} → x5∈{x5} by vsnid)
+							mkTransSet = \other : [RuExpNode], useMpbid : bool -> {
+								biE2 = ruFwdMkRule(ids.wb, ids.wff, [
+									ruFwdMkRule(ids.wcel, ids.wff, [RuExp(xa, -1), RuExp(fu, -1)]),
+									ruFwdMkRule(ids.wcel, ids.wff, [RuExp(xa, -1), RuExp(fv, -1)])]);
+								maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi,
+									(ruFwdMkRule(ids.wcel, ids.wff, [RuExp(xa, -1), RuExp(other, -1)])).nodes, stcl, depth - 1, path, prover_env), \po -> {
+									inst = RuProofStep(s2id_("eleq2"), [], RuStmt(stcl, [mkImp(RuExp(fn, -1), biE2)], -1));
+									pBi = RuProofStep(s2id_("syl"), [f.first, inst], RuStmt(stcl, [mkImp(psi, biE2)], -1));
+									RuProofStep(if (useMpbid) s2id_("mpbid") else s2id_("mpbird"), [po, pBi], RuStmt(stcl, [psiX], -1));
+								});
+							};
 							if (fu == xa) mkTrans(fv, false)       // have v∈T, want u∈T: mpbird
 							else if (fv == xa) mkTrans(fu, true)   // have u∈T, want v∈T: mpbid
+							else if (fu == xb) mkTransSet(fv, false)      // goal x∈fu: close x∈fv, mpbird
+							else if (fv == xb) mkTransSet(fu, true)       // goal x∈fv: close x∈fu, mpbid
 							else None();
 						}
 					});
@@ -2528,7 +2611,81 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 						intro(ruFwdMkRule(ids.wa, ids.wff, [
 							ruFwdMkRule(ids.wcel, ids.wff, [RuExp(oa, -1), RuExp(tc1, -1)]),
 							ruFwdMkRule(ids.wcel, ids.wff, [RuExp(ob, -1), RuExp(td1, -1)])]), s2id_("opelxp"));
-					} else None();
+					} else if (th == s2id("cuni") && length(xb) >= 2) {
+						// (e2) ∪.-INTRO: x ∈ ∪.C from a pooled el-fact ψ→(x∈B) whose set is
+						// itself a member — ψ→(B∈C) closed recursively — via elunii
+						// (((A∈B) ∧ (B∈C)) → (A∈∪.C)), joined under the guard by jca+syl
+						// (t93-class: x26 ∈ ∪.x16 from x26∈x24, x24∈x16)
+						uc = subrange(xb, 1, length(xb) - 1);
+						fold(facts.el, None(), \acU, f -> switch (acU) {
+							Some(__): acU;
+							None(): {
+								fn = f.second;
+								flend = ruFwdSpan(fn, 1);
+								fEl = subrange(fn, 1, flend - 1);
+								fB = subrange(fn, flend, length(fn) - flend);
+								if (fEl != xa || fB == uc) None()
+								else {
+									bcE = ruFwdMkRule(ids.wcel, ids.wff, [RuExp(fB, -1), RuExp(uc, -1)]);
+									maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, bcE.nodes, stcl, depth - 1, path, prover_env), \pbc -> {
+										andE = ruFwdMkRule(ids.wa, ids.wff, [RuExp(fn, -1), bcE]);
+										pAnd = RuProofStep(s2id_("jca"), [f.first, pbc], RuStmt(stcl, [mkImp(psi, andE)], -1));
+										inst = RuProofStep(s2id_("elunii"), [], RuStmt(stcl, [mkImp(andE, RuExp(x, -1))], -1));
+										RuProofStep(s2id_("syl"), [pAnd, inst], RuStmt(stcl, [psiX], -1));
+									});
+								}
+							}
+						});
+					} else {
+						// (f) ∨-ELIM by jaod: a pooled case-split fact whose disjuncts are
+						// EQUALITIES pinning the goal's SET (S=A ∨ S=B, the velpr/vdfop
+						// cascade shape) or its ELEMENT (x=a ∨ x=b) — close the goal under
+						// each branch's transported form (eleq2/eleq1 + biimprd + com12),
+						// assemble ψ→((a∨b)→G) by jaod, discharge with the ∨-fact by mpd
+						// (t93-class step 4: x5∈x26 under (x26={x5}) ∨ (x26={x5,x8}))
+						if (depth <= 0) None() else
+						fold(facts.ors, None(), \acO, orf -> switch (acO) {
+							Some(__): acO;
+							None(): {
+								on = orf.second;
+								olend = ruFwdSpan(on, 1);
+								oa = subrange(on, 1, olend - 1);
+								ob = subrange(on, olend, length(on) - olend);
+								parseEq = \d : [RuExpNode] -> {
+									eqOk = length(d) >= 3 && switch (d[0]) {
+										RuVar(__,__): false;
+										RuRuleNode(idTd, __): ruIdType2Id(idTd) == s2id("wceq");
+									};
+									if (!eqOk) None() else {
+										dend = ruFwdSpan(d, 1);
+										Some(Pair(subrange(d, 1, dend - 1), subrange(d, dend, length(d) - dend)));
+									}
+								};
+								maybeBind(parseEq(oa), \ea -> maybeBind(parseEq(ob), \eb -> {
+									mkBranch = \dq : [RuExpNode], bGoal : RuExp, biLem : int, biE : RuExp ->
+										maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, bGoal.nodes, stcl, depth - 1, path, prover_env), \pg -> {
+											inst = RuProofStep(biLem, [], RuStmt(stcl, [mkImp(RuExp(dq, -1), biE)], -1));
+											pImp = RuProofStep(s2id_("biimprd"), [inst], RuStmt(stcl, [mkImp(RuExp(dq, -1), mkImp(bGoal, RuExp(x, -1)))], -1));
+											pCom = RuProofStep(s2id_("com12"), [pImp], RuStmt(stcl, [mkImp(bGoal, mkImp(RuExp(dq, -1), RuExp(x, -1)))], -1));
+											RuProofStep(s2id_("syl"), [pg, pCom], RuStmt(stcl, [mkImp(psi, mkImp(RuExp(dq, -1), RuExp(x, -1)))], -1));
+										});
+									branch = \e : Pair<[RuExpNode],[RuExpNode]>, dq : [RuExpNode] ->
+										if (e.first == xb) {
+											bGoal = ruFwdMkRule(ids.wcel, ids.wff, [RuExp(xa, -1), RuExp(e.second, -1)]);
+											mkBranch(dq, bGoal, s2id_("eleq2"), ruFwdMkRule(ids.wb, ids.wff, [RuExp(x, -1), bGoal]));
+										} else if (e.first == xa) {
+											bGoal = ruFwdMkRule(ids.wcel, ids.wff, [RuExp(e.second, -1), RuExp(xb, -1)]);
+											mkBranch(dq, bGoal, s2id_("eleq1"), ruFwdMkRule(ids.wb, ids.wff, [RuExp(x, -1), bGoal]));
+										} else None();
+									maybeBind(branch(ea, oa), \p1 ->
+										maybeMap(branch(eb, ob), \p2 -> {
+											pJ = RuProofStep(s2id_("jaod"), [p1, p2], RuStmt(stcl, [mkImp(psi, mkImp(RuExp(on, -1), RuExp(x, -1)))], -1));
+											RuProofStep(s2id_("mpd"), [orf.first, pJ], RuStmt(stcl, [psiX], -1));
+										}));
+								}));
+							}
+						});
+					}
 					}
 					}}
 					}}
