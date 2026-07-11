@@ -628,6 +628,7 @@ ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTactic
 	else if (n == "focus")           ruDslBuildFocus(ast, ctx)
 	else if (n == "track")           ruDslBuildTrack(ast, ctx)
 	else if (n == "scoped")          ruDslBuildScoped(ast, ctx)
+	else if (n == "when")            ruDslBuildWhen(ast, ctx)
 	// File-based tactics (presets) are resolved UPSTREAM in ruParseAndBuildTactic / ruResolveTacticSource
 	// (a `.tac` reference is expanded to its DSL body before this dispatch runs), so by here `n` is either a
 	// built-in or a genuine unknown.
@@ -1452,6 +1453,49 @@ ruNamedScope(name : string) -> Maybe<[int]> {
 // preceding positional is the scope spec. Lifts the old `penv.whitelist :=` side-effect into a visible
 // combinator: the whitelist is set on the prove env at build time, and ruScopedTactic carries the scope
 // into toString. `apply(...)` and def-close's realizer are expressed through this.
+
+// when(<rule-name> …, <tactic>): the FEATURE GATE — build (and run) the tactic
+// only when at least one of the named grammar rules occurs in the TASK (the
+// goal or a premise expression); otherwise the done tactic, so an enclosing
+// or-else falls through IMMEDIATELY instead of burning the stage's slice.
+// THEORY-FREE: the combinator tests rule-name occurrence generically; the
+// names are L2 data in the .tac files — e.g. when(wceq wb, checker-eq) skips
+// the Equalizer on an equality-free task. Completeness-sound inside or-else
+// whenever the names are a NECESSARY condition for the gated tactic to close
+// anything (an Equalizer close needs an equality SOMEWHERE in the task).
+ruDslBuildWhen(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+	poss = ruDslPositional(ast);
+	n = length(poss);
+	if (n < 2) {
+		ctx.env.out.error("tactic DSL: when(<rule-name> …, <tactic>) needs at least one rule name and a tactic", []);
+		None();
+	} else {
+		ids = filtermap(take(poss, n - 1), \v -> switch (v) {
+			RuTacticValAst(sub): if (sub.name != "") Some(s2id(sub.name)) else None();
+			RuTacticValLit(l):   Some(s2id(l));
+		});
+		subMb = switch (poss[n - 1]) {
+			RuTacticValAst(sub): ruBuildTacticFromAst(sub, ctx);
+			RuTacticValLit(l): { ctx.env.out.error("tactic DSL: when's last argument must be a tactic, got literal '" + l + "'", []); None(); }
+		};
+		maybeMap(subMb, \sub ->
+			RuTacticBuilder(\penv -> {
+				task = penv.conf.task;
+				hasRule = \e : RuExp -> exists(e.nodes, \nd -> switch (nd) {
+					RuVar(__,__): false;
+					RuRuleNode(idT, __): contains(ids, ruIdType2Id(idT));
+				});
+				stmtHas = \st : RuStmt -> exists(st.exps, \ex -> hasRule(ruExp(ex)));
+				present = stmtHas(task.goal.stmt) || exists(task.premises, \p -> switch (p) {
+					RuHyp(__, st, __): stmtHas(st);
+					RuStep(__, __, __, st, __, __, __): stmtHas(st);
+				});
+				if (present) sub.build(penv)
+				else Pair(penv, ruDoneTactic);
+			}));
+	}
+}
+
 ruDslBuildScoped(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
 	poss = ruDslPositional(ast);
 	n = length(poss);
@@ -1519,7 +1563,7 @@ ruParseAndBuildTactic(src : string, ctx : RuTacticContext) -> Maybe<RuTacticBuil
 // a built-in always wins over a same-named file.
 ruBuiltinTacticNames() -> [string] {
 	["bfs", "forward", "assume-neg", "ordered", "instantiate", "done", "giveup", "spr", "fragment-replay", "ml", "ap", "kalmar-closer", "checker", "hilbert", "replay",
-	 "linear-guided", "follow-proof", "oracle", "seq", "or-else", "loop", "limited", "focus", "track", "scoped"]
+	 "linear-guided", "follow-proof", "oracle", "seq", "or-else", "loop", "limited", "focus", "track", "scoped", "when"]
 }
 ruIsBuiltinTacticName(n : string) -> bool { exists(ruBuiltinTacticNames(), \b -> b == n) }
 
