@@ -1,0 +1,448 @@
+import ru/prover/core/env;
+import ru/prover/core/forward;
+import ru/prover/core/proofs;
+import ru/subst;
+import ru/util/exp;
+import ru/util/src2s;
+import ru/verify/math;
+import base/ids;
+import ds/set;
+
+// ---------------------------------------------------------------------------
+// PROOF-PRODUCING CONGRUENCE CLOSURE (L2).
+//
+// WHY. Equality reasoning used to be done by the forward wave: take a known equality
+// and APPLY every congruence lemma to it, deriving f(a)=f(b) for every constructor f,
+// then do it again to the results. On zfmisc t7 one wave took the front from 176 to 511
+// facts — the wave was re-deriving the equality theory as junk while the actual goal
+// never got a turn. Congruence closure is the standard cure: an equality MERGES two
+// classes (near-constant cost) instead of SPAWNING a fact per constructor. Terms that
+// become equal are discovered by matching signatures, not by search.
+//
+// The kernel will not accept a union-find, so the closure is PROOF-PRODUCING: every
+// merge records an edge justified by a real RuProofTree, and `ruCongExplain` walks the
+// path between two terms and chains the edges with eqtri/eqcomi. Congruence edges get
+// their proof built EAGERLY at merge time (the argument equalities are already explained
+// by then), so we never need the Nieuwenhuis-Oliveras proof forest.
+//
+// The congruence LEMMAS are discovered mechanically, like the unfold tables: any
+// assertion `a = b ⊢ f(…a…) = f(…b…)` (or its implication form) registers itself as the
+// rule for (f, argument position). Nothing is hand-listed.
+// ---------------------------------------------------------------------------
+
+export {
+	// A congruence lemma for one constructor and one argument position:
+	//   hypForm:  `(a = b) ⊢ (L = R)`         — applied with the arg-equality as a ref
+	//   else:     `(a = b) → (L = R)`         — applied by ax-mp against the arg-equality
+	// L and R are identical except that L has `va` where R has `vb`, at argument `argPos`.
+	RuCongRule(lemmaId : int, hypForm : bool, opId : int, argPos : int,
+		prop : RuExp, lhs : RuExp, rhs : RuExp, va : RuVar, vb : RuVar);
+
+	// Scan the assertion index for every congruence lemma, keyed by constructor id.
+	ruCongRules(math : RuMath) -> Tree<int, [RuCongRule]>;
+
+	// The closure state: an equality graph over ground terms (edge = a proven a = b),
+	// plus the union-find that decides "already equal?" in near-constant time.
+	RuCongSt(
+		rules  : Tree<int, [RuCongRule]>,
+		parent : ref Tree<string, string>,          // union-find: term key -> parent key
+		edges  : ref Tree<string, [RuCongEdge]>,    // explanation graph
+		terms  : ref Tree<string, RuExp>,           // key -> the term itself
+		stcl   : int,
+		math   : RuMath,
+		env    : RuEnv
+	);
+	RuCongEdge(to : string, proof : RuProofTree);   // proof of (from = to)
+
+	// Build the closure over `facts` (each a proof of a ground equality `a = b`) and the
+	// subterms of `terms`, saturating congruence to a fixpoint.
+	ruCongClose(rules : Tree<int, [RuCongRule]>, facts : [Pair<RuProofTree, RuExp>],
+		terms : [RuExp], stcl : int, math : RuMath, env : RuEnv) -> RuCongSt;
+
+	// Are these two ground terms equal in the closure?
+	ruCongEqual(st : RuCongSt, a : RuExp, b : RuExp) -> bool;
+
+	// A Russell proof of `a = b`, or None if the closure does not entail it.
+	ruCongExplain(st : RuCongSt, a : RuExp, b : RuExp) -> Maybe<RuProofTree>;
+
+	// Is this expression an equality atom? / its two sides.
+	ruCongIsEq(e : RuExp) -> bool;
+	ruCongSides(e : RuExp) -> Maybe<Pair<RuExp, RuExp>>;
+}
+
+ruCongIsEq(e : RuExp) -> bool { isSome(ruCongSides(e)) }
+ruCongSides(e : RuExp) -> Maybe<Pair<RuExp, RuExp>> { ruCgAsEq(e, s2id("wceq")) }
+
+// ---- keys and subterms -----------------------------------------------------
+
+ruCgKey(e : RuExp) -> string {
+	strGlue(map(e.nodes, \n -> switch (n) {
+		RuRuleNode(idType, __): "R" + i2s(ruIdType2Id(idType));
+		RuVar(id, type):        "V" + i2s(id) + "#" + i2s(type);
+	}), ",");
+}
+
+ruCgSpanEnd(nodes : [RuExpNode], i : int) -> int {
+	switch (nodes[i]) {
+		RuVar(__, __): i + 1;
+		RuRuleNode(__, arityLen): fold(enumFromTo(1, ruArityLen2Arity(arityLen)), i + 1, \pos, __ -> ruCgSpanEnd(nodes, pos));
+	}
+}
+
+ruCgHead(e : RuExp) -> int {
+	switch (e.nodes[0]) { RuRuleNode(idType, __): ruIdType2Id(idType); RuVar(__, __): -1; }
+}
+
+ruCgArity(e : RuExp) -> int {
+	switch (e.nodes[0]) { RuRuleNode(__, arityLen): ruArityLen2Arity(arityLen); RuVar(__, __): 0; }
+}
+
+// The immediate arguments of a rule-headed term.
+ruCgArgs(e : RuExp) -> [RuExp] {
+	nodes = e.nodes;
+	n = ruCgArity(e);
+	fold(enumFromTo(1, n), Pair(1, []), \acc, __ -> {
+		end = ruCgSpanEnd(nodes, acc.first);
+		Pair(end, arrayPush(acc.second, RuExp(subrange(nodes, acc.first, end - acc.first), -1)));
+	}).second;
+}
+
+// Every subterm of e (including e), as (key, term).
+ruCgSubterms(e : RuExp) -> [RuExp] {
+	nodes = e.nodes;
+	map(enumFromTo(0, length(nodes) - 1), \i -> RuExp(subrange(nodes, i, ruCgSpanEnd(nodes, i) - i), -1));
+}
+
+// ---- the mechanical congruence-rule table ----------------------------------
+
+ruCgInfer(ass : RuAssertion) -> RuInference {
+	switch (ass) {
+		RuAxiom(__, inf): inf; RuCong(__, inf): inf;
+		RuTheorem(__, inf, __, __): inf; RuDef(__, inf, __, __): inf;
+	}
+}
+
+ruCgDeclId(ass : RuAssertion) -> int {
+	switch (ass) {
+		RuAxiom(info, __): info.id; RuCong(info, __): info.id;
+		RuTheorem(info, __, __, __): info.id; RuDef(info, __, __, __): info.id;
+	}
+}
+
+// Split `( x = y )` into its two sides, if that is what this is.
+ruCgAsEq(e : RuExp, wceqId : int) -> Maybe<Pair<RuExp, RuExp>> {
+	n = e.nodes;
+	if (length(n) < 3 || ruCgHead(e) != wceqId) None()
+	else {
+		mid = ruCgSpanEnd(n, 1);
+		Some(Pair(RuExp(subrange(n, 1, mid - 1), -1), RuExp(subrange(n, mid, length(n) - mid), -1)));
+	}
+}
+
+// A congruence conclusion `L = R`: same head, same arity, and the two sides differ in
+// EXACTLY ONE argument, which on the left is the variable `va` and on the right `vb`.
+// Returns (opId, argPos). Rejects everything else — transitivity (equtr), Euclid
+// (equeucl) and the eqeq/equequ biconditional family all fail this test, which is why
+// the table cannot be built by pattern-matching on names.
+ruCgConclusion(l : RuExp, r : RuExp, va : RuVar, vb : RuVar) -> Maybe<Pair<int, int>> {
+	if (ruCgHead(l) < 0 || ruCgHead(l) != ruCgHead(r) || ruCgArity(l) != ruCgArity(r)) None()
+	else {
+		la = ruCgArgs(l);
+		ra = ruCgArgs(r);
+		if (length(la) != length(ra) || length(la) == 0) None()
+		else {
+			diffs = filter(enumFromTo(0, length(la) - 1), \i -> la[i].nodes != ra[i].nodes);
+			if (length(diffs) != 1) None()
+			else {
+				i = diffs[0];
+				if (la[i].nodes == [va] && ra[i].nodes == [vb]) Some(Pair(ruCgHead(l), i)) else None();
+			}
+		}
+	}
+}
+
+ruCongRules(math : RuMath) -> Tree<int, [RuCongRule]> {
+	wceqId = s2id("wceq");
+	wiId   = s2id("wi");
+	fold(getTreeValues(math.decls.assertions), makeTree(), \acc, ass -> {
+		inf  = ruCgInfer(ass);
+		if (!isEmptySet(inf.vars.disjs)) acc
+		else {
+			prop = ruExp(inf.prop.exps[0]);
+			hyps = map(inf.hyps, \h -> ruExp(h.stmt.exps[0]));
+			// hypothesis form: one equality hyp, an equality conclusion
+			mk = \hypForm : bool, eqAnte : Pair<RuExp, RuExp>, concl : RuExp -> {
+				switch (eqAnte.first.nodes[0]) {
+					RuRuleNode(__, __): acc;   // the antecedent sides must be plain vars
+					RuVar(idA, tpA): switch (eqAnte.second.nodes[0]) {
+						RuRuleNode(__, __): acc;
+						RuVar(idB, tpB): {
+							if (length(eqAnte.first.nodes) != 1 || length(eqAnte.second.nodes) != 1 || idA == idB) acc
+							else {
+								va = RuVar(idA, tpA);
+								vb = RuVar(idB, tpB);
+								switch (ruCgAsEq(concl, wceqId)) {
+									None(): acc;
+									Some(lr): switch (ruCgConclusion(lr.first, lr.second, va, vb)) {
+										None(): acc;
+										Some(opPos): {
+											rule = RuCongRule(ruCgDeclId(ass), hypForm, opPos.first, opPos.second,
+												prop, lr.first, lr.second, va, vb);
+											setTree(acc, opPos.first, arrayPush(lookupTreeDef(acc, opPos.first, []), rule));
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			};
+			if (length(hyps) == 1) {
+				switch (ruCgAsEq(hyps[0], wceqId)) {
+					None(): acc;
+					Some(ante): mk(true, ante, prop);
+				}
+			} else if (length(hyps) == 0 && ruCgHead(prop) == wiId) {
+				// implication form: ( (a = b) → (L = R) )
+				pn = prop.nodes;
+				mid = ruCgSpanEnd(pn, 1);
+				ante = RuExp(subrange(pn, 1, mid - 1), -1);
+				concl = RuExp(subrange(pn, mid, length(pn) - mid), -1);
+				switch (ruCgAsEq(ante, wceqId)) {
+					None(): acc;
+					Some(ab): mk(false, ab, concl);
+				}
+			} else acc;
+		}
+	});
+}
+
+// ---- union-find ------------------------------------------------------------
+
+ruCgFind(st : RuCongSt, k : string) -> string {
+	p = lookupTreeDef(^(st.parent), k, k);
+	if (p == k) k else {
+		r = ruCgFind(st, p);
+		st.parent := setTree(^(st.parent), k, r);   // path compression
+		r;
+	}
+}
+
+ruCgEqualKeys(st : RuCongSt, a : string, b : string) -> bool { ruCgFind(st, a) == ruCgFind(st, b) }
+
+ruCongEqual(st : RuCongSt, a : RuExp, b : RuExp) -> bool { ruCgEqualKeys(st, ruCgKey(a), ruCgKey(b)) }
+
+// Record term t (and its subterms) in the closure's universe.
+ruCgAddTerm(st : RuCongSt, t : RuExp) -> void {
+	iter(ruCgSubterms(t), \s -> {
+		k = ruCgKey(s);
+		if (!containsKeyTree(^(st.terms), k)) st.terms := setTree(^(st.terms), k, s);
+	});
+}
+
+// Merge a and b, justified by `proof` (a proof of `a = b`). Adds the explanation edges
+// in both directions (the reverse edge is flipped by eqcomi at explain time).
+ruCgMerge(st : RuCongSt, a : RuExp, b : RuExp, proof : RuProofTree) -> void {
+	ka = ruCgKey(a);
+	kb = ruCgKey(b);
+	ruCgAddTerm(st, a);
+	ruCgAddTerm(st, b);
+	st.edges := setTree(^(st.edges), ka, arrayPush(lookupTreeDef(^(st.edges), ka, []), RuCongEdge(kb, proof)));
+	st.edges := setTree(^(st.edges), kb, arrayPush(lookupTreeDef(^(st.edges), kb, []), RuCongEdge(ka, proof)));
+	ra = ruCgFind(st, ka);
+	rb = ruCgFind(st, kb);
+	if (ra != rb) st.parent := setTree(^(st.parent), ra, rb);
+}
+
+// ---- explanation: a path in the equality graph, chained by eqtri ------------
+
+ruCgEqExp(st : RuCongSt, a : RuExp, b : RuExp) -> RuExp {
+	// build via the shared helper — hand-rolling the rule node mis-packs the id/type band
+	ruFwdMkRule(s2id("wceq"), tp2id_("wff"), [a, b]);
+}
+
+// Is `p` a proof of (from = to), or of (to = from)? The edge stores ONE proof and both
+// directions reference it, so orient it here: an edge traversed backwards is eqcomi'd.
+ruCgOrient(st : RuCongSt, p : RuProofTree, from : RuExp, to : RuExp) -> RuProofTree {
+	want = ruCgEqExp(st, from, to);
+	// The edge stores ONE proof and BOTH directions point at it, so an edge walked against
+	// its stored orientation must be flipped by eqcomi. This applies to hypothesis leaves
+	// exactly as it does to derived steps (`A=B, A=C ⊢ B=C` walks the A→B edge backwards):
+	// skipping the leaf case silently emitted a proof of the WRONG equality (eqtr3i).
+	concl = switch (p) {
+		RuProofStep(__, __, stmt): ruExp(stmt.exps[0]);
+		RuProofHyp(__, stmt):      ruExp(stmt.exps[0]);
+	};
+	if (concl.nodes == want.nodes) p
+	else RuProofStep(s2id_("eqcomi"), [p], RuStmt(st.stcl, [want], -1));
+}
+
+// BFS the equality graph for a path a … b, then chain the edge proofs with eqtri.
+ruCongExplain(st : RuCongSt, a : RuExp, b : RuExp) -> Maybe<RuProofTree> {
+	ka = ruCgKey(a);
+	kb = ruCgKey(b);
+	if (ka == kb) Some(RuProofStep(s2id_("eqid"), [], RuStmt(st.stcl, [ruCgEqExp(st, a, a)], -1)))
+	else if (!ruCgEqualKeys(st, ka, kb)) None()
+	else {
+		// BFS, recording each key's predecessor and the edge proof that reached it
+		prev = ruCgBfs(st, ka, kb, [ka], buildSet([ka]), makeTree());
+		switch (lookupTree(prev, kb)) {
+			None(): None();
+			Some(__): {
+				// walk back from b to a, collecting keys
+				path = ruCgPath(prev, kb, [kb]);
+				// chain: (t0 = t1), (t1 = t2), … → eqtri
+				fold(enumFromTo(1, length(path) - 1), None(), \acc : Maybe<RuProofTree>, i -> {
+					from = lookupTreeDef(^(st.terms), path[i - 1], a);
+					to   = lookupTreeDef(^(st.terms), path[i], b);
+					edge = find(lookupTreeDef(^(st.edges), path[i - 1], []), \e -> e.to == path[i]);
+					switch (edge) {
+						None(): acc;
+						Some(e): {
+							step = ruCgOrient(st, e.proof, from, to);
+							switch (acc) {
+								None(): Some(step);
+								Some(sofar): {
+									// sofar : (t0 = t_{i-1}), step : (t_{i-1} = t_i)
+									t0 = lookupTreeDef(^(st.terms), path[0], a);
+									Some(RuProofStep(s2id_("eqtri"), [sofar, step],
+										RuStmt(st.stcl, [ruCgEqExp(st, t0, to)], -1)));
+								}
+							}
+						}
+					}
+				});
+			}
+		}
+	}
+}
+
+ruCgBfs(st : RuCongSt, start : string, target : string, frontier : [string], seen : Set<string>, prev : Tree<string, string>) -> Tree<string, string> {
+	if (frontier == [] || containsKeyTree(prev, target)) prev
+	else {
+		next = fold(frontier, Pair([], Pair(seen, prev)), \acc, k ->
+			fold(lookupTreeDef(^(st.edges), k, []), acc, \acc2, e ->
+				if (containsSet(acc2.second.first, e.to)) acc2
+				else Pair(arrayPush(acc2.first, e.to),
+					Pair(insertSet(acc2.second.first, e.to), setTree(acc2.second.second, e.to, k)))
+			)
+		);
+		ruCgBfs(st, start, target, next.first, next.second.first, next.second.second);
+	}
+}
+
+ruCgPath(prev : Tree<string, string>, k : string, acc : [string]) -> [string] {
+	switch (lookupTree(prev, k)) {
+		None(): reverseA(acc);
+		Some(p): ruCgPath(prev, p, arrayPush(acc, p));
+	}
+}
+
+// ---- congruence saturation --------------------------------------------------
+
+// Build `f(…c…) = f(…d…)` for ONE argument position, from a proof of (c = d), using the
+// registered rule for (f, pos). The rule's LHS pattern is matched against the concrete
+// term, then its `vb` is bound to the new argument — so the instance is exactly the
+// congruence step we want, and its proof is the lemma applied to the argument equality.
+ruCgStepProof(st : RuCongSt, opId : int, pos : int, term : RuExp, newArg : RuExp, argEq : RuProofTree) -> Maybe<RuProofTree> {
+	fold(lookupTreeDef(st.rules, opId, []), None(), \acc, rule -> switch (acc) {
+		Some(__): acc;
+		None(): if (rule.argPos != pos) None()
+		else switch (ruMatchExp(term, rule.lhs, st.math, st.env)) {
+			None(): None();
+			Some(sub0): {
+				// bind the rule's "changed" variable to the NEW argument; every other var
+				// comes from matching the lemma's LHS against the concrete term
+				m = copyHashMap(sub0.map);
+				setHashMap(m, rule.vb.id, RuSubExpr(rule.vb, newArg, ruExpVarIdsHashSet(newArg)));
+				sub = RuSubst(m);
+				lhsI = ruApplySubst(rule.lhs, sub);
+				rhsI = ruApplySubst(rule.rhs, sub);
+				concl = ruCgEqExp(st, lhsI, rhsI);
+				if (rule.hypForm)
+					Some(RuProofStep(rule.lemmaId, [argEq], RuStmt(st.stcl, [concl], -1)))
+				else {
+					inst = RuProofStep(rule.lemmaId, [], RuStmt(st.stcl, [ruApplySubst(rule.prop, sub)], -1));
+					Some(RuProofStep(s2id_("ax-mp"), [argEq, inst], RuStmt(st.stcl, [concl], -1)));
+				}
+			}
+		}
+	});
+}
+
+// One saturation round: for every pair of recorded terms with the same head whose
+// arguments are pairwise equal in the current closure but which are not yet equal,
+// build the congruence proof (argument by argument, chained by eqtri) and merge.
+// Returns true if anything merged.
+ruCgRound(st : RuCongSt) -> bool {
+	ts = getTreeValues(^(st.terms));
+	fold(ts, false, \changed, t1 ->
+		fold(ts, changed, \changed2, t2 -> {
+			if (ruCgKey(t1) == ruCgKey(t2) || ruCgHead(t1) < 0 || ruCgHead(t1) != ruCgHead(t2)) changed2
+			else if (ruCongEqual(st, t1, t2)) changed2
+			else {
+				a1 = ruCgArgs(t1);
+				a2 = ruCgArgs(t2);
+				if (length(a1) != length(a2) || length(a1) == 0) changed2
+				else if (!forall(enumFromTo(0, length(a1) - 1), \i -> ruCongEqual(st, a1[i], a2[i]))) changed2
+				else {
+					// walk t1 -> t2 one argument at a time; each hop is one congruence step
+					res = fold(enumFromTo(0, length(a1) - 1), Some(Pair(t1, None())), \acc : Maybe<Pair<RuExp, Maybe<RuProofTree>>>, i -> switch (acc) {
+						None(): None();
+						Some(cur): {
+							curT = cur.first;
+							if (a1[i].nodes == a2[i].nodes) acc   // this argument already syntactically equal
+							else switch (ruCongExplain(st, a1[i], a2[i])) {
+								None(): None();
+								Some(argEq): switch (ruCgStepProof(st, ruCgHead(t1), i, curT, a2[i], argEq)) {
+									None(): None();
+									Some(stepP): {
+										// the term after replacing argument i
+										nextT = ruCgReplaceArg(curT, i, a2[i]);
+										combined = switch (cur.second) {
+											None(): stepP;
+											Some(sofar): RuProofStep(s2id_("eqtri"), [sofar, stepP],
+												RuStmt(st.stcl, [ruCgEqExp(st, t1, nextT)], -1));
+										};
+										Some(Pair(nextT, Some(combined)));
+									}
+								}
+							}
+						}
+					});
+					switch (res) {
+						None(): changed2;
+						Some(fin): switch (fin.second) {
+							None(): changed2;
+							Some(p): { ruCgMerge(st, t1, t2, p); true; }
+						}
+					}
+				}
+			}
+		})
+	);
+}
+
+ruCgReplaceArg(t : RuExp, pos : int, arg : RuExp) -> RuExp {
+	nodes = t.nodes;
+	args = ruCgArgs(t);
+	RuExp(concat([nodes[0]], concatA(mapi(args, \i, a -> if (i == pos) arg.nodes else a.nodes))), -1);
+}
+
+ruCongClose(rules : Tree<int, [RuCongRule]>, facts : [Pair<RuProofTree, RuExp>],
+	terms : [RuExp], stcl : int, math : RuMath, env : RuEnv) -> RuCongSt {
+	st = RuCongSt(rules, ref makeTree(), ref makeTree(), ref makeTree(), stcl, math, env);
+	wceqId = s2id("wceq");
+	iter(terms, \t -> ruCgAddTerm(st, t));
+	iter(facts, \f -> switch (ruCgAsEq(f.second, wceqId)) {
+		None(): {};
+		Some(lr): ruCgMerge(st, lr.first, lr.second, f.first);
+	});
+	// saturate: bounded by the number of term pairs (each round merges at least one class)
+	ruCgSaturate(st, 32);
+	st;
+}
+
+ruCgSaturate(st : RuCongSt, fuel : int) -> void {
+	if (fuel <= 0) {} else if (ruCgRound(st)) ruCgSaturate(st, fuel - 1) else {};
+}

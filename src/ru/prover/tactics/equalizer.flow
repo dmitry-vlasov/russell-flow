@@ -1,5 +1,6 @@
 import ru/prover/tactics/kalmar;
 import ru/prover/tactics/unfold;
+import ru/prover/tactics/congruence;
 import ru/prover/tactics/closer;
 import ru/prover/core/controls;
 import ru/proof_tree;
@@ -295,6 +296,20 @@ ruEqualizerGoalRel(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass :
 	});
 }
 
+// Splice the residual proof's HYPOTHESIS leaves: leaf i proves the rewritten hyp', but the
+// theorem supplies the original hyp. Replace each such leaf with mpbi(hyp-leaf, hyp ↔ hyp').
+// A hyp the rewrite left alone keeps its plain leaf.
+ruEqzSpliceHyps(tree : RuProofTree, stmtClass : int, hyps : [RuExp], hypExps : [RuExp], rwProofs : [RuProofTree]) -> RuProofTree {
+	switch (tree) {
+		RuProofHyp(idx, st): {
+			if (idx < 0 || idx >= length(hyps) || hyps[idx] == hypExps[idx]) tree
+			else RuProofStep(s2id_("mpbi"), [RuProofHyp(idx, RuStmt(stmtClass, [hyps[idx]], -1)), rwProofs[idx]],
+				RuStmt(stmtClass, [hypExps[idx]], -1));
+		}
+		RuProofStep(ass, children, st): RuProofStep(ass, map(children, \c -> ruEqzSpliceHyps(c, stmtClass, hyps, hypExps, rwProofs)), st);
+	}
+}
+
 ruEqualizerProve(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, clo : RuEqCloser) -> Maybe<RuProofTree> {
 	facts = ruUnfoldFacts(em.math, em.env, stmtClass, arrayPush(hyps, goal));
 	// atom→subtree nodes over goal + hyps + every fact's biconditional, so ruKForm2Exp can rebuild
@@ -323,11 +338,21 @@ ruEqualizerProve(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : i
 	// driven as a real sub-prove by ruRunCloser, then splice each eqFact premise leaf (index ≥ |hyps|)
 	// with its ax-mp proof. The closer is a pluggable tactic, so the equalizer is no longer hardwired to
 	// Kalmár — it just supplies the residual and the splice.
-	premiseExps = concat(hyps, eqFactExps);
+	// NORMALIZE THE PREMISES TOO, with the SAME rewrite that normalized the goal. Without this
+	// the goal reaches ∈-normal form while a premise keeps its compound atom (`x ∈ (A∪B)` stays
+	// shut), so the residual closer sees two different signatures and cannot connect them — the
+	// premise side was simply never unfolded. Each rewritten premise carries (hyp ↔ hyp'), and
+	// its leaf in the residual proof is spliced with mpbi(hyp, hyp ↔ hyp') below.
+	hypRws  = map(hyps, \h -> ruEqzRw(ctx, factMap, makeSet(), ruPAtomize(conn, h)));
+	hypExps = map(hypRws, \r -> ruKForm2Exp(ctx, r.first));
+	premiseExps = concat(hypExps, eqFactExps);
 	premsHyps   = mapi(premiseExps, \i, e -> RuHyp(i, RuStmt(stmtClass, [e], -1), -1));
+	// hyp leaf i proves the REWRITTEN hyp'; the theorem gives us the original hyp. Bridge with
+	// mpbi (ph, (ph ↔ ps) ⊢ ps) — the mirror of the goal side's mpbir.
+	spliceHyps = \tree : RuProofTree -> ruEqzSpliceHyps(tree, stmtClass, hyps, hypExps, map(hypRws, \r -> r.second));
 	mkResidual = \ -> maybeMap(
 		ruRunCloser(em.math, em.env, clo.info, stmtClass, premsHyps, goal2Exp, clo.scope, clo.mkCloser(premiseExps, goal2Exp), clo.limit),
-		\tree -> ruUnfoldSplice(tree, length(hyps), map(eqFacts, \f -> f.second))
+		\tree -> spliceHyps(ruUnfoldSplice(tree, length(hyps), map(eqFacts, \f -> f.second)))
 	);
 	// Prove the residual goal' over the (now base-atom) signature. A reflexive ↔ closes by biid.
 	residual : Maybe<RuProofTree> = switch (goalForm2) {

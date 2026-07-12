@@ -78,38 +78,145 @@ ruUKey(e : RuExp) -> string {
 }
 
 // ---- membership-lemma registry --------------------------------------------
-// op rule id -> (lemma id, lemma prop exp, lemma membership-LHS pattern exp).
-RuMembLemma(lemmaId : int, prop : RuExp, lhs : RuExp);
+// op rule id -> (lemma id, lemma prop exp, lemma membership-LHS pattern exp, setness hyp patterns).
+RuMembLemma(lemmaId : int, prop : RuExp, lhs : RuExp, hyps : [RuExp]);
 
-ruMembRegistry(math : RuMath) -> Tree<int, RuMembLemma> {
-	pairs = [
-		Pair("cun", "elun"), Pair("cin", "elin"), Pair("cdif", "eldif"),
-		Pair("csymdif", "elsymdif"),
-		// singleton/powerset use the HYP-FREE setvar variants (velsn/velpw) — the plain elsn/elpr/elpw
-		// carry an `A ∈ _V` hyp and so are dropped by the 0-hyp guard below. velpr does NOT exist (pair has
-		// no hyp-free ↔ setvar variant), so cpr stays unmapped for now. velpw reduces `x∈𝒫A` to `x⊆A`,
-		// which the checker's ⊆ bridge then handles (potential NEW coverage — def-close has no powerset).
-		Pair("csn", "velsn"), Pair("cpw", "velpw")
-	];
-	fold(pairs, makeTree(), \acc, p -> {
-		opId = s2id(p.first);
-		switch (lookupTree(math.decls.assertions, s2id_(p.second))) {
-			Some(ass): {
-				inf = ruMembInfer(ass);
-				// Only HYPOTHESIS-FREE membership lemmas may be used as unconditional rewrite facts: the
-				// unfold applies them with zero refs (ruUnfoldAtom), so a lemma with a hyp — e.g. elsn/elpr
-				// need `A ∈ _V` — would build an INVALID 0-ref step ("number of refs: 0 mismatch arity: 1").
-				if (length(inf.hyps) != 0) acc
-				else {
-					prop = ruExp(inf.prop.exps[0]);
-					// prop = wb( <membership-LHS> , <RHS> ); extract child 0 (the LHS pattern).
-					lhs = ruUChild0(prop);
-					setTree(acc, opId, RuMembLemma(s2id_(p.second), prop, lhs));
+// A SETNESS lemma: `T ∈ _V` for a constructor term T, under setness hypotheses of its own
+// (`inex1`: (A∩B) ∈ _V given A ∈ _V). Keyed by T's head constructor (-1 for a bare setvar,
+// which is `vex`). Discovered mechanically, exactly like the membership table.
+RuSetLemma(lemmaId : int, prop : RuExp, term : RuExp, hyps : [RuExp]);
+
+// Is this hypothesis a setness condition `X ∈ _V`? Returns the X it constrains.
+ruUSetnessHyp(h : RuExp, wcelId : int, cvvId : int) -> Maybe<RuExp> {
+	n = h.nodes;
+	if (length(n) < 3 || ruUNodeId(n[0]) != wcelId) None()
+	else {
+		objIdx = ruUSpanEnd(n, 1);
+		if (objIdx != length(n) - 1 || ruUNodeId(n[objIdx]) != cvvId) None()
+		else Some(RuExp(subrange(n, 1, objIdx - 1), -1));
+	}
+}
+
+// THE SETNESS TABLE, scanned from the index: every assertion `T ∈ _V` whose own hypotheses
+// are themselves setness conditions. vex/vsnex/prex/tpex/opex/uniex/pwex/inex1/difexi… all
+// register themselves. This is the mechanical replacement for ruFwdSetness's hand-coded id
+// list in literal_closers, and it is what lets the unfold use the HYP-CARRYING membership
+// biconds (elsn/elpr/eltp/elpw/elop) — i.e. it unlocks {a}, {a,b}, {a,b,c}, 〈a,b〉, 𝒫.
+ruSetnessRegistry(math : RuMath) -> Tree<int, [RuSetLemma]> {
+	wcelId = s2id("wcel");
+	cvvId  = s2id("cvv");
+	fold(getTreeValues(math.decls.assertions), makeTree(), \acc, ass -> {
+		inf = ruMembInfer(ass);
+		if (!isEmptySet(inf.vars.disjs)) acc
+		else {
+			prop = ruExp(inf.prop.exps[0]);
+			hyps = map(inf.hyps, \h -> ruExp(h.stmt.exps[0]));
+			switch (ruUSetnessHyp(prop, wcelId, cvvId)) {
+				None(): acc;
+				Some(term): {
+					// every hypothesis must itself be a setness condition, else we cannot discharge it
+					hypTerms = filtermap(hyps, \h -> ruUSetnessHyp(h, wcelId, cvvId));
+					if (length(hypTerms) != length(hyps)) acc
+					else {
+						headId = ruUNodeId(term.nodes[0]);
+						cur = lookupTreeDef(acc, headId, []);
+						setTree(acc, headId, arrayPush(cur, RuSetLemma(ruDeclId(ass), prop, term, hyps)));
+					}
 				}
 			}
-			None(): acc;
 		}
 	});
+}
+
+// Prove `t ∈ _V` for a concrete term t, recursively: match t against a registered setness
+// lemma, then discharge that lemma's own setness hypotheses the same way. Fuel-bounded (the
+// recursion descends into subterms, so the term size bounds it anyway).
+ruSetnessProof(reg : Tree<int, [RuSetLemma]>, t : RuExp, wcelId : int, cvvId : int,
+	stmtClass : int, math : RuMath, env : RuEnv, fuel : int) -> Maybe<RuProofTree> {
+	if (fuel <= 0) None() else {
+		fold(lookupTreeDef(reg, ruUNodeId(t.nodes[0]), []), None(), \acc, sl -> switch (acc) {
+			Some(__): acc;
+			None(): switch (ruMatchExp(t, sl.term, math, env)) {
+				None(): None();
+				Some(sub): {
+					// the lemma's own prop, instantiated — never hand-build the node array
+					goal = ruApplySubst(sl.prop, sub);
+					hypProofs = filtermap(sl.hyps, \h -> {
+						hi = ruApplySubst(h, sub);
+						switch (ruUSetnessHyp(hi, wcelId, cvvId)) {
+							None(): None();
+							Some(ht): ruSetnessProof(reg, ht, wcelId, cvvId, stmtClass, math, env, fuel - 1);
+						}
+					});
+					if (length(hypProofs) != length(sl.hyps)) None()
+					else Some(RuProofStep(sl.lemmaId, hypProofs, RuStmt(stmtClass, [goal], -1)));
+				}
+			}
+		});
+	}
+}
+
+// MECHANICAL, not hand-listed: scan the assertion index for EVERY membership
+// biconditional `( t ∈ C(…) ) ↔ RHS` whose object head C is a constructor, and key it by
+// C. The foundation's own definitions ARE the table — elun/elin/eldif/elsymdif/velpw/elxp/
+// abid/… all register themselves, and any lemma a later article adds registers too. This
+// is the Phase-1 replacement for the six hard-coded pairs: the unfold covers a constructor
+// because the foundation defines it, not because someone remembered to add a channel.
+//
+// Restrictions (each one a KNOWN next step, not a design choice):
+//  - HYPOTHESIS-FREE only: the unfold applies a lemma with zero refs, so a lemma carrying a
+//    setness hyp (`A ∈ _V` — elsn/elpr/eltp/eluni) would build an invalid 0-ref step. This
+//    is exactly why {a}/{a,b}/{a,b,c}/⋃ still need the hand-written channels; discharging
+//    those hyps from a mechanical setness table is Phase 1b.
+//  - DV-FREE only: an instantiated lemma with disjoint-variable provisos needs those provisos
+//    declared in the assembled proof (cf. ruExistUnfoldFacts, which returns them); until the
+//    caller threads them through, admitting such a lemma would silently build a rejected proof.
+// Several lemmas may share a constructor (𝒫 has velpw and friends), so the registry maps a
+// constructor to a LIST and ruUnfoldAtom takes the first whose LHS matches the atom.
+ruMembRegistry(math : RuMath) -> Tree<int, [RuMembLemma]> {
+	wcelId = s2id("wcel");
+	wbId   = s2id("wb");
+	cvvId  = s2id("cvv");
+	fold(getTreeValues(math.decls.assertions), makeTree(), \acc, ass -> {
+		inf = ruMembInfer(ass);
+		hypExps = map(inf.hyps, \h -> ruExp(h.stmt.exps[0]));
+		// SETNESS-conditioned lemmas are admitted (elsn/elpr/eltp/elpw/elop): their hyps are
+		// discharged by the setness prover at instantiation time. Any OTHER hypothesis shape
+		// we cannot discharge, so the lemma is not a usable rewrite rule.
+		setnessOnly = length(filtermap(hypExps, \h -> ruUSetnessHyp(h, wcelId, cvvId))) == length(hypExps);
+		if (!setnessOnly || !isEmptySet(inf.vars.disjs)) acc
+		else {
+			prop = ruExp(inf.prop.exps[0]);
+			nodes = prop.nodes;
+			if (length(nodes) < 4 || ruUNodeId(nodes[0]) != wbId) acc
+			else {
+				lhs = ruUChild0(prop);                       // the bicond's left side
+				ln  = lhs.nodes;
+				if (length(ln) < 3 || ruUNodeId(ln[0]) != wcelId) acc
+				else {
+					objIdx = ruUSpanEnd(ln, 1);              // the membership's OBJECT
+					if (objIdx >= length(ln)) acc
+					else {
+						opId = ruUNodeId(ln[objIdx]);
+						// a bare-variable object (`t ∈ A`) is not a constructor — nothing to unfold
+						if (opId < 0) acc
+						else {
+							id = ruDeclId(ass);
+							cur = lookupTreeDef(acc, opId, []);
+							setTree(acc, opId, arrayPush(cur, RuMembLemma(id, prop, lhs, hypExps)));
+						}
+					}
+				}
+			}
+		}
+	});
+}
+
+ruDeclId(ass : RuAssertion) -> int {
+	switch (ass) {
+		RuAxiom(info, __): info.id; RuCong(info, __): info.id;
+		RuTheorem(info, __, __, __): info.id; RuDef(info, __, __, __): info.id;
+	}
 }
 
 ruMembInfer(ass : RuAssertion) -> RuInference {
@@ -145,27 +252,29 @@ ruUMembAtoms(exp : RuExp, wcelId : int, ops : Set<int>) -> [RuExp] {
 // ---- unfold ----------------------------------------------------------------
 ruUnfoldFacts(math : RuMath, env : RuEnv, stmtClass : int, exps : [RuExp]) -> [Pair<RuExp, RuProofTree>] {
 	registry = ruMembRegistry(math);
+	setReg   = ruSetnessRegistry(math);
 	wcelId   = s2id("wcel");
 	ops      = buildSet(getTreeKeys(registry));
 	// Iterate to a fixpoint: a fact's RHS may expose further compound membership atoms.
-	ruUnfoldLoop(math, env, stmtClass, registry, wcelId, ops, exps, makeTree(), 6);
+	ruUnfoldLoop(math, env, stmtClass, registry, setReg, wcelId, ops, exps, makeTree(), 6);
 }
 
 ruUnfoldLoop(
-	math : RuMath, env : RuEnv, stmtClass : int, registry : Tree<int, RuMembLemma>,
+	math : RuMath, env : RuEnv, stmtClass : int, registry : Tree<int, [RuMembLemma]>,
+	setReg : Tree<int, [RuSetLemma]>,
 	wcelId : int, ops : Set<int>, frontier : [RuExp], seen : Tree<string, Pair<RuExp, RuProofTree>>, fuel : int
 ) -> [Pair<RuExp, RuProofTree>] {
 	atoms = concatA(map(frontier, \e -> ruUMembAtoms(e, wcelId, ops)));
 	newFacts = filtermap(atoms, \atom -> {
 		key = ruUKey(atom);
 		if (containsKeyTree(seen, key)) None()
-		else ruUnfoldAtom(registry, wcelId, stmtClass, atom, math, env);
+		else ruUnfoldAtom(registry, setReg, wcelId, stmtClass, atom, math, env);
 	});
 	if (newFacts == [] || fuel <= 0) getTreeValues(seen)
 	else {
 		seen1 = fold(newFacts, seen, \acc, f -> setTree(acc, ruUKey(ruUnfoldAtomOf(f)), f));
 		// scan the new facts' instance formulas for further compound atoms.
-		ruUnfoldLoop(math, env, stmtClass, registry, wcelId, ops, map(newFacts, \f -> f.first), seen1, fuel - 1);
+		ruUnfoldLoop(math, env, stmtClass, registry, setReg, wcelId, ops, map(newFacts, \f -> f.first), seen1, fuel - 1);
 	}
 }
 
@@ -173,19 +282,34 @@ ruUnfoldLoop(
 ruUnfoldAtomOf(f : Pair<RuExp, RuProofTree>) -> RuExp { ruUChild0(f.first); }
 
 // One atom -> its lemma instance + proof, or None if the lemma does not match.
-ruUnfoldAtom(registry : Tree<int, RuMembLemma>, wcelId : int, stmtClass : int, atom : RuExp, math : RuMath, env : RuEnv) -> Maybe<Pair<RuExp, RuProofTree>> {
+ruUnfoldAtom(registry : Tree<int, [RuMembLemma]>, setReg : Tree<int, [RuSetLemma]>, wcelId : int,
+	stmtClass : int, atom : RuExp, math : RuMath, env : RuEnv) -> Maybe<Pair<RuExp, RuProofTree>> {
+	cvvId = s2id("cvv");
 	opId = ruUNodeId(atom.nodes[ruUSpanEnd(atom.nodes, 1)]);   // object's head rule
-	switch (lookupTree(registry, opId)) {
-		None(): None();
-		Some(ml): switch (ruMatchExp(atom, ml.lhs, math, env)) {
+	// A constructor may have several membership lemmas (the general (B ∖ C) alongside the
+	// specialized (B ∖ {C}), or elsn/elsn2 which differ only in WHICH side must be a set);
+	// take the first whose LHS matches this atom AND whose setness hyps we can discharge.
+	fold(lookupTreeDef(registry, opId, []), None(), \acc, ml -> switch (acc) {
+		Some(__): acc;
+		None(): switch (ruMatchExp(atom, ml.lhs, math, env)) {
 			None(): None();
 			Some(sub): {
-				inst  = ruApplySubst(ml.prop, sub);
-				proof = RuProofStep(ml.lemmaId, [], RuStmt(stmtClass, [inst], -1));
-				Some(Pair(inst, proof));
+				hypProofs = filtermap(ml.hyps, \h -> {
+					hi = ruApplySubst(h, sub);
+					switch (ruUSetnessHyp(hi, wcelId, cvvId)) {
+						None(): None();
+						Some(ht): ruSetnessProof(setReg, ht, wcelId, cvvId, stmtClass, math, env, 8);
+					}
+				});
+				if (length(hypProofs) != length(ml.hyps)) None()
+				else {
+					inst  = ruApplySubst(ml.prop, sub);
+					proof = RuProofStep(ml.lemmaId, hypProofs, RuStmt(stmtClass, [inst], -1));
+					Some(Pair(inst, proof));
+				}
 			}
 		}
-	}
+	});
 }
 
 // ---- splice facts into the Kalmár skeleton ---------------------------------

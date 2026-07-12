@@ -12,6 +12,7 @@ import ru/prover/tactics/follow_proof;
 import ru/prover/tactics/kalmar;
 import ru/prover/tactics/hilbert;
 import ru/prover/tactics/unfold;
+import ru/prover/tactics/congruence;
 import ru/prover/tactics/equalizer;
 import ru/prover/tactics/refiners;
 import ru/prover/tactics/literal_closers;
@@ -475,6 +476,8 @@ ruTacticDocs() -> [RuTacticDoc] {
 		dp("atoms", "ap(a, child, ...)",            "replay a positional proof tree: assertion `a` applied at the goal, each child proving a premise in order", [p("a", "the assertion applied at this node"), p("child ...", "each child: a nested ap(...) or `prem` (a premise discharged by a hyp / prior step)")]),
 		d ("atoms", "kalmar-closer",                "propositional closer: unfold membership atoms + Kalmar certificate [PRUNE-CANDIDATE]"),
 		d ("atoms", "hilbert",                      "the Hilbert-certificate emitter PRIMITIVE: unfold membership atoms + fresh refutation certificate (hilbert.flow), installed directly; no-op when the gap is not certifiable. Composable in any combinator."),
+		df("atoms", "congruence",                   "proof-producing congruence closure: decide an equality goal from the premise equalities (replaces equality saturation)",
+			"The equality DECISION PROCEDURE. Premise equalities merge congruence classes; consequences are found by matching term signatures, not by applying congruence lemmas wave after wave (which regenerates the equality theory as junk). If the goal equality is entailed, ruCongExplain emits an eqtri/eqcomi certificate over the proof-carrying merge edges and installs it. Closes whole-or-nothing, so it is safe anywhere in an or-else. The congruence lemmas are discovered mechanically from the loaded math (106 rules / 38 constructors on miz_set) — nothing is hand-listed."),
 		dp("atoms", "checker(closer=<tactic>)",     "Mizar-style refutation-closer PRESET = hilbert + an optional fallback finisher; checker(closer=X) == or-else(hilbert, X)", [p("closer", "fallback tactic when the emitter cannot certify (e.g. limited(bfs,...)); omit for a no-op")]),
 		dp("atoms", "linear-guided(attempts)", "guide search by linear goal->premise chains from the corpus (unbounded; wrap in limited)", [p("attempts", "how many goal->premise chains to try")]),
 		dp("atoms", "follow-proof(theorem)",        "replay a named theorem's stored proof tree (diagnostic)", [p("theorem", "name of the theorem whose stored proof tree to replay")]),
@@ -616,6 +619,7 @@ ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTactic
 	else if (n == "ap")              ruTagBuilder("ap", ruDslBuildAp(ast, ctx))
 	else if (n == "kalmar-closer")   ruTagBuilder("kalmar-closer", ruDslBuildKalmarCloser(ast, ctx))
 	else if (n == "checker")         ruTagBuilder("checker", ruDslBuildCheckerCloser(ast, ctx))
+	else if (n == "congruence")      ruTagBuilder("congruence", ruDslBuildCongruence(ast, ctx))
 	else if (n == "hilbert")         ruTagBuilder("hilbert", ruDslBuildHilbert(ast, ctx))
 	else if (n == "replay")          ruDslBuildRealizer(ast, ctx, "replay", ruReplayRealize)
 	else if (n == "linear-guided")   ruTagBuilder("linear-guided", ruDslBuildLinearGuided(ast, ctx))
@@ -862,6 +866,40 @@ ruDslBuildHilbert(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBui
 
 // `checker(closer=<tactic>)`: the Mizar-style refutation-closer PRESET = the hilbert emitter plus a pluggable
 // fallback finisher (MODULARITY #1). checker(closer=X) ≡ or-else(hilbert, X); bare `checker` ≡ `hilbert`.
+// THE CONGRUENCE-CLOSURE ATOM. Replaces equality SATURATION (apply every congruence lemma
+// to every known equality, wave after wave — zfmisc t7: one wave 176 -> 511 facts, all junk)
+// with the decision procedure: the premise equalities MERGE classes, congruence consequences
+// are found by signature, and the goal equality is either entailed or it is not. Whole-or-
+// nothing, so it cannot preempt anything in an or-else. The certificate is built by
+// ruCongExplain (eqtri/eqcomi chains over the proof-carrying edges) and installed.
+ruDslBuildCongruence(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+	Some(RuTacticBuilder(\penv -> {
+		task      = penv.conf.task;
+		goalStmt  = task.goal.stmt;
+		stmtClass = goalStmt.class;
+		sp        = ruStripForall(ruExp(goalStmt.exps[0]));   // peel ∀, re-quantified by ax-gen
+		body      = sp.first;
+		axgen = \tree -> fold(sp.second, tree, \acc, lvl -> RuProofStep(s2id_("ax-gen"), [acc], RuStmt(stmtClass, [lvl], -1)));
+		rules = ruCongRules(ctx.math);
+		// premises that ARE equalities seed the closure; each is justified by its own hyp leaf
+		facts = filtermap(mapi(task.premises, \i, pr -> Pair(i, ruExp(pr.stmt.exps[0]))), \ie ->
+			if (ruCongIsEq(ie.second)) Some(Pair(RuProofHyp(ie.first, task.premises[ie.first].stmt), ie.second)) else None());
+		terms = arrayPush(map(task.premises, \pr -> ruExp(pr.stmt.exps[0])), body);
+		st = ruCongClose(rules, facts, terms, stmtClass, ctx.math, ctx.env);
+		tactic = switch (ruCongSides(body)) {
+			None(): ruDoneTactic;   // not an equality goal — nothing for the closure to decide
+			Some(lr): switch (ruCongExplain(st, lr.first, lr.second)) {
+				None(): ruDoneTactic;
+				Some(pr2): switch (pr2) {
+					RuProofStep(__, __, __): ruInstallProofTactic(RuProof(ruEmptyVarsDisjs, ruMakeLinearProof(axgen(pr2)), -1));
+					RuProofHyp(__, __): ruDoneTactic;
+				}
+			}
+		};
+		Pair(penv, tactic);
+	}));
+}
+
 ruDslBuildCheckerCloser(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
 	ruBuildHilbertEmitter(ruDslCloserArg(ast), ctx)
 }
@@ -1563,7 +1601,7 @@ ruParseAndBuildTactic(src : string, ctx : RuTacticContext) -> Maybe<RuTacticBuil
 // a built-in always wins over a same-named file.
 ruBuiltinTacticNames() -> [string] {
 	["bfs", "forward", "assume-neg", "ordered", "instantiate", "done", "giveup", "spr", "fragment-replay", "ml", "ap", "kalmar-closer", "checker", "hilbert", "replay",
-	 "linear-guided", "follow-proof", "oracle", "seq", "or-else", "loop", "limited", "focus", "track", "scoped", "when"]
+	 "linear-guided", "follow-proof", "oracle", "seq", "or-else", "loop", "limited", "focus", "track", "scoped", "when", "congruence"]
 }
 ruIsBuiltinTacticName(n : string) -> bool { exists(ruBuiltinTacticNames(), \b -> b == n) }
 

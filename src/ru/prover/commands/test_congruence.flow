@@ -1,0 +1,121 @@
+import ru/prover/tactics/congruence;
+import ru/prover/core/env;
+import ru/math;
+import ru/verify/theorem;
+import ru/proof_tree;
+import comm;
+import base/comms;
+import ru/util/src2s;
+import base/ids;
+
+// Self-check for the proof-producing congruence closure: build the rule table from the
+// loaded math, take a theorem's equality hypotheses as input equalities, close, and then
+// (a) report the table's size, (b) try to prove the theorem's equality conclusion from
+// the closure and VERIFY the emitted proof against the kernel. This is the unit the
+// equality saturation is being replaced by, so it must stand on its own before it is
+// wired into a tactic.
+//
+//   russellj no-server=1 test/congruence target=t12_zfmisc_1
+
+export {
+	ruCommTestCongruence : RuComm;
+}
+
+ruCommTestCongruence = RuComm(
+	RuCommInfo(
+		"test/congruence", "prover",
+		"self-check the proof-producing congruence closure: rule table + close + explain + verify",
+		"target", true, false,
+		[
+			RuCommArg("target", true, "theorem whose equality hyps seed the closure", ""),
+			RuCommArg("rules",  true, "1 = also print the discovered congruence rules", "0")
+		], []
+	),
+	ruRunTestCongruence
+);
+
+ruRunTestCongruence(unit : RuUnit) -> Maybe<RuState> {
+	env   = ruUnitEnv(unit);
+	math  = ruMathFromSources(unit.state.ru, env);
+	rules = ruCongRules(math);
+	nrules = fold(getTreeValues(rules), 0, \acc, rs -> acc + length(rs));
+	env.out.println("congruence rules discovered: " + i2s(nrules) + " over " + i2s(sizeTree(rules)) + " constructors");
+	if (ruTaskStringArg(unit.task, "rules", "0") == "1") {
+		iter(getTreeValues(rules), \rs -> iter(rs, \r ->
+			env.out.println("  " + id2s(r.lemmaId) + "  op=" + id2s(r.opId) + " arg=" + i2s(r.argPos)
+				+ (if (r.hypForm) " [hyp]" else " [imp]"))));
+	} else {};
+
+	target = ruTaskStringArg(unit.task, "target", "");
+	if (target == "") Some(unit.state)
+	else switch (lookupTree(math.decls.assertions, s2id_(target))) {
+		None(): { env.out.error("test/congruence: no such theorem: " + target, []); None(); }
+		Some(ass): {
+			inf  = ruCongTestInfer(ass);
+			stcl = inf.prop.class;
+			hyps = mapi(inf.hyps, \i, h -> Pair(RuProofHyp(i, h.stmt), ruExp(h.stmt.exps[0])));
+			goal = ruExp(inf.prop.exps[0]);
+			// seed with the equality hypotheses; the goal's terms enter the universe so
+			// congruence can fire on them
+			st = ruCongClose(rules, hyps, [goal], stcl, math, env);
+			env.out.println("closure seeded with " + i2s(length(hyps)) + " hyps, goal: "
+				+ ruSafeExp2s(goal, math.decls.lang));
+			switch (ruCongTestSides(goal)) {
+				None(): { env.out.println("goal is not an equality — nothing to explain"); Some(unit.state); }
+				Some(lr): {
+					env.out.println("  a = b in the closure? " + b2s(ruCongEqual(st, lr.first, lr.second)));
+					switch (ruCongExplain(st, lr.first, lr.second)) {
+						None(): { env.out.println("  EXPLAIN: none (closure does not entail it)"); Some(unit.state); }
+						Some(p): {
+							env.out.println("  EXPLAIN: proof built, " + i2s(ruCongTestSize(p)) + " steps");
+							// THE test: the kernel must accept it. Install the emitted tree as this
+							// theorem's proof and run the real verifier — a congruence closure that
+							// cannot produce a checkable certificate is worthless here.
+							switch (ass) {
+								RuTheorem(info, inf2, meta, __): {
+									th = RuTheorem(info, inf2, meta, RuProof(inf2.vars, ruMakeLinearProof(p), -1));
+									res = ruVerifyTheorem(th, math, env);
+									env.out.println("  KERNEL VERIFY: " + (if (res.errs == []) "OK" else "FAILED"));
+									if (res.errs != []) env.out.println("    " + ruVerifyTheoremErrs2s(res, math)) else {};
+								}
+								default: env.out.println("  (target is not a theorem — cannot kernel-verify)");
+							}
+							Some(unit.state);
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+ruCongTestInfer(ass : RuAssertion) -> RuInference {
+	switch (ass) {
+		RuAxiom(__, inf): inf; RuCong(__, inf): inf;
+		RuTheorem(__, inf, __, __): inf; RuDef(__, inf, __, __): inf;
+	}
+}
+
+ruCongTestSpan(nodes : [RuExpNode], i : int) -> int {
+	switch (nodes[i]) {
+		RuVar(__, __): i + 1;
+		RuRuleNode(__, al): fold(enumFromTo(1, ruArityLen2Arity(al)), i + 1, \pos, __ -> ruCongTestSpan(nodes, pos));
+	}
+}
+
+ruCongTestSides(e : RuExp) -> Maybe<Pair<RuExp, RuExp>> {
+	n = e.nodes;
+	head = switch (n[0]) { RuRuleNode(it, __): ruIdType2Id(it); RuVar(__, __): -1; };
+	if (head != s2id("wceq") || length(n) < 3) None()
+	else {
+		mid = ruCongTestSpan(n, 1);
+		Some(Pair(RuExp(subrange(n, 1, mid - 1), -1), RuExp(subrange(n, mid, length(n) - mid), -1)));
+	}
+}
+
+ruCongTestSize(p : RuProofTree) -> int {
+	switch (p) {
+		RuProofHyp(__, __): 1;
+		RuProofStep(__, cs, __): fold(cs, 1, \acc, c -> acc + ruCongTestSize(c));
+	}
+}
