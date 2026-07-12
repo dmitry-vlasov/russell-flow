@@ -19,6 +19,15 @@ export {
 	ruInstallLiteralClosers() -> void;
 }
 
+// MEASUREMENT SWITCH (no-literal-closers=1): turn OFF the hand-written literal-channel
+// battery (the clause/bare literal closers) while leaving the GENERAL machinery — refute
+// front, instantiate front, identity/eq-normalize seeding, forward saturation, backward
+// bfs, the Hilbert certificate emitter — untouched. Lets us measure how much coverage the
+// general procedure carries on its own, which is the number that should be going UP.
+ruLitClosersOff(prover_env : RuProverEnv) -> bool {
+	ruOptsString(prover_env.env.conf.opts, "no-literal-closers", "") == "1";
+}
+
 ruInstallLiteralClosers() -> void {
 	ruRegisterForwardSeedHook("refute", \pe, ct, fw, ass ->
 		if (^(pe.refute)) ruSeedRefuteFront(pe, ct, fw) else fw);
@@ -2734,8 +2743,31 @@ ruFwdMizProdExParse(ids : RuFwdInstIds, y : [RuExpNode]) -> Maybe<Pair<[[RuExpNo
 // ⊊ via the ⊊-closure / dfpss2-intro, = via the ∅-channels / antisymmetry,
 // ⊆ via the guarded ⊆-closure, bare relClose and the ssdif0 collapse.
 // `depth` bounds all synthetic-clause / transport recursion.
+// MEMO WRAPPER. The channel battery below is a DETERMINISTIC dfs: the same (goal,
+// guard, depth) over the same pools always yields the same result — but dozens of
+// channels reach the same subgoal by different routes, so the raw dfs re-derived every
+// FAILING subgoal again and again (zfmisc t85: 11000 calls behind 231 distinct goals)
+// and spent its whole stage slice doing it. The memo lives for ONE closure entry, so
+// the pools — a function of the guard, which is part of the key — are fixed for its
+// lifetime. The cycle-guard rejection is NOT cached: it is a property of the current
+// path, not of the goal, and caching it would poison that goal for every other path.
 ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asses : RuIndex<RuAssertion>,
-	facts : RuFwdClsFacts, bareFacts : RuFwdClsFacts, psi : RuExp, x : [RuExpNode], stcl : int, depth : int, path0 : [[RuExpNode]], prover_env : RuProverEnv) -> Maybe<RuProofTree> {
+	facts : RuFwdClsFacts, bareFacts : RuFwdClsFacts, psi : RuExp, x : [RuExpNode], stcl : int, depth : int, path0 : [[RuExpNode]], memo : ref Tree<Pair<[RuExpNode], Pair<[RuExpNode], int>>, Maybe<RuProofTree>>, prover_env : RuProverEnv) -> Maybe<RuProofTree> {
+	if (contains(path0, x)) None() else {
+		key = Pair(x, Pair(psi.nodes, depth));
+		switch (lookupTree(^memo, key)) {
+			Some(hit): hit;
+			None(): {
+				res = ruFwdLitCloseDfs(ids, eids, rules, asses, facts, bareFacts, psi, x, stcl, depth, path0, memo, prover_env);
+				memo := setTree(^memo, key, res);
+				res;
+			}
+		}
+	}
+}
+
+ruFwdLitCloseDfs(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asses : RuIndex<RuAssertion>,
+	facts : RuFwdClsFacts, bareFacts : RuFwdClsFacts, psi : RuExp, x : [RuExpNode], stcl : int, depth : int, path0 : [[RuExpNode]], memo : ref Tree<Pair<[RuExpNode], Pair<[RuExpNode], int>>, Maybe<RuProofTree>>, prover_env : RuProverEnv) -> Maybe<RuProofTree> {
 	// CYCLE GUARD: inverse channel pairs (x=y ⟸ x∈{y} ⟸ x=y …) ping-pong
 	// forever without it, burning the whole depth budget on one loop.
 	// TIMER GUARD: the recursive channel product (∨-elim × pool rebuilds) can
@@ -2828,7 +2860,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 						None(): {
 							celWT = ruFwdMkRule(ids.wcel, ids.wff, [RuExp(w, -1), RuExp(tT, -1)]);
 							maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi,
-								celWT.nodes, stcl, depth - 4, path, prover_env), \pEl -> {
+								celWT.nodes, stcl, depth - 4, path, memo, prover_env), \pEl -> {
 								inst = RuProofStep(s2id_("n0i"), [],
 									RuStmt(stcl, [mkImp(celWT, RuExp(x, -1))], -1));
 								RuProofStep(s2id_("syl"), [pEl, inst], RuStmt(stcl, [psiX], -1));
@@ -2846,7 +2878,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 						abc = abcL.first;
 						celE = ruFwdMkRule(ids.wcel, ids.wff, [RuExp(abc[0], -1),
 							ruFwdMkRule(s2id("cxp"), ids.cls, [RuExp(abc[1], -1), RuExp(abc[2], -1)])]);
-						maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, celE.nodes, stcl, depth - 1, path, prover_env), \pEl -> {
+						maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, celE.nodes, stcl, depth - 1, path, memo, prover_env), \pEl -> {
 							inst = RuProofStep(s2id_(abcL.second), [], RuStmt(stcl, [mkImp(celE, RuExp(x, -1))], -1));
 							RuProofStep(s2id_("syl"), [pEl, inst], RuStmt(stcl, [psiX], -1));
 						});
@@ -2856,7 +2888,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 					if (depth <= 0) None() else {
 						synth = ruFwdMkRule(ids.wn, ids.wff,
 							[ruFwdMkRule(ids.wa, ids.wff, [psi, RuExp(y, -1)])]);
-						maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, [], synth.nodes, stcl, depth - 1, path, prover_env),
+						maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, [], synth.nodes, stcl, depth - 1, path, memo, prover_env),
 							\pc -> RuProofStep(s2id_("imnani"), [pc], RuStmt(stcl, [psiX], -1)));
 					}
 				}}
@@ -2870,14 +2902,14 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 				xa = subrange(x, 1, lend - 1);
 				xb = subrange(x, lend, length(x) - lend);
 				if (hid == ids.wa) {
-					maybeBind(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, xa, stcl, depth, path, prover_env), \p1 ->
-						maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, xb, stcl, depth, path, prover_env), \p2 ->
+					maybeBind(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, xa, stcl, depth, path, memo, prover_env), \p1 ->
+						maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, xb, stcl, depth, path, memo, prover_env), \p2 ->
 							RuProofStep(s2id_("jca"), [p1, p2], RuStmt(stcl, [psiX], -1))));
 				} else if (hid == ids.wo) {
-					p1 = maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, xa, stcl, depth, path, prover_env),
+					p1 = maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, xa, stcl, depth, path, memo, prover_env),
 						\p -> RuProofStep(s2id_("orcd"), [p], RuStmt(stcl, [psiX], -1)));
 					switch (p1) { Some(__): p1; None(): {
-					p2 = maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, xb, stcl, depth, path, prover_env),
+					p2 = maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, xb, stcl, depth, path, memo, prover_env),
 						\p -> RuProofStep(s2id_("olcd"), [p], RuStmt(stcl, [psiX], -1)));
 					switch (p2) { Some(__): p2; None(): {
 						// the oran route: ψ→¬(¬a∧¬b) by refuting ψ∧(¬a∧¬b)
@@ -2886,7 +2918,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 								ruFwdMkRule(ids.wn, ids.wff, [RuExp(xa, -1)]),
 								ruFwdMkRule(ids.wn, ids.wff, [RuExp(xb, -1)])]);
 							synth = ruFwdMkRule(ids.wn, ids.wff, [ruFwdMkRule(ids.wa, ids.wff, [psi, nn])]);
-							maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, [], synth.nodes, stcl, depth - 1, path, prover_env), \pc -> {
+							maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, [], synth.nodes, stcl, depth - 1, path, memo, prover_env), \pc -> {
 								pNeg = RuProofStep(s2id_("imnani"), [pc],
 									RuStmt(stcl, [mkImp(psi, ruFwdMkRule(ids.wn, ids.wff, [nn]))], -1));
 								bi = ruFwdMkRule(ids.wb, ids.wff, [RuExp(x, -1), ruFwdMkRule(ids.wn, ids.wff, [nn])]);
@@ -2905,7 +2937,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 						nn = ruFwdMkRule(ids.wa, ids.wff, [RuExp(xa, -1),
 							ruFwdMkRule(ids.wn, ids.wff, [RuExp(xb, -1)])]);
 						synth = ruFwdMkRule(ids.wn, ids.wff, [ruFwdMkRule(ids.wa, ids.wff, [psi, nn])]);
-						maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, [], synth.nodes, stcl, depth - 1, path, prover_env), \pc -> {
+						maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, [], synth.nodes, stcl, depth - 1, path, memo, prover_env), \pc -> {
 							pNeg = RuProofStep(s2id_("imnani"), [pc],
 								RuStmt(stcl, [mkImp(psi, ruFwdMkRule(ids.wn, ids.wff, [nn]))], -1));
 							bi = ruFwdMkRule(ids.wb, ids.wff, [RuExp(x, -1), ruFwdMkRule(ids.wn, ids.wff, [nn])]);
@@ -2932,7 +2964,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 								nn = ruFwdMkRule(ids.wa, ids.wff, [RuExp(pp, -1),
 									ruFwdMkRule(ids.wn, ids.wff, [RuExp(qq, -1)])]);
 								synth = ruFwdMkRule(ids.wn, ids.wff, [ruFwdMkRule(ids.wa, ids.wff, [psi, nn])]);
-								maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, [], synth.nodes, stcl, depth - 1, path, prover_env), \pc -> {
+								maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, [], synth.nodes, stcl, depth - 1, path, memo, prover_env), \pc -> {
 									pNeg = RuProofStep(s2id_("imnani"), [pc],
 										RuStmt(stcl, [mkImp(psi, ruFwdMkRule(ids.wn, ids.wff, [nn]))], -1));
 									impE = mkImp(RuExp(pp, -1), RuExp(qq, -1));
@@ -2963,7 +2995,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 					mkEq2 = \ee : [RuExpNode] -> ruFwdMkRule(s2id("wceq"), ids.wff, [RuExp(xa, -1), RuExp(ee, -1)]);
 					enumEl = \dE : RuExp, biId : int ->
 						maybeBind(ruFwdSetness(ids, xa, stcl), \setn ->
-							maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, dE.nodes, stcl, depth - 1, path, prover_env), \pd ->
+							maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, dE.nodes, stcl, depth - 1, path, memo, prover_env), \pd ->
 								RuProofStep(s2id_("mpbird"), [pd,
 									RuProofStep(s2id_("a1i"),
 										[RuProofStep(biId, [setn], RuStmt(stcl, [ruFwdMkRule(ids.wb, ids.wff, [RuExp(x, -1), dE])], -1))],
@@ -3001,7 +3033,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 								c3 = subrange(wn3, w3end, length(wn3) - w3end);
 								if (c3 != ua3) None()
 								else maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi,
-									(ruFwdMkRule(ids.wcel, ids.wff, [RuExp(xa, -1), RuExp(w3, -1)])).nodes, stcl, depth - 1, path, prover_env), \pIn3 -> {
+									(ruFwdMkRule(ids.wcel, ids.wff, [RuExp(xa, -1), RuExp(w3, -1)])).nodes, stcl, depth - 1, path, memo, prover_env), \pIn3 -> {
 									andE3 = ruFwdMkRule(ids.wa, ids.wff, [
 										ruFwdMkRule(ids.wcel, ids.wff, [RuExp(xa, -1), RuExp(w3, -1)]), RuExp(wn3, -1)]);
 									pAnd3 = RuProofStep(s2id_("jca"), [pIn3, fw3.first], RuStmt(stcl, [mkImp(psi, andE3)], -1));
@@ -3029,7 +3061,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 								RuProofStep(s2id_("vdfop"), [], RuStmt(stcl, [eqE4], -1)),
 								RuProofStep(s2id_("eleq2"), [], RuStmt(stcl, [mkImp(eqE4, biE4)], -1))],
 								RuStmt(stcl, [biE4], -1));
-							maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, dE4.nodes, stcl, depth - 1, path, prover_env), \pd4 ->
+							maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, dE4.nodes, stcl, depth - 1, path, memo, prover_env), \pd4 ->
 								RuProofStep(s2id_("mpbird"), [pd4,
 									RuProofStep(s2id_("a1i"), [pBi4], RuStmt(stcl, [mkImp(psi, biE4)], -1))],
 									RuStmt(stcl, [psiX], -1)));
@@ -3078,9 +3110,9 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 							flend = ruFwdSpan(fn, 1);
 							fl = subrange(fn, 1, flend - 1);
 							fr = subrange(fn, flend, length(fn) - flend);
-							if (fl == x) maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, fr, stcl, depth - 1, path, prover_env),
+							if (fl == x) maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, fr, stcl, depth - 1, path, memo, prover_env),
 								\pr -> RuProofStep(s2id_("mpbird"), [pr, f.first], RuStmt(stcl, [psiX], -1)))
-							else if (fr == x) maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, fl, stcl, depth - 1, path, prover_env),
+							else if (fr == x) maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, fl, stcl, depth - 1, path, memo, prover_env),
 								\pl -> RuProofStep(s2id_("mpbid"), [pl, f.first], RuStmt(stcl, [psiX], -1)))
 							else None();
 						}
@@ -3099,7 +3131,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 								ruFwdMkRule(ids.wcel, ids.wff, [RuExp(fv, -1), RuExp(xb, -1)])]);
 							mkTrans = \other : [RuExpNode], useMpbid : bool ->
 								maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi,
-									(ruFwdMkRule(ids.wcel, ids.wff, [RuExp(other, -1), RuExp(xb, -1)])).nodes, stcl, depth - 1, path, prover_env), \po -> {
+									(ruFwdMkRule(ids.wcel, ids.wff, [RuExp(other, -1), RuExp(xb, -1)])).nodes, stcl, depth - 1, path, memo, prover_env), \po -> {
 									inst = RuProofStep(ids.eleq1, [], RuStmt(stcl, [mkImp(RuExp(fn, -1), biE)], -1));
 									pBi = RuProofStep(s2id_("syl"), [f.first, inst], RuStmt(stcl, [mkImp(psi, biE)], -1));
 									RuProofStep(if (useMpbid) s2id_("mpbid") else s2id_("mpbird"), [po, pBi], RuStmt(stcl, [psiX], -1));
@@ -3112,7 +3144,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 									ruFwdMkRule(ids.wcel, ids.wff, [RuExp(xa, -1), RuExp(fu, -1)]),
 									ruFwdMkRule(ids.wcel, ids.wff, [RuExp(xa, -1), RuExp(fv, -1)])]);
 								maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi,
-									(ruFwdMkRule(ids.wcel, ids.wff, [RuExp(xa, -1), RuExp(other, -1)])).nodes, stcl, depth - 1, path, prover_env), \po -> {
+									(ruFwdMkRule(ids.wcel, ids.wff, [RuExp(xa, -1), RuExp(other, -1)])).nodes, stcl, depth - 1, path, memo, prover_env), \po -> {
 									inst = RuProofStep(s2id_("eleq2"), [], RuStmt(stcl, [mkImp(RuExp(fn, -1), biE2)], -1));
 									pBi = RuProofStep(s2id_("syl"), [f.first, inst], RuStmt(stcl, [mkImp(psi, biE2)], -1));
 									RuProofStep(if (useMpbid) s2id_("mpbid") else s2id_("mpbird"), [po, pBi], RuStmt(stcl, [psiX], -1));
@@ -3154,14 +3186,14 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 									otherU  = if (frst) ub else ua;   // the witness's U-factor
 									otherV  = if (frst) vd else vc;   // the witness's V-factor
 									maybeBind(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi,
-										(mEl(xa, needSet)).nodes, stcl, depth - 1, path, prover_env), \px -> {
+										(mEl(xa, needSet)).nodes, stcl, depth - 1, path, memo, prover_env), \px -> {
 										// witness candidates: x itself, pooled el-facts w ∈ otherU
 										// DIRECTLY, then every pooled ELEMENT w recursively — its
 										// w∈otherU may itself need a transport (t110's x8∈x23
 										// through the OTHER factor of the same product equality)
 										wcands : [Pair<[RuExpNode], () -> Maybe<RuProofTree>>] = concatA([
 											[Pair(xa, \ -> ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi,
-												(mEl(xa, otherU)).nodes, stcl, depth - 1, path, prover_env))],
+												(mEl(xa, otherU)).nodes, stcl, depth - 1, path, memo, prover_env))],
 											filtermap(facts.el, \f2 -> {
 												f2n = f2.second;
 												f2end = ruFwdSpan(f2n, 1);
@@ -3181,7 +3213,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 												wset = subrange(f2n, ruFwdSpan(f2n, 1), length(f2n) - ruFwdSpan(f2n, 1));
 												if (w2 == xa || wset == otherU) None()
 												else Some(Pair(w2, \ -> ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi,
-													(mEl(w2, otherU)).nodes, stcl, depth - 4, path, prover_env)));
+													(mEl(w2, otherU)).nodes, stcl, depth - 4, path, memo, prover_env)));
 											})]);
 										fold(wcands, None(), \acW, wc -> switch (acW) {
 											Some(__): acW;
@@ -3280,7 +3312,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 					th = switch (xb[0]) { RuVar(__,__): -1; RuRuleNode(idTb, __): ruIdType2Id(idTb); };
 					mkEl = \cl : [RuExpNode] -> ruFwdMkRule(ids.wcel, ids.wff, [RuExp(xa, -1), RuExp(cl, -1)]);
 					intro = \dE : RuExp, biId : int ->
-						maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, dE.nodes, stcl, depth, path, prover_env), \pd -> {
+						maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, dE.nodes, stcl, depth, path, memo, prover_env), \pd -> {
 							biStep = RuProofStep(s2id_("a1i"),
 								[RuProofStep(biId, [], RuStmt(stcl, [ruFwdMkRule(ids.wb, ids.wff, [RuExp(x, -1), dE])], -1))],
 								RuStmt(stcl, [mkImp(psi, ruFwdMkRule(ids.wb, ids.wff, [RuExp(x, -1), dE]))], -1));
@@ -3347,7 +3379,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 								if (fEl != xa || fB == uc) None()
 								else {
 									bcE = ruFwdMkRule(ids.wcel, ids.wff, [RuExp(fB, -1), RuExp(uc, -1)]);
-									maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, bcE.nodes, stcl, depth - 1, path, prover_env), \pbc -> {
+									maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, bcE.nodes, stcl, depth - 1, path, memo, prover_env), \pbc -> {
 										andE = ruFwdMkRule(ids.wa, ids.wff, [RuExp(fn, -1), bcE]);
 										pAnd = RuProofStep(s2id_("jca"), [f.first, pbc], RuStmt(stcl, [mkImp(psi, andE)], -1));
 										inst = RuProofStep(s2id_("elunii"), [], RuStmt(stcl, [mkImp(andE, RuExp(x, -1))], -1));
@@ -3430,7 +3462,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 								};
 								maybeBind(parseEq(oa), \ea -> maybeBind(parseEq(ob), \eb -> {
 									mkBranch = \dq : [RuExpNode], bGoal : RuExp, biLem : int, biE : RuExp ->
-										maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, bGoal.nodes, stcl, depth - 1, path, prover_env), \pg -> {
+										maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, bGoal.nodes, stcl, depth - 1, path, memo, prover_env), \pg -> {
 											inst = RuProofStep(biLem, [], RuStmt(stcl, [mkImp(RuExp(dq, -1), biE)], -1));
 											pImp = RuProofStep(s2id_("biimprd"), [inst], RuStmt(stcl, [mkImp(RuExp(dq, -1), mkImp(bGoal, RuExp(x, -1)))], -1));
 											pCom = RuProofStep(s2id_("com12"), [pImp], RuStmt(stcl, [mkImp(bGoal, mkImp(RuExp(dq, -1), RuExp(x, -1)))], -1));
@@ -3454,7 +3486,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 						});
 						switch (viaOrEq) { Some(__): viaOrEq; None(): {
 						// (f2) hoisted to ruFwdOrElimClose — shared with the ⊆-target branch
-						ruFwdOrElimClose(ids, eids, rules, asses, facts, bareFacts, psi, x, stcl, depth, path0, prover_env);
+						ruFwdOrElimClose(ids, eids, rules, asses, facts, bareFacts, psi, x, stcl, depth, path0, memo, prover_env);
 						}}
 						}}
 					}
@@ -3536,7 +3568,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 								fv = subrange(fn, flend, length(fn) - flend);
 								mkTr = \pAm : RuProofTree, m : [RuExpNode] ->
 									maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi,
-										(ruFwdMkRule(s2id("wceq"), ids.wff, [RuExp(m, -1), RuExp(xb, -1)])).nodes, stcl, depth - 1, path, prover_env), \pmb ->
+										(ruFwdMkRule(s2id("wceq"), ids.wff, [RuExp(m, -1), RuExp(xb, -1)])).nodes, stcl, depth - 1, path, memo, prover_env), \pmb ->
 										RuProofStep(s2id_("eqtrd"), [pAm, pmb], RuStmt(stcl, [psiX], -1)));
 								if (fu == xa && fv != xb) mkTr(f.first, fv)
 								else if (fv == xa && fu != xb) mkTr(
@@ -3552,7 +3584,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 						extr = if (depth <= 0 || length(xa) != 2 || length(xb) != 2) None() else {
 							snYE = ruFwdMkRule(csn0, ids.cls, [RuExp(xb, -1)]);
 							e1 = maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi,
-								(ruFwdMkRule(ids.wcel, ids.wff, [RuExp(xa, -1), snYE])).nodes, stcl, depth - 1, path, prover_env), \pe -> {
+								(ruFwdMkRule(ids.wcel, ids.wff, [RuExp(xa, -1), snYE])).nodes, stcl, depth - 1, path, memo, prover_env), \pe -> {
 								biE = ruFwdMkRule(ids.wb, ids.wff, [ruFwdMkRule(ids.wcel, ids.wff, [RuExp(xa, -1), snYE]), RuExp(x, -1)]);
 								RuProofStep(s2id_("mpbid"), [pe,
 									RuProofStep(s2id_("a1i"), [RuProofStep(s2id_("velsn"), [], RuStmt(stcl, [biE], -1))],
@@ -3562,7 +3594,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 								snXE = ruFwdMkRule(csn0, ids.cls, [RuExp(xa, -1)]);
 								flipE = ruFwdMkRule(s2id("wceq"), ids.wff, [RuExp(xb, -1), RuExp(xa, -1)]);
 								maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi,
-									(ruFwdMkRule(ids.wcel, ids.wff, [RuExp(xb, -1), snXE])).nodes, stcl, depth - 1, path, prover_env), \pe -> {
+									(ruFwdMkRule(ids.wcel, ids.wff, [RuExp(xb, -1), snXE])).nodes, stcl, depth - 1, path, memo, prover_env), \pe -> {
 									biE = ruFwdMkRule(ids.wb, ids.wff, [ruFwdMkRule(ids.wcel, ids.wff, [RuExp(xb, -1), snXE]), flipE]);
 									pFl = RuProofStep(s2id_("mpbid"), [pe,
 										RuProofStep(s2id_("a1i"), [RuProofStep(s2id_("velsn"), [], RuStmt(stcl, [biE], -1))],
@@ -3576,9 +3608,9 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 						// the enumeration channels ssClose lacks — t21_zfmisc_1)
 						anti = if (depth <= 0) None() else
 							maybeBind(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi,
-								(ruFwdMkRule(ids.wss, ids.wff, [RuExp(xa, -1), RuExp(xb, -1)])).nodes, stcl, depth - 1, path, prover_env), \p1 ->
+								(ruFwdMkRule(ids.wss, ids.wff, [RuExp(xa, -1), RuExp(xb, -1)])).nodes, stcl, depth - 1, path, memo, prover_env), \p1 ->
 								maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi,
-									(ruFwdMkRule(ids.wss, ids.wff, [RuExp(xb, -1), RuExp(xa, -1)])).nodes, stcl, depth - 1, path, prover_env), \p2 ->
+									(ruFwdMkRule(ids.wss, ids.wff, [RuExp(xb, -1), RuExp(xa, -1)])).nodes, stcl, depth - 1, path, memo, prover_env), \p2 ->
 									RuProofStep(s2id_("eqssd"), [p1, p2], RuStmt(stcl, [psiX], -1))));
 						switch (anti) { Some(__): anti; None(): {
 						eqc = ruFwdEqClose(ids, facts, xa, xb, stcl, Some(psi), prover_env);
@@ -3586,7 +3618,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 							// (h) neg-∧ unit resolution over the clause pool
 							fold(facts.neg, None(), \acRz, nfz -> switch (acRz) {
 								Some(__): acRz;
-								None(): ruFwdNegAndResolve(ids, eids, rules, asses, facts, bareFacts, psi, x, nfz.first, nfz.second, stcl, depth, path, prover_env);
+								None(): ruFwdNegAndResolve(ids, eids, rules, asses, facts, bareFacts, psi, x, nfz.first, nfz.second, stcl, depth, path, memo, prover_env);
 							});
 						}
 						}}
@@ -3601,7 +3633,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 					lh = switch (xa[0]) { RuVar(__,__): -1; RuRuleNode(idTe, __): ruIdType2Id(idTe); };
 					mkElOf = \v : [RuExpNode] -> ruFwdMkRule(ids.wcel, ids.wff, [RuExp(v, -1), RuExp(xb, -1)]);
 					enumSs = \dE : RuExp, biId : int ->
-						maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, dE.nodes, stcl, depth, path, prover_env), \pd ->
+						maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, dE.nodes, stcl, depth, path, memo, prover_env), \pd ->
 							RuProofStep(s2id_("mpbid"), [pd,
 								RuProofStep(s2id_("a1i"),
 									[RuProofStep(biId, [], RuStmt(stcl, [ruFwdMkRule(ids.wb, ids.wff, [dE, RuExp(x, -1)])], -1))],
@@ -3630,7 +3662,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 							tryVia = \pEq : RuProofTree, eE : [RuExpNode] ->
 								if (eE == xa) None() // a = a, no progress
 								else maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi,
-									(ruFwdMkRule(ids.wss, ids.wff, [RuExp(eE, -1), RuExp(xb, -1)])).nodes, stcl, depth - 1, path, prover_env), \pSs1 ->
+									(ruFwdMkRule(ids.wss, ids.wff, [RuExp(eE, -1), RuExp(xb, -1)])).nodes, stcl, depth - 1, path, memo, prover_env), \pSs1 ->
 									RuProofStep(s2id_("eqsstrd"), [pEq, pSs1], RuStmt(stcl, [psiX], -1)));
 							if (eu1 == xa) tryVia(fe1.first, ev1)
 							else if (ev1 == xa) tryVia(
@@ -3672,7 +3704,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 								switch (cSs) { Some(__): cSs; None():
 									// (f2) fallback: case-split the ⊆-goal on a pooled ∨-fact
 									// (t118-class: the disguised 8-way enumeration ∨)
-									ruFwdOrElimClose(ids, eids, rules, asses, facts, bareFacts, psi, x, stcl, depth, path0, prover_env);
+									ruFwdOrElimClose(ids, eids, rules, asses, facts, bareFacts, psi, x, stcl, depth, path0, memo, prover_env);
 								}
 							}
 						}
@@ -3692,7 +3724,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 // split, gate <2: the used ∨-fact is CONSUMED and the ianor children are
 // well-founded, the timer guard bounds the budget — an 8-way ∨ needs 7 splits.
 ruFwdOrElimClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asses : RuIndex<RuAssertion>,
-	facts : RuFwdClsFacts, bareFacts : RuFwdClsFacts, psi : RuExp, x : [RuExpNode], stcl : int, depth : int, path0 : [[RuExpNode]], prover_env : RuProverEnv) -> Maybe<RuProofTree> {
+	facts : RuFwdClsFacts, bareFacts : RuFwdClsFacts, psi : RuExp, x : [RuExpNode], stcl : int, depth : int, path0 : [[RuExpNode]], memo : ref Tree<Pair<[RuExpNode], Pair<[RuExpNode], int>>, Maybe<RuProofTree>>, prover_env : RuProverEnv) -> Maybe<RuProofTree> {
 	mkImp = \e1, e2 -> ruFwdMkRule(ids.wi, ids.wff, [e1, e2]);
 	empty = [ruMakeRuleNode(s2id("c0"), ids.cls, 0, 0)];
 	psiX = mkImp(psi, RuExp(x, -1));
@@ -3711,14 +3743,17 @@ ruFwdOrElimClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], a
 	// (t94-class: x5∈x21 under a ∨ of product ⊆-facts, each branch
 	// closing by the (d2) product transport).
 	if (depth < 1) None() else
-	fold(facts.ors, None(), \acO2, orf2 -> switch (acO2) {
+	foldi(facts.ors, None(), \i2, acO2, orf2 -> switch (acO2) {
 		Some(__): acO2;
 		None(): {
 			on2 = orf2.second;
 			o2lend = ruFwdSpan(on2, 1);
 			oa2 = subrange(on2, 1, o2lend - 1);
 			ob2 = subrange(on2, o2lend, length(on2) - o2lend);
-			others = filter(facts.ors, \g -> g.second != on2);
+			// CANONICAL PIVOT ORDER: a branch inherits only the ∨-facts AFTER this one.
+			// Case-splitting is commutative, so every SET of splits stays reachable (taken
+			// in index order); only the n! PERMUTATIONS of the same set are pruned.
+			others = subrange(facts.ors, i2 + 1, length(facts.ors) - i2 - 1);
 			mkBranch2 = \dq : [RuExpNode] -> {
 				psi2 = ruFwdMkRule(ids.wa, ids.wff, [psi, RuExp(dq, -1)]);
 				wk = \p : Pair<RuProofTree, [RuExpNode]>, bodyE : RuExp ->
@@ -3731,7 +3766,7 @@ ruFwdOrElimClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], a
 					map(facts.neg, \p -> wk(p, ruFwdMkRule(ids.wn, ids.wff, [RuExp(p.second, -1)]))));
 				pD = RuProofStep(s2id_("simpr"), [], RuStmt(stcl, [ruFwdMkRule(ids.wi, ids.wff, [psi2, RuExp(dq, -1)])], -1));
 				branchFacts = ruFwdClassifyFact(ids, Pair(pD, dq), stcl, Some(psi2), wkFacts, 4);
-				maybeMap(ruFwdLitClose(ids, eids, rules, asses, branchFacts, bareFacts, psi2, x, stcl, depth - 1, path0, prover_env), \pg ->
+				maybeMap(ruFwdLitClose(ids, eids, rules, asses, branchFacts, bareFacts, psi2, x, stcl, depth - 1, path0, memo, prover_env), \pg ->
 					RuProofStep(s2id_("ex"), [pg], RuStmt(stcl, [mkImp(psi, mkImp(RuExp(dq, -1), RuExp(x, -1)))], -1)));
 			};
 			maybeBind(mkBranch2(oa2), \pa2 ->
@@ -3749,7 +3784,7 @@ ruFwdOrElimClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], a
 // ψ→¬¬x strips by notnotrd (t130-132: the spcv-instantiated d10 trivial rule
 // ¬((a∈X)∧((b∈X)∧¬(a=b))) resolves against the pooled memberships).
 ruFwdNegAndResolve(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asses : RuIndex<RuAssertion>,
-	facts : RuFwdClsFacts, bareFacts : RuFwdClsFacts, psi : RuExp, x : [RuExpNode], pCur : RuProofTree, rN : [RuExpNode], stcl : int, depth : int, path : [[RuExpNode]], prover_env : RuProverEnv) -> Maybe<RuProofTree> {
+	facts : RuFwdClsFacts, bareFacts : RuFwdClsFacts, psi : RuExp, x : [RuExpNode], pCur : RuProofTree, rN : [RuExpNode], stcl : int, depth : int, path : [[RuExpNode]], memo : ref Tree<Pair<[RuExpNode], Pair<[RuExpNode], int>>, Maybe<RuProofTree>>, prover_env : RuProverEnv) -> Maybe<RuProofTree> {
 	// pCur proves ψ→¬R (R = rN); terminal R == ¬x
 	mkImp = \e1, e2 -> ruFwdMkRule(ids.wi, ids.wff, [e1, e2]);
 	negX = ruFwdMkRule(ids.wn, ids.wff, [RuExp(x, -1)]);
@@ -3774,10 +3809,10 @@ ruFwdNegAndResolve(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule],
 					ruFwdMkRule(ids.wn, ids.wff, [RuExp(rN, -1)])])], -1));
 			pPeel = RuProofStep(s2id_("sylibr"), [pCur, imnanInst],
 				RuStmt(stcl, [mkImp(psi, mkImp(RuExp(c, -1), nr2))], -1));
-			maybeBind(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, c, stcl, depth - 1, path, prover_env), \pc ->
+			maybeBind(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, c, stcl, depth - 1, path, memo, prover_env), \pc ->
 				ruFwdNegAndResolve(ids, eids, rules, asses, facts, bareFacts, psi, x,
 					RuProofStep(s2id_("mpd"), [pc, pPeel], RuStmt(stcl, [mkImp(psi, nr2)], -1)),
-					r2, stcl, depth - 1, path, prover_env));
+					r2, stcl, depth - 1, path, memo, prover_env));
 		}
 	}
 }
@@ -3788,7 +3823,7 @@ ruFwdNegAndResolve(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule],
 // (⊆-arithmetic), t57/t62/t105 (⊊-unfolds + antisymmetry), t66/t70/t77-class
 // (disjointness) all land here.
 ruFwdClauseClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asses : RuIndex<RuAssertion>,
-	bareFacts : RuFwdClsFacts, premLeaves : [Pair<RuProofTree, [RuExpNode]>], body : [RuExpNode], stcl : int, depth : int, path0 : [[RuExpNode]], prover_env : RuProverEnv) -> Maybe<RuProofTree> {
+	bareFacts : RuFwdClsFacts, premLeaves : [Pair<RuProofTree, [RuExpNode]>], body : [RuExpNode], stcl : int, depth : int, path0 : [[RuExpNode]], memo : ref Tree<Pair<[RuExpNode], Pair<[RuExpNode], int>>, Maybe<RuProofTree>>, prover_env : RuProverEnv) -> Maybe<RuProofTree> {
 	if (contains(path0, body) || ruTimeIsOver(prover_env.conf.timer)) None() else {
 	path = arrayPush(path0, body);
 	if (prover_env.env.conf.verbose >= 5) {
@@ -3803,8 +3838,8 @@ ruFwdClauseClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], a
 				lend = ruFwdSpan(body, 1);
 				l = subrange(body, 1, lend - 1);
 				r = subrange(body, lend, length(body) - lend);
-				maybeBind(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, l, stcl, depth, path, prover_env), \pl ->
-					maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, r, stcl, depth, path, prover_env), \pr ->
+				maybeBind(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, l, stcl, depth, path, memo, prover_env), \pl ->
+					maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, r, stcl, depth, path, memo, prover_env), \pr ->
 						RuProofStep(s2id_("pm3.2i"), [pl, pr], RuStmt(stcl, [RuExp(body, -1)], -1))));
 			} else if (hid == ids.wi && length(body) >= 3) {
 				lend = ruFwdSpan(body, 1);
@@ -3819,7 +3854,7 @@ ruFwdClauseClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], a
 					chi = subrange(r, 1, length(r) - 1);
 					synth = ruFwdMkRule(ids.wn, ids.wff,
 						[ruFwdMkRule(ids.wa, ids.wff, [RuExp(l, -1), RuExp(chi, -1)])]);
-					maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, synth.nodes, stcl, depth, path, prover_env),
+					maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, synth.nodes, stcl, depth, path, memo, prover_env),
 						\pc -> RuProofStep(s2id_("imnani"), [pc], RuStmt(stcl, [RuExp(body, -1)], -1)));
 				} else {
 					// φ→χ, χ positive: guard on the antecedent, close the literal —
@@ -3832,7 +3867,7 @@ ruFwdClauseClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], a
 							RuStmt(stcl, [mkImp(psi, RuExp(pr.second, -1))], -1)),
 						pr.second));
 					facts = ruFwdBuildClsFacts(ids, prover_env.assertions, prover_env.fns.fresher, concat(lifted, conjs), stcl, Some(psi));
-					ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, r, stcl, depth, path, prover_env);
+					ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, r, stcl, depth, path, memo, prover_env);
 				}
 			} else if (hid == ids.wb && length(body) >= 3) {
 				// a BARE biconditional: impbii of the two implication directions,
@@ -3842,17 +3877,17 @@ ruFwdClauseClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], a
 				r = subrange(body, lend, length(body) - lend);
 				d1E = ruFwdMkRule(ids.wi, ids.wff, [RuExp(l, -1), RuExp(r, -1)]);
 				d2E = ruFwdMkRule(ids.wi, ids.wff, [RuExp(r, -1), RuExp(l, -1)]);
-				maybeBind(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, d1E.nodes, stcl, depth, path, prover_env), \p1 ->
-					maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, d2E.nodes, stcl, depth, path, prover_env), \p2 ->
+				maybeBind(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, d1E.nodes, stcl, depth, path, memo, prover_env), \p1 ->
+					maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, d2E.nodes, stcl, depth, path, memo, prover_env), \p2 ->
 						RuProofStep(s2id_("impbii"), [p1, p2], RuStmt(stcl, [RuExp(body, -1)], -1))));
 			} else if (hid == ids.wo && length(body) >= 3) {
 				lend = ruFwdSpan(body, 1);
 				l = subrange(body, 1, lend - 1);
 				r = subrange(body, lend, length(body) - lend);
-				p1 = maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, l, stcl, depth, path, prover_env),
+				p1 = maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, l, stcl, depth, path, memo, prover_env),
 					\p -> RuProofStep(s2id_("orci"), [p], RuStmt(stcl, [RuExp(body, -1)], -1)));
 				switch (p1) { Some(__): p1; None(): {
-				p2 = maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, r, stcl, depth, path, prover_env),
+				p2 = maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, r, stcl, depth, path, memo, prover_env),
 					\p -> RuProofStep(s2id_("olci"), [p], RuStmt(stcl, [RuExp(body, -1)], -1)));
 				switch (p2) { Some(__): p2; None(): {
 					// the oran route: ⊢(a∨b) from refuting ¬a∧¬b (t104 dir 1)
@@ -3861,7 +3896,7 @@ ruFwdClauseClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], a
 							ruFwdMkRule(ids.wn, ids.wff, [RuExp(l, -1)]),
 							ruFwdMkRule(ids.wn, ids.wff, [RuExp(r, -1)])]);
 						synth = ruFwdMkRule(ids.wn, ids.wff, [nn]);
-						maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, synth.nodes, stcl, depth - 1, path, prover_env), \pc -> {
+						maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, synth.nodes, stcl, depth - 1, path, memo, prover_env), \pc -> {
 							bi = ruFwdMkRule(ids.wb, ids.wff, [RuExp(body, -1), synth]);
 							RuProofStep(s2id_("mpbir"), [pc,
 								RuProofStep(s2id_("oran"), [], RuStmt(stcl, [bi], -1))],
@@ -3893,7 +3928,7 @@ ruFwdClauseClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], a
 				refuted = fold(facts.neg, None(), \acc, ng -> switch (acc) {
 					Some(__): acc;
 					None(): maybeMap(
-						ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, ng.second, stcl, depth, path, prover_env),
+						ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, ng.second, stcl, depth, path, memo, prover_env),
 						\pg -> RuProofStep(s2id_("pm2.65i"), [pg, ng.first], RuStmt(stcl, [RuExp(body, -1)], -1)));
 				});
 				// EL-CLASH: an element of a pooled el-fact provably belongs to a
@@ -3912,7 +3947,7 @@ ruFwdClauseClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], a
 							Some(__): acX;
 							None(): {
 								celE = ruFwdMkRule(ids.wcel, ids.wff, [RuExp(xe, -1), RuExp(qf.second, -1)]);
-								maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, celE.nodes, stcl, depth - 1, path, prover_env), \pg -> {
+								maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, celE.nodes, stcl, depth - 1, path, memo, prover_env), \pg -> {
 									eqE = ruFwdMkRule(s2id("wceq"), ids.wff, [RuExp(qf.second, -1), RuExp(empty0, -1)]);
 									inst = RuProofStep(s2id_("nel02"), [],
 										RuStmt(stcl, [mkImp(eqE, ruFwdMkRule(ids.wn, ids.wff, [celE]))], -1));
@@ -3941,8 +3976,8 @@ ruFwdClauseClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], a
 							ob = subrange(on, olend, length(on) - olend);
 							synthA = ruFwdMkRule(ids.wn, ids.wff, [ruFwdMkRule(ids.wa, ids.wff, [psi, RuExp(oa, -1)])]);
 							synthB = ruFwdMkRule(ids.wn, ids.wff, [ruFwdMkRule(ids.wa, ids.wff, [psi, RuExp(ob, -1)])]);
-							maybeBind(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, synthA.nodes, stcl, depth - 1, path, prover_env), \pa ->
-								maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, synthB.nodes, stcl, depth - 1, path, prover_env), \pb -> {
+							maybeBind(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, synthA.nodes, stcl, depth - 1, path, memo, prover_env), \pa ->
+								maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, synthB.nodes, stcl, depth - 1, path, memo, prover_env), \pb -> {
 									nnA = ruFwdMkRule(ids.wn, ids.wff, [RuExp(oa, -1)]);
 									nnB = ruFwdMkRule(ids.wn, ids.wff, [RuExp(ob, -1)]);
 									qa = RuProofStep(s2id_("imnani"), [pa], RuStmt(stcl, [mkImp(psi, nnA)], -1));
@@ -3973,7 +4008,7 @@ ruFwdClauseClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], a
 // hypothesis-theorem counterpart of the clause discharge (t8-class:
 // x8∈(x5∖{x7}) from ⊊/∈/∉ hypotheses).
 ruFwdBareLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asses : RuIndex<RuAssertion>,
-	bareFacts : RuFwdClsFacts, premLeaves : [Pair<RuProofTree, [RuExpNode]>], goal : [RuExpNode], stcl : int, depth : int, prover_env : RuProverEnv) -> Maybe<RuProofTree> {
+	bareFacts : RuFwdClsFacts, premLeaves : [Pair<RuProofTree, [RuExpNode]>], goal : [RuExpNode], stcl : int, depth : int, memo : ref Tree<Pair<[RuExpNode], Pair<[RuExpNode], int>>, Maybe<RuProofTree>>, prover_env : RuProverEnv) -> Maybe<RuProofTree> {
 	path : [[RuExpNode]] = [];
 	if (premLeaves == []) None()
 	else {
@@ -3988,7 +4023,7 @@ ruFwdBareLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], 
 		psiE = RuExp(assembled.second, -1);
 		conjs = ruFwdConjProjections(ids, psiE, assembled.second, None(), stcl);
 		facts = ruFwdBuildClsFacts(ids, prover_env.assertions, prover_env.fns.fresher, conjs, stcl, Some(psiE));
-		resBare = maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psiE, goal, stcl, depth, path, prover_env), \pg ->
+		resBare = maybeMap(ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psiE, goal, stcl, depth, path, memo, prover_env), \pg ->
 			RuProofStep(ids.axmp, [assembled.first, pg], RuStmt(stcl, [RuExp(goal, -1)], -1)));
 		if (prover_env.env.conf.verbose >= 6) {
 			prover_env.env.out.println("  bareLit EXIT " + ruSafeExp2s(RuExp(goal, -1), prover_env.math.decls.lang)
@@ -4196,7 +4231,7 @@ ruSeedEqNormalize(prover_env : RuProverEnv, c_task : RuConstAny<RuProverTask>, f
 				// eq0 ∅-cover) against the ψ→¬X projections. Normalization stays
 				// BARE (structural identities are 0-hyp; a1i lifts their chains).
 				rules = mkRules();
-				switch (ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, body, stcl, 6, [], prover_env)) {
+				switch ((if (ruLitClosersOff(prover_env)) None() else ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, body, stcl, 6, [], ref makeTree(), prover_env))) {
 					None(): {
 						// the ¬-goal may be a POSITIVE claim in disguise — ¬(T=∅) is
 						// nonemptiness (t110's step 1), closable by the bare-premise
@@ -4214,7 +4249,7 @@ ruSeedEqNormalize(prover_env : RuProverEnv, c_task : RuConstAny<RuProverTask>, f
 						// the shape check is exact, so no other failing ¬-clause re-burns
 						isProdEx = isSome(ruFwdMizProdExParse(ids, subrange(body, 1, length(body) - 1)));
 						bare = if (!isNe0 && !isProdEx) None()
-							else ruFwdBareLitClose(ids, eids, rules, asses, bareFacts, premLeaves, body, stcl, 6, prover_env);
+							else (if (ruLitClosersOff(prover_env)) None() else ruFwdBareLitClose(ids, eids, rules, asses, bareFacts, premLeaves, body, stcl, 6, ref makeTree(), prover_env));
 						switch (bare) {
 							Some(pb): {
 								if (prover_env.env.conf.verbose >= 4) {
@@ -4298,7 +4333,7 @@ ruSeedEqNormalize(prover_env : RuProverEnv, c_task : RuConstAny<RuProverTask>, f
 									ruFwdMkRule(ids.wcel, ids.wff, [RuExp(vSlice, -1), RuExp(xs, -1)]),
 									ruFwdMkRule(ids.wcel, ids.wff, [RuExp(vSlice, -1), RuExp(ys, -1)])]);
 								impE = ruFwdMkRule(ids.wi, ids.wff, [RuExp(hypBody, -1), biE]);
-								maybeMap(ruFwdClauseClose(ids, eids, rules, asses, bareFacts, [], impE.nodes, stcl, 5, [], prover_env), \pImp -> {
+								maybeMap((if (ruLitClosersOff(prover_env)) None() else ruFwdClauseClose(ids, eids, rules, asses, bareFacts, [], impE.nodes, stcl, 5, [], ref makeTree(), prover_env)), \pImp -> {
 									pBody = RuProofStep(s2id_("spi"), [pl.first], RuStmt(stcl, [RuExp(hypBody, -1)], -1));
 									pBi = RuProofStep(ids.axmp, [pBody, pImp], RuStmt(stcl, [biE], -1));
 									allE = ruFwdMkRule(ids.wal, ids.wff, [RuExp([v], -1), biE]);
@@ -4316,7 +4351,7 @@ ruSeedEqNormalize(prover_env : RuProverEnv, c_task : RuConstAny<RuProverTask>, f
 				if (nx.first != ny.first) {
 					switch (pointwise()) {
 						Some(p): register(p);
-						None(): switch (ruFwdBareLitClose(ids, eids, rules, asses, bareFacts, premLeaves, body, stcl, 6, prover_env)) {
+						None(): switch ((if (ruLitClosersOff(prover_env)) None() else ruFwdBareLitClose(ids, eids, rules, asses, bareFacts, premLeaves, body, stcl, 6, ref makeTree(), prover_env))) {
 							// the BARE-PREMISE route: equality goals of hypothesis
 							// theorems (t4_zfmisc_1: {x}={y,z} ⊢ x=y — the derived
 							// member equalities close it through the eqs pool)
@@ -4367,7 +4402,7 @@ ruSeedEqNormalize(prover_env : RuProverEnv, c_task : RuConstAny<RuProverTask>, f
 					// of ruFwdClauseClose handles both shapes.
 					if (hid != ids.wi && hid != ids.wb) fwd else {
 						rules2 = mkRules();
-						switch (ruFwdClauseClose(ids, eids, rules2, asses, bareFacts, premLeaves, body, stcl, 6, [], prover_env)) {
+						switch ((if (ruLitClosersOff(prover_env)) None() else ruFwdClauseClose(ids, eids, rules2, asses, bareFacts, premLeaves, body, stcl, 6, [], ref makeTree(), prover_env))) {
 							None(): fwd;
 							Some(p): register(p);
 						}
@@ -4418,10 +4453,10 @@ ruSeedEqNormalize(prover_env : RuProverEnv, c_task : RuConstAny<RuProverTask>, f
 						// an ∧ of CLAUSES (t66-class) — per-conjunct pm2.65i; else the
 						// BARE-PREMISE route (guard on the ∧ of hypotheses, t8-class)
 						cl = if (hid != ids.wa && hid != ids.wo) None()
-							else ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, body, stcl, 6, [], prover_env);
+							else (if (ruLitClosersOff(prover_env)) None() else ruFwdClauseClose(ids, eids, rules, asses, bareFacts, premLeaves, body, stcl, 6, [], ref makeTree(), prover_env));
 						switch (cl) {
 							Some(p): register(p);
-							None(): switch (ruFwdBareLitClose(ids, eids, rules, asses, bareFacts, premLeaves, body, stcl, 8, prover_env)) {
+							None(): switch ((if (ruLitClosersOff(prover_env)) None() else ruFwdBareLitClose(ids, eids, rules, asses, bareFacts, premLeaves, body, stcl, 8, ref makeTree(), prover_env))) {
 								None(): fwd;
 								Some(p2): register(p2);
 							}
