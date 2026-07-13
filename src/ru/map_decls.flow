@@ -174,14 +174,52 @@ ruMapDeclsSequentially(decls : [RuDecl], f : RuMapFn, time_limit : double, timer
 	});
 }
 
-ruMapDeclsConcurrently(decls : [RuDecl], f : RuMapFn, time_limit : double, timer : RuTimer, mapped_math : RuMappedMath, env : RuEnv) -> RuMappedMath {
+ruMapDeclsConcurrently(decls : [RuDecl], f : RuMapFn, width : int, time_limit : double, timer : RuTimer, mapped_math : RuMappedMath, env : RuEnv) -> RuMappedMath {
 	split_by = ruOptsString(env.conf.opts, "decls-split-num", "");
-	if (split_by == "") {
+	if (width > 0) {
+		ruMapDeclsConcurrentlyBounded(decls, f, width, time_limit, timer, mapped_math, env);
+	} else if (split_by == "") {
 		ruMapDeclsConcurrentlyAll(decls, f, time_limit, timer, mapped_math, env);
 	} else {
 		chunks = splitByNumber(decls, s2i(split_by));
 		ruMapDeclsConcurrentlyByChunks(chunks, f, time_limit, timer, mapped_math, env);
 	}
+}
+
+// BOUNDED-WIDTH streaming concurrency: exactly `width` worker loops pull the next decl index
+// from a shared atomic cursor — no chunk barriers (a straggler never blocks the queue) and
+// never more than `width` decls in flight. This is the mode for many wall-clock-budgeted
+// provers on one machine: unbounded width (ruMapDeclsConcurrentlyAll floods the pool with all
+// decls at once) runs ~nproc allocation-heavy provers concurrently, and the memory/GC
+// contention devalues every wall-clock slice (zfmisc_1 measured 95/140 sequential vs 9/140
+// unbounded-parallel with the SAME slices). The slice scale factor is `width` — the number
+// actually in flight — not nproc.
+ruMapDeclsConcurrentlyBounded(decls : [RuDecl], f : RuMapFn, width : int, time_limit : double, timer : RuTimer, mapped_math : RuMappedMath, env : RuEnv) -> RuMappedMath {
+	measures = ruDecls2Measures(decls, f);
+	sum_measure = ruSumDoublesFromArray(measures);
+	n = length(decls);
+	cursor = ref 0;
+	next = ruAtomicIntAdd(cursor);
+	results : ConcurHashMap<int, RuMappedDecl> = makeConcurHashMap(idfn);
+	worker = \env1 : RuEnv -> {
+		for(next(1) - 1, \i -> i < n, \i -> {
+			d = decls[i];
+			m = if (ruTimeIsOver(timer)) {
+				RuMappedDecl(false, false, d);
+			} else {
+				slice = time_limit * i2d(width) * measures[i] / sum_measure;
+				left = ruTimeLeft(timer);
+				f.func(d, if (slice < left) slice else left, env1);
+			}
+			setConcurHashMap(results, i, m);
+			next(1) - 1;
+		});
+		0;
+	}
+	ruConcurrent(map(enumFromTo(1, min(width, max(n, 1))), \__ -> worker), env);
+	foldi(decls, mapped_math, \i, acc, d ->
+		ruAddMappedDecl2MappedMath(acc, getConcurHashMap(results, i, RuMappedDecl(false, false, d)), env)
+	);
 }
 
 ruMapDeclsConcurrentlyAll(decls : [RuDecl], f : RuMapFn, time_limit : double, timer : RuTimer, mapped_math : RuMappedMath, env : RuEnv) -> RuMappedMath {
@@ -277,7 +315,10 @@ ruMapFnComm(unit : RuUnit, f : RuMapFn) -> RuState {
 		if (!ruTargetIsConcurrent(target) || length(to_proc) == 1) {
 			ruMapDeclsSequentially(to_proc, prog_f, new_time_limit, stats.progress.timer, to_map_math, env);
 		} else {
-			ruMapDeclsConcurrently(to_proc, prog_f, new_time_limit, stats.progress.timer, to_map_math, env);
+			// map-width > 0 = bounded-width streaming concurrency (set programmatically by the
+			// command, e.g. prove's parallel=N); 0 = the legacy unbounded pool flood.
+			width = ruTaskIntArg(task, "map-width", 0);
+			ruMapDeclsConcurrently(to_proc, prog_f, width, new_time_limit, stats.progress.timer, to_map_math, env);
 		}
 	}
 	mapped = for(

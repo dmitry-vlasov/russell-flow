@@ -44,7 +44,7 @@ ruCommProve = RuComm(
 			RuCommArg("relevance-tolerance",   true,  "SInE trigger tolerance (>=1; higher = more premises kept)",                        "1.2"),
 			RuCommArg("relevance-ubiq",        true,  "fraction of assertions a symbol must hit to count as ubiquitous logical glue",     "0.4"),
 			RuCommArg("exclude-disjointed",    true,  "drop disjoint-variable theorems from scope (efficiency; soundness is type-level)", "1"),
-			RuCommArg("parallel",              true,  "1 = prove theorems in parallel (experimental — limited by nested thread-pool contention); 0 = sequential (default, reliable)", "0"),
+			RuCommArg("parallel",              true,  "0 = sequential (default); N>1 = prove up to N theorems concurrently (bounded width — keeps wall-clock slices honest); 1 = unbounded pool (legacy, loses theorems to GC contention)", "0"),
 			RuCommArg("progress",              true,  "override verbosity for the after-all report (else conf.verb): 0 none, 1 summary, 2 a ✓/✗ line per theorem", "")
 		], ruMapFnCommArgs), []
 	),
@@ -183,18 +183,25 @@ ruRunProve(unit : RuUnit) -> Maybe<RuState> {
 		//     the tactic can be internally concurrent too).
 		//   parallel=0 (default elsewhere): force sequential outer traversal (-seq) to avoid nested
 		//     thread-pool contention; same per-theorem budget via min(n, nProc) scaling.
-		run_parallel   = ruTaskIntArg(task, "parallel", 0) > 0;
+		par_arg        = ruTaskIntArg(task, "parallel", 0);
+		run_parallel   = par_arg > 0;
 		n_theorems     = length(filter(ruTargetDecls(target, math, env), ruDeclIsTheorem));
-		n_par          = availableProcessors();
+		// parallel=1 = legacy unbounded (the whole pool at once); parallel=N>1 = bounded width N.
+		// Unbounded floods ~nproc allocation-heavy provers onto one heap and the GC/memory
+		// contention devalues every wall-clock slice (zfmisc_1: 95/140 sequential vs 9/140
+		// unbounded with identical slices, invariant under tl 10s -> 60s). A bounded width
+		// keeps each slice honest while still overlapping N theorems.
+		n_par          = if (par_arg > 1) min(par_arg, availableProcessors()) else availableProcessors();
 		job_limit_str  = ruTaskStringArg(task, "job-time-limit", "");
 		cap_job        = \ms -> if (job_limit_str != "" && job_limit_str != "no") min(ms, ruParseTime(job_limit_str)) else ms;
 		dispatch_task  = if (run_parallel) {
-			// slice = job * nproc / n is the effective per-theorem budget (the tactic does not self-limit;
-			// it runs until ruEvalTimed3 stops it at the slice). job timer = per_th_ms * n / nproc gives
+			// slice = job * width / n is the effective per-theorem budget (the tactic does not self-limit;
+			// it runs until ruEvalTimed3 stops it at the slice). job timer = per_th_ms * n / width gives
 			// slice ≈ per_th_ms. The count and progress are taken from the FINAL math state below, not the
 			// racy ref counters, so retries / abandoned-thread prints can't corrupt the reported result.
 			job_ms = cap_job(per_th_ms * i2d(max(1, n_theorems)) / i2d(max(1, n_par)));
-			RuTask(task with args = setTree(task.args, "time-limit", ruTime2s(job_ms)));
+			task1 = RuTask(task with args = setTree(task.args, "time-limit", ruTime2s(job_ms)));
+			if (par_arg > 1) RuTask(task1 with args = setTree(task1.args, "map-width", i2s(n_par))) else task1;
 		} else {
 			// The job budget must cover EVERY theorem at ≈per_th_ms: the sequential
 			// mapper hands each decl time_limit·measure/Σmeasure, so a job of

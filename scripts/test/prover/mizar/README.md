@@ -30,6 +30,34 @@ see the mizar-decision-gap memory / forward.flow, proofs.flow:121).
   bare `russellj test/...` invocation then dies at `read-ru`: obligatory `file`
   missing). Write lemma sets as `(a, b)` in help text, never `{a, b}`.
 
+## Concurrent proving (par=N) — fast smoke, NOT floors
+
+`measure.sh <article> <off> <tl> <par>` proves up to `par` theorems concurrently
+(`prove parallel=N` → the bounded-width streaming mapper in map_decls.flow; no chunk
+barriers, slices scaled by the width actually in flight). Measured on zfmisc_1
+general-only (sequential = 95/140 in ~7 min, reproducible):
+
+| mode                    | proved  | wall  |
+|-------------------------|---------|-------|
+| sequential (par=0)      | 95/140  | 420 s |
+| par=8                   | 92/140  | 159 s |
+| par=8 (repeat)          | 87/140  | 215 s |
+| par=4                   | 91/140  | 192 s |
+| par=1 (unbounded, legacy)| 9/140  |  80 s |
+
+WHY the loss: not persistence (verify=true everywhere, xboole_0 8-wide is exact) and
+not core starvation — the provers are effectively single-threaded (t112 probe: 0.41 s
+at threads=1 vs 0.62 s pooled). It is the 50 W package-power cap: N busy cores share
+the wattage, per-core clocks drop ~2x, and every WALL-CLOCK slice (tl, dcms/mzms/eqms)
+buys less work, varying with width, heat and governor state. Widening the slices 1.3x
+did NOT recover the borderliners (90/140) — the effect is not a constant factor.
+
+USE: par=8 for a quick differential signal while iterating (2.6x faster, +-5 theorems
+noise band, open-set diffs meaningful only outside that band). NEVER for floors or
+commit-message numbers — those are sequential. The real fix is deterministic work-unit
+budgets (limited() already supports applied/produced/size/depth) through the checker
+stages and refiner/closer timers — open design item.
+
 ## Pinned golden floors (00_baseline.rus)
 
 Settings: tl=8s, relevance-depth=0, max-depth=8, max-size=65536 — keep STABLE

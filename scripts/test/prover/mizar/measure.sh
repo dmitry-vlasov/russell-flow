@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # HERMETIC MIZAR MEASUREMENT.
 #
-#   scripts/test/prover/mizar/measure.sh <article> [off] [tl]        # one article
-#   scripts/test/prover/mizar/measure.sh --chain    [off] [tl]       # the whole dependency chain
+#   scripts/test/prover/mizar/measure.sh <article> [off] [tl] [par]  # one article
+#   scripts/test/prover/mizar/measure.sh --chain    [off] [tl] [par] # the whole dependency chain
+#
+#   par=N (N>1)      prove up to N theorems concurrently — FAST SMOKE ONLY (~2.6x at N=8, but
+#                    the power cap devalues wall-clock slices: +-5 theorems noise; see README).
+#                    Floors and commit numbers are ALWAYS par=0 (sequential, count-exact).
 #   scripts/test/prover/mizar/measure.sh --probe <article> <theorem> [off] [v]
 #
 #   off=1 (default)  the GENERAL-PATH metric: hand-written literal closers disabled
@@ -42,12 +46,13 @@ setup_sandbox() {
 	ln -s "$RUSSELL_MATH/MML" "$SANDBOX/MML"          # the Mizar XML, read-only
 }
 
-run_article() {   # <article> <off> <tl>
-	local article="$1" off="$2" tl="$3"
+run_article() {   # <article> <off> <tl> [par]   (stage slices via env: DCMS/MZMS/EQMS)
+	local article="$1" off="$2" tl="$3" par="${4:-0}"
 	setup_sandbox
 	local out
 	out="$(RUSSELL_MATH="$SANDBOX" "$RUSSELL_BIN" no-server=1 mem=16g \
-		test/prover/mizar/general_only article="$article" off="$off" tl="$tl" 2>&1)"
+		test/prover/mizar/general_only article="$article" off="$off" tl="$tl" par="$par" \
+		dcms="${DCMS:-4500}" mzms="${MZMS:-1500}" eqms="${EQMS:-1000}" 2>&1)"
 	local open verify total
 	open="$(grep -oP 'open theorems -> axioms: \K[0-9]+' <<<"$out" || echo '?')"
 	verify="$(grep -oP 'Russell verify \(all proofs valid\): \K\w+' <<<"$out" || echo '?')"
@@ -59,20 +64,20 @@ run_article() {   # <article> <off> <tl>
 
 case "${1:-}" in
 	--chain)
-		off="${2:-1}"; tl="${3:-10s}"
-		echo "== hermetic measurement, off=$off (1 = general path only), tl=$tl"
-		for a in "${CHAIN[@]}"; do run_article "$a" "$off" "$tl"; done
+		off="${2:-1}"; tl="${3:-10s}"; par="${4:-0}"
+		echo "== hermetic measurement, off=$off (1 = general path only), tl=$tl, par=$par"
+		for a in "${CHAIN[@]}"; do run_article "$a" "$off" "$tl" "$par"; done
 		;;
 	--probe)
-		article="${2:?article}"; theorem="${3:?theorem}"; off="${4:-1}"; v="${5:-1}"
+		article="${2:?article}"; theorem="${3:?theorem}"; off="${4:-1}"; v="${5:-1}"; thr="${6:-0}"
 		setup_sandbox
 		RUSSELL_MATH="$SANDBOX" "$RUSSELL_BIN" no-server=1 mem=16g \
-			test/prover/mizar/general_probe module="$article" target="$theorem" off="$off" v="$v"
+			test/prover/mizar/general_probe module="$article" target="$theorem" off="$off" v="$v" thr="$thr"
 		;;
 	"" | -h | --help)
 		sed -n '2,30p' "${BASH_SOURCE[0]}"
 		;;
 	*)
-		run_article "$1" "${2:-1}" "${3:-10s}"
+		run_article "$1" "${2:-1}" "${3:-10s}" "${4:-0}"
 		;;
 esac
