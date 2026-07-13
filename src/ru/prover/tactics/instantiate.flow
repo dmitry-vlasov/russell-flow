@@ -41,11 +41,21 @@ import ds/set;
 // ---------------------------------------------------------------------------
 
 export {
-	// Instantiate every ∀-shaped premise at every candidate term, as (instance, proof) pairs.
-	// `hyps` are the (already normalized) premises; the proof of each instance is built against
-	// the hyp's own leaf, whose index in the premise array is given by `hypIdx`.
-	ruInstantiateFacts(math : RuMath, env : RuEnv, stmtClass : int,
-		hyps : [Pair<int, RuExp>], goal : RuExp, cap : int) -> [Pair<RuExp, RuProofTree>];
+	// THE MIZAR SATURATION over the premises, one bounded pass, everything mechanical:
+	//  (1) EMPTINESS AS A FIRST-CLASS LITERAL: a premise `X = ∅` carries its whole content in the
+	//      ∀-form eq0 gives it — `∀v ¬(v ∈ X)` — but the eq0 unfold only fired REACTIVELY (when the
+	//      goal already contained that ∀-atom), so the ∅-hypotheses were inert. Derive the ∀-form
+	//      for every such premise, with a FRESH bound var (eq0 requires DV(A x)).
+	//  (2) BOUNDED INSTANTIATION: every ∀-shaped premise (given or derived) instantiated at the
+	//      setvars OCCURRING in the problem, via spcv, declaring spcv's DV provisos and declining
+	//      when the bound var survives in the result.
+	//  (3) REFLEXIVITY: `t = t` (equid) for every candidate — the literal `x=x` that instances'
+	//      normalized forms bottom out on.
+	// `hyps` carry their own proofs (a leaf for a real hypothesis, the derivation tree for a
+	// derived one), so the returned facts are self-contained up to real-hyp leaves.
+	// Returns the facts and the DV provisos their proofs require.
+	ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
+		hyps : [Pair<RuProofTree, RuExp>], goal : RuExp, cap : int) -> Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>>;
 }
 
 // TABLE CACHE. The three scans below walk the whole assertion index (~9800 on miz_set), and the
@@ -288,17 +298,97 @@ ruInSubstAtom(atoms : Tree<int, [RuInAtomCong]>, ante : RuExp, x : RuExpNode, t 
 
 // Candidate terms, Mizar-style: the setvars that OCCUR in the goal and the premises. No search —
 // the problem supplies them. Deduped, capped.
-ruInCandidates(goal : RuExp, hyps : [Pair<int, RuExp>], setvarT : int, cap : int) -> [RuExp] {
-	collect = \e : RuExp -> filtermap(e.nodes, \n -> switch (n) {
-		RuVar(id, tp): if (tp == setvarT) Some(RuExp([n], -1)) else None();
-		RuRuleNode(__, __): None();
-	});
+// Candidates are the COERCED setvar occurrences: the 2-node slices [unary class rule, setvar]
+// (the foundation's setvar->class coercion), harvested from the goal and premises themselves —
+// no coercion-rule name is hard-wired. A bare setvar is NOT a candidate: the setness lemmas
+// (vex) and the congruence rules take the coerced form, so a bare-var candidate matches nothing
+// (which is exactly how the first version of this phase silently produced zero instances).
+ruInCandidates(goal : RuExp, hyps : [Pair<RuProofTree, RuExp>], setvarT : int, cap : int) -> [RuExp] {
+	clsT = tp2id_("class");
+	collect = \e : RuExp -> {
+		n = e.nodes;
+		filtermap(enumFromTo(0, length(n) - 2), \i -> switch (n[i]) {
+			RuVar(__, __): None();
+			RuRuleNode(idT, al): {
+				if (ruArityLen2Arity(al) != 1 || ruIdType2Type(idT) != clsT) None()
+				else switch (n[i + 1]) {
+					RuVar(__, tp): if (tp == setvarT) Some(RuExp([n[i], n[i + 1]], -1)) else None();
+					RuRuleNode(__, __): None();
+				}
+			}
+		});
+	};
 	all = concat(collect(goal), concatA(map(hyps, \h -> collect(h.second))));
 	take(fold(all, [], \acc, c -> if (exists(acc, \a -> a.nodes == c.nodes)) acc else arrayPush(acc, c)), cap);
 }
 
-ruInstantiateFacts(math : RuMath, env : RuEnv, stmtClass : int,
-	hyps : [Pair<int, RuExp>], goal : RuExp, cap : int) -> [Pair<RuExp, RuProofTree>] {
+ruInVarsOf(e : RuExp) -> [RuVar] {
+	fold(e.nodes, [], \acc, n -> switch (n) {
+		RuVar(id, tp): if (exists(acc, \v -> v.id == id)) acc else arrayPush(acc, RuVar(id, tp));
+		RuRuleNode(__, __): acc;
+	});
+}
+
+ruInFreshSetvar(used : Set<int>, setvarT : int, i : int) -> RuVar {
+	id = s2id("inst_v" + i2s(i));
+	if (containsSet(used, id)) ruInFreshSetvar(used, setvarT, i + 1) else RuVar(id, setvarT);
+}
+
+// (1) `X = ∅` premises -> their eq0 ∀-forms `∀v ¬(v ∈ X)` (fresh v), with DV(u, v) per var u of X.
+ruInEmptinessForalls(math : RuMath, env : RuEnv, stmtClass : int,
+	hyps : [Pair<RuProofTree, RuExp>], used : Set<int>, setvarT : int) -> Pair<[Pair<RuProofTree, RuExp>], Set<RuDisj>> {
+	eq0Id = s2id_("eq0");
+	switch (lookupTree(math.decls.assertions, eq0Id)) {
+		None(): Pair([], makeSet());
+		Some(ass): {
+			prop = ruExp((ruInInfer(ass)).prop.exps[0]);       // (A = ∅) ↔ ∀x ¬(x∈A)
+			pa = ruInArgs(prop);
+			lhs = pa[0];                                        // (A = ∅) — the match pattern
+			// eq0's bound var: the ∀-side's binder var
+			xNode = (ruInArgs(pa[1]))[0].nodes[0];
+			fold(hyps, Pair([], makeSet()), \acc : Pair<[Pair<RuProofTree, RuExp>], Set<RuDisj>>, h ->
+				switch (ruMatchExp(h.second, lhs, math, env)) {
+					None(): acc;
+					Some(sub0): {
+						v = ruInFreshSetvar(used, setvarT, 0);
+						m = copyHashMap(sub0.map);
+						xVar = switch (xNode) { RuVar(id, tp): RuVar(id, tp); RuRuleNode(__, __): RuVar(-1, setvarT); };
+						setHashMap(m, xVar.id, RuSubExpr(xVar, RuExp([RuVar(v.id, v.type)], -1), ruExpVarIdsHashSet(RuExp([RuVar(v.id, v.type)], -1))));
+						sub = RuSubst(m);
+						inst = ruApplySubst(prop, sub);          // (X = ∅) ↔ ∀v ¬(v∈X)
+						forallF = (ruInArgs(inst))[1];           // ∀v ¬(v∈X)
+						pEq0 = RuProofStep(eq0Id, [], RuStmt(stmtClass, [inst], -1));
+						pAll = RuProofStep(s2id_("mpbi"), [h.first, pEq0], RuStmt(stmtClass, [forallF], -1));
+						// eq0's disjointed(A x), instantiated: DV(u, v) for every var u of X
+						dvs = fold(ruInVarsOf(h.second), acc.second, \ds, u -> insertSet(ds, RuDisj(u, v)));
+						Pair(arrayPush(acc.first, Pair(pAll, forallF)), dvs);
+					}
+				});
+		}
+	}
+}
+
+// (3) reflexivity `t = t` per candidate, by equid.
+ruInReflFacts(math : RuMath, env : RuEnv, stmtClass : int, cands : [RuExp]) -> [Pair<RuExp, RuProofTree>] {
+	equidId = s2id_("equid");
+	switch (lookupTree(math.decls.assertions, equidId)) {
+		None(): [];
+		Some(ass): {
+			prop = ruExp((ruInInfer(ass)).prop.exps[0]);       // (x = x)
+			xv = fold(prop.nodes, ruNoVar, \acc, n -> switch (n) { RuVar(id, tp): if (acc == ruNoVar) RuVar(id, tp) else acc; RuRuleNode(__, __): acc; });
+			if (xv == ruNoVar) [] else map(cands, \t -> {
+				bare = RuExp([t.nodes[1]], -1);   // equid's var is SETVAR-typed: bind the bare var
+				m = makeHashMap(idfn);
+				setHashMap(m, xv.id, RuSubExpr(xv, bare, ruExpVarIdsHashSet(bare)));
+				inst = ruApplySubst(prop, RuSubst(m));
+				Pair(inst, RuProofStep(equidId, [], RuStmt(stmtClass, [inst], -1)));
+			});
+		}
+	}
+}
+
+ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
+	hyps : [Pair<RuProofTree, RuExp>], goal : RuExp, cap : int) -> Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>> {
 	walId   = s2id("wal");
 	wbId    = s2id("wb");
 	wceqId  = s2id("wceq");
@@ -306,40 +396,51 @@ ruInstantiateFacts(math : RuMath, env : RuEnv, stmtClass : int,
 	spcv    = s2id_("spcv");
 	biidd   = s2id_("biidd");
 	tabs    = ruInTables(math);
-	atoms   = tabs.atoms;
-	conns   = tabs.conns;
-	setReg  = tabs.setness;
 	cands   = ruInCandidates(goal, hyps, setvarT, cap);
-	// every ∀-shaped premise, instantiated at every candidate
-	concatA(map(hyps, \h -> {
-		phiAll = h.second;
-		if (ruInHead(phiAll) != walId || ruInArity(phiAll) != 2) []
-		else {
-			pa = ruInArgs(phiAll);
-			xE = pa[0]; body = pa[1];
-			if (length(xE.nodes) != 1) [] else {
-				x = xE.nodes[0];
-				filtermap(cands, \t ->
-					if (t.nodes == [x]) None()     // instantiating at the bound var itself is a no-op
-					else {
-						ante = ruFwdMkRule(wceqId, tp2id_("wff"), [RuExp([x], -1), t]);
-						switch (ruInSubstChain(atoms, conns, biidd, wbId, ante, x, t, body, stmtClass, math, env)) {
-							None(): None();
-							Some(sc): switch (ruSetnessProof2(setReg, t, stmtClass, math, env)) {
-								None(): None();
+	used    = fold(arrayPush(map(hyps, \h -> h.second), goal), makeSet(), \acc, e ->
+		fold(e.nodes, acc, \a, n -> switch (n) { RuVar(id, __): insertSet(a, id); RuRuleNode(__, __): a; }));
+	// (1) emptiness ∀-forms
+	emp = ruInEmptinessForalls(math, env, stmtClass, hyps, used, setvarT);
+	// (2) the ∀-pool: given ∀-premises + derived ∀-forms; instantiate at every candidate.
+	// An EMPTY pool means the whole pass has nothing to do — return nothing at all (the refl
+	// facts alone never close anything and their downstream normalization is pure cost).
+	pool = concat(filter(hyps, \h -> ruInHead(h.second) == walId && ruInArity(h.second) == 2), emp.first);
+	if (pool == []) Pair([], makeSet()) else {
+	instAcc = fold(pool, Pair([], emp.second), \acc : Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>>, h -> {
+		pa = ruInArgs(h.second);
+		xE = pa[0]; body = pa[1];
+		if (length(xE.nodes) != 1) acc else {
+			x = xE.nodes[0];
+			xVar = switch (x) { RuVar(id, tp): RuVar(id, tp); RuRuleNode(__, __): RuVar(-1, setvarT); };
+			fold(cands, acc, \acc2, t ->
+				if (t.nodes[1] == x) acc2   // instantiating at the bound var itself is a no-op
+				else {
+					// the antecedent (x = A): both sides in the coerced (class) form; the coercion
+					// node is harvested from the candidate itself
+					ante = ruFwdMkRule(wceqId, tp2id_("wff"), [RuExp([t.nodes[0], x], -1), t]);
+					switch (ruInSubstChain(tabs.atoms, tabs.conns, biidd, wbId, ante, x, t, body, stmtClass, math, env)) {
+						None(): acc2;
+						Some(sc): {
+							// spcv's DV: disjointed(A x, ps x) — decline if x survives in the result
+							if (ruInContains(sc.result, x)) acc2
+							else switch (ruSetnessProof2(tabs.setness, t, stmtClass, math, env)) {
+								None(): acc2;
 								Some(setn): {
-									// spcv: A ∈ _V , (x = A → (φ ↔ ψ)) ⊢ (∀x φ → ψ)
-									imp = ruFwdMkRule(s2id("wi"), tp2id_("wff"), [phiAll, sc.result]);
+									imp = ruFwdMkRule(s2id("wi"), tp2id_("wff"), [h.second, sc.result]);
 									pImp = RuProofStep(spcv, [setn, sc.proof], RuStmt(stmtClass, [imp], -1));
-									pInst = RuProofStep(s2id_("ax-mp"), [RuProofHyp(h.first, RuStmt(stmtClass, [phiAll], -1)), pImp],
-										RuStmt(stmtClass, [sc.result], -1));
-									Some(Pair(sc.result, pInst));
+									pInst = RuProofStep(s2id_("ax-mp"), [h.first, pImp], RuStmt(stmtClass, [sc.result], -1));
+									dvs = fold(concat(ruInVarsOf(t), ruInVarsOf(sc.result)), acc2.second, \ds, u ->
+										if (u.id == xVar.id) ds else insertSet(ds, RuDisj(u, xVar)));
+									Pair(arrayPush(acc2.first, Pair(sc.result, pInst)), dvs);
 								}
 							}
 						}
 					}
-				);
-			}
+				});
 		}
-	}));
+	});
+	// (3) reflexivity facts
+	refl = ruInReflFacts(math, env, stmtClass, cands);
+	Pair(concat(instAcc.first, refl), instAcc.second);
+	}
 }

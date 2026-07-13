@@ -8,6 +8,7 @@ import ru/prover/tactics/combinators;
 import ru/prover/tactics/equalizer;
 import ru/prover/tactics/unfold;
 import ru/prover/tactics/instantiate;
+import ru/prover/tactics/hilbert;
 import ru/prover/tactics/propositional;
 import ru/prover/tactics/closer;
 import ru/unify/index;
@@ -322,28 +323,60 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 			RuStmt(stmtClass, [hRw[i].residual], -1));                      // ⊢ hyp_i'
 	});
 	hypDisjs = fold(changed, makeSet(), \acc, c -> mergeSets(acc, hRw[c.first].disjs));
-	// INSTANTIATION (Mizar's unifier): a ∀-shaped premise is useless to the propositional/equality
-	// machinery until it is instantiated at the terms the problem actually mentions — a hypothesis
-	// `X = ∅` unfolds to `∀v ¬(v ∈ X)` and only bites once someone instantiates it at the goal's
-	// setvars (zfmisc t15). Instantiate the REWRITTEN hyps (that is where the ∀-forms appear), at the
-	// setvars occurring in goal+premises, bounded and deduped. Each instance joins as a derived
-	// premise with its own spcv proof.
-	instHyps = concat(
-		mapi(hyps, \i, h -> Pair(i, h)),
-		mapi(derivedHyps, \j, h -> Pair(nh + j, h))
+	// THE MIZAR SATURATION (ruInSaturate): emptiness premises become their eq0 ∀-forms, every
+	// ∀-shaped premise is instantiated at the setvars the problem mentions (spcv, DV declared),
+	// and reflexivity facts t=t (equid) join. Each saturated fact is then NORMALIZED by the same
+	// rewrite the hyps got — an instance ¬(x5 ∈ ({x5}∖{x8})) is opaque to the propositional closer
+	// until eldif/elsn reduce it to ¬((x5=x5) ∧ ¬(x5=x8)) — and both forms join as derived
+	// premises, with self-contained proofs (spliced below like the unfolded hyps).
+	instHyps : [Pair<RuProofTree, RuExp>] = concat(
+		mapi(hyps, \i, h -> Pair(RuProofHyp(i, RuStmt(stmtClass, [h], -1)), h)),
+		map(changed, \c -> Pair(
+			RuProofStep(s2id_("mpbi"),
+				[RuProofHyp(c.first, RuStmt(stmtClass, [hyps[c.first]], -1)), c.second],
+				RuStmt(stmtClass, [hRw[c.first].residual], -1)),
+			hRw[c.first].residual))
 	);
-	insts = ruInstantiateFacts(math, env, stmtClass, instHyps, goal, 8);
+	sat = ruInSaturate(math, env, stmtClass, instHyps, goal, 8);
+	satAll = concatA(map(sat.first, \f -> {
+		rw2 = ruEqualizerRewrite(em, conn, wff, stmtClass, [], f.first, nnf, precedes);
+		switch (rw2.proof) {
+			None(): [f];
+			Some(p2): [f, Pair(rw2.residual,
+				RuProofStep(s2id_("mpbi"), [f.second, p2], RuStmt(stmtClass, [rw2.residual], -1)))];
+		}
+	}));
 	nd = length(derivedHyps);
-	// premises: the real hyps (0..nh-1), then the derived unfolded hyps, then the instances.
+	// premises: the real hyps (0..nh-1), then the derived unfolded hyps, then the saturation.
 	premises = concat3(
 		mapi(hyps, \i, h -> RuHyp(i, RuStmt(stmtClass, [h], -1), -1)),
 		mapi(derivedHyps, \j, h -> RuHyp(nh + j, RuStmt(stmtClass, [h], -1), -1)),
-		mapi(insts, \k, p -> RuHyp(nh + nd + k, RuStmt(stmtClass, [p.first], -1), -1))
+		mapi(satAll, \k, p -> RuHyp(nh + nd + k, RuStmt(stmtClass, [p.first], -1), -1))
 	);
+	hypDisjs2 = mergeSets(hypDisjs, sat.second);
 	// Drive the closer (a fresh one per call) over `scope` on `premises ⊢ goal`, then splice each derived
 	// premise's leaf (index ≥ nh) with its mpbi derivation. Carry the hyps' DV provisos out.
-	maybeMap(ruRunCloser(math, env, info, stmtClass, premises, goal, scope, mkCloser(), limit),
-		\unc -> RuRefineResult(ruUnfoldSplice(unc, nh, concat(derivedProofs, map(insts, \p -> p.second))), hypDisjs));
+	// The bounded BFS first (cheap, closes everything it used to close at the old cost), then the
+	// COMPLETE propositional check as the FALLBACK (the Mizar shape: after saturation the literal
+	// set is DECIDED, not searched over a hand-kept lemma list — which kept silently missing basic
+	// combinations: bare ∨-introduction two days ago, disjunctive syllogism today).
+	// ruHilbertCertificate is the G3cp-refutation -> Hilbert emitter: deterministic and complete
+	// over the atomized premises, but exponential in the atom count — so it runs only where the
+	// cheap search failed, and only under an atom-count gate (running it FIRST on every residual
+	// starved the fixed wall-clock stage slices: zfmisc full stack 126 -> 109).
+	premiseExps2 = map(premises, \pr -> ruExp(pr.stmt.exps[0]));
+	spliceAll = \unc : RuProofTree -> ruUnfoldSplice(unc, nh, concat(derivedProofs, map(satAll, \p -> p.second)));
+	switch (ruRunCloser(math, env, info, stmtClass, premises, goal, scope, mkCloser(), limit)) {
+		Some(unc): Some(RuRefineResult(spliceAll(unc), hypDisjs2));
+		None(): {
+			natoms = sizeTree(fold(arrayPush(premiseExps2, goal), ruPAtomNodes(conn, goal), \acc, e -> mergeTree(acc, ruPAtomNodes(conn, e))));
+			if (natoms > 24) None()
+			else switch (ruHilbertCertificate(em, conn, wff, stmtClass, premiseExps2, goal)) {
+				Some(pr): Some(RuRefineResult(spliceAll(pr.first), mergeSets(hypDisjs2, pr.second.disjs)));
+				None(): None();
+			}
+		}
+	}
 }
 
 // Phase 1: strip the leading ∀-chain; validation re-quantifies the matrix proof with ax-gen. Declines
@@ -358,7 +391,13 @@ ruStripForallRefiner(stmtClass : int, precedes : (int) -> bool) -> RuRefiner {
 				RuProofStep(s2id_("ax-gen"), [acc], RuStmt(stmtClass, [lvl], -1))),
 			makeSet()));
 	},
-		\__ -> None());
+		// ALT: for a SETVAR equality whose pointwise (extensionality) route failed, offer the
+		// un-reduced goal — the saturation in the residual can often decide `x = y` directly from
+		// the instantiated literal set (zfmisc t15: ¬((x5=x5) ∧ ¬(x5=x8)) + x5=x5 ⊢ x5=x8).
+		// Shape-gated, so the extra residual run is paid only where the literal route exists.
+		\goal -> if (ruEqHead(goal) == s2id("wceq") && ruRelIsSetvarEq(goal))
+			Some(RuRefineStep([goal], \proofs -> proofs[0], makeSet()))
+		else None());
 }
 
 // Phase 2: unfold + canonicalise the matrix to a residual; validation combines via mpbir (or is the
@@ -381,7 +420,8 @@ ruEqRewriteRefiner(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass :
 		// fallback re-runs the residual closer for every failed goal and is too expensive.
 		\goal -> {
 			hypForms = map(hyps, \h -> (ruEqualizerRewrite(em, conn, wff, stmtClass, [], h, nnf, precedes)).residual);
-			if (exists(hypForms, \h -> h.nodes == goal.nodes))
+			svEq = ruEqHead(goal) == s2id("wceq") && ruRelIsSetvarEq(goal);
+			if (svEq || exists(hypForms, \h -> h.nodes == goal.nodes))
 				Some(RuRefineStep([goal], \proofs -> proofs[0], makeSet()))
 			else None();
 		});
@@ -390,6 +430,14 @@ ruEqRewriteRefiner(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass :
 // Phase between strip-forall and eq-rewrite: if the goal is a `⊆` / set-`=` relation, REDUCE it via
 // ssriv/eqriv to a fresh-setvar membership subgoal `(v∈A)→(v∈B)` / `(v∈A)↔(v∈B)`, which then flows to
 // eq-rewrite (membership unfold) + the bounded BFS closer — no Kalmár, so proofs stay small. Non-
+// Both sides of this `=` are setvars (each a class coercion of a setvar variable)?
+ruRelIsSetvarEq(goal : RuExp) -> bool {
+	setvarT = tp2id_("setvar");
+	sides = ruEqArgs(goal);
+	isSv = \e : RuExp -> length(e.nodes) == 2 && (switch (e.nodes[1]) { RuVar(__, tp): tp == setvarT; RuRuleNode(__, __): false; });
+	isSv(sides.first) && isSv(sides.second);
+}
+
 // relation goals pass through unchanged. This unlocks the ⊆/= gaps the prop-only residual can't.
 ruRelIntroRefiner(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], precedes : (int) -> bool) -> RuRefiner {
 	wssId = s2id("wss"); wceqId = s2id("wceq");
