@@ -1,0 +1,133 @@
+import ru/math;
+import ru/util/math;
+import ru/util/exp;
+import comm;
+import ds/hashmap;
+import math/hash;
+
+export {
+	// Measures how much RAM expression-interning would save, distinguishing
+	// two designs:
+	//   - whole-expression interning (a trie keyed on the linear form): one
+	//     instance per distinct full RuExp;
+	//   - subterm sharing (a hash-consed DAG): one node per distinct subtree.
+	// Reports node counts and dedup ratios for both against the current flat
+	// representation, so we know whether a trie or a DAG is worth building.
+	ruDedupStatsComm : RuComm;
+}
+
+// Structural key for one node. idType already encodes (rule, type); arity is
+// fixed per rule, so it is implied. Variables keep their (id, type) — interning
+// is exact, so distinct var ids are distinct.
+ruDedupNodeKey(node : RuExpNode) -> string {
+	switch (node) {
+		RuVar(id, type):           "v" + i2s(id) + "_" + i2s(type);
+		RuRuleNode(idType, __):    "r" + i2s(idType);
+	}
+}
+
+// Key for a whole expression: its linear (Polish) form.
+ruDedupWholeKey(exp : RuExp) -> string {
+	strGlue(map(exp.nodes, ruDedupNodeKey), "|");
+}
+
+// Intern a DAG node key, returning a small dense id.
+ruDedupIntern(dag : HashMap<string, int>, key : string) -> int {
+	switch (lookupHashMap(dag, key)) {
+		Some(id): id;
+		None(): {
+			id = sizeHashMap(dag);
+			setHashMap(dag, key, id);
+			id;
+		}
+	}
+}
+
+// Bottom-up hash-cons of the subtree rooted at index i of a Polish node array.
+// Returns Pair(interned-id, next-index). A node's DAG key is its symbol plus
+// the ids of its (already-interned) children, so the key length is bounded by
+// arity — not by subtree size.
+ruDedupDagParse(nodes : [RuExpNode], i : int, dag : HashMap<string, int>) -> Pair<int, int> {
+	node = nodes[i];
+	switch (node) {
+		RuVar(__, __): Pair(ruDedupIntern(dag, ruDedupNodeKey(node)), i + 1);
+		RuRuleNode(idType, arityLen): {
+			arity = ruArityLen2Arity(arityLen);
+			res = fold(enumFromTo(1, arity), Pair(i + 1, []), \acc, __ -> {
+				child = ruDedupDagParse(nodes, acc.first, dag);
+				Pair(child.second, arrayPush(acc.second, child.first));
+			});
+			key = "r" + i2s(idType) + ":" + strGlue(map(res.second, i2s), ",");
+			Pair(ruDedupIntern(dag, key), res.first);
+		}
+	}
+}
+
+ruDedupRatio(a : int, b : int) -> string {
+	r = if (b == 0) 0.0 else i2d(a) / i2d(b);
+	d2s(i2d(round(r * 100.0)) / 100.0);
+}
+
+ruDedupStatsComm = RuComm(
+	RuCommInfo("stats-dedup", "stats",
+		"measure expression dedup: whole-expr interning (trie) vs subterm sharing (DAG)",
+		"", false, false, [], []
+	),
+	\unit -> {
+		env  = ruUnitEnv(unit);
+		math = ruMathFromSources(unit.state.ru, env);
+
+		totalExps          = ref 0;  // every RuExp occurrence
+		totalNodes         = ref 0;  // sum of nodes over all occurrences = current flat RAM
+		distinctWholeNodes = ref 0;  // sum of nodes over distinct whole expressions
+		wholeMap = makeHashMap(hashString);  // distinct whole expressions
+		dag      = makeHashMap(hashString);  // distinct subterms (DAG nodes)
+
+		process = \exp : RuExp -> {
+			n = length(exp.nodes);
+			totalExps  := ^totalExps + 1;
+			totalNodes := ^totalNodes + n;
+			key = ruDedupWholeKey(exp);
+			if (!containsKeyHashMap(wholeMap, key)) {
+				setHashMap(wholeMap, key, 1);
+				distinctWholeNodes := ^distinctWholeNodes + n;
+				// every distinct whole expr contributes its subterms to the DAG
+				ignore(ruDedupDagParse(exp.nodes, 0, dag));
+			}
+		};
+
+		fromStmt    = \stmt : RuStmt -> iter(stmt.exps, \te -> switch (te) { RuExp(__, __): process(te); RuTerm(__, __, __): {}; });
+		fromTermExp = \te : RuTermExp -> switch (te) { RuExp(__, __): process(te); RuTerm(__, __, __): {}; };
+		fromInfer   = \infer : RuInference -> { iter(infer.hyps, \h -> fromStmt(h.stmt)); fromStmt(infer.prop); };
+		fromProof   = \proof : RuProof -> ruDedupIterProof(proof, fromStmt);
+
+		iter(getTreeValues(math.decls.assertions), \ass -> switch (ass) {
+			RuAxiom(__, infer):       fromInfer(infer);
+			RuCong(__, infer):        fromInfer(infer);
+			RuDef(__, infer, dm, ds): { fromInfer(infer); fromTermExp(dm); fromTermExp(ds); };
+			RuTheorem(__, infer, __, proof): { fromInfer(infer); fromProof(proof); };
+		});
+
+		distinctWhole = sizeHashMap(wholeMap);
+		dagNodes      = sizeHashMap(dag);
+		out = unit.out.println;
+		out("Expression dedup measurement (" + i2s(sizeTree(math.decls.assertions)) + " assertions):");
+		out("  RuExp occurrences:        " + i2s(^totalExps));
+		out("  distinct whole exprs:     " + i2s(distinctWhole) +
+			"  (" + ruDedupRatio(distinctWhole, ^totalExps) + " of occurrences)");
+		out("  flat nodes (current RAM): " + i2s(^totalNodes));
+		out("");
+		out("  trie (whole-expr interning): " + i2s(^distinctWholeNodes) + " nodes" +
+			"   -> " + ruDedupRatio(^totalNodes, ^distinctWholeNodes) + "x smaller");
+		out("  DAG  (subterm sharing):      " + i2s(dagNodes) + " nodes" +
+			"   -> " + ruDedupRatio(^totalNodes, dagNodes) + "x smaller");
+		Some(unit.state);
+	}
+);
+
+ruDedupIterProof(proof : RuProof, fromStmt : (RuStmt) -> void) -> void {
+	iter(proof.steps, \step -> {
+		fromStmt(step.stmt);
+		ruDedupIterProof(step.proof, fromStmt);
+	});
+}
