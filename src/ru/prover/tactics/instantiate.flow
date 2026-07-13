@@ -298,28 +298,35 @@ ruInSubstAtom(atoms : Tree<int, [RuInAtomCong]>, ante : RuExp, x : RuExpNode, t 
 
 // Candidate terms, Mizar-style: the setvars that OCCUR in the goal and the premises. No search —
 // the problem supplies them. Deduped, capped.
-// Candidates are the COERCED setvar occurrences: the 2-node slices [unary class rule, setvar]
-// (the foundation's setvar->class coercion), harvested from the goal and premises themselves —
-// no coercion-rule name is hard-wired. A bare setvar is NOT a candidate: the setness lemmas
-// (vex) and the congruence rules take the coerced form, so a bare-var candidate matches nothing
-// (which is exactly how the first version of this phase silently produced zero instances).
+// Candidates are ALL the class-typed TERMS occurring in the goal and premises — Mizar
+// instantiates at the terms the problem mentions, not only at its variables. This includes the
+// coerced setvar occurrences (the 2-node [unary class rule, setvar] slices — a bare setvar is
+// NOT a candidate: the setness lemmas and congruences take the coerced form) and the compound
+// terms ({x5}, (A∪B), …) whose setness the recursive setness prover discharges (snex/prex/
+// inex1/…). Nothing is harvested by name. SMALLEST FIRST, deduped, capped: the small terms are
+// the workhorses (variables, singletons), and under a cap the big products must not crowd
+// them out.
 ruInCandidates(goal : RuExp, hyps : [Pair<RuProofTree, RuExp>], setvarT : int, cap : int) -> [RuExp] {
 	clsT = tp2id_("class");
 	collect = \e : RuExp -> {
 		n = e.nodes;
-		filtermap(enumFromTo(0, length(n) - 2), \i -> switch (n[i]) {
+		filtermap(enumFromTo(0, length(n) - 1), \i -> switch (n[i]) {
 			RuVar(__, __): None();
-			RuRuleNode(idT, al): {
-				if (ruArityLen2Arity(al) != 1 || ruIdType2Type(idT) != clsT) None()
-				else switch (n[i + 1]) {
-					RuVar(__, tp): if (tp == setvarT) Some(RuExp([n[i], n[i + 1]], -1)) else None();
-					RuRuleNode(__, __): None();
-				}
+			RuRuleNode(idT, __): {
+				if (ruIdType2Type(idT) != clsT) None()
+				else Some(RuExp(subrange(n, i, ruInSpan(n, i) - i), -1));
 			}
 		});
 	};
-	all = concat(collect(goal), concatA(map(hyps, \h -> collect(h.second))));
-	take(fold(all, [], \acc, c -> if (exists(acc, \a -> a.nodes == c.nodes)) acc else arrayPush(acc, c)), cap);
+	// GOAL-DIRECTED breadth (Mizar's unifier is goal-driven): setvar candidates come from the
+	// whole problem — they are the workhorses and cheap — but COMPOUND candidates only from the
+	// GOAL. Problem-wide compounds multiplied every residual's premise set and starved the
+	// general path's slices (zfmisc general 98 -> 92) without adding a single closure there.
+	isSetvar = \c : RuExp -> length(c.nodes) == 2 && (switch (c.nodes[1]) { RuVar(__, __): true; RuRuleNode(__, __): false; });
+	all = concat(collect(goal), filter(concatA(map(hyps, \h -> collect(h.second))), isSetvar));
+	deduped = fold(all, [], \acc, c -> if (exists(acc, \a -> a.nodes == c.nodes)) acc else arrayPush(acc, c));
+	rank = \c : RuExp -> if (isSetvar(c)) length(c.nodes) else 1000 + length(c.nodes);
+	take(mergeSort(deduped, \a, b -> rank(a) - rank(b)), cap);
 }
 
 ruInVarsOf(e : RuExp) -> [RuVar] {
@@ -376,12 +383,19 @@ ruInReflFacts(math : RuMath, env : RuEnv, stmtClass : int, cands : [RuExp]) -> [
 		Some(ass): {
 			prop = ruExp((ruInInfer(ass)).prop.exps[0]);       // (x = x)
 			xv = fold(prop.nodes, ruNoVar, \acc, n -> switch (n) { RuVar(id, tp): if (acc == ruNoVar) RuVar(id, tp) else acc; RuRuleNode(__, __): acc; });
-			if (xv == ruNoVar) [] else map(cands, \t -> {
-				bare = RuExp([t.nodes[1]], -1);   // equid's var is SETVAR-typed: bind the bare var
-				m = makeHashMap(idfn);
-				setHashMap(m, xv.id, RuSubExpr(xv, bare, ruExpVarIdsHashSet(bare)));
-				inst = ruApplySubst(prop, RuSubst(m));
-				Pair(inst, RuProofStep(equidId, [], RuStmt(stmtClass, [inst], -1)));
+			if (xv == ruNoVar) [] else filtermap(cands, \t -> {
+				// equid's var is SETVAR-typed: only a coerced-setvar candidate yields a refl fact
+				if (length(t.nodes) != 2) None()
+				else switch (t.nodes[1]) {
+					RuRuleNode(__, __): None();
+					RuVar(__, __): {
+						bare = RuExp([t.nodes[1]], -1);
+						m = makeHashMap(idfn);
+						setHashMap(m, xv.id, RuSubExpr(xv, bare, ruExpVarIdsHashSet(bare)));
+						inst = ruApplySubst(prop, RuSubst(m));
+						Some(Pair(inst, RuProofStep(equidId, [], RuStmt(stmtClass, [inst], -1))));
+					}
+				}
 			});
 		}
 	}
@@ -412,12 +426,23 @@ ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
 		if (length(xE.nodes) != 1) acc else {
 			x = xE.nodes[0];
 			xVar = switch (x) { RuVar(id, tp): RuVar(id, tp); RuRuleNode(__, __): RuVar(-1, setvarT); };
+			// the coercion node for x, harvested from the ∀-body's own coerced occurrence of it
+			// (the candidate can no longer supply it — it may be a compound term)
+			bn = body.nodes;
+			coerceIdx = fold(enumFromTo(0, length(bn) - 2), -1, \ci, i ->
+				if (ci >= 0) ci
+				else switch (bn[i]) {
+					RuVar(__, __): ci;
+					RuRuleNode(idT, al): if (ruArityLen2Arity(al) == 1 && ruIdType2Type(idT) == tp2id_("class") && bn[i + 1] == x) i else ci;
+				});
+			if (coerceIdx < 0) acc   // x never occurs in a class position — nothing to substitute at
+			else {
+			xC = RuExp([bn[coerceIdx], x], -1);
 			fold(cands, acc, \acc2, t ->
-				if (t.nodes[1] == x) acc2   // instantiating at the bound var itself is a no-op
+				if (t.nodes == xC.nodes) acc2   // instantiating at the bound var itself is a no-op
 				else {
-					// the antecedent (x = A): both sides in the coerced (class) form; the coercion
-					// node is harvested from the candidate itself
-					ante = ruFwdMkRule(wceqId, tp2id_("wff"), [RuExp([t.nodes[0], x], -1), t]);
+					// the antecedent (x = A): x in its coerced (class) form, A the candidate term
+					ante = ruFwdMkRule(wceqId, tp2id_("wff"), [xC, t]);
 					switch (ruInSubstChain(tabs.atoms, tabs.conns, biidd, wbId, ante, x, t, body, stmtClass, math, env)) {
 						None(): acc2;
 						Some(sc): {
@@ -437,10 +462,15 @@ ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
 						}
 					}
 				});
+			}
 		}
 	});
 	// (3) reflexivity facts
 	refl = ruInReflFacts(math, env, stmtClass, cands);
-	Pair(concat(instAcc.first, refl), instAcc.second);
+	// TOTAL-INSTANCE CAP: candidates are smallest-first, so the cap keeps the workhorse
+	// instances (variables, singletons) and sheds the big-product tail. Without it the
+	// pool x candidates product multiplied the per-instance normalization cost and starved
+	// the general path's slices (zfmisc general 98 -> 92 when compounds landed uncapped).
+	Pair(concat(take(instAcc.first, 8), refl), instAcc.second);
 	}
 }

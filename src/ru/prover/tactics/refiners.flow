@@ -50,6 +50,14 @@ export {
 	// proof TREE. A self-contained prover run on a CONCRETE goal — no free witness variable ever reaches
 	// search. `mkCloser` is a THUNK producing a fresh closer tactic per call (the closer carries internal
 	// ref-snapshots — e.g. bounded-bfs's delta limit — that must not leak across residual sub-proves).
+// Remap a certificate's hypothesis leaves from SUBSET positions to the original premise indices.
+ruInRemapLeaves(t : RuProofTree, subset : [int]) -> RuProofTree {
+	switch (t) {
+		RuProofHyp(i, stmt): if (i >= 0 && i < length(subset)) RuProofHyp(subset[i], stmt) else t;
+		RuProofStep(ass, cs, stmt): RuProofStep(ass, map(cs, \c -> ruInRemapLeaves(c, subset)), stmt);
+	}
+}
+
 	// The default closer is bounded-bfs; any search strategy over `scope` can be substituted.
 	ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int,
 		hyps : [RuExp], goal : RuExp, scope : [int], mkCloser : () -> RuProverTactic, limit : double, nnf : bool, precedes : (int) -> bool) -> Maybe<RuRefineResult>;
@@ -339,11 +347,18 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 	);
 	sat = ruInSaturate(math, env, stmtClass, instHyps, goal, 8);
 	satAll = concatA(map(sat.first, \f -> {
-		rw2 = ruEqualizerRewrite(em, conn, wff, stmtClass, [], f.first, nnf, precedes);
-		switch (rw2.proof) {
-			None(): [f];
-			Some(p2): [f, Pair(rw2.residual,
-				RuProofStep(s2id_("mpbi"), [f.second, p2], RuStmt(stmtClass, [rw2.residual], -1)))];
+		// a reflexivity fact `t = t` is already a literal — its eqss rewrite is pure junk cost
+		isRefl = ruEqHead(f.first) == s2id("wceq") && {
+			sides = ruEqArgs(f.first);
+			sides.first.nodes == sides.second.nodes;
+		};
+		if (isRefl) [f] else {
+			rw2 = ruEqualizerRewrite(em, conn, wff, stmtClass, [], f.first, nnf, precedes);
+			switch (rw2.proof) {
+				None(): [f];
+				Some(p2): [f, Pair(rw2.residual,
+					RuProofStep(s2id_("mpbi"), [f.second, p2], RuStmt(stmtClass, [rw2.residual], -1)))];
+			}
 		}
 	}));
 	nd = length(derivedHyps);
@@ -369,11 +384,36 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 	switch (ruRunCloser(math, env, info, stmtClass, premises, goal, scope, mkCloser(), limit)) {
 		Some(unc): Some(RuRefineResult(spliceAll(unc), hypDisjs2));
 		None(): {
-			natoms = sizeTree(fold(arrayPush(premiseExps2, goal), ruPAtomNodes(conn, goal), \acc, e -> mergeTree(acc, ruPAtomNodes(conn, e))));
-			if (natoms > 24) None()
-			else switch (ruHilbertCertificate(em, conn, wff, stmtClass, premiseExps2, goal)) {
-				Some(pr): Some(RuRefineResult(spliceAll(pr.first), mergeSets(hypDisjs2, pr.second.disjs)));
-				None(): None();
+			// RELEVANCE for the complete check: G3cp is exponential in the atom count, and the
+			// saturation deliberately over-produces (instances at every occurring term), so running
+			// the check over ALL premises either blows up or gets gated away — the gate then defeats
+			// the very theorems the saturation enabled. Select the ATOM-CONNECTED premises instead:
+			// two rounds of "shares an atom with the goal's growing atom set" — the standard
+			// relevance closure, at the literal level. The certificate's hyp leaves are remapped
+			// from subset positions back to the original premise indices before splicing.
+			atomKeys = \e : RuExp -> buildSet(getTreeKeys(ruPAtomNodes(conn, e)));
+			goalKs = atomKeys(goal);
+			pick = \ks : Set<string> -> filtermapi(premiseExps2, \i, e ->
+				if (!isEmptySet(intersectSets(atomKeys(e), ks))) Some(i) else None());
+			r1 = pick(goalKs);
+			ks2 = fold(r1, goalKs, \acc, i -> mergeSets(acc, atomKeys(premiseExps2[i])));
+			subset = pick(ks2);
+			tryHilb = \idxs : [int] -> {
+				exps = map(idxs, \i -> premiseExps2[i]);
+				natoms = sizeTree(fold(arrayPush(exps, goal), ruPAtomNodes(conn, goal), \acc, e -> mergeTree(acc, ruPAtomNodes(conn, e))));
+				if (natoms > 24) None()
+				else maybeMap(ruHilbertCertificate(em, conn, wff, stmtClass, exps, goal),
+					\pr -> RuRefineResult(spliceAll(ruInRemapLeaves(pr.first, idxs)), mergeSets(hypDisjs2, pr.second.disjs)));
+			};
+			switch (tryHilb(subset)) {
+				Some(r): Some(r);
+				// The relevance subset is UNSOUND for refutations: an inconsistent premise set
+				// proves anything, and the contradiction can live among premises sharing no atom
+				// with the goal. Retry with the FULL set — but only for a REFUTATION-shaped
+				// (¬-headed) goal: an unconditional retry paid a second exponential check on
+				// every failing residual and starved two full-stack theorems.
+				None(): if (length(subset) == length(premiseExps2) || ruEqHead(goal) != conn.wn) None()
+					else tryHilb(enumFromTo(0, length(premiseExps2) - 1));
 			}
 		}
 	}
@@ -418,12 +458,21 @@ ruEqRewriteRefiner(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass :
 		// whose elsn normal form is exactly `x5 = x8`, rewritten by eqss to `(x8⊆x5) ∧ (x5⊆x8)`).
 		// Offer the UN-rewritten goal as an alternative, but only in that case: an unconditional
 		// fallback re-runs the residual closer for every failed goal and is too expensive.
-		\goal -> {
-			hypForms = map(hyps, \h -> (ruEqualizerRewrite(em, conn, wff, stmtClass, [], h, nnf, precedes)).residual);
-			svEq = ruEqHead(goal) == s2id("wceq") && ruRelIsSetvarEq(goal);
-			if (svEq || exists(hypForms, \h -> h.nodes == goal.nodes))
-				Some(RuRefineStep([goal], \proofs -> proofs[0], makeSet()))
-			else None();
+		// The hyp normal forms are fixed for this refiner's lifetime — computed ONCE, lazily
+		// (recomputing them per failed goal was a measurable slice-starver).
+		{
+			hypFormsC : ref [[RuExp]] = ref [];
+			\goal -> {
+				svEq = ruEqHead(goal) == s2id("wceq") && ruRelIsSetvarEq(goal);
+				hypForms = if (^hypFormsC != []) (^hypFormsC)[0] else {
+					hf = map(hyps, \h -> (ruEqualizerRewrite(em, conn, wff, stmtClass, [], h, nnf, precedes)).residual);
+					hypFormsC := [hf];
+					hf;
+				};
+				if (svEq || exists(hypForms, \h -> h.nodes == goal.nodes))
+					Some(RuRefineStep([goal], \proofs -> proofs[0], makeSet()))
+				else None();
+			}
 		});
 }
 
