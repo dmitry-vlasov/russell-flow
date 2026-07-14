@@ -7,6 +7,7 @@ import ru/prover/tactics/subproof_replay;
 import ru/prover/tactics/breadth_first;
 import ru/prover/tactics/combinators;
 import ru/prover/tactics/labels;
+import ru/prover/tactics/board;
 import ru/prover/tactics/focus;
 import ru/prover/tactics/follow_proof;
 import ru/prover/tactics/kalmar;
@@ -39,7 +40,12 @@ export {
 		// OUTERMOST or-else creates it and threads it down, so nested or-elses
 		// share one store with parent-linked stage tags, and any consumer
 		// (refiners, selection) can consult visibility. None outside an or-else.
-		labels     : Maybe<RuPvtLabels>
+		labels     : Maybe<RuPvtLabels>,
+		// The tactic blackboard (board.flow): the general shared store for stage
+		// artifacts (decision caches, rewrite memos, fact pools, junk markers).
+		// Commands create it (session scope spans the run); the outermost
+		// or-else resets its step scope once per prove step, like the labels.
+		board      : Maybe<RuTacticBoard>
 	);
 
 	// The DSL produces a "tactic builder": a closure invoked once the
@@ -962,7 +968,13 @@ ruRefineGuideBuilder(refinerNames : [string], md : int, ms : int, tl : double, c
 			None():    false;
 		};
 		refiners  = filtermap(refinerNames, \nm -> ruRefinerByName(nm, em, conn, wff, stmtClass, hypExps, nnf, precedes));
-		close     = \g -> ruCheckerResidual(ctx.math, ctx.env, task.info, stmtClass, hypExps, g, scope.second, mkCloser, tl, nnf, precedes);
+		// The residual decision-cache handle: within a prove step hyps/precedes are fixed,
+		// so (config fingerprint, goal) keys the verdict. All config that can change the
+		// residual's outcome is in the fingerprint: scope, budgets, nnf, the closer AST.
+		memo = maybeMap(ctx.board, \b -> RuResidualMemo(b,
+			scope.first + "|d" + i2s(md) + "|s" + i2s(ms) + "|t" + d2s(tl) + "|n" + b2s(nnf)
+			+ "|c" + (switch (closerAstMb) { Some(a): ruTacticAst2s(a); None(): "bfs" })));
+		close     = \g -> ruCheckerResidual(ctx.math, ctx.env, task.info, stmtClass, hypExps, g, scope.second, mkCloser, tl, nnf, precedes, memo);
 		ruRefine(refiners, goalExp, close);
 	});
 }
@@ -1239,7 +1251,11 @@ ruDslBuildOrElse(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuil
 	// or-elses (and every builder below them) receive it through the context.
 	created = isNone(ctx.labels);
 	labels = either(ctx.labels, ruMakePvtLabels());
-	ctx2 = RuTacticContext(ctx with labels = Some(labels));
+	// The blackboard normally arrives from the command (session scope spans the
+	// run); a bare or-else without one gets its own. Its STEP scope is reset by
+	// the outermost or-else below, in the same spot the labels are reset.
+	board = either(ctx.board, ruMakeTacticBoard());
+	ctx2 = RuTacticContext(ctx with labels = Some(labels), board = Some(board));
 	pairsMb = map(poss, \v -> switch (v) {
 		RuTacticValAst(sub): maybeMap(ruBuildTacticFromAst(sub, ctx2), \b -> Pair(ruTacticAst2s(sub), b));
 		RuTacticValLit(s): { ctx.env.out.error("tactic DSL: or-else alternative must be a tactic, got literal '" + s + "'", []); None(); };
@@ -1273,7 +1289,9 @@ ruDslBuildOrElse(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuil
 			// stage's SELECTION never expands a foreign stage's nodes (the foreign
 			// work stays in the tree; L1 propagation across labels = free meets).
 			// The store is per prove step: only the OUTERMOST or-else resets it.
-			if (created) ruPvtReset(labels) else {};
+			// The blackboard's step scope follows the same lifecycle (its session
+			// scope survives — that is the command-level cross-step store).
+			if (created) { ruPvtReset(labels); ruBoardStepReset(board); } else {};
 			// sibling stages parent to the stage enclosing THIS or-else (the tag
 			// active now, at builder time) — not to whichever sibling ran before
 			parentTag = ^(labels.stage);

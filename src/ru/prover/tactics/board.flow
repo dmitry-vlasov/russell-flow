@@ -1,0 +1,108 @@
+import ds/tree;
+
+// THE TACTIC BLACKBOARD — a pure LEVEL-2 mechanism (engine-owns-proofs law):
+// a general associative store for ARBITRARY tactic data, shared across a
+// tactic composition so orthogonal stages exchange artifacts instead of
+// recomputing them. Level 1 (src/ru/prover/core/) never imports this file —
+// like RuPvtLabels, the board is a side index (over string keys and node ids),
+// never a field on an engine struct.
+//
+// THREE SCOPES:
+//   session — never reset; created at the COMMAND level, spans the whole run
+//             (an article's worth of prove steps). Cross-theorem artifacts.
+//   step    — reset ONCE PER PROVE STEP by the outermost or-else (the same
+//             spot that resets RuPvtLabels). Survives the stage cascade and
+//             retry rounds by design: that persistence IS the point.
+//   nodes   — per-PVT-node metadata keyed by node id; reset with `step`.
+//
+// COMPOSABILITY LAW: artifacts stored here must be general — usable by any
+// tactic composition, never private to one pipeline. Each artifact defines
+// ONE typed wrapper module over its key; raw flow-casts are confined to the
+// accessors below and those wrappers.
+//
+// COMPLETENESS LAW: board data may only ever REDIRECT or DEDUPLICATE work,
+// never discard a reachable proof variant. Concretely:
+//  - a cached FAILURE may short-circuit a re-run only if the recorded run was
+//    provably budget-independent (no wall-clock gate fired);
+//  - junk markers are deprioritization HINTS with an unfiltered fallback —
+//    a selection that would become empty after filtering must re-offer the
+//    unfiltered frontier.
+//
+// RESERVED KEY NAMESPACES ("<artifact>.<name>"):
+//   residual.verdicts — decision cache of ruCheckerResidual (refiners.flow):
+//                       Tree<Pair<string, [RuExpNode]>, RuResidualVerdict>
+//   rewrite.cache     — equalizer-rewrite memo (refiners.flow):
+//                       Tree<Pair<[RuExpNode], bool>, RuEqRewrite>
+//   facts.pool        — proved-fact pool (future producers: annotator tactics;
+//                       consumers: closers, congruence, normalization):
+//                       Tree<[RuExpNode], RuBoardFact>
+//   wave.junk / nodes."junk" — dead-end markers for selection tactics.
+
+export {
+	RuTacticBoard(
+		session : ref Tree<string, flow>,            // never reset
+		step    : ref Tree<string, flow>,            // reset per prove step
+		nodes   : ref Tree<int, Tree<string, flow>>  // node id -> local metadata
+	);
+
+	ruMakeTacticBoard() -> RuTacticBoard;
+	// Clear the per-step scopes (step + nodes); session survives.
+	ruBoardStepReset(b : RuTacticBoard) -> void;
+
+	// step scope
+	ruBoardGet(b : RuTacticBoard, key : string) -> Maybe<flow>;
+	ruBoardSet(b : RuTacticBoard, key : string, v : flow) -> void;
+	ruBoardUpdate(b : RuTacticBoard, key : string, def : flow, upd : (flow) -> flow) -> void;
+
+	// session scope
+	ruBoardSessionGet(b : RuTacticBoard, key : string) -> Maybe<flow>;
+	ruBoardSessionSet(b : RuTacticBoard, key : string, v : flow) -> void;
+
+	// per-node scope
+	ruBoardNodeGet(b : RuTacticBoard, id : int, key : string) -> Maybe<flow>;
+	ruBoardNodeSet(b : RuTacticBoard, id : int, key : string, v : flow) -> void;
+
+	// A proved fact published on the board (facts.pool). `origin` names the
+	// producer (for traces and provenance), never gates consumption.
+	RuBoardFact(proof : flow, disjs : flow, origin : string);
+}
+
+ruMakeTacticBoard() -> RuTacticBoard {
+	RuTacticBoard(ref makeTree(), ref makeTree(), ref makeTree());
+}
+
+ruBoardStepReset(b : RuTacticBoard) -> void {
+	b.step := makeTree();
+	b.nodes := makeTree();
+}
+
+ruBoardGet(b : RuTacticBoard, key : string) -> Maybe<flow> {
+	lookupTree(^(b.step), key);
+}
+
+ruBoardSet(b : RuTacticBoard, key : string, v : flow) -> void {
+	b.step := setTree(^(b.step), key, v);
+}
+
+ruBoardUpdate(b : RuTacticBoard, key : string, def : flow, upd : (flow) -> flow) -> void {
+	b.step := setTree(^(b.step), key, upd(lookupTreeDef(^(b.step), key, def)));
+}
+
+ruBoardSessionGet(b : RuTacticBoard, key : string) -> Maybe<flow> {
+	lookupTree(^(b.session), key);
+}
+
+ruBoardSessionSet(b : RuTacticBoard, key : string, v : flow) -> void {
+	b.session := setTree(^(b.session), key, v);
+}
+
+ruBoardNodeGet(b : RuTacticBoard, id : int, key : string) -> Maybe<flow> {
+	switch (lookupTree(^(b.nodes), id)) {
+		None(): None();
+		Some(t): lookupTree(t, key);
+	}
+}
+
+ruBoardNodeSet(b : RuTacticBoard, id : int, key : string, v : flow) -> void {
+	b.nodes := setTree(^(b.nodes), id, setTree(lookupTreeDef(^(b.nodes), id, makeTree()), key, v));
+}

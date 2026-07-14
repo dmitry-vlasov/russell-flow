@@ -12,6 +12,7 @@ import ru/prover/tactics/congruence;
 import ru/prover/tactics/hilbert;
 import ru/prover/tactics/propositional;
 import ru/prover/tactics/closer;
+import ru/prover/tactics/board;
 import ru/unify/index;
 import ru/proof_tree;
 import ru/verify/math;
@@ -63,9 +64,23 @@ ruInRemapLeaves(t : RuProofTree, subset : [int]) -> RuProofTree {
 	}
 }
 
+	// THE RESIDUAL DECISION CACHE (board artifact "residual.verdicts"): the or-else
+	// stage cascade re-enters the residual ~5x per prove step with identical
+	// (goal, premises, config) — memoize the verdict, successes AND failures.
+	// COMPLETENESS RULE: a failure short-circuits a re-run ONLY when the recorded
+	// run was budget-independent (no wall-clock gate fired, truncated=false);
+	// truncated failures are recorded but never honored — the caller re-runs.
+	RuResidualVerdict ::= RuResidualProved, RuResidualFailed;
+		RuResidualProved(result : RuRefineResult);
+		RuResidualFailed(truncated : bool, budget : double);
+	// The memo handle: the board plus the caller's config fingerprint (scope name,
+	// depth/size/time budgets, nnf, closer AST) — goal nodes complete the key.
+	RuResidualMemo(board : RuTacticBoard, fingerprint : string);
+
 	// The default closer is bounded-bfs; any search strategy over `scope` can be substituted.
 	ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int,
-		hyps : [RuExp], goal : RuExp, scope : [int], mkCloser : () -> RuProverTactic, limit : double, nnf : bool, precedes : (int) -> bool) -> Maybe<RuRefineResult>;
+		hyps : [RuExp], goal : RuExp, scope : [int], mkCloser : () -> RuProverTactic, limit : double, nnf : bool, precedes : (int) -> bool,
+		memo : Maybe<RuResidualMemo>) -> Maybe<RuRefineResult>;
 
 	// The orthogonal Checker phases, as refiners, + the name registry that `refine(...)` resolves against.
 	// `nnf` toggles De Morgan in the eq-rewrite canon pass (checker tries false then true). `precedes(aid)`
@@ -319,14 +334,156 @@ ruCheckerFullScope() -> [int] {
 	]));
 }
 
+ruResidualVerdictsKey = "residual.verdicts";
+
+ruResidualVerdicts(b : RuTacticBoard) -> Tree<Pair<string, [RuExpNode]>, RuResidualVerdict> {
+	switch (ruBoardGet(b, ruResidualVerdictsKey)) {
+		None(): makeTree();
+		Some(t): cast(t : flow -> Tree<Pair<string, [RuExpNode]>, RuResidualVerdict>);
+	}
+}
+
+// The equalizer-rewrite memo (board artifact "rewrite.cache"): the per-hyp rewrites are
+// identical for every residual call of a prove step — key = (expr nodes, nnf), RuEqRewrite
+// is pure data. Step-scoped because `precedes` changes per theorem.
+ruRewriteCacheKey = "rewrite.cache";
+
+ruMemoRewrite(memo : Maybe<RuResidualMemo>, em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int,
+	e : RuExp, nnf : bool, precedes : (int) -> bool) -> RuEqRewrite {
+	switch (memo) {
+		None(): ruEqualizerRewrite(em, conn, wff, stmtClass, [], e, nnf, precedes);
+		Some(m): {
+			cache = switch (ruBoardGet(m.board, ruRewriteCacheKey)) {
+				None(): makeTree();
+				Some(t): cast(t : flow -> Tree<Pair<[RuExpNode], bool>, RuEqRewrite>);
+			};
+			key = Pair(e.nodes, nnf);
+			switch (lookupTree(cache, key)) {
+				Some(r): r;
+				None(): {
+					r = ruEqualizerRewrite(em, conn, wff, stmtClass, [], e, nnf, precedes);
+					ruBoardSet(m.board, ruRewriteCacheKey, setTree(cache, key, r));
+					r;
+				}
+			}
+		}
+	}
+}
+
+// THE FACTOR-BY-DEPENDENCY CACHES. The stage cascade's residual calls differ in
+// (scope, budgets, closer) — the full-config verdict memo above only catches exact
+// re-entries. But two sub-computations do NOT depend on that config and are shared
+// across all stages of a prove step:
+//   residual.saturate — ruInSaturate output, keyed (goal, nnf): pure data (facts+DVs).
+//   residual.fallback — the whole post-closer fallback chain (congruence try, ∃-tries,
+//     certificates — the exponential part), keyed (goal, nnf); same completeness rule
+//     as the verdict memo (truncated failures re-run).
+ruSaturateCacheKey = "residual.saturate";
+ruFallbackCacheKey = "residual.fallback";
+
+ruMemoSaturate(memo : Maybe<RuResidualMemo>, math : RuMath, env : RuEnv, stmtClass : int,
+	instHyps : [Pair<RuProofTree, RuExp>], goal : RuExp, cap : int, nnf : bool) -> Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>> {
+	switch (memo) {
+		None(): ruInSaturate(math, env, stmtClass, instHyps, goal, cap);
+		Some(m): {
+			cache = switch (ruBoardGet(m.board, ruSaturateCacheKey)) {
+				None(): makeTree();
+				Some(t): cast(t : flow -> Tree<Pair<[RuExpNode], bool>, Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>>>);
+			};
+			key = Pair(goal.nodes, nnf);
+			switch (lookupTree(cache, key)) {
+				Some(r): r;
+				None(): {
+					r = ruInSaturate(math, env, stmtClass, instHyps, goal, cap);
+					ruBoardSet(m.board, ruSaturateCacheKey, setTree(cache, key, r));
+					r;
+				}
+			}
+		}
+	}
+}
+
+ruFallbackLookup(memo : Maybe<RuResidualMemo>, goal : RuExp, nnf : bool) -> Maybe<RuResidualVerdict> {
+	switch (memo) {
+		None(): None();
+		Some(m): switch (ruBoardGet(m.board, ruFallbackCacheKey)) {
+			None(): None();
+			Some(t): lookupTree(cast(t : flow -> Tree<Pair<[RuExpNode], bool>, RuResidualVerdict>), Pair(goal.nodes, nnf));
+		}
+	}
+}
+
+ruFallbackStore(memo : Maybe<RuResidualMemo>, goal : RuExp, nnf : bool, v : RuResidualVerdict) -> void {
+	switch (memo) {
+		None(): {};
+		Some(m): {
+			cache = switch (ruBoardGet(m.board, ruFallbackCacheKey)) {
+				None(): makeTree();
+				Some(t): cast(t : flow -> Tree<Pair<[RuExpNode], bool>, RuResidualVerdict>);
+			};
+			ruBoardSet(m.board, ruFallbackCacheKey, setTree(cache, Pair(goal.nodes, nnf), v));
+		}
+	}
+}
+
 ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int,
-	hyps : [RuExp], goal : RuExp, scope : [int], mkCloser : () -> RuProverTactic, limit : double, nnf : bool, precedes : (int) -> bool) -> Maybe<RuRefineResult> {
+	hyps : [RuExp], goal : RuExp, scope : [int], mkCloser : () -> RuProverTactic, limit : double, nnf : bool, precedes : (int) -> bool,
+	memo : Maybe<RuResidualMemo>) -> Maybe<RuRefineResult> {
+	run = \-> ruCheckerResidualRun(math, env, info, stmtClass, hyps, goal, scope, mkCloser, limit, nnf, precedes, memo);
+	if (env.conf.verbose >= 5) {
+		env.out.println("    resid-memo: " + (switch (memo) { None(): "NONE"; Some(m): "fp=" + m.fingerprint + " entries=" + i2s(sizeTree(ruResidualVerdicts(m.board))); }));
+	} else {};
+	switch (memo) {
+		None(): run().first;
+		Some(m): {
+			key = Pair(m.fingerprint, goal.nodes);
+			runStore = \-> {
+				r = run();
+				// never overwrite a Proved entry (unreachable — proved hits return below)
+				verdict = switch (r.first) {
+					Some(res): RuResidualProved(res);
+					None(): RuResidualFailed(r.second, limit);
+				};
+				ruBoardSet(m.board, ruResidualVerdictsKey, setTree(ruResidualVerdicts(m.board), key, verdict));
+				r.first;
+			}
+			switch (lookupTree(ruResidualVerdicts(m.board), key)) {
+				None(): runStore();
+				Some(v): switch (v) {
+					RuResidualProved(res): {
+						if (env.conf.verbose >= 4) { env.out.println("  resid: memo hit (proved) goal=" + ru2s(goal, math)); } else {};
+						Some(res);
+					}
+					RuResidualFailed(truncated, __): {
+						// COMPLETENESS RULE: only a budget-independent failure (no wall gate
+						// fired) short-circuits; a truncated one re-runs (and re-records).
+						if (truncated) runStore()
+						else {
+							if (env.conf.verbose >= 4) { env.out.println("  resid: memo hit (failed) goal=" + ru2s(goal, math)); } else {};
+							None();
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// The residual body: Pair(result, truncated) — `truncated` = some wall-clock gate fired
+// during the run (the closer's own env timer, or the fallback chain's fbTimer).
+ruCheckerResidualRun(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int,
+	hyps : [RuExp], goal : RuExp, scope : [int], mkCloser : () -> RuProverTactic, limit : double, nnf : bool, precedes : (int) -> bool,
+	memo : Maybe<RuResidualMemo>) -> Pair<Maybe<RuRefineResult>, bool> {
+	// mirrors the closer sub-prove's own timer (ruInitProverEnv gets the same `limit`),
+	// started strictly earlier — fires at least as often as the closer's gate.
+	callTimer = ruMakeLimitedTimer(limit);
+	fbRef : ref [RuTimer] = ref [];
 	em = RuEnvMath(math, env); conn = ruPConnectives(); wff = tp2id_("wff");
 	nh = length(hyps);
 	// HYP-REWRITING: unfold each hyp the same way the goal was unfolded, so a gap like
 	// `x∈(A∪B) ⊢ (x∈A)∨(x∈B)` connects (the hyp is rewritten to the goal's normal form). A hyp that
 	// changes becomes a DERIVED premise `hyp'`, proven from the real hyp by mpbi(hyp, hyp↔hyp').
-	hRw = map(hyps, \h -> ruEqualizerRewrite(em, conn, wff, stmtClass, [], h, nnf, precedes));
+	hRw = map(hyps, \h -> ruMemoRewrite(memo, em, conn, wff, stmtClass, h, nnf, precedes));
 	changed = filtermapi(hyps, \i, __ -> switch (hRw[i].proof) { None(): None(); Some(p): Some(Pair(i, p)); });
 	derivedHyps = map(changed, \c -> hRw[c.first].residual);
 	derivedProofs = map(changed, \c -> {
@@ -350,7 +507,7 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 				RuStmt(stmtClass, [hRw[c.first].residual], -1)),
 			hRw[c.first].residual))
 	);
-	sat = ruInSaturate(math, env, stmtClass, instHyps, goal, 8);
+	sat = ruMemoSaturate(memo, math, env, stmtClass, instHyps, goal, 8, nnf);
 	satAll = concatA(map(sat.first, \f -> {
 		// a reflexivity fact `t = t` is already a literal — its eqss rewrite is pure junk cost
 		isRefl = ruEqHead(f.first) == s2id("wceq") && {
@@ -358,7 +515,7 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 			sides.first.nodes == sides.second.nodes;
 		};
 		if (isRefl) [f] else {
-			rw2 = ruEqualizerRewrite(em, conn, wff, stmtClass, [], f.first, nnf, precedes);
+			rw2 = ruMemoRewrite(memo, em, conn, wff, stmtClass, f.first, nnf, precedes);
 			switch (rw2.proof) {
 				None(): [f];
 				Some(p2): [f, Pair(rw2.residual,
@@ -389,9 +546,36 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 	if (env.conf.verbose >= 4) {
 		env.out.println("  resid: goal=" + ru2s(goal, math) + " hyps=" + i2s(nh) + " derived=" + i2s(nd) + " sat=" + i2s(length(satAll)));
 	} else {};
-	switch (ruRunCloser(math, env, info, stmtClass, premises, goal, scope, mkCloser(), limit)) {
+	res = switch (ruRunCloser(math, env, info, stmtClass, premises, goal, scope, mkCloser(), limit)) {
 		Some(unc): Some(RuRefineResult(spliceAll(unc), hypDisjs2));
-		None(): {
+		None(): switch (ruFallbackLookup(memo, goal, nnf)) {
+			// The fallback chain below (congruence try, ∃-tries, certificates) does NOT
+			// depend on the closer config — its verdict is shared across all stages of
+			// the step. Truncated failures re-run (the completeness rule).
+			Some(fv): switch (fv) {
+				RuResidualProved(fres): {
+					if (env.conf.verbose >= 4) { env.out.println("  resid: fallback memo hit (proved) goal=" + ru2s(goal, math)); } else {};
+					Some(fres);
+				}
+				RuResidualFailed(ftrunc, __): if (!ftrunc) {
+					if (env.conf.verbose >= 4) { env.out.println("  resid: fallback memo hit (failed) goal=" + ru2s(goal, math)); } else {};
+					None();
+				} else ruResidualFallback(memo, math, env, stmtClass, goal, nnf, precedes, conn, wff, em,
+					premiseExps2, spliceAll, hypDisjs2, fbRef);
+			}
+			None(): ruResidualFallback(memo, math, env, stmtClass, goal, nnf, precedes, conn, wff, em,
+				premiseExps2, spliceAll, hypDisjs2, fbRef);
+		}
+	};
+	Pair(res, ruTimeIsOver(callTimer) || exists(^fbRef, ruTimeIsOver));
+}
+
+// The post-closer fallback chain, factored out so its verdict can be cached per (goal, nnf).
+ruResidualFallback(memo : Maybe<RuResidualMemo>, math : RuMath, env : RuEnv, stmtClass : int,
+	goal : RuExp, nnf : bool, precedes : (int) -> bool, conn : RuPConnectives, wff : int, em : RuEnvMath,
+	premiseExps2 : [RuExp], spliceAll : (RuProofTree) -> RuProofTree, hypDisjs2 : Set<RuDisj>,
+	fbRef : ref [RuTimer]) -> Maybe<RuRefineResult> {
+	res = {
 			// THE EQUALIZER'S SECOND ROUND: an EQUALITY goal gets the congruence-closure
 			// decision over the SATURATED premise set — the derived ground equalities
 			// (x9=x5 from the unfolded transported membership) exist only here, so the
@@ -425,6 +609,7 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 			// The WHOLE fallback chain (skolemization + subset try + component tries + full
 			// retry) shares one wall-clock budget (see the cost-bomb lesson).
 			fbTimer = ruMakeLimitedTimer(1000.0);
+			fbRef := [fbTimer];
 			// SKOLEMIZATION (S4): an ∃-premise is OPAQUE to the propositional check (∃xφ
 			// atomizes to a single atom), so eliminate it first — Mizar's pre-check. The
 			// premise's own bound var x is the eigenvariable (declined if x occurs free
@@ -470,7 +655,7 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 					// unfold the ∃-body the same way real hyps are unfolded (its atoms — x∈(A∩B)
 					// composites — are otherwise opaque to the propositional check); the bridge
 					// (body → body') is biimpi of the rewrite bicond, syl-composed below.
-					bodyRw = ruEqualizerRewrite(em, conn, wff, stmtClass, [], body, nnf, precedes);
+					bodyRw = ruMemoRewrite(memo, em, conn, wff, stmtClass, body, nnf, precedes);
 					body2 = bodyRw.residual;
 					natoms = sizeTree(fold(concat(otherExps, [body2, goal]), ruPAtomNodes(conn, goal), \acc, e -> mergeTree(acc, ruPAtomNodes(conn, e))));
 					if (env.conf.verbose >= 4) {
@@ -594,8 +779,12 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 			}
 			}
 			}
-		}
-	}
+	};
+	ruFallbackStore(memo, goal, nnf, switch (res) {
+		Some(r): RuResidualProved(r);
+		None(): RuResidualFailed(exists(^fbRef, ruTimeIsOver), 1000.0);
+	});
+	res;
 }
 
 // Phase 1: strip the leading ∀-chain; validation re-quantifies the matrix proof with ax-gen. Declines
