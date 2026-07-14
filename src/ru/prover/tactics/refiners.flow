@@ -51,6 +51,10 @@ export {
 	// proof TREE. A self-contained prover run on a CONCRETE goal — no free witness variable ever reaches
 	// search. `mkCloser` is a THUNK producing a fresh closer tactic per call (the closer carries internal
 	// ref-snapshots — e.g. bounded-bfs's delta limit — that must not leak across residual sub-proves).
+// An ∃-premise candidate for the residual's skolemization: the ∃-expression, the premise index
+// it replaces (-1 for an on-demand ELIM derivation), the minor proof discharging it, its DVs.
+RuExPremCand(prem : RuExp, exclude : int, minor : RuProofTree, disjs : Set<RuDisj>);
+
 // Remap a certificate's hypothesis leaves from SUBSET positions to the original premise indices.
 ruInRemapLeaves(t : RuProofTree, subset : [int]) -> RuProofTree {
 	switch (t) {
@@ -427,17 +431,34 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 			// elsewhere): the emitter proves (φ(x) → G) natively in deduction form, exlimiv
 			// turns it into (∃xφ → G) — its DV(x, G) proviso declared — and ax-mp with the
 			// premise concludes G. First ∃-premise only (nesting = a later increment).
+			// the ∃-tries get HALF the fallback budget: the exponential emitter on ∃-shaped
+			// residuals must not starve the component-retry chain that closes the borderliner
+			// class in article runs (the 6e44dbc4 lesson — full zfmisc slipped 126 -> 124).
+			exBudget = ruMakeLimitedTimer(min(500.0, ruTimeLeft(fbTimer)));
 			exTry = {
 				wexId = s2id("wex");
-				exIdxs = filter(enumFromTo(0, length(premiseExps2) - 1), \i -> ruEqHead(premiseExps2[i]) == wexId);
-				if (exIdxs == [] || !precedes(s2id_("exlimiv"))) None()
-				else fold(exIdxs, None(), \found : Maybe<RuRefineResult>, exIdx ->
-				if (isSome(found) || ruTimeIsOver(fbTimer)) found
+				plainCands = filtermapi(premiseExps2, \i, e ->
+					if (ruEqHead(e) == wexId) Some(RuExPremCand(e, i, RuProofHyp(i, RuStmt(stmtClass, [e], -1)), makeSet())) else None());
+				if ((plainCands == [] && !exists(premiseExps2, \e -> ruInHasExUnfold(math, ruEqHead(e))))
+					|| !precedes(s2id_("exlimiv"))) None()
 				else {
-					exPrem = premiseExps2[exIdx];
+				// ELIM on demand: eluni-shaped premises yield their ∃v-forms here, NOT as
+				// saturation facts (there they add an opaque atom to every closer's problem).
+				usedIds = fold(arrayPush(premiseExps2, goal), makeSet(), \acc, e ->
+					fold(e.nodes, acc, \a, n -> switch (n) { RuVar(id, __): insertSet(a, id); RuRuleNode(__, __): a; }));
+				exhyps = mapi(premiseExps2, \i, e -> {
+					ph : RuProofTree = RuProofHyp(i, RuStmt(stmtClass, [e], -1));
+					Pair(ph, e);
+				});
+				derived = ruInRelExistsFacts(math, env, stmtClass, exhyps, usedIds, tp2id_("setvar"));
+				exCands = concat(plainCands, map(derived.first, \d -> RuExPremCand(d.second, -1, d.first, derived.second)));
+				fold(exCands, None(), \found : Maybe<RuRefineResult>, cand ->
+				if (isSome(found) || ruTimeIsOver(exBudget)) found
+				else {
+					exPrem = cand.prem;
 					xE = (ruEqArgs(exPrem)).first;
 					body = (ruEqArgs(exPrem)).second;
-					others = filter(enumFromTo(0, length(premiseExps2) - 1), \i -> i != exIdx);
+					others = filter(enumFromTo(0, length(premiseExps2) - 1), \i -> i != cand.exclude);
 					otherExps = map(others, \i -> premiseExps2[i]);
 					// exlimiv's ONLY proviso is DV(x, goal): decline when x occurs in the goal.
 					// Occurrences of x in other hypothesis LEAVES are licensed (hyps are
@@ -456,11 +477,11 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 						env.out.println("  exTry: prem=" + ru2s(exPrem, math) + " xInGoal=" + b2s(xInGoal) + " natoms=" + i2s(natoms) +
 							(if (body2.nodes == body.nodes) "" else " body'=" + ru2s(body2, math)));
 					} else {};
-					if (xInGoal || natoms > 24) None()
+					if (xInGoal || natoms > 16) None()
 					else {
 						atomNodesEx = fold(concat(otherExps, [body2]), ruPAtomNodes(conn, goal), \acc, e -> mergeTree(acc, ruPAtomNodes(conn, e)));
 						ctxH = RuHCtx(ruHCtx(em, wff, stmtClass, atomNodesEx) with
-							timer = ruMakeLimitedTimer(ruTimeLeft(fbTimer)), fo = Some(ruInAtomCongsCached(math)));
+							timer = ruMakeLimitedTimer(ruTimeLeft(exBudget)), fo = Some(ruInAtomCongsCached(math)));
 						switch (ruHilbertProveUnder(ctxH, map(otherExps, \e -> ruPAtomize(conn, e)), ruPAtomize(conn, body2), ruPAtomize(conn, goal))) {
 							None(): None();
 							Some(tree): {
@@ -476,18 +497,19 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 								};
 								exImp = ruFwdMkRule(s2id("wi"), wff, [exPrem, goal]);
 								pEx = RuProofStep(s2id_("exlimiv"), [ruInRemapLeaves(treeB, others)], RuStmt(stmtClass, [exImp], -1));
-								pG  = RuProofStep(s2id_("ax-mp"), [RuProofHyp(exIdx, RuStmt(stmtClass, [exPrem], -1)), pEx], RuStmt(stmtClass, [goal], -1));
+								pG  = RuProofStep(s2id_("ax-mp"), [cand.minor, pEx], RuStmt(stmtClass, [goal], -1));
 								// DV(x, ψ) instantiated at the concrete goal: x # each goal var.
 								dvs = fold(goal.nodes, makeSet(), \ds, n -> switch (n) {
 									RuVar(id, tp): if (id == xVar.id) ds else insertSet(ds, RuDisj(RuVar(id, tp), xVar));
 									RuRuleNode(__, __): ds;
 								});
 								Some(RuRefineResult(spliceAll(pG),
-									mergeSets(mergeSets(mergeSets(hypDisjs2, dvs), ^(ctxH.disjs)), bodyRw.disjs)));
+									mergeSets(mergeSets(mergeSets(mergeSets(hypDisjs2, dvs), ^(ctxH.disjs)), bodyRw.disjs), cand.disjs)));
 							}
 						}
 					}
 				});
+				}
 			};
 			if (isSome(exTry)) exTry else {
 			// SKOLEMIZATION, GOAL SIDE (S4b): an ∃-GOAL is equally opaque to the propositional
@@ -495,7 +517,7 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 			// ψ = φ[t/x] (the mechanical subst congruence + setness; spcev assembles ψ → ∃xφ),
 			// and the certificate closes ψ. First witness that closes wins (a LIMIT, not a
 			// variant discard — the engine's own routes stay available).
-			exGoalTry = if (ruEqHead(goal) != s2id("wex") || !precedes(s2id_("spcev")) || ruTimeIsOver(fbTimer)) None()
+			exGoalTry = if (ruEqHead(goal) != s2id("wex") || !precedes(s2id_("spcev")) || ruTimeIsOver(exBudget)) None()
 				else {
 				ws = ruInExGoalWitnesses(math, env, stmtClass, goal, premiseExps2, 8);
 				if (env.conf.verbose >= 4) {
@@ -505,8 +527,8 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 				fold(ws, None(), \found : Maybe<RuRefineResult>, w ->
 					switch (found) {
 						Some(__): found;
-						None(): if (ruTimeIsOver(fbTimer)) None()
-							else maybeMap(ruHilbertCertificateTimed(em, conn, wff, stmtClass, premiseExps2, w.subgoal, ruTimeLeft(fbTimer), Some(ruInAtomCongsCached(math))),
+						None(): if (ruTimeIsOver(exBudget)) None()
+							else maybeMap(ruHilbertCertificateTimed(em, conn, wff, stmtClass, premiseExps2, w.subgoal, ruTimeLeft(exBudget), Some(ruInAtomCongsCached(math))),
 								\pr -> RuRefineResult(spliceAll(w.assemble(pr.first)),
 									mergeSets(mergeSets(hypDisjs2, w.disjs), pr.second.disjs)));
 					});
