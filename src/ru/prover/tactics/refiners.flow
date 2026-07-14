@@ -398,22 +398,49 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 			r1 = pick(goalKs);
 			ks2 = fold(r1, goalKs, \acc, i -> mergeSets(acc, atomKeys(premiseExps2[i])));
 			subset = pick(ks2);
-			tryHilb = \idxs : [int] -> {
+			// The WHOLE fallback chain (subset try + component tries + full retry) shares one
+			// wall-clock budget: the atom gate bounds which attempts run, NOT how long one takes
+			// (the emitter is exponential and its split caps bound shape, not wall cost — an
+			// ungated chain of near-gate certificates once turned a 7-min article run into 6.5h).
+			fbTimer = ruMakeLimitedTimer(1000.0);
+			tryHilb = \idxs : [int], atomGate : int -> {
 				exps = map(idxs, \i -> premiseExps2[i]);
 				natoms = sizeTree(fold(arrayPush(exps, goal), ruPAtomNodes(conn, goal), \acc, e -> mergeTree(acc, ruPAtomNodes(conn, e))));
-				if (natoms > 24) None()
-				else maybeMap(ruHilbertCertificate(em, conn, wff, stmtClass, exps, goal),
+				if (natoms > atomGate || ruTimeIsOver(fbTimer)) None()
+				else maybeMap(ruHilbertCertificateTimed(em, conn, wff, stmtClass, exps, goal, ruTimeLeft(fbTimer)),
 					\pr -> RuRefineResult(spliceAll(ruInRemapLeaves(pr.first, idxs)), mergeSets(hypDisjs2, pr.second.disjs)));
 			};
-			switch (tryHilb(subset)) {
+			switch (tryHilb(subset, 24)) {
 				Some(r): Some(r);
 				// The relevance subset is UNSOUND for refutations: an inconsistent premise set
 				// proves anything, and the contradiction can live among premises sharing no atom
-				// with the goal. Retry with the FULL set — but only for a REFUTATION-shaped
-				// (¬-headed) goal: an unconditional retry paid a second exponential check on
-				// every failing residual and starved two full-stack theorems.
-				None(): if (length(subset) == length(premiseExps2) || ruEqHead(goal) != conn.wn) None()
-					else tryHilb(enumFromTo(0, length(premiseExps2) - 1));
+				// with the goal. But deriving ⊥ needs premises sharing atoms WITH EACH OTHER
+				// (a minimal inconsistent set is atom-connected — disjoint-atom parts satisfy
+				// independently), so retry with subset ∪ C per atom-connected COMPONENT C of the
+				// unpicked premises, smallest first, under a TIGHTER atom gate — small tries that
+				// pass where the full set fails its gate. Then the ¬-gated full-set retry as
+				// before (components can be bridged by a subset premise's out-of-closure atoms).
+				None(): {
+					rest = filter(enumFromTo(0, length(premiseExps2) - 1), \i -> !contains(subset, i));
+					comps = fold(rest, [], \acc : [Pair<[int], Set<string>>], i -> {
+						ks = atomKeys(premiseExps2[i]);
+						linked = filter(acc, \c -> !isEmptySet(intersectSets(c.second, ks)));
+						other  = filter(acc, \c -> isEmptySet(intersectSets(c.second, ks)));
+						merged = fold(linked, Pair([i], ks), \m, c ->
+							Pair(concat(m.first, c.first), mergeSets(m.second, c.second)));
+						arrayPush(other, merged);
+					});
+					compTry = fold(take(mergeSort(comps, \a, b -> length(a.first) - length(b.first)), 2), None(),
+						\found : Maybe<RuRefineResult>, c -> switch (found) {
+							Some(__): found;
+							None(): tryHilb(mergeSort(concat(subset, c.first), \a, b -> a - b), 14);
+						});
+					switch (compTry) {
+						Some(r): Some(r);
+						None(): if (length(subset) == length(premiseExps2) || ruEqHead(goal) != conn.wn) None()
+							else tryHilb(enumFromTo(0, length(premiseExps2) - 1), 24);
+					}
+				}
 			}
 		}
 	}

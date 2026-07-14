@@ -27,14 +27,21 @@ export {
 	//   disjs/freshVars — the disjoint-variable provisos + fresh setvars the ssrdv steps require; the caller
 	//     MUST fold these into the installed RuProof.vars, else verification fails on a DV violation
 	//   em — RuEnvMath, for ruEqualizerRelSubgoal (the ⊆/= goal reduction's fresh-var + DV machinery)
+	//   timer — a WALL-CLOCK deadline for the whole emitter run. The split/work caps bound the
+	//     backtracking SHAPE but not its wall cost (a near-24-atom certificate can run minutes —
+	//     the 6.5h zfmisc lesson); every ruHProve entry checks the timer and bails.
 	RuHCtx(conn : RuPConnectives, wff : int, stmtClass : int, atomNodes : ref Tree<string, [RuExpNode]>,
-		splitBudget : ref int, globalSplits : ref int, disjs : ref Set<RuDisj>, freshVars : ref [RuVar], em : RuEnvMath);
+		splitBudget : ref int, globalSplits : ref int, disjs : ref Set<RuDisj>, freshVars : ref [RuVar], em : RuEnvMath,
+		timer : RuTimer);
 	// `wff` (the wff type id) and `stmtClass` (the |- turnstile id) MUST come from the loaded math — derive
 	// them from a real expression (ruIdType2Type of a connective node / the prop's class), never from the
 	// memoized ruIdWff/ruIdTurnstile helpers (they cache -1 if interned before the library loads).
 	ruHCtx(em : RuEnvMath, wff : int, stmtClass : int, atomNodes : Tree<string, [RuExpNode]>) -> RuHCtx;
 	// A deduction-form Hilbert proof of `hyps |- goal`, or None if the emitter can't build one.
 	ruHilbertProve(ctx : RuHCtx, hyps : [RuPForm], goal : RuPForm) -> Maybe<RuProofTree>;
+	// ruHilbertCertificate with an explicit wall-clock budget (ms) — the certificate search bails
+	// (returns None) once the deadline passes. Callers with their own slice discipline use this.
+	ruHilbertCertificateTimed(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, limit_ms : double) -> Maybe<Pair<RuProofTree, RuVarsDisjs>>;
 	// Realize a propositional form as a statement `|- f` (for building the hyps/conclusion of a test theorem).
 	ruHStmt(ctx : RuHCtx, f : RuPForm) -> RuStmt;
 	// Build a certificate for a residual `hyps |- goal` (the equalizer's output): atomize over the real
@@ -44,10 +51,16 @@ export {
 }
 
 ruHilbertCertificate(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp) -> Maybe<Pair<RuProofTree, RuVarsDisjs>> {
+	// 60 s SAFETY-NET deadline for untimed callers: far above any certificate that ever succeeds,
+	// but a runaway search can no longer outlive its whole article run (the 6.5h lesson).
+	ruHilbertCertificateTimed(em, conn, wff, stmtClass, hyps, goal, 60000.0);
+}
+
+ruHilbertCertificateTimed(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, limit_ms : double) -> Maybe<Pair<RuProofTree, RuVarsDisjs>> {
 	atomNodes = fold(hyps, ruPAtomNodes(conn, goal), \acc, h -> mergeTree(acc, ruPAtomNodes(conn, h)));
 	hypForms  = map(hyps, \h -> ruPAtomize(conn, h));
 	goalForm  = ruPAtomize(conn, goal);
-	ctx = ruHCtx(em, wff, stmtClass, atomNodes);
+	ctx = RuHCtx(ruHCtx(em, wff, stmtClass, atomNodes) with timer = ruMakeLimitedTimer(limit_ms));
 	maybeMap(ruHilbertProve(ctx, hypForms, goalForm), \tree ->
 		Pair(tree, RuVarsDisjs(fold(^(ctx.freshVars), makeTree(), \acc, v -> setTree(acc, v.id, v)), ^(ctx.disjs))));
 }
@@ -56,7 +69,8 @@ ruHilbertCertificate(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass
 RuHF(content : RuPForm, tree : RuProofTree);
 
 ruHCtx(em : RuEnvMath, wff : int, stmtClass : int, atomNodes : Tree<string, [RuExpNode]>) -> RuHCtx {
-	RuHCtx(ruPConnectives(), wff, stmtClass, ref atomNodes, ref 6, ref 400, ref makeSet(), ref [], em);
+	RuHCtx(ruPConnectives(), wff, stmtClass, ref atomNodes, ref 6, ref 400, ref makeSet(), ref [], em,
+		ruMakeLimitedTimer(60000.0));
 }
 
 // ---- RuPForm -> RuExp / RuStmt (own copy; mirrors the kalmar pattern, no kalmar dependency) ----
@@ -378,7 +392,7 @@ ruHFalsum(ctx : RuHCtx, amb : Maybe<RuPForm>, fbot : RuHF, goal : RuPForm) -> Ru
 
 // ---- the prover ------------------------------------------------------------
 ruHProve(ctx : RuHCtx, amb : Maybe<RuPForm>, facts0 : [RuHF], goal : RuPForm, fuel : int) -> Maybe<RuHF> {
-	if (fuel <= 0) None()
+	if (fuel <= 0 || ruTimeIsOver(ctx.timer)) None()
 	else {
 		facts = ruHSaturate(ctx, amb, facts0, 8);
 		direct = ruHFind(facts, goal);
