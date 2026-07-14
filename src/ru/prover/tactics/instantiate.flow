@@ -62,7 +62,8 @@ export {
 // residual closer calls this phase for EVERY goal — rebuilding them per call cost enough time that
 // theorems which close as a single probe missed their stage slice in a whole-article run. Keyed by
 // the index size, which is fixed for the duration of a run.
-RuInTables(atoms : Tree<int, [RuInAtomCong]>, conns : Tree<int, RuInConnCong>, setness : Tree<int, [RuSetLemma]>);
+RuInTables(atoms : Tree<int, [RuInAtomCong]>, conns : Tree<int, RuInConnCong>, setness : Tree<int, [RuSetLemma]>,
+	enums : Tree<int, [RuInEnumRule]>);
 ruInTablesCache : ref [Pair<int, RuInTables>] = ref [];
 
 ruInTables(math : RuMath) -> RuInTables {
@@ -72,7 +73,7 @@ ruInTables(math : RuMath) -> RuInTables {
 }
 
 ruInBuildTables(math : RuMath, n : int) -> RuInTables {
-	t = RuInTables(ruInAtomCongs(math), ruInConnCongs(math), ruSetnessRegistry(math));
+	t = RuInTables(ruInAtomCongs(math), ruInConnCongs(math), ruSetnessRegistry(math), ruInEnumRules(math));
 	ruInTablesCache := [Pair(n, t)];
 	t;
 }
@@ -210,6 +211,64 @@ ruInConnCongs(math : RuMath) -> Tree<int, RuInConnCong> {
 							if (!ok) acc
 							else if (containsKeyTree(acc, ruInHead(l))) acc   // first wins, deterministic
 							else setTree(acc, ruInHead(l), RuInConnCong(ruInId(ass), nh));
+						}
+					}
+				}
+			}
+		}
+	});
+}
+
+// ---- the definitional-membership table (snid/prid1/prid2/tpid1-3 by SHAPE) --
+
+// A lemma `v ∈ T(…v…)` (optionally under a setness hyp `v ∈ _V`): applying it at an
+// enumeration term occurring in the problem yields the term's definitional membership
+// fact — the ground literal Mizar's Equalizer knows for every enumerated set.
+//   lemmaId    the assertion; prop its statement; tvars the constructor's arg vars in order;
+//   argPos     which constructor arg is the member; hasSetness whether a `v ∈ _V` hyp
+//              must be discharged (by the recursive setness prover).
+RuInEnumRule(lemmaId : int, prop : RuExp, tvars : [RuVar], argPos : int, hasSetness : bool);
+
+// Mechanical scan (nothing hand-listed): 0/1-hyp assertions, no DV, whose prop is
+// `v ∈ T(v1…vn)` with v and every vi a plain class var, the vi distinct, v = v_argPos,
+// and the hyp (when present) exactly `v ∈ _V`. On miz_set this finds snid, prid1/prid2,
+// tpid1/tpid2/tpid3 — and any future enumeration constructor's lemma of the same shape.
+ruInEnumRules(math : RuMath) -> Tree<int, [RuInEnumRule]> {
+	wcelId = s2id("wcel");
+	asVar = \e : RuExp -> if (length(e.nodes) != 1) None() else switch (e.nodes[0]) {
+		RuVar(id, tp): Some(RuVar(id, tp));
+		RuRuleNode(__, __): None();
+	};
+	fold(getTreeValues(math.decls.assertions), makeTree(), \acc, ass -> {
+		inf = ruInInfer(ass);
+		nh = length(inf.hyps);
+		if (nh > 1 || !isEmptySet(inf.vars.disjs)) acc else {
+			prop = ruExp(inf.prop.exps[0]);
+			if (ruInHead(prop) != wcelId || ruInArity(prop) != 2) acc else {
+				pa = ruInArgs(prop);
+				switch (asVar(pa[0])) {
+					None(): acc;
+					Some(v): {
+						t = pa[1];
+						th = ruInHead(t);
+						if (th < 0 || ruInArity(t) == 0) acc else {
+							targs = map(ruInArgs(t), asVar);
+							if (!forall(targs, isSome)) acc else {
+								tvars = map(targs, \m -> either(m, ruNoVar));
+								distinct = sizeSet(buildSet(map(tvars, \tv -> tv.id))) == length(tvars);
+								pos = findiDef(tvars, \tv -> tv.id == v.id, -1);
+								hypOk = nh == 0 || {
+									h = ruExp(inf.hyps[0].stmt.exps[0]);
+									ruInHead(h) == wcelId && ruInArity(h) == 2
+										&& (ruInArgs(h))[0].nodes == pa[0].nodes
+										&& ruInHead((ruInArgs(h))[1]) == s2id("cvv");
+								};
+								if (!distinct || pos < 0 || !hypOk) acc
+								else {
+									cur = lookupTreeDef(acc, th, []);
+									setTree(acc, th, arrayPush(cur, RuInEnumRule(ruInId(ass), prop, tvars, pos, nh == 1)));
+								}
+							}
 						}
 					}
 				}
@@ -401,6 +460,102 @@ ruInReflFacts(math : RuMath, env : RuEnv, stmtClass : int, cands : [RuExp]) -> [
 	}
 }
 
+// (4) DEFINITIONAL ENUMERATION MEMBERSHIPS: for every enumeration term {a}/{a,b}/{a,b,c}
+// occurring in the problem, derive its element memberships (a ∈ {a,b} …) by the scanned
+// enum-rule table — foundation lemmas (snid/prid1/…), setness hyp discharged recursively.
+// These are the ground literals Mizar's Equalizer holds definitionally for enumerated sets.
+ruInEnumFacts(math : RuMath, env : RuEnv, stmtClass : int, tabs : RuInTables,
+	hyps : [Pair<RuProofTree, RuExp>], goal : RuExp) -> [Pair<RuExp, RuProofTree>] {
+	// every rule-headed subterm whose head has enum rules, from the WHOLE problem
+	collect = \e : RuExp -> {
+		n = e.nodes;
+		filtermap(enumFromTo(0, length(n) - 1), \i -> switch (n[i]) {
+			RuVar(__, __): None();
+			RuRuleNode(idT, __): {
+				if (!containsKeyTree(tabs.enums, ruIdType2Id(idT))) None()
+				else Some(RuExp(subrange(n, i, ruInSpan(n, i) - i), -1));
+			}
+		});
+	};
+	all = concatA(map(arrayPush(map(hyps, \h -> h.second), goal), collect));
+	terms = take(fold(all, [], \acc, t -> if (exists(acc, \a -> a.nodes == t.nodes)) acc else arrayPush(acc, t)), 8);
+	fold(terms, [], \acc, t -> {
+		targs = ruInArgs(t);
+		fold(lookupTreeDef(tabs.enums, ruInHead(t), []), acc, \ac, r -> {
+			if (length(targs) != length(r.tvars)) ac else {
+				m = makeHashMap(idfn);
+				iteri(r.tvars, \i, tv -> setHashMap(m, tv.id, RuSubExpr(tv, targs[i], ruExpVarIdsHashSet(targs[i]))));
+				inst = ruApplySubst(r.prop, RuSubst(m));
+				if (exists(ac, \f -> f.first.nodes == inst.nodes)) ac
+				else {
+					stmt = RuStmt(stmtClass, [inst], -1);
+					if (!r.hasSetness) arrayPush(ac, Pair(inst, RuProofStep(r.lemmaId, [], stmt)))
+					else switch (ruSetnessProof2(tabs.setness, targs[r.argPos], stmtClass, math, env)) {
+						None(): ac;
+						Some(setn): arrayPush(ac, Pair(inst, RuProofStep(r.lemmaId, [setn], stmt)));
+					}
+				}
+			}
+		});
+	});
+}
+
+// (5) EQUALITY TRANSPORT — the Equalizer's atom merge: for every premise ground equality
+// (X = Y) (and its eqcomi flip) and every atom fact F holding X at a congruence position,
+// derive F[Y/X] via the scanned atom congruences (eleq1/eleq2/sseq1/… — one ax-mp + mpbi).
+// One bounded round: enough to move a definitional membership across the premise equality
+// (x9 ∈ {x9,x10} + {x5}={x9,x10} → x9 ∈ {x5}, the t4-class step).
+ruInTransport(math : RuMath, env : RuEnv, stmtClass : int, tabs : RuInTables,
+	hyps : [Pair<RuProofTree, RuExp>], facts : [Pair<RuExp, RuProofTree>]) -> [Pair<RuExp, RuProofTree>] {
+	wceqId = s2id("wceq");
+	eqcomi = s2id_("eqcomi");
+	axmp   = s2id_("ax-mp");
+	mpbi   = s2id_("mpbi");
+	eqHyps0 = filter(hyps, \h -> ruInHead(h.second) == wceqId && ruInArity(h.second) == 2);
+	eqs = concatA(map(eqHyps0, \h -> {
+		sides = ruInArgs(h.second);
+		if (sides[0].nodes == sides[1].nodes) [] else {
+			flipped = ruFwdMkRule(wceqId, tp2id_("wff"), [sides[1], sides[0]]);
+			[Triple(h.first, sides[0], sides[1]),
+			 Triple(RuProofStep(eqcomi, [h.first], RuStmt(stmtClass, [flipped], -1)), sides[1], sides[0])];
+		}
+	}));
+	if (eqs == []) [] else {
+		// transport ONLY the derived facts (the enum memberships), NOT the premise atoms:
+		// premise-atom transport multiplies junk on enum-free problems (every ⊆/=-premise ×
+		// every congruence rule), and each junk fact is then eqss-normalized downstream —
+		// measured to starve the def-close stage out of theorems it closed in 1s (t104).
+		// For an enum-free problem `facts` is empty and this whole phase is a no-op.
+		pool = facts;
+		known = \fs : [Pair<RuExp, RuProofTree>], e : RuExp ->
+			exists(hyps, \h -> h.second.nodes == e.nodes) || exists(pool, \p -> p.first.nodes == e.nodes)
+			|| exists(fs, \p -> p.first.nodes == e.nodes);
+		fold(pool, [], \acc, f -> if (length(acc) >= 16) acc else
+			fold(eqs, acc, \ac, eq -> if (length(ac) >= 16) ac else
+				fold(lookupTreeDef(tabs.atoms, ruInHead(f.first), []), ac, \a, r -> switch (ruMatchExp(f.first, r.lhs, math, env)) {
+					None(): a;
+					Some(sub0): {
+						va = lookupHashMap(sub0.map, r.va.id);
+						vaIsX = switch (va) { Some(se): se.exp.nodes == eq.second.nodes; None(): false; };
+						if (!vaIsX) a else {
+							m = copyHashMap(sub0.map);
+							setHashMap(m, r.vb.id, RuSubExpr(r.vb, eq.third, ruExpVarIdsHashSet(eq.third)));
+							sub = RuSubst(m);
+							f2 = ruApplySubst(r.rhs, sub);
+							if (f2.nodes == f.first.nodes || known(a, f2)) a
+							else {
+								inst = ruApplySubst(r.prop, sub);            // (X=Y) → (F ↔ F')
+								bi = (ruInArgs(inst))[1];                    // (F ↔ F')
+								pInst = RuProofStep(r.lemmaId, [], RuStmt(stmtClass, [inst], -1));
+								pBi = RuProofStep(axmp, [eq.first, pInst], RuStmt(stmtClass, [bi], -1));
+								arrayPush(a, Pair(f2, RuProofStep(mpbi, [f.second, pBi], RuStmt(stmtClass, [f2], -1))));
+							}
+						}
+					}
+				})));
+	}
+}
+
 ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
 	hyps : [Pair<RuProofTree, RuExp>], goal : RuExp, cap : int) -> Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>> {
 	walId   = s2id("wal");
@@ -415,11 +570,16 @@ ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
 		fold(e.nodes, acc, \a, n -> switch (n) { RuVar(id, __): insertSet(a, id); RuRuleNode(__, __): a; }));
 	// (1) emptiness ∀-forms
 	emp = ruInEmptinessForalls(math, env, stmtClass, hyps, used, setvarT);
+	// (4) definitional enumeration memberships, (5) their transport across premise equalities
+	enumFacts = ruInEnumFacts(math, env, stmtClass, tabs, hyps, goal);
+	moved = ruInTransport(math, env, stmtClass, tabs, hyps, enumFacts);
+	eqlz = concat(enumFacts, moved);
 	// (2) the ∀-pool: given ∀-premises + derived ∀-forms; instantiate at every candidate.
-	// An EMPTY pool means the whole pass has nothing to do — return nothing at all (the refl
-	// facts alone never close anything and their downstream normalization is pure cost).
+	// An EMPTY pool with NO equalizer facts means the whole pass has nothing to do — return
+	// nothing at all (the refl facts alone never close anything and their downstream
+	// normalization is pure cost).
 	pool = concat(filter(hyps, \h -> ruInHead(h.second) == walId && ruInArity(h.second) == 2), emp.first);
-	if (pool == []) Pair([], makeSet()) else {
+	if (pool == [] && eqlz == []) Pair([], makeSet()) else {
 	instAcc = fold(pool, Pair([], emp.second), \acc : Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>>, h -> {
 		pa = ruInArgs(h.second);
 		xE = pa[0]; body = pa[1];
@@ -465,12 +625,14 @@ ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
 			}
 		}
 	});
-	// (3) reflexivity facts
-	refl = ruInReflFacts(math, env, stmtClass, cands);
+	// (3) reflexivity facts — ONLY when there are spcv instances for them to bottom out on:
+	// with an empty ∀-pool they close nothing and their downstream normalization is pure
+	// cost (the pre-equalizer early return suppressed them; keep that property).
+	refl = if (pool == []) [] else ruInReflFacts(math, env, stmtClass, cands);
 	// TOTAL-INSTANCE CAP: candidates are smallest-first, so the cap keeps the workhorse
 	// instances (variables, singletons) and sheds the big-product tail. Without it the
 	// pool x candidates product multiplied the per-instance normalization cost and starved
 	// the general path's slices (zfmisc general 98 -> 92 when compounds landed uncapped).
-	Pair(concat(take(instAcc.first, 8), refl), instAcc.second);
+	Pair(concat3(eqlz, take(instAcc.first, 8), refl), instAcc.second);
 	}
 }
