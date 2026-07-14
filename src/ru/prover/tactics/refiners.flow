@@ -8,6 +8,7 @@ import ru/prover/tactics/combinators;
 import ru/prover/tactics/equalizer;
 import ru/prover/tactics/unfold;
 import ru/prover/tactics/instantiate;
+import ru/prover/tactics/congruence;
 import ru/prover/tactics/hilbert;
 import ru/prover/tactics/propositional;
 import ru/prover/tactics/closer;
@@ -384,6 +385,36 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 	switch (ruRunCloser(math, env, info, stmtClass, premises, goal, scope, mkCloser(), limit)) {
 		Some(unc): Some(RuRefineResult(spliceAll(unc), hypDisjs2));
 		None(): {
+			// THE EQUALIZER'S SECOND ROUND: an EQUALITY goal gets the congruence-closure
+			// decision over the SATURATED premise set — the derived ground equalities
+			// (x9=x5 from the unfolded transported membership) exist only here, so the
+			// whole-theorem `congruence` pipeline stage never sees them. The closer misses
+			// long eqtri/eqcomi chains and the Hilbert emitter treats equality atoms as
+			// opaque, so this is the only route for the t5-class (x9=x5, x10=x5 ⊢ x9=x10).
+			// Whole-or-nothing and cheap: rules cached, the closure graph is premise-sized.
+			congTry = switch (ruCongSides(goal)) {
+				None(): None();
+				Some(lr): {
+					eqFacts = filtermap(mapi(premiseExps2, \i, e -> Pair(i, e)), \ie ->
+						if (ruCongIsEq(ie.second)) Some(Pair(RuProofHyp(ie.first, RuStmt(stmtClass, [ie.second], -1)), ie.second)) else None());
+					if (eqFacts == []) None() else {
+						st = ruCongClose(ruCongRulesCached(math), eqFacts, arrayPush(premiseExps2, goal), stmtClass, math, env);
+						if (env.conf.verbose >= 4) {
+							env.out.println("  congTry: goal=" + ru2s(goal, math) + " eqFacts=" +
+								strGlue(map(eqFacts, \f -> ru2s(f.second, math)), " | ") +
+								" entailed=" + b2s(ruCongEqual(st, lr.first, lr.second)));
+						} else {};
+						switch (ruCongExplain(st, lr.first, lr.second)) {
+							None(): None();
+							Some(pr): switch (pr) {
+								RuProofStep(__, __, __): Some(RuRefineResult(spliceAll(pr), hypDisjs2));
+								RuProofHyp(__, __): None();   // goal IS a premise — the closer's job
+							}
+						}
+					}
+				}
+			};
+			if (isSome(congTry)) congTry else {
 			// RELEVANCE for the complete check: G3cp is exponential in the atom count, and the
 			// saturation deliberately over-produces (instances at every occurring term), so running
 			// the check over ALL premises either blows up or gets gated away — the gate then defeats
@@ -441,6 +472,7 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 							else tryHilb(enumFromTo(0, length(premiseExps2) - 1), 24);
 					}
 				}
+			}
 			}
 		}
 	}
@@ -537,7 +569,14 @@ ruRelIntroRefiner(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : 
 				r.disjs));
 		};
 	},
-		\__ -> None());
+		// ALT: a SETVAR equality whose pointwise (extensionality) route failed goes to the residual
+		// UN-reduced — the saturation there derives the element equalities (x9∈{x5} → x9=x5) and the
+		// congruence closure chains them to the goal (the t5-class: {x5}={x9,x10} ⊢ x9=x10). The
+		// pointwise reduction is BACKWARDS for this class: it needs the equality it is trying to
+		// prove. Same shape gate as eq-rewrite's alt, so the extra residual run stays rare.
+		\goal -> if (ruEqHead(goal) == s2id("wceq") && ruRelIsSetvarEq(goal))
+			Some(RuRefineStep([goal], \proofs -> proofs[0], makeSet()))
+		else None());
 }
 
 // Split a CONJUNCTION goal `(B ∧ C ∧ …)` into its conjuncts, prove each separately, and recombine with
