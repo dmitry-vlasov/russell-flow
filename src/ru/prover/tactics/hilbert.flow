@@ -37,7 +37,7 @@ export {
 	//     literals INSIDE the branch, where saturation-before-the-check cannot see it).
 	RuHCtx(conn : RuPConnectives, wff : int, stmtClass : int, atomNodes : ref Tree<string, [RuExpNode]>,
 		splitBudget : ref int, globalSplits : ref int, disjs : ref Set<RuDisj>, freshVars : ref [RuVar], em : RuEnvMath,
-		timer : RuTimer, fo : Maybe<Tree<int, [RuInAtomCong]>>);
+		timer : RuTimer, fo : Maybe<Tree<int, [RuInAtomCong]>>, inClash : ref bool);
 	// `wff` (the wff type id) and `stmtClass` (the |- turnstile id) MUST come from the loaded math — derive
 	// them from a real expression (ruIdType2Type of a connective node / the prop's class), never from the
 	// memoized ruIdWff/ruIdTurnstile helpers (they cache -1 if interned before the library loads).
@@ -81,6 +81,28 @@ ruHilbertCertificateTimed(em : RuEnvMath, conn : RuPConnectives, wff : int, stmt
 // a proof fragment: `tree` proves `|- und(curAmb, content)` for the ambient in force at its creation.
 RuHF(content : RuPForm, tree : RuProofTree);
 
+// the ∧-leaves of a form (flattening nested conjunctions).
+ruHAndLeaves(f : RuPForm) -> [RuPForm] {
+	switch (f) {
+		RuPAnd(a, b): concat(ruHAndLeaves(a), ruHAndLeaves(b));
+		default: [f];
+	}
+}
+
+// does the form contain an equality ATOM anywhere? (shape gate for the ¬-membership unfold)
+ruHFormHasEqAtom(ctx : RuHCtx, f : RuPForm) -> bool {
+	switch (f) {
+		RuPAtom(k): ruEqHead(ruHAtomExp(ctx, k)) == ruHwceq();
+		RuPNot(a): ruHFormHasEqAtom(ctx, a);
+		RuPAnd(a, b): ruHFormHasEqAtom(ctx, a) || ruHFormHasEqAtom(ctx, b);
+		RuPOr(a, b): ruHFormHasEqAtom(ctx, a) || ruHFormHasEqAtom(ctx, b);
+		RuPImp(a, b): ruHFormHasEqAtom(ctx, a) || ruHFormHasEqAtom(ctx, b);
+		RuPIff(a, b): ruHFormHasEqAtom(ctx, a) || ruHFormHasEqAtom(ctx, b);
+		RuPTrue(): false;
+		RuPFalse(): false;
+	}
+}
+
 // debug: the propositional SHAPE of a form (atoms anonymized).
 ruHFormShape(f : RuPForm) -> string {
 	switch (f) {
@@ -97,7 +119,7 @@ ruHFormShape(f : RuPForm) -> string {
 
 ruHCtx(em : RuEnvMath, wff : int, stmtClass : int, atomNodes : Tree<string, [RuExpNode]>) -> RuHCtx {
 	RuHCtx(ruPConnectives(), wff, stmtClass, ref atomNodes, ref 6, ref 400, ref makeSet(), ref [], em,
-		ruMakeLimitedTimer(60000.0), None());
+		ruMakeLimitedTimer(60000.0), None(), ref false);
 }
 
 // ---- RuPForm -> RuExp / RuStmt (own copy; mirrors the kalmar pattern, no kalmar dependency) ----
@@ -167,15 +189,21 @@ ruHRelInst(ctx : RuHCtx, amb : Maybe<RuPForm>, f : RuHF, key : string, witnesses
 // the bridge use `=` hyps (e.g. `(X∪Y)=∅`) — the dominant core-but-not-cert class. The iff then ↔-elims.
 ruHEqInst(ctx : RuHCtx, amb : Maybe<RuPForm>, f : RuHF, key : string, witnesses : [RuExp]) -> [RuHF] {
 	sub = ruHAtomExp(ctx, key); ar = ruEqArgs(sub); a = ar.first; b = ar.second;
-	map(witnesses, \e -> {
+	if (ctx.em.env.conf.verbose >= 6) {
+		ctx.em.env.out.println("        hEqInst: eq=" + ru2s(sub, ctx.em.math) + " witnesses=" + strGlue(map(witnesses, \w -> ru2s(w, ctx.em.math)), ","));
+	} else {};
+	concatA(map(witnesses, \e -> {
 		iffExp = ruHMkExp(s2id_("wb"), ctx.wff, [ruHMkExp(ruHwcel(), ctx.wff, [e, a]), ruHMkExp(ruHwcel(), ctx.wff, [e, b])]);
 		ctx.atomNodes := mergeTree(^(ctx.atomNodes), ruPAtomNodes(ctx.conn, iffExp));
 		content = ruPAtomize(ctx.conn, iffExp);   // (e∈A ↔ e∈B)
-		switch (amb) {
+		fBi = switch (amb) {
 			None():  RuHF(content, ruHStep(ctx, "ax-mp", [f.tree, ruHStep(ctx, "eleq2", [], RuPImp(f.content, content))], content));
 			Some(w): RuHF(content, ruHStep(ctx, "eleq2d", [f.tree], RuPImp(w, content)));   // (W→A=B) ⊢ (W→(e∈A↔e∈B))
 		};
-	});
+		// (the ∅-side ¬(e∈A) shortcut proved redundant — the bicond + noel + tollens
+		// saturation reaches it; a direct emission here was dead weight)
+		[fBi];
+	}));
 }
 // reduce a ⊆/= GOAL atom to its fresh-witness membership subgoal, prove it, wrap with ssriv/ssrdv (eqriv/eqrdv).
 ruHRelGoal(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], key : string, fuel : int) -> Maybe<RuHF> {
@@ -223,6 +251,43 @@ ruHMembFact(ctx : RuHCtx, amb : Maybe<RuPForm>, f : RuHF, key : string, rhs : Ru
 	switch (amb) {
 		None():  RuHF(rhs, ruHStep(ctx, "mpbi", [f.tree, iff], rhs));
 		Some(w): RuHF(rhs, ruHStep(ctx, "sylib", [f.tree, iff], RuPImp(w, rhs)));
+	}
+}
+// the NEGATED twin, as UNIT RESOLUTION: fact ¬(v∈COMPOUND) whose unfold is (a∧b) with one
+// conjunct a PRESENT FACT resolves to the negation of the other (t84: ¬(v∈(x5∩x9)) + v∈x5
+// ⊢ ¬(v∈x9)). The ¬(a∧b) intermediate NEVER becomes a lasting fact — as a fact it derails
+// unrelated searches (t48 flipped when it joined the saturation).
+//   ¬(v∈X) --sylnib/mtbi across the unfold bicond--> ¬(a∧b)
+//   --mpbir/sylibr across imnan--> (a→¬b) --ax-mp/mpd with a--> ¬b   (symmetrically for b)
+ruHMembNegResolve(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], f : RuHF, key : string, rhs : RuPForm, lemma : string) -> [RuHF] {
+	switch (rhs) {
+		RuPAnd(a, b): {
+			iff = ruHStep(ctx, lemma, [], RuPIff(RuPAtom(key), rhs));
+			nAnd = switch (amb) {
+				None():  ruHStep(ctx, "mtbi", [f.tree, iff], RuPNot(rhs));
+				Some(w): ruHStep(ctx, "sylnib", [f.tree, iff], RuPImp(w, RuPNot(rhs)));
+			};
+			resolve = \haveF : RuHF, have : RuPForm, other : RuPForm -> {
+				// (have → ¬other) ↔ ¬(have ∧ other): for the b-side use ancom first? No —
+				// imnan is (φ→¬ψ)↔¬(φ∧ψ); the b-side resolution needs ¬(a∧b) with b known:
+				// con2-style; keep it to the a-side + the commuted bicond via ancomi below.
+				imn = ruHStep(ctx, "imnan", [], RuPIff(RuPImp(have, RuPNot(other)), RuPNot(RuPAnd(have, other))));
+				impF = switch (amb) {
+					None():  ruHStep(ctx, "mpbir", [nAnd, imn], RuPImp(have, RuPNot(other)));
+					Some(w): ruHStep(ctx, "sylibr", [nAnd, imn], RuPImp(w, RuPImp(have, RuPNot(other))));
+				};
+				nOther = RuPNot(other);
+				switch (amb) {
+					None():  RuHF(nOther, ruHStep(ctx, "ax-mp", [haveF.tree, impF], nOther));
+					Some(w): RuHF(nOther, ruHStep(ctx, "mpd", [haveF.tree, impF], RuPImp(w, nOther)));
+				};
+			};
+			switch (ruHFind(facts, a)) {
+				Some(fa): [resolve(fa, a, b)];
+				None(): [];
+			}
+		}
+		default: [];
 	}
 }
 // prove a GOAL `e∈S` (compound) by proving its unfold RHS, then mpbir/sylibr back to `e∈S`.
@@ -278,21 +343,44 @@ ruHDeneg(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], inner : RuPForm, fu
 // so ¬((Q→R)∧((R→Q)∧P)) never clashed even with Q,R,P all in context. Bounded: first
 // few ¬-compound facts, derivation at reduced fuel; ExFalso yields any goal.
 ruHClashDerive(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], goal : RuPForm, fuel : int) -> Maybe<RuHF> {
+	if (^(ctx.inClash)) None() else {   // NO re-entry: nested clash attempts multiply the search
+	// FEASIBILITY pre-filter: an ∧-candidate with an atomic leaf that is neither a present
+	// fact nor a composable compound membership can never derive — attempting it at every
+	// failing entry is pure drag (t48: the ¬((v∈{x5})∧(v∈x16)) junk with bare x16).
+	leafFeasible = \a : RuPForm -> switch (a) {
+		RuPAtom(k): ruHFind(facts, a) != None() || {
+			ea = ruHAtomExp(ctx, k);
+			ruEqHead(ea) == ruHwcel() && length((ruEqArgs(ea)).second.nodes) > 2;
+		}
+		default: true;   // non-atomic leaves derive structurally
+	};
+	feasible = \phi : RuPForm -> forall(ruHAndLeaves(phi), leafFeasible);
 	cands = filtermap(facts, \f -> switch (f.content) {
 		RuPNot(phi): switch (phi) {
-			RuPAnd(__, __): Some(Pair(phi, f));
+			RuPAnd(__, __): if (feasible(phi)) Some(Pair(phi, f)) else None();
 			RuPIff(__, __): Some(Pair(phi, f));
+			// ¬(v ∈ COMPOUND): the membership composes from its unfold's conjuncts
+			// (ruHMembGoal) — the witness route's v∈(x5∩(x7∩x9)) (S2/S3 piece).
+			RuPAtom(k): {
+				ea = ruHAtomExp(ctx, k);
+				if (ruEqHead(ea) == ruHwcel() && length((ruEqArgs(ea)).second.nodes) > 2) Some(Pair(phi, f)) else None();
+			}
 			default: None();
 		}
 		default: None();
 	});
-	// SHALLOW derivations only (fuel ≤ 4): the clash φ is a direct composition of present
-	// facts (∧-intro / one ImpR level); full-fuel attempts at every failing entry multiply
-	// the whole search — the hilbert-fallback cost bomb (t86 closed 1s → timeout, measured).
-	fold(take(cands, 2), None(), \acc, c -> switch (acc) {
+	// SHALLOW derivations only (fuel ≤ 6): the clash φ is a direct composition of present
+	// facts (nested ∧-intro / membership-goal unfolds — t77's v∈(x5∩(x7∩x9)) needs 5);
+	// full-fuel attempts at every failing entry multiply the whole search — the
+	// hilbert-fallback cost bomb (t86 closed 1s → timeout, measured).
+	r = fold(take(cands, 2), None(), \acc, c -> switch (acc) {
 		Some(__): acc;
 		None(): if (ruTimeIsOver(ctx.timer)) None()
-			else switch (ruHProve(ctx, amb, facts, c.first, min(fuel - 1, 4))) {
+			else {
+				ctx.inClash := true;
+				pphiMb = ruHProve(ctx, amb, facts, c.first, min(fuel - 1, 6));
+				ctx.inClash := false;
+				switch (pphiMb) {
 				None(): None();
 				Some(pphi): {
 					pm  = ruHStep(ctx, "pm2.21", [], RuPImp(RuPNot(c.first), RuPImp(c.first, goal)));
@@ -308,7 +396,10 @@ ruHClashDerive(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], goal : RuPFor
 					});
 				}
 			}
+			}
 	});
+	r;
+	}
 }
 
 // e∈∅ is false (noel: ¬(A∈∅)) — derive ¬(e∈∅) so the contradiction-closure discharges the goal.
@@ -332,12 +423,32 @@ ruHForward(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF]) -> [RuHF] {
 		switch (f.content) {
 			RuPAnd(a, b): [ruHConjElim(ctx, amb, f, a, b, true), ruHConjElim(ctx, amb, f, a, b, false)];
 			RuPIff(a, b): [ruHIffElim(ctx, amb, f, a, b, true), ruHIffElim(ctx, amb, f, a, b, false)];
-			RuPImp(a, b): switch (ruHCheapProve(ctx, amb, facts, a)) { Some(fa): [ruHModus(ctx, amb, fa, f, a, b)]; None(): []; };
-			RuPNot(a): switch (a) { RuPNot(x): [ruHNotNot(ctx, amb, f, x)]; default: []; };  // ¬¬x ⊢ x
+			RuPImp(a, b): switch (ruHCheapProve(ctx, amb, facts, a)) {
+				Some(fa): [ruHModus(ctx, amb, fa, f, a, b)];
+				None(): switch (ruHFind(facts, RuPNot(b))) {
+					Some(fnb): [ruHTollens(ctx, amb, fnb, f, a)];
+					None(): [];
+				}
+			};
+			RuPNot(a): switch (a) {
+				RuPNot(x): [ruHNotNot(ctx, amb, f, x)];  // ¬¬x ⊢ x
+				RuPAtom(k): {   // ¬(v∈COMPOUND): UNIT-RESOLVE against present conjunct facts
+					ea = ruHAtomExp(ctx, k);
+					if (ruEqHead(ea) != ruHwcel()) [] else {
+						ar = ruEqArgs(ea);
+						switch (ruHMembUnfold(ctx, ar.first, ar.second)) {
+							Some(p): ruHMembNegResolve(ctx, amb, facts, f, k, p.first, p.second);
+							None(): [];
+						}
+					}
+				}
+				default: [];
+			};
 			RuPAtom(k): {
 				ea = ruHAtomExp(ctx, k); h = ruEqHead(ea);
+				refl = h == ruHwceq() && { s = ruEqArgs(ea); s.first.nodes == s.second.nodes; };
 				if (h == ruHwss() && witnesses != []) ruHRelInst(ctx, amb, f, k, witnesses)
-					else if (h == ruHwceq() && witnesses != []) ruHEqInst(ctx, amb, f, k, witnesses)
+					else if (h == ruHwceq() && !refl && witnesses != []) ruHEqInst(ctx, amb, f, k, witnesses)
 				else if (h == ruHwcel()) { ar = ruEqArgs(ea); if (ruEqHead(ar.second) == s2id_("c0")) [ruHNoel(ctx, amb, k)] else switch (ruHMembUnfold(ctx, ar.first, ar.second)) { Some(p): [ruHMembFact(ctx, amb, f, k, p.first, p.second)]; None(): []; }; }
 				else [];
 			};
@@ -366,6 +477,15 @@ ruHModus(ctx : RuHCtx, amb : Maybe<RuPForm>, fa : RuHF, fimp : RuHF, a : RuPForm
 	switch (amb) {
 		None():  RuHF(b, ruHStep(ctx, "ax-mp", [fa.tree, fimp.tree], b));
 		Some(w): RuHF(b, ruHStep(ctx, "mpd", [fa.tree, fimp.tree], RuPImp(w, b)));  // (W→A),(W→(A→B)) ⊢ (W→B)
+	}
+}
+// modus TOLLENS: fact (A→B) + ¬B ⊢ ¬A — the witness route's ¬(v∈A) from the pointwise
+// bicond implication and noel (S2/S3 branch-Unifier piece).
+ruHTollens(ctx : RuHCtx, amb : Maybe<RuPForm>, fnb : RuHF, fimp : RuHF, a : RuPForm) -> RuHF {
+	na = RuPNot(a);
+	switch (amb) {
+		None():  RuHF(na, ruHStep(ctx, "mto", [fnb.tree, fimp.tree], na));
+		Some(w): RuHF(na, ruHStep(ctx, "mtod", [fnb.tree, fimp.tree], RuPImp(w, na)));  // (W→¬B),(W→(A→B)) ⊢ (W→¬A)
 	}
 }
 // cheap (non-recursive) antecedent derivation: a is a known fact, or a disjunction with a known disjunct
@@ -560,7 +680,13 @@ ruHTransportRound(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], atoms : [T
 								setHashMap(m, r.vb.id, RuSubExpr(r.vb, sides.second, ruExpVarIdsHashSet(sides.second)));
 								sub = RuSubst(m);
 								f2exp = ruApplySubst(r.rhs, sub);
-								if (f2exp.nodes == fa.second.nodes || known(a, f2exp, fa.third)) a
+								// a REFLEXIVE product ((∅=∅), (A=A) from moving an equality across
+								// itself/its flip) is junk that re-enters eq-instantiation (t48)
+								f2refl = ruEqHead(f2exp) == ruHwceq() && {
+									s2 = ruEqArgs(f2exp);
+									s2.first.nodes == s2.second.nodes;
+								};
+								if (f2refl || f2exp.nodes == fa.second.nodes || known(a, f2exp, fa.third)) a
 								else {
 									inst = ruApplySubst(r.prop, sub);            // (X=Y) → (F ↔ F')
 									biExp = (ruEqArgs(inst)).second;             // (F ↔ F')  [args of wi]
@@ -758,13 +884,18 @@ ruHDisjElim(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], goal : RuPForm, 
 // classical case-split (pm2.61): pick an undecided atom p, prove the goal under p and under ¬p, combine.
 // The completing rule for classical propositional logic; bounded by ctx.splitBudget (shared, total).
 ruHCaseSplit(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], goal : RuPForm, fuel : int) -> Maybe<RuHF> {
-	if (^(ctx.splitBudget) <= 0 || ^(ctx.globalSplits) <= 0) None()
+	// a clash DERIVATION is a composition of present facts — case splits inside it burn
+	// the shared budgets on failing attempts and starve the main search (t48 flipped).
+	if (^(ctx.inClash) || ^(ctx.splitBudget) <= 0 || ^(ctx.globalSplits) <= 0) None()
 	else {
 		keys = set2array(fold(facts, ruPAtoms(goal), \acc, f -> mergeSets(acc, ruPAtoms(f.content))));
 		undecided = filter(keys, \k -> ruHFind(facts, RuPAtom(k)) == None() && ruHFind(facts, RuPNot(RuPAtom(k))) == None());
 		if (undecided == []) None()
 		else {
 			p = RuPAtom(undecided[0]);
+			if (ctx.em.env.conf.verbose >= 6) {
+				ctx.em.env.out.println("        hSplit: on=" + ru2s(ruHAtomExp(ctx, undecided[0]), ctx.em.math) + " budget=" + i2s(^(ctx.splitBudget)) + " undecided=" + i2s(length(undecided)));
+			} else {};
 			saved = ^(ctx.splitBudget);
 			ctx.splitBudget := saved - 1;
 			ctx.globalSplits := ^(ctx.globalSplits) - 1;   // global cap: consumed even on failure (no restore)
