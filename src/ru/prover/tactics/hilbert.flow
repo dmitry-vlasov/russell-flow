@@ -71,12 +71,29 @@ ruHilbertCertificateTimed(em : RuEnvMath, conn : RuPConnectives, wff : int, stmt
 	hypForms  = map(hyps, \h -> ruPAtomize(conn, h));
 	goalForm  = ruPAtomize(conn, goal);
 	ctx = RuHCtx(ruHCtx(em, wff, stmtClass, atomNodes) with timer = ruMakeLimitedTimer(limit_ms), fo = fo);
+	if (em.env.conf.verbose >= 5) {
+		em.env.out.println("      hCert: goal=" + ruHFormShape(goalForm) + " hyps=" + strGlue(map(hypForms, ruHFormShape), " ; "));
+	} else {};
 	maybeMap(ruHilbertProve(ctx, hypForms, goalForm), \tree ->
 		Pair(tree, RuVarsDisjs(fold(^(ctx.freshVars), makeTree(), \acc, v -> setTree(acc, v.id, v)), ^(ctx.disjs))));
 }
 
 // a proof fragment: `tree` proves `|- und(curAmb, content)` for the ambient in force at its creation.
 RuHF(content : RuPForm, tree : RuProofTree);
+
+// debug: the propositional SHAPE of a form (atoms anonymized).
+ruHFormShape(f : RuPForm) -> string {
+	switch (f) {
+		RuPAtom(__): "A";
+		RuPNot(a): "~" + ruHFormShape(a);
+		RuPAnd(a, b): "(" + ruHFormShape(a) + "&" + ruHFormShape(b) + ")";
+		RuPOr(a, b): "(" + ruHFormShape(a) + "|" + ruHFormShape(b) + ")";
+		RuPImp(a, b): "(" + ruHFormShape(a) + ">" + ruHFormShape(b) + ")";
+		RuPIff(a, b): "(" + ruHFormShape(a) + "=" + ruHFormShape(b) + ")";
+		RuPTrue(): "T";
+		RuPFalse(): "F";
+	}
+}
 
 ruHCtx(em : RuEnvMath, wff : int, stmtClass : int, atomNodes : Tree<string, [RuExpNode]>) -> RuHCtx {
 	RuHCtx(ruPConnectives(), wff, stmtClass, ref atomNodes, ref 6, ref 400, ref makeSet(), ref [], em,
@@ -240,8 +257,58 @@ ruHDeneg(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], inner : RuPForm, fu
 				};
 			});
 		}
+		RuPIff(a, b): {
+			// ¬(A↔B) via xor3: prove (A↔¬B), convert across ¬(A↔B) ↔ (A↔¬B).
+			goal = RuPNot(inner);
+			alt = RuPIff(a, RuPNot(b));
+			maybeMap(ruHProve(ctx, amb, facts, alt, fuel - 1), \pa -> {
+				iff = ruHStep(ctx, "xor3", [], RuPIff(goal, alt));   // ¬(A↔B) ↔ (A↔¬B)
+				switch (amb) {
+					None():  RuHF(goal, ruHStep(ctx, "mpbir", [pa.tree, iff], goal));
+					Some(w): RuHF(goal, ruHStep(ctx, "sylibr", [pa.tree, iff], RuPImp(w, goal)));
+				};
+			});
+		}
 		default: None();
 	}
+}
+
+// S5 CLASH-BY-DERIVATION (Mizar's clash detect): a fact ¬φ with DECOMPOSABLE φ clashes
+// when φ is derivable from the other facts — ruHFindContra only matches EXISTING pairs,
+// so ¬((Q→R)∧((R→Q)∧P)) never clashed even with Q,R,P all in context. Bounded: first
+// few ¬-compound facts, derivation at reduced fuel; ExFalso yields any goal.
+ruHClashDerive(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], goal : RuPForm, fuel : int) -> Maybe<RuHF> {
+	cands = filtermap(facts, \f -> switch (f.content) {
+		RuPNot(phi): switch (phi) {
+			RuPAnd(__, __): Some(Pair(phi, f));
+			RuPIff(__, __): Some(Pair(phi, f));
+			default: None();
+		}
+		default: None();
+	});
+	// SHALLOW derivations only (fuel ≤ 4): the clash φ is a direct composition of present
+	// facts (∧-intro / one ImpR level); full-fuel attempts at every failing entry multiply
+	// the whole search — the hilbert-fallback cost bomb (t86 closed 1s → timeout, measured).
+	fold(take(cands, 2), None(), \acc, c -> switch (acc) {
+		Some(__): acc;
+		None(): if (ruTimeIsOver(ctx.timer)) None()
+			else switch (ruHProve(ctx, amb, facts, c.first, min(fuel - 1, 4))) {
+				None(): None();
+				Some(pphi): {
+					pm  = ruHStep(ctx, "pm2.21", [], RuPImp(RuPNot(c.first), RuPImp(c.first, goal)));
+					Some(switch (amb) {
+						None(): {
+							impAG = ruHStep(ctx, "ax-mp", [c.second.tree, pm], RuPImp(c.first, goal));
+							RuHF(goal, ruHStep(ctx, "ax-mp", [pphi.tree, impAG], goal));
+						}
+						Some(w): {
+							sylr = ruHStep(ctx, "syl", [c.second.tree, pm], RuPImp(w, RuPImp(c.first, goal)));
+							RuHF(goal, ruHStep(ctx, "mpd", [pphi.tree, sylr], RuPImp(w, goal)));
+						}
+					});
+				}
+			}
+	});
 }
 
 // e∈∅ is false (noel: ¬(A∈∅)) — derive ¬(e∈∅) so the contradiction-closure discharges the goal.
@@ -415,31 +482,71 @@ ruHFalsum(ctx : RuHCtx, amb : Maybe<RuPForm>, fbot : RuHF, goal : RuPForm) -> Ru
 // Called ONCE per assumption introduction (ruHProveUnder / ruHImpR), not per ruHProve
 // entry: the per-entry version re-matched atoms×eqs×rules down the whole recursion and
 // its cost starved certificates that closed before (t21 4.7s → timeout, measured).
+// The eqcomi/eqcomd FLIP of an equality fact — S5 canonicalization: both orientations
+// join the branch facts, so transports and clash pairs match either spelling.
+ruHEqFlip(ctx : RuHCtx, amb : Maybe<RuPForm>, f : Pair<RuHF, RuExp>) -> Maybe<Pair<RuHF, RuExp>> {
+	if (ruEqHead(f.second) != ruHwceq()) None() else {
+		sides = ruEqArgs(f.second);
+		if (sides.first.nodes == sides.second.nodes) None() else {
+			flipExp = ruFwdMkRule(ruHwceq(), ctx.wff, [sides.second, sides.first]);
+			ctx.atomNodes := mergeTree(^(ctx.atomNodes), ruPAtomNodes(ctx.conn, flipExp));
+			tree = switch (amb) {
+				None(): RuProofStep(s2id_("eqcomi"), [f.first.tree], RuStmt(ctx.stmtClass, [flipExp], -1));
+				Some(w): {
+					wExp = RuExp(ruHForm2Nodes(ctx, w), -1);
+					RuProofStep(s2id_("eqcomd"), [f.first.tree],
+						RuStmt(ctx.stmtClass, [ruFwdMkRule(s2id("wi"), ctx.wff, [wExp, flipExp])], -1));
+				}
+			};
+			Some(Pair(RuHF(ruPAtomize(ctx.conn, flipExp), tree), flipExp));
+		}
+	}
+}
+
 ruHTransportNew(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], newF : RuHF, congs : Tree<int, [RuInAtomCong]>) -> [RuHF] {
+	// positive atoms AND negated atoms (S5: ¬P(a) moves across a=b too — the clash
+	// pair ¬P(b) never meets P(b) otherwise); .third = negated.
 	atomExp = \f : RuHF -> switch (f.content) {
-		RuPAtom(k): Some(Pair(f, ruHAtomExp(ctx, k)));
+		RuPAtom(k): Some(Triple(f, ruHAtomExp(ctx, k), false));
+		RuPNot(inner): switch (inner) {
+			RuPAtom(k): Some(Triple(f, ruHAtomExp(ctx, k), true));
+			default: None();
+		}
 		default: None();
 	};
 	switch (atomExp(newF)) {
 		None(): [];
 		Some(nf): {
 			atoms0 = filtermap(facts, atomExp);
-			newIsEq = ruEqHead(nf.second) == ruHwceq();
+			newIsEq = !nf.third && ruEqHead(nf.second) == ruHwceq();
 			atoms = if (newIsEq) atoms0 else [nf];
-			eqs   = if (newIsEq) [nf] else filter(atoms0, \a -> ruEqHead(a.second) == ruHwceq());
-			ruHTransportRound(ctx, amb, facts, atoms, eqs, congs);
+			eqs0  = if (newIsEq) [Pair(nf.first, nf.second)]
+				else filtermap(atoms0, \a -> if (!a.third && ruEqHead(a.second) == ruHwceq()) Some(Pair(a.first, a.second)) else None());
+			// S5 orientation: every driving equality also acts in its flipped form.
+			eqs = fold(eqs0, eqs0, \acc, e -> switch (ruHEqFlip(ctx, amb, e)) {
+				None(): acc;
+				Some(fl): arrayPush(acc, fl);
+			});
+			out = ruHTransportRound(ctx, amb, facts, atoms, eqs, congs);
+			if (ctx.em.env.conf.verbose >= 5) {
+				ctx.em.env.out.println("      hTransport: new=" + ru2s(nf.second, ctx.em.math) + (if (nf.third) "(neg)" else "") +
+					" atoms=" + i2s(length(atoms)) + " eqs=" + i2s(length(eqs)) + " produced=" + i2s(length(out)) +
+					(if (out == []) "" else " first=" + ru2s(RuExp(ruHForm2Nodes(ctx, out[0].content), -1), ctx.em.math)));
+			} else {};
+			out;
 		}
 	}
 }
 
-ruHTransportRound(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], atoms : [Pair<RuHF, RuExp>], eqs : [Pair<RuHF, RuExp>], congs : Tree<int, [RuInAtomCong]>) -> [RuHF] {
+ruHTransportRound(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], atoms : [Triple<RuHF, RuExp, bool>], eqs : [Pair<RuHF, RuExp>], congs : Tree<int, [RuInAtomCong]>) -> [RuHF] {
 	if (eqs == []) [] else {
-		known = \fs : [RuHF], e : RuExp -> {
-			pf = ruPAtomize(ctx.conn, e);
+		known = \fs : [RuHF], e : RuExp, neg : bool -> {
+			pf0 = ruPAtomize(ctx.conn, e);
+			pf : RuPForm = if (neg) RuPNot(pf0) else pf0;
 			exists(facts, \f -> f.content == pf) || exists(fs, \f -> f.content == pf);
 		};
-		fold(atoms, [], \acc, fa -> if (length(acc) >= 6) acc else
-			fold(eqs, acc, \ac, eq -> if (length(ac) >= 6 || eq.second.nodes == fa.second.nodes) ac else {
+		fold(atoms, [], \acc, fa -> if (length(acc) >= 8) acc else
+			fold(eqs, acc, \ac, eq -> if (length(ac) >= 8 || eq.second.nodes == fa.second.nodes) ac else {
 				sides = ruEqArgs(eq.second);
 				if (sides.first.nodes == sides.second.nodes) ac else
 				fold(lookupTreeDef(congs, ruEqHead(fa.second), []), ac, \a, r ->
@@ -453,27 +560,42 @@ ruHTransportRound(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], atoms : [P
 								setHashMap(m, r.vb.id, RuSubExpr(r.vb, sides.second, ruExpVarIdsHashSet(sides.second)));
 								sub = RuSubst(m);
 								f2exp = ruApplySubst(r.rhs, sub);
-								if (f2exp.nodes == fa.second.nodes || known(a, f2exp)) a
+								if (f2exp.nodes == fa.second.nodes || known(a, f2exp, fa.third)) a
 								else {
 									inst = ruApplySubst(r.prop, sub);            // (X=Y) → (F ↔ F')
 									biExp = (ruEqArgs(inst)).second;             // (F ↔ F')  [args of wi]
 									ctx.atomNodes := mergeTree(^(ctx.atomNodes), ruPAtomNodes(ctx.conn, f2exp));
-									f2 = ruPAtomize(ctx.conn, f2exp);
+									f2atom = ruPAtomize(ctx.conn, f2exp);
+									f2 : RuPForm = if (fa.third) RuPNot(f2atom) else f2atom;
+									notF2exp = ruFwdMkRule(s2id("wn"), ctx.wff, [f2exp]);
 									pInst = RuProofStep(r.lemmaId, [], RuStmt(ctx.stmtClass, [inst], -1));
+									// positive fact: mpbi/mpbid across (F↔F'); negated: mtbi/mtbid — ¬F(a)
+									// moves to ¬F(b), the S5 clash-pair transport.
 									tree = switch (amb) {
 										None(): {
 											pBi = RuProofStep(s2id_("ax-mp"), [eq.first.tree, pInst], RuStmt(ctx.stmtClass, [biExp], -1));
-											RuProofStep(s2id_("mpbi"), [fa.first.tree, pBi], RuStmt(ctx.stmtClass, [f2exp], -1));
+											if (fa.third) RuProofStep(s2id_("mtbi"), [fa.first.tree, pBi], RuStmt(ctx.stmtClass, [notF2exp], -1))
+											else RuProofStep(s2id_("mpbi"), [fa.first.tree, pBi], RuStmt(ctx.stmtClass, [f2exp], -1));
 										}
 										Some(w): {
 											wExp = RuExp(ruHForm2Nodes(ctx, w), -1);
 											wBi  = ruFwdMkRule(s2id("wi"), ctx.wff, [wExp, biExp]);
-											wF2  = ruFwdMkRule(s2id("wi"), ctx.wff, [wExp, f2exp]);
 											pBi = RuProofStep(s2id_("syl"), [eq.first.tree, pInst], RuStmt(ctx.stmtClass, [wBi], -1));
-											RuProofStep(s2id_("mpbid"), [fa.first.tree, pBi], RuStmt(ctx.stmtClass, [wF2], -1));
+											if (fa.third) RuProofStep(s2id_("mtbid"), [fa.first.tree, pBi],
+												RuStmt(ctx.stmtClass, [ruFwdMkRule(s2id("wi"), ctx.wff, [wExp, notF2exp])], -1))
+											else RuProofStep(s2id_("mpbid"), [fa.first.tree, pBi],
+												RuStmt(ctx.stmtClass, [ruFwdMkRule(s2id("wi"), ctx.wff, [wExp, f2exp])], -1));
 										}
 									};
-									arrayPush(a, RuHF(f2, tree));
+									f2f = RuHF(f2, tree);
+									// a PRODUCED equality also joins flipped (S5 orientation — the
+									// clash premise may spell it the other way: t86 x12=x1 vs ¬(x1=x12))
+									a2 = arrayPush(a, f2f);
+									if (fa.third) a2
+									else switch (ruHEqFlip(ctx, amb, Pair(f2f, f2exp))) {
+										None(): a2;
+										Some(fl): if (known(a2, fl.second, false)) a2 else arrayPush(a2, fl.first);
+									}
 								}
 							}
 						}
@@ -512,7 +634,10 @@ ruHProve(ctx : RuHCtx, amb : Maybe<RuPForm>, facts0 : [RuHF], goal : RuPForm, fu
 						};
 						switch (structural) {
 							Some(r): Some(r);
-							None(): ruHCaseSplit(ctx, amb, facts, goal, fuel);   // classical case-split: last resort (bounded)
+							None(): switch (ruHClashDerive(ctx, amb, facts, goal, fuel)) {   // S5 clash-by-derivation
+								Some(r): Some(r);
+								None(): ruHCaseSplit(ctx, amb, facts, goal, fuel);   // classical case-split: last resort (bounded)
+							};
 						};
 					};
 				};

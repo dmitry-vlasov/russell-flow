@@ -29,6 +29,13 @@ export {
 	// equalizer rewrite an equality atom to its subset-antisymmetry form. Used by the checker only.
 	ruRelUnfoldFacts(math : RuMath, env : RuEnv, stmtClass : int, exps : [RuExp]) -> [Pair<RuExp, RuProofTree>];
 
+	// CONNECTIVE unfolds (S5): flat n-ary wff connectives (w3o/w3a — df-3or, df-3an) are OPAQUE
+	// ATOMS to the propositional layer, so a `(φ∨ψ∨χ)` premise never case-splits. For every
+	// subexpression of `exps` headed by a scanned connective, the definition instance
+	// `C(φ…) ↔ rhs` (rhs over known connectives only) joins the rewrite facts. Shape-scanned:
+	// 0-hyp `⊢ C(distinct wff metavars) ↔ rhs-over-wn/wi/wb/wa/wo(same metavars)`, cached.
+	ruConnUnfoldFacts(math : RuMath, env : RuEnv, stmtClass : int, exps : [RuExp]) -> [Pair<RuExp, RuProofTree>];
+
 	// Existential/emptiness unfold: for every quantified atom `∀v¬(v∈X)` in `exps` (matching eq0's
 	// RHS), the eq0 fact `(X = ∅) ↔ ∀v¬(v∈X)` — instantiated with the SAME bound var v as the goal
 	// uses (eq0's x is a setvar metavar), so the equalizer can rewrite `X=∅` to the goal's own
@@ -197,6 +204,88 @@ ruSetnessProof(reg : Tree<int, [RuSetLemma]>, t : RuExp, wcelId : int, cvvId : i
 // fixed for the duration of a run.
 ruMembRegCache : ref [Pair<int, Tree<int, [RuMembLemma]>>] = ref [];
 ruSetRegCache : ref [Pair<int, Tree<int, [RuSetLemma]>>] = ref [];
+ruConnRegCache : ref [Pair<int, Tree<int, RuConnLemma>>] = ref [];
+
+RuConnLemma(lemmaId : int, lhs : RuExp, prop : RuExp);
+
+// Non-primitive wff connectives with a propositional definition: 0-hyp `⊢ C(φ…) ↔ rhs`
+// where C's args are distinct bare wff metavars and rhs is built ONLY from the known
+// connectives (wn/wi/wb/wa/wo) over those metavars. Catches df-3or/df-3an by shape.
+ruConnRegistry(math : RuMath) -> Tree<int, RuConnLemma> {
+	n = sizeTree(math.decls.assertions);
+	c = ^ruConnRegCache;
+	if (c != [] && c[0].first == n) c[0].second else {
+		wbId = s2id("wb");
+		known = buildSet([s2id("wn"), s2id("wi"), s2id("wb"), s2id("wa"), s2id("wo")]);
+		wffT = tp2id_("wff");
+		t = fold(getTreeValues(math.decls.assertions), makeTree(), \acc, ass -> {
+			inf = switch (ass) {
+				RuAxiom(__, i): i; RuCong(__, i): i; RuTheorem(__, i, __, __): i; RuDef(__, i, __, __): i;
+			};
+			if (length(inf.hyps) != 0) acc else {
+				prop = ruExp(inf.prop.exps[0]);
+				pn = prop.nodes;
+				headOk = pn != [] && ruUNodeId(pn[0]) == wbId;
+				if (!headOk) acc else {
+					lhsEnd = ruUSpanEnd(pn, 1);
+					lhs = RuExp(subrange(pn, 1, lhsEnd - 1), -1);
+					rhs = RuExp(subrange(pn, lhsEnd, length(pn) - lhsEnd), -1);
+					cId = ruUNodeId(lhs.nodes[0]);
+					argIds = fold(tail(lhs.nodes), [], \vs, nd -> switch (nd) {
+						RuVar(id, tp): if (tp == wffT) arrayPush(vs, id) else vs;
+						RuRuleNode(__, __): vs;
+					});
+					lhsOk = length(lhs.nodes) >= 2 && cId >= 0 && !containsSet(known, cId)
+						&& length(argIds) == length(lhs.nodes) - 1
+						&& sizeSet(buildSet(argIds)) == length(argIds)
+						&& (switch (lhs.nodes[0]) { RuRuleNode(__, __): true; RuVar(__, __): false; });
+					rhsOk = forall(rhs.nodes, \nd -> switch (nd) {
+						RuRuleNode(idT, __): containsSet(known, ruIdType2Id(idT));
+						RuVar(id, tp): tp == wffT && contains(argIds, id);
+					});
+					if (lhsOk && rhsOk && !containsKeyTree(acc, cId)) setTree(acc, cId, RuConnLemma(
+						switch (ass) { RuAxiom(i, __): i.id; RuCong(i, __): i.id; RuTheorem(i, __, __, __): i.id; RuDef(i, __, __, __): i.id; },
+						lhs, prop)) else acc;
+				}
+			}
+		});
+		ruConnRegCache := [Pair(n, t)];
+		t;
+	}
+}
+
+ruConnUnfoldFacts(math : RuMath, env : RuEnv, stmtClass : int, exps : [RuExp]) -> [Pair<RuExp, RuProofTree>] {
+	reg = ruConnRegistry(math);
+	if (isEmptyTree(reg)) [] else {
+		collect = \e : RuExp -> {
+			nn = e.nodes;
+			filtermap(enumFromTo(0, length(nn) - 1), \i -> switch (nn[i]) {
+				RuVar(__, __): None();
+				RuRuleNode(idT, __):
+					if (!containsKeyTree(reg, ruIdType2Id(idT))) None()
+					else Some(RuExp(subrange(nn, i, ruUSpanEnd(nn, i) - i), -1));
+			});
+		};
+		subs = concatA(map(exps, collect));
+		(fold(subs, Pair([], makeSet()), \acc : Pair<[Pair<RuExp, RuProofTree>], Set<string>>, s -> {
+			key = ruUKey(s);
+			if (containsSet(acc.second, key)) acc else {
+				seen = insertSet(acc.second, key);
+				switch (lookupTree(reg, ruUNodeId(s.nodes[0]))) {
+					None(): Pair(acc.first, seen);
+					Some(cl): switch (ruMatchExp(s, cl.lhs, math, env)) {
+						None(): Pair(acc.first, seen);
+						Some(sub): {
+							inst = ruApplySubst(cl.prop, sub);
+							Pair(arrayPush(acc.first, Pair(inst,
+								RuProofStep(cl.lemmaId, [], RuStmt(stmtClass, [inst], -1)))), seen);
+						}
+					}
+				}
+			}
+		})).first;
+	}
+}
 
 ruMembRegistry(math : RuMath) -> Tree<int, [RuMembLemma]> {
 	n = sizeTree(math.decls.assertions);

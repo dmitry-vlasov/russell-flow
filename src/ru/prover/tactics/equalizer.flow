@@ -84,28 +84,48 @@ ruEqzStmt(ctx : RuKEmitCtx, l : RuPForm, r : RuPForm) -> RuStmt {
 // rewrite(form) = (form', proof of (form ↔ form')) where every compound atom with a fact has been
 // replaced by its (recursively rewritten) RHS. `visiting` guards against (acyclic, but be safe) loops.
 ruEqzRw(ctx : RuKEmitCtx, facts : Tree<string, RuEqzFact>, visiting : Set<string>, form : RuPForm) -> Pair<RuPForm, RuProofTree> {
+	ruEqzRwPol(ctx, facts, visiting, form, true);
+}
+
+// `pos` = the polarity of the position (flips under ¬ and in an antecedent). S5 CANONICAL
+// LITERALS: a NEGATIVE equality atom is a ≠-literal — clash material for the certificate's
+// per-branch transport — so its eqss-style expansion (rhs = a ∧-of-relations) is BLOCKED
+// there: ¬(a=b) → ¬(⊆∧⊇) hides the literal the clash detector needs (t8_xboole_0). The
+// ∀-form expansions (eq0/dfcleq: rhs atomizes to a single ∀-atom) stay polarity-blind —
+// ¬(X=∅) → ∃v(v∈X) is what feeds the skolemizer.
+ruEqzRwPol(ctx : RuKEmitCtx, facts : Tree<string, RuEqzFact>, visiting : Set<string>, form : RuPForm, pos : bool) -> Pair<RuPForm, RuProofTree> {
 	cong1 = \lemma, child, l, r -> RuProofStep(s2id_(lemma), [child], ruEqzStmt(ctx, l, r));
 	cong2 = \lemma, c1, c2, l, r -> RuProofStep(s2id_(lemma), [c1, c2], ruEqzStmt(ctx, l, r));
 	switch (form) {
 		RuPAtom(k):
 			switch (lookupTree(facts, k)) {
 				None(): Pair(form, RuProofStep(s2id_("biid"), [], ruEqzStmt(ctx, form, form)));   // A ↔ A
-				Some(fact):
-					if (containsSet(visiting, k)) Pair(form, RuProofStep(s2id_("biid"), [], ruEqzStmt(ctx, form, form)))
+				Some(fact): {
+					negEqConj = !pos
+						&& (switch (lookupTree(ctx.atomNodes, k)) {
+							Some(nodes): nodes != [] && (switch (nodes[0]) {
+								RuRuleNode(idT, __): ruIdType2Id(idT) == s2id("wceq");
+								RuVar(__, __): false;
+							});
+							None(): false;
+						})
+						&& (switch (fact.rhs) { RuPAnd(__, __): true; default: false; });
+					if (containsSet(visiting, k) || negEqConj) Pair(form, RuProofStep(s2id_("biid"), [], ruEqzStmt(ctx, form, form)))
 					else {
-						rhsRw = ruEqzRw(ctx, facts, insertSet(visiting, k), fact.rhs);   // (rhs', rhs ↔ rhs')
+						rhsRw = ruEqzRwPol(ctx, facts, insertSet(visiting, k), fact.rhs, pos);   // (rhs', rhs ↔ rhs')
 						form2 = rhsRw.first;
 						// P ↔ form2 : the fact (P ↔ rhs) then, if rhs rewrote further, bitri with (rhs ↔ form2).
 						proof = if (fact.rhs == form2) fact.proof
 							else RuProofStep(s2id_("bitri"), [fact.proof, rhsRw.second], ruEqzStmt(ctx, form, form2));
 						Pair(form2, proof);
 					}
+				}
 			}
-		RuPNot(a): { r = ruEqzRw(ctx, facts, visiting, a); Pair(RuPNot(r.first), cong1("notbii", r.second, form, RuPNot(r.first))); }
-		RuPAnd(a, b): { ra = ruEqzRw(ctx, facts, visiting, a); rb = ruEqzRw(ctx, facts, visiting, b); f2 = RuPAnd(ra.first, rb.first); Pair(f2, cong2("anbi12i", ra.second, rb.second, form, f2)); }
-		RuPOr(a, b):  { ra = ruEqzRw(ctx, facts, visiting, a); rb = ruEqzRw(ctx, facts, visiting, b); f2 = RuPOr(ra.first, rb.first);  Pair(f2, cong2("orbi12i", ra.second, rb.second, form, f2)); }
-		RuPImp(a, b): { ra = ruEqzRw(ctx, facts, visiting, a); rb = ruEqzRw(ctx, facts, visiting, b); f2 = RuPImp(ra.first, rb.first); Pair(f2, cong2("imbi12i", ra.second, rb.second, form, f2)); }
-		RuPIff(a, b): { ra = ruEqzRw(ctx, facts, visiting, a); rb = ruEqzRw(ctx, facts, visiting, b); f2 = RuPIff(ra.first, rb.first); Pair(f2, cong2("bibi12i", ra.second, rb.second, form, f2)); }
+		RuPNot(a): { r = ruEqzRwPol(ctx, facts, visiting, a, !pos); Pair(RuPNot(r.first), cong1("notbii", r.second, form, RuPNot(r.first))); }
+		RuPAnd(a, b): { ra = ruEqzRwPol(ctx, facts, visiting, a, pos); rb = ruEqzRwPol(ctx, facts, visiting, b, pos); f2 = RuPAnd(ra.first, rb.first); Pair(f2, cong2("anbi12i", ra.second, rb.second, form, f2)); }
+		RuPOr(a, b):  { ra = ruEqzRwPol(ctx, facts, visiting, a, pos); rb = ruEqzRwPol(ctx, facts, visiting, b, pos); f2 = RuPOr(ra.first, rb.first);  Pair(f2, cong2("orbi12i", ra.second, rb.second, form, f2)); }
+		RuPImp(a, b): { ra = ruEqzRwPol(ctx, facts, visiting, a, !pos); rb = ruEqzRwPol(ctx, facts, visiting, b, pos); f2 = RuPImp(ra.first, rb.first); Pair(f2, cong2("imbi12i", ra.second, rb.second, form, f2)); }
+		RuPIff(a, b): { ra = ruEqzRwPol(ctx, facts, visiting, a, pos); rb = ruEqzRwPol(ctx, facts, visiting, b, pos); f2 = RuPIff(ra.first, rb.first); Pair(f2, cong2("bibi12i", ra.second, rb.second, form, f2)); }
 		RuPTrue():  Pair(form, RuProofStep(s2id_("biid"), [], ruEqzStmt(ctx, form, form)));
 		RuPFalse(): Pair(form, RuProofStep(s2id_("biid"), [], ruEqzStmt(ctx, form, form)));
 	}
@@ -441,12 +461,16 @@ ruEqualizerRewrite(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass :
 	exps0 = arrayPush(hyps, goal);
 	exist = ruExistUnfoldFacts(em.math, em.env, stmtClass, exps0);
 	disjs = exist.second;
-	facts = concatA([
+	facts0 = concatA([
 		ruUnfoldFacts(em.math, em.env, stmtClass, exps0),
 		ruRelUnfoldFacts(em.math, em.env, stmtClass, exps0),
 		exist.first,
 		ruDfExUnfoldFacts(em.math, em.env, stmtClass, exps0)
 	]);
+	// connective unfolds (df-3or/df-3an by shape) scan the OTHER facts' instances too —
+	// the flat triple only appears in an unfold's RHS (veltp: x∈{a,b,c} ↔ (x=a ∨ x=b ∨ x=c)).
+	facts = concat(facts0,
+		ruConnUnfoldFacts(em.math, em.env, stmtClass, concat(exps0, map(facts0, \f -> f.first))));
 	atomNodes = fold(concat(hyps, map(facts, \f -> f.first)), ruPAtomNodes(conn, goal),
 		\acc, e -> mergeTree(acc, ruPAtomNodes(conn, e)));
 	ctx = RuKEmitCtx(conn, wff, stmtClass, atomNodes, makeTree());
