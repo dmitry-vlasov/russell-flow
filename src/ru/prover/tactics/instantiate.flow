@@ -63,7 +63,7 @@ export {
 // theorems which close as a single probe missed their stage slice in a whole-article run. Keyed by
 // the index size, which is fixed for the duration of a run.
 RuInTables(atoms : Tree<int, [RuInAtomCong]>, conns : Tree<int, RuInConnCong>, setness : Tree<int, [RuSetLemma]>,
-	enums : Tree<int, [RuInEnumRule]>);
+	enums : Tree<int, [RuInEnumRule]>, rels : Tree<int, [RuInRelForall]>);
 ruInTablesCache : ref [Pair<int, RuInTables>] = ref [];
 
 ruInTables(math : RuMath) -> RuInTables {
@@ -73,7 +73,8 @@ ruInTables(math : RuMath) -> RuInTables {
 }
 
 ruInBuildTables(math : RuMath, n : int) -> RuInTables {
-	t = RuInTables(ruInAtomCongs(math), ruInConnCongs(math), ruSetnessRegistry(math), ruInEnumRules(math));
+	t = RuInTables(ruInAtomCongs(math), ruInConnCongs(math), ruSetnessRegistry(math), ruInEnumRules(math),
+		ruInRelForalls(math));
 	ruInTablesCache := [Pair(n, t)];
 	t;
 }
@@ -400,38 +401,76 @@ ruInFreshSetvar(used : Set<int>, setvarT : int, i : int) -> RuVar {
 	if (containsSet(used, id)) ruInFreshSetvar(used, setvarT, i + 1) else RuVar(id, setvarT);
 }
 
-// (1) `X = ∅` premises -> their eq0 ∀-forms `∀v ¬(v ∈ X)` (fresh v), with DV(u, v) per var u of X.
-ruInEmptinessForalls(math : RuMath, env : RuEnv, stmtClass : int,
-	hyps : [Pair<RuProofTree, RuExp>], used : Set<int>, setvarT : int) -> Pair<[Pair<RuProofTree, RuExp>], Set<RuDisj>> {
-	eq0Id = s2id_("eq0");
-	switch (lookupTree(math.decls.assertions, eq0Id)) {
-		None(): Pair([], makeSet());
-		Some(ass): {
-			prop = ruExp((ruInInfer(ass)).prop.exps[0]);       // (A = ∅) ↔ ∀x ¬(x∈A)
-			pa = ruInArgs(prop);
-			lhs = pa[0];                                        // (A = ∅) — the match pattern
-			// eq0's bound var: the ∀-side's binder var
-			xNode = (ruInArgs(pa[1]))[0].nodes[0];
-			fold(hyps, Pair([], makeSet()), \acc : Pair<[Pair<RuProofTree, RuExp>], Set<RuDisj>>, h ->
-				switch (ruMatchExp(h.second, lhs, math, env)) {
-					None(): acc;
-					Some(sub0): {
-						v = ruInFreshSetvar(used, setvarT, 0);
-						m = copyHashMap(sub0.map);
-						xVar = switch (xNode) { RuVar(id, tp): RuVar(id, tp); RuRuleNode(__, __): RuVar(-1, setvarT); };
-						setHashMap(m, xVar.id, RuSubExpr(xVar, RuExp([RuVar(v.id, v.type)], -1), ruExpVarIdsHashSet(RuExp([RuVar(v.id, v.type)], -1))));
-						sub = RuSubst(m);
-						inst = ruApplySubst(prop, sub);          // (X = ∅) ↔ ∀v ¬(v∈X)
-						forallF = (ruInArgs(inst))[1];           // ∀v ¬(v∈X)
-						pEq0 = RuProofStep(eq0Id, [], RuStmt(stmtClass, [inst], -1));
-						pAll = RuProofStep(s2id_("mpbi"), [h.first, pEq0], RuStmt(stmtClass, [forallF], -1));
-						// eq0's disjointed(A x), instantiated: DV(u, v) for every var u of X
-						dvs = fold(ruInVarsOf(h.second), acc.second, \ds, u -> insertSet(ds, RuDisj(u, v)));
-						Pair(arrayPush(acc.first, Pair(pAll, forallF)), dvs);
+// ---- the relational ∀-form table (S1 of the completion plan) ----------------
+
+// A definitional bicond `R(A…) ↔ ∀x φ(x, A…)`: applying it to a matching premise and
+// mpbi-ing yields the premise's ∀-FORM — the scheme the Unifier instantiates. Without
+// this, a ⊆/=-shaped premise is INVISIBLE to instantiation (only literal ∀-premises and
+// `X = ∅` used to contribute; eq0 was the hand-picked special case this scan subsumes).
+RuInRelForall(lemmaId : int, prop : RuExp, lhs : RuExp, xVar : RuVar);
+
+// Mechanical scan: 0-hyp assertions (definitions included — df-ss) whose prop is
+// `lhs ↔ ∀x body`, lhs a bare atom (rule-headed; every arg a single node — a plain class
+// var or a 0-ary constant like ∅; the vars distinct; x not among them). On miz_set this
+// finds df-ss (⊆), dfcleq (=), eq0 (=∅) — and any future relation's ∀-bicond of the same
+// shape. DV provisos are declared at APPLICATION: DV(u, fresh v) for every premise var u
+// (the instantiated superset of the lemma's disjointed(A x, B x, …); v is fresh, so the
+// provisos hold trivially in the theorem context).
+ruInRelForalls(math : RuMath) -> Tree<int, [RuInRelForall]> {
+	wbId = s2id("wb");
+	walId = s2id("wal");
+	fold(getTreeValues(math.decls.assertions), makeTree(), \acc, ass -> {
+		inf = ruInInfer(ass);
+		if (length(inf.hyps) != 0) acc else {
+			prop = ruExp(inf.prop.exps[0]);
+			if (ruInHead(prop) != wbId || ruInArity(prop) != 2) acc else {
+				pa = ruInArgs(prop);
+				lhs = pa[0]; rhs = pa[1];
+				if (ruInHead(rhs) != walId || ruInArity(rhs) != 2) acc else {
+					xE = (ruInArgs(rhs))[0];
+					xOk = length(xE.nodes) == 1 && (switch (xE.nodes[0]) { RuVar(__, __): true; RuRuleNode(__, __): false; });
+					argOk = \e : RuExp -> length(e.nodes) == 1;
+					largs = ruInArgs(lhs);
+					lvars = fold(largs, [], \vs, a -> switch (a.nodes[0]) {
+						RuVar(id, __): arrayPush(vs, id);
+						RuRuleNode(__, __): vs;
+					});
+					ok = xOk && ruInHead(lhs) >= 0 && ruInArity(lhs) >= 1
+						&& forall(largs, argOk)
+						&& sizeSet(buildSet(lvars)) == length(lvars)
+						&& (switch (xE.nodes[0]) { RuVar(id, __): !contains(lvars, id); RuRuleNode(__, __): false; });
+					if (!ok) acc else {
+						xVar = switch (xE.nodes[0]) { RuVar(id, tp): RuVar(id, tp); RuRuleNode(__, __): ruNoVar; };
+						cur = lookupTreeDef(acc, ruInHead(lhs), []);
+						setTree(acc, ruInHead(lhs), arrayPush(cur, RuInRelForall(ruInId(ass), prop, lhs, xVar)));
 					}
-				});
+				}
+			}
 		}
-	}
+	});
+}
+
+// (1) RELATIONAL ∀-FORMS: every premise matching a scanned `R(A…) ↔ ∀x φ` bicond derives
+// its ∀-form `∀v φ[v/x]` (fresh v; DV(u, v) per premise var u) — the Unifier's scheme pool.
+ruInRelForallFacts(math : RuMath, env : RuEnv, stmtClass : int, tabs : RuInTables,
+	hyps : [Pair<RuProofTree, RuExp>], used : Set<int>, setvarT : int) -> Pair<[Pair<RuProofTree, RuExp>], Set<RuDisj>> {
+	fold(hyps, Pair([], makeSet()), \acc : Pair<[Pair<RuProofTree, RuExp>], Set<RuDisj>>, h ->
+		fold(lookupTreeDef(tabs.rels, ruInHead(h.second), []), acc, \ac, r ->
+			switch (ruMatchExp(h.second, r.lhs, math, env)) {
+				None(): ac;
+				Some(sub0): {
+					v = ruInFreshSetvar(used, setvarT, 0);
+					vE = RuExp([RuVar(v.id, v.type)], -1);
+					m = copyHashMap(sub0.map);
+					setHashMap(m, r.xVar.id, RuSubExpr(r.xVar, vE, ruExpVarIdsHashSet(vE)));
+					inst = ruApplySubst(r.prop, RuSubst(m));   // R(X…) ↔ ∀v φ[v/x, X…]
+					forallF = (ruInArgs(inst))[1];
+					pBi  = RuProofStep(r.lemmaId, [], RuStmt(stmtClass, [inst], -1));
+					pAll = RuProofStep(s2id_("mpbi"), [h.first, pBi], RuStmt(stmtClass, [forallF], -1));
+					dvs = fold(ruInVarsOf(h.second), ac.second, \ds, u -> insertSet(ds, RuDisj(u, v)));
+					Pair(arrayPush(ac.first, Pair(pAll, forallF)), dvs);
+				}
+			}));
 }
 
 // (3) reflexivity `t = t` per candidate, by equid.
@@ -568,22 +607,27 @@ ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
 	cands   = ruInCandidates(goal, hyps, setvarT, cap);
 	used    = fold(arrayPush(map(hyps, \h -> h.second), goal), makeSet(), \acc, e ->
 		fold(e.nodes, acc, \a, n -> switch (n) { RuVar(id, __): insertSet(a, id); RuRuleNode(__, __): a; }));
-	// (1) emptiness ∀-forms
-	emp = ruInEmptinessForalls(math, env, stmtClass, hyps, used, setvarT);
+	// (1) relational ∀-forms (⊆ via df-ss, = via dfcleq, =∅ via eq0 — one shape scan)
+	emp = ruInRelForallFacts(math, env, stmtClass, tabs, hyps, used, setvarT);
 	// (4) definitional enumeration memberships, (5) their transport across premise equalities
 	enumFacts = ruInEnumFacts(math, env, stmtClass, tabs, hyps, goal);
 	moved = ruInTransport(math, env, stmtClass, tabs, hyps, enumFacts);
 	eqlz = concat(enumFacts, moved);
 	// (2) the ∀-pool: given ∀-premises + derived ∀-forms; instantiate at every candidate.
+	// SMALLEST SCHEMES FIRST (the ground-first principle — the eq0-forms ¬(v∈X) are the
+	// workhorses) and the fold STOPS BUILDING once the instance cap is reached: with the
+	// relational forms every ⊆/= premise now contributes a scheme, and building the whole
+	// pool×candidates product before capping starved the full-stack slices (126 → 124).
 	// An EMPTY pool with NO equalizer facts means the whole pass has nothing to do — return
 	// nothing at all (the refl facts alone never close anything and their downstream
 	// normalization is pure cost).
-	pool = concat(filter(hyps, \h -> ruInHead(h.second) == walId && ruInArity(h.second) == 2), emp.first);
+	pool0 = concat(filter(hyps, \h -> ruInHead(h.second) == walId && ruInArity(h.second) == 2), emp.first);
+	pool = mergeSort(pool0, \a, b -> length(a.second.nodes) - length(b.second.nodes));
 	if (pool == [] && eqlz == []) Pair([], makeSet()) else {
 	instAcc = fold(pool, Pair([], emp.second), \acc : Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>>, h -> {
 		pa = ruInArgs(h.second);
 		xE = pa[0]; body = pa[1];
-		if (length(xE.nodes) != 1) acc else {
+		if (length(acc.first) >= 8 || length(xE.nodes) != 1) acc else {
 			x = xE.nodes[0];
 			xVar = switch (x) { RuVar(id, tp): RuVar(id, tp); RuRuleNode(__, __): RuVar(-1, setvarT); };
 			// the coercion node for x, harvested from the ∀-body's own coerced occurrence of it
@@ -599,7 +643,7 @@ ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
 			else {
 			xC = RuExp([bn[coerceIdx], x], -1);
 			fold(cands, acc, \acc2, t ->
-				if (t.nodes == xC.nodes) acc2   // instantiating at the bound var itself is a no-op
+				if (length(acc2.first) >= 8 || t.nodes == xC.nodes) acc2   // cap reached / bound-var no-op
 				else {
 					// the antecedent (x = A): x in its coerced (class) form, A the candidate term
 					ante = ruFwdMkRule(wceqId, tp2id_("wff"), [xC, t]);
@@ -625,10 +669,17 @@ ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
 			}
 		}
 	});
-	// (3) reflexivity facts — ONLY when there are spcv instances for them to bottom out on:
-	// with an empty ∀-pool they close nothing and their downstream normalization is pure
-	// cost (the pre-equalizer early return suppressed them; keep that property).
-	refl = if (pool == []) [] else ruInReflFacts(math, env, stmtClass, cands);
+	// (3) reflexivity facts — ONLY for the schemes whose normalized instances bottom out on
+	// them: real ∀-premises and the ∅-class forms (eq0: ¬(v∈X) normalizes into (x=x)-shaped
+	// subgoals). The RELATIONAL schemes (df-ss/dfcleq) do not need them, and un-gating refl
+	// on every ⊆/=-premise residual taxed the full-stack slices (8 junk t=t premises each:
+	// 126 → 125 measured against a same-day control).
+	hasForallPremise = exists(hyps, \h -> ruInHead(h.second) == walId && ruInArity(h.second) == 2);
+	hasZeroaryScheme = exists(hyps, \h ->
+		exists(lookupTreeDef(tabs.rels, ruInHead(h.second), []), \r ->
+			exists(ruInArgs(r.lhs), \a -> length(a.nodes) == 1 && (switch (a.nodes[0]) { RuRuleNode(__, __): true; RuVar(__, __): false; }))
+			&& isSome(ruMatchExp(h.second, r.lhs, math, env))));
+	refl = if (!hasForallPremise && !hasZeroaryScheme) [] else ruInReflFacts(math, env, stmtClass, cands);
 	// TOTAL-INSTANCE CAP: candidates are smallest-first, so the cap keeps the workhorse
 	// instances (variables, singletons) and sheds the big-product tail. Without it the
 	// pool x candidates product multiplied the per-instance normalization cost and starved
