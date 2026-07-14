@@ -1,6 +1,7 @@
 import ru/prover/tactics/propositional;
 import ru/prover/tactics/equalizer;   // ruEqualizerRelSubgoal (fresh-setvar membership subgoal + DV)
 import ru/prover/tactics/unfold;      // RuEnvMath
+import ru/prover/tactics/instantiate; // RuInAtomCong — the per-branch equality transport table
 import ru/proof_tree;
 
 // PHASE 2, step 2 of the fresh (Kalmár-free) certificate generator (project_mizar_proving_stats).
@@ -30,9 +31,13 @@ export {
 	//   timer — a WALL-CLOCK deadline for the whole emitter run. The split/work caps bound the
 	//     backtracking SHAPE but not its wall cost (a near-24-atom certificate can run minutes —
 	//     the 6.5h zfmisc lesson); every ruHProve entry checks the timer and bails.
+	//   fo — the FIRST-ORDER PER-BRANCH transport table (atom congruences): with Some, every
+	//     ruHProve entry moves the branch's atom facts across its equality facts (Mizar's
+	//     per-basic-problem Equalizer — a case split's equality disjunct transports the other
+	//     literals INSIDE the branch, where saturation-before-the-check cannot see it).
 	RuHCtx(conn : RuPConnectives, wff : int, stmtClass : int, atomNodes : ref Tree<string, [RuExpNode]>,
 		splitBudget : ref int, globalSplits : ref int, disjs : ref Set<RuDisj>, freshVars : ref [RuVar], em : RuEnvMath,
-		timer : RuTimer);
+		timer : RuTimer, fo : Maybe<Tree<int, [RuInAtomCong]>>);
 	// `wff` (the wff type id) and `stmtClass` (the |- turnstile id) MUST come from the loaded math — derive
 	// them from a real expression (ruIdType2Type of a connective node / the prop's class), never from the
 	// memoized ruIdWff/ruIdTurnstile helpers (they cache -1 if interned before the library loads).
@@ -41,7 +46,8 @@ export {
 	ruHilbertProve(ctx : RuHCtx, hyps : [RuPForm], goal : RuPForm) -> Maybe<RuProofTree>;
 	// ruHilbertCertificate with an explicit wall-clock budget (ms) — the certificate search bails
 	// (returns None) once the deadline passes. Callers with their own slice discipline use this.
-	ruHilbertCertificateTimed(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, limit_ms : double) -> Maybe<Pair<RuProofTree, RuVarsDisjs>>;
+	// `fo` = Some(atom-congruence table) turns on the per-branch equality transport.
+	ruHilbertCertificateTimed(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, limit_ms : double, fo : Maybe<Tree<int, [RuInAtomCong]>>) -> Maybe<Pair<RuProofTree, RuVarsDisjs>>;
 	// Realize a propositional form as a statement `|- f` (for building the hyps/conclusion of a test theorem).
 	ruHStmt(ctx : RuHCtx, f : RuPForm) -> RuStmt;
 	// Build a certificate for a residual `hyps |- goal` (the equalizer's output): atomize over the real
@@ -53,14 +59,14 @@ export {
 ruHilbertCertificate(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp) -> Maybe<Pair<RuProofTree, RuVarsDisjs>> {
 	// 60 s SAFETY-NET deadline for untimed callers: far above any certificate that ever succeeds,
 	// but a runaway search can no longer outlive its whole article run (the 6.5h lesson).
-	ruHilbertCertificateTimed(em, conn, wff, stmtClass, hyps, goal, 60000.0);
+	ruHilbertCertificateTimed(em, conn, wff, stmtClass, hyps, goal, 60000.0, None());
 }
 
-ruHilbertCertificateTimed(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, limit_ms : double) -> Maybe<Pair<RuProofTree, RuVarsDisjs>> {
+ruHilbertCertificateTimed(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, limit_ms : double, fo : Maybe<Tree<int, [RuInAtomCong]>>) -> Maybe<Pair<RuProofTree, RuVarsDisjs>> {
 	atomNodes = fold(hyps, ruPAtomNodes(conn, goal), \acc, h -> mergeTree(acc, ruPAtomNodes(conn, h)));
 	hypForms  = map(hyps, \h -> ruPAtomize(conn, h));
 	goalForm  = ruPAtomize(conn, goal);
-	ctx = RuHCtx(ruHCtx(em, wff, stmtClass, atomNodes) with timer = ruMakeLimitedTimer(limit_ms));
+	ctx = RuHCtx(ruHCtx(em, wff, stmtClass, atomNodes) with timer = ruMakeLimitedTimer(limit_ms), fo = fo);
 	maybeMap(ruHilbertProve(ctx, hypForms, goalForm), \tree ->
 		Pair(tree, RuVarsDisjs(fold(^(ctx.freshVars), makeTree(), \acc, v -> setTree(acc, v.id, v)), ^(ctx.disjs))));
 }
@@ -70,7 +76,7 @@ RuHF(content : RuPForm, tree : RuProofTree);
 
 ruHCtx(em : RuEnvMath, wff : int, stmtClass : int, atomNodes : Tree<string, [RuExpNode]>) -> RuHCtx {
 	RuHCtx(ruPConnectives(), wff, stmtClass, ref atomNodes, ref 6, ref 400, ref makeSet(), ref [], em,
-		ruMakeLimitedTimer(60000.0));
+		ruMakeLimitedTimer(60000.0), None());
 }
 
 // ---- RuPForm -> RuExp / RuStmt (own copy; mirrors the kalmar pattern, no kalmar dependency) ----
@@ -390,6 +396,88 @@ ruHFalsum(ctx : RuHCtx, amb : Maybe<RuPForm>, fbot : RuHF, goal : RuPForm) -> Ru
 	}
 }
 
+// ---- the per-branch equality transport (Mizar's per-basic-problem Equalizer) ----
+// For every equality FACT (X = Y) and atom FACT F holding X at a congruence position,
+// derive F[Y/X] — INSIDE the branch, under its ambient: the case split that introduced
+// the equality is exactly where the transport is needed (t51: the branch fact x11=x5
+// moves x11∈x24 to x5∈x24, clashing with the premise ¬(x5∈x24)), and the saturation
+// that runs BEFORE the certificate can never see a branch-local equality. Deduction
+// composition per ambient:
+//   bare:    ax-mp(eq, congInst) = (F↔F');  mpbi(F, that) = F'
+//   Some(w): syl(eq, congInst) = w→(F↔F');  mpbid(F, that) = w→F'
+// One round per ruHProve entry (the recursion is the fixpoint), capped and deduped.
+// Targeted variant: only the pairs involving the NEWLY INTRODUCED branch fact — the new
+// equality moves the existing atoms, or the new atom moves across the existing equalities.
+// Called ONCE per assumption introduction (ruHProveUnder / ruHImpR), not per ruHProve
+// entry: the per-entry version re-matched atoms×eqs×rules down the whole recursion and
+// its cost starved certificates that closed before (t21 4.7s → timeout, measured).
+ruHTransportNew(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], newF : RuHF, congs : Tree<int, [RuInAtomCong]>) -> [RuHF] {
+	atomExp = \f : RuHF -> switch (f.content) {
+		RuPAtom(k): Some(Pair(f, ruHAtomExp(ctx, k)));
+		default: None();
+	};
+	switch (atomExp(newF)) {
+		None(): [];
+		Some(nf): {
+			atoms0 = filtermap(facts, atomExp);
+			newIsEq = ruEqHead(nf.second) == ruHwceq();
+			atoms = if (newIsEq) atoms0 else [nf];
+			eqs   = if (newIsEq) [nf] else filter(atoms0, \a -> ruEqHead(a.second) == ruHwceq());
+			ruHTransportRound(ctx, amb, facts, atoms, eqs, congs);
+		}
+	}
+}
+
+ruHTransportRound(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], atoms : [Pair<RuHF, RuExp>], eqs : [Pair<RuHF, RuExp>], congs : Tree<int, [RuInAtomCong]>) -> [RuHF] {
+	if (eqs == []) [] else {
+		known = \fs : [RuHF], e : RuExp -> {
+			pf = ruPAtomize(ctx.conn, e);
+			exists(facts, \f -> f.content == pf) || exists(fs, \f -> f.content == pf);
+		};
+		fold(atoms, [], \acc, fa -> if (length(acc) >= 6) acc else
+			fold(eqs, acc, \ac, eq -> if (length(ac) >= 6 || eq.second.nodes == fa.second.nodes) ac else {
+				sides = ruEqArgs(eq.second);
+				if (sides.first.nodes == sides.second.nodes) ac else
+				fold(lookupTreeDef(congs, ruEqHead(fa.second), []), ac, \a, r ->
+					switch (ruMatchExp(fa.second, r.lhs, ctx.em.math, ctx.em.env)) {
+						None(): a;
+						Some(sub0): {
+							va = lookupHashMap(sub0.map, r.va.id);
+							vaIsX = switch (va) { Some(se): se.exp.nodes == sides.first.nodes; None(): false; };
+							if (!vaIsX) a else {
+								m = copyHashMap(sub0.map);
+								setHashMap(m, r.vb.id, RuSubExpr(r.vb, sides.second, ruExpVarIdsHashSet(sides.second)));
+								sub = RuSubst(m);
+								f2exp = ruApplySubst(r.rhs, sub);
+								if (f2exp.nodes == fa.second.nodes || known(a, f2exp)) a
+								else {
+									inst = ruApplySubst(r.prop, sub);            // (X=Y) → (F ↔ F')
+									biExp = (ruEqArgs(inst)).second;             // (F ↔ F')  [args of wi]
+									ctx.atomNodes := mergeTree(^(ctx.atomNodes), ruPAtomNodes(ctx.conn, f2exp));
+									f2 = ruPAtomize(ctx.conn, f2exp);
+									pInst = RuProofStep(r.lemmaId, [], RuStmt(ctx.stmtClass, [inst], -1));
+									tree = switch (amb) {
+										None(): {
+											pBi = RuProofStep(s2id_("ax-mp"), [eq.first.tree, pInst], RuStmt(ctx.stmtClass, [biExp], -1));
+											RuProofStep(s2id_("mpbi"), [fa.first.tree, pBi], RuStmt(ctx.stmtClass, [f2exp], -1));
+										}
+										Some(w): {
+											wExp = RuExp(ruHForm2Nodes(ctx, w), -1);
+											wBi  = ruFwdMkRule(s2id("wi"), ctx.wff, [wExp, biExp]);
+											wF2  = ruFwdMkRule(s2id("wi"), ctx.wff, [wExp, f2exp]);
+											pBi = RuProofStep(s2id_("syl"), [eq.first.tree, pInst], RuStmt(ctx.stmtClass, [wBi], -1));
+											RuProofStep(s2id_("mpbid"), [fa.first.tree, pBi], RuStmt(ctx.stmtClass, [wF2], -1));
+										}
+									};
+									arrayPush(a, RuHF(f2, tree));
+								}
+							}
+						}
+					})
+			}));
+	}
+}
+
 // ---- the prover ------------------------------------------------------------
 ruHProve(ctx : RuHCtx, amb : Maybe<RuPForm>, facts0 : [RuHF], goal : RuPForm, fuel : int) -> Maybe<RuHF> {
 	if (fuel <= 0 || ruTimeIsOver(ctx.timer)) None()
@@ -444,16 +532,25 @@ ruHImpR(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], a : RuPForm, b : RuP
 		None(): {
 			// introduce A: lift every fact `|- f` to `(A→f)` (a1i), add `(A→A)` (id), prove B under Some(A).
 			lifted = map(facts, \f -> RuHF(f.content, ruHStep(ctx, "a1i", [f.tree], RuPImp(a, f.content))));
-			facts2 = concat(lifted, [RuHF(a, ruHStep(ctx, "id", [], RuPImp(a, a)))]);
+			aF = RuHF(a, ruHStep(ctx, "id", [], RuPImp(a, a)));
+			facts2 = ruHWithTransport(ctx, Some(a), concat(lifted, [aF]), aF);
 			maybeMap(ruHProve(ctx, Some(a), facts2, b, fuel - 1), \pb -> RuHF(imp, pb.tree));  // pb proves (A→B)
 		}
 		Some(w): {
 			neww = RuPAnd(w, a);
 			lifted = map(facts, \f -> RuHF(f.content, ruHStep(ctx, "adantr", [f.tree], RuPImp(neww, f.content))));
-			facts2 = concat(lifted, [RuHF(a, ruHStep(ctx, "simpr", [], RuPImp(neww, a)))]);
+			aF = RuHF(a, ruHStep(ctx, "simpr", [], RuPImp(neww, a)));
+			facts2 = ruHWithTransport(ctx, Some(neww), concat(lifted, [aF]), aF);
 			maybeMap(ruHProve(ctx, Some(neww), facts2, b, fuel - 1),
 				\pb -> RuHF(imp, ruHStep(ctx, "ex", [pb.tree], RuPImp(w, imp))));  // ((W∧A)→B) ⊢ (W→(A→B))
 		}
+	}
+}
+// facts + the targeted transport for a newly introduced branch fact (no-op without ctx.fo).
+ruHWithTransport(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], newF : RuHF) -> [RuHF] {
+	switch (ctx.fo) {
+		None(): facts;
+		Some(congs): concat(facts, ruHTransportNew(ctx, amb, facts, newF, congs));
 	}
 }
 ruHOrR(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], a : RuPForm, b : RuPForm, fuel : int) -> Maybe<RuHF> {
@@ -482,14 +579,14 @@ ruHProveUnder(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], a : RuPForm, g
 	switch (amb) {
 		None(): {
 			lifted = map(facts, \f -> RuHF(f.content, ruHStep(ctx, "a1i", [f.tree], RuPImp(a, f.content))));
-			facts2 = concat(lifted, [RuHF(a, ruHStep(ctx, "id", [], RuPImp(a, a)))]);
-			ruHProve(ctx, Some(a), facts2, goal, fuel);   // proves (a→goal)
+			aF = RuHF(a, ruHStep(ctx, "id", [], RuPImp(a, a)));
+			ruHProve(ctx, Some(a), ruHWithTransport(ctx, Some(a), concat(lifted, [aF]), aF), goal, fuel);   // proves (a→goal)
 		}
 		Some(w): {
 			neww = RuPAnd(w, a);
 			lifted = map(facts, \f -> RuHF(f.content, ruHStep(ctx, "adantr", [f.tree], RuPImp(neww, f.content))));
-			facts2 = concat(lifted, [RuHF(a, ruHStep(ctx, "simpr", [], RuPImp(neww, a)))]);
-			ruHProve(ctx, Some(neww), facts2, goal, fuel);   // proves ((W∧a)→goal)
+			aF = RuHF(a, ruHStep(ctx, "simpr", [], RuPImp(neww, a)));
+			ruHProve(ctx, Some(neww), ruHWithTransport(ctx, Some(neww), concat(lifted, [aF]), aF), goal, fuel);   // proves ((W∧a)→goal)
 		}
 	}
 }
