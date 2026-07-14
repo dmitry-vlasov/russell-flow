@@ -62,6 +62,27 @@ export {
 	// branch's equality fact moves the other branch facts across it; mizar-complete-plan).
 	RuInAtomCong(lemmaId : int, prop : RuExp, lhs : RuExp, rhs : RuExp, va : RuVar, vb : RuVar);
 	ruInAtomCongsCached(math : RuMath) -> Tree<int, [RuInAtomCong]>;
+
+	// S4b — ∃-GOAL WITNESS OPTIONS (the other half of skolemization): for a goal `∃x φ`,
+	// each candidate term t occurring in the problem yields (ψ = φ[t/x], assemble, DV):
+	// prove ψ and assemble(pf) concludes `∃x φ` by spcev (setness(t) + the substitution
+	// congruence (x=t)→(φ↔ψ), both built mechanically). Candidates smallest-first, capped.
+	RuInExWitness(subgoal : RuExp, assemble : (RuProofTree) -> RuProofTree, disjs : Set<RuDisj>);
+	ruInExGoalWitnesses(math : RuMath, env : RuEnv, stmtClass : int, goal : RuExp, hyps : [RuExp], cap : int) -> [RuInExWitness];
+
+	// S4c — RELATIONAL ∃-FORMS (the ELIM dual of the ∀-form scan): every premise matching a
+	// scanned `R(A…) ↔ ∃x φ` bicond (eluni-shaped) derives its ∃-form `∃v φ[v/x]` (fresh
+	// eigenvariable v, mpbi; DV(u, v) per premise var u) — which the residual's premise-side
+	// skolemization then opens.
+	ruInRelExistsFacts(math : RuMath, env : RuEnv, stmtClass : int, tabs : RuInTables,
+		hyps : [Pair<RuProofTree, RuExp>], used : Set<int>, setvarT : int) -> Pair<[Pair<RuProofTree, RuExp>], Set<RuDisj>>;
+
+	// S4c — GOAL-SIDE WITNESS IMPLICATIONS (the INTRO dual): when the goal is ∃-shaped or
+	// matches a rel-∃ lhs, each witness candidate t yields the PROVED implication premise
+	// `φ[t/x] → goal` (spcev chain; biimpri+syl across the bicond when the goal was matched,
+	// not bare ∃). These join the saturated premise set, so the ordinary closers and the
+	// certificate see the ∃-introduction propositionally.
+	ruInExGoalImps(math : RuMath, env : RuEnv, stmtClass : int, goal : RuExp, hyps : [Pair<RuProofTree, RuExp>], cap : int) -> Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>>;
 }
 
 // TABLE CACHE. The three scans below walk the whole assertion index (~9800 on miz_set), and the
@@ -69,7 +90,7 @@ export {
 // theorems which close as a single probe missed their stage slice in a whole-article run. Keyed by
 // the index size, which is fixed for the duration of a run.
 RuInTables(atoms : Tree<int, [RuInAtomCong]>, conns : Tree<int, RuInConnCong>, setness : Tree<int, [RuSetLemma]>,
-	enums : Tree<int, [RuInEnumRule]>, rels : Tree<int, [RuInRelForall]>);
+	enums : Tree<int, [RuInEnumRule]>, rels : Tree<int, [RuInRelForall]>, exs : Tree<int, [RuInRelForall]>);
 ruInTablesCache : ref [Pair<int, RuInTables>] = ref [];
 
 ruInTables(math : RuMath) -> RuInTables {
@@ -80,7 +101,7 @@ ruInTables(math : RuMath) -> RuInTables {
 
 ruInBuildTables(math : RuMath, n : int) -> RuInTables {
 	t = RuInTables(ruInAtomCongs(math), ruInConnCongs(math), ruSetnessRegistry(math), ruInEnumRules(math),
-		ruInRelForalls(math));
+		ruInRelForalls(math), ruInRelBinders(math, s2id("wex")));
 	ruInTablesCache := [Pair(n, t)];
 	t;
 }
@@ -340,10 +361,17 @@ ruInSubstAtom(atoms : Tree<int, [RuInAtomCong]>, ante : RuExp, x : RuExpNode, t 
 			fold(lookupTreeDef(atoms, head, []), None(), \found : Maybe<RuInSubst>, r -> switch (found) {
 				Some(__): found;
 				None(): {
-					// match the rule's LHS against the current atom, then bind vb to the term
+					// match the rule's LHS against the current atom, then bind vb to the term.
+					// The rule must transport x ITSELF: its va metavar has to have matched the
+					// bare/coerced x — eleq1 also matches (x5 ∈ x) structurally (va := x5), and
+					// picking it transports the WRONG argument (the caller then discards the
+					// result on the x-survival check: lost coverage for every arg-1 position).
 					switch (ruMatchExp(curPhi, r.lhs, math, env)) {
 						None(): None();
-						Some(sub0): {
+						Some(sub0): if (!(switch (lookupHashMap(sub0.map, r.va.id)) {
+							None(): false;
+							Some(se): se.exp.nodes == [x] || (length(se.exp.nodes) == 2 && se.exp.nodes[1] == x);
+						})) None() else {
 							m = copyHashMap(sub0.map);
 							setHashMap(m, r.vb.id, RuSubExpr(r.vb, t, ruExpVarIdsHashSet(t)));
 							sub = RuSubst(m);
@@ -426,8 +454,20 @@ RuInRelForall(lemmaId : int, prop : RuExp, lhs : RuExp, xVar : RuVar);
 // (the instantiated superset of the lemma's disjointed(A x, B x, …); v is fresh, so the
 // provisos hold trivially in the theorem context).
 ruInRelForalls(math : RuMath) -> Tree<int, [RuInRelForall]> {
+	ruInRelBinders(math, s2id("wal"));
+}
+
+// The shared shape scan behind the ∀-form (S1) and ∃-form (S4c) tables: 0-hyp assertions
+// `R(A…) ↔ <binder> x φ` with a relation-headed lhs over distinct bare metavars.
+ruInRelBinders(math : RuMath, walId : int) -> Tree<int, [RuInRelForall]> {
+	ruInRelBinders2(math, walId, walId == s2id("wal"));
+}
+
+// bareArgs=true (the measured ∀-scan): lhs args must be single-node metavars.
+// bareArgs=false (the ∃-scan): lhs may be any LINEAR pattern (distinct vars) — eluni's
+// lhs (A ∈ ∪. B) has a compound arg and still matches one-directionally.
+ruInRelBinders2(math : RuMath, walId : int, bareArgs : bool) -> Tree<int, [RuInRelForall]> {
 	wbId = s2id("wb");
-	walId = s2id("wal");
 	fold(getTreeValues(math.decls.assertions), makeTree(), \acc, ass -> {
 		inf = ruInInfer(ass);
 		if (length(inf.hyps) != 0) acc else {
@@ -440,12 +480,26 @@ ruInRelForalls(math : RuMath) -> Tree<int, [RuInRelForall]> {
 					xOk = length(xE.nodes) == 1 && (switch (xE.nodes[0]) { RuVar(__, __): true; RuRuleNode(__, __): false; });
 					argOk = \e : RuExp -> length(e.nodes) == 1;
 					largs = ruInArgs(lhs);
-					lvars = fold(largs, [], \vs, a -> switch (a.nodes[0]) {
+					lvars = if (bareArgs) fold(largs, [], \vs, a -> switch (a.nodes[0]) {
+						RuVar(id, __): arrayPush(vs, id);
+						RuRuleNode(__, __): vs;
+					}) else fold(lhs.nodes, [], \vs, n -> switch (n) {
 						RuVar(id, __): arrayPush(vs, id);
 						RuRuleNode(__, __): vs;
 					});
-					ok = xOk && ruInHead(lhs) >= 0 && ruInArity(lhs) >= 1
-						&& forall(largs, argOk)
+					// the ∃-scan takes only STRUCTURE-DECOMPOSING unfolds: some lhs arg compound
+					// (eluni's ∪.B — else df-clel matches every ∈-premise and floods the
+					// saturation) and a binder-free body (the certificate is propositional).
+					rbody = (ruInArgs(rhs))[1];
+					binderIds = [s2id("wal"), s2id("wex")];
+					exOk = bareArgs || (
+						exists(largs, \a -> length(a.nodes) > 1)
+						&& !exists(rbody.nodes, \n -> switch (n) {
+							RuVar(__, __): false;
+							RuRuleNode(idT, __): contains(binderIds, ruIdType2Id(idT));
+						}));
+					ok = xOk && exOk && ruInHead(lhs) >= 0 && ruInArity(lhs) >= 1
+						&& (!bareArgs || forall(largs, argOk))
 						&& sizeSet(buildSet(lvars)) == length(lvars)
 						&& (switch (xE.nodes[0]) { RuVar(id, __): !contains(lvars, id); RuRuleNode(__, __): false; });
 					if (!ok) acc else {
@@ -478,6 +532,28 @@ ruInRelForallFacts(math : RuMath, env : RuEnv, stmtClass : int, tabs : RuInTable
 					pAll = RuProofStep(s2id_("mpbi"), [h.first, pBi], RuStmt(stmtClass, [forallF], -1));
 					dvs = fold(ruInVarsOf(h.second), ac.second, \ds, u -> insertSet(ds, RuDisj(u, v)));
 					Pair(arrayPush(ac.first, Pair(pAll, forallF)), dvs);
+				}
+			}));
+}
+
+ruInRelExistsFacts(math : RuMath, env : RuEnv, stmtClass : int, tabs : RuInTables,
+	hyps : [Pair<RuProofTree, RuExp>], used : Set<int>, setvarT : int) -> Pair<[Pair<RuProofTree, RuExp>], Set<RuDisj>> {
+	fold(hyps, Pair([], makeSet()), \acc : Pair<[Pair<RuProofTree, RuExp>], Set<RuDisj>>, h ->
+		if (length(acc.first) >= 4) acc
+		else fold(lookupTreeDef(tabs.exs, ruInHead(h.second), []), acc, \ac, r ->
+			switch (ruMatchExp(h.second, r.lhs, math, env)) {
+				None(): ac;
+				Some(sub0): {
+					v = ruInFreshSetvar(used, setvarT, 1);
+					vE = RuExp([RuVar(v.id, v.type)], -1);
+					m = copyHashMap(sub0.map);
+					setHashMap(m, r.xVar.id, RuSubExpr(r.xVar, vE, ruExpVarIdsHashSet(vE)));
+					inst = ruApplySubst(r.prop, RuSubst(m));   // R(X…) ↔ ∃v φ[v/x, X…]
+					exF = (ruInArgs(inst))[1];
+					pBi = RuProofStep(r.lemmaId, [], RuStmt(stmtClass, [inst], -1));
+					pEx = RuProofStep(s2id_("mpbi"), [h.first, pBi], RuStmt(stmtClass, [exF], -1));
+					dvs = fold(ruInVarsOf(h.second), ac.second, \ds, u -> insertSet(ds, RuDisj(u, v)));
+					Pair(arrayPush(ac.first, Pair(pEx, exF)), dvs);
 				}
 			}));
 }
@@ -604,6 +680,154 @@ ruInTransport(math : RuMath, env : RuEnv, stmtClass : int, tabs : RuInTables,
 	}
 }
 
+// One witness intro: ψ = φ[t/x], with pImp proving (ψ → ∃xφ) by spcev.
+RuInExIntro(psi : RuExp, imp : RuExp, pImp : RuProofTree, disjs : Set<RuDisj>);
+
+// The shared witness core over a BARE ∃-goal `∃x φ`: for each candidate term t of the
+// problem, the substitution congruence (x=t)→(φ↔ψ) + setness(t) give spcev's premises,
+// so pImp : (ψ → ∃xφ). Candidates smallest-first, capped.
+ruInExIntros(math : RuMath, env : RuEnv, stmtClass : int, exGoal : RuExp, hyps : [RuExp], cap : int) -> [RuInExIntro] {
+	wexId   = s2id("wex");
+	wbId    = s2id("wb");
+	wceqId  = s2id("wceq");
+	setvarT = tp2id_("setvar");
+	spcev   = s2id_("spcev");
+	biidd   = s2id_("biidd");
+	tabs    = ruInTables(math);
+	if (ruInHead(exGoal) != wexId || ruInArity(exGoal) != 2) [] else {
+		ga = ruInArgs(exGoal);
+		xE = ga[0]; body = ga[1];
+		if (length(xE.nodes) != 1) [] else {
+			x = xE.nodes[0];
+			xVar = switch (x) { RuVar(id, tp): RuVar(id, tp); RuRuleNode(__, __): RuVar(-1, setvarT); };
+			// the coerced occurrence of x inside the body (as in the spcv loop)
+			bn = body.nodes;
+			coerceIdx = fold(enumFromTo(0, length(bn) - 2), -1, \ci, i ->
+				if (ci >= 0) ci
+				else switch (bn[i]) {
+					RuVar(__, __): ci;
+					RuRuleNode(idT, al): if (ruArityLen2Arity(al) == 1 && ruIdType2Type(idT) == tp2id_("class") && bn[i + 1] == x) i else ci;
+				});
+			if (coerceIdx < 0) {
+				if (env.conf.verbose >= 5) { env.out.println("    exIntros: no coerced occurrence of x in body=" + ru2s(body, math)); } else {};
+				[];
+			} else {
+				xC = RuExp([bn[coerceIdx], x], -1);
+				cands = ruInCandidates(exGoal, map(hyps, \h -> Pair(ruNoProofTree, h)), setvarT, cap);
+				if (env.conf.verbose >= 5) { env.out.println("    exIntros: body=" + ru2s(body, math) + " cands=" + strGlue(map(cands, \c -> ru2s(c, math)), " | ")); } else {};
+				filtermap(cands, \t ->
+					if (t.nodes == xC.nodes) None()
+					else {
+						ante = ruFwdMkRule(wceqId, tp2id_("wff"), [xC, t]);
+						switch (ruInSubstChain(tabs.atoms, tabs.conns, biidd, wbId, ante, x, t, body, stmtClass, math, env)) {
+							None(): {
+								if (env.conf.verbose >= 5) { env.out.println("    exIntros: subst-chain FAILED for t=" + ru2s(t, math)); } else {};
+								None();
+							}
+							Some(sc): {
+								if (ruInContains(sc.result, x)) {
+									if (env.conf.verbose >= 5) { env.out.println("    exIntros: x SURVIVES in psi=" + ru2s(sc.result, math) + " for t=" + ru2s(t, math)); } else {};
+									None();
+								}
+								else switch (ruSetnessProof2(tabs.setness, t, stmtClass, math, env)) {
+									None(): {
+										if (env.conf.verbose >= 5) { env.out.println("    exIntros: setness FAILED for t=" + ru2s(t, math)); } else {};
+										None();
+									}
+									Some(setn): {
+										imp = ruFwdMkRule(s2id("wi"), tp2id_("wff"), [sc.result, exGoal]);   // (ψ → ∃xφ)
+										pImp = RuProofStep(spcev, [setn, sc.proof], RuStmt(stmtClass, [imp], -1));
+										dvs = fold(concat(ruInVarsOf(t), ruInVarsOf(sc.result)), makeSet(), \ds, u ->
+											if (u.id == xVar.id) ds else insertSet(ds, RuDisj(u, xVar)));
+										Some(RuInExIntro(sc.result, imp, pImp, dvs));
+									}
+								}
+							}
+						}
+					});
+			}
+		}
+	}
+}
+
+ruInExGoalWitnesses(math : RuMath, env : RuEnv, stmtClass : int, goal : RuExp, hyps : [RuExp], cap : int) -> [RuInExWitness] {
+	map(ruInExIntros(math, env, stmtClass, goal, hyps, cap), \w ->
+		RuInExWitness(w.psi,
+			\pf -> RuProofStep(s2id_("ax-mp"), [pf, w.pImp], RuStmt(stmtClass, [goal], -1)),
+			w.disjs));
+}
+
+// Does `c` occur as a contiguous node slice of some hyp? (An ∃-premise's body atoms are
+// slices of the premise, so witnesses drawn from under a binder pass too.)
+ruInSliceOccurs(hypExps : [RuExp], c : RuExp) -> bool {
+	cn = c.nodes;
+	lc = length(cn);
+	exists(hypExps, \h -> {
+		hn = h.nodes;
+		exists(enumFromTo(0, length(hn) - lc), \i ->
+			fold(enumFromTo(0, lc - 1), true, \eq, j -> eq && hn[i + j] == cn[j]));
+	});
+}
+
+ruInSplitAnds(waId : int, e : RuExp) -> [RuExp] {
+	if (ruInHead(e) != waId || ruInArity(e) != 2) [e]
+	else concatA(map(ruInArgs(e), \a -> ruInSplitAnds(waId, a)));
+}
+
+ruInExGoalImps(math : RuMath, env : RuEnv, stmtClass : int, goal : RuExp, hyps : [Pair<RuProofTree, RuExp>], cap : int) -> Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>> {
+	wexId   = s2id("wex");
+	waId    = s2id("wa");
+	setvarT = tp2id_("setvar");
+	hypExps = map(hyps, \h -> h.second);
+	// RELEVANCE (the unifier discipline): keep only intros whose ψ-conjuncts all occur in the
+	// premises — junk witnesses inflate the certificate's atom count for nothing.
+	relevant = \ws : [RuInExIntro] -> {
+		kept = take(filter(ws, \w ->
+			forall(ruInSplitAnds(waId, w.psi), \c -> ruInSliceOccurs(hypExps, c))), cap);
+		if (env.conf.verbose >= 4) {
+			env.out.println("  exImps: goal=" + ru2s(goal, math) + " intros=" + i2s(length(ws)) + " kept=" + i2s(length(kept)) +
+				(if (kept == []) (if (ws == []) "" else " dropped-first-psi=" + ru2s(ws[0].psi, math)) else " first=" + ru2s(kept[0].imp, math)));
+		} else {};
+		kept;
+	};
+	if (ruInHead(goal) == wexId) {
+		// bare ∃-goal: the intro implication IS (ψ → goal)
+		intros = relevant(ruInExIntros(math, env, stmtClass, goal, hypExps, cap * 2));
+		fold(intros, Pair([], makeSet()), \acc, w ->
+			Pair(arrayPush(acc.first, Pair(w.imp, w.pImp)), mergeSets(acc.second, w.disjs)));
+	} else {
+		// goal matching a rel-∃ lhs: rewrite across the bicond (fresh binder v), then bridge
+		// each intro (ψ → ∃vφ') to (ψ → goal) by syl with biimpri of the bicond instance.
+		tabs = ruInTables(math);
+		used = fold(arrayPush(hypExps, goal), makeSet(), \acc, e ->
+			fold(e.nodes, acc, \a, n -> switch (n) { RuVar(id, __): insertSet(a, id); RuRuleNode(__, __): a; }));
+		fold(lookupTreeDef(tabs.exs, ruInHead(goal), []), Pair([], makeSet()), \acc : Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>>, r ->
+			if (acc.first != []) acc   // first matching scheme wins
+			else switch (ruMatchExp(goal, r.lhs, math, env)) {
+				None(): acc;
+				Some(sub0): {
+					v = ruInFreshSetvar(used, setvarT, 2);
+					vE = RuExp([RuVar(v.id, v.type)], -1);
+					m = copyHashMap(sub0.map);
+					setHashMap(m, r.xVar.id, RuSubExpr(r.xVar, vE, ruExpVarIdsHashSet(vE)));
+					inst = ruApplySubst(r.prop, RuSubst(m));   // goal ↔ ∃v φ'
+					exF = (ruInArgs(inst))[1];
+					pBi = RuProofStep(r.lemmaId, [], RuStmt(stmtClass, [inst], -1));
+					impBk = ruFwdMkRule(s2id("wi"), tp2id_("wff"), [exF, goal]);
+					pBk = RuProofStep(s2id_("biimpri"), [pBi], RuStmt(stmtClass, [impBk], -1));   // (∃vφ' → goal)
+					dvsBi = fold(ruInVarsOf(goal), makeSet(), \ds, u -> insertSet(ds, RuDisj(u, v)));
+					intros = relevant(ruInExIntros(math, env, stmtClass, exF, hypExps, cap * 2));
+					if (intros == []) acc else
+					fold(intros, Pair(acc.first, mergeSets(acc.second, dvsBi)), \ac, w -> {
+						impG = ruFwdMkRule(s2id("wi"), tp2id_("wff"), [w.psi, goal]);
+						pG = RuProofStep(s2id_("syl"), [w.pImp, pBk], RuStmt(stmtClass, [impG], -1));
+						Pair(arrayPush(ac.first, Pair(impG, pG)), mergeSets(ac.second, w.disjs));
+					});
+				}
+			});
+	}
+}
+
 ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
 	hyps : [Pair<RuProofTree, RuExp>], goal : RuExp, cap : int) -> Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>> {
 	walId   = s2id("wal");
@@ -618,6 +842,11 @@ ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
 		fold(e.nodes, acc, \a, n -> switch (n) { RuVar(id, __): insertSet(a, id); RuRuleNode(__, __): a; }));
 	// (1) relational ∀-forms (⊆ via df-ss, = via dfcleq, =∅ via eq0 — one shape scan)
 	emp = ruInRelForallFacts(math, env, stmtClass, tabs, hyps, used, setvarT);
+	// (6) relational ∃-forms: ELIM facts (∃v φ from an eluni-shaped premise — the premise-side
+	// skolemization opens them) and the goal-side witness IMPLICATIONS (ψ → goal), both S4c.
+	exElim = ruInRelExistsFacts(math, env, stmtClass, tabs, hyps, used, setvarT);
+	exFacts = map(exElim.first, \f -> Pair(f.second, f.first));
+	exImps = ruInExGoalImps(math, env, stmtClass, goal, hyps, 4);
 	// (4) definitional enumeration memberships, (5) their transport across premise equalities
 	enumFacts = ruInEnumFacts(math, env, stmtClass, tabs, hyps, goal);
 	moved = ruInTransport(math, env, stmtClass, tabs, hyps, enumFacts);
@@ -632,7 +861,7 @@ ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
 	// normalization is pure cost).
 	pool0 = concat(filter(hyps, \h -> ruInHead(h.second) == walId && ruInArity(h.second) == 2), emp.first);
 	pool = mergeSort(pool0, \a, b -> length(a.second.nodes) - length(b.second.nodes));
-	if (pool == [] && eqlz == []) Pair([], makeSet()) else {
+	if (pool == [] && eqlz == [] && exFacts == [] && exImps.first == []) Pair([], makeSet()) else {
 	instAcc = fold(pool, Pair([], emp.second), \acc : Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>>, h -> {
 		pa = ruInArgs(h.second);
 		xE = pa[0]; body = pa[1];
@@ -693,6 +922,7 @@ ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
 	// instances (variables, singletons) and sheds the big-product tail. Without it the
 	// pool x candidates product multiplied the per-instance normalization cost and starved
 	// the general path's slices (zfmisc general 98 -> 92 when compounds landed uncapped).
-	Pair(concat3(eqlz, take(instAcc.first, 8), refl), instAcc.second);
+	Pair(concatA([eqlz, take(instAcc.first, 8), refl, exFacts, exImps.first]),
+		mergeSets(mergeSets(instAcc.second, exElim.second), exImps.second));
 	}
 }

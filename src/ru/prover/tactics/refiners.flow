@@ -382,6 +382,9 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 	// starved the fixed wall-clock stage slices: zfmisc full stack 126 -> 109).
 	premiseExps2 = map(premises, \pr -> ruExp(pr.stmt.exps[0]));
 	spliceAll = \unc : RuProofTree -> ruUnfoldSplice(unc, nh, concat(derivedProofs, map(satAll, \p -> p.second)));
+	if (env.conf.verbose >= 4) {
+		env.out.println("  resid: goal=" + ru2s(goal, math) + " hyps=" + i2s(nh) + " derived=" + i2s(nd) + " sat=" + i2s(length(satAll)));
+	} else {};
 	switch (ruRunCloser(math, env, info, stmtClass, premises, goal, scope, mkCloser(), limit)) {
 		Some(unc): Some(RuRefineResult(spliceAll(unc), hypDisjs2));
 		None(): {
@@ -415,6 +418,100 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 				}
 			};
 			if (isSome(congTry)) congTry else {
+			// The WHOLE fallback chain (skolemization + subset try + component tries + full
+			// retry) shares one wall-clock budget (see the cost-bomb lesson).
+			fbTimer = ruMakeLimitedTimer(1000.0);
+			// SKOLEMIZATION (S4): an ∃-premise is OPAQUE to the propositional check (∃xφ
+			// atomizes to a single atom), so eliminate it first — Mizar's pre-check. The
+			// premise's own bound var x is the eigenvariable (declined if x occurs free
+			// elsewhere): the emitter proves (φ(x) → G) natively in deduction form, exlimiv
+			// turns it into (∃xφ → G) — its DV(x, G) proviso declared — and ax-mp with the
+			// premise concludes G. First ∃-premise only (nesting = a later increment).
+			exTry = {
+				wexId = s2id("wex");
+				exIdxs = filter(enumFromTo(0, length(premiseExps2) - 1), \i -> ruEqHead(premiseExps2[i]) == wexId);
+				if (exIdxs == [] || !precedes(s2id_("exlimiv"))) None()
+				else fold(exIdxs, None(), \found : Maybe<RuRefineResult>, exIdx ->
+				if (isSome(found) || ruTimeIsOver(fbTimer)) found
+				else {
+					exPrem = premiseExps2[exIdx];
+					xE = (ruEqArgs(exPrem)).first;
+					body = (ruEqArgs(exPrem)).second;
+					others = filter(enumFromTo(0, length(premiseExps2) - 1), \i -> i != exIdx);
+					otherExps = map(others, \i -> premiseExps2[i]);
+					// exlimiv's ONLY proviso is DV(x, goal): decline when x occurs in the goal.
+					// Occurrences of x in other hypothesis LEAVES are licensed (hyps are
+					// universally closed; the verifier checks DV at assertion applications only).
+					xInGoal = switch (xE.nodes[0]) {
+						RuRuleNode(__, __): true;
+						RuVar(xid, __): exists(goal.nodes, \n -> switch (n) { RuVar(id, __): id == xid; RuRuleNode(__, __): false; });
+					};
+					// unfold the ∃-body the same way real hyps are unfolded (its atoms — x∈(A∩B)
+					// composites — are otherwise opaque to the propositional check); the bridge
+					// (body → body') is biimpi of the rewrite bicond, syl-composed below.
+					bodyRw = ruEqualizerRewrite(em, conn, wff, stmtClass, [], body, nnf, precedes);
+					body2 = bodyRw.residual;
+					natoms = sizeTree(fold(concat(otherExps, [body2, goal]), ruPAtomNodes(conn, goal), \acc, e -> mergeTree(acc, ruPAtomNodes(conn, e))));
+					if (env.conf.verbose >= 4) {
+						env.out.println("  exTry: prem=" + ru2s(exPrem, math) + " xInGoal=" + b2s(xInGoal) + " natoms=" + i2s(natoms) +
+							(if (body2.nodes == body.nodes) "" else " body'=" + ru2s(body2, math)));
+					} else {};
+					if (xInGoal || natoms > 24) None()
+					else {
+						atomNodesEx = fold(concat(otherExps, [body2]), ruPAtomNodes(conn, goal), \acc, e -> mergeTree(acc, ruPAtomNodes(conn, e)));
+						ctxH = RuHCtx(ruHCtx(em, wff, stmtClass, atomNodesEx) with
+							timer = ruMakeLimitedTimer(ruTimeLeft(fbTimer)), fo = Some(ruInAtomCongsCached(math)));
+						switch (ruHilbertProveUnder(ctxH, map(otherExps, \e -> ruPAtomize(conn, e)), ruPAtomize(conn, body2), ruPAtomize(conn, goal))) {
+							None(): None();
+							Some(tree): {
+								xVar = switch (xE.nodes[0]) { RuVar(id, tp): RuVar(id, tp); RuRuleNode(__, __): ruNoVar; };
+								treeB = switch (bodyRw.proof) {
+									None(): tree;
+									Some(pRw): {
+										impBB = ruFwdMkRule(s2id("wi"), wff, [body, body2]);
+										pImpB = RuProofStep(s2id_("biimpi"), [pRw], RuStmt(stmtClass, [impBB], -1));
+										impBG = ruFwdMkRule(s2id("wi"), wff, [body, goal]);
+										RuProofStep(s2id_("syl"), [pImpB, tree], RuStmt(stmtClass, [impBG], -1));
+									}
+								};
+								exImp = ruFwdMkRule(s2id("wi"), wff, [exPrem, goal]);
+								pEx = RuProofStep(s2id_("exlimiv"), [ruInRemapLeaves(treeB, others)], RuStmt(stmtClass, [exImp], -1));
+								pG  = RuProofStep(s2id_("ax-mp"), [RuProofHyp(exIdx, RuStmt(stmtClass, [exPrem], -1)), pEx], RuStmt(stmtClass, [goal], -1));
+								// DV(x, ψ) instantiated at the concrete goal: x # each goal var.
+								dvs = fold(goal.nodes, makeSet(), \ds, n -> switch (n) {
+									RuVar(id, tp): if (id == xVar.id) ds else insertSet(ds, RuDisj(RuVar(id, tp), xVar));
+									RuRuleNode(__, __): ds;
+								});
+								Some(RuRefineResult(spliceAll(pG),
+									mergeSets(mergeSets(mergeSets(hypDisjs2, dvs), ^(ctxH.disjs)), bodyRw.disjs)));
+							}
+						}
+					}
+				});
+			};
+			if (isSome(exTry)) exTry else {
+			// SKOLEMIZATION, GOAL SIDE (S4b): an ∃-GOAL is equally opaque to the propositional
+			// check — introduce a WITNESS instead: for each candidate term t of the problem,
+			// ψ = φ[t/x] (the mechanical subst congruence + setness; spcev assembles ψ → ∃xφ),
+			// and the certificate closes ψ. First witness that closes wins (a LIMIT, not a
+			// variant discard — the engine's own routes stay available).
+			exGoalTry = if (ruEqHead(goal) != s2id("wex") || !precedes(s2id_("spcev")) || ruTimeIsOver(fbTimer)) None()
+				else {
+				ws = ruInExGoalWitnesses(math, env, stmtClass, goal, premiseExps2, 8);
+				if (env.conf.verbose >= 4) {
+					env.out.println("  exGoal: goal=" + ru2s(goal, math) + " witnesses=" + i2s(length(ws)) +
+						(if (ws == []) "" else " first=" + ru2s(ws[0].subgoal, math)));
+				} else {};
+				fold(ws, None(), \found : Maybe<RuRefineResult>, w ->
+					switch (found) {
+						Some(__): found;
+						None(): if (ruTimeIsOver(fbTimer)) None()
+							else maybeMap(ruHilbertCertificateTimed(em, conn, wff, stmtClass, premiseExps2, w.subgoal, ruTimeLeft(fbTimer), Some(ruInAtomCongsCached(math))),
+								\pr -> RuRefineResult(spliceAll(w.assemble(pr.first)),
+									mergeSets(mergeSets(hypDisjs2, w.disjs), pr.second.disjs)));
+					});
+				};
+			if (isSome(exGoalTry)) exGoalTry else {
 			// RELEVANCE for the complete check: G3cp is exponential in the atom count, and the
 			// saturation deliberately over-produces (instances at every occurring term), so running
 			// the check over ALL premises either blows up or gets gated away — the gate then defeats
@@ -429,11 +526,9 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 			r1 = pick(goalKs);
 			ks2 = fold(r1, goalKs, \acc, i -> mergeSets(acc, atomKeys(premiseExps2[i])));
 			subset = pick(ks2);
-			// The WHOLE fallback chain (subset try + component tries + full retry) shares one
-			// wall-clock budget: the atom gate bounds which attempts run, NOT how long one takes
-			// (the emitter is exponential and its split caps bound shape, not wall cost — an
-			// ungated chain of near-gate certificates once turned a 7-min article run into 6.5h).
-			fbTimer = ruMakeLimitedTimer(1000.0);
+			// The atom gate bounds which attempts run, NOT how long one takes (the emitter is
+			// exponential and its split caps bound shape, not wall cost — an ungated chain of
+			// near-gate certificates once turned a 7-min article run into 6.5h).
 			tryHilb = \idxs : [int], atomGate : int -> {
 				exps = map(idxs, \i -> premiseExps2[i]);
 				natoms = sizeTree(fold(arrayPush(exps, goal), ruPAtomNodes(conn, goal), \acc, e -> mergeTree(acc, ruPAtomNodes(conn, e))));
@@ -473,6 +568,8 @@ ruCheckerResidual(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int
 							else tryHilb(enumFromTo(0, length(premiseExps2) - 1), 24);
 					}
 				}
+			}
+			}
 			}
 			}
 		}
