@@ -1,0 +1,425 @@
+import ru/prover/tactics/instantiate;
+import ru/prover/tactics/congruence;
+import base/ids;
+import ds/set;
+
+// ---------------------------------------------------------------------------
+// THE RULE TABLE (L2) — P0 of the rule-table plan (~/.claude/plans/rule-table-design.md).
+//
+// One mechanical scan over the whole assertion index classifies every foundation
+// assertion into a rule ROLE by its statement SHAPE — the generalization of the
+// twelve existing shape-scanned registries (congruence.flow, unfold.flow,
+// instantiate.flow). Nothing is keyed by name: relations are discovered by finding
+// their reflexivity/transitivity/... rules, ops by their monotonicity rules.
+//
+// The second product is the GUARDED-MATRIX index: every assertion of the form
+//   (ψ→H1), …, (ψ→Hn) ⊢ (ψ→C)      ψ a plain wff var absent from the matrix
+// is indexed by the alpha-canonical key of its stripped matrix (H1…Hn ⊢ C).
+// A table rule's d-form companion is then a pure lookup — pairing is by SHAPE,
+// the "+d" name convention is only a label. Resolution order for deduction mode:
+//   0-hyp rule  → a1i-lift (always available)
+//   n-hyp rule  → shape-matched guarded companion
+//   neither     → a HOLE, reported by info/rule-table — the curation loop's input.
+//
+// P0 is informational only: nothing consumes the table in proof search yet, so
+// prover behavior is unchanged by construction. The generic applier (P2) and the
+// channel-family deletions (P3) build on it.
+//
+// L1 law: core/ never imports this file.
+// ---------------------------------------------------------------------------
+
+export {
+	RuTableRole ::= RuRoleRefl, RuRoleShrink, RuRoleGrow, RuRoleTrans, RuRoleAntisym,
+		RuRoleIntro, RuRoleTransport, RuRoleUnfoldBi, RuRoleClash, RuRoleIdentity;
+		RuRoleRefl();      // ⊢ X R X                      (ssid, eqid)
+		RuRoleShrink();    // ⊢ f(…v…) R v                 (inss1, difss)
+		RuRoleGrow();      // ⊢ v R f(…v…)                 (ssun1)
+		RuRoleTrans();     // A R B, B R' C ⊢ A R'' C      (sstri, psssstr)
+		RuRoleAntisym();   // A R B, B R A ⊢ A E B         (eqssi)
+		RuRoleIntro();     // A R C, B R C ⊢ f(A,B) R C    (unssi; and the dual C R A, C R B ⊢ C R f(A,B))
+		RuRoleTransport(); // R(a,b) → (P(…a…) → P(…b…))   (ssel; hyp form too)
+		RuRoleUnfoldBi();  // ⊢ P(v1…vn) ↔ B               (df-ss, elun, dfpss2)
+		RuRoleClash();     // ⊢ ¬ P(…)                     (nel02, with a constant slot)
+		RuRoleIdentity();  // ⊢ L = R, L rule-headed       (incom, difdif — the eq-rule base)
+
+	// How the rule enters DEDUCTION mode (fact under a guard ψ→_):
+	RuDForm ::= RuDFormLift, RuDFormFound, RuDFormHole;
+		RuDFormLift();               // 0-hyp: a1i-lift the instance
+		RuDFormFound(assId : int);   // n-hyp: the shape-matched guarded companion
+		RuDFormHole();               // n-hyp, no companion in the foundation — author one
+
+	// One classified foundation assertion.
+	//   head  the discovered relation/predicate/op the rule is keyed under
+	//   aux   the secondary head (the op f for shrink/grow/intro, the equality E
+	//         for antisym, the transported predicate for transport), or -1
+	RuTableRule(assId : int, role : RuTableRole, head : int, aux : int,
+		nhyps : int, hasDisjs : bool, dform : RuDForm);
+
+	RuRuleTable(
+		all     : [RuTableRule],
+		byHead  : Tree<int, [RuTableRule]>,
+		guarded : Tree<string, int>          // canonical matrix key -> guarded assertion id
+	);
+
+	// Scan the whole assertion index (cached by index size, like the other registries).
+	ruRuleTable(math : RuMath) -> RuRuleTable;
+
+	ruTableRole2s(r : RuTableRole) -> string;
+	// The combiners deduction mode cannot run: n-hyp rules with no guarded companion.
+	ruTableHoles(t : RuRuleTable) -> [RuTableRule];
+}
+
+ruTableRole2s(r : RuTableRole) -> string {
+	switch (r) {
+		RuRoleRefl():      "refl";
+		RuRoleShrink():    "shrink";
+		RuRoleGrow():      "grow";
+		RuRoleTrans():     "trans";
+		RuRoleAntisym():   "antisym";
+		RuRoleIntro():     "intro";
+		RuRoleTransport(): "transport";
+		RuRoleUnfoldBi():  "unfold-bi";
+		RuRoleClash():     "clash";
+		RuRoleIdentity():  "identity";
+	}
+}
+
+ruTableHoles(t : RuRuleTable) -> [RuTableRule] {
+	filter(t.all, \r -> r.dform == RuDFormHole());
+}
+
+// ---- cache -------------------------------------------------------------------
+
+ruRuleTableCache : ref [Pair<int, RuRuleTable>] = ref [];
+
+ruRuleTable(math : RuMath) -> RuRuleTable {
+	n = sizeTree(math.decls.assertions);
+	c = ^ruRuleTableCache;
+	if (c != [] && c[0].first == n) c[0].second else {
+		t = ruRtBuild(math);
+		ruRuleTableCache := [Pair(n, t)];
+		t;
+	}
+}
+
+// ---- shared helpers ------------------------------------------------------------
+
+ruRtInfer(a : RuAssertion) -> RuInference {
+	switch (a) {
+		RuAxiom(__, i): i; RuCong(__, i): i; RuTheorem(__, i, __, __): i; RuDef(__, i, __, __): i;
+	}
+}
+
+ruRtId(a : RuAssertion) -> int {
+	switch (a) {
+		RuAxiom(i, __): i.id; RuCong(i, __): i.id; RuTheorem(i, __, __, __): i.id; RuDef(i, __, __, __): i.id;
+	}
+}
+
+ruRtAsVar(e : RuExp) -> Maybe<RuVar> {
+	if (length(e.nodes) != 1) None()
+	else switch (e.nodes[0]) {
+		RuVar(id, tp): Some(RuVar(id, tp));
+		RuRuleNode(__, __): None();
+	}
+}
+
+// A rule-headed binary atom: (head, lhs, rhs).
+ruRtBin(e : RuExp) -> Maybe<Triple<int, RuExp, RuExp>> {
+	if (ruInHead(e) < 0 || ruInArity(e) != 2) None()
+	else {
+		a = ruInArgs(e);
+		Some(Triple(ruInHead(e), a[0], a[1]));
+	}
+}
+
+// A rule-headed binary atom whose both sides are plain distinct vars: (head, va, vb).
+ruRtBinVars(e : RuExp) -> Maybe<Triple<int, RuVar, RuVar>> {
+	switch (ruRtBin(e)) {
+		None(): None();
+		Some(t): switch (ruRtAsVar(t.second)) {
+			None(): None();
+			Some(a): switch (ruRtAsVar(t.third)) {
+				None(): None();
+				Some(b): if (a.id == b.id) None() else Some(Triple(t.first, a, b));
+			}
+		}
+	}
+}
+
+// A rule-headed term whose args are all plain PAIRWISE-DISTINCT vars: (head, vars).
+ruRtVarArgs(e : RuExp) -> Maybe<Pair<int, [RuVar]>> {
+	h = ruInHead(e);
+	if (h < 0 || ruInArity(e) == 0) None()
+	else {
+		vs = map(ruInArgs(e), ruRtAsVar);
+		if (!forall(vs, isSome)) None()
+		else {
+			vars = filtermap(vs, \v -> v);
+			if (sizeSet(buildSet(map(vars, \v -> v.id))) != length(vars)) None()
+			else Some(Pair(h, vars));
+		}
+	}
+}
+
+ruRtContainsVar(e : RuExp, v : RuVar) -> bool {
+	exists(e.nodes, \n -> n == v);
+}
+
+// ---- the alpha-canonical matrix key --------------------------------------------
+
+// Render hyps ++ [prop] with vars renamed by first occurrence (type kept), so two
+// statements that are the same rule up to variable names get the same key.
+ruRtCanonKey(exps : [RuExp]) -> string {
+	res = fold(exps, Pair(makeTree(), []), \acc, e ->
+		fold(e.nodes, Pair(acc.first, arrayPush(acc.second, "|")), \a : Pair<Tree<int, int>, [string]>, n -> switch (n) {
+			RuRuleNode(idType, arityLen): Pair(a.first, arrayPush(a.second, "R" + i2s(idType) + "/" + i2s(arityLen)));
+			RuVar(id, tp): switch (lookupTree(a.first, id)) {
+				Some(k): Pair(a.first, arrayPush(a.second, "v" + i2s(k) + ":" + i2s(tp)));
+				None(): {
+					k = sizeTree(a.first);
+					Pair(setTree(a.first, id, k), arrayPush(a.second, "v" + i2s(k) + ":" + i2s(tp)));
+				}
+			}
+		})
+	);
+	strGlue(res.second, ",");
+}
+
+// ---- the guarded-matrix side: is this assertion a d-form? ----------------------
+
+// (ψ→H1), …, (ψ→Hn) ⊢ (ψ→C), ψ a plain wff var absent from every consequent.
+// Returns the canonical key of the STRIPPED matrix (H1…Hn ⊢ C).
+ruRtGuardedMatrix(prop : RuExp, hyps : [RuExp]) -> Maybe<string> {
+	wiId = s2id("wi");
+	strip = \e : RuExp -> {
+		if (ruInHead(e) != wiId || ruInArity(e) != 2) None()
+		else {
+			a = ruInArgs(e);
+			switch (ruRtAsVar(a[0])) {
+				None(): None();
+				Some(g): Some(Pair(g, a[1]));
+			}
+		}
+	};
+	switch (strip(prop)) {
+		None(): None();
+		Some(pc): {
+			guard = pc.first;
+			parts = filtermap(hyps, strip);
+			if (length(parts) != length(hyps)) None()
+			else if (!forall(parts, \p -> p.first.id == guard.id)) None()
+			else {
+				matrix = arrayPush(map(parts, \p -> p.second), pc.second);
+				if (exists(matrix, \m -> ruRtContainsVar(m, guard))) None()
+				else Some(ruRtCanonKey(matrix));
+			}
+		}
+	}
+}
+
+// ---- role classification --------------------------------------------------------
+
+RuRtIds(wi : int, wb : int, wn : int, wceq : int);
+
+// (role, head, aux) or None. Checked in a fixed priority order — an assertion
+// gets at most one role (refl before identity: eqid is both).
+ruRtClassify(ids : RuRtIds, prop : RuExp, hyps : [RuExp]) -> Maybe<Triple<RuTableRole, int, int>> {
+	n = length(hyps);
+	if (n == 0) ruRtClassify0(ids, prop)
+	else if (n == 1) ruRtClassify1(ids, prop, hyps[0])
+	else if (n == 2) ruRtClassify2(ids, prop, hyps)
+	else None();
+}
+
+ruRtClassify0(ids : RuRtIds, prop : RuExp) -> Maybe<Triple<RuTableRole, int, int>> {
+	// clash: ⊢ ¬ P(…), args plain vars or constants, at least one constant slot
+	if (ruInHead(prop) == ids.wn && ruInArity(prop) == 1) {
+		body = (ruInArgs(prop))[0];
+		h = ruInHead(body);
+		if (h < 0 || ruInArity(body) == 0) None()
+		else {
+			args = ruInArgs(body);
+			hasConst = exists(args, \a -> ruInHead(a) >= 0 && ruInArity(a) == 0);
+			varOrConst = forall(args, \a -> isSome(ruRtAsVar(a)) || (ruInHead(a) >= 0 && ruInArity(a) == 0));
+			if (hasConst && varOrConst) Some(Triple(RuRoleClash(), h, -1)) else None();
+		}
+	} else switch (ruRtBin(prop)) {
+		None(): None();
+		Some(t): {
+			r = t.first; l = t.second; rr = t.third;
+			lv = ruRtAsVar(l);
+			rv = ruRtAsVar(rr);
+			// refl: ⊢ v R v
+			if (isSome(lv) && l.nodes == rr.nodes) Some(Triple(RuRoleRefl(), r, -1))
+			// shrink: ⊢ f(…v…) R v
+			else if (isSome(rv) && ruRtShrinks(l, rr)) Some(Triple(RuRoleShrink(), r, ruInHead(l)))
+			// grow: ⊢ v R f(…v…)
+			else if (isSome(lv) && ruRtShrinks(rr, l)) Some(Triple(RuRoleGrow(), r, ruInHead(rr)))
+			// transport, implication form: R(a,b) → (P(…a…) → P(…b…))
+			else if (r == ids.wi) {
+				switch (ruRtTransport(ids, l, rr)) {
+					Some(ht): Some(Triple(RuRoleTransport(), ht.first, ht.second));
+					None(): None();
+				}
+			}
+			// unfold: ⊢ P(v1…vn) ↔ B
+			else if (r == ids.wb) {
+				switch (ruRtVarArgs(l)) {
+					Some(hv): Some(Triple(RuRoleUnfoldBi(), hv.first, -1));
+					None(): None();
+				}
+			}
+			// identity: ⊢ L = R, L rule-headed — the eq-rule base candidate
+			else if (r == ids.wceq && ruInHead(l) >= 0) Some(Triple(RuRoleIdentity(), ruInHead(l), -1))
+			else None();
+		}
+	}
+}
+
+// Is `l` a term f(…) with plain distinct var args, one of which is exactly `v`?
+ruRtShrinks(l : RuExp, v : RuExp) -> bool {
+	switch (ruRtVarArgs(l)) {
+		None(): false;
+		Some(hv): switch (ruRtAsVar(v)) {
+			None(): false;
+			Some(vv): exists(hv.second, \x -> x.id == vv.id);
+		}
+	}
+}
+
+// ante = R(a,b) (plain vars), concl = (P → Q), P/Q same head+arity differing in
+// exactly one argument which is (a | b). Returns (R, head(P)).
+ruRtTransport(ids : RuRtIds, ante : RuExp, concl : RuExp) -> Maybe<Pair<int, int>> {
+	switch (ruRtBinVars(ante)) {
+		None(): None();
+		Some(rab): {
+			if (ruInHead(concl) != ids.wi || ruInArity(concl) != 2) None()
+			else {
+				ca = ruInArgs(concl);
+				ruRtTransported(rab, ca[0], ca[1]);
+			}
+		}
+	}
+}
+
+ruRtTransported(rab : Triple<int, RuVar, RuVar>, p : RuExp, q : RuExp) -> Maybe<Pair<int, int>> {
+	if (ruInHead(p) < 0 || ruInHead(p) != ruInHead(q) || ruInArity(p) != ruInArity(q) || ruInArity(p) == 0) None()
+	else {
+		pa = ruInArgs(p);
+		qa = ruInArgs(q);
+		diffs = filter(enumFromTo(0, length(pa) - 1), \i -> pa[i].nodes != qa[i].nodes);
+		if (length(diffs) != 1) None()
+		else {
+			i = diffs[0];
+			va = rab.second; vb = rab.third;
+			if (pa[i].nodes == [va] && qa[i].nodes == [vb]) Some(Pair(rab.first, ruInHead(p)))
+			else None();
+		}
+	}
+}
+
+ruRtClassify1(ids : RuRtIds, prop : RuExp, hyp : RuExp) -> Maybe<Triple<RuTableRole, int, int>> {
+	// transport, hypothesis form: R(a,b) ⊢ (P(…a…) → P(…b…))
+	switch (ruRtBinVars(hyp)) {
+		None(): None();
+		Some(rab): {
+			if (ruInHead(prop) != ids.wi || ruInArity(prop) != 2) None()
+			else {
+				pa = ruInArgs(prop);
+				switch (ruRtTransported(rab, pa[0], pa[1])) {
+					Some(rp): Some(Triple(RuRoleTransport(), rp.first, rp.second));
+					None(): None();
+				}
+			}
+		}
+	}
+}
+
+ruRtClassify2(ids : RuRtIds, prop : RuExp, hyps : [RuExp]) -> Maybe<Triple<RuTableRole, int, int>> {
+	switch (ruRtBinVars(hyps[0])) {
+		None(): None();
+		Some(h1): switch (ruRtBinVars(hyps[1])) {
+			None(): None();
+			Some(h2): switch (ruRtBin(prop)) {
+				None(): None();
+				Some(c): {
+					// antisym: A R B, B R A ⊢ A E B  (E ≠ R)
+					isAntisym = h1.first == h2.first
+						&& h1.second.id == h2.third.id && h1.third.id == h2.second.id
+						&& c.second.nodes == [h1.second] && c.third.nodes == [h1.third]
+						&& c.first != h1.first;
+					// trans: A R B, B R' C ⊢ A R'' C, three distinct vars
+					isTrans = h1.third.id == h2.second.id
+						&& h1.second.id != h2.third.id
+						&& c.second.nodes == [h1.second] && c.third.nodes == [h2.third];
+					if (isAntisym) Some(Triple(RuRoleAntisym(), h1.first, c.first))
+					else if (isTrans) Some(Triple(RuRoleTrans(), c.first, -1))
+					else {
+						// intro left: A R C, B R C ⊢ f(A,B) R C
+						introL = h1.first == h2.first && c.first == h1.first
+							&& h1.third.id == h2.third.id
+							&& c.third.nodes == [h1.third]
+							&& ruRtIsPair(c.second, h1.second, h2.second);
+						// intro right: C R A, C R B ⊢ C R f(A,B)
+						introR = h1.first == h2.first && c.first == h1.first
+							&& h1.second.id == h2.second.id
+							&& c.second.nodes == [h1.second]
+							&& ruRtIsPair(c.third, h1.third, h2.third);
+						if (introL) Some(Triple(RuRoleIntro(), c.first, ruInHead(c.second)))
+						else if (introR) Some(Triple(RuRoleIntro(), c.first, ruInHead(c.third)))
+						else None();
+					}
+				}
+			}
+		}
+	}
+}
+
+// Is `e` exactly f(a, b) for the two given vars?
+ruRtIsPair(e : RuExp, a : RuVar, b : RuVar) -> bool {
+	switch (ruRtVarArgs(e)) {
+		None(): false;
+		Some(hv): length(hv.second) == 2 && hv.second[0].id == a.id && hv.second[1].id == b.id;
+	}
+}
+
+// ---- the build -------------------------------------------------------------------
+
+RuRtCand(assId : int, role : RuTableRole, head : int, aux : int,
+	nhyps : int, hasDisjs : bool, key : string);
+
+ruRtBuild(math : RuMath) -> RuRuleTable {
+	ids = RuRtIds(s2id("wi"), s2id("wb"), s2id("wn"), s2id("wceq"));
+	scan = fold(getTreeValues(math.decls.assertions), Pair([], makeTree()),
+		\acc : Pair<[RuRtCand], Tree<string, int>>, ass -> {
+			inf = ruRtInfer(ass);
+			prop = ruExp(inf.prop.exps[0]);
+			hyps = map(inf.hyps, \h -> ruExp(h.stmt.exps[0]));
+			// guarded side: index every d-form-shaped assertion by its stripped matrix
+			guarded = switch (ruRtGuardedMatrix(prop, hyps)) {
+				None(): acc.second;
+				Some(k): if (containsKeyTree(acc.second, k)) acc.second   // first wins, deterministic
+					else setTree(acc.second, k, ruRtId(ass));
+			};
+			// i-form side: classify by role
+			cands = switch (ruRtClassify(ids, prop, hyps)) {
+				None(): acc.first;
+				Some(rha): arrayPush(acc.first, RuRtCand(ruRtId(ass), rha.first, rha.second, rha.third,
+					length(hyps), !isEmptySet(inf.vars.disjs), ruRtCanonKey(arrayPush(hyps, prop))));
+			};
+			Pair(cands, guarded);
+		});
+	guarded = scan.second;
+	all = map(scan.first, \c -> {
+		dform = if (c.nhyps == 0) RuDFormLift()
+			else switch (lookupTree(guarded, c.key)) {
+				Some(did): RuDFormFound(did);
+				None(): RuDFormHole();
+			};
+		RuTableRule(c.assId, c.role, c.head, c.aux, c.nhyps, c.hasDisjs, dform);
+	});
+	byHead = fold(all, makeTree(), \acc, r ->
+		setTree(acc, r.head, arrayPush(lookupTreeDef(acc, r.head, []), r)));
+	RuRuleTable(all, byHead, guarded);
+}
