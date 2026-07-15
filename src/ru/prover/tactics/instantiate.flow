@@ -845,6 +845,77 @@ ruInExGoalImps(math : RuMath, env : RuEnv, stmtClass : int, goal : RuExp, hyps :
 	}
 }
 
+// DIRECT INSTANTIATION of ∀-closed predicate definitions (the trivial-class, d10): for a
+// premise P(t…) with setvar args whose definition is `∀t…(P(t…) ↔ ∀v1..vm matrix)`, the
+// matrix instance at candidate setvars is fully mechanical — apply the assertion with ALL
+// metavars substituted (setvar-for-setvar), strip the prefix ∀s with sp, mpbi against the
+// premise, strip the m binder ∀s with sp. No substitution chains — the chain cannot pass a
+// nested ∀-atom (the albid gap). m ≤ 2; tuples from the smallest candidates, capped.
+ruInPredInstances(math : RuMath, env : RuEnv, stmtClass : int,
+	hyps : [Pair<RuProofTree, RuExp>], cands : [RuExp]) -> [Pair<RuExp, RuProofTree>] {
+	reg = ruPredRegistry(math);
+	if (isEmptyTree(reg)) [] else {
+		walId = s2id("wal");
+		wiId = s2id("wi");
+		wffT = tp2id_("wff");
+		spId = s2id_("sp");
+		candVars = filtermap(cands, \c ->
+			if (length(c.nodes) == 2) switch (c.nodes[1]) { RuVar(id, tp): Some(RuVar(id, tp)); RuRuleNode(__, __): None(); }
+			else None());
+		mkImp = \a : RuExp, b : RuExp -> ruFwdMkRule(wiId, wffT, [a, b]);
+		stripN = \start : Pair<RuExp, RuProofTree>, n : int -> fold(enumFromTo(1, n), start, \ac, __ -> {
+			cur = ac.first;
+			bodyEnd = ruInSpan(cur.nodes, 1);
+			body = RuExp(subrange(cur.nodes, bodyEnd, length(cur.nodes) - bodyEnd), -1);
+			spInst = RuProofStep(spId, [], RuStmt(stmtClass, [mkImp(cur, body)], -1));
+			Pair(body, RuProofStep(s2id_("ax-mp"), [ac.second, spInst], RuStmt(stmtClass, [body], -1)));
+		});
+		fold(hyps, [], \acc, h -> {
+			if (length(acc) >= 6) acc else
+			switch (lookupTree(reg, ruInHead(h.second))) {
+				None(): acc;
+				Some(pu): switch (ruMatchExp(h.second, pu.lhs, math, env)) {
+					None(): acc;
+					Some(sub0): {
+						// the RHS binder vars (of the UNsubstituted lemma)
+						coreNodes = (ruUStripWal(pu.prop.nodes, [], walId)).second;
+						lhsEnd = ruInSpan(coreNodes, 1);
+						rhsNodes = subrange(coreNodes, lhsEnd, length(coreNodes) - lhsEnd);
+						binders = (ruUStripWal(rhsNodes, [], walId)).first;
+						m = length(binders);
+						if (m < 1 || m > 2) acc else {
+							base = take(candVars, 3);
+							tuples : [[RuVar]] = if (m == 1) map(base, \v -> [v])
+								else concatA(map(base, \v1 -> map(base, \v2 -> [v1, v2])));
+							fold(take(tuples, 6), acc, \ac2, tp -> {
+								if (length(ac2) >= 6) ac2 else {
+									msub = fold(enumFromTo(0, m - 1), copyHashMap(sub0.map), \mm, i -> {
+										vE = RuExp([RuVar(tp[i].id, tp[i].type)], -1);
+										setHashMap(mm, binders[i].id, RuSubExpr(binders[i], vE, ruExpVarIdsHashSet(vE)));
+										mm;
+									});
+									instFull = ruApplySubst(pu.prop, RuSubst(msub));
+									pf0 = RuProofStep(pu.lemmaId, [], RuStmt(stmtClass, [instFull], -1));
+									// strip the prefix ∀s → the bicond instance
+									bi = stripN(Pair(instFull, pf0), length(pu.prefix));
+									// RHS side via mpbi with the premise, then strip the m binder ∀s
+									biArgs = ruInArgs(bi.first);
+									if (length(biArgs) != 2) ac2 else {
+										pRhs = RuProofStep(s2id_("mpbi"), [h.first, bi.second], RuStmt(stmtClass, [biArgs[1]], -1));
+										matrix = stripN(Pair(biArgs[1], pRhs), m);
+										if (exists(ac2, \pr -> pr.first.nodes == matrix.first.nodes)) ac2
+										else arrayPush(ac2, Pair(matrix.first, matrix.second));
+									}
+								}
+							});
+						}
+					}
+				}
+			}
+		});
+	}
+}
+
 ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
 	hyps : [Pair<RuProofTree, RuExp>], goal : RuExp, cap : int) -> Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>> {
 	walId   = s2id("wal");
@@ -864,6 +935,8 @@ ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
 	// to every closer's problem while only the premise-side skolemization consumes them — the
 	// residual's exTry derives them on demand instead (full zfmisc slipped 126 -> 124).
 	exImps = ruInExGoalImps(math, env, stmtClass, goal, hyps, 4);
+	// (7) ∀-closed predicate definitions instantiated directly at candidate setvars (trivial-class)
+	predInsts = ruInPredInstances(math, env, stmtClass, hyps, ruInCandidates(goal, hyps, tp2id_("setvar"), cap));
 	// (4) definitional enumeration memberships, (5) their transport across premise equalities
 	enumFacts = ruInEnumFacts(math, env, stmtClass, tabs, hyps, goal);
 	moved = ruInTransport(math, env, stmtClass, tabs, hyps, enumFacts);
@@ -878,8 +951,9 @@ ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
 	// normalization is pure cost).
 	pool0 = concat(filter(hyps, \h -> ruInHead(h.second) == walId && ruInArity(h.second) == 2), emp.first);
 	pool = mergeSort(pool0, \a, b -> length(a.second.nodes) - length(b.second.nodes));
-	if (pool == [] && eqlz == [] && exImps.first == []) Pair([], makeSet()) else {
-	instAcc = fold(pool, Pair([], emp.second), \acc : Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>>, h -> {
+	if (pool == [] && eqlz == [] && exImps.first == [] && predInsts == []) Pair([], makeSet()) else {
+	instantiateRound = \poolIn : [Pair<RuProofTree, RuExp>], acc0 : Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>> ->
+	fold(poolIn, acc0, \acc : Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>>, h -> {
 		pa = ruInArgs(h.second);
 		xE = pa[0]; body = pa[1];
 		if (length(acc.first) >= 8 || length(xE.nodes) != 1) acc else {
@@ -924,6 +998,13 @@ ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
 			}
 		}
 	});
+	instAcc1 = instantiateRound(pool, Pair([], emp.second));
+	// NESTED BINDERS (the trivial-class, d10: the unfolded attribute is a ∀∀-form whose first
+	// instance is STILL ∀-headed): one more instantiation round over the ∀-headed instances.
+	// The shared 8-instance cap bounds both rounds together.
+	nestedPool = filtermap(instAcc1.first, \pr ->
+		if (ruInHead(pr.first) == walId && ruInArity(pr.first) == 2) Some(Pair(pr.second, pr.first)) else None());
+	instAcc = if (nestedPool == []) instAcc1 else instantiateRound(nestedPool, instAcc1);
 	// (3) reflexivity facts — ONLY for the schemes whose normalized instances bottom out on
 	// them: real ∀-premises and the ∅-class forms (eq0: ¬(v∈X) normalizes into (x=x)-shaped
 	// subgoals). The RELATIONAL schemes (df-ss/dfcleq) do not need them, and un-gating refl
@@ -939,7 +1020,7 @@ ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
 	// instances (variables, singletons) and sheds the big-product tail. Without it the
 	// pool x candidates product multiplied the per-instance normalization cost and starved
 	// the general path's slices (zfmisc general 98 -> 92 when compounds landed uncapped).
-	Pair(concatA([eqlz, take(instAcc.first, 8), refl, exImps.first]),
+	Pair(concatA([eqlz, take(instAcc.first, 8), refl, exImps.first, predInsts]),
 		mergeSets(instAcc.second, exImps.second));
 	}
 }

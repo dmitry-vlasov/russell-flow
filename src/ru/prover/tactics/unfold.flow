@@ -36,6 +36,21 @@ export {
 	// 0-hyp `⊢ C(distinct wff metavars) ↔ rhs-over-wn/wi/wb/wa/wo(same metavars)`, cached.
 	ruConnUnfoldFacts(math : RuMath, env : RuEnv, stmtClass : int, exps : [RuExp]) -> [Pair<RuExp, RuProofTree>];
 
+	// ∀-CLOSED PREDICATE unfolds: a Mizar ATTRIBUTE definition is a ∀-closed bicond
+	// (d10_zfmisc_1: ∀X((trivial X) ↔ ∀u∀v¬(...))) — invisible to every bare-bicond scan.
+	// For each predicate atom P(t…) of `exps` with ALL-SETVAR args, the instance bicond is
+	// mechanical: apply the assertion with the prefix vars substituted by the arg setvars
+	// (setvar-for-setvar, always licensed), then strip each ∀ by sp + ax-mp. DV-FREE
+	// definitions only (same constraint as the membership unfolds).
+	ruPredUnfoldFacts(math : RuMath, env : RuEnv, stmtClass : int, exps : [RuExp]) -> [Pair<RuExp, RuProofTree>];
+
+	// The ∀-closed predicate definitions, exported for the saturation's DIRECT instantiation
+	// (the RHS's own binders get candidate setvars via whole-assertion application + sp strips
+	// — the substitution chain cannot pass a nested ∀-atom, the albid gap).
+	RuPredUnfold(lemmaId : int, prefix : [RuVar], lhs : RuExp, prop : RuExp);
+	ruPredRegistry(math : RuMath) -> Tree<int, RuPredUnfold>;
+	ruUStripWal(nds : [RuExpNode], pfx : [RuVar], walId : int) -> Pair<[RuVar], [RuExpNode]>;
+
 	// Existential/emptiness unfold: for every quantified atom `∀v¬(v∈X)` in `exps` (matching eq0's
 	// RHS), the eq0 fact `(X = ∅) ↔ ∀v¬(v∈X)` — instantiated with the SAME bound var v as the goal
 	// uses (eq0's x is a setvar metavar), so the equalizer can rewrite `X=∅` to the goal's own
@@ -252,6 +267,129 @@ ruConnRegistry(math : RuMath) -> Tree<int, RuConnLemma> {
 		ruConnRegCache := [Pair(n, t)];
 		t;
 	}
+}
+
+ruPredRegCache : ref [Pair<int, Tree<int, RuPredUnfold>>] = ref [];
+
+ruPredRegistry(math : RuMath) -> Tree<int, RuPredUnfold> {
+	n = sizeTree(math.decls.assertions);
+	c = ^ruPredRegCache;
+	if (c != [] && c[0].first == n) c[0].second else {
+		wbId = s2id("wb");
+		walId = s2id("wal");
+		nonPred = buildSet([s2id("wn"), s2id("wi"), s2id("wb"), s2id("wa"), s2id("wo"),
+			s2id("wal"), s2id("wex"), s2id("wceq"), s2id("wcel"), s2id("wss")]);
+		t = fold(getTreeValues(math.decls.assertions), makeTree(), \acc, ass -> {
+			inf = switch (ass) {
+				RuAxiom(__, i): i; RuCong(__, i): i; RuTheorem(__, i, __, __): i; RuDef(__, i, __, __): i;
+			};
+			if (length(inf.hyps) != 0 || !isEmptySet(inf.vars.disjs)) acc else {
+				prop = ruExp(inf.prop.exps[0]);
+				st = ruUStripWal(prop.nodes, [], walId);
+				prefix = st.first;
+				core = RuExp(st.second, -1);
+				if (prefix == [] || core.nodes == [] || ruUNodeId(core.nodes[0]) != wbId) acc else {
+					lhsEnd = ruUSpanEnd(core.nodes, 1);
+					lhs = RuExp(subrange(core.nodes, 1, lhsEnd - 1), -1);
+					hd = ruUNodeId(lhs.nodes[0]);
+					// lhs = predicate atom over EXACTLY the coerced prefix vars, in order-free set
+					argIds = filtermap(enumFromTo(0, length(lhs.nodes) - 1), \i -> switch (lhs.nodes[i]) {
+						RuVar(id, __): Some(id); RuRuleNode(__, __): None();
+					});
+					prefIds = map(prefix, \v -> v.id);
+					lhsOk = hd >= 0 && !containsSet(nonPred, hd)
+						&& (switch (lhs.nodes[0]) { RuRuleNode(__, __): true; RuVar(__, __): false; })
+						&& length(argIds) > 0
+						&& sizeSet(buildSet(argIds)) == length(argIds)
+						&& forall(argIds, \id -> contains(prefIds, id))
+						&& forall(prefIds, \id -> contains(argIds, id));
+					if (lhsOk && !containsKeyTree(acc, hd)) setTree(acc, hd, RuPredUnfold(
+						switch (ass) { RuAxiom(i, __): i.id; RuCong(i, __): i.id; RuTheorem(i, __, __, __): i.id; RuDef(i, __, __, __): i.id; },
+						prefix, lhs, prop)) else acc;
+				}
+			}
+		});
+		ruPredRegCache := [Pair(n, t)];
+		t;
+	}
+}
+
+ruPredUnfoldFacts(math : RuMath, env : RuEnv, stmtClass : int, exps : [RuExp]) -> [Pair<RuExp, RuProofTree>] {
+	reg = ruPredRegistry(math);
+	if (isEmptyTree(reg)) [] else {
+		collect = \e : RuExp -> {
+			nn = e.nodes;
+			filtermap(enumFromTo(0, length(nn) - 1), \i -> switch (nn[i]) {
+				RuVar(__, __): None();
+				RuRuleNode(idT, __):
+					if (!containsKeyTree(reg, ruIdType2Id(idT))) None()
+					else Some(RuExp(subrange(nn, i, ruUSpanEnd(nn, i) - i), -1));
+			});
+		};
+		subs = concatA(map(exps, collect));
+		(fold(subs, Pair([], makeSet()), \acc : Pair<[Pair<RuExp, RuProofTree>], Set<string>>, s -> {
+			key = ruUKey(s);
+			if (containsSet(acc.second, key)) acc else {
+				seen = insertSet(acc.second, key);
+				switch (lookupTree(reg, ruUNodeId(s.nodes[0]))) {
+					None(): Pair(acc.first, seen);
+					Some(pu): {
+						// all args must be coerced setvars — the substitution is then
+						// setvar-for-setvar (always licensed) and sp strips each ∀ level
+						args = ruUArgsOf(s);
+						argVars = filtermap(args, \a ->
+							if (length(a.nodes) == 2) switch (a.nodes[1]) { RuVar(id, tp): Some(RuVar(id, tp)); RuRuleNode(__, __): None(); }
+							else None());
+						if (length(argVars) != length(pu.prefix) || length(args) != length(argVars)) Pair(acc.first, seen)
+						else switch (ruMatchExp(s, pu.lhs, math, env)) {
+							None(): Pair(acc.first, seen);
+							Some(sub): {
+								instFull = ruApplySubst(pu.prop, sub);   // ∀t…(P(t…) ↔ RHS[t…])
+								pf0 = RuProofStep(pu.lemmaId, [], RuStmt(stmtClass, [instFull], -1));
+								// strip each ∀ with sp + ax-mp
+								res = fold(enumFromTo(1, length(pu.prefix)), Pair(instFull, pf0), \ac2, __ -> {
+									cur = ac2.first;
+									bodyEnd = ruUSpanEnd(cur.nodes, 1);   // skip the binder var
+									body = RuExp(subrange(cur.nodes, bodyEnd, length(cur.nodes) - bodyEnd), -1);
+									spInst = RuProofStep(s2id_("sp"), [],
+										RuStmt(stmtClass, [ruUMkImp(cur, body, stmtClass)], -1));
+									Pair(body, RuProofStep(s2id_("ax-mp"), [ac2.second, spInst], RuStmt(stmtClass, [body], -1)));
+								});
+								Pair(arrayPush(acc.first, Pair(res.first, res.second)), seen);
+							}
+						}
+					}
+				}
+			}
+		})).first;
+	}
+}
+
+// strip a ∀-prefix whose binders are plain setvars: ([binder vars], remaining body nodes)
+ruUStripWal(nds : [RuExpNode], pfx : [RuVar], walId : int) -> Pair<[RuVar], [RuExpNode]> {
+	if (length(nds) < 2) Pair(pfx, nds)
+	else switch (nds[0]) {
+		RuRuleNode(idT, __): if (ruIdType2Id(idT) != walId) Pair(pfx, nds)
+			else switch (nds[1]) {
+				RuVar(id, tp): ruUStripWal(subrange(nds, 2, length(nds) - 2), arrayPush(pfx, RuVar(id, tp)), walId);
+				RuRuleNode(__, __): Pair(pfx, nds);
+			}
+		RuVar(__, __): Pair(pfx, nds);
+	}
+}
+
+ruUArgsOf(e : RuExp) -> [RuExp] {
+	nodes = e.nodes;
+	arity = switch (nodes[0]) { RuRuleNode(__, al): ruArityLen2Arity(al); RuVar(__, __): 0; };
+	(fold(enumFromTo(1, arity), Pair(1, []), \acc : Pair<int, [RuExp]>, __ -> {
+		end = ruUSpanEnd(nodes, acc.first);
+		Pair(end, arrayPush(acc.second, RuExp(subrange(nodes, acc.first, end - acc.first), -1)));
+	})).second;
+}
+
+ruUMkImp(a : RuExp, b : RuExp, stmtClass : int) -> RuExp {
+	RuExp(concat([ruMakeRuleNode(s2id("wi"), tp2id_("wff"), 2, length(a.nodes) + length(b.nodes))],
+		concat(a.nodes, b.nodes)), -1);
 }
 
 ruConnUnfoldFacts(math : RuMath, env : RuEnv, stmtClass : int, exps : [RuExp]) -> [Pair<RuExp, RuProofTree>] {
