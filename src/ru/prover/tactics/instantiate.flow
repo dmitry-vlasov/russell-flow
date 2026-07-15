@@ -79,9 +79,11 @@ export {
 	// Does the rel-∃ table have an unfold for this head? (the residual's cheap gate)
 	ruInHasExUnfold(math : RuMath, head : int) -> bool;
 
-	// generic expression helpers (head / arity / argument subexpressions)
+	// generic expression helpers (head / arity / argument subexpressions / distinct vars)
+	ruInHead(e : RuExp) -> int;
 	ruInArity(e : RuExp) -> int;
 	ruInArgs(e : RuExp) -> [RuExp];
+	ruInVarsOf(e : RuExp) -> [RuVar];
 
 	// S4c — GOAL-SIDE WITNESS IMPLICATIONS (the INTRO dual): when the goal is ∃-shaped or
 	// matches a rel-∃ lhs, each witness candidate t yields the PROVED implication premise
@@ -89,6 +91,21 @@ export {
 	// not bare ∃). These join the saturated premise set, so the ordinary closers and the
 	// certificate see the ∃-introduction propositionally.
 	ruInExGoalImps(math : RuMath, env : RuEnv, stmtClass : int, goal : RuExp, hyps : [Pair<RuProofTree, RuExp>], cap : int) -> Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>>;
+
+	// S4d — BRANCH SKOLEMIZATION helpers (the Hilbert emitter's ∃-elimination INSIDE a
+	// deduction branch; hilbert.flow's ruHExElim). An atom matching a scanned rel-∃ bicond
+	// (eluni-shaped) yields its instantiated unfold with a FRESH eigenvariable:
+	//   pBi  ⊢ aexp ↔ ∃v ψ      (the bicond instance, a closed lemma application)
+	//   body = ψ[v/x]           (the assumption the branch introduces)
+	//   disjs = DV(u, v) per var u of aexp (the eluni-class lemmas' own provisos)
+	// The caller composes mpbi/sylib for the ∃-fact and exlimiv/exlimddv for the discharge.
+	RuInExUnfold(eigen : RuVar, exForm : RuExp, body : RuExp, pBi : RuProofTree, disjs : Set<RuDisj>);
+	ruInExUnfoldAt(math : RuMath, env : RuEnv, stmtClass : int, aexp : RuExp, used : Set<int>) -> Maybe<RuInExUnfold>;
+
+	// A ∀-shaped fact instantiated at a SETVAR (the Unifier increment at a branch
+	// eigenvariable): returns (instance, ⊢(fexp → instance) — the closed spcv implication —
+	// and spcv's DV provisos). The caller composes ax-mp (bare fact) / syl (deduction form).
+	ruInForallInstVar(math : RuMath, env : RuEnv, stmtClass : int, fexp : RuExp, v : RuVar) -> Maybe<Triple<RuExp, RuProofTree, Set<RuDisj>>>;
 }
 
 // TABLE CACHE. The three scans below walk the whole assertion index (~9800 on miz_set), and the
@@ -96,7 +113,8 @@ export {
 // theorems which close as a single probe missed their stage slice in a whole-article run. Keyed by
 // the index size, which is fixed for the duration of a run.
 RuInTables(atoms : Tree<int, [RuInAtomCong]>, conns : Tree<int, RuInConnCong>, setness : Tree<int, [RuSetLemma]>,
-	enums : Tree<int, [RuInEnumRule]>, rels : Tree<int, [RuInRelForall]>, exs : Tree<int, [RuInRelForall]>);
+	enums : Tree<int, [RuInEnumRule]>, rels : Tree<int, [RuInRelForall]>, exs : Tree<int, [RuInRelForall]>,
+	teqs : Tree<int, [RuInAtomCong]>);
 ruInTablesCache : ref [Pair<int, RuInTables>] = ref [];
 
 ruInTables(math : RuMath) -> RuInTables {
@@ -107,7 +125,7 @@ ruInTables(math : RuMath) -> RuInTables {
 
 ruInBuildTables(math : RuMath, n : int) -> RuInTables {
 	t = RuInTables(ruInAtomCongs(math), ruInConnCongs(math), ruSetnessRegistry(math), ruInEnumRules(math),
-		ruInRelForalls(math), ruInRelBinders(math, s2id("wex")));
+		ruInRelForalls(math), ruInRelBinders(math, s2id("wex")), ruInTermCongs(math));
 	ruInTablesCache := [Pair(n, t)];
 	t;
 }
@@ -316,51 +334,114 @@ ruInEnumRules(math : RuMath) -> Tree<int, [RuInEnumRule]> {
 
 // ---- the substitution congruence (x = A) → (φ ↔ φ[A/x]) --------------------
 
-RuInSubst(result : RuExp, proof : RuProofTree);
+RuInSubst(result : RuExp, proof : RuProofTree, disjs : Set<RuDisj>);
 
 // `ante` = the equality (x = A) as an expression; `x` the bound var node; `t` the term A.
-ruInSubstChain(atoms : Tree<int, [RuInAtomCong]>, conns : Tree<int, RuInConnCong>, biidd : int, wbId : int,
+ruInSubstChain(tabs : RuInTables, biidd : int, wbId : int,
 	ante : RuExp, x : RuExpNode, t : RuExp, phi : RuExp, stcl : int, math : RuMath, env : RuEnv) -> Maybe<RuInSubst> {
+	atoms = tabs.atoms;
+	conns = tabs.conns;
 	mkImp = \a : RuExp, b : RuExp -> ruFwdMkRule(s2id("wi"), tp2id_("wff"), [a, b]);
 	mkBi  = \a : RuExp, b : RuExp -> ruFwdMkRule(wbId, tp2id_("wff"), [a, b]);
-	// φ does not mention x: (x=A) → (φ ↔ φ), by biidd (a1i of biid)
-	if (!ruInContains(phi, x)) {
-		Some(RuInSubst(phi, RuProofStep(biidd, [], RuStmt(stcl, [mkImp(ante, mkBi(phi, phi))], -1))));
+	walId = s2id("wal");
+	wexId = s2id("wex");
+	// a BINDER ∀z/∃z shadowing x: no FREE x below — (x=A) → (φ ↔ φ) by biidd
+	// (the bare ruInContains test is syntactic and would wrongly recurse)
+	shadowed = (ruInHead(phi) == walId || ruInHead(phi) == wexId) && ruInArity(phi) == 2
+		&& (ruInArgs(phi))[0].nodes == [x];
+	if (!ruInContains(phi, x) || shadowed) {
+		Some(RuInSubst(phi, RuProofStep(biidd, [], RuStmt(stcl, [mkImp(ante, mkBi(phi, phi))], -1)), makeSet()));
 	} else {
 		head = ruInHead(phi);
+		// a BINDER ∀z/∃z (z ≠ x): recurse into the body, recombine with the DV-version
+		// congruence albidv/exbidv — the albid gap closed the mechanical way: the proviso
+		// DV(z, antecedent vars) rides in .disjs (z is a bound var, x/t are the problem's —
+		// the pairs hold as declared DVs). Declined when t itself mentions z (capture).
+		if ((head == walId || head == wexId) && ruInArity(phi) == 2) {
+			zE = (ruInArgs(phi))[0];
+			body = (ruInArgs(phi))[1];
+			zOk = length(zE.nodes) == 1 && !ruInContains(t, zE.nodes[0]) && !ruInContains(ante, zE.nodes[0]);
+			zVar = switch (zE.nodes[0]) { RuVar(id, tp): RuVar(id, tp); RuRuleNode(__, __): ruNoVar; };
+			if (!zOk || zVar == ruNoVar) None()
+			else switch (ruInSubstChain(tabs, biidd, wbId, ante, x, t, body, stcl, math, env)) {
+				None(): None();
+				Some(sb): {
+					phi2 = ruFwdMkRule(head, tp2id_("wff"), [zE, sb.result]);
+					lemma = if (head == walId) s2id_("albidv") else s2id_("exbidv");
+					dvs = fold(ruInVarsOf(ante), sb.disjs, \ds, u ->
+						if (u.id == zVar.id) ds else insertSet(ds, RuDisj(u, zVar)));
+					Some(RuInSubst(phi2, RuProofStep(lemma, [sb.proof],
+						RuStmt(stcl, [mkImp(ante, mkBi(phi, phi2))], -1)), dvs));
+				}
+			}
+		} else {
 		// a CONNECTIVE: recurse into the arguments, recombine with the deduction-form congruence
 		switch (lookupTree(conns, head)) {
 			Some(cc): {
 				args = ruInArgs(phi);
 				if (length(args) != cc.arity) None()
 				else {
-					subs = map(args, \a -> ruInSubstChain(atoms, conns, biidd, wbId, ante, x, t, a, stcl, math, env));
+					subs = map(args, \a -> ruInSubstChain(tabs, biidd, wbId, ante, x, t, a, stcl, math, env));
 					if (!forall(subs, isSome)) None()
 					else {
-						rs = map(subs, \s -> either(s, RuInSubst(phi, RuProofHyp(0, ruNoStmt))));
+						rs = map(subs, \s -> either(s, RuInSubst(phi, RuProofHyp(0, ruNoStmt), makeSet())));
 						phi2 = ruFwdMkRule(head, tp2id_("wff"), map(rs, \r -> r.result));
 						Some(RuInSubst(phi2, RuProofStep(cc.lemmaId, map(rs, \r -> r.proof),
-							RuStmt(stcl, [mkImp(ante, mkBi(phi, phi2))], -1))));
+							RuStmt(stcl, [mkImp(ante, mkBi(phi, phi2))], -1)),
+							fold(rs, makeSet(), \ds, r -> mergeSets(ds, r.disjs))));
 					}
 				}
 			}
 			// an ATOM mentioning x: rewrite the argument(s) that are x, one at a time
-			None(): ruInSubstAtom(atoms, ante, x, t, phi, stcl, math, env);
+			None(): ruInSubstAtom(tabs, ante, x, t, phi, stcl, math, env);
+		}
 		}
 	}
 }
 
 // An atom P(…x…): apply the (a=b)→(P(a)↔P(b)) rule at each argument position that IS x.
-// (Deeper occurrences — x inside a compound argument — are declined: they need the TERM
-// congruences, which is the next increment.)
-ruInSubstAtom(atoms : Tree<int, [RuInAtomCong]>, ante : RuExp, x : RuExpNode, t : RuExp,
+// A DEEP occurrence — x inside a compound argument — goes through the TERM-congruence
+// chain instead: syl-compose implication-form term congruences (ineq1/uneq2/…) down to
+// the occurrence, then lift through the atom congruence (the ∀∀-premise matrix case:
+// x901 inside ((x901 ∩ x902) = ∅)).
+ruInSubstAtom(tabs : RuInTables, ante : RuExp, x : RuExpNode, t : RuExp,
 	phi : RuExp, stcl : int, math : RuMath, env : RuEnv) -> Maybe<RuInSubst> {
+	atoms = tabs.atoms;
 	head = ruInHead(phi);
 	args = ruInArgs(phi);
 	// positions holding exactly x (as a bare node, possibly under a class coercion)
 	posOf = filter(enumFromTo(0, length(args) - 1), \i -> args[i].nodes == [x] || (length(args[i].nodes) == 2 && args[i].nodes[1] == x));
-	if (posOf == []) None()
-	else fold(posOf, Some(RuInSubst(phi, ruNoProofTree)), \acc : Maybe<RuInSubst>, i -> switch (acc) {
+	if (posOf == []) {
+		deep = filter(enumFromTo(0, length(args) - 1), \i -> ruInContains(args[i], x));
+		if (length(deep) != 1) None()
+		else {
+			j = deep[0];
+			switch (ruInTermEqChain(tabs.teqs, ante, x, t, args[j], stcl, math, env)) {
+				None(): None();
+				Some(ch): fold(lookupTreeDef(atoms, head, []), None(), \found : Maybe<RuInSubst>, r -> switch (found) {
+					Some(__): found;
+					None(): switch (ruMatchExp(phi, r.lhs, math, env)) {
+						None(): None();
+						Some(sub0): if (!(switch (lookupHashMap(sub0.map, r.va.id)) {
+							None(): false;
+							Some(se): se.exp.nodes == args[j].nodes;   // the rule must transport THE occurrence argument
+						})) None() else {
+							m = copyHashMap(sub0.map);
+							setHashMap(m, r.vb.id, RuSubExpr(r.vb, ch.first, ruExpVarIdsHashSet(ch.first)));
+							sub = RuSubst(m);
+							phi2 = ruApplySubst(r.rhs, sub);
+							inst = ruApplySubst(r.prop, sub);   // (argj = argj') → (φ ↔ φ')
+							stepInst = RuProofStep(r.lemmaId, [], RuStmt(stcl, [inst], -1));
+							biPhi = ruFwdMkRule(s2id("wb"), tp2id_("wff"), [phi, phi2]);
+							Some(RuInSubst(phi2, RuProofStep(s2id_("syl"), [ch.second, stepInst],
+								RuStmt(stcl, [ruFwdMkRule(s2id("wi"), tp2id_("wff"), [ante, biPhi])], -1)), makeSet()));
+						}
+					}
+				});
+			}
+		}
+	}
+	else fold(posOf, Some(RuInSubst(phi, ruNoProofTree, makeSet())), \acc : Maybe<RuInSubst>, i -> switch (acc) {
 		None(): None();
 		Some(cur): {
 			curPhi = cur.result;
@@ -386,13 +467,107 @@ ruInSubstAtom(atoms : Tree<int, [RuInAtomCong]>, ante : RuExp, x : RuExpNode, t 
 							step = RuProofStep(r.lemmaId, [], RuStmt(stcl, [inst], -1));
 							// chain with what we already have (first position: the step IS the chain)
 							switch (cur.proof) {
-								RuProofHyp(__, __): Some(RuInSubst(phi2, step));
+								RuProofHyp(__, __): Some(RuInSubst(phi2, step, makeSet()));
 								RuProofStep(__, __, __): None();   // multi-position: declined (rare; needs bitrd)
 							}
 						}
 					}
 				}
 			});
+		}
+	});
+}
+
+// ⊢ (ante → (term = term')) for x occurring ONCE inside the class term: the base is the
+// coerced occurrence itself (term IS the ante's left side — `id`), each level up applies
+// the op's implication-form term congruence at the occurrence argument and syl-composes.
+ruInTermEqChain(teqs : Tree<int, [RuInAtomCong]>, ante : RuExp, x : RuExpNode, t : RuExp,
+	term : RuExp, stcl : int, math : RuMath, env : RuEnv) -> Maybe<Pair<RuExp, RuProofTree>> {
+	mkImp = \a : RuExp, b : RuExp -> ruFwdMkRule(s2id("wi"), tp2id_("wff"), [a, b]);
+	mkEq  = \a : RuExp, b : RuExp -> ruFwdMkRule(s2id("wceq"), tp2id_("wff"), [a, b]);
+	if (term.nodes == ((ruInArgs(ante))[0]).nodes) {
+		// term is exactly the ante's lhs (the coerced x): (ante → ante) by id
+		Some(Pair(t, RuProofStep(s2id_("id"), [], RuStmt(stcl, [mkImp(ante, ante)], -1))));
+	} else {
+		args = ruInArgs(term);
+		occ = filter(enumFromTo(0, length(args) - 1), \i -> ruInContains(args[i], x));
+		if (length(occ) != 1) None()
+		else {
+			j = occ[0];
+			switch (ruInTermEqChain(teqs, ante, x, t, args[j], stcl, math, env)) {
+				None(): None();
+				Some(subC): fold(lookupTreeDef(teqs, ruInHead(term), []), None(), \found : Maybe<Pair<RuExp, RuProofTree>>, r -> switch (found) {
+					Some(__): found;
+					None(): switch (ruMatchExp(term, r.lhs, math, env)) {
+						None(): None();
+						Some(sub0): if (!(switch (lookupHashMap(sub0.map, r.va.id)) {
+							None(): false;
+							Some(se): se.exp.nodes == args[j].nodes;   // the rule must rewrite THE occurrence argument
+						})) None() else {
+							m = copyHashMap(sub0.map);
+							setHashMap(m, r.vb.id, RuSubExpr(r.vb, subC.first, ruExpVarIdsHashSet(subC.first)));
+							sub = RuSubst(m);
+							term2 = ruApplySubst(r.rhs, sub);
+							inst = ruApplySubst(r.prop, sub);   // (argj = argj') → (term = term2)
+							stepInst = RuProofStep(r.lemmaId, [], RuStmt(stcl, [inst], -1));
+							Some(Pair(term2, RuProofStep(s2id_("syl"), [subC.second, stepInst],
+								RuStmt(stcl, [mkImp(ante, mkEq(term, term2))], -1))));
+						}
+					}
+				});
+			}
+		}
+	}
+}
+
+// (a = b) → (O(…a…) = O(…b…)) : the TERM congruences in implication form (ineq1/uneq2/
+// difeq1/xpeq1 …), keyed by the CLASS-OP head — the same scan shape as ruInAtomCongs
+// with an equality conclusion. They let the substitution chain pass a compound argument
+// (x deep inside (x∩B): syl-compose the term chain down to the occurrence, then lift
+// through the atom congruence) — the "term congruences, the next increment" of
+// ruInSubstAtom, needed by the ∀∀-premises whose matrix holds x inside a term.
+ruInTermCongs(math : RuMath) -> Tree<int, [RuInAtomCong]> {
+	wiId = s2id("wi"); wceqId = s2id("wceq");
+	fold(getTreeValues(math.decls.assertions), makeTree(), \acc, ass -> {
+		inf = ruInInfer(ass);
+		if (length(inf.hyps) != 0 || !isEmptySet(inf.vars.disjs)) acc else {
+			prop = ruExp(inf.prop.exps[0]);
+			if (ruInHead(prop) != wiId || ruInArity(prop) != 2) acc else {
+				pa = ruInArgs(prop);
+				ante = pa[0]; concl = pa[1];
+				if (ruInHead(ante) != wceqId || ruInArity(ante) != 2) acc else {
+					aa = ruInArgs(ante);
+					switch (aa[0].nodes[0]) {
+						RuRuleNode(__, __): acc;
+						RuVar(ida, tpa): switch (aa[1].nodes[0]) {
+							RuRuleNode(__, __): acc;
+							RuVar(idb, tpb): {
+								if (length(aa[0].nodes) != 1 || length(aa[1].nodes) != 1 || ida == idb) acc
+								else if (ruInHead(concl) != wceqId || ruInArity(concl) != 2) acc
+								else {
+									ca = ruInArgs(concl);
+									l = ca[0]; r = ca[1];
+									// same class-op head, differing in EXACTLY one argument = (va | vb)
+									if (ruInHead(l) < 0 || ruInHead(l) != ruInHead(r) || ruInArity(l) != ruInArity(r) || ruInArity(l) == 0) acc
+									else {
+										la = ruInArgs(l); ra = ruInArgs(r);
+										diffs = filter(enumFromTo(0, length(la) - 1), \i -> la[i].nodes != ra[i].nodes);
+										if (length(diffs) != 1) acc else {
+											i = diffs[0];
+											va = RuVar(ida, tpa); vb = RuVar(idb, tpb);
+											if (la[i].nodes != [va] || ra[i].nodes != [vb]) acc
+											else {
+												cur = lookupTreeDef(acc, ruInHead(l), []);
+												setTree(acc, ruInHead(l), arrayPush(cur, RuInAtomCong(ruInId(ass), prop, l, r, va, vb)));
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
 		}
 	});
 }
@@ -496,10 +671,19 @@ ruInRelBinders2(math : RuMath, walId : int, bareArgs : bool) -> Tree<int, [RuInR
 					// the ∃-scan takes only STRUCTURE-DECOMPOSING unfolds: some lhs arg compound
 					// (eluni's ∪.B — else df-clel matches every ∈-premise and floods the
 					// saturation) and a binder-free body (the certificate is propositional).
+					// A COERCED SETVAR arg ([cv, x]) is NOT compound: df-clel-shaped lemmas with
+					// a setvar lhs slip the length test and their (v=A)∧(v∈B) unfolds then match
+					// every bare membership — S4d's branch skolemization looped on them.
 					rbody = (ruInArgs(rhs))[1];
 					binderIds = [s2id("wal"), s2id("wex")];
+					setvarT = tp2id_("setvar");
+					isCompound = \a : RuExp -> length(a.nodes) > 1
+						&& !(length(a.nodes) == 2 && (switch (a.nodes[1]) {
+							RuVar(__, tp): tp == setvarT;
+							RuRuleNode(__, __): false;
+						}));
 					exOk = bareArgs || (
-						exists(largs, \a -> length(a.nodes) > 1)
+						exists(largs, isCompound)
 						&& !exists(rbody.nodes, \n -> switch (n) {
 							RuVar(__, __): false;
 							RuRuleNode(idT, __): contains(binderIds, ruIdType2Id(idT));
@@ -573,6 +757,79 @@ ruInRelExistsFacts(math : RuMath, env : RuEnv, stmtClass : int,
 					Pair(arrayPush(ac.first, Pair(pEx, exF)), dvs);
 				}
 			}));
+}
+
+ruInExUnfoldAt(math : RuMath, env : RuEnv, stmtClass : int, aexp : RuExp, used : Set<int>) -> Maybe<RuInExUnfold> {
+	tabs = ruInTables(math);
+	setvarT = tp2id_("setvar");
+	fold(lookupTreeDef(tabs.exs, ruInHead(aexp), []), None(), \acc : Maybe<RuInExUnfold>, r -> switch (acc) {
+		Some(__): acc;
+		None(): switch (ruMatchExp(aexp, r.lhs, math, env)) {
+			None(): None();
+			Some(sub0): {
+				v = ruInFreshSetvar(used, setvarT, 1);
+				vE = RuExp([RuVar(v.id, v.type)], -1);
+				m = copyHashMap(sub0.map);
+				setHashMap(m, r.xVar.id, RuSubExpr(r.xVar, vE, ruExpVarIdsHashSet(vE)));
+				inst = ruApplySubst(r.prop, RuSubst(m));   // aexp ↔ ∃v ψ
+				exF = (ruInArgs(inst))[1];
+				body = (ruInArgs(exF))[1];
+				pBi = RuProofStep(r.lemmaId, [], RuStmt(stmtClass, [inst], -1));
+				dvs = fold(ruInVarsOf(aexp), makeSet(), \ds, u -> insertSet(ds, RuDisj(u, v)));
+				Some(RuInExUnfold(v, exF, body, pBi, dvs));
+			}
+		}
+	});
+}
+
+ruInForallInstVar(math : RuMath, env : RuEnv, stmtClass : int, fexp : RuExp, v : RuVar) -> Maybe<Triple<RuExp, RuProofTree, Set<RuDisj>>> {
+	walId = s2id("wal");
+	wbId = s2id("wb");
+	wceqId = s2id("wceq");
+	biidd = s2id_("biidd");
+	spcv = s2id_("spcv");
+	tabs = ruInTables(math);
+	if (ruInHead(fexp) != walId || ruInArity(fexp) != 2) None() else {
+		pa = ruInArgs(fexp);
+		xE = pa[0];
+		body = pa[1];
+		if (length(xE.nodes) != 1) None() else {
+			x = xE.nodes[0];
+			xVar = switch (x) { RuVar(id, tp): RuVar(id, tp); RuRuleNode(__, __): RuVar(-1, tp2id_("setvar")); };
+			// the coercion node for x, harvested from the ∀-body's own coerced occurrence
+			// (same harvest as ruInSaturate's instantiation round)
+			bn = body.nodes;
+			coerceIdx = fold(enumFromTo(0, length(bn) - 2), -1, \ci, i ->
+				if (ci >= 0) ci
+				else switch (bn[i]) {
+					RuVar(__, __): ci;
+					RuRuleNode(idT, al): if (ruArityLen2Arity(al) == 1 && ruIdType2Type(idT) == tp2id_("class") && bn[i + 1] == x) i else ci;
+				});
+			if (coerceIdx < 0 || xVar.id == v.id) None()
+			else {
+				xC = RuExp([bn[coerceIdx], x], -1);
+				t = RuExp([bn[coerceIdx], RuVar(v.id, v.type)], -1);
+				ante = ruFwdMkRule(wceqId, tp2id_("wff"), [xC, t]);
+				switch (ruInSubstChain(tabs, biidd, wbId, ante, x, t, body, stmtClass, math, env)) {
+					None(): None();
+					Some(sc): {
+						// spcv's DV: disjointed(A x, ps x) — decline if x survives in the result
+						if (ruInContains(sc.result, x)) None()
+						else switch (ruSetnessProof2(tabs.setness, t, stmtClass, math, env)) {
+							None(): None();
+							Some(setn): {
+								imp = ruFwdMkRule(s2id("wi"), tp2id_("wff"), [fexp, sc.result]);
+								pImp = RuProofStep(spcv, [setn, sc.proof], RuStmt(stmtClass, [imp], -1));
+								dvs = fold(concat(ruInVarsOf(t), ruInVarsOf(sc.result)), sc.disjs, \ds, u ->
+									if (u.id == xVar.id) ds else insertSet(ds, RuDisj(u, xVar)));
+								Some(Triple(sc.result, pImp, dvs));
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 }
 
 // (3) reflexivity `t = t` per candidate, by equid.
@@ -736,7 +993,7 @@ ruInExIntros(math : RuMath, env : RuEnv, stmtClass : int, exGoal : RuExp, hyps :
 					if (t.nodes == xC.nodes) None()
 					else {
 						ante = ruFwdMkRule(wceqId, tp2id_("wff"), [xC, t]);
-						switch (ruInSubstChain(tabs.atoms, tabs.conns, biidd, wbId, ante, x, t, body, stmtClass, math, env)) {
+						switch (ruInSubstChain(tabs, biidd, wbId, ante, x, t, body, stmtClass, math, env)) {
 							None(): {
 								if (env.conf.verbose >= 5) { env.out.println("    exIntros: subst-chain FAILED for t=" + ru2s(t, math)); } else {};
 								None();
@@ -754,7 +1011,7 @@ ruInExIntros(math : RuMath, env : RuEnv, stmtClass : int, exGoal : RuExp, hyps :
 									Some(setn): {
 										imp = ruFwdMkRule(s2id("wi"), tp2id_("wff"), [sc.result, exGoal]);   // (ψ → ∃xφ)
 										pImp = RuProofStep(spcev, [setn, sc.proof], RuStmt(stmtClass, [imp], -1));
-										dvs = fold(concat(ruInVarsOf(t), ruInVarsOf(sc.result)), makeSet(), \ds, u ->
+										dvs = fold(concat(ruInVarsOf(t), ruInVarsOf(sc.result)), sc.disjs, \ds, u ->
 											if (u.id == xVar.id) ds else insertSet(ds, RuDisj(u, xVar)));
 										Some(RuInExIntro(sc.result, imp, pImp, dvs));
 									}
@@ -976,7 +1233,7 @@ ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
 				else {
 					// the antecedent (x = A): x in its coerced (class) form, A the candidate term
 					ante = ruFwdMkRule(wceqId, tp2id_("wff"), [xC, t]);
-					switch (ruInSubstChain(tabs.atoms, tabs.conns, biidd, wbId, ante, x, t, body, stmtClass, math, env)) {
+					switch (ruInSubstChain(tabs, biidd, wbId, ante, x, t, body, stmtClass, math, env)) {
 						None(): acc2;
 						Some(sc): {
 							// spcv's DV: disjointed(A x, ps x) — decline if x survives in the result
@@ -987,7 +1244,7 @@ ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
 									imp = ruFwdMkRule(s2id("wi"), tp2id_("wff"), [h.second, sc.result]);
 									pImp = RuProofStep(spcv, [setn, sc.proof], RuStmt(stmtClass, [imp], -1));
 									pInst = RuProofStep(s2id_("ax-mp"), [h.first, pImp], RuStmt(stmtClass, [sc.result], -1));
-									dvs = fold(concat(ruInVarsOf(t), ruInVarsOf(sc.result)), acc2.second, \ds, u ->
+									dvs = fold(concat(ruInVarsOf(t), ruInVarsOf(sc.result)), mergeSets(acc2.second, sc.disjs), \ds, u ->
 										if (u.id == xVar.id) ds else insertSet(ds, RuDisj(u, xVar)));
 									Pair(arrayPush(acc2.first, Pair(sc.result, pInst)), dvs);
 								}

@@ -35,9 +35,18 @@ export {
 	//     ruHProve entry moves the branch's atom facts across its equality facts (Mizar's
 	//     per-basic-problem Equalizer — a case split's equality disjunct transports the other
 	//     literals INSIDE the branch, where saturation-before-the-check cannot see it).
+	//   exElims/exSeen/exElimsGlobal — S4d branch skolemization bounds: per-PATH ∃-elimination
+	//     depth (restored on a failed branch, like splitBudget), the atom keys already
+	//     eliminated down the current recursion (no re-elimination loops), and the TOTAL
+	//     elimination attempts across the whole proof (never restored — the hard work cap,
+	//     exactly the splitBudget/globalSplits pairing).
+	//   exNoMatch — atoms match-tested against the ∃-unfold table and declined, per
+	//     certificate: ruHExElim runs at EVERY failing ruHProve entry, and without the
+	//     negative cache the repeated match scans alone starved big certificates (t101).
 	RuHCtx(conn : RuPConnectives, wff : int, stmtClass : int, atomNodes : ref Tree<string, [RuExpNode]>,
 		splitBudget : ref int, globalSplits : ref int, disjs : ref Set<RuDisj>, freshVars : ref [RuVar], em : RuEnvMath,
-		timer : RuTimer, fo : Maybe<Tree<int, [RuInAtomCong]>>, inClash : ref bool);
+		timer : RuTimer, fo : Maybe<Tree<int, [RuInAtomCong]>>, inClash : ref bool,
+		exElims : ref int, exSeen : ref Set<string>, exElimsGlobal : ref int, exNoMatch : ref Set<string>);
 	// `wff` (the wff type id) and `stmtClass` (the |- turnstile id) MUST come from the loaded math — derive
 	// them from a real expression (ruIdType2Type of a connective node / the prop's class), never from the
 	// memoized ruIdWff/ruIdTurnstile helpers (they cache -1 if interned before the library loads).
@@ -119,7 +128,7 @@ ruHFormShape(f : RuPForm) -> string {
 
 ruHCtx(em : RuEnvMath, wff : int, stmtClass : int, atomNodes : Tree<string, [RuExpNode]>) -> RuHCtx {
 	RuHCtx(ruPConnectives(), wff, stmtClass, ref atomNodes, ref 6, ref 400, ref makeSet(), ref [], em,
-		ruMakeLimitedTimer(60000.0), None(), ref false);
+		ruMakeLimitedTimer(60000.0), None(), ref false, ref 3, ref makeSet(), ref 16, ref makeSet());
 }
 
 // ---- RuPForm -> RuExp / RuStmt (own copy; mirrors the kalmar pattern, no kalmar dependency) ----
@@ -402,6 +411,164 @@ ruHClashDerive(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], goal : RuPFor
 	}
 }
 
+// ---- S4d BRANCH SKOLEMIZATION: ∃-elimination inside the certificate ---------
+// A branch atom fact with a scanned ∃-unfold (the eluni class: (v∈∪A) ↔ ∃y((v∈y)∧(y∈A)))
+// is OPAQUE to the propositional check — the t126-class endgame lives behind it.
+// Eliminate it natively:
+//   1. unfold to ∃yψ in deduction form (mpbi / sylib across the bicond instance),
+//      y a FRESH eigenvariable;
+//   2. instantiate the branch's ∀-atom facts at y and at the branch's setvars (the
+//      Unifier draws on the new constant — the pairwise-disjointness ∀∀-premise meets
+//      its eigenvariables here); nested ∀∀ gets one more round;
+//   3. prove the goal under the assumption ψ (the ordinary deduction-theorem lift);
+//   4. discharge:  amb None:    (ψ→G) —exlimiv→ (∃yψ→G) —ax-mp→ G          [DV(y, G)]
+//                  amb Some(w): (w→∃yψ), ((w∧ψ)→G) —exlimddv→ (w→G)        [DV(y,w), DV(y,G)]
+// Tried AFTER the structural/clash routes fail, BEFORE the classical case-split.
+// Bounded: ctx.exElims eliminations per certificate (restored on failure), ctx.exSeen
+// (no re-elimination of the same atom down the recursion), fuel and the wall timer.
+ruHExElim(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], goal : RuPForm, fuel : int) -> Maybe<RuHF> {
+	if (fuel <= 0 || ^(ctx.exElims) <= 0 || ^(ctx.exElimsGlobal) <= 0 || ruTimeIsOver(ctx.timer)) None()
+	else {
+		math = ctx.em.math;
+		env = ctx.em.env;
+		// cheap pre-scan: head gate + the per-certificate negative cache — the full match +
+		// `used` fold must NOT run at every failing entry (it alone starved t101)
+		pre = filtermap(facts, \f -> switch (f.content) {
+			RuPAtom(k): if (containsSet(^(ctx.exSeen), k) || containsSet(^(ctx.exNoMatch), k)
+					|| !ruInHasExUnfold(math, ruEqHead(ruHAtomExp(ctx, k)))) None()
+				else Some(Pair(f, k));
+			default: None();
+		});
+		cands = if (pre == []) [] else {
+			// every var id the certificate knows (atom exprs + fresh vars): the eigenvar must be new
+			used0 = foldTree(^(ctx.atomNodes), makeSet(), \__, nodes, acc ->
+				fold(nodes, acc, \a, n -> switch (n) { RuVar(id, __): insertSet(a, id); RuRuleNode(__, __): a; }));
+			used = fold(^(ctx.freshVars), used0, \a, v -> insertSet(a, v.id));
+			filtermap(pre, \p -> switch (ruInExUnfoldAt(math, env, ctx.stmtClass, ruHAtomExp(ctx, p.second), used)) {
+				None(): {
+					ctx.exNoMatch := insertSet(^(ctx.exNoMatch), p.second);
+					None();
+				}
+				Some(u): Some(Triple(p.first, p.second, u));
+			});
+		};
+		fold(take(cands, 2), None(), \acc : Maybe<RuHF>, c -> switch (acc) {
+			Some(__): acc;
+			None(): if (ruTimeIsOver(ctx.timer)) None()
+			else {
+				f = c.first;
+				k = c.second;
+				u = c.third;
+				// the deduction-form ∃-fact: ⊢ ∃yψ (bare) / (w→∃yψ)
+				exFact = switch (amb) {
+					None(): RuProofStep(s2id_("mpbi"), [f.tree, u.pBi], RuStmt(ctx.stmtClass, [u.exForm], -1));
+					Some(w): {
+						wExp = RuExp(ruHForm2Nodes(ctx, w), -1);
+						RuProofStep(s2id_("sylib"), [f.tree, u.pBi],
+							RuStmt(ctx.stmtClass, [ruFwdMkRule(s2id("wi"), ctx.wff, [wExp, u.exForm])], -1));
+					}
+				};
+				ctx.atomNodes := mergeTree(^(ctx.atomNodes), ruPAtomNodes(ctx.conn, u.body));
+				psi = ruPAtomize(ctx.conn, u.body);
+				// the Unifier increment: ∀-atom facts instantiated at the eigenvar + branch setvars
+				instFacts = ruHExForallInsts(ctx, amb, facts, u.eigen);
+				if (env.conf.verbose >= 5) {
+					env.out.println("      hExElim: atom=" + ru2s(ruHAtomExp(ctx, k), math) + " ex=" + ru2s(u.exForm, math)
+						+ " forallInsts=" + i2s(length(instFacts)) + " fuel=" + i2s(fuel) + " left=" + i2s(^(ctx.exElimsGlobal)));
+				} else {};
+				// recurse under ψ; the path budget/seen roll back on failure, the global cap never does
+				seen0 = ^(ctx.exSeen);
+				el0 = ^(ctx.exElims);
+				ctx.exSeen := insertSet(seen0, k);
+				ctx.exElims := el0 - 1;
+				ctx.exElimsGlobal := ^(ctx.exElimsGlobal) - 1;
+				sub = ruHProveUnder(ctx, amb, concat(facts, instFacts), psi, goal, fuel - 1);
+				switch (sub) {
+					None(): {
+						ctx.exSeen := seen0;
+						ctx.exElims := el0;
+						None();
+					}
+					Some(ps): {
+						goalExp = RuExp(ruHForm2Nodes(ctx, goal), -1);
+						gdvs = fold(ruInVarsOf(goalExp), u.disjs, \ds, gv ->
+							if (gv.id == u.eigen.id) ds else insertSet(ds, RuDisj(gv, u.eigen)));
+						r = switch (amb) {
+							None(): {
+								// exlimiv: DV(y, goal) — (ψ→G) ⊢ (∃yψ→G); ax-mp with ⊢∃yψ
+								ctx.disjs := mergeSets(^(ctx.disjs), gdvs);
+								exImp = ruFwdMkRule(s2id("wi"), ctx.wff, [u.exForm, goalExp]);
+								pEx = RuProofStep(s2id_("exlimiv"), [ps.tree], RuStmt(ctx.stmtClass, [exImp], -1));
+								RuHF(goal, RuProofStep(s2id_("ax-mp"), [exFact, pEx], RuStmt(ctx.stmtClass, [goalExp], -1)));
+							}
+							Some(w): {
+								wExp = RuExp(ruHForm2Nodes(ctx, w), -1);
+								wdvs = fold(ruInVarsOf(wExp), gdvs, \ds, wv ->
+									if (wv.id == u.eigen.id) ds else insertSet(ds, RuDisj(wv, u.eigen)));
+								ctx.disjs := mergeSets(^(ctx.disjs), wdvs);
+								// exlimddv: (w→∃yψ), ((w∧ψ)→G) ⊢ (w→G); DV(y,w), DV(y,G)
+								RuHF(goal, RuProofStep(s2id_("exlimddv"), [exFact, ps.tree],
+									RuStmt(ctx.stmtClass, [ruFwdMkRule(s2id("wi"), ctx.wff, [wExp, goalExp])], -1)));
+							}
+						};
+						ctx.freshVars := arrayPush(^(ctx.freshVars), u.eigen);
+						Some(r);
+					}
+				}
+			}
+		});
+	}
+}
+
+// The ∀-atom branch facts instantiated at the eigenvar and the branch's setvars (cap 3
+// terms, 8 instances; one nested round for still-∀-headed instances — the ∀∀-premises).
+// Composition per fact form: ax-mp (bare) / syl (deduction form) with the closed spcv
+// implication ruInForallInstVar builds.
+ruHExForallInsts(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], eigen : RuVar) -> [RuHF] {
+	math = ctx.em.math;
+	env = ctx.em.env;
+	walId = s2id("wal");
+	setvarT = tp2id_("setvar");
+	branchVars = fold(facts, [], \acc, f -> switch (f.content) {
+		RuPAtom(k): fold(ruInVarsOf(ruHAtomExp(ctx, k)), acc, \a, v ->
+			if (v.type != setvarT || v.id == eigen.id || exists(a, \x -> x.id == v.id)) a else arrayPush(a, v));
+		default: acc;
+	});
+	terms = concat([eigen], take(branchVars, 3));
+	forallFacts = filtermap(facts, \f -> switch (f.content) {
+		RuPAtom(k): {
+			ea = ruHAtomExp(ctx, k);
+			if (ruInHead(ea) == walId) Some(Pair(f, ea)) else None();
+		}
+		default: None();
+	});
+	inst1 = \pf : Pair<RuHF, RuExp>, v : RuVar -> maybeMap(ruInForallInstVar(math, env, ctx.stmtClass, pf.second, v), \tr -> {
+		instExp = tr.first;
+		tree = switch (amb) {
+			None(): RuProofStep(s2id_("ax-mp"), [pf.first.tree, tr.second], RuStmt(ctx.stmtClass, [instExp], -1));
+			Some(w): {
+				wExp = RuExp(ruHForm2Nodes(ctx, w), -1);
+				RuProofStep(s2id_("syl"), [pf.first.tree, tr.second],
+					RuStmt(ctx.stmtClass, [ruFwdMkRule(s2id("wi"), ctx.wff, [wExp, instExp])], -1));
+			}
+		};
+		ctx.disjs := mergeSets(^(ctx.disjs), tr.third);
+		ctx.atomNodes := mergeTree(^(ctx.atomNodes), ruPAtomNodes(ctx.conn, instExp));
+		Pair(RuHF(ruPAtomize(ctx.conn, instExp), tree), instExp);
+	});
+	round = \pfs : [Pair<RuHF, RuExp>] -> fold(pfs, [], \acc : [Pair<RuHF, RuExp>], pf ->
+		fold(terms, acc, \a, v -> if (length(a) >= 8) a else switch (inst1(pf, v)) {
+			None(): a;
+			Some(p): if (exists(a, \q -> q.second.nodes == p.second.nodes)
+				|| exists(facts, \q -> q.content == p.first.content)) a else arrayPush(a, p);
+		}));
+	r1 = round(forallFacts);
+	// nested ∀∀ (the pairwise-disjointness premise): one more round over ∀-headed instances
+	nested = filter(r1, \p -> ruInHead(p.second) == walId);
+	r2 = if (nested == []) [] else round(map(nested, \p -> Pair(p.first, p.second)));
+	map(concat(r1, r2), firstOfPair);
+}
+
 // e∈∅ is false (noel: ¬(A∈∅)) — derive ¬(e∈∅) so the contradiction-closure discharges the goal.
 ruHNoel(ctx : RuHCtx, amb : Maybe<RuPForm>, key : string) -> RuHF {
 	notAtom = RuPNot(RuPAtom(key));
@@ -432,6 +599,20 @@ ruHForward(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF]) -> [RuHF] {
 			};
 			RuPNot(a): switch (a) {
 				RuPNot(x): [ruHNotNot(ctx, amb, f, x)];  // ¬¬x ⊢ x
+				RuPAnd(x, y): switch (ruHFind(facts, x)) {   // LEFT-UNIT RESOLUTION (S4d): ¬(X∧Y) + X ⊢ ¬Y
+					// (imnan: (X→¬Y) ↔ ¬(X∧Y); the ∀∀-premise instances arrive as ¬(a∈A ∧ (b∈B ∧ ¬C))
+					// and resolve left-to-right down to their decided literal)
+					Some(fx): {
+						impF = RuPImp(x, RuPNot(y));
+						imnanInst = ruHStep(ctx, "imnan", [], RuPIff(impF, RuPNot(RuPAnd(x, y))));
+						fimp = switch (amb) {
+							None():  RuHF(impF, ruHStep(ctx, "mpbir", [f.tree, imnanInst], impF));
+							Some(w): RuHF(impF, ruHStep(ctx, "sylibr", [f.tree, imnanInst], RuPImp(w, impF)));
+						};
+						[ruHModus(ctx, amb, fx, fimp, x, RuPNot(y))];
+					}
+					None(): [];
+				};
 				RuPAtom(k): {   // ¬(v∈COMPOUND): UNIT-RESOLVE against present conjunct facts
 					ea = ruHAtomExp(ctx, k);
 					if (ruEqHead(ea) != ruHwcel()) [] else {
@@ -767,7 +948,10 @@ ruHProve(ctx : RuHCtx, amb : Maybe<RuPForm>, facts0 : [RuHF], goal : RuPForm, fu
 							Some(r): Some(r);
 							None(): switch (ruHClashDerive(ctx, amb, facts, goal, fuel)) {   // S5 clash-by-derivation
 								Some(r): Some(r);
-								None(): ruHCaseSplit(ctx, amb, facts, goal, fuel);   // classical case-split: last resort (bounded)
+								None(): switch (ruHExElim(ctx, amb, facts, goal, fuel)) {   // S4d branch skolemization
+									Some(r): Some(r);
+									None(): ruHCaseSplit(ctx, amb, facts, goal, fuel);   // classical case-split: last resort (bounded)
+								};
 							};
 						};
 					};
