@@ -729,13 +729,57 @@ ruResidualFallback(memo : Maybe<RuResidualMemo>, math : RuMath, env : RuEnv, stm
 			// two rounds of "shares an atom with the goal's growing atom set" — the standard
 			// relevance closure, at the literal level. The certificate's hyp leaves are remapped
 			// from subset positions back to the original premise indices before splicing.
+			// FIRST-ORDER connectivity (S5): the per-branch transport bridges atoms through
+			// EQUALITIES — (x11=x6) shares no atom with (x6∈x24), yet the branch moves it to
+			// (x11∈x24). Terms therefore propagate ONLY through non-reflexive equality atoms:
+			// seed = the goal atoms' argument terms; a premise joins if it shares an atom OR
+			// any of its atoms' argument terms is equality-reachable; an admitted equality
+			// extends the term set with both sides. Full term-keys over-widened the subsets
+			// (t2/t86 blew their gates) — the equality bridge is the narrow, principled rule.
 			atomKeys = \e : RuExp -> buildSet(getTreeKeys(ruPAtomNodes(conn, e)));
+			termKey = \arg : RuExp -> strGlue(map(arg.nodes, \n -> switch (n) {
+				RuRuleNode(idT, __): "R" + i2s(ruIdType2Id(idT));
+				RuVar(id, __): "V" + i2s(id);
+			}), ",");
+			atomExps = \e : RuExp -> map(getTreeValues(ruPAtomNodes(conn, e)), \nodes -> RuExp(nodes, -1));
+			argTerms = \e : RuExp -> fold(atomExps(e), makeSet(), \acc, ae ->
+				fold(ruInArgs(ae), acc, \a2, arg -> insertSet(a2, termKey(arg))));
+			eqSides = \e : RuExp, known : Set<string> -> fold(atomExps(e), makeSet(), \acc, ae ->
+				if (ruEqHead(ae) != s2id("wceq")) acc else {
+					sides = ruEqArgs(ae);
+					if (sides.first.nodes == sides.second.nodes) acc   // refl: no transport value
+					else if (containsSet(known, termKey(sides.first)) || containsSet(known, termKey(sides.second)))
+						insertSet(insertSet(acc, termKey(sides.first)), termKey(sides.second))
+					else acc;
+				});
 			goalKs = atomKeys(goal);
-			pick = \ks : Set<string> -> filtermapi(premiseExps2, \i, e ->
-				if (!isEmptySet(intersectSets(atomKeys(e), ks))) Some(i) else None());
-			r1 = pick(goalKs);
+			terms0 = argTerms(goal);
+			pickA = \ksAtoms : Set<string> -> filtermapi(premiseExps2, \i, e ->
+				if (!isEmptySet(intersectSets(atomKeys(e), ksAtoms))) Some(i) else None());
+			r1 = pickA(goalKs);
 			ks2 = fold(r1, goalKs, \acc, i -> mergeSets(acc, atomKeys(premiseExps2[i])));
-			subset = pick(ks2);
+			// equality-reachable terms: one propagation round over ALL premises' equality atoms
+			terms2 = fold(premiseExps2, terms0, \acc, e -> mergeSets(acc, eqSides(e, acc)));
+			// a premise whose atom ARG TERMS meet the terms that arrived VIA AN EQUALITY is
+			// transportable (the seed terms alone would readmit everything — t2's blow-up);
+			// bridge-only admissions CAPPED smallest-first (uncapped, enum junk with equality
+			// args re-inflated t86's certificate past its gate)
+			bridged = differenceSets(terms2, terms0);
+			atomPick = pickA(ks2);
+			bridgeOnly = filtermapi(premiseExps2, \i, e ->
+				if (!contains(atomPick, i) && !isEmptySet(intersectSets(argTerms(e), bridged))) Some(i) else None());
+			// the bridge fires only while the subset stays small — on rich atom-connected
+			// sets (t86's final step) the additions are junk that burns the emitter's
+			// budgets; on sparse ones (t32/t19) the transport link is the missing piece
+			bridgeAdds = if (length(atomPick) > 8) [] else
+				take(mergeSort(bridgeOnly, \a, b -> length(premiseExps2[a].nodes) - length(premiseExps2[b].nodes)), 4);
+			subset0 = mergeSort(concat(atomPick, bridgeAdds), \a, b -> a - b);
+			// DEDUP by expression: the saturation re-derives the same fact (three copies of one
+			// ∨-premise = three case-split candidates burning the split budget — t86)
+			subset = (fold(subset0, Pair([], makeSet()), \acc : Pair<[int], Set<[RuExpNode]>>, i -> {
+				nds = premiseExps2[i].nodes;
+				if (containsSet(acc.second, nds)) acc else Pair(arrayPush(acc.first, i), insertSet(acc.second, nds));
+			})).first;
 			// The atom gate bounds which attempts run, NOT how long one takes (the emitter is
 			// exponential and its split caps bound shape, not wall cost — an ungated chain of
 			// near-gate certificates once turned a 7-min article run into 6.5h).
