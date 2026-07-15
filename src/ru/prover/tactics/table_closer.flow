@@ -63,7 +63,12 @@ RuTcIndex(byHead : Tree<int, [RuTcEntry]>);
 // 6-8 theorems to the fixed wall-clock stage slices with them on. Turn back on
 // only together with per-goal attempt budgets (the ⊊/eq0 family switches need
 // them); the solver capabilities (∧-split, bare-var guard) stay — they are
-// inert without entries that use them.
+// inert without entries that use them. SECOND MEASUREMENT (with budgets@256 +
+// the imp-and matrix dedup): STILL zfmisc −7 (122; t38/t72/t85/t93 lost, t127
+// gained) — the budget caps the applier's local fan, but every bicond subgoal
+// recurses into the FULL closer and each recursion is a fresh unbounded cost
+// unit. Enable only after subgoal recursion gets a CHEAP mode (pool-only) or
+// the unfolds move into the dispatcher's own routes.
 ruTcExtendedEntries = false;
 
 ruTcIndexCache : ref [Pair<int, RuTcIndex>] = ref [];
@@ -91,9 +96,22 @@ ruTcHead(e : RuExp) -> int {
 ruTcBuild(math : RuMath) -> RuTcIndex {
 	table = ruRuleTable(math);
 	wiId = s2id("wi");
+	// pass 1: the combiner matrix keys — an imp-and rule duplicating one is skipped.
+	// Gated: this scan costs real time INSIDE the first theorem's stage slice
+	// (the index builds lazily), and only the extended entries consume it.
+	combKeys = fold(if (ruTcExtendedEntries) table.all else [], makeSet(), \ks, r ->
+		if (r.nhyps == 0 || r.hasDisjs) ks
+		else switch (lookupTree(math.decls.assertions, r.assId)) {
+			None(): ks;
+			Some(ass): {
+				inf = ruTcInfer(ass);
+				insertSet(ks, ruRtCanonKey(arrayPush(map(inf.hyps, \h -> ruExp(h.stmt.exps[0])), ruExp(inf.prop.exps[0]))));
+			}
+		});
 	byHead = fold(table.all, makeTree(), \acc, r -> {
 		if (r.hasDisjs) acc   // DV-carrying rules are P2-skipped (the applier declares no DVs)
 		else if (!ruTcExtendedEntries && r.role == RuRoleImpAnd()) acc
+		else if (ruTcExtendedEntries && r.role == RuRoleImpAnd() && ruTcImpAndDup(math, r, combKeys)) acc
 		else switch (lookupTree(math.decls.assertions, r.assId)) {
 			None(): acc;
 			Some(ass): {
@@ -140,6 +158,23 @@ ruTcBuild(math : RuMath) -> RuTcIndex {
 	RuTcIndex(mapTree(byHead, \es -> concat(filter(es, \e -> !isBi(e)), filter(es, isBi))));
 }
 
+// Is this ∧-antecedent implication a duplicate of an existing combiner?
+// (P1 ∧ P2) → C duplicates the combiner P1, P2 ⊢ C — same canonical matrix.
+ruTcImpAndDup(math : RuMath, r : RuTableRule, combKeys : Set<string>) -> bool {
+	switch (lookupTree(math.decls.assertions, r.assId)) {
+		None(): false;
+		Some(ass): {
+			prop = ruExp((ruTcInfer(ass)).prop.exps[0]);
+			if (ruTcHead(prop) != s2id("wi") || ruInArity(prop) != 2) false
+			else {
+				pa = ruInArgs(prop);
+				if (ruTcHead(pa[0]) != s2id("wa") || ruInArity(pa[0]) != 2) false
+				else containsSet(combKeys, ruRtCanonKey(arrayPush(ruInArgs(pa[0]), pa[1])));
+			}
+		}
+	}
+}
+
 ruTcPush(acc : Tree<int, [RuTcEntry]>, e : RuTcEntry) -> Tree<int, [RuTcEntry]> {
 	h = ruTcHead(e.concl);
 	if (h < 0) acc else setTree(acc, h, arrayPush(lookupTreeDef(acc, h, []), e));
@@ -162,6 +197,15 @@ ruTcGround(e : RuExp) -> bool {
 	!exists(e.nodes, \n -> switch (n) { RuVar(__, __): true; RuRuleNode(__, __): false; });
 }
 
+// THE PER-GOAL ATTEMPT BUDGET (the P3 cost law): the applier's failure mode is
+// not wrong proofs but unbounded spend on FAILING goals — every entry can fan
+// into pool enumeration × recursion with nothing but the per-theorem timer to
+// stop it, and redundant routes re-pay that fan (zfmisc −6..−8 measured). One
+// weighted budget per ruTableClose invocation caps the fan: 1 per matched entry
+// attempt, 1 per pool-completion branch, 4 per recursion into the full closer.
+// A bounded work budget on L2 selection — not a variant cap; completeness law intact.
+ruTcAttemptBudget = 256;   // 64 truncated t85 (the 11k-call DFS theorem); 256 measured safe
+
 ruTableClose(pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, x : [RuExpNode],
 	stcl : int, depth : int, close : ([RuExpNode], int) -> Maybe<RuProofTree>,
 	prover_env : RuProverEnv) -> Maybe<RuProofTree> {
@@ -180,9 +224,11 @@ ruTableClose(pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, x : [RuExpNod
 					idx = ruTcIndex(prover_env.math);
 					entries = lookupTreeDef(idx.byHead, ruIdType2Id(idT), []);
 					goal = RuExp(x, -1);
+					budget = ref ruTcAttemptBudget;
 					fold(entries, None(), \ac : Maybe<RuProofTree>, e -> switch (ac) {
 						Some(__): ac;
-						None(): ruTcApply(e, pool, psi, goal, stcl, depth, close, prover_env);
+						None(): if (^budget <= 0) None()
+							else ruTcApply(e, pool, psi, goal, stcl, depth, close, budget, prover_env);
 					});
 				}
 			}
@@ -192,12 +238,14 @@ ruTableClose(pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, x : [RuExpNod
 
 ruTcApply(e : RuTcEntry, pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, goal : RuExp,
 	stcl : int, depth : int, close : ([RuExpNode], int) -> Maybe<RuProofTree>,
-	prover_env : RuProverEnv) -> Maybe<RuProofTree> {
+	budget : ref int, prover_env : RuProverEnv) -> Maybe<RuProofTree> {
 	math = prover_env.math;
 	env = prover_env.env;
 	switch (ruMatchExp(goal, e.concl, math, env)) {
 		None(): None();
-		Some(sub0): switch (ruTcSolve(e.antes, 0, sub0, [], pool, psi, stcl, depth, close, prover_env)) {
+		Some(sub0): {
+			budget := ^budget - 1;
+			switch (ruTcSolve(e.antes, 0, sub0, [], pool, psi, stcl, depth, close, budget, prover_env)) {
 			None(): None();
 			Some(solved): {
 				children = solved.first;
@@ -243,6 +291,7 @@ ruTcApply(e : RuTcEntry, pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, g
 				} else {};
 				res;
 			}
+			}
 		}
 	}
 }
@@ -273,8 +322,9 @@ ruTcBiStep(e : RuTcEntry, goalIsLhs : bool, instAntes : [RuExp], children : [RuP
 ruTcSolve(antes : [RuExp], i : int, sub : RuSubst, children : [RuProofTree],
 	pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, stcl : int, depth : int,
 	close : ([RuExpNode], int) -> Maybe<RuProofTree>,
-	prover_env : RuProverEnv) -> Maybe<Pair<[RuProofTree], RuSubst>> {
+	budget : ref int, prover_env : RuProverEnv) -> Maybe<Pair<[RuProofTree], RuSubst>> {
 	if (i >= length(antes)) Some(Pair(children, sub))
+	else if (^budget <= 0) None()
 	else {
 		p = ruApplySubst(antes[i], sub);
 		waSplit = ruTcHead(p) == s2id("wa") && ruInArity(p) == 2;
@@ -282,7 +332,7 @@ ruTcSolve(antes : [RuExp], i : int, sub : RuSubst, children : [RuProofTree],
 			// (P ∧ Q): solve the conjuncts as sub-antecedents (P may bind vars Q needs),
 			// then rebuild the conjunction by jca under the guard
 			pa = ruInArgs(p);
-			switch (ruTcSolve(pa, 0, sub, [], pool, psi, stcl, depth, close, prover_env)) {
+			switch (ruTcSolve(pa, 0, sub, [], pool, psi, stcl, depth, close, budget, prover_env)) {
 				None(): None();
 				Some(cs): {
 					if (length(cs.first) != 2) None()
@@ -292,7 +342,7 @@ ruTcSolve(antes : [RuExp], i : int, sub : RuSubst, children : [RuProofTree],
 						andE = ruApplySubst(p, sub2);
 						pAnd = RuProofStep(s2id_("jca"), cs.first,
 							RuStmt(stcl, [ruFwdMkRule(s2id("wi"), wff, [psi, andE])], -1));
-						ruTcSolve(antes, i + 1, sub2, arrayPush(children, pAnd), pool, psi, stcl, depth, close, prover_env);
+						ruTcSolve(antes, i + 1, sub2, arrayPush(children, pAnd), pool, psi, stcl, depth, close, budget, prover_env);
 					}
 				}
 			}
@@ -303,11 +353,14 @@ ruTcSolve(antes : [RuExp], i : int, sub : RuSubst, children : [RuProofTree],
 			});
 			child = switch (direct) {
 				Some(__): direct;
-				None(): close(p.nodes, depth - 2);
+				None(): {
+					budget := ^budget - 4;   // a recursion into the full closer is the expensive step
+					if (^budget < 0) None() else close(p.nodes, depth - 2);
+				}
 			};
 			switch (child) {
 				None(): None();
-				Some(c): ruTcSolve(antes, i + 1, sub, arrayPush(children, c), pool, psi, stcl, depth, close, prover_env);
+				Some(c): ruTcSolve(antes, i + 1, sub, arrayPush(children, c), pool, psi, stcl, depth, close, budget, prover_env);
 			}
 		} else if (ruTcHead(p) < 0) None()
 		// ^ a bare-var pattern would match EVERY pool fact — the applier never guesses
@@ -320,7 +373,11 @@ ruTcSolve(antes : [RuExp], i : int, sub : RuSubst, children : [RuProofTree],
 					None(): None();
 					Some(s2): switch (ruMergeSubst(sub, s2)) {
 						None(): None();
-						Some(sub2): ruTcSolve(antes, i + 1, sub2, arrayPush(children, f.first), pool, psi, stcl, depth, close, prover_env);
+						Some(sub2): {
+							budget := ^budget - 1;   // each pool-completion branch is one attempt
+							if (^budget < 0) None()
+							else ruTcSolve(antes, i + 1, sub2, arrayPush(children, f.first), pool, psi, stcl, depth, close, budget, prover_env);
+						}
 					}
 				}
 			});
