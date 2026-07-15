@@ -52,6 +52,7 @@ run_article() {   # <article> <off> <tl> [par]   (stage slices via env: DCMS/MZM
 	local out
 	out="$(RUSSELL_MATH="$SANDBOX" "$RUSSELL_BIN" no-server=1 mem=16g \
 		test/prover/mizar/general_only article="$article" off="$off" tl="$tl" par="$par" \
+		tac="${TAC:-checker-pipeline}" \
 		dcms="${DCMS:-4500}" mzms="${MZMS:-1500}" eqms="${EQMS:-1000}" 2>&1)"
 	local open verify total
 	open="$(grep -oP 'open theorems -> axioms: \K[0-9]+' <<<"$out" || echo '?')"
