@@ -1,0 +1,233 @@
+import ru/prover/tactics/rule_table;
+import ru/prover/core/forward;
+import ru/prover/core/proofs;
+import ru/prover/core/env;
+import ru/subst;
+import base/ids;
+
+// ---------------------------------------------------------------------------
+// THE GENERIC APPLIER (L2) — P2 of the rule-table plan.
+//
+// One guarded closer applies ANY table rule instead of a per-family channel:
+// the goal literal is matched against a rule's conclusion, the remaining
+// antecedents are solved left-to-right — a still-open (non-ground) antecedent
+// is completed against the pooled facts (that is the trans-chaining "find the
+// middle B"), a ground one recurses into the full literal closer — and the
+// application is assembled in DEDUCTION form automatically:
+//   combiner (n-hyp rule)   → one step of its shape-matched d-form companion
+//   0-hyp implication chain → instance + syl/mpd folding under the guard ψ
+//   0-hyp direct match      → instance + a1i-lift
+// Rules whose d-form is a HOLE, or with DV conditions (either form), are
+// skipped — exactly the cases info/rule-table reports.
+//
+// Behind table-closer=1 (default OFF): with the flag off nothing here runs,
+// so all floors are untouched. Selection is deterministic first-success (the
+// channel discipline); recursion shares the literal closer's memo and cycle
+// guard through the `close` callback. L1 law: core/ never imports this file.
+// ---------------------------------------------------------------------------
+
+export {
+	// table-closer=1 turns the generic applier on.
+	ruTableCloserOn(prover_env : RuProverEnv) -> bool;
+
+	// Prove ψ→x from the pooled guarded facts (each: proof of ψ→atom, atom nodes)
+	// by applying table rules. `close` re-enters the full literal closer
+	// (memoized, cycle-guarded) for ground subgoals.
+	ruTableClose(pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, x : [RuExpNode],
+		stcl : int, depth : int, close : ([RuExpNode], int) -> Maybe<RuProofTree>,
+		prover_env : RuProverEnv) -> Maybe<RuProofTree>;
+}
+
+ruTableCloserOn(prover_env : RuProverEnv) -> bool {
+	ruOptsString(prover_env.env.conf.opts, "table-closer", "") == "1";
+}
+
+// ---- the application index -----------------------------------------------------
+//
+// A table rule unpacked for application, keyed by its conclusion head:
+//   combiner (nhyps>0): antes = the hyp patterns, applyId = the d-form companion
+//   chain (nhyps==0):   the prop peeled A1→(A2→…→C) one level at a time — one
+//                       entry per peel depth (0 = direct match), applyId = the rule
+RuTcEntry(assId : int, applyId : int, isCombiner : bool, antes : [RuExp], concl : RuExp);
+RuTcIndex(byHead : Tree<int, [RuTcEntry]>);
+
+ruTcIndexCache : ref [Pair<int, RuTcIndex>] = ref [];
+
+ruTcIndex(math : RuMath) -> RuTcIndex {
+	n = sizeTree(math.decls.assertions);
+	c = ^ruTcIndexCache;
+	if (c != [] && c[0].first == n) c[0].second else {
+		idx = ruTcBuild(math);
+		ruTcIndexCache := [Pair(n, idx)];
+		idx;
+	}
+}
+
+ruTcInfer(a : RuAssertion) -> RuInference {
+	switch (a) {
+		RuAxiom(__, i): i; RuCong(__, i): i; RuTheorem(__, i, __, __): i; RuDef(__, i, __, __): i;
+	}
+}
+
+ruTcHead(e : RuExp) -> int {
+	switch (e.nodes[0]) { RuRuleNode(it, __): ruIdType2Id(it); RuVar(__, __): -1; }
+}
+
+ruTcBuild(math : RuMath) -> RuTcIndex {
+	table = ruRuleTable(math);
+	wiId = s2id("wi");
+	byHead = fold(table.all, makeTree(), \acc, r -> {
+		if (r.hasDisjs) acc   // DV-carrying rules are P2-skipped (the applier declares no DVs)
+		else switch (lookupTree(math.decls.assertions, r.assId)) {
+			None(): acc;
+			Some(ass): {
+				inf = ruTcInfer(ass);
+				prop = ruExp(inf.prop.exps[0]);
+				hyps = map(inf.hyps, \h -> ruExp(h.stmt.exps[0]));
+				if (r.nhyps > 0) {
+					// combiner: needs a DV-free d-form companion
+					switch (r.dform) {
+						RuDFormFound(did): switch (lookupTree(math.decls.assertions, did)) {
+							None(): acc;
+							Some(dass): if (!isEmptySet((ruTcInfer(dass)).vars.disjs)) acc
+								else ruTcPush(acc, RuTcEntry(r.assId, did, true, hyps, prop));
+						}
+						default: acc;
+					}
+				} else {
+					// 0-hyp: one entry per wi-peel depth (0..3), conclusion rule-headed
+					ruTcPeel(r.assId, [], prop, acc, wiId);
+				}
+			}
+		}
+	});
+	RuTcIndex(byHead);
+}
+
+ruTcPush(acc : Tree<int, [RuTcEntry]>, e : RuTcEntry) -> Tree<int, [RuTcEntry]> {
+	h = ruTcHead(e.concl);
+	if (h < 0) acc else setTree(acc, h, arrayPush(lookupTreeDef(acc, h, []), e));
+}
+
+// Peel the implication chain of a 0-hyp rule: emit an entry at every depth —
+// depth 0 is the direct match, each further level moves one antecedent out.
+ruTcPeel(assId : int, antes : [RuExp], concl : RuExp, acc : Tree<int, [RuTcEntry]>, wiId : int) -> Tree<int, [RuTcEntry]> {
+	ac1 = ruTcPush(acc, RuTcEntry(assId, assId, false, antes, concl));
+	if (length(antes) >= 3 || ruTcHead(concl) != wiId || ruInArity(concl) != 2) ac1
+	else {
+		ca = ruInArgs(concl);
+		ruTcPeel(assId, arrayPush(antes, ca[0]), ca[1], ac1, wiId);
+	}
+}
+
+// ---- the closer ------------------------------------------------------------------
+
+ruTcGround(e : RuExp) -> bool {
+	!exists(e.nodes, \n -> switch (n) { RuVar(__, __): true; RuRuleNode(__, __): false; });
+}
+
+ruTableClose(pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, x : [RuExpNode],
+	stcl : int, depth : int, close : ([RuExpNode], int) -> Maybe<RuProofTree>,
+	prover_env : RuProverEnv) -> Maybe<RuProofTree> {
+	if (depth <= 0 || ruTimeIsOver(prover_env.conf.timer)) None()
+	else switch (x[0]) {
+		RuVar(__, __): None();
+		RuRuleNode(idT, __): {
+			idx = ruTcIndex(prover_env.math);
+			entries = lookupTreeDef(idx.byHead, ruIdType2Id(idT), []);
+			goal = RuExp(x, -1);
+			fold(entries, None(), \ac : Maybe<RuProofTree>, e -> switch (ac) {
+				Some(__): ac;
+				None(): ruTcApply(e, pool, psi, goal, stcl, depth, close, prover_env);
+			});
+		}
+	}
+}
+
+ruTcApply(e : RuTcEntry, pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, goal : RuExp,
+	stcl : int, depth : int, close : ([RuExpNode], int) -> Maybe<RuProofTree>,
+	prover_env : RuProverEnv) -> Maybe<RuProofTree> {
+	math = prover_env.math;
+	env = prover_env.env;
+	switch (ruMatchExp(goal, e.concl, math, env)) {
+		None(): None();
+		Some(sub0): switch (ruTcSolve(e.antes, 0, sub0, [], pool, depth, close, prover_env)) {
+			None(): None();
+			Some(solved): {
+				children = solved.first;
+				sub = solved.second;
+				wff = tp2id_("wff");
+				mkImp = \a, b -> ruFwdMkRule(s2id("wi"), wff, [a, b]);
+				psiGoal = mkImp(psi, goal);
+				res = if (e.isCombiner) {
+					// one step of the d-form companion: children are ψ→Hᵢ in matrix order
+					Some(RuProofStep(e.applyId, children, RuStmt(stcl, [psiGoal], -1)));
+				} else {
+					instAntes = map(e.antes, \a -> ruApplySubst(a, sub));
+					if (!forall(instAntes, ruTcGround)) None()   // an unbound rule var survived
+					else {
+						// rests[i] = the instantiated A_{i+1}→(…→C) tail after consuming i antecedents
+						k = length(instAntes);
+						rests = fold(reverseA(instAntes), [goal], \acc, a -> arrayPush(acc, mkImp(a, acc[length(acc) - 1])));
+						restAt = \i : int -> rests[k - i];
+						inst = RuProofStep(e.assId, [], RuStmt(stcl, [restAt(0)], -1));
+						if (k == 0) Some(RuProofStep(s2id_("a1i"), [inst], RuStmt(stcl, [psiGoal], -1)))
+						else {
+							// syl for the first antecedent, mpd for the rest, all under ψ
+							first = RuProofStep(s2id_("syl"), [children[0], inst],
+								RuStmt(stcl, [mkImp(psi, restAt(1))], -1));
+							Some(fold(enumFromTo(1, k - 1), first, \cur, i ->
+								RuProofStep(s2id_("mpd"), [children[i], cur],
+									RuStmt(stcl, [mkImp(psi, restAt(i + 1))], -1))));
+						}
+					}
+				};
+				if (isSome(res) && prover_env.env.conf.verbose >= 5) {
+					prover_env.env.out.println("    tblClose: " + id2s(e.assId)
+						+ (if (e.isCombiner) " via " + id2s(e.applyId) else "")
+						+ " -> " + ruSafeExp2s(goal, math.decls.lang));
+				} else {};
+				res;
+			}
+		}
+	}
+}
+
+// Solve the antecedents left-to-right, backtracking over pool choices:
+// non-ground → complete against a pooled fact (extends the substitution);
+// ground → the pool verbatim, else the full literal closer (depth-damped).
+ruTcSolve(antes : [RuExp], i : int, sub : RuSubst, children : [RuProofTree],
+	pool : [Pair<RuProofTree, [RuExpNode]>], depth : int,
+	close : ([RuExpNode], int) -> Maybe<RuProofTree>,
+	prover_env : RuProverEnv) -> Maybe<Pair<[RuProofTree], RuSubst>> {
+	if (i >= length(antes)) Some(Pair(children, sub))
+	else {
+		p = ruApplySubst(antes[i], sub);
+		if (ruTcGround(p)) {
+			direct = fold(pool, None(), \ac : Maybe<RuProofTree>, f -> switch (ac) {
+				Some(__): ac;
+				None(): if (f.second == p.nodes) Some(f.first) else None();
+			});
+			child = switch (direct) {
+				Some(__): direct;
+				None(): close(p.nodes, depth - 2);
+			};
+			switch (child) {
+				None(): None();
+				Some(c): ruTcSolve(antes, i + 1, sub, arrayPush(children, c), pool, depth, close, prover_env);
+			}
+		} else {
+			// backtracking fold: first pool fact that matches AND lets the rest solve
+			fold(pool, None(), \ac : Maybe<Pair<[RuProofTree], RuSubst>>, f -> switch (ac) {
+				Some(__): ac;
+				None(): switch (ruMatchExp(RuExp(f.second, -1), p, prover_env.math, prover_env.env)) {
+					None(): None();
+					Some(s2): switch (ruMergeSubst(sub, s2)) {
+						None(): None();
+						Some(sub2): ruTcSolve(antes, i + 1, sub2, arrayPush(children, f.first), pool, depth, close, prover_env);
+					}
+				}
+			});
+		}
+	}
+}

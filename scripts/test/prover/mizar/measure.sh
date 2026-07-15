@@ -52,8 +52,9 @@ run_article() {   # <article> <off> <tl> [par]   (stage slices via env: DCMS/MZM
 	local out
 	out="$(RUSSELL_MATH="$SANDBOX" "$RUSSELL_BIN" no-server=1 mem=16g \
 		test/prover/mizar/general_only article="$article" off="$off" tl="$tl" par="$par" \
-		tac="${TAC:-checker-pipeline}" \
+		tac="${TAC:-checker-pipeline}" tblc="${TBLC:-0}" \
 		dcms="${DCMS:-4500}" mzms="${MZMS:-1500}" eqms="${EQMS:-1000}" 2>&1)"
+	if [ -n "${MLOG:-}" ]; then printf '%s\n' "$out" > "$MLOG"; fi
 	local open verify total
 	open="$(grep -oP 'open theorems -> axioms: \K[0-9]+' <<<"$out" || echo '?')"
 	verify="$(grep -oP 'Russell verify \(all proofs valid\): \K\w+' <<<"$out" || echo '?')"
@@ -73,7 +74,7 @@ case "${1:-}" in
 		article="${2:?article}"; theorem="${3:?theorem}"; off="${4:-1}"; v="${5:-1}"; thr="${6:-0}"
 		setup_sandbox
 		RUSSELL_MATH="$SANDBOX" "$RUSSELL_BIN" no-server=1 mem=16g \
-			test/prover/mizar/general_probe module="$article" target="$theorem" off="$off" v="$v" thr="$thr"
+			test/prover/mizar/general_probe module="$article" target="$theorem" off="$off" v="$v" thr="$thr" tblc="${TBLC:-0}"
 		;;
 	"" | -h | --help)
 		sed -n '2,30p' "${BASH_SOURCE[0]}"
