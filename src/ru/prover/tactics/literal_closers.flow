@@ -1125,13 +1125,45 @@ ruFwdSsPremises(ids : RuFwdInstIds, premises : [RuPremise], stcl : int) -> [Pair
 //         literal folds to the equality A=B via dfcleq)
 // The uniform (ψ→atom proof, atom nodes) pool for the table closer: the classified
 // pools re-flattened; neg entries rebuilt to their ¬-atom form, eq0 entries (which
-// store just the set T) rebuilt to the T=∅ equality they stand for.
-ruFwdTcPool(ids : RuFwdInstIds, facts : RuFwdClsFacts) -> [Pair<RuProofTree, [RuExpNode]>] {
+// store just the set T) rebuilt to the T=∅ equality they stand for. The ¬-pool is
+// closed under EQUALITY SYMMETRY: a pooled ψ→¬(a=b) also serves as ψ→¬(b=a)
+// (eqcom/biimpi → con3i → syl) — the generic form of the dfpss2-INTRO flip, done
+// once here so every consumer sees the flipped literal.
+ruFwdTcPool(ids : RuFwdInstIds, facts : RuFwdClsFacts, psi : RuExp, stcl : int) -> [Pair<RuProofTree, [RuExpNode]>] {
 	emptyE = RuExp([ruMakeRuleNode(s2id("c0"), ids.cls, 0, 0)], -1);
+	wceq = s2id("wceq");
+	negs = map(facts.neg, \f -> Pair(f.first, ruFwdMkRule(ids.wn, ids.wff, [RuExp(f.second, -1)]).nodes));
+	flips = filtermap(facts.neg, \f -> {
+		n = f.second;
+		isEq = length(n) >= 3 && switch (n[0]) {
+			RuVar(__,__): false;
+			RuRuleNode(idT, __): ruIdType2Id(idT) == wceq;
+		};
+		if (!isEq) None() else {
+			lend = ruFwdSpan(n, 1);
+			u = subrange(n, 1, lend - 1);
+			v = subrange(n, lend, length(n) - lend);
+			eqE = RuExp(n, -1);
+			eqFl = ruFwdMkRule(wceq, ids.wff, [RuExp(v, -1), RuExp(u, -1)]);
+			// (b=a)→(a=b) by biimpi of eqcom; con3i flips to ¬(a=b)→¬(b=a); syl under ψ
+			biE = ruFwdMkRule(ids.wb, ids.wff, [eqFl, eqE]);
+			imE = ruFwdMkRule(ids.wi, ids.wff, [eqFl, eqE]);
+			neFl = ruFwdMkRule(ids.wn, ids.wff, [eqFl]);
+			cnE = ruFwdMkRule(ids.wi, ids.wff, [ruFwdMkRule(ids.wn, ids.wff, [eqE]), neFl]);
+			pIm = RuProofStep(s2id_("biimpi"),
+				[RuProofStep(s2id_("eqcom"), [], RuStmt(stcl, [biE], -1))],
+				RuStmt(stcl, [imE], -1));
+			pCn = RuProofStep(s2id_("con3i"), [pIm], RuStmt(stcl, [cnE], -1));
+			Some(Pair(
+				RuProofStep(s2id_("syl"), [f.first, pCn],
+					RuStmt(stcl, [ruFwdMkRule(ids.wi, ids.wff, [psi, neFl])], -1)),
+				neFl.nodes));
+		}
+	});
 	concatA([
 		facts.ss, facts.pss, facts.el, facts.bi, facts.eqs, facts.ors,
-		map(facts.neg, \f -> Pair(f.first, ruFwdMkRule(ids.wn, ids.wff, [RuExp(f.second, -1)]).nodes)),
-		map(facts.eq0, \f -> Pair(f.first, ruFwdMkRule(s2id("wceq"), ids.wff, [RuExp(f.second, -1), emptyE]).nodes))
+		negs, flips,
+		map(facts.eq0, \f -> Pair(f.first, ruFwdMkRule(wceq, ids.wff, [RuExp(f.second, -1), emptyE]).nodes))
 	]);
 }
 
@@ -2780,7 +2812,7 @@ ruFwdLitClose(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], asse
 				res = switch (res0) {
 					Some(__): res0;
 					None(): if (!ruTableCloserOn(prover_env)) None()
-						else ruTableClose(ruFwdTcPool(ids, facts), psi, x, stcl, depth,
+						else ruTableClose(ruFwdTcPool(ids, facts, psi, stcl), psi, x, stcl, depth,
 							\x2, d2 -> ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, x2, stcl, d2, arrayPush(path0, x), memo, prover_env),
 							prover_env);
 				};
@@ -3525,53 +3557,16 @@ ruFwdLitCloseDfs(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], a
 					}}
 					}}}}}}
 				} else if (hid == wpss) {
-					// THE TABLE APPLIER on the ⊊-family (P3, family 3): psssstr/sspsstr as
-					// imp-and entries (∧-antecedent by pool completion + jca), dfpss2 as a
-					// bicond entry (subgoal (⊆ ∧ ¬=) via the ∧-split, mpbird back) — wpss is
-					// the first head admitted to ruTcExtendedHeads. Channel FIRST (its fast
-					// path fed t22's slice; table-first swapped t22 for t98), table as the
-					// fallback — it still captures what the channel misses (t98), and the
-					// channel + its neg-FLIP block get deleted once the flip is generic.
-					pt = ruFwdPssClose(ids, facts, xa, xb, stcl, Some(psi), prover_env);
-					switch (pt) { Some(__): pt; None(): {
-					tpt = ruTableClose(ruFwdTcPool(ids, facts), psi, x, stcl, depth,
+					// THE ⊊-FAMILY RUNS ON THE TABLE ALONE (P3, family 3 complete): the pooled
+					// ⊊-fact verbatim (goal-in-pool), psssstr/sspsstr as imp-and entries
+					// (∧-antecedent by pool completion + jca), dfpss2 as a bicond entry
+					// (subgoal (⊆ ∧ ¬=) via the ∧-split, mpbird back) — the ¬=-conjunct is
+					// served by the pool's equality-symmetry closure (the generic neg-flip,
+					// see ruFwdTcPool), which retired the hand channel and its dfpss2-INTRO
+					// block. ruFwdPssClose survives only for its bare-mode relClose caller.
+					ruTableClose(ruFwdTcPool(ids, facts, psi, stcl), psi, x, stcl, depth,
 						\xT, dT -> ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, xT, stcl, dT, path, memo, prover_env),
 						prover_env);
-					switch (tpt) { Some(__): tpt; None(): {
-						// dfpss2-INTRO: ψ→(a⊆b) + a pooled ψ→¬(a=b) (either orientation,
-						// flipped through eqcom/con3i) give ψ→(a⊊b)
-						eqE = ruFwdMkRule(s2id("wceq"), ids.wff, [RuExp(xa, -1), RuExp(xb, -1)]);
-						eqFl = ruFwdMkRule(s2id("wceq"), ids.wff, [RuExp(xb, -1), RuExp(xa, -1)]);
-						neE = ruFwdMkRule(ids.wn, ids.wff, [eqE]);
-						mNe = fold(facts.neg, None(), \ac, f -> switch (ac) {
-							Some(__): ac;
-							None():
-								if (f.second == eqE.nodes) Some(f.first)
-								else if (f.second == eqFl.nodes) {
-									biE = ruFwdMkRule(ids.wb, ids.wff, [eqE, eqFl]);
-									imE = ruFwdMkRule(ids.wi, ids.wff, [eqE, eqFl]);
-									cnE = ruFwdMkRule(ids.wi, ids.wff, [ruFwdMkRule(ids.wn, ids.wff, [eqFl]), neE]);
-									pIm = RuProofStep(s2id_("biimpi"),
-										[RuProofStep(s2id_("eqcom"), [], RuStmt(stcl, [biE], -1))],
-										RuStmt(stcl, [imE], -1));
-									pCn = RuProofStep(s2id_("con3i"), [pIm], RuStmt(stcl, [cnE], -1));
-									Some(RuProofStep(s2id_("syl"), [f.first, pCn], RuStmt(stcl, [mkImp(psi, neE)], -1)));
-								}
-								else None();
-						});
-						maybeBind(mNe, \pn ->
-							maybeMap(ruFwdSsClose(ids, facts, xa, xb, stcl, 8, Some(psi), prover_env), \ps -> {
-								ssE = ruFwdMkRule(ids.wss, ids.wff, [RuExp(xa, -1), RuExp(xb, -1)]);
-								rhsE = ruFwdMkRule(ids.wa, ids.wff, [ssE, neE]);
-								pAnd = RuProofStep(s2id_("jca"), [ps, pn], RuStmt(stcl, [mkImp(psi, rhsE)], -1));
-								bi = ruFwdMkRule(ids.wb, ids.wff, [RuExp(x, -1), rhsE]);
-								biStep = RuProofStep(s2id_("a1i"),
-									[RuProofStep(s2id_("dfpss2"), [], RuStmt(stcl, [bi], -1))],
-									RuStmt(stcl, [mkImp(psi, bi)], -1));
-								RuProofStep(s2id_("mpbird"), [pAnd, biStep], RuStmt(stcl, [psiX], -1));
-							}));
-					}}
-					}}
 				} else if (hid == s2id("wceq")) {
 					if (xa == xb) Some(RuProofStep(s2id_("eqidd"), [], RuStmt(stcl, [psiX], -1))) else {
 					if (prover_env.env.conf.verbose >= 6) {
@@ -3719,7 +3714,7 @@ ruFwdLitCloseDfs(ids : RuFwdInstIds, eids : RuFwdEqIds, rules : [RuFwdEqRule], a
 					// applied from the scanned table (sstri→sstrd etc.), via-fact chaining
 					// through the pool, subgoals re-entering the full closer. ruFwdSsClose
 					// remains only for its internal callers until their families switch.
-					switch (ruTableClose(ruFwdTcPool(ids, facts), psi, x, stcl, depth,
+					switch (ruTableClose(ruFwdTcPool(ids, facts, psi, stcl), psi, x, stcl, depth,
 						\xT, dT -> ruFwdLitClose(ids, eids, rules, asses, facts, bareFacts, psi, xT, stcl, dT, path, memo, prover_env),
 						prover_env)) {
 						Some(pd): Some(pd);
