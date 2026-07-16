@@ -282,6 +282,34 @@ ruTcClose(pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, x : [RuExpNode],
 			switch (direct) {
 				Some(__): direct;
 				None(): {
+					// a pooled BICOND fact with one side == the goal: close the other side,
+					// conclude by mpbird/mpbid — generic for every head (the ↔-transport)
+					wbId0 = s2id("wb");
+					poolBi = if (cheap || depth <= 0) None() else fold(pool, None(), \acB : Maybe<RuProofTree>, f -> switch (acB) {
+						Some(__): acB;
+						None(): {
+							fn = f.second;
+							isBiF = length(fn) >= 3 && switch (fn[0]) {
+								RuVar(__,__): false;
+								RuRuleNode(idTf, __): ruIdType2Id(idTf) == wbId0;
+							};
+							if (!isBiF) None() else {
+								fargs = ruInArgs(RuExp(fn, -1));
+								fl = fargs[0].nodes;
+								fr = fargs[1].nodes;
+								if (fl == x) maybeMap(close(fr, depth - 1), \pr ->
+									RuProofStep(s2id_("mpbird"), [pr, f.first],
+										RuStmt(stcl, [ruFwdMkRule(s2id("wi"), tp2id_("wff"), [psi, RuExp(x, -1)])], -1)))
+								else if (fr == x) maybeMap(close(fl, depth - 1), \pl ->
+									RuProofStep(s2id_("mpbid"), [pl, f.first],
+										RuStmt(stcl, [ruFwdMkRule(s2id("wi"), tp2id_("wff"), [psi, RuExp(x, -1)])], -1)))
+								else None();
+							}
+						}
+					});
+					switch (poolBi) {
+					Some(__): poolBi;
+					None(): {
 					idx = ruTcIndex(prover_env.math);
 					h = ruIdType2Id(idT);
 					goal0 = RuExp(x, -1);
@@ -294,6 +322,8 @@ ruTcClose(pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, x : [RuExpNode],
 						None(): if (^budget <= 0) None()
 							else ruTcApply(e, pool, psi, goal0, stcl, depth, close, budget, cheap, prover_env);
 					});
+				}
+				}
 				}
 			}
 		}
@@ -397,14 +427,30 @@ ruTcBiStep(e : RuTcEntry, goalIsLhs : bool, instAntes : [RuExp], children : [RuP
 // a ∧-antecedent splits into its conjuncts (rebuilt by jca under the guard);
 // non-ground → complete against a pooled fact (extends the substitution);
 // ground → the pool verbatim, else the full literal closer (depth-damped).
-ruTcSolve(antes : [RuExp], i : int, sub : RuSubst, children : [RuProofTree],
+// The antecedent worklist keeps (original index, pattern): a non-ground antecedent
+// that cannot pool-match yet is DEFERRED to the back once (ssel states A⊆B before
+// C∈A, but only the el-conjunct binds A) — children are reassembled in original
+// positions afterwards (combiner/chain assembly depends on statement order).
+ruTcSolve(antes : [RuExp], i0 : int, sub0 : RuSubst, children0 : [RuProofTree],
 	pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, stcl : int, depth : int,
 	close : ([RuExpNode], int) -> Maybe<RuProofTree>,
 	budget : ref int, cheap : bool, prover_env : RuProverEnv) -> Maybe<Pair<[RuProofTree], RuSubst>> {
-	if (i >= length(antes)) Some(Pair(children, sub))
+	switch (ruTcSolveW(mapi(antes, \ix, a -> Pair(ix, a)), sub0, makeTree(), 0, pool, psi, stcl, depth, close, budget, cheap, prover_env)) {
+		None(): None();
+		Some(solvedW): Some(Pair(map(enumFromTo(0, length(antes) - 1), \ix -> lookupTreeDef(solvedW.first, ix, RuProofHyp(-1, RuStmt(-1, [], -1)))), solvedW.second));
+	}
+}
+
+ruTcSolveW(work : [Pair<int, RuExp>], sub : RuSubst, solved : Tree<int, RuProofTree>, defers : int,
+	pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, stcl : int, depth : int,
+	close : ([RuExpNode], int) -> Maybe<RuProofTree>,
+	budget : ref int, cheap : bool, prover_env : RuProverEnv) -> Maybe<Pair<Tree<int, RuProofTree>, RuSubst>> {
+	if (work == []) Some(Pair(solved, sub))
 	else if (^budget <= 0) None()
 	else {
-		p = ruApplySubst(antes[i], sub);
+		item = work[0];
+		rest = tail(work);
+		p = ruApplySubst(item.second, sub);
 		waSplit = ruTcHead(p) == s2id("wa") && ruInArity(p) == 2;
 		if (waSplit) {
 			// (P ∧ Q): solve the conjuncts as sub-antecedents (P may bind vars Q needs),
@@ -420,7 +466,7 @@ ruTcSolve(antes : [RuExp], i : int, sub : RuSubst, children : [RuProofTree],
 						andE = ruApplySubst(p, sub2);
 						pAnd = RuProofStep(s2id_("jca"), cs.first,
 							RuStmt(stcl, [ruFwdMkRule(s2id("wi"), wff, [psi, andE])], -1));
-						ruTcSolve(antes, i + 1, sub2, arrayPush(children, pAnd), pool, psi, stcl, depth, close, budget, cheap, prover_env);
+						ruTcSolveW(rest, sub2, setTree(solved, item.first, pAnd), defers, pool, psi, stcl, depth, close, budget, cheap, prover_env);
 					}
 				}
 			}
@@ -442,14 +488,14 @@ ruTcSolve(antes : [RuExp], i : int, sub : RuSubst, children : [RuProofTree],
 			};
 			switch (child) {
 				None(): None();
-				Some(c): ruTcSolve(antes, i + 1, sub, arrayPush(children, c), pool, psi, stcl, depth, close, budget, cheap, prover_env);
+				Some(c): ruTcSolveW(rest, sub, setTree(solved, item.first, c), defers, pool, psi, stcl, depth, close, budget, cheap, prover_env);
 			}
 		} else if (ruTcHead(p) < 0) None()
 		// ^ a bare-var pattern would match EVERY pool fact — the applier never guesses
 		// instantiations for propositional metavariables (the zfmisc −7 cost bomb)
 		else {
 			// backtracking fold: first pool fact that matches AND lets the rest solve
-			fold(pool, None(), \ac : Maybe<Pair<[RuProofTree], RuSubst>>, f -> switch (ac) {
+			res = fold(pool, None(), \ac : Maybe<Pair<Tree<int, RuProofTree>, RuSubst>>, f -> switch (ac) {
 				Some(__): ac;
 				None(): switch (ruMatchExp(RuExp(f.second, -1), p, prover_env.math, prover_env.env)) {
 					None(): None();
@@ -458,11 +504,17 @@ ruTcSolve(antes : [RuExp], i : int, sub : RuSubst, children : [RuProofTree],
 						Some(sub2): {
 							budget := ^budget - 1;   // each pool-completion branch is one attempt
 							if (^budget < 0) None()
-							else ruTcSolve(antes, i + 1, sub2, arrayPush(children, f.first), pool, psi, stcl, depth, close, budget, cheap, prover_env);
+							else ruTcSolveW(rest, sub2, setTree(solved, item.first, f.first), defers, pool, psi, stcl, depth, close, budget, cheap, prover_env);
 						}
 					}
 				}
 			});
+			switch (res) {
+				Some(__): res;
+				// DEFER once: a later antecedent may bind this one's variables
+				None(): if (rest == [] || defers >= length(work)) None()
+					else ruTcSolveW(arrayPush(rest, item), sub, solved, defers + 1, pool, psi, stcl, depth, close, budget, cheap, prover_env);
+			}
 		}
 	}
 }
