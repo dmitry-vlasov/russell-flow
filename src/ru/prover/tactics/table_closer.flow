@@ -54,7 +54,12 @@ ruTableCloserOn(prover_env : RuProverEnv) -> bool {
 RuTcKind ::= RuTcComb, RuTcChain, RuTcBiL, RuTcBiR;
 	RuTcComb(); RuTcChain(); RuTcBiL(); RuTcBiR();
 RuTcEntry(assId : int, applyId : int, kind : RuTcKind, antes : [RuExp], concl : RuExp, ext : bool);
-RuTcIndex(byHead : Tree<int, [RuTcEntry]>);
+// Entries with a binary-atom conclusion whose FIRST argument is rule-headed are
+// sub-indexed by (conclHead, arg0Head): a goal whose lhs head differs can never
+// match them (identity entries — 547 under wceq — stop flooding every = literal).
+// Var-lhs / non-binary conclusions go to the anyArg bucket, tried for every goal
+// of that head.
+RuTcIndex(byPair : Tree<Pair<int, int>, [RuTcEntry]>, anyArg : Tree<int, [RuTcEntry]>);
 
 // EXTENDED ENTRIES (bicond unfolds + ∧-antecedent implications) — MEASURED OFF:
 // they duplicate routes the dispatcher already tries (sstr repeats the sstri
@@ -71,7 +76,7 @@ RuTcIndex(byHead : Tree<int, [RuTcEntry]>);
 // family has switched to the table. A head joins the list when its family is
 // deleted, never before.
 ruTcExtendedEntries = true;
-ruTcExtendedHeads() -> Set<int> { buildSet([s2id("wpss")]) }
+ruTcExtendedHeads() -> Set<int> { buildSet([s2id("wpss"), s2id("wceq"), s2id("wne")]) }
 
 ruTcIndexCache : ref [Pair<int, RuTcIndex>] = ref [];
 
@@ -110,11 +115,13 @@ ruTcBuild(math : RuMath) -> RuTcIndex {
 				insertSet(ks, ruRtCanonKey(arrayPush(map(inf.hyps, \h -> ruExp(h.stmt.exps[0])), ruExp(inf.prop.exps[0]))));
 			}
 		});
-	byHead = fold(table.all, makeTree(), \acc, r -> {
+	byHead = fold(table.all, RuTcAcc(makeTree(), makeTree()), \acc, r -> {
 		if (r.hasDisjs) acc   // DV-carrying rules are P2-skipped (the applier declares no DVs)
-		else if (!ruTcExtendedEntries && r.role == RuRoleImpAnd()) acc
+		else if (!ruTcExtendedEntries && (r.role == RuRoleImpAnd() || r.role == RuRoleCondFact())) acc
 		else if (ruTcExtendedEntries && r.role == RuRoleImpAnd()
 			&& (ruTcImpAndDup(math, r, combKeys) || !containsSet(ruTcExtendedHeads(), r.head))) acc
+		else if (ruTcExtendedEntries && r.role == RuRoleCondFact()
+			&& !containsSet(ruTcExtendedHeads(), r.head)) acc
 		else switch (lookupTree(math.decls.assertions, r.assId)) {
 			None(): acc;
 			Some(ass): {
@@ -133,7 +140,7 @@ ruTcBuild(math : RuMath) -> RuTcIndex {
 					}
 				} else {
 					// 0-hyp: one entry per wi-peel depth (0..3), conclusion rule-headed
-					ac1 = ruTcPeel(r.assId, [], prop, acc, wiId, r.role == RuRoleImpAnd());
+					ac1 = ruTcPeel(r.assId, [], prop, acc, wiId, r.role == RuRoleImpAnd() || r.role == RuRoleCondFact());
 					// ⊢ L ↔ R additionally applies as an unfold in both directions
 					// (goal = one side, prove the other, mpbird/mpbid) — dfpss2, velsn.
 					// A BINDER-headed side (df-ss/dfcleq's ∀-form) is excluded: recursing
@@ -145,7 +152,10 @@ ruTcBuild(math : RuMath) -> RuTcIndex {
 						walId = s2id("wal"); wexId = s2id("wex");
 						hs = ruTcExtendedHeads();
 						binder = \s : RuExp -> ruTcHead(s) == walId || ruTcHead(s) == wexId;
-						if (ruTcHead(pa[0]) >= 0 && ruTcHead(pa[1]) >= 0) {
+						if (ruTcHead(pa[0]) >= 0 && ruTcHead(pa[1]) >= 0
+							// symmetric biconds (eqcom: both sides same head) would emit
+							// self-head flip entries — flips are the pool closure's job
+							&& ruTcHead(pa[0]) != ruTcHead(pa[1])) {
 							ac2 = if (binder(pa[1]) || !containsSet(hs, ruTcHead(pa[0]))) ac1
 								else ruTcPush(ac1, RuTcEntry(r.assId, r.assId, RuTcBiL(), [pa[1]], pa[0], true));
 							if (binder(pa[0]) || !containsSet(hs, ruTcHead(pa[1]))) ac2
@@ -157,9 +167,9 @@ ruTcBuild(math : RuMath) -> RuTcIndex {
 		}
 	});
 	// bicond unfolds are the expensive tail (a recursive subgoal per attempt) —
-	// try direct/chain/combiner entries first, bi entries last
-	isBi = \e : RuTcEntry -> switch (e.kind) { RuTcBiL(): true; RuTcBiR(): true; default: false; };
-	RuTcIndex(mapTree(byHead, \es -> concat(filter(es, \e -> !isBi(e)), filter(es, isBi))));
+	// try direct/chain/combiner entries first, bi entries last (per bucket)
+	biLast = \es : [RuTcEntry] -> concat(filter(es, \e -> !ruTcIsBi(e)), filter(es, ruTcIsBi));
+	RuTcIndex(mapTree(byHead.byPair, biLast), mapTree(byHead.anyArg, biLast));
 }
 
 // Is this ∧-antecedent implication a duplicate of an existing combiner?
@@ -179,14 +189,24 @@ ruTcImpAndDup(math : RuMath, r : RuTableRule, combKeys : Set<string>) -> bool {
 	}
 }
 
-ruTcPush(acc : Tree<int, [RuTcEntry]>, e : RuTcEntry) -> Tree<int, [RuTcEntry]> {
+RuTcAcc(byPair : Tree<Pair<int, int>, [RuTcEntry]>, anyArg : Tree<int, [RuTcEntry]>);
+
+ruTcPush(acc : RuTcAcc, e : RuTcEntry) -> RuTcAcc {
 	h = ruTcHead(e.concl);
-	if (h < 0) acc else setTree(acc, h, arrayPush(lookupTreeDef(acc, h, []), e));
+	if (h < 0) acc
+	else {
+		argHead = if (ruInArity(e.concl) == 2) ruTcHead((ruInArgs(e.concl))[0]) else -1;
+		if (argHead >= 0) RuTcAcc(
+			setTree(acc.byPair, Pair(h, argHead), arrayPush(lookupTreeDef(acc.byPair, Pair(h, argHead), []), e)),
+			acc.anyArg)
+		else RuTcAcc(acc.byPair,
+			setTree(acc.anyArg, h, arrayPush(lookupTreeDef(acc.anyArg, h, []), e)));
+	}
 }
 
 // Peel the implication chain of a 0-hyp rule: emit an entry at every depth —
 // depth 0 is the direct match, each further level moves one antecedent out.
-ruTcPeel(assId : int, antes : [RuExp], concl : RuExp, acc : Tree<int, [RuTcEntry]>, wiId : int, ext : bool) -> Tree<int, [RuTcEntry]> {
+ruTcPeel(assId : int, antes : [RuExp], concl : RuExp, acc : RuTcAcc, wiId : int, ext : bool) -> RuTcAcc {
 	ac1 = ruTcPush(acc, RuTcEntry(assId, assId, RuTcChain(), antes, concl, ext));
 	if (length(antes) >= 3 || ruTcHead(concl) != wiId || ruInArity(concl) != 2) ac1
 	else {
@@ -240,13 +260,16 @@ ruTcClose(pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, x : [RuExpNode],
 				Some(__): direct;
 				None(): {
 					idx = ruTcIndex(prover_env.math);
-					entries0 = lookupTreeDef(idx.byHead, ruIdType2Id(idT), []);
+					h = ruIdType2Id(idT);
+					goal0 = RuExp(x, -1);
+					argHead = if (ruInArity(goal0) == 2) ruTcHead((ruInArgs(goal0))[0]) else -1;
+					specific = if (argHead >= 0) lookupTreeDef(idx.byPair, Pair(h, argHead), []) else [];
+					entries0 = concat(specific, lookupTreeDef(idx.anyArg, h, []));
 					entries = if (cheap) filter(entries0, \e -> !ruTcIsBi(e)) else entries0;
-					goal = RuExp(x, -1);
 					fold(entries, None(), \ac : Maybe<RuProofTree>, e -> switch (ac) {
 						Some(__): ac;
 						None(): if (^budget <= 0) None()
-							else ruTcApply(e, pool, psi, goal, stcl, depth, close, budget, cheap, prover_env);
+							else ruTcApply(e, pool, psi, goal0, stcl, depth, close, budget, cheap, prover_env);
 					});
 				}
 			}
