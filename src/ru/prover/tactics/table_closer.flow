@@ -30,12 +30,20 @@ export {
 	// table-closer=1 turns the generic applier on.
 	ruTableCloserOn(prover_env : RuProverEnv) -> bool;
 
-	// Prove ψ→x from the pooled guarded facts (each: proof of ψ→atom, atom nodes)
-	// by applying table rules. `close` re-enters the full literal closer
-	// (memoized, cycle-guarded) for ground subgoals.
-	ruTableClose(pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, x : [RuExpNode],
+	// Prove guard→x (or bare x when guard is None) from the pooled facts (each:
+	// proof of guard→atom / bare atom, atom nodes) by applying table rules.
+	// `close` re-enters the full literal closer (memoized, cycle-guarded) for
+	// ground subgoals. Assembly is guard-directed: d-form combiners / syl+mpd
+	// chains / a1i-lifts / mpbid under Some, i-form combiners / ax-mp chains /
+	// plain instances / mpbi under None — the channels' own convention.
+	ruTableClose(pool : [Pair<RuProofTree, [RuExpNode]>], guard : Maybe<RuExp>, x : [RuExpNode],
 		stcl : int, depth : int, close : ([RuExpNode], int) -> Maybe<RuProofTree>,
 		prover_env : RuProverEnv) -> Maybe<RuProofTree>;
+
+	// The SELF-CONTAINED closer (pool + table only, cheap mode, no channel
+	// re-entry) — what ruFwdSsCloseP was: subgoals recurse into the table itself.
+	ruTableCloseCheap(pool : [Pair<RuProofTree, [RuExpNode]>], guard : Maybe<RuExp>, x : [RuExpNode],
+		stcl : int, depth : int, prover_env : RuProverEnv) -> Maybe<RuProofTree>;
 }
 
 ruTableCloserOn(prover_env : RuProverEnv) -> bool {
@@ -253,11 +261,17 @@ ruTcGround(e : RuExp) -> bool {
 // A bounded work budget on L2 selection — not a variant cap; completeness law intact.
 ruTcAttemptBudget = 256;   // 64 truncated t85 (the 11k-call theorem); 256 measured safe
 
-ruTableClose(pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, x : [RuExpNode],
+ruTableClose(pool : [Pair<RuProofTree, [RuExpNode]>], guard : Maybe<RuExp>, x : [RuExpNode],
 	stcl : int, depth : int, close : ([RuExpNode], int) -> Maybe<RuProofTree>,
 	prover_env : RuProverEnv) -> Maybe<RuProofTree> {
 	budget = ref ruTcAttemptBudget;
-	ruTcClose(pool, psi, x, stcl, depth, close, budget, false, prover_env);
+	ruTcClose(pool, guard, x, stcl, depth, close, budget, false, prover_env);
+}
+
+ruTableCloseCheap(pool : [Pair<RuProofTree, [RuExpNode]>], guard : Maybe<RuExp>, x : [RuExpNode],
+	stcl : int, depth : int, prover_env : RuProverEnv) -> Maybe<RuProofTree> {
+	budget = ref ruTcAttemptBudget;
+	ruTcClose(pool, guard, x, stcl, depth, \__, ___ -> None(), budget, true, prover_env);
 }
 
 // THE CHEAP RECURSION MODE (cheap=true): subgoals of EXTENDED entries never
@@ -267,7 +281,14 @@ ruTableClose(pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, x : [RuExpNod
 // combiner entries, and nothing else; bi entries are skipped (no bi-in-bi
 // ping-pong), and the budget is SHARED with the caller, so one top-level goal
 // still spends at most one budget.
-ruTcClose(pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, x : [RuExpNode],
+ruTcWrap(guard : Maybe<RuExp>, e : RuExp) -> RuExp {
+	switch (guard) {
+		None(): e;
+		Some(g): ruFwdMkRule(s2id("wi"), tp2id_("wff"), [g, e]);
+	}
+}
+
+ruTcClose(pool : [Pair<RuProofTree, [RuExpNode]>], guard : Maybe<RuExp>, x : [RuExpNode],
 	stcl : int, depth : int, close : ([RuExpNode], int) -> Maybe<RuProofTree>,
 	budget : ref int, cheap : bool, prover_env : RuProverEnv) -> Maybe<RuProofTree> {
 	if (depth <= 0 || ruTimeIsOver(prover_env.conf.timer)) None()
@@ -297,12 +318,14 @@ ruTcClose(pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, x : [RuExpNode],
 								fargs = ruInArgs(RuExp(fn, -1));
 								fl = fargs[0].nodes;
 								fr = fargs[1].nodes;
+								mpL = switch (guard) { None(): s2id_("mpbir"); Some(__): s2id_("mpbird"); };
+								mpR = switch (guard) { None(): s2id_("mpbi"); Some(__): s2id_("mpbid"); };
 								if (fl == x) maybeMap(close(fr, depth - 1), \pr ->
-									RuProofStep(s2id_("mpbird"), [pr, f.first],
-										RuStmt(stcl, [ruFwdMkRule(s2id("wi"), tp2id_("wff"), [psi, RuExp(x, -1)])], -1)))
+									RuProofStep(mpL, [pr, f.first],
+										RuStmt(stcl, [ruTcWrap(guard, RuExp(x, -1))], -1)))
 								else if (fr == x) maybeMap(close(fl, depth - 1), \pl ->
-									RuProofStep(s2id_("mpbid"), [pl, f.first],
-										RuStmt(stcl, [ruFwdMkRule(s2id("wi"), tp2id_("wff"), [psi, RuExp(x, -1)])], -1)))
+									RuProofStep(mpR, [pl, f.first],
+										RuStmt(stcl, [ruTcWrap(guard, RuExp(x, -1))], -1)))
 								else None();
 							}
 						}
@@ -320,7 +343,7 @@ ruTcClose(pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, x : [RuExpNode],
 					fold(entries, None(), \ac : Maybe<RuProofTree>, e -> switch (ac) {
 						Some(__): ac;
 						None(): if (^budget <= 0) None()
-							else ruTcApply(e, pool, psi, goal0, stcl, depth, close, budget, cheap, prover_env);
+							else ruTcApply(e, pool, guard, goal0, stcl, depth, close, budget, cheap, prover_env);
 					});
 				}
 				}
@@ -334,7 +357,7 @@ ruTcIsBi(e : RuTcEntry) -> bool {
 	switch (e.kind) { RuTcBiL(): true; RuTcBiR(): true; default: false; }
 }
 
-ruTcApply(e : RuTcEntry, pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, goal : RuExp,
+ruTcApply(e : RuTcEntry, pool : [Pair<RuProofTree, [RuExpNode]>], guard : Maybe<RuExp>, goal : RuExp,
 	stcl : int, depth : int, close : ([RuExpNode], int) -> Maybe<RuProofTree>,
 	budget : ref int, cheap : bool, prover_env : RuProverEnv) -> Maybe<RuProofTree> {
 	math = prover_env.math;
@@ -346,19 +369,21 @@ ruTcApply(e : RuTcEntry, pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, g
 			// EXTENDED-origin entries (bi + imp-and) solve their subgoals in CHEAP mode
 			// (pool + table only, shared budget); once cheap, always cheap
 			cheapSolve = cheap || e.ext || ruTcIsBi(e);
-			switch (ruTcSolve(e.antes, 0, sub0, [], pool, psi, stcl, depth, close, budget, cheapSolve, prover_env)) {
+			switch (ruTcSolve(e.antes, 0, sub0, [], pool, guard, stcl, depth, close, budget, cheapSolve, prover_env)) {
 			None(): None();
 			Some(solved): {
 				children = solved.first;
 				sub = solved.second;
 				wff = tp2id_("wff");
 				mkImp = \a, b -> ruFwdMkRule(s2id("wi"), wff, [a, b]);
-				psiGoal = mkImp(psi, goal);
+				psiGoal = ruTcWrap(guard, goal);
 				instAntes = map(e.antes, \a -> ruApplySubst(a, sub));
 				res = switch (e.kind) {
 					RuTcComb(): {
-						// one step of the d-form companion: children are ψ→Hᵢ in matrix order
-						Some(RuProofStep(e.applyId, children, RuStmt(stcl, [psiGoal], -1)));
+						// one step of the d-form companion (guarded) / the i-form itself
+						// (bare): children are guard→Hᵢ / bare Hᵢ in matrix order
+						stepId = switch (guard) { None(): e.assId; Some(__): e.applyId; };
+						Some(RuProofStep(stepId, children, RuStmt(stcl, [psiGoal], -1)));
 					}
 					RuTcChain(): if (!forall(instAntes, ruTcGround)) None()   // an unbound rule var survived
 					else {
@@ -367,18 +392,24 @@ ruTcApply(e : RuTcEntry, pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, g
 						rests = fold(reverseA(instAntes), [goal], \acc, a -> arrayPush(acc, mkImp(a, acc[length(acc) - 1])));
 						restAt = \i : int -> rests[k - i];
 						inst = RuProofStep(e.assId, [], RuStmt(stcl, [restAt(0)], -1));
-						if (k == 0) Some(RuProofStep(s2id_("a1i"), [inst], RuStmt(stcl, [psiGoal], -1)))
-						else {
-							// syl for the first antecedent, mpd for the rest, all under ψ
-							first = RuProofStep(s2id_("syl"), [children[0], inst],
-								RuStmt(stcl, [mkImp(psi, restAt(1))], -1));
-							Some(fold(enumFromTo(1, k - 1), first, \cur, i ->
-								RuProofStep(s2id_("mpd"), [children[i], cur],
-									RuStmt(stcl, [mkImp(psi, restAt(i + 1))], -1))));
+						switch (guard) {
+							None(): if (k == 0) Some(inst)
+								else Some(fold(enumFromTo(0, k - 1), inst, \cur, i ->
+									RuProofStep(s2id_("ax-mp"), [children[i], cur],
+										RuStmt(stcl, [restAt(i + 1)], -1))));
+							Some(g): if (k == 0) Some(RuProofStep(s2id_("a1i"), [inst], RuStmt(stcl, [psiGoal], -1)))
+							else {
+								// syl for the first antecedent, mpd for the rest, all under the guard
+								first = RuProofStep(s2id_("syl"), [children[0], inst],
+									RuStmt(stcl, [mkImp(g, restAt(1))], -1));
+								Some(fold(enumFromTo(1, k - 1), first, \cur, i ->
+									RuProofStep(s2id_("mpd"), [children[i], cur],
+										RuStmt(stcl, [mkImp(g, restAt(i + 1))], -1))));
+							}
 						}
 					}
-					RuTcBiL(): ruTcBiStep(e, true, instAntes, children, goal, psi, psiGoal, stcl, math, env);
-					RuTcBiR(): ruTcBiStep(e, false, instAntes, children, goal, psi, psiGoal, stcl, math, env);
+					RuTcBiL(): ruTcBiStep(e, true, instAntes, children, goal, guard, psiGoal, stcl, math, env);
+					RuTcBiR(): ruTcBiStep(e, false, instAntes, children, goal, guard, psiGoal, stcl, math, env);
 				};
 				if (isSome(res) && prover_env.env.conf.verbose >= 5) {
 					kind2s = switch (e.kind) {
@@ -403,7 +434,7 @@ ruTcApply(e : RuTcEntry, pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, g
 // (2 antecedents, ⊢cond→(L↔R)): children[0] proves ψ→cond, syl carries it
 // through the instance to ψ→(L↔R), then children[1] concludes as above.
 ruTcBiStep(e : RuTcEntry, goalIsLhs : bool, instAntes : [RuExp], children : [RuProofTree],
-	goal : RuExp, psi : RuExp, psiGoal : RuExp, stcl : int, math : RuMath, env : RuEnv) -> Maybe<RuProofTree> {
+	goal : RuExp, guard : Maybe<RuExp>, psiGoal : RuExp, stcl : int, math : RuMath, env : RuEnv) -> Maybe<RuProofTree> {
 	n = length(children);
 	if (!forall(instAntes, ruTcGround) || n < 1 || n > 2 || n != length(instAntes)) None()
 	else {
@@ -412,13 +443,18 @@ ruTcBiStep(e : RuTcEntry, goalIsLhs : bool, instAntes : [RuExp], children : [RuP
 		other = instAntes[n - 1];
 		bi = if (goalIsLhs) ruFwdMkRule(s2id("wb"), wff, [goal, other])
 			else ruFwdMkRule(s2id("wb"), wff, [other, goal]);
-		biStep = if (n == 1) RuProofStep(s2id_("a1i"),
-				[RuProofStep(e.assId, [], RuStmt(stcl, [bi], -1))],
-				RuStmt(stcl, [mkImp(psi, bi)], -1))
-			else RuProofStep(s2id_("syl"), [children[0],
-				RuProofStep(e.assId, [], RuStmt(stcl, [mkImp(instAntes[0], bi)], -1))],
-				RuStmt(stcl, [mkImp(psi, bi)], -1));
-		mp = if (goalIsLhs) s2id_("mpbird") else s2id_("mpbid");
+		inst0 = RuProofStep(e.assId, [], RuStmt(stcl, [if (n == 1) bi else mkImp(instAntes[0], bi)], -1));
+		biStep = switch (guard) {
+			None(): if (n == 1) inst0
+				// bare conditional: ax-mp the condition through the instance
+				else RuProofStep(s2id_("ax-mp"), [children[0], inst0], RuStmt(stcl, [bi], -1));
+			Some(g): if (n == 1) RuProofStep(s2id_("a1i"), [inst0], RuStmt(stcl, [mkImp(g, bi)], -1))
+				else RuProofStep(s2id_("syl"), [children[0], inst0], RuStmt(stcl, [mkImp(g, bi)], -1));
+		};
+		mp = switch (guard) {
+			None(): if (goalIsLhs) s2id_("mpbir") else s2id_("mpbi");
+			Some(__): if (goalIsLhs) s2id_("mpbird") else s2id_("mpbid");
+		};
 		Some(RuProofStep(mp, [children[n - 1], biStep], RuStmt(stcl, [psiGoal], -1)));
 	}
 }
@@ -432,17 +468,17 @@ ruTcBiStep(e : RuTcEntry, goalIsLhs : bool, instAntes : [RuExp], children : [RuP
 // C∈A, but only the el-conjunct binds A) — children are reassembled in original
 // positions afterwards (combiner/chain assembly depends on statement order).
 ruTcSolve(antes : [RuExp], i0 : int, sub0 : RuSubst, children0 : [RuProofTree],
-	pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, stcl : int, depth : int,
+	pool : [Pair<RuProofTree, [RuExpNode]>], guard : Maybe<RuExp>, stcl : int, depth : int,
 	close : ([RuExpNode], int) -> Maybe<RuProofTree>,
 	budget : ref int, cheap : bool, prover_env : RuProverEnv) -> Maybe<Pair<[RuProofTree], RuSubst>> {
-	switch (ruTcSolveW(mapi(antes, \ix, a -> Pair(ix, a)), sub0, makeTree(), 0, pool, psi, stcl, depth, close, budget, cheap, prover_env)) {
+	switch (ruTcSolveW(mapi(antes, \ix, a -> Pair(ix, a)), sub0, makeTree(), 0, pool, guard, stcl, depth, close, budget, cheap, prover_env)) {
 		None(): None();
 		Some(solvedW): Some(Pair(map(enumFromTo(0, length(antes) - 1), \ix -> lookupTreeDef(solvedW.first, ix, RuProofHyp(-1, RuStmt(-1, [], -1)))), solvedW.second));
 	}
 }
 
 ruTcSolveW(work : [Pair<int, RuExp>], sub : RuSubst, solved : Tree<int, RuProofTree>, defers : int,
-	pool : [Pair<RuProofTree, [RuExpNode]>], psi : RuExp, stcl : int, depth : int,
+	pool : [Pair<RuProofTree, [RuExpNode]>], guard : Maybe<RuExp>, stcl : int, depth : int,
 	close : ([RuExpNode], int) -> Maybe<RuProofTree>,
 	budget : ref int, cheap : bool, prover_env : RuProverEnv) -> Maybe<Pair<Tree<int, RuProofTree>, RuSubst>> {
 	if (work == []) Some(Pair(solved, sub))
@@ -456,17 +492,17 @@ ruTcSolveW(work : [Pair<int, RuExp>], sub : RuSubst, solved : Tree<int, RuProofT
 			// (P ∧ Q): solve the conjuncts as sub-antecedents (P may bind vars Q needs),
 			// then rebuild the conjunction by jca under the guard
 			pa = ruInArgs(p);
-			switch (ruTcSolve(pa, 0, sub, [], pool, psi, stcl, depth, close, budget, cheap, prover_env)) {
+			switch (ruTcSolve(pa, 0, sub, [], pool, guard, stcl, depth, close, budget, cheap, prover_env)) {
 				None(): None();
 				Some(cs): {
 					if (length(cs.first) != 2) None()
 					else {
 						sub2 = cs.second;
-						wff = tp2id_("wff");
 						andE = ruApplySubst(p, sub2);
-						pAnd = RuProofStep(s2id_("jca"), cs.first,
-							RuStmt(stcl, [ruFwdMkRule(s2id("wi"), wff, [psi, andE])], -1));
-						ruTcSolveW(rest, sub2, setTree(solved, item.first, pAnd), defers, pool, psi, stcl, depth, close, budget, cheap, prover_env);
+						andId = switch (guard) { None(): s2id_("pm3.2i"); Some(__): s2id_("jca"); };
+						pAnd = RuProofStep(andId, cs.first,
+							RuStmt(stcl, [ruTcWrap(guard, andE)], -1));
+						ruTcSolveW(rest, sub2, setTree(solved, item.first, pAnd), defers, pool, guard, stcl, depth, close, budget, cheap, prover_env);
 					}
 				}
 			}
@@ -480,7 +516,7 @@ ruTcSolveW(work : [Pair<int, RuExp>], sub : RuSubst, solved : Tree<int, RuProofT
 				None(): if (cheap) {
 					budget := ^budget - 1;   // cheap recursion: pool + table only, shared budget
 					if (^budget < 0) None()
-					else ruTcClose(pool, psi, p.nodes, stcl, depth - 2, close, budget, true, prover_env);
+					else ruTcClose(pool, guard, p.nodes, stcl, depth - 2, close, budget, true, prover_env);
 				} else {
 					budget := ^budget - 4;   // a recursion into the full closer is the expensive step
 					if (^budget < 0) None() else close(p.nodes, depth - 2);
@@ -488,7 +524,7 @@ ruTcSolveW(work : [Pair<int, RuExp>], sub : RuSubst, solved : Tree<int, RuProofT
 			};
 			switch (child) {
 				None(): None();
-				Some(c): ruTcSolveW(rest, sub, setTree(solved, item.first, c), defers, pool, psi, stcl, depth, close, budget, cheap, prover_env);
+				Some(c): ruTcSolveW(rest, sub, setTree(solved, item.first, c), defers, pool, guard, stcl, depth, close, budget, cheap, prover_env);
 			}
 		} else if (ruTcHead(p) < 0) None()
 		// ^ a bare-var pattern would match EVERY pool fact — the applier never guesses
@@ -504,7 +540,7 @@ ruTcSolveW(work : [Pair<int, RuExp>], sub : RuSubst, solved : Tree<int, RuProofT
 						Some(sub2): {
 							budget := ^budget - 1;   // each pool-completion branch is one attempt
 							if (^budget < 0) None()
-							else ruTcSolveW(rest, sub2, setTree(solved, item.first, f.first), defers, pool, psi, stcl, depth, close, budget, cheap, prover_env);
+							else ruTcSolveW(rest, sub2, setTree(solved, item.first, f.first), defers, pool, guard, stcl, depth, close, budget, cheap, prover_env);
 						}
 					}
 				}
@@ -513,7 +549,7 @@ ruTcSolveW(work : [Pair<int, RuExp>], sub : RuSubst, solved : Tree<int, RuProofT
 				Some(__): res;
 				// DEFER once: a later antecedent may bind this one's variables
 				None(): if (rest == [] || defers >= length(work)) None()
-					else ruTcSolveW(arrayPush(rest, item), sub, solved, defers + 1, pool, psi, stcl, depth, close, budget, cheap, prover_env);
+					else ruTcSolveW(arrayPush(rest, item), sub, solved, defers + 1, pool, guard, stcl, depth, close, budget, cheap, prover_env);
 			}
 		}
 	}
