@@ -53,8 +53,8 @@ export {
 //                         entry per peel depth (0 = direct match + a1i)
 //   RuTcBiL/R (0-hyp ⊢L↔R): goal matches L (resp. R), antes = [the other side],
 //                         concluded by mpbird (resp. mpbid) over the a1i-lifted instance
-RuTcKind ::= RuTcComb, RuTcChain, RuTcBiL, RuTcBiR;
-	RuTcComb(); RuTcChain(); RuTcBiL(); RuTcBiR();
+RuTcKind ::= RuTcComb, RuTcChain, RuTcBiL, RuTcBiR, RuTcNBiL, RuTcNBiR;
+	RuTcComb(); RuTcChain(); RuTcBiL(); RuTcBiR(); RuTcNBiL(); RuTcNBiR();
 RuTcEntry(assId : int, applyId : int, kind : RuTcKind, antes : [RuExp], concl : RuExp, ext : bool, desc : bool);
 // desc: a DESCENDING unfold — the entry is a bicond whose goal side is a binary
 // atom (h, x, T) and every same-head atom on the other side has its set argument
@@ -187,10 +187,16 @@ ruTcBuild(math : RuMath) -> RuTcIndex {
 							// symmetric biconds (eqcom: both sides same head) would emit
 							// self-head flip entries — flips are the pool closure's job
 							&& ruTcHead(pa[0]) != ruTcHead(pa[1])) {
+							wnE = \side : RuExp -> ruFwdMkRule(s2id("wn"), tp2id_("wff"), [side]);
 							ac2 = if (binder(pa[1]) || !containsSet(hs, ruTcHead(pa[0]))) ac1b
-								else ruTcPush(ac1b, RuTcEntry(r.assId, r.assId, RuTcBiL(), [pa[1]], pa[0], true, ruTcDescending(pa[0], pa[1])));
+								else ruTcPush(ruTcPush(ac1b,
+									RuTcEntry(r.assId, r.assId, RuTcBiL(), [pa[1]], pa[0], true, ruTcDescending(pa[0], pa[1]))),
+									// NEGATIVE unfolding: goal ¬L, solve ¬R, conclude mtbir/mtbird
+									RuTcEntry(r.assId, r.assId, RuTcNBiL(), [wnE(pa[1])], wnE(pa[0]), true, ruTcDescending(pa[0], pa[1])));
 							if (binder(pa[0]) || !containsSet(hs, ruTcHead(pa[1]))) ac2
-							else ruTcPush(ac2, RuTcEntry(r.assId, r.assId, RuTcBiR(), [pa[0]], pa[1], true, ruTcDescending(pa[1], pa[0])));
+							else ruTcPush(ruTcPush(ac2,
+								RuTcEntry(r.assId, r.assId, RuTcBiR(), [pa[0]], pa[1], true, ruTcDescending(pa[1], pa[0]))),
+								RuTcEntry(r.assId, r.assId, RuTcNBiR(), [wnE(pa[0])], wnE(pa[1]), true, ruTcDescending(pa[1], pa[0])));
 						} else ac1b;
 					} else ac1b;
 				}
@@ -431,7 +437,7 @@ ruTcAtomsDescend(e : RuExp, h : int, subs : [[RuExpNode]]) -> bool {
 }
 
 ruTcIsBi(e : RuTcEntry) -> bool {
-	switch (e.kind) { RuTcBiL(): true; RuTcBiR(): true; default: false; }
+	switch (e.kind) { RuTcBiL(): true; RuTcBiR(): true; RuTcNBiL(): true; RuTcNBiR(): true; default: false; }
 }
 
 ruTcApply(e : RuTcEntry, pool : [Pair<RuProofTree, [RuExpNode]>], guard : Maybe<RuExp>, goal : RuExp,
@@ -494,6 +500,8 @@ ruTcApply(e : RuTcEntry, pool : [Pair<RuProofTree, [RuExpNode]>], guard : Maybe<
 					}
 					RuTcBiL(): ruTcBiStep(e, true, instAntes, children, goal, guard, psiGoal, stcl, math, env);
 					RuTcBiR(): ruTcBiStep(e, false, instAntes, children, goal, guard, psiGoal, stcl, math, env);
+					RuTcNBiL(): ruTcNBiStep(e, true, instAntes, children, goal, guard, psiGoal, stcl);
+					RuTcNBiR(): ruTcNBiStep(e, false, instAntes, children, goal, guard, psiGoal, stcl);
 				};
 				if (isSome(res) && prover_env.env.conf.verbose >= 5) {
 					kind2s = switch (e.kind) {
@@ -501,6 +509,8 @@ ruTcApply(e : RuTcEntry, pool : [Pair<RuProofTree, [RuExpNode]>], guard : Maybe<
 						RuTcChain(): "";
 						RuTcBiL(): " [bi<-]";
 						RuTcBiR(): " [bi->]";
+						RuTcNBiL(): " [¬bi<-]";
+						RuTcNBiR(): " [¬bi->]";
 					};
 					prover_env.env.out.println("    tblClose: " + id2s(e.assId) + kind2s
 						+ " -> " + ruSafeExp2s(goal, math.decls.lang));
@@ -540,6 +550,37 @@ ruTcBiStep(e : RuTcEntry, goalIsLhs : bool, instAntes : [RuExp], children : [RuP
 			Some(__): if (goalIsLhs) s2id_("mpbird") else s2id_("mpbid");
 		};
 		Some(RuProofStep(mp, [children[n - 1], biStep], RuStmt(stcl, [psiGoal], -1)));
+	}
+}
+
+// The NEGATIVE bicond-unfold: the goal is ¬L (resp. ¬R) of a scanned ⊢L↔R;
+// children[0] proves ψ→¬R (resp. ψ→¬L); the a1i-lifted bicond instance and
+// mtbird/mtbid (bare: mtbir/mtbi) conclude — "the sides are equivalent, one
+// side is false, so the other is false". The generic form of the hand chains'
+// negated-membership unfolds (t72's ¬(x∈𝒫B) from ¬(x⊆B)).
+ruTcNBiStep(e : RuTcEntry, goalIsNegL : bool, instAntes : [RuExp], children : [RuProofTree],
+	goal : RuExp, guard : Maybe<RuExp>, psiGoal : RuExp, stcl : int) -> Maybe<RuProofTree> {
+	if (!forall(instAntes, ruTcGround) || length(children) != 1 || length(instAntes) != 1) None()
+	else {
+		wff = tp2id_("wff");
+		mkImp = \a, b -> ruFwdMkRule(s2id("wi"), wff, [a, b]);
+		// goal = ¬Side, ante = ¬Other; the bicond is (Side ↔ Other) for NBiL,
+		// (Other ↔ Side) for NBiR — strip the ¬ wrappers to rebuild it
+		gInner = (ruInArgs(goal))[0];
+		aInner = (ruInArgs(instAntes[0]))[0];
+		bi = if (goalIsNegL) ruFwdMkRule(s2id("wb"), wff, [gInner, aInner])
+			else ruFwdMkRule(s2id("wb"), wff, [aInner, gInner]);
+		inst0 = RuProofStep(e.assId, [], RuStmt(stcl, [bi], -1));
+		biStep = switch (guard) {
+			None(): inst0;
+			Some(g): RuProofStep(s2id_("a1i"), [inst0], RuStmt(stcl, [mkImp(g, bi)], -1));
+		};
+		// ¬L from ¬R over (L↔R): mtbir/mtbird; ¬R from ¬L: mtbi/mtbid
+		mp = switch (guard) {
+			None(): if (goalIsNegL) s2id_("mtbir") else s2id_("mtbi");
+			Some(__): if (goalIsNegL) s2id_("mtbird") else s2id_("mtbid");
+		};
+		Some(RuProofStep(mp, [children[0], biStep], RuStmt(stcl, [psiGoal], -1)));
 	}
 }
 
