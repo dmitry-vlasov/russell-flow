@@ -14,6 +14,7 @@ import ru/prover/tactics/propositional;
 import ru/prover/tactics/closer;
 import ru/prover/tactics/board;
 import ru/prover/tactics/rule_table;
+import ru/prover/tactics/scope_file;
 import ru/prover/tactics/deduction;
 import ru/unify/index;
 import ru/proof_tree;
@@ -603,19 +604,26 @@ ruResidualOrElim(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int,
 	spliceAll : (RuProofTree) -> RuProofTree, hypDisjs2 : Set<RuDisj>, timer : RuTimer) -> Maybe<RuRefineResult> {
 	woId = s2id("wo"); wiId = s2id("wi"); wff = tp2id_("wff");
 	isOr = \e : RuExp -> ruInHead(e) == woId && ruInArity(e) == 2;
-	// COST GATE: only a DISJUNCTION goal (the class where case-analysis pays off — t19/t22
-	// enum subset comparability) enters or-elim. Without this the sweep fires on every
-	// failing residual and its per-goal budget compounds into a suite-wide slowdown.
-	if (!isOr(goal) || ruTimeIsOver(timer)) None() else {
+	if (ruTimeIsOver(timer)) None() else {
 	// Candidate disjunctions to split on, each with HOW to prove it:
-	//   Some(i) — premiseExps2[i] IS the disjunction (a hyp leaf, free);
+	//   Some(i) — premiseExps2[i] IS the disjunction (a hyp leaf, FREE — no sub-prove);
 	//   None()  — a disjunction that occurs as the CONSEQUENT of a pooled implication
 	//             `A→(P∨Q)` (the case-split source Mizar derives, e.g. the enum
 	//             membership x∈{a,b} unfolds to (x=a)∨(x=b) only AFTER the ⊆-hyp is
 	//             applied); proved on demand by a sub-closer.
-	directOrs = filtermapi(premiseExps2, \i, e -> if (isOr(e)) Some(Pair(e, Some(i))) else None());
-	implOrs = filtermap(premiseExps2, \e ->
+	// COST MODEL: direct pooled ∨-facts are free and uncommon, so they always qualify
+	// (t73: the hyp `x5∈(𝒫(A∖B)∪𝒫(B∖A))` unfolds straight to the case-split, and its
+	// GOAL is not a disjunction). The implication-consequent candidates each cost a
+	// sub-prove, so they are restricted to DISJUNCTION goals (t19/t22) — ungated they
+	// fire on every failing residual and compound into a suite-wide slowdown.
+	directOrs0 = filtermapi(premiseExps2, \i, e -> if (isOr(e)) Some(Pair(e, Some(i))) else None());
+	implOrs = if (!isOr(goal)) [] else filtermap(premiseExps2, \e ->
 		if (ruInHead(e) == wiId && ruInArity(e) == 2 && isOr(ruInArgs(e)[1])) Some(Pair(ruInArgs(e)[1], None())) else None());
+	// SPECULATIVE PATH (goal is NOT a disjunction — t70/t73): admit ONE unambiguous
+	// pooled case-split only. Trying every pooled ∨ on every failing non-∨ residual
+	// is what cost t21/t53/t66 (measured); a single candidate is the shape where the
+	// hyp unfold IS the case analysis (x5∈(𝒫(A∖B)∪𝒫(B∖A)) → the two-way split).
+	directOrs = if (isOr(goal) || length(directOrs0) <= 2) directOrs0 else [];
 	// implication-consequent disjunctions FIRST (the derived, relevant ones), deduped by expr.
 	cands = fold(concat(implOrs, directOrs), Pair([], makeSet()), \ac : Pair<[Pair<RuExp, Maybe<int>>], Set<[RuExpNode]>>, c ->
 		if (containsSet(ac.second, c.first.nodes)) ac else Pair(arrayPush(ac.first, c), insertSet(ac.second, c.first.nodes)));
@@ -623,11 +631,15 @@ ruResidualOrElim(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int,
 		rt = ruRuleTable(math);
 		nh2 = length(premises);   // index of the added branch-assumption hypothesis
 		// The branch sub-proves are SMALL problems (goal + a few premises + one added
-		// disjunct). They need the equality→⊆→∨ glue (eqimss/eqss/jca/olc) the caller's
-		// stage scope may lack — but a WIDE scope makes the branch bfs explode, so keep
-		// it to the caller's scope plus a tight glue set.
-		branchScope = map(["eqimss", "eqimss2", "eqss", "eqssi", "jca", "olci", "orci", "biimpi", "biimpri",
-			"eqcomi", "ax-mp", "mpbi", "mpbir", "syl", "sseq1", "sseq2", "simpli", "simpri"], s2id_);
+		// disjunct) run by a bare bfs, so the scope must be TIGHT — handing them the
+		// caller's stage scope makes the branch bfs explode (measured: it bought t70 but
+		// cost 8 cost-regressions). tactics/scopes/orelim-branch-scope.scope takes
+		// precedence (scopes as data — the curation, and the INFERENCE-FORM lesson behind
+		// it, lives there); the list below is only the fallback.
+		branchScope = eitherFn(ruLoadScopeFile("orelim-branch-scope"), idfn, \ ->
+			map(["eqimss", "eqimss2", "eqss", "eqssi", "jca", "olci", "orci", "biimpi", "biimpri",
+				"eqcomi", "ax-mp", "mpbi", "mpbir", "syl", "sseq1", "sseq2", "simpli", "simpri",
+				"sstr", "sstri", "sseqtrri", "sseqtri", "difsssymdif", "symdifcom", "velpw", "ssun1", "ssun2", "difss"], s2id_));
 		if (env.conf.verbose >= 4) {
 			env.out.println("  orElimTry: goal=" + ru2s(goal, math) + " cands=" + i2s(length(cands.first)));
 		} else {};
@@ -644,7 +656,12 @@ ruResidualOrElim(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int,
 				maybeBind(pOrMb, \pOr -> {
 					proveBranch = \branchE : RuExp -> {
 						branchPrem = arrayPush(premises, RuHyp(nh2, RuStmt(stmtClass, [branchE], -1), -1));
-						cl = ruRunCloser(math, env, info, stmtClass, branchPrem, goal, branchScope, ruLimitedTactic(ruBreadthFirstTactic, 0.0, 0, 0, 8192, 8, 16), min(limit, ruTimeLeft(timer)));
+						// ONE attempt on the tight glue scope. A second, wide-scope retry was
+						// MEASURED OUT: it bought t70 but cost 8 real cost-regressions
+						// (t21/t36/t53/t62/t63/t64/t66/t94) — every wide bfs is a fresh
+						// unbounded cost unit on a FAILING branch, and they compound.
+						cl = ruRunCloser(math, env, info, stmtClass, branchPrem, goal, branchScope,
+							ruLimitedTactic(ruBreadthFirstTactic, 0.0, 0, 0, 8192, 8, 16), min(limit, ruTimeLeft(timer)));
 						bres = maybeBind(cl, \btree -> ruDeductionTheorem(rt, math, stmtClass, branchE, nh2, btree));
 						if (env.conf.verbose >= 5) { env.out.println("      oe branch=" + ru2s(branchE, math) + " -> " + b2s(isSome(bres))); } else {};
 						bres;
