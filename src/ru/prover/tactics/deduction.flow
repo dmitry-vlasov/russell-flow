@@ -1,0 +1,82 @@
+import ru/prover/tactics/rule_table;
+import ru/prover/core/forward;   // ruFwdMkRule
+import ru/proof_tree;
+import base/ids;
+import ru/src;
+
+// THE DEDUCTION THEOREM on proof trees — the general-path bridge from a HYP-form
+// branch proof (`premises, P ⊢ G`) to the IMPLICATION `premises ⊢ P → G`, which
+// general-path or-elim needs (jaoi wants the two branch implications). Reuses the
+// rule table's d-form pairing: every inference `H1..Hn ⊢ C` has a guarded
+// companion `(ψ→H1)..(ψ→Hn) ⊢ (ψ→C)` (syl↦syld, sstr↦sstrd, jaoi↦jaod), found by
+// matrix SHAPE (the "+d" name is only a label). No new machinery: the transform is
+// a structural walk that swaps each i-form assertion for its d-form and lifts the
+// leaves (guard leaf ↦ id, other leaves ↦ a1i, 0-hyp instances ↦ a1i). Fails
+// (None) the moment any inference has no d-form (a hole) — the caller then just
+// skips or-elim for that branch, so a missing companion never produces an unsound
+// tree. The result is kernel-verified at proof install like any other.
+
+export {
+	// The general d-form of an assertion (its guarded companion): given assId with
+	// inference H1..Hn ⊢ C (n≥1), the assertion whose stripped matrix equals
+	// [H1..Hn, C]. None for 0-hyp assertions (a1i-lifted instead) and for holes.
+	ruDFormOf(t : RuRuleTable, math : RuMath, assId : int) -> Maybe<int>;
+
+	// Given `tree` proving C using leaf premise `guardIdx` (statement `guard`) plus
+	// other premises, return a tree proving (guard → C) from the OTHER premises, or
+	// None if any inference lacks a d-form.
+	ruDeductionTheorem(t : RuRuleTable, math : RuMath, stmtClass : int,
+		guard : RuExp, guardIdx : int, tree : RuProofTree) -> Maybe<RuProofTree>;
+}
+
+ruDedInfer(a : RuAssertion) -> RuInference {
+	switch (a) {
+		RuAxiom(__, i): i; RuCong(__, i): i; RuTheorem(__, i, __, __): i; RuDef(__, i, __, __): i;
+	}
+}
+
+ruDFormOf(t : RuRuleTable, math : RuMath, assId : int) -> Maybe<int> {
+	switch (lookupTree(math.decls.assertions, assId)) {
+		None(): None();
+		Some(ass): {
+			inf = ruDedInfer(ass);
+			hyps = map(inf.hyps, \h -> ruExp(h.stmt.exps[0]));
+			if (hyps == []) None()
+			else lookupTree(t.guarded, ruRtCanonKey(arrayPush(hyps, ruExp(inf.prop.exps[0]))));
+		}
+	}
+}
+
+ruDeductionTheorem(t : RuRuleTable, math : RuMath, stmtClass : int,
+	guard : RuExp, guardIdx : int, tree : RuProofTree) -> Maybe<RuProofTree> {
+	ruDedGo(t, math, stmtClass, guard, guardIdx, tree);
+}
+
+// Structural walk: rewrite the subtree proving C into one proving (guard → C).
+ruDedGo(t : RuRuleTable, math : RuMath, stmtClass : int, guard : RuExp, guardIdx : int,
+	node : RuProofTree) -> Maybe<RuProofTree> {
+	mkImp = \a : RuExp, b : RuExp -> ruFwdMkRule(s2id("wi"), tp2id_("wff"), [a, b]);
+	switch (node) {
+		RuProofHyp(i, stmt): {
+			c = ruExp(stmt.exps[0]);
+			if (i == guardIdx)
+				Some(RuProofStep(s2id_("id"), [], RuStmt(stmtClass, [mkImp(guard, guard)], -1)))
+			else
+				Some(RuProofStep(s2id_("a1i"), [node], RuStmt(stmtClass, [mkImp(guard, c)], -1)));
+		}
+		RuProofStep(assId, children, stmt): {
+			target = RuStmt(stmtClass, [mkImp(guard, ruExp(stmt.exps[0]))], -1);
+			if (children == [])
+				// a 0-hyp lemma instance: lift its conclusion under the guard by a1i.
+				Some(RuProofStep(s2id_("a1i"), [node], target))
+			else {
+				tch = map(children, \ch -> ruDedGo(t, math, stmtClass, guard, guardIdx, ch));
+				if (exists(tch, \m -> !isSome(m))) None()
+				else switch (ruDFormOf(t, math, assId)) {
+					None(): None();   // a hole — bail; caller skips or-elim
+					Some(dId): Some(RuProofStep(dId, map(tch, \m -> either(m, ruNoProofTree)), target));
+				}
+			}
+		}
+	}
+}
