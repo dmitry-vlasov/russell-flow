@@ -52,6 +52,15 @@ export {
 	// the placeholder constant from being declared at all — which is what made two imported
 	// articles collide on `unhandled_term_Choice` (Mizar's choice term `the Element of X`).
 	mizFormHasUnhandled(f : TptpForm) -> bool;
+
+	// The article's CLUSTER REGISTRATIONS as axioms. These are the rules Mizar's checker
+	// applies silently to keep proofs short, and NOTHING of them was translated before — the
+	// type layer's whole inference content was missing. All three kinds are ORDINARY
+	// implications, so they need no new logic and no new trusted machinery:
+	//   FCluster  ∀L̄ ( argGuards(L̄) → adjs(f(L̄)) )                functorial: `𝒫X is non empty`
+	//   CCluster  ∀L̄∀t ( argGuards ∧ typ(t) ∧ ante(t) → cons(t) )  conditional: `finite ⇒ countable`
+	//   RCluster  ∀L̄ ( argGuards(L̄) → ∃t ( typ(t) ∧ adjs(t) ) )    existential: inhabitation
+	mizArticleClusters(xmlContent : string, sig : MizSig) -> [Pair<RuParseDecl, TptpForm>];
 }
 
 // `srcOf(aid)` yields the (.miz, .xml) of the article that DEFINES an env entry, so each
@@ -153,6 +162,64 @@ mizArticleDefs(xmlContent : string, mizSource : string, sig : MizSig, syms : Miz
 						}
 				}
 			});
+		}
+	}
+}
+
+mizArticleClusters(xmlContent : string, sig : MizSig) -> [Pair<RuParseDecl, TptpForm>] {
+	switch (mizParseXml(xmlContent)) {
+		None(): [];
+		Some(root): {
+			aid = switch (mizFindFirst([root], "Article")) { None(): ""; Some(ar): toLowerCase(mizAttr(ar, "aid")); };
+			concatA(map([Pair("RCluster", "rc"), Pair("CCluster", "cc"), Pair("FCluster", "fc")], \kp ->
+				filtermapi(mizCollectAll([root], kp.first), \i, cl -> {
+					// the loci: <ArgTypes> lists one <Typ> per LocusVar, in order. Each is read in
+					// the env of the loci BEFORE it (a later locus type may mention an earlier one).
+					argTyps = switch (mizFindFirst([cl], "ArgTypes")) { None(): []; Some(at): mizKidsTagged(at, "Typ"); };
+					loci = fold(argTyps, Pair([], []), \ac : Pair<[string], [TptpForm]>, ty -> {
+						vn = "L" + i2s(length(ac.first) + 1);   // matches mizTerm's <LocusVar nr=k> naming
+						Pair(arrayPush(ac.first, vn), concat(ac.second, mizTypGuards(sig, ac.first, ty, TptpVar(vn))));
+					});
+					env = loci.first;
+					rest = filter(cl.kids, \k -> k.tag != "ArgTypes");
+					body = if (kp.first == "FCluster") {
+						// [Func(term), Cluster…] — the registered term gains the adjectives
+						fn = find(rest, \k -> mizIsTermTag(k.tag));
+						switch (fn) {
+							None(): None();
+							Some(f): {
+								t = mizTerm(sig, env, f);
+								gs = mizAdjGuards(sig, env, filter(rest, \k -> k.tag == "Cluster"), t);
+								if (gs == []) None() else Some(mizFoldAnd(gs));
+							}
+						}
+					} else {
+						// R/CCluster: [Cluster(ante)?, Typ, Cluster(cons)…] over a fresh subject
+						ty = find(rest, \k -> k.tag == "Typ");
+						switch (ty) {
+							None(): None();
+							Some(typ): {
+								idx = findi(rest, \k -> k.tag == "Typ");
+								sv = "Lt";
+								tg = mizTypGuards(sig, env, typ, TptpVar(sv));
+								befores = filtermapi(rest, \j, k -> if (j < either(idx, 0) && k.tag == "Cluster") Some(k) else None());
+								afters  = filtermapi(rest, \j, k -> if (j > either(idx, 0) && k.tag == "Cluster") Some(k) else None());
+								ante = mizAdjGuards(sig, env, befores, TptpVar(sv));
+								cons = mizAdjGuards(sig, env, afters,  TptpVar(sv));
+								if (cons == []) None()
+								else if (kp.first == "CCluster")
+									Some(TptpQuant("forall", [sv], TptpBin("imp", mizFoldAnd(concat(tg, ante)), mizFoldAnd(cons))))
+								else Some(TptpQuant("exists", [sv], mizFoldAnd(concatA([tg, ante, cons]))));
+							}
+						}
+					};
+					maybeMap(body, \b -> {
+						full = mizResugar(if (env == []) b
+							else TptpQuant("forall", env, if (loci.second == []) b else TptpBin("imp", mizFoldAnd(loci.second), b)));
+						nm = kp.second + i2s(i + 1) + "_" + aid;
+						Pair(mptpAxiomC(nm, toUpperCase(aid) + ":" + kp.first + " " + i2s(i + 1), full), full);
+					});
+				})));
 		}
 	}
 }
@@ -596,9 +663,17 @@ mizTypePred(sig : MizSig, env : [string], typ : MizXml, t : TptpTerm) -> TptpFor
 // policy as `misses`: no opaque predicate survives into the class layer.
 // A Typ carries two clusters (lower/upper) with the same adjectives — dedupe.
 mizTypAdjGuards(sig : MizSig, env : [string], typ : MizXml, t : TptpTerm) -> [TptpForm] {
+	mizAdjGuards(sig, env, mizKidsTagged(typ, "Cluster"), t);
+}
+
+// The adjective guards carried by a list of <Cluster> nodes, applied to a term. Factored out
+// of mizTypAdjGuards because a REGISTRATION carries its adjectives in bare <Cluster> siblings
+// rather than inside a <Typ> (a Typ lists lower/upper clusters with the same adjectives — the
+// uniq below collapses that duplication either way).
+mizAdjGuards(sig : MizSig, env : [string], clusters : [MizXml], t : TptpTerm) -> [TptpForm] {
 	// an attribute may itself be parameterised (`is Subset of D`), so carry its arguments
 	// for the same soundness reason as mizTypePred.
-	adjs = uniq(concatA(map(mizKidsTagged(typ, "Cluster"), \c ->
+	adjs = uniq(concatA(map(clusters, \c ->
 		map(mizKidsTagged(c, "Adjective"), \a ->
 			Triple(s2i(mizAttr(a, "nr")), mizAttr(a, "value") == "false",
 				map(filter(a.kids, \k -> mizIsTermTag(k.tag)), \k -> mizTerm(sig, env, k)))))));
