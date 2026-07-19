@@ -23,8 +23,14 @@ export {
 	// How an article's signature is emitted, parameterised by the target foundation:
 	//  - `termType`   : the sort of individual terms — "set" (flat miz_logic) or "class" (A-map miz_set).
 	//  - `isReused`   : symbols the foundation already provides a rule for → emit NO article rule/def.
-	//  - `reusedCong` : whether reused symbols still get an article congruence (flat: yes, for ∈; A-map: no, the foundation has eleq*/uneq* etc.).
-	MptpEmit(termType : string, isReused : (string) -> bool, reusedCong : bool);
+	//                   KIND-AWARE: `isPred` says whether the occurrence is in WFF position (a
+	//                   predicate/mode/attribute) or TERM position (a functor). A name alone is
+	//                   NOT enough — Mizar happily spells an ATTRIBUTE `pair` while the bracket
+	//                   FUNCTOR { , } is also named `pair`, and matching the term A-map from a
+	//                   wff position emitted the guard as a TERM (`∀x ( { x } → …)`), which does
+	//                   not parse and lost the WHOLE article: 16 of the 34 parse failures in the
+	//                   2026-07-19 MML survey, cascading from xtuple_0 into relat_1/funct_1/….
+	MptpEmit(termType : string, isReused : (string, bool) -> bool, reusedCong : bool);
 
 	// Flat foundation (miz_logic): individuals are `set`; only ∈ is reused (wcel) and it needs an
 	// article term-level congruence (the flat foundation lacks one).
@@ -36,23 +42,43 @@ export {
 	mptpAmapReused(name : string) -> bool;
 }
 
-mptpFlatEmit() -> MptpEmit { MptpEmit("set", \n -> n == "∈", true); }
-mptpAmapEmit() -> MptpEmit { MptpEmit("class", mptpAmapReused, false); }
+mptpFlatEmit() -> MptpEmit { MptpEmit("set", \n, isPred -> isPred && n == "∈", true); }
+mptpAmapEmit() -> MptpEmit { MptpEmit("class", mptpAmapReusedKind, false); }
 
-// The Mizar set-theoretic constructors that map onto set.mm's class layer in miz_set. The
-// symbols are exactly what mizOpName / mizBracketName emit (so the article formulas already use
-// the foundation's symbols); `singleton`/`pair` are the circumfix bracket functor NAMES.
-mptpAmapReused(name : string) -> bool {
-	exists(["∪", "∩", "∖", "△", "∅", "⊆", "⊊", "∈", "×.", "singleton", "pair", "triple",
+// The Mizar set-theoretic constructors that map onto set.mm's class layer in miz_set, SPLIT BY
+// KIND. The symbols are exactly what mizOpName / mizBracketName emit (so the article formulas
+// already use the foundation's symbols); `singleton`/`pair`/`triple` are the circumfix bracket
+// functor NAMES. Splitting is a CORRECTNESS requirement, not tidiness — see MptpEmit.
+// TERM-valued (class layer): only ever reused from functor position.
+mptpAmapReusedTerm(name : string) -> bool {
+	exists(["∪", "∩", "∖", "△", "∅", "×.", "singleton", "pair", "triple",
 		// the zfmisc alignment: power set (cpw), union of a family (cuni), ordered
 		// pair (cop) — the foundation's velpw/eluni/opth corpus replaces the
 		// article-local fn_bool/fn_union/fn_opair definitional axioms
 		"𝒫", "∪.", "opair"], \s -> s == name);
 }
+// WFF-valued relations: only ever reused from predicate position.
+mptpAmapReusedPred(name : string) -> bool {
+	exists(["⊆", "⊊", "∈"], \s -> s == name);
+}
+mptpAmapReusedKind(name : string, isPred : bool) -> bool {
+	if (isPred) mptpAmapReusedPred(name) else mptpAmapReusedTerm(name);
+}
+// Kind-agnostic legacy view (either position) — used only where the kind is genuinely unknown.
+mptpAmapReused(name : string) -> bool { mptpAmapReusedTerm(name) || mptpAmapReusedPred(name); }
 
 // ---- small builders -------------------------------------------------------
 
 mptpConst(sym : string) -> RuParseConst { RuParseConst(s2id(sym), [], -1, "", -1); }
+
+// Drop later decls whose NAME was already emitted (see mptpArticleSource).
+mptpDedupDecls(ds : [RuParseDecl]) -> [RuParseDecl] {
+	(fold(ds, Pair([], makeSet()), \acc : Pair<[RuParseDecl], Set<int>>, d -> {
+		id = d.id;
+		if (containsSet(acc.second, id)) acc
+		else Pair(arrayPush(acc.first, d), insertSet(acc.second, id));
+	})).first;
+}
 mptpVar(name : string, type : string) -> RuParseVar { RuParseVar(s2id(name), tp2id(type), -1); }
 mptpExpr(toks : [string]) -> RuParseExpr { RuParseExpr(map(toks, s2id), -1); }
 
@@ -293,7 +319,7 @@ mptpSigForm(emit : MptpEmit, acc : MptpSig, f : TptpForm) -> MptpSig {
 		// the foundation has eleq*). `$true`/`$false` are foundation constants. STILL traverse the
 		// arguments — functors nested inside membership (e.g. `x ∈ ( a ∪ b )`) reach the signature.
 		TptpPred(name, args): {
-			isReused = emit.isReused(name);
+			isReused = emit.isReused(name, true);
 			isConst  = name == "$true" || name == "$false";
 			preds1  = if (isConst || isReused) acc.preds else setTree(acc.preds, name, length(args));
 			reused1 = if (isReused) setTree(acc.reused, name, length(args)) else acc.reused;
@@ -312,7 +338,7 @@ mptpSigTerm(emit : MptpEmit, acc : MptpSig, t : TptpTerm) -> MptpSig {
 		TptpApp(name, args): {
 			// a reused functor (∪/∩/∖/△/∅/singleton/pair) is foundation-provided — collect it into
 			// `reused` (no article rule), but still traverse its arguments.
-			isReused = emit.isReused(name);
+			isReused = emit.isReused(name, false);
 			funcs1  = if (isReused) acc.funcs  else setTree(acc.funcs, name, length(args));
 			reused1 = if (isReused) setTree(acc.reused, name, length(args)) else acc.reused;
 			fold(args, MptpSig(funcs1, acc.preds, reused1), \a, t2 -> mptpSigTerm(emit, a, t2));
@@ -557,9 +583,14 @@ mptpArticleSource(tptp : TptpSource, sigForms : [TptpForm], extra : [RuParseDecl
 	srules : [RuParseDecl] = map(sig_decls.second, \r -> r);
 	congs  : [RuParseDecl] = map(mptpCongruences(sig, emit), \a -> a);
 	axioms : [RuParseDecl] = map(tptp.decls, \d -> mptpDeclAssertion(d));
+	// DEFENSIVE DEDUP by decl name. The per-source signature is already uniq'd, but a name can
+	// still arrive twice from independent paths — notably the `unhandled_term_<Tag>` placeholder
+	// the translator mints for a Mizar construct it cannot render (funct_1: <Choice>), which is
+	// emitted once per occurrence. A duplicate decl is a hard CRASH at parse-collect that costs
+	// the whole article, so collapse identical names here: first wins, order preserved.
 	RuParseSource(
 		map(import_ids, \id -> RuParseImport(id, -1)),
-		mptpPosition(concatA([sconsts, srules, congs, axioms, extra])),
+		mptpPosition(mptpDedupDecls(concatA([sconsts, srules, congs, axioms, extra]))),
 		[],
 		ruNewFileInfo(module, conf, ".ru")
 	);

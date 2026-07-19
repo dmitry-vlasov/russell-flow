@@ -46,6 +46,24 @@ mizFile(unit : RuUnit, article : string, ext : string) -> string {
 
 mizEth(unit : RuUnit, article : string) -> string { mizFile(unit, article, "eth"); }
 
+// The MML canonical article order (mml.lar, one aid per line) as aid -> index. This is the
+// ownership order for a contested symbol: the article that introduced a notion owns its name,
+// every later article that re-spells it falls back to a mechanical name. Read once per run;
+// empty (all ranks unknown) if mml.lar is absent, which just restores the old drop-both rule.
+mizMmlOrder(unit : RuUnit) -> Tree<string, int> {
+	path = ruDirName(mizArticleDir(unit)) + "/mml.lar";
+	if (!fileExists(path)) makeTree()
+	else foldi(filter(map(strSplit(getFileContent(path), "\n"), trim), \l -> l != ""),
+		makeTree(), \i, acc, aid -> if (containsKeyTree(acc, toLowerCase(aid))) acc else setTree(acc, toLowerCase(aid), i));
+}
+
+// Rank a constructor by its defining article. HIDDEN's primitives (∈, =) precede every article;
+// an aid absent from mml.lar (miz_aux, a stray) ranks last so it never steals a symbol.
+mizAidRank(order : Tree<string, int>, ctorName : string, aid : string) -> int {
+	if (aid == "hidden" || endsWith(ctorName, "_hidden")) -1
+	else lookupTreeDef(order, aid, 1000000);
+}
+
 // The full signature (constructor resolution + readable notation names) from .atr/.eno/.frm/.dcx.
 mizReadSig(unit : RuUnit, article : string) -> MizSig {
 	mizFullSig(mizFile(unit, article, "xml"), mizFile(unit, article, "atr"), mizFile(unit, article, "eno"),
@@ -202,6 +220,25 @@ ruRunMizarToRu(unit : RuUnit) -> Maybe<RuState> {
 	isOwn = \cn : string -> endsWith(cn, "_" + toLowerCase(article));
 	mseniors = foldTree(mcounts, makeTree(), \nm, cs, acc ->
 		setTree(acc, nm, filterSet(cs, \cn -> !isOwn(cn))));
+	// SENIORITY, PART 2 — the CANONICAL-ORDER tiebreak. Own-vs-imported settles a contest only
+	// while one claimant is the article's own. Downstream every claimant is imported
+	// (`∅ <- k1_subset_1, k1_xboole_0`, `∈ <- k10_subset_1, r2_hidden`, `∪. <- k2_setfam_1,
+	// k3_tarski`), the name is dropped from BOTH, and the primitive falls back to a mechanical
+	// const — which two imports then declare twice ("decl 'k1_xboole_0' is already added").
+	// A symbol belongs to the article that introduced it, so rank claimants by MML canonical
+	// order (mml.lar) and let the EARLIEST win; HIDDEN is the most primitive of all.
+	mmlOrder = mizMmlOrder(unit);
+	// a mechanical name is <kind><nr>_<aid> and the AID ITSELF CONTAINS UNDERSCORES
+	// (k1_xboole_0 -> xboole_0, k10_subset_1 -> subset_1), so split at the FIRST one.
+	rankOfCtor = \cn : string -> {
+		us = strIndexOf(cn, "_");
+		aid = if (us < 0) "" else toLowerCase(substring(cn, us + 1, strlen(cn) - us - 1));
+		mizAidRank(mmlOrder, cn, aid);
+	};
+	bestOf = \cs : Set<string> -> fold(set2array(cs), Pair("", 1000000), \bp, cn -> {
+		r = rankOfCtor(cn);
+		if (r < bp.second) Pair(cn, r) else bp;
+	});
 	sig = MizSig(sig0 with readable = filterTree(merged, \k, v -> {
 		all = lookupTreeDef(mcounts, v, makeSet());
 		if (sizeSet(all) == 1) true
@@ -211,7 +248,16 @@ ruRunMizarToRu(unit : RuUnit) -> Maybe<RuState> {
 				Some(c): mizConstrName(strSplit(k, ":")[0], c);
 				None(): k;
 			};
-			sizeSet(sen) == 1 && containsSet(sen, cn);
+			// One non-own claimant → it wins. Otherwise: a FOUNDATION symbol (∅/∈/⊆/𝒫/…) must
+			// still be resolved — falling back to a mechanical name there both severs the A-map
+			// and makes every user declare its own copy ("decl 'k1_xboole_0' is already added"),
+			// so the canonically-earliest article takes it. For any OTHER contested name the safe
+			// mechanical fallback stands: adopting more pretty names was MEASURED WORSE
+			// (28 OK / 1262 thms / 5 parse-fails vs 29 / 1331 / 0) — mangling is always correct,
+			// a pretty name is only ever an optimisation.
+			if (sizeSet(sen) == 1) containsSet(sen, cn)
+			else if (mptpAmapReused(v)) (bestOf(if (isEmptySet(sen)) all else sen)).first == cn
+			else false;
 		}
 	}));
 	// Signature comments: the constructor's FINAL Russell name (readable or MPTP) -> its symbol.
@@ -231,7 +277,17 @@ ruRunMizarToRu(unit : RuUnit) -> Maybe<RuState> {
 				// <ru-root>/miz_aux.ru exists (ruMizLoadDeps no-ops when absent). The
 				// prover's assertion index is import-precedence filtered, so without
 				// the import the aux lemmas are read-visible but never applicable.
-				depAids0 = arrayPush(if (eth != "") mizEnvAids(eth) else [], "miz_aux");
+				// The .eth cites only the articles whose THEOREMS are used. An article may also
+				// USE a constructor (subset_1's `Element of`, xboole_0's ∅) without citing any of
+				// that article's theorems — and then re-declares the symbol locally. Import two such
+				// articles together and their duplicate `constant element` blocks collide at
+				// parse-collect ("decl 'element' is already added": partfun1/funct_2/funct_3/
+				// funcop_1/funct_4, and 'k1_xboole_0' for ordinal2/ordinal3/pboole). So the
+				// dependency set is the cited aids UNION the DEFINING aids of every constructor in
+				// the environment — a symbol is declared by its own article and imported everywhere.
+				ctorAids = filter(uniq(map(getTreeValues(sig0.table), \c -> toLowerCase(c.aid))),
+					\a -> a != toLowerCase(article) && a != "hidden" && a != "");
+				depAids0 = uniq(concat(arrayPush(if (eth != "") mizEnvAids(eth) else [], "miz_aux"), ctorAids));
 				// AUTO-LOAD already-translated dependency articles (their .ru lives next to the output
 				// module) so the cited theorems come from `import`, not re-inlined axioms. No-op for a
 				// dependency that isn't translated yet (its env axioms then fall back to foundation dedup).
@@ -254,7 +310,7 @@ ruRunMizarToRu(unit : RuUnit) -> Maybe<RuState> {
 						RuCong(__,__):     insertSet(acN, id2s(d.info.id));
 						default: acN;
 					}));
-				emitD = MptpEmit(emit with isReused = \n -> emit.isReused(n) || containsSet(depLangNames, n));
+				emitD = MptpEmit(emit with isReused = \n, isPred -> emit.isReused(n, isPred) || containsSet(depLangNames, n));
 				// Import the foundation by its ACTUAL loaded source id (read-from-disk module
 				// ids may be path-qualified), exactly as mptp-to-ru does.
 				found_id = foldTree(stateD.ru, s2id(foundation), \id, s, acc ->
@@ -269,15 +325,16 @@ ruRunMizarToRu(unit : RuUnit) -> Maybe<RuState> {
 				// foundation — `read-ru <path>` before translating this article — so its self-id is in
 				// the same (resolvable-on-read-back) form as the foundation's, and the cited theorems
 				// come FROM the import (deduped below by name) rather than re-inlined as axioms here.
-				depIds  = filtermap(depAids0, \aid ->
+				depResolved = filtermap(depAids0, \aid ->
 					foldTree(stateD.ru, None(), \id, s, acc ->
-						if (s.info.module == aid || endsWith(s.info.module, "/" + aid)) Some(s.info.id) else acc));
-				importIds = concat([found_id], depIds);
+						if (s.info.module == aid || endsWith(s.info.module, "/" + aid)) Some(Pair(aid, s.info.id)) else acc));
+				depIds  = map(depResolved, \pr -> pr.second);
+				importedAids = buildSet(map(depResolved, \pr -> toLowerCase(pr.first)));				importIds = concat([found_id], depIds);
 				syms = mizParseNotation(mizFile(unit, article, "eno"), mizFile(unit, article, "frm"), mizFile(unit, article, "dcx"));
 				// env theorems as commented axioms (available premises for the open steps).
 				// srcOf resolves the DEFINING article's (.miz, .xml) so each carries its surface text.
 				srcOf = \aid -> Pair(mizFile(unit, aid, "miz"), mizFile(unit, aid, "xml"));
-				envPairs = if (eth != "") mizParseEnv(eth, sig, syms, srcOf, emitD.isReused) else [];
+				envPairs = if (eth != "") mizParseEnv(eth, sig, syms, srcOf, emitD.isReused, \a -> containsSet(importedAids, a)) else [];
 				// the article's OWN definitions (XBOOLE_0:def N) as definitional axioms — the
 				// `unfold` material the prover needs to close the by-gaps; in scope before the theorems.
 				defPairs = mizArticleDefs(p.first, mizFile(unit, article, "miz"), sig, syms, emitD.isReused);
