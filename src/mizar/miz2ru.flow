@@ -401,6 +401,7 @@ mizRenameFree(f : TptpForm, ren : Tree<string, string>) -> TptpForm {
 mizRenameTerm(t : TptpTerm, ren : Tree<string, string>) -> TptpTerm {
 	switch (t) {
 		TptpVar(nm):       TptpVar(lookupTreeDef(ren, nm, nm));
+		TptpAbs(v, body):  TptpAbs(lookupTreeDef(ren, v, v), mizRenameFree(body, ren));
 		TptpApp(nm, args): TptpApp(nm, map(args, \a -> mizRenameTerm(a, ren)));
 	}
 }
@@ -420,6 +421,7 @@ mizFormAllVars(f : TptpForm) -> [string] {
 mizTermAllVars(t : TptpTerm) -> [string] {
 	switch (t) {
 		TptpVar(nm):       [nm];
+		TptpAbs(v, body):  concat([v], mizFormAllVars(body));
 		TptpApp(__, args): concatA(map(args, mizTermAllVars));
 	}
 }
@@ -496,6 +498,35 @@ mizTerm(sig : MizSig, env : [string], e : MizXml) -> TptpTerm {
 			map(e.kids, \k -> mizTerm(sig, env, k)));
 	} else if (e.tag == "LocusVar") {
 		TptpVar("L" + mizAttr(e, "nr"));
+	} else if (e.tag == "Fraenkel") {
+		// `{ f(x̄) where x̄ is T̄ : P[x̄] }` — Mizar's Fraenkel (comprehension) term.
+		// Children: [Typ…, RESULT term, CONDITION formula]; each <Typ> introduces a binder and
+		// is itself read in the scope OUTSIDE that binder (same rule as <For>).
+		// Rendered as set.mm's own class abstraction (the `cab` rule, `{ x ∣ ph }`):
+		//     { y ∣ ∃x̄ ( T̄(x̄) ∧ P[x̄] ∧ y = f(x̄) ) }
+		// so the term lands in the foundation's class layer instead of an opaque constant —
+		// this is merge work, not a workaround. `y` is fresh, named off the binder vids.
+		{
+			typs = filter(e.kids, \k -> k.tag == "Typ");
+			rest = filter(e.kids, \k -> k.tag != "Typ");
+			if (length(rest) < 2 || typs == []) TptpApp("unhandled_term_Fraenkel", []) else {
+				// bind each Typ in turn; its guards are read in the env BEFORE it is added
+				bound = fold(typs, Pair(env, []), \ac : Pair<[string], [Pair<string, [TptpForm]>]>, ty -> {
+					vid = mizAttr(ty, "vid");
+					vn  = if (vid != "") "X" + vid else "Xfk" + i2s(length(ac.first) + 1);
+					Pair(arrayPush(ac.first, vn),
+						arrayPush(ac.second, Pair(vn, mizTypGuards(sig, ac.first, ty, TptpVar(vn)))));
+				});
+				envIn = bound.first;
+				res   = mizTerm(sig, envIn, rest[0]);                    // f(x̄)
+				cond  = mizForm(sig, envIn, rest[length(rest) - 1]);     // P[x̄]
+				// a fresh result variable, disjoint from every binder in scope
+				y = "Yfk" + strGlue(map(typs, \ty -> mizAttr(ty, "vid")), "_");
+				guards = concatA(map(bound.second, \p -> p.second));
+				body = mizFoldAnd(concat(guards, [cond, TptpEq(TptpVar(y), res)]));
+				TptpAbs(y, TptpQuant("exists", map(bound.second, \p -> p.first), body));
+			}
+		}
 	} else if (e.tag == "PrivFunc") {
 		// `deffunc F(x) = t(x)` used as `F(u)`. Dual to PrivPred, but the expansion comes FIRST
 		// and the actual arguments follow it (verified against the <DefFunc> bodies).
@@ -531,6 +562,7 @@ mizNameUnhandled(n : string) -> bool { startsWith(n, "unhandled") || startsWith(
 mizTermHasUnhandled(t : TptpTerm) -> bool {
 	switch (t) {
 		TptpVar(n):        mizNameUnhandled(n);
+		TptpAbs(__, body): mizFormHasUnhandled(body);
 		TptpApp(n, args):  mizNameUnhandled(n) || exists(args, mizTermHasUnhandled);
 	}
 }
