@@ -1,0 +1,212 @@
+import ru/prover/tactics/instantiate;
+import ru/unify/index;
+import ru/verify/math;
+import base/ids;
+
+// THE TYPE REGISTRY (soft-type-layer.md §4.1) — the scanned, read-only view of the Mizar
+// soft-type layer as it exists in the loaded assertions. Read-only by design: this pass only
+// CLASSIFIES what the translation produced; nothing here touches proof search. Its consumers
+// (the `types.env` blackboard artifact and `ensure-type`) come next.
+//
+// Everything is classified BY SHAPE, never by a hand-kept name list (the standing rule) — so
+// it works the same on the foundation, on a translated article, and on anything authored in
+// miz_aux. The four rule kinds the design calls for:
+//
+//   DEF   ∀ā ( θ(t,ā) ↔ body )                        a mode/attribute UNFOLD. Mizar's guarded
+//         (possibly `(c ∨ (θ↔B)) ∧ (c → (θ↔B'))`)     definitions (SUBSET_1:def 1) take the
+//                                                     second form — the ∨-branch IS the
+//                                                     conditional bicond `¬c → (θ↔B)`.
+//   FUNC  ∀L̄ ( guards → α(f(L̄)) )                     functorial registration: the subject of
+//                                                     the conclusion is a COMPOUND term.
+//   COND  ∀L̄∀t ( guards ∧ α(t) → β(t) )               conditional registration: the subject is
+//                                                     a variable already guarded in the
+//                                                     antecedent.
+//   EX    ∀L̄ ( guards → ∃t ( … ) )                    existential registration (inhabitation).
+//
+// Cluster rules are ORDINARY implications, so a consumer applies one as an ordinary proof step
+// — nothing in this registry is trusted, and a misclassification costs coverage, never
+// soundness.
+
+export {
+	RuTyRole ::= RuTyDef, RuTyFunc, RuTyCond, RuTyEx;
+		RuTyDef();    // mode/attribute unfold (bicond, possibly guarded)
+		RuTyFunc();   // functorial registration  — conclusion subject is a compound term
+		RuTyCond();   // conditional registration — conclusion subject is a guarded variable
+		RuTyEx();     // existential registration — inhabitation
+
+	// head  = the guard/predicate symbol the rule is keyed under (its CONCLUSION head)
+	// arity = that predicate's arity (1 = bare attribute, 2+ = parameterised mode/attribute)
+	RuTyRule(assId : int, role : RuTyRole, head : int, arity : int, guarded : bool);
+
+	RuTypeTable(all : [RuTyRule], byHead : Tree<int, [RuTyRule]>);
+
+	ruTypeTable(math : RuMath) -> RuTypeTable;
+	ruTyRole2s(r : RuTyRole) -> string;
+}
+
+ruTyRole2s(r : RuTyRole) -> string {
+	switch (r) { RuTyDef(): "def"; RuTyFunc(): "func-cluster"; RuTyCond(): "cond-cluster"; RuTyEx(): "ex-cluster"; }
+}
+
+// ---- cache (per index size, like ruRuleTable) --------------------------------
+
+ruTypeTableCache : ref [Pair<int, RuTypeTable>] = ref [];
+
+ruTypeTable(math : RuMath) -> RuTypeTable {
+	n = sizeTree(math.decls.assertions);
+	c = ^ruTypeTableCache;
+	if (c != [] && c[0].first == n) c[0].second else {
+		t = ruTyBuild(math);
+		ruTypeTableCache := [Pair(n, t)];
+		t;
+	}
+}
+
+ruTyInfer(a : RuAssertion) -> RuInference {
+	switch (a) {
+		RuAxiom(__, i): i; RuCong(__, i): i; RuTheorem(__, i, __, __): i; RuDef(__, i, __, __): i;
+	}
+}
+
+// "d" = a definition (mode/attribute/functor unfold), "r"/"c"/"f" = the registration kinds.
+// "" = not type-layer content.
+ruTyDeclKind(nm : string) -> string {
+	pre2 = if (strlen(nm) >= 2) substring(nm, 0, 2) else "";
+	rest = if (strlen(nm) >= 2) substring(nm, 2, strlen(nm) - 2) else "";
+	isNumTail = \r : string -> r != "" && (getCharCodeAt(r, 0) >= 48 && getCharCodeAt(r, 0) <= 57);
+	if ((pre2 == "rc" || pre2 == "cc" || pre2 == "fc") && isNumTail(rest)) pre2
+	else if (strlen(nm) >= 2 && substring(nm, 0, 1) == "d"
+		&& isNumTail(substring(nm, 1, strlen(nm) - 1))) "d"
+	else "";
+}
+
+ruTyInfoOf(a : RuAssertion) -> RuDeclInfo {
+	switch (a) { RuAxiom(i, __): i; RuCong(i, __): i; RuTheorem(i, __, __, __): i; RuDef(i, __, __, __): i; }
+}
+
+ruTyId(a : RuAssertion) -> int {
+	switch (a) { RuAxiom(i, __): i.id; RuCong(i, __): i.id; RuTheorem(i, __, __, __): i.id; RuDef(i, __, __, __): i.id; }
+}
+
+// peel the leading ∀ binders: wal's args are [x, body]
+ruTyStripForalls(e : RuExp) -> RuExp {
+	if (ruInHead(e) != s2id("wal") || ruInArity(e) != 2) e
+	else ruTyStripForalls((ruInArgs(e))[1]);
+}
+
+// is this expression a compound (rule-headed, argument-bearing) term rather than a variable?
+ruTyIsCompound(e : RuExp) -> bool { ruInHead(e) >= 0 && ruInArity(e) > 0; }
+
+// The logical SKELETON. A guard is an ATOM, so a connective-headed expression is never one —
+// without this the scan calls every `∀…(A → B)` in set.mm a conditional cluster.
+ruTyIsConnective(h : int) -> bool {
+	exists([s2id("wi"), s2id("wa"), s2id("wo"), s2id("wn"), s2id("wb"), s2id("wal"), s2id("wex")],
+		\c -> c == h);
+}
+
+// the head symbol a guard atom is keyed under, with its arity; (-1, 0) when it is not an atom
+ruTyAtomHead(e : RuExp) -> Pair<int, int> {
+	h = ruInHead(e);
+	if (h < 0 || ruTyIsConnective(h)) Pair(-1, 0) else Pair(h, ruInArity(e));
+}
+
+// The CONCLUSION of an implication chain, and whether its subject is compound. For a functorial
+// registration the subject is a term like `𝒫 X`; for a conditional one it is the bound variable.
+ruTyClassifyImp(concl : RuExp) -> Pair<RuTyRole, Pair<int, int>> {
+	// A conditional registration NESTS: ∀L̄ ( argGuards → ∀t ( typ(t) ∧ ante(t) → cons(t) ) ).
+	// Descend the implication chain (∀-stripping as we go) to the FINAL conclusion —
+	// classifying only the first level found 1 of 9 cond-clusters.
+	if (ruInHead(concl) == s2id("wi") && ruInArity(concl) == 2)
+		ruTyClassifyImp(ruTyStripForalls((ruInArgs(concl))[1]))
+	else {
+	wexId = s2id("wex");
+	// an existential registration's conclusion is ∃-headed; key it on the FIRST guard inside
+	// the body (ruTyAtomHead would reject ∃ itself, since ∃ is part of the logical skeleton)
+	if (ruInHead(concl) == wexId && ruInArity(concl) == 2) {
+		inner = (ruInArgs(concl))[1];
+		hd = fold(ruTyConjuncts(inner), Pair(-1, 0), \acc, a ->
+			if (acc.first >= 0) acc else ruTyAtomHead(a));
+		Pair(RuTyEx(), hd);
+	} else {
+		// a conclusion may be a ∧ of guards — key on the first atom that has a subject
+		atoms = ruTyConjuncts(concl);
+		subj = fold(atoms, Pair(RuTyCond(), Pair(-1, 0)), \acc, a ->
+			if ((acc.second).first >= 0) acc else {
+				hd = ruTyAtomHead(a);
+				if (hd.first < 0 || hd.second == 0) acc
+				else {
+					args = ruInArgs(a);
+					role = if (args != [] && ruTyIsCompound(args[0])) RuTyFunc() else RuTyCond();
+					Pair(role, hd);
+				}
+			});
+		subj;
+	}
+	}
+}
+
+ruTyConjuncts(e : RuExp) -> [RuExp] {
+	if (ruInHead(e) != s2id("wa") || ruInArity(e) != 2) [e]
+	else concatA(map(ruInArgs(e), ruTyConjuncts));
+}
+
+// Does this expression contain a biconditional anywhere at the top ∧/∨ structure? Mizar's
+// guarded definitions bury the real unfold inside `(c ∨ (θ↔B)) ∧ (c → (θ↔B'))`.
+ruTyFindBicond(e : RuExp) -> Maybe<RuExp> {
+	wbId = s2id("wb"); waId = s2id("wa"); woId = s2id("wo"); wiId = s2id("wi");
+	h = ruInHead(e);
+	if (h == wbId && ruInArity(e) == 2) Some(e)
+	else if ((h == waId || h == woId || h == wiId) && ruInArity(e) == 2)
+		fold(ruInArgs(e), None(), \acc, a -> if (isSome(acc)) acc else ruTyFindBicond(a))
+	else None();
+}
+
+ruTyBuild(math : RuMath) -> RuTypeTable {
+	// The soft-type layer is MIZAR-side content. set.mm's own corpus (the miz_set foundation)
+	// is thousands of ordinary set-theory theorems whose shapes collide with the cluster
+	// patterns — scanning it reported 4045 "type rules" keyed on wceq/wcel/wi, i.e. noise.
+	// Foundation reasoning is the RULE table's business; this registry covers the translated
+	// articles and anything authored alongside them.
+	foundIds = foldTree(math.sources, makeSet(), \id, src, acc -> {
+		m = src.info.module;
+		if (m == "miz_set" || endsWith(m, "/miz_set")) insertSet(acc, id) else acc;
+	});
+	all = filtermap(getTreeValues(math.decls.assertions), \ass -> {
+		inf = ruTyInfer(ass);
+		// WHICH decls are type-layer content is metadata WE emit, not something shape can decide:
+	// an ordinary Mizar theorem `∀(A → atom)` is shaped exactly like a conditional
+	// registration (that ambiguity reported 126 `wceq` "clusters" for subset_1). The
+	// translator names registrations rc/cc/fc<n>_<aid> and definitions d<n>_<aid>, so the
+	// KIND is read off that convention; the SHAPE analysis below still does the classifying.
+	if (ruTyDeclKind(id2s(ruTyId(ass))) == "" || containsSet(foundIds, ruTyInfoOf(ass).src)) None() else
+		// only 0-hypothesis, ∀-closed statements: definitions and registrations both take
+		// that shape after translation. (A hypothesised rule is the rule table's business.)
+		if (inf.hyps != []) None() else {
+			body = ruTyStripForalls(ruExp(inf.prop.exps[0]));
+			wiId = s2id("wi");
+			switch (ruTyFindBicond(body)) {
+				Some(bi): {
+					lhs = (ruInArgs(bi))[0];
+					hd  = ruTyAtomHead(lhs);
+					// a bicond whose LHS is an ATOM with a subject is a mode/attribute unfold;
+					// `guarded` records Mizar's empty-case split (the ∨/→ wrapper).
+					if (hd.first < 0 || hd.second == 0) None()
+					else Some(RuTyRule(ruTyId(ass), RuTyDef(), hd.first, hd.second, ruInHead(body) != s2id("wb")));
+				}
+				None(): {
+					// A registration with NO locus guards is a bare conclusion rather than an
+					// implication (fc1_subset_1 is just `∀X ¬(𝒫X = ∅)`), and a conditional
+					// one re-quantifies its subject, so the conclusion needs its own ∀-strip.
+					concl = if (ruInHead(body) == wiId && ruInArity(body) == 2)
+						ruTyStripForalls((ruInArgs(body))[1]) else body;
+					cl = ruTyClassifyImp(concl);
+					hd = cl.second;
+					if (hd.first < 0 || hd.second == 0) None()
+					else Some(RuTyRule(ruTyId(ass), cl.first, hd.first, hd.second, false));
+				}
+			}
+		}
+	});
+	byHead = fold(all, makeTree(), \acc, r -> setTree(acc, r.head, arrayPush(lookupTreeDef(acc, r.head, []), r)));
+	RuTypeTable(all, byHead);
+}
