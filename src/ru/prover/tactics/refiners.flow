@@ -14,6 +14,7 @@ import ru/prover/tactics/propositional;
 import ru/prover/tactics/closer;
 import ru/prover/tactics/board;
 import ru/prover/tactics/rule_table;
+import ru/prover/tactics/type_table;
 import ru/prover/tactics/scope_file;
 import ru/prover/tactics/deduction;
 import ru/unify/index;
@@ -510,7 +511,37 @@ ruCheckerResidualRun(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : 
 				RuStmt(stmtClass, [hRw[c.first].residual], -1)),
 			hRw[c.first].residual))
 	);
-	sat = ruMemoSaturate(memo, math, env, stmtClass, instHyps, goal, 8, nnf);
+	// ENSURE-TYPE, the type registry's first consumer (soft-type-layer.md §4.3). A Mizar mode or
+	// attribute is opaque until its DEFINITION is in the problem — `element x7 x4` is underivable
+	// from `x7 ∈ x4` with d1_subset_1 merely sitting in scope as an axiom. So the registry's
+	// definition rules are seeded into the ∀-pool the saturation ALREADY instantiates (spcv at the
+	// problem's terms): no new proof-assembly engine, and each fact arrives with its own proof, so
+	// nothing new is trusted.
+	// GATED on head occurrence — only notions the problem actually mentions. Every extra pool
+	// entry competes for the instance cap and taxes every downstream closer (the standing cost
+	// law), so an ungated seed would be a regression by construction.
+	// PARKED BEHIND A FLAG, OFF by default; enable with `conf-set ensure-type=1` (the same
+	// mechanism as no-literal-closers — a bare CLI arg does NOT reach conf.opts). It is wired end-to-end and fires
+	// (t2_subset_1: 1 definition seeded, sat 11 -> 17), but it closes NOTHING yet — subset_1 is
+	// 13/53 with and without it — while it does fire on zfmisc, so the risk to a proved floor is
+	// real and the gain is zero. Shipping that trade is exactly what was reverted twice today
+	// (the subcompar scope, the wide-scope branch retry). Kept as working scaffolding so the next
+	// iteration starts from here.
+	// THE ISOLATED BLOCKER: the ∀∀ instantiation of d1_subset_1 never yields
+	// `element x7 x4 ↔ x7 ∈ x4`. Ruled out by test: the instance cap (8 -> 24 changed nothing)
+	// and missing congruences (pr_element_cong1d/cong2d are both emitted, correctly shaped).
+	// Remaining suspects: the candidate list in COERCED setvar form, and the setness proof.
+	tyOn = ruOptsString(env.conf.opts, "ensure-type", "") == "1";
+	tyTable = if (!tyOn) RuTypeTable([], makeTree()) else ruTypeTable(math);
+	tyHeads = if (!tyOn) makeSet() else ruTyHeadsOf(tyTable, arrayPush(map(instHyps, \p -> p.second), goal));
+	tyFacts = if (isEmptySet(tyHeads)) [] else
+		filtermap(filter(tyTable.all, \r -> r.role == RuTyDef() && containsSet(tyHeads, r.head)),
+			\r -> ruTyRuleFact(math, stmtClass, r));
+	if (env.conf.verbose >= 4 && tyFacts != []) {
+		env.out.println("  ensure-type: " + i2s(length(tyFacts)) + " definition(s) seeded for "
+			+ i2s(sizeSet(tyHeads)) + " head(s)");
+	} else {};
+	sat = ruMemoSaturate(memo, math, env, stmtClass, concat(instHyps, tyFacts), goal, 8, nnf);
 	satAll = concatA(map(sat.first, \f -> {
 		// a reflexivity fact `t = t` is already a literal — its eqss rewrite is pure junk cost
 		isRefl = ruEqHead(f.first) == s2id("wceq") && {
