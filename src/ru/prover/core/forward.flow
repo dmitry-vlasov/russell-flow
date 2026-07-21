@@ -700,6 +700,37 @@ ruRegisterForwardSeedHook(name : string, hook : (RuProverEnv, RuConstAny<RuProve
 	}
 }
 
+// assertion ids referenced anywhere in a forward fact's proof tree
+ruFwdTreeAssertions(t : RuProofTree) -> [int] {
+	switch (t) {
+		RuProofStep(aid, children, __): fold(children, if (aid >= 0) [aid] else [], \acc, c -> concat(acc, ruFwdTreeAssertions(c)));
+		RuProofHyp(__, __): [];
+	}
+}
+
+ruFwdAssInfo(a : RuAssertion) -> RuDeclInfo {
+	switch (a) { RuAxiom(i, __): i; RuCong(i, __): i; RuTheorem(i, __, __, __): i; RuDef(i, __, __, __): i; }
+}
+
+// REACHABILITY (soundness law): does every assertion this forward fact's proof rests on
+// PRECEDE the theorem being proved? The seed hooks and 0-hyp seeding can build a fact from an
+// assertion the goal cannot reach — most importantly the GOAL THEOREM ITSELF, since every
+// translated Mizar skeleton ends in a QED step whose goal IS the theorem's own statement, so a
+// 0-hyp theorem (t6_ordinal1: `x ∈ succ x`) is a perfect fact for its own final gap. The
+// backward engine already filters candidates by ruDeclInfoPreceeds (expand.flow); this applies
+// the SAME test to forward facts, so both directions share one reachable set.
+ruFwdFactReachable(prover_env : RuProverEnv, pf : RuProverExp) -> bool {
+	if (sizeVector(pf.proofs) == 0) true
+	else {
+		tree = ruMakeProofTree(vector2array(pf.proofs)[0]);
+		forall(ruFwdTreeAssertions(tree), \aid ->
+			switch (lookupTree(prover_env.math.decls.assertions, aid)) {
+				Some(a2): ruDeclInfoPreceeds(ruFwdAssInfo(a2), prover_env.conf.task.info, prover_env.importDependencies);
+				None():   true;   // a sentinel / non-corpus id — not an accessibility concern
+			});
+	}
+}
+
 ruSeedForwardFront(prover_env : RuProverEnv) -> void {
 	if (^(prover_env.forwardFront) == None()) {
 		// a fresh front has run no wave yet — clear any stale gain from a
@@ -759,12 +790,29 @@ ruSeedForwardFront(prover_env : RuProverEnv) -> void {
 				+ ", front " + i2s(length(fwd3.front))
 			);
 		}
-		prover_env.forwardFront := Some(fwd3);
+		// REACHABILITY post-filter (soundness law [[reachability-soundness-law]]): drop any seed
+		// whose proof rests on a non-preceding assertion (the goal theorem itself, or any later
+		// one). Rebuild the front's index/seen from the survivors. Derived wave facts inherit
+		// reachability from clean seeds (the wave applies only single-hyp assertions from the
+		// already-scoped index), so filtering the seed front suffices.
+		keptFront = filter(fwd3.front, \pf -> ruFwdFactReachable(prover_env, pf));
+		fwdF = if (length(keptFront) == length(fwd3.front)) fwd3 else {
+			if (prover_env.env.conf.verbose >= 4) {
+				prover_env.env.out.println("seed front: dropped " + i2s(length(fwd3.front) - length(keptFront))
+					+ " unreachable seed(s) of " + i2s(length(fwd3.front)) + " (self-citation / not-yet-accessible)");
+			} else {};
+			RuProverForward(fwd3 with
+				front = keptFront,
+				index = fold(keptFront, ruMakeIndex(), \acc, pf -> ruSetIndex(ruExp(pf.stmt.exps[0]), pf, acc)),
+				seen  = fold(keptFront, makeSet(), \acc, pf -> insertSet(acc, (ruExp(pf.stmt.exps[0])).nodes))
+			);
+		};
+		prover_env.forwardFront := Some(fwdF);
 		// Join-check the SEEDS: only derived facts pass through ruReverseJoin (at
 		// creation in ruApplyForward), and the dedup (`seen`) blocks re-derivation —
 		// so a seed that IS the goal (e.g. an identity instance matching the root
 		// verbatim) would never join. One pass over the initial front covers it.
-		iter(fwd3.front, \sf -> ruReverseJoin(sf, prover_env));
+		iter(fwdF.front, \sf -> ruReverseJoin(sf, prover_env));
 	}
 }
 

@@ -1,6 +1,7 @@
 import ru/subst;
 import ru/verify/proof;
 import ru/util/normalize;
+import ru/util/sources;
 
 export {
 	RuVerifyTheoremResult(
@@ -11,7 +12,11 @@ export {
 	ruIsVerified(res : RuVerifyTheoremResult) -> bool;
 	ruVerifyTheorem(th : RuTheorem, math : RuMath, env : RuEnv) -> RuVerifyTheoremResult;
 	ruVerifyTheoremPrecedence(th : RuTheorem, imported_map : Tree<int, Set<int>>, math : RuMath, env : RuEnv) -> [RuVerifyErr];
+	// DEPRECATED: precedence is now checked inside ruVerifyTheorem. Kept as an alias so existing
+	// callers (ruVerifyTheoremsAll / ruVerifySource) compile; the imported_map arg is ignored.
 	ruVerifyTheoremAll(th : RuTheorem, imported_map : Tree<int, Set<int>>, math : RuMath, env : RuEnv) -> RuVerifyTheoremResult;
+	// The cached transitive import map used by the theorem-level precedence check.
+	ruVerifyImportedMap(math : RuMath, env : RuEnv) -> Tree<int, Set<int>>;
 
 	ruOutputVerifyErrs(res : RuVerifyTheoremResult, math : RuMath, env : RuEnv) -> void;
 	ruVerifyTheoremErrs2s(res : RuVerifyTheoremResult, math : RuMath) -> string;
@@ -48,6 +53,15 @@ ruVerifyTheorem(th_orig : RuTheorem, math : RuMath, env : RuEnv) -> RuVerifyTheo
 	));
 	verified = ruVerifyProof(th.proof, th.infer.hyps, th.infer.prop, math, env);
 	th_verified = ruNormalizeTheoremVarsDisjs(RuTheorem(th with proof = verified.proof));
+	// REACHABILITY (the soundness law [[reachability-soundness-law]]) is part of theorem-level
+	// verification: every assertion a proof cites must PRECEDE the theorem in the partial order
+	// (earlier in the same source, or in an imported source). Without it a theorem could cite
+	// ITSELF or a later assertion and still "verify" — the checker's forward seeds did exactly
+	// that (t6_ordinal1 proved by t6_ordinal1). This lives here (not only in ruVerifyMath) so
+	// EVERY verify path — whole-library, single-theorem, per-source — enforces it uniformly.
+	// FAST: the per-proof walk is O(steps); the only library-wide input, the transitive import
+	// map, is CACHED (ruVerifyImportedMap) so it is built once per source-set, not per theorem.
+	prec_errs = ruVerifyPrecedenceInProof(th_verified, th_verified.proof, ruVerifyImportedMap(math, env), math, env);
 	// Check that all disjointed restrictions are inherently satisfied
 	disj_errs = if (ruSubsetDisjs(th_verified.infer.vars.disjs, th_orig.infer.vars.disjs)) [] else {
 		/*pr_disj = \disj -> {
@@ -88,8 +102,34 @@ ruVerifyTheorem(th_orig : RuTheorem, math : RuMath, env : RuEnv) -> RuVerifyTheo
 	}
 	RuVerifyTheoremResult(
 		th_verified,
-		concat(verified.errs, disj_errs)
+		concatA([verified.errs, disj_errs, prec_errs])
 	);
+}
+
+// The transitive import map (source -> the sources it can reach), CACHED so the theorem-level
+// precedence check does not rebuild it once per theorem. The key is the exact SET OF SOURCE IDS,
+// NOT their count: the map is keyed on source ids, so two different libraries that happen to have
+// the same number of sources (e.g. set-3000 and set-10000) would otherwise collide and one would
+// be verified against the other's import map — a false-positive flood (measured: 140 spurious
+// disproved). Computing the key set is O(sources) — far cheaper than the O(sources^2) rebuild —
+// so the cache still wins. Import structure is fixed once sources are loaded and does not change
+// as theorems are added to existing sources, so within a library it is a stable cache hit.
+// A benign concurrent first-population race recomputes the identical value (ruVerifyTheorems runs
+// theorems in parallel).
+ruVerifyImportedMapCache : ref Maybe<Pair<Set<int>, Tree<int, Set<int>>>> = ref None();
+
+ruVerifyImportedMap(math : RuMath, env : RuEnv) -> Tree<int, Set<int>> {
+	key = foldTree(math.sources, makeSet(), \id, __, acc -> insertSet(acc, id));
+	switch (^ruVerifyImportedMapCache) {
+		Some(c): if (equalSet(c.first, key)) c.second else ruVerifyImportedMapStore(math, env, key);
+		None():  ruVerifyImportedMapStore(math, env, key);
+	}
+}
+
+ruVerifyImportedMapStore(math : RuMath, env : RuEnv, key : Set<int>) -> Tree<int, Set<int>> {
+	m = ruSourcesAllImported(math.sources, env);
+	ruVerifyImportedMapCache := Some(Pair(key, m));
+	m;
 }
 
 ruVerifyTheoremPrecedence(th : RuTheorem, imported_map : Tree<int, Set<int>>, math : RuMath, env : RuEnv) -> [RuVerifyErr] {
@@ -97,8 +137,6 @@ ruVerifyTheoremPrecedence(th : RuTheorem, imported_map : Tree<int, Set<int>>, ma
 }
 
 ruVerifyTheoremAll(th : RuTheorem, imported_map : Tree<int, Set<int>>, math : RuMath, env : RuEnv) -> RuVerifyTheoremResult {
-	res = ruVerifyTheorem(th, math, env);
-	RuVerifyTheoremResult(res with 
-		errs = concat(res.errs, ruVerifyPrecedenceInProof(th, th.proof, imported_map, math, env))
-	);
+	// ruVerifyTheorem now checks precedence itself; this is a compatibility alias.
+	ruVerifyTheorem(th, math, env);
 }
