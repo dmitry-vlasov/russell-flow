@@ -1,0 +1,434 @@
+import ru/prover/tactics/congruence;
+import ru/prover/tactics/instantiate;
+import ru/verify/theorem;
+import ru/util/lang;
+import ru/util/src2s;
+import base/ids;
+
+// THE EQUALIZER PLANNER — decision core (planner-executor architecture).
+//
+// Transcribed from the original Mizar checker (~/dev/system/kernel/):
+//   checker.pas  InferenceChecker: PreCheck -> per-disjunct Equate -> Unification;
+//                a disjunct is refuted when Contr > 0.
+//   equalizer.pas Equate: every term of the disjunct is canonicalized into an
+//                eq-class (YTerm, hash-consing); positive `=` literals become
+//                pending equalities; UnionTrms merges classes with congruence
+//                propagated through per-functor occurrence lists; the negated
+//                goal l <> r is refuted by REFLEXIVITY (SetContr 19 in
+//                ContradictionVerify) once closure puts l and r in one class.
+//   unifier.pas  instantiates UNIVERSAL premises so that their instances feed
+//                the eq-class structure until a clash appears.
+//
+// The mapping into our context: the theorem's ∀-closed equality goal, negated and
+// Skolemized (Mizar's PreCheck), is exactly the goal MATRIX with its bound setvars
+// read as free constants. Universal equality premises are instantiated by MATCHING
+// their STRUCTURED sides against the term DAG (the Unifier restricted to the equality
+// fragment; Mizar's Identities likewise registers lhs patterns), each instance is a
+// ground equality fact, and the ground closure is the existing proof-producing
+// congruence closure (congruence.flow — our UnionTrms + FuncTrmList). Decision:
+// goal sides in one class.
+//
+// This module is the PLANNER'S BRAIN only: it navigates freely (any internal
+// structures) and NEVER touches the PVT. Plan extraction (which nodes the executor
+// expands) and the executor wiring come on top of the decision.
+//
+// REPRESENTATION LESSONS (all measured, each cost a debugging round):
+//  - THE COERCION IS AN IDENTITY, NOT A SHAPE. The setvar->class coercion node must be
+//    recognized by its RULE ID (ruSuperRule(setvar, class)); the shape test "1-ary class
+//    rule over a var" also matches csn(A) — the SINGLETON — and the apply then swallowed
+//    the {·} wrappers (df-pr's instance came out as `x2 ∪ x3`).
+//  - RULE NODES PACK (arity, LEN): len is the argument-subtree node count, so plain node
+//    equality only holds between identically-SIZED subterms — a pattern head never equals
+//    a term head over different arguments. Compare id+type+arity, ignore len; and after
+//    substitution RECOMPUTE lens (len = arity-driven span - 1), or the instances neither
+//    dedup nor key against real expressions.
+//  - CLASS-typed premise vars are true metavariables (set.mm's A/B): they bind ANY class
+//    slice. SETVAR vars bind bare vars, or any class slice through the coercion.
+//  - A premise side that is a LONE (possibly coerced) variable matches every term: never
+//    match that direction (equid / unidm-reversed junk flooded the caps).
+
+export {
+	RuEqzPlan(
+		provable  : bool,
+		rounds    : int,   // instantiation rounds actually run
+		instances : int,   // universal-premise instances admitted into the closure
+		premises  : int,   // universal equality premises offered (post head-filter)
+		overflow  : bool   // a cap fired (Mizar's LatOvfl analogue) — verdict only "not decided"
+	);
+
+	// Decide `goal` (a possibly ∀-closed equality) from ground equality hyps + the
+	// universal equality premises. stmtClass = the statement class of the theorem.
+	ruEqzPlanDecide(math : RuMath, env : RuEnv, stmtClass : int,
+		prems : [RuEqzPremise], hyps : [RuExp], goal : RuExp) -> RuEqzPlan;
+
+	// A universal equality premise, pre-split: ∀-stripped matrix sides + matrix vars.
+	RuEqzPremise(assId : int, lhs : RuExp, rhs : RuExp, vars : [int], foundational : bool);
+
+	// The premise set for a theorem: every ∀-closed (or class-var) equality assertion
+	// PRECEDING the theorem (the reachability soundness law). Article/import equalities
+	// wholesale; FOUNDATION (miz_set) equalities only in DEFINITIONAL shape (one
+	// constructor over distinct plain-var args — the df-pr/df-tp family the A-map reuse
+	// displaced the article defs onto) or STRUCTURAL shape (comm/assoc/idem of one
+	// constructor — Mizar carries these as constructor PROPERTIES, equalizer.pas).
+	// Wholesale foundation admission floods the caps (measured).
+	ruEqzScopePremises(math : RuMath, env : RuEnv, thInfo : RuDeclInfo) -> [RuEqzPremise];
+
+	ruEqzStripAlls(e : RuExp) -> RuExp;
+	ruEqzCoercionId(math : RuMath, env : RuEnv) -> int;
+	ruEqzMatch(term : [RuExpNode], pat : [RuExpNode], patVars : Set<int>, coId : int) -> Maybe<Tree<int, [RuExpNode]>>;
+	ruEqzApply(pat : [RuExpNode], bind : Tree<int, [RuExpNode]>, coId : int) -> Maybe<[RuExpNode]>;
+}
+
+// ---- caps (Mizar's LatOvfl/TrmOvfl analogues) -------------------------------
+
+ruEqzMaxRounds = 6;
+ruEqzMaxInstances = 1024;
+ruEqzMaxTerms = 4096;
+ruEqzMaxFoundPerRound = 128;
+
+// ---- small expression utilities ---------------------------------------------
+
+ruEqzStripAlls(e : RuExp) -> RuExp {
+	if (ruInHead(e) == s2id("wal") && ruInArity(e) == 2) ruEqzStripAlls((ruInArgs(e))[1]) else e;
+}
+
+// THE setvar->class coercion rule id, from the language's super-rule registry.
+ruEqzCoercionId(math : RuMath, env : RuEnv) -> int {
+	switch (ruSuperRule(tp2id_("setvar"), tp2id_("class"), math.decls.lang, env)) {
+		Some(r): r.info.id;
+		None(): -1;
+	}
+}
+
+ruEqzIsCoercionAt(nodes : [RuExpNode], i : int, coId : int) -> bool {
+	switch (nodes[i]) {
+		RuVar(__, __): false;
+		RuRuleNode(idT, __): ruIdType2Id(idT) == coId;
+	}
+}
+
+ruEqzVarAt(nodes : [RuExpNode], i : int) -> int {
+	switch (nodes[i]) { RuVar(id, __): id; RuRuleNode(__, __): -1; }
+}
+
+// Same constructor? Compare id+type+arity, IGNORE len (see header).
+ruEqzSameNode(a : RuExpNode, b : RuExpNode) -> bool {
+	switch (a) {
+		RuVar(__, __): a == b;
+		RuRuleNode(idT1, al1): switch (b) {
+			RuVar(__, __): false;
+			RuRuleNode(idT2, al2): idT1 == idT2 && ruArityLen2Arity(al1) == ruArityLen2Arity(al2);
+		}
+	}
+}
+
+// the node span of the subterm starting at i (1 + spans of its arguments; arity-driven,
+// so it stays correct on stale-len nodes)
+ruEqzSpan(nodes : [RuExpNode], i : int) -> int {
+	switch (nodes[i]) {
+		RuVar(__, __): 1;
+		RuRuleNode(__, al): {
+			fold(enumFromTo(1, ruArityLen2Arity(al)), 1, \acc, __ ->
+				acc + ruEqzSpan(nodes, i + acc));
+		}
+	}
+}
+
+// ---- matching: ground term against a premise-side pattern -------------------
+
+ruEqzMatch(term : [RuExpNode], pat : [RuExpNode], patVars : Set<int>, coId : int) -> Maybe<Tree<int, [RuExpNode]>> {
+	ruEqzDoMatch(term, 0, length(term), pat, 0, length(pat), patVars, coId, Some(makeTree()));
+}
+
+ruEqzDoMatch(term : [RuExpNode], ti : int, tEnd : int, pat : [RuExpNode], pi : int, pEnd : int,
+	patVars : Set<int>, coId : int, accM : Maybe<Tree<int, [RuExpNode]>>) -> Maybe<Tree<int, [RuExpNode]>> {
+	switch (accM) {
+		None(): None();
+		Some(acc): {
+			if (pi >= pEnd && ti >= tEnd) accM
+			else if (pi >= pEnd || ti >= tEnd) None()
+			else {
+				bindVar = \v : int, slice : [RuExpNode], pAdv : int, tAdv : int -> {
+					bound = switch (lookupTree(acc, v)) {
+						Some(old): if (old == slice) accM else None();
+						None(): Some(setTree(acc, v, slice));
+					}
+					switch (bound) {
+						None(): None();
+						Some(__): ruEqzDoMatch(term, ti + tAdv, tEnd, pat, pi + pAdv, pEnd, patVars, coId, bound);
+					}
+				}
+				coercedVar = ruEqzIsCoercionAt(pat, pi, coId) && pi + 1 < pEnd
+					&& containsSet(patVars, ruEqzVarAt(pat, pi + 1));
+				if (coercedVar) {
+					// coerced setvar: swallow the whole class term at ti
+					span = ruEqzSpan(term, ti);
+					bindVar(ruEqzVarAt(pat, pi + 1), subrange(term, ti, span), 2, span);
+				} else {
+					switch (pat[pi]) {
+						RuVar(vid, tpv): {
+							if (containsSet(patVars, vid)) {
+								if (tpv == tp2id_("class")) {
+									// a CLASS-typed matrix var is a true metavariable — any class slice
+									span = ruEqzSpan(term, ti);
+									bindVar(vid, subrange(term, ti, span), 1, span);
+								} else {
+									// a bare SETVAR matrix var: only a bare var slice can stand in
+									switch (term[ti]) {
+										RuVar(__, __): bindVar(vid, [term[ti]], 1, 1);
+										RuRuleNode(__, __): None();
+									}
+								}
+							} else if (term[ti] == pat[pi])
+								ruEqzDoMatch(term, ti + 1, tEnd, pat, pi + 1, pEnd, patVars, coId, accM)
+							else None();
+						}
+						RuRuleNode(__, __):
+							if (ruEqzSameNode(term[ti], pat[pi]))
+								ruEqzDoMatch(term, ti + 1, tEnd, pat, pi + 1, pEnd, patVars, coId, accM)
+							else None();
+					}
+				}
+			}
+		}
+	}
+}
+
+// apply a binding: coerced-setvar slices and class-var occurrences are replaced by the
+// bound slices; bare setvar occurrences only by single-var slices
+ruEqzApply(pat : [RuExpNode], bind : Tree<int, [RuExpNode]>, coId : int) -> Maybe<[RuExpNode]> {
+	ok = ref true;
+	built = ruEqzDoApply(pat, bind, coId, ok);
+	if (^ok) Some(ruEqzFixLens(built)) else None();
+}
+
+ruEqzDoApply(pat : [RuExpNode], bind : Tree<int, [RuExpNode]>, coId : int, ok : ref bool) -> [RuExpNode] {
+	out = fold(enumFromTo(0, length(pat) - 1), Pair([], 0), \acc : Pair<[[RuExpNode]], int>, j ->
+		if (j < acc.second) acc else {
+			coerced = ruEqzIsCoercionAt(pat, j, coId) && j + 1 < length(pat)
+				&& isSome(lookupTree(bind, ruEqzVarAt(pat, j + 1)));
+			if (coerced) {
+				slice = either(lookupTree(bind, ruEqzVarAt(pat, j + 1)), []);
+				Pair(arrayPush(acc.first, slice), j + 2);
+			} else {
+				n = switch (pat[j]) {
+					RuVar(vid, tpv): switch (lookupTree(bind, vid)) {
+						Some(slice): if (tpv == tp2id_("class") || length(slice) == 1) slice
+							else { ok := false; [pat[j]]; };
+						None(): [pat[j]];
+					}
+					RuRuleNode(__, __): [pat[j]];
+				}
+				Pair(arrayPush(acc.first, n), j + 1);
+			}
+		});
+	concatA(out.first);
+}
+
+// After splicing, rule nodes above a splice carry STALE lens; recompute
+// (len = span - 1: subst.flow reads subrange(nodes, 1, len)).
+ruEqzFixLens(nodes : [RuExpNode]) -> [RuExpNode] {
+	mapi(nodes, \i, n -> switch (n) {
+		RuVar(__, __): n;
+		RuRuleNode(idT, al): ruMakeRuleNode(ruIdType2Id(idT), ruIdType2Type(idT),
+			ruArityLen2Arity(al), ruEqzSpan(nodes, i) - 1);
+	});
+}
+
+// ---- scope premises ---------------------------------------------------------
+
+ruEqzInfer(a : RuAssertion) -> RuInference {
+	switch (a) { RuAxiom(__, i): i; RuCong(__, i): i; RuTheorem(__, i, __, __): i; RuDef(__, i, __, __): i; }
+}
+ruEqzInfo(a : RuAssertion) -> RuDeclInfo {
+	switch (a) { RuAxiom(i, __): i; RuCong(i, __): i; RuTheorem(i, __, __, __): i; RuDef(i, __, __, __): i; }
+}
+
+ruEqzScopePremises(math : RuMath, env : RuEnv, thInfo : RuDeclInfo) -> [RuEqzPremise] {
+	imported = ruVerifyImportedMap(math, env);
+	coId = ruEqzCoercionId(math, env);
+	walId = s2id("wal"); wexId = s2id("wex");
+	isFoundation = \src : int -> switch (lookupTree(math.sources, src)) {
+		Some(sc): { m = sc.info.module; m == "miz_set" || endsWith(m, "/miz_set"); }
+		None(): true;
+	}
+	// a "plain arg": a bare var, or the coercion over a var
+	argVar = \a : RuExp ->
+		if (length(a.nodes) == 1) ruEqzVarAt(a.nodes, 0)
+		else if (length(a.nodes) == 2 && ruEqzIsCoercionAt(a.nodes, 0, coId)) ruEqzVarAt(a.nodes, 1)
+		else -1;
+	// DEFINITIONAL: one constructor over pairwise-distinct plain-var args; rhs adds no vars
+	defShape = \lhs : RuExp, rhs : RuExp -> {
+		args = ruInArgs(lhs);
+		vs = map(args, argVar);
+		ruInArity(lhs) > 0 && forall(vs, \v -> v >= 0)
+			&& sizeSet(buildSet(vs)) == length(vs)
+			&& forall(ruInVarsOf(rhs), \v -> contains(vs, v.id));
+	}
+	// STRUCTURAL: comm/assoc/idem of ONE constructor (both sides only C + plain vars,
+	// C appearing 1-2 times per side); rhs vars within lhs vars
+	structSide = \side : RuExp, c : int -> {
+		cnt = fold(enumFromTo(0, length(side.nodes) - 1), Pair(0, true), \acc : Pair<int, bool>, i ->
+			if (!acc.second) acc
+			else if (ruEqzIsCoercionAt(side.nodes, i, coId)) acc
+			else switch (side.nodes[i]) {
+				RuVar(__, __): acc;
+				RuRuleNode(idT, __):
+					if (ruIdType2Id(idT) == c) Pair(acc.first + 1, true)
+					else Pair(acc.first, false);
+			});
+		if (cnt.second) cnt.first else -1;
+	}
+	structShape = \lhs : RuExp, rhs : RuExp -> {
+		c = ruInHead(lhs);
+		nl = structSide(lhs, c);
+		nr = structSide(rhs, c);
+		c >= 0 && c != coId && nl >= 1 && nl <= 2 && nr >= 0 && nr <= 2
+			&& forall(ruInVarsOf(rhs), \v -> exists(ruInVarsOf(lhs), \w -> w.id == v.id));
+	}
+	filtermap(getTreeValues(math.decls.assertions), \ass -> {
+		inf = ruEqzInfer(ass);
+		info = ruEqzInfo(ass);
+		if (inf.hyps != [] || inf.prop.exps == []) None()
+		else if (!ruDeclInfoPreceeds(info, thInfo, imported)) None()
+		else {
+			matrix = ruEqzStripAlls(ruExp(inf.prop.exps[0]));
+			if (ruInHead(matrix) != s2id("wceq") || ruInArity(matrix) != 2) None()
+			else if (exists(matrix.nodes, \n -> switch (n) {
+					RuVar(__, __): false;
+					RuRuleNode(idT, __): ruIdType2Id(idT) == walId || ruIdType2Id(idT) == wexId;
+				})) None()   // v1: no binders inside the matrix
+			else {
+				sides = ruInArgs(matrix);
+				found = isFoundation(info.src);
+				if (found && !defShape(sides[0], sides[1]) && !structShape(sides[0], sides[1])) None()
+				else {
+					vars = fold(matrix.nodes, makeSet(), \acc, n -> switch (n) {
+						RuVar(id, __): insertSet(acc, id);
+						RuRuleNode(__, __): acc;
+					});
+					Some(RuEqzPremise(info.id, sides[0], sides[1], set2array(vars), found));
+				}
+			}
+		}
+	});
+}
+
+// ---- the decision loop ------------------------------------------------------
+
+ruEqzPlanDecide(math : RuMath, env : RuEnv, stmtClass : int,
+	prems : [RuEqzPremise], hyps : [RuExp], goal : RuExp) -> RuEqzPlan {
+	matrix = ruEqzStripAlls(goal);
+	if (ruInHead(matrix) != s2id("wceq") || ruInArity(matrix) != 2)
+		RuEqzPlan(false, 0, 0, length(prems), false)
+	else {
+		gs = ruInArgs(matrix);
+		coId = ruEqzCoercionId(math, env);
+		// HEAD-RELEVANCE premise filter (our stand-in until by-refs are carried through
+		// translation — Mizar's by-list names its premises)
+		problemHeads = fold(concat([matrix], hyps), makeSet(), \acc, e ->
+			fold(e.nodes, acc, \a, n -> switch (n) {
+				RuVar(__, __): a;
+				RuRuleNode(idT, __): insertSet(a, ruIdType2Id(idT));
+			}));
+		relPrems0 = filter(prems, \p ->
+			containsSet(problemHeads, ruInHead(p.lhs)) || containsSet(problemHeads, ruInHead(p.rhs)));
+		// ARTICLE premises first: the instance cap is a shared budget, and the foundation's
+		// comm/assoc family generates instances at every subterm — admitted first it CROWDS
+		// OUT the article-def chains (measured: the k-functor theorems regressed from
+		// decided to open when the foundation was added). Mizar has no such contention
+		// because the by-list names few premises; ordering is our stand-in.
+		relPrems = mergeSort(relPrems0, \a, b -> b2i(a.foundational) - b2i(b.foundational));
+		rules = ruCongRulesCached(math);
+		hypFacts = filtermap(hyps, \h -> {
+			hm = ruEqzStripAlls(h);
+			if (ruInHead(hm) == s2id("wceq") && ruInArity(hm) == 2
+				&& !exists(hm.nodes, \n -> switch (n) { RuVar(__, __): false; RuRuleNode(idT, __): ruIdType2Id(idT) == s2id("wal"); }))
+				Some(Pair(RuProofHyp(-1, RuStmt(stmtClass, [hm], -1)), hm))
+			else None();
+		});
+		terms0 = concat([gs[0], gs[1]], concatA(map(hypFacts, \f -> ruInArgs(f.second))));
+		decideLoop(math, env, stmtClass, relPrems, rules, coId, hypFacts, terms0, 0, gs);
+	}
+}
+
+decideLoop(math : RuMath, env : RuEnv, stmtClass : int, prems : [RuEqzPremise],
+	rules : Tree<int, [RuCongRule]>, coId : int, facts : [Pair<RuProofTree, RuExp>], terms : [RuExp],
+	round : int, gs : [RuExp]) -> RuEqzPlan {
+	st = ruCongClose(rules, facts, terms, stmtClass, math, env);
+	if (ruCongEqual(st, gs[0], gs[1]))
+		RuEqzPlan(true, round, length(facts), length(prems), false)
+	else if (round >= ruEqzMaxRounds)
+		RuEqzPlan(false, round, length(facts), length(prems), false)
+	else {
+		subs = ruEqzSubterms(terms);
+		if (length(subs) > ruEqzMaxTerms)
+			RuEqzPlan(false, round, length(facts), length(prems), true)
+		else {
+			seen0 = buildSet(map(facts, \f -> f.second.nodes));
+			wceqW = tp2id_("wff");
+			foundCnt = ref 0;   // per-round foundation-instance budget (comm/assoc fan out hard)
+			newFacts = fold(prems, Pair([], seen0), \acc : Pair<[Pair<RuProofTree, RuExp>], Set<[RuExpNode]>>, p -> {
+				pv = buildSet(p.vars);
+				// only match STRUCTURED sides — a lone-(coerced-)var side matches everything
+				sides = filter([Pair(p.lhs, p.rhs), Pair(p.rhs, p.lhs)], \sd ->
+					!(length(sd.first.nodes) == 1
+						|| (length(sd.first.nodes) == 2 && ruEqzIsCoercionAt(sd.first.nodes, 0, coId))));
+				fold(sides, acc, \ac, side ->
+					fold(subs, ac, \a : Pair<[Pair<RuProofTree, RuExp>], Set<[RuExpNode]>>, t -> {
+						if (length(a.first) + length(facts) > ruEqzMaxInstances
+							|| (p.foundational && ^foundCnt > ruEqzMaxFoundPerRound)) a else
+						switch (ruEqzMatch(t.nodes, side.first.nodes, pv, coId)) {
+							None(): a;
+							Some(bind): {
+								if (exists(p.vars, \v -> !containsKeyTree(bind, v))) a
+								else switch (ruEqzApply(side.second.nodes, bind, coId)) {
+									None(): a;
+									Some(otherNodes): {
+										inst = ruFwdMkRule(s2id("wceq"), wceqW,
+											[RuExp(t.nodes, -1), RuExp(otherNodes, -1)]);
+										if (containsSet(a.second, inst.nodes)) a
+										else {
+											if (p.foundational) foundCnt := ^foundCnt + 1 else {};
+											Pair(arrayPush(a.first,
+												Pair(RuProofHyp(-1, RuStmt(stmtClass, [inst], -1)), inst)),
+												insertSet(a.second, inst.nodes));
+										}
+									}
+								}
+							}
+						}
+					}));
+			});
+			if (env.conf.verbose > 2) {
+				iter(take(newFacts.first, 100), \f -> env.out.println("      inst: " + ru2s(f.second, math)));
+				env.out.println("      round " + i2s(round) + ": +" + i2s(length(newFacts.first)) + " instances, " + i2s(length(subs)) + " subterms");
+			} else {};
+			if (newFacts.first == [])
+				RuEqzPlan(false, round, length(facts), length(prems), length(facts) >= ruEqzMaxInstances)
+			else {
+				facts1 = concat(facts, newFacts.first);
+				terms1 = concat(terms, concatA(map(newFacts.first, \f -> ruInArgs(f.second))));
+				decideLoop(math, env, stmtClass, prems, rules, coId, facts1, terms1, round + 1, gs);
+			}
+		}
+	}
+}
+
+// all subterm slices (as RuExps) of the given terms, deduped
+ruEqzSubterms(terms : [RuExp]) -> [RuExp] {
+	collected = fold(terms, Pair(makeSet(), []), \acc : Pair<Set<[RuExpNode]>, [RuExp]>, t ->
+		ruEqzCollectSubs(t.nodes, 0, acc));
+	collected.second;
+}
+
+ruEqzCollectSubs(nodes : [RuExpNode], i : int, acc : Pair<Set<[RuExpNode]>, [RuExp]>) -> Pair<Set<[RuExpNode]>, [RuExp]> {
+	if (i >= length(nodes)) acc
+	else {
+		span = ruEqzSpan(nodes, i);
+		slice = subrange(nodes, i, span);
+		acc1 = if (containsSet(acc.first, slice)) acc
+			else Pair(insertSet(acc.first, slice), arrayPush(acc.second, RuExp(slice, -1)));
+		ruEqzCollectSubs(nodes, i + 1, acc1);
+	}
+}

@@ -1,0 +1,98 @@
+import ru/prover/tactics/equalizer_plan;
+import ru/math;
+import comm;
+import base/ids;
+
+// EQUALIZER-PROBE — measure the Equalizer planner's DECISION coverage over one
+// article's theorems, with no PVT and no proof construction: for each theorem whose
+// (∀-stripped) statement is an equality, run the planner's decision core
+// (ruEqzPlanDecide) against the article-scope universal equality premises. This is the
+// acceptance instrument for the Equalizer planner (the enumset1 class): it answers
+// "does the transcribed Mizar Equate+instantiation DECIDE these goals?" before any
+// executor wiring exists.
+//
+//   russellj no-server=1 <read the article first> equalizer-probe target=enumset1
+
+export {
+	ruCommEqualizerProbe : RuComm;
+}
+
+ruCommEqualizerProbe = RuComm(
+	RuCommInfo(
+		"equalizer-probe", "prover",
+		"measure the Equalizer planner's decision coverage over an article's equality theorems",
+		"target", false, false,
+		[RuCommArg("target", false, "the article source module (e.g. enumset1)", "")],
+		[RuCommRet("equalizer-probe.decided", "int", "equality theorems the planner decides"),
+		 RuCommRet("equalizer-probe.eq-goals", "int", "theorems whose statement is an equality"),
+		 RuCommRet("equalizer-probe.total", "int", "theorems in the article")]
+	),
+	ruRunEqualizerProbe
+);
+
+ruRunEqualizerProbe(unit : RuUnit) -> Maybe<RuState> {
+	env   = ruUnitEnv(unit);
+	state = unit.state;
+	math  = ruMathFromSources(state.ru, env);
+	target = ruTaskStringArg(unit.task, "target", "");
+	srcM = switch (lookupTree(math.sources, s2id(target))) {
+		Some(s): Some(s);
+		None(): foldTree(math.sources, None(), \__, s, acc ->
+			if (isSome(acc)) acc
+			else if (s.info.module == target || endsWith(s.info.module, "/" + target)) Some(s) else acc);
+	}
+	switch (srcM) {
+		None(): {
+			env.out.error("equalizer-probe: source '" + target + "' is not loaded", []);
+			Some(state);
+		}
+		Some(src): {
+			theorems = filtermap(src.decls, \d -> switch (d) {
+				RuTheorem(__, __, __, __): Some(d);
+				default: None();
+			});
+			timer = ruMakeTimer();
+			counts = fold(theorems, Pair(0, 0), \acc : Pair<int, int>, th -> {
+				prop = ruExp(th.infer.prop.exps[0]);
+				matrix = ruEqzStripAlls(prop);
+				isEq = ruInHead(matrix) == s2id("wceq") && ruInArity(matrix) == 2;
+				if (!isEq) {
+					if (ruVerbose(env.conf) > 1) {
+						env.out.println("  - " + id2s(th.info.id) + ": not an equality goal");
+					}
+					acc;
+				} else {
+					prems = ruEqzScopePremises(math, env, th.info);
+					if (ruVerbose(env.conf) > 1) {
+						gm = ruEqzStripAlls(prop);
+						gss = ruInArgs(gm);
+						env.out.println("  == " + id2s(th.info.id) + " goal: " + ru2s(gm, math)
+							+ "  lhsHead=" + id2s(ruInHead(gss[0])) + " rhsHead=" + id2s(ruInHead(gss[1])));
+
+					}
+					hyps = map(th.infer.hyps, \h -> ruExp(h.stmt.exps[0]));
+					plan = ruEqzPlanDecide(math, env, th.infer.prop.class, prems, hyps, prop);
+					if (ruVerbose(env.conf) > 0) {
+						env.out.println("  " + (if (plan.provable) "+ " else "- ") + id2s(th.info.id)
+							+ (if (plan.provable) " DECIDED" else " open")
+							+ " (rounds=" + i2s(plan.rounds) + ", instances=" + i2s(plan.instances)
+							+ ", premises=" + i2s(plan.premises)
+							+ (if (plan.overflow) ", OVERFLOW" else "") + ")");
+					}
+					Pair(acc.first + (if (plan.provable) 1 else 0), acc.second + 1);
+				}
+			});
+			env.out.println("equalizer-probe [" + target + "]: decided " + i2s(counts.first)
+				+ " of " + i2s(counts.second) + " equality goals (" + i2s(length(theorems))
+				+ " theorems) in " + ruTimePassed2s(timer));
+			Some(RuState(state with
+				vars = setTree(state.vars, "equalizer-probe", pairs2tree([
+					Pair("decided", flow(counts.first)),
+					Pair("eq-goals", flow(counts.second)),
+					Pair("total", flow(length(theorems))),
+					Pair("time", flow(ruTimePassed(timer)))
+				]))
+			));
+		}
+	}
+}
