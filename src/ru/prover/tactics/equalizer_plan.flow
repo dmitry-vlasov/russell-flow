@@ -54,7 +54,14 @@ export {
 		instances : int,   // universal-premise instances admitted into the closure
 		premises  : int,   // universal equality premises offered (post head-filter)
 		overflow  : bool,  // a cap fired (Mizar's LatOvfl analogue) — verdict only "not decided"
-		route     : [RuEqzRouteFact]  // provable only: the closure-explain's USED facts, in leaf order
+		route     : [RuEqzRouteFact],  // provable only: the closure-explain's USED facts, in leaf order
+		// The ASSEMBLED PROOF (the direct generator, pre-tactic): the explain tree with
+		// every route-fact leaf spliced — hyp fact → the theorem's hyp leaf, setvar-only
+		// premise instance → a 0-ref application step (the verifier reconstructs the
+		// substitution from the statement). None when the goal was ∀-stripped, a hyp
+		// fact was ∀-stripped, an instance is classBound, or the route uses an elem-eq
+		// (the extensionality builder is not written yet).
+		proof     : Maybe<RuProofTree>
 	);
 
 	// A fact admitted into the closure, with its PROVENANCE — the plan-extraction
@@ -69,8 +76,10 @@ export {
 	//                  (both membership characterizations + the ⋁-permutation bridge).
 	RuEqzRouteFact(exp : RuExp, src : RuEqzRouteFactSrc);
 	RuEqzRouteFactSrc ::= RuEqzSrcHyp, RuEqzSrcPremise, RuEqzSrcElems;
-		RuEqzSrcHyp(idx : int);
-		RuEqzSrcPremise(assId : int, bind : Tree<int, [RuExpNode]>, classBound : bool);
+		RuEqzSrcHyp(idx : int, direct : bool);   // direct = the hyp was not ∀-stripped
+		RuEqzSrcPremise(assId : int, bind : Tree<int, [RuExpNode]>, classBound : bool,
+			flipped : bool,    // instance matched the premise's RHS: replay = application + eqcomi
+			stripped : bool);  // premise was ∀-closed: replay needs an instantiation chain (not yet)
 		RuEqzSrcElems(a : RuExp, b : RuExp);
 
 	// Decide `goal` (a possibly ∀-closed equality) from ground equality hyps + the
@@ -80,7 +89,8 @@ export {
 		hyps : [RuExp], goal : RuExp) -> RuEqzPlan;
 
 	// A universal equality premise, pre-split: ∀-stripped matrix sides + matrix vars.
-	RuEqzPremise(assId : int, lhs : RuExp, rhs : RuExp, vars : [int], foundational : bool);
+	RuEqzPremise(assId : int, lhs : RuExp, rhs : RuExp, vars : [int], foundational : bool,
+		stripped : bool);   // the matrix was ∀-stripped from the assertion's prop
 
 	// The premise set for a theorem: every ∀-closed (or class-var) equality assertion
 	// PRECEDING the theorem (the reachability soundness law). Article/import equalities
@@ -342,7 +352,8 @@ ruEqzScopePremises(math : RuMath, env : RuEnv, thInfo : RuDeclInfo) -> [RuEqzPre
 						RuVar(id, __): insertSet(acc, id);
 						RuRuleNode(__, __): acc;
 					});
-					Some(RuEqzPremise(info.id, sides[0], sides[1], set2array(vars), found));
+					Some(RuEqzPremise(info.id, sides[0], sides[1], set2array(vars), found,
+						matrix.nodes != (ruExp(inf.prop.exps[0])).nodes));
 				}
 			}
 		}
@@ -608,6 +619,37 @@ ruEqzElemFacts(rules : Tree<int, [RuEqzElemRule]>, st : RuCongSt, subs : [RuExp]
 	}
 }
 
+// ---- proof assembly (the direct generator) -----------------------------------
+
+// Splice every route-fact leaf of the explain tree into a real proof node.
+// None = a fact kind the generator cannot replay yet.
+ruEqzSpliceProof(tr : RuProofTree, facts : [RuEqzRouteFact]) -> Maybe<RuProofTree> {
+	switch (tr) {
+		RuProofHyp(i, stmt):
+			if (i < 0 || i >= length(facts)) None()
+			else switch (facts[i].src) {
+				RuEqzSrcHyp(idx, direct): if (direct) Some(RuProofHyp(idx, stmt)) else None();
+				RuEqzSrcPremise(assId, __, cb, flipped, stripped):
+					if (cb || stripped) None()
+					else if (!flipped) Some(RuProofStep(assId, [], stmt))
+					else {
+						// the instance matched the premise's RHS — the assertion proves the
+						// SWAPPED equality; bridge with eqcomi (A = B ⊢ B = A)
+						sds = ruInArgs(facts[i].exp);
+						swapped = ruFwdMkRule(s2id("wceq"), tp2id_("wff"), [sds[1], sds[0]]);
+						Some(RuProofStep(s2id("eqcomi"),
+							[RuProofStep(assId, [], RuStmt(stmt with exps = [swapped]))], stmt));
+					}
+				RuEqzSrcElems(__, __): None();
+			}
+		RuProofStep(ass, ch, stmt): {
+			chM = fold(ch, Some([]), \acc : Maybe<[RuProofTree]>, c -> maybeBind(acc, \arr ->
+				maybeMap(ruEqzSpliceProof(c, facts), \cc -> arrayPush(arr, cc))));
+			maybeMap(chM, \cc -> RuProofStep(ass, cc, stmt));
+		}
+	}
+}
+
 // ---- route extraction --------------------------------------------------------
 
 // The route = the facts the goal's explain chain actually USES, in first-use leaf
@@ -636,7 +678,7 @@ ruEqzPlanDecide(math : RuMath, env : RuEnv, stmtClass : int,
 	hyps : [RuExp], goal : RuExp) -> RuEqzPlan {
 	matrix = ruEqzStripAlls(goal);
 	if (ruInHead(matrix) != s2id("wceq") || ruInArity(matrix) != 2)
-		RuEqzPlan(false, 0, 0, length(prems), false, [])
+		RuEqzPlan(false, 0, 0, length(prems), false, [], None())
 	else {
 		gs = ruInArgs(matrix);
 		coId = ruEqzCoercionId(math, env);
@@ -660,31 +702,37 @@ ruEqzPlanDecide(math : RuMath, env : RuEnv, stmtClass : int,
 			hm = ruEqzStripAlls(h);
 			if (ruInHead(hm) == s2id("wceq") && ruInArity(hm) == 2
 				&& !exists(hm.nodes, \n -> switch (n) { RuVar(__, __): false; RuRuleNode(idT, __): ruIdType2Id(idT) == s2id("wal"); }))
-				Some(RuEqzRouteFact(hm, RuEqzSrcHyp(i)))
+				Some(RuEqzRouteFact(hm, RuEqzSrcHyp(i, hm.nodes == h.nodes)))
 			else None();
 		});
 		terms0 = concat([gs[0], gs[1]], concatA(map(hypFacts, \f -> ruInArgs(f.exp))));
-		decideLoop(math, env, stmtClass, relPrems, elemRules, rules, coId, hypFacts, terms0, 0, gs);
+		goalDirect = matrix.nodes == goal.nodes;
+		decideLoop(math, env, stmtClass, relPrems, elemRules, rules, coId, hypFacts, terms0, 0, gs, goalDirect);
 	}
 }
 
 decideLoop(math : RuMath, env : RuEnv, stmtClass : int, prems : [RuEqzPremise],
 	elemRules : Tree<int, [RuEqzElemRule]>,
 	rules : Tree<int, [RuCongRule]>, coId : int, facts : [RuEqzRouteFact], terms : [RuExp],
-	round : int, gs : [RuExp]) -> RuEqzPlan {
+	round : int, gs : [RuExp], goalDirect : bool) -> RuEqzPlan {
 	// the closure's facts are INDEXED placeholder hyps, so an explain tree maps its
 	// leaves straight back to provenance-carrying facts (route extraction)
 	pairs = mapi(facts, \i, f -> Pair(RuProofHyp(i, RuStmt(stmtClass, [f.exp], -1)), f.exp));
 	st = ruCongClose(rules, pairs, terms, stmtClass, math, env);
-	if (ruCongEqual(st, gs[0], gs[1]))
-		RuEqzPlan(true, round, length(facts), length(prems), false,
-			ruEqzExtractRoute(st, gs, facts))
-	else if (round >= ruEqzMaxRounds)
-		RuEqzPlan(false, round, length(facts), length(prems), false, [])
+	if (ruCongEqual(st, gs[0], gs[1])) {
+		explM = ruCongExplain(st, gs[0], gs[1]);
+		route = switch (explM) {
+			None(): [];
+			Some(tr): map(ruEqzRouteWalk(tr, Pair([], makeSet())).first, \i -> facts[i]);
+		}
+		prf = if (!goalDirect) None() else maybeBind(explM, \tr -> ruEqzSpliceProof(tr, facts));
+		RuEqzPlan(true, round, length(facts), length(prems), false, route, prf);
+	} else if (round >= ruEqzMaxRounds)
+		RuEqzPlan(false, round, length(facts), length(prems), false, [], None())
 	else {
 		subs = ruEqzSubterms(terms);
 		if (length(subs) > ruEqzMaxTerms)
-			RuEqzPlan(false, round, length(facts), length(prems), true, [])
+			RuEqzPlan(false, round, length(facts), length(prems), true, [], None())
 		else {
 			seen00 = buildSet(map(facts, \f -> f.exp.nodes));
 			// definition consumption: terms whose canonical element sets coincide are equal
@@ -729,8 +777,10 @@ decideLoop(math : RuMath, env : RuEnv, stmtClass : int, prems : [RuEqzPremise],
 											} else {};
 											classBound = foldTree(bind, false, \v, sl, cb -> cb
 												|| (lookupTreeDef(varTps, v, -1) == setvarT && !plainSlice(sl)));
+											flipped = side.first.nodes == p.rhs.nodes;
 											Pair(arrayPush(a.first,
-												RuEqzRouteFact(inst, RuEqzSrcPremise(p.assId, bind, classBound))),
+												RuEqzRouteFact(inst, RuEqzSrcPremise(p.assId, bind,
+													classBound, flipped, p.stripped))),
 												insertSet(a.second, inst.nodes));
 										}
 									}
@@ -747,11 +797,11 @@ decideLoop(math : RuMath, env : RuEnv, stmtClass : int, prems : [RuEqzPremise],
 			} else {};
 			combined = concat(elemFacts, newFacts.first);
 			if (combined == [])
-				RuEqzPlan(false, round, length(facts), length(prems), length(facts) >= ruEqzMaxInstances, [])
+				RuEqzPlan(false, round, length(facts), length(prems), length(facts) >= ruEqzMaxInstances, [], None())
 			else {
 				facts1 = concat(facts, combined);
 				terms1 = concat(terms, concatA(map(newFacts.first, \f -> ruInArgs(f.exp))));
-				decideLoop(math, env, stmtClass, prems, elemRules, rules, coId, facts1, terms1, round + 1, gs);
+				decideLoop(math, env, stmtClass, prems, elemRules, rules, coId, facts1, terms1, round + 1, gs, goalDirect);
 			}
 		}
 	}

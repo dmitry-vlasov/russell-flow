@@ -1,4 +1,5 @@
 import ru/prover/tactics/equalizer_plan;
+import ru/verify/math;
 import ru/math;
 import comm;
 import base/ids;
@@ -22,7 +23,8 @@ ruCommEqualizerProbe = RuComm(
 		"equalizer-probe", "prover",
 		"measure the Equalizer planner's decision coverage over an article's equality theorems",
 		"target", false, false,
-		[RuCommArg("target", false, "the article source module (e.g. enumset1)", "")],
+		[RuCommArg("target", false, "the article source module (e.g. enumset1)", ""),
+		 RuCommArg("th", true, "probe only this theorem (name), e.g. t6_xboole_1", "")],
 		[RuCommRet("equalizer-probe.decided", "int", "equality theorems the planner decides"),
 		 RuCommRet("equalizer-probe.eq-goals", "int", "theorems whose statement is an equality"),
 		 RuCommRet("equalizer-probe.total", "int", "theorems in the article")]
@@ -47,8 +49,10 @@ ruRunEqualizerProbe(unit : RuUnit) -> Maybe<RuState> {
 			Some(state);
 		}
 		Some(src): {
+			thName = ruTaskStringArg(unit.task, "th", "");
 			theorems = filtermap(src.decls, \d -> switch (d) {
-				RuTheorem(__, __, __, __): Some(d);
+				RuTheorem(info, __, __, __):
+					if (thName == "" || id2s(info.id) == thName) Some(d) else None();
 				default: None();
 			});
 			timer = ruMakeTimer();
@@ -57,6 +61,9 @@ ruRunEqualizerProbe(unit : RuUnit) -> Maybe<RuState> {
 			// element-set equality (needs the extensionality builder); classBound = a setvar
 			// premise var bound to a class slice (needs ax-gen + spcv re-generalization)
 			rtElems = ref 0; rtClass = ref 0; rtPure = ref 0;
+			// the direct generator's scoreboard: assembled+verified vs assembled-but-REJECTED
+			// (a rejection = the assembly or the route itself is wrong — must stay 0)
+			asmOk = ref 0; asmBad = ref 0;
 			counts = fold(theorems, Pair(0, 0), \acc : Pair<int, int>, th -> {
 				prop = ruExp(th.infer.prop.exps[0]);
 				matrix = ruEqzStripAlls(prop);
@@ -107,17 +114,57 @@ ruRunEqualizerProbe(unit : RuUnit) -> Maybe<RuState> {
 					nElems = length(filter(plan.route, \f -> switch (f.src) {
 						RuEqzSrcElems(__, __): true; default: false; }));
 					nClass = length(filter(plan.route, \f -> switch (f.src) {
-						RuEqzSrcPremise(__, __, cb): cb; default: false; }));
+						RuEqzSrcPremise(__, __, cb, __, __): cb; default: false; }));
 					if (plan.provable) {
 						if (nElems > 0) rtElems := ^rtElems + 1 else {};
 						if (nClass > 0) rtClass := ^rtClass + 1 else {};
 						if (nElems == 0 && nClass == 0) rtPure := ^rtPure + 1 else {};
 					} else {};
+					if (ruVerbose(env.conf) > 2 && plan.provable) {
+						iter(plan.route, \f -> env.out.println("      route: " + ru2s(f.exp, math)
+							+ "  " + switch (f.src) {
+								RuEqzSrcHyp(ix, dr): "hyp " + i2s(ix) + (if (dr) "" else " STRIPPED");
+								RuEqzSrcPremise(aid, __, cb, fl, st): "prem " + id2s(aid)
+									+ (if (cb) " CLASSBOUND" else "") + (if (fl) " FLIPPED" else "")
+									+ (if (st) " STRIPPED" else "");
+								RuEqzSrcElems(__, __): "elems";
+							}));
+					} else {};
+					// verify the assembled proof (the direct generator) against the
+					// theorem's own hyps and prop — the same check the library verify runs
+					asmV = switch (plan.proof) {
+						None(): false;
+						Some(tr): {
+							steps = ruMakeLinearProof(tr);
+							extra = differenceSets(
+								fold(steps, makeSet(), \a, st -> mergeSets(a, ruStmt2Vars(st.stmt))),
+								fold(th.infer.hyps, ruStmt2Vars(th.infer.prop), \a, h ->
+									mergeSets(a, ruStmt2Vars(h.stmt))));
+							prf = RuProof(RuVarsDisjs(values2tree(set2array(extra), \v -> v.id),
+								makeSet()), steps, -1);
+							res = ruVerifyProof(prf, th.infer.hyps, th.infer.prop, math, env);
+							ok = res.errs == [];
+							if (ok) asmOk := ^asmOk + 1 else {
+								asmBad := ^asmBad + 1;
+								if (ruVerbose(env.conf) > 3) {
+									// raw structural dump — ruVerifyErr2s crashes its expression
+									// printer on some malformed-step errors
+									iter(res.errs, \e -> env.out.println("      asm verify err raw ["
+										+ id2s(th.info.id) + "]: " + strLeft(toString(e), 600)));
+								} else if (ruVerbose(env.conf) > 1) {
+									iter(res.errs, \e -> env.out.println("      asm verify err ["
+										+ id2s(th.info.id) + "]: " + ruVerifyErr2s(e, math)));
+								} else {};
+							}
+							ok;
+						}
+					}
 					if (ruVerbose(env.conf) > 0) {
 						env.out.println("  " + (if (plan.provable) "+ " else "- ") + id2s(th.info.id)
 							+ (if (plan.provable) " DECIDED" else " open")
 							+ " (rounds=" + i2s(plan.rounds) + ", instances=" + i2s(plan.instances)
 							+ ", premises=" + i2s(plan.premises)
+							+ (if (asmV) " ASSEMBLED+VERIFIED" else if (isSome(plan.proof)) " ASSEMBLY-REJECTED" else "")
 							+ (if (plan.provable) ", route=" + i2s(length(plan.route))
 								+ (if (nElems > 0) " elems=" + i2s(nElems) else "")
 								+ (if (nClass > 0) " classBound=" + i2s(nClass) else "") else "")
@@ -131,6 +178,8 @@ ruRunEqualizerProbe(unit : RuUnit) -> Maybe<RuState> {
 				+ " theorems) in " + ruTimePassed2s(timer));
 			env.out.println("  routes: pure " + i2s(^rtPure) + ", with elem-eqs " + i2s(^rtElems)
 				+ ", with class-bound instances " + i2s(^rtClass));
+			env.out.println("  direct generator: assembled+verified " + i2s(^asmOk)
+				+ ", REJECTED " + i2s(^asmBad));
 			Some(RuState(state with
 				vars = setTree(state.vars, "equalizer-probe", pairs2tree([
 					Pair("decided", flow(counts.first)),
