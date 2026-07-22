@@ -1,0 +1,179 @@
+import ru/prover/tactics/equalizer_plan;
+import ru/prover/tactics/unfold;
+import ru/prover/tactics/hilbert;
+
+// THE EXTENSIONALITY BUILDER — proofs for the Equalizer's elem-eq facts.
+//
+// An elem-eq (a = b) is justified by coinciding element sets. The proof, v1
+// (composite–composite: both sides characterized by SOURCE-A membership biconds —
+// the elun/elpr/elsn family; the means-def k-term route comes separately):
+//
+//   for a FRESH setvar x, emit as FACTS the membership-bicond instances
+//     (x ∈ T) ↔ rhs(T)   for a, b and every mem-arg subterm,
+//   with setness hypotheses discharged by the mechanical setness prover; then the
+//   COMPLETE propositional certificate proves (x∈a ↔ x∈b) from those facts (the
+//   composition/⋁-permutation happens propositionally — no orbi chains built by
+//   hand), and eqriv (hyp (x∈A ↔ x∈B) ⊢ A=B, DV(A,x)+DV(B,x)) closes a = b.
+//
+// Returns the proof tree + the DV provisos the enclosing proof must declare
+// (eqriv's instantiated DVs + whatever the certificate introduced).
+
+export {
+	ruEqzElemEqProof(math : RuMath, env : RuEnv, stmtClass : int,
+		a : RuExp, b : RuExp) -> Maybe<Pair<RuProofTree, Set<RuDisj>>>;
+}
+
+ruEqzElemEqProof(math : RuMath, env : RuEnv, stmtClass : int,
+	a : RuExp, b : RuExp) -> Maybe<Pair<RuProofTree, Set<RuDisj>>> {
+	coId = ruEqzCoercionId(math, env);
+	wffT = tp2id_("wff");
+	// the fresh setvar: a name no translated article uses; type/coercion node harvested
+	// from the sides' own coerced occurrences
+	usedIds = fold(concat(a.nodes, b.nodes), makeSet(), \acc, n -> switch (n) {
+		RuVar(id, __): insertSet(acc, id);
+		RuRuleNode(__, __): acc;
+	});
+	tpAndCo = ruEqzXTemplate(concat(a.nodes, b.nodes), coId);
+	switch (tpAndCo) {
+		None(): None();
+		Some(tc): {
+			xId = ruEqzFreshName(usedIds, 0);
+			xVar = RuVar(xId, tc.first);
+			xExp = RuExp([tc.second, xVar], -1);
+			// bicond facts for both sides
+			factsM = ruEqzCharFacts(math, env, stmtClass, coId, xExp, a,
+				ruEqzCharFacts(math, env, stmtClass, coId, xExp, b, Some([])));
+			switch (factsM) {
+				None(): None();
+				Some(facts): {
+					atomA = ruFwdMkRule(s2id("wcel"), wffT, [xExp, a]);
+					atomB = ruFwdMkRule(s2id("wcel"), wffT, [xExp, b]);
+					g = ruFwdMkRule(s2id("wb"), wffT, [atomA, atomB]);
+					em = RuEnvMath(math, env);
+					switch (ruHilbertCertificateTimed(em, ruPConnectives(), wffT, stmtClass,
+							map(facts, \f -> f.first), g, 2000.0, None())) {
+						None(): None();
+						Some(cert): {
+							spliced = ruUnfoldSplice(cert.first, 0, map(facts, \f -> f.second));
+							concl = RuStmt(stmtClass, [ruFwdMkRule(s2id("wceq"), wffT, [a, b])], -1);
+							// eqriv's instantiated DV: x against every var of A and of B
+							dvs = fold(set2array(fold(concat(a.nodes, b.nodes), makeSet(), \acc, n ->
+								switch (n) {
+									RuVar(id, tp): insertSet(acc, RuVar(id, tp));
+									RuRuleNode(__, __): acc;
+								})), cert.second.disjs, \acc, v -> insertSet(acc, RuDisj(v, xVar)));
+							Some(Pair(
+								RuProofStep(s2id("eqriv"), [spliced], concl),
+								dvs));
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// find the setvar type + a coercion rule node to clone, from any coerced occurrence
+ruEqzXTemplate(nodes : [RuExpNode], coId : int) -> Maybe<Pair<int, RuExpNode>> {
+	fold(enumFromTo(0, length(nodes) - 2), None(), \acc : Maybe<Pair<int, RuExpNode>>, i ->
+		if (isSome(acc)) acc
+		else if (ruEqzIsCoercionAt(nodes, i, coId)) {
+			switch (nodes[i + 1]) {
+				RuVar(__, tp): Some(Pair(tp, nodes[i]));
+				RuRuleNode(__, __): acc;
+			}
+		} else acc);
+}
+
+ruEqzFreshName(used : Set<int>, i : int) -> int {
+	id = s2id("xqz" + i2s(i));
+	if (containsSet(used, id)) ruEqzFreshName(used, i + 1) else id;
+}
+
+// Emit the membership-bicond FACT instances for term t and (recursively) its mem-arg
+// subterms: each fact = (instance bicond expression, its proof — the source-A lemma
+// applied 0-ref-style with setness hyps discharged). None = a term in the chain has no
+// DV-free source-A characterization (k-terms decline here; their route is the means-def).
+ruEqzCharFacts(math : RuMath, env : RuEnv, stmtClass : int, coId : int, xExp : RuExp,
+	t : RuExp, accM : Maybe<[Pair<RuExp, RuProofTree>]>) -> Maybe<[Pair<RuExp, RuProofTree>]> {
+	switch (accM) {
+		None(): None();
+		Some(acc): {
+			h = ruInHead(t);
+			ar = ruInArity(t);
+			rules = ruEqzElemRulesAll(math, env);
+			switch (find(lookupTreeDef(rules, h, []), \rl -> rl.arity == ar)) {
+				None(): None();
+				Some(rl): {
+					switch (ruEqzCharFact(math, env, stmtClass, coId, xExp, t, rl)) {
+						None(): None();
+						Some(fact): {
+							args = ruInArgs(t);
+							fold(rl.memArgs, Some(arrayPush(acc, fact)), \a2, j ->
+								ruEqzCharFacts(math, env, stmtClass, coId, xExp, args[j], a2));
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+ruEqzCharFact(math : RuMath, env : RuEnv, stmtClass : int, coId : int, xExp : RuExp,
+	t : RuExp, rl : RuEqzElemRule) -> Maybe<Pair<RuExp, RuProofTree>> {
+	switch (lookupTree(math.decls.assertions, rl.assId)) {
+		None(): None();
+		Some(ass): {
+			inf = switch (ass) {
+				RuAxiom(__, i): i; RuCong(__, i): i;
+				RuTheorem(__, i, __, __): i; RuDef(__, i, __, __): i;
+			};
+			if (inf.prop.exps == [] || !isEmptySet(inf.vars.disjs)) None()
+			else {
+				prop = ruEqzStripAlls(ruExp(inf.prop.exps[0]));
+				// SOURCE A only: bicond headed by a membership lhs (means-defs decline)
+				if (ruInHead(prop) != s2id("wb")) None()
+				else {
+					lhs = (ruInArgs(prop))[0];
+					if (ruInHead(lhs) != s2id("wcel")) None()
+					else {
+						lemVars = fold(prop.nodes, makeSet(), \acc, n -> switch (n) {
+							RuVar(id, __): insertSet(acc, id);
+							RuRuleNode(__, __): acc;
+						});
+						atom = ruFwdMkRule(s2id("wcel"), tp2id_("wff"), [xExp, t]);
+						switch (ruEqzMatch(atom.nodes, lhs.nodes, lemVars, coId)) {
+							None(): None();
+							Some(bind): switch (ruEqzApply(prop.nodes, bind, coId)) {
+								None(): None();
+								Some(instNodes): {
+									inst = RuExp(instNodes, -1);
+									// discharge the setness hyps (`T ∈ _V`) mechanically
+									reg = ruSetnessRegistry(math);
+									hypProofs = fold(inf.hyps, Some([]), \hacc : Maybe<[RuProofTree]>, hyp ->
+										maybeBind(hacc, \harr -> {
+											if (hyp.stmt.exps == []) None() else
+											switch (ruEqzApply((ruExp(hyp.stmt.exps[0])).nodes, bind, coId)) {
+												None(): None();
+												Some(hn): {
+													he = RuExp(hn, -1);
+													if (ruInHead(he) != s2id("wcel")) None()
+													else {
+														term = (ruInArgs(he))[0];
+														maybeMap(ruSetnessProof2(reg, term, stmtClass, math, env),
+															\p -> arrayPush(harr, p));
+													}
+												}
+											}
+										}));
+									maybeMap(hypProofs, \hp -> Pair(inst,
+										RuProofStep(rl.assId, hp, RuStmt(stmtClass, [inst], -1))));
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
