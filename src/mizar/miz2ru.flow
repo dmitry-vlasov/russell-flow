@@ -21,8 +21,16 @@ export {
 	// assumptions) and `steps` — the proof's step propositions, each later emitted as an
 	// OPEN (`?`) step; the conclusion is the last step. `statement` is the full ∀ form
 	// (used for the signature). A direct/no-proof theorem has hyps=[] and steps=[statement].
-	MizThm(name : string, ref : string, hyps : [FolForm], steps : [FolForm], statement : FolForm, unhandled : [string]);
-	mizArticleTheorems(xmlContent : string, mizSource : string, sig : MizSig) -> Maybe<[MizThm]>;
+	// stepRefs: per step, the Mizar BY-CITATION list resolved to our assertion names
+	// (t<nr>_<aid> / d<nr>_<aid>) — THE data the original checker receives as its premise
+	// list (the rule of thumb: whatever the Mizar prover gets as data, we carry too).
+	// Local (label) refs and scheme refs are not included: the former are already the
+	// skeleton's own hyps/steps, the latter are out of scope.
+	MizThm(name : string, ref : string, hyps : [FolForm], steps : [FolForm], stepRefs : [[string]], statement : FolForm, unhandled : [string]);
+	mizArticleTheorems(xmlContent : string, mizSource : string, sig : MizSig, refTable : Tree<string, string>) -> Maybe<[MizThm]>;
+	// (articlenr:nr:kind) -> our assertion name, from the article's .eth environment
+	// (each <Theorem articlenr nr aid kind> row IS the resolution table).
+	mizRefTable(ethContent : string) -> Tree<string, string>;
 
 	// The article's environment theorems (its `.eth` — imported theorems a proof may cite)
 	// as commented AXIOMS (decl + its form, for the signature). t<nr>_<aid> (T) / d<nr>_<aid> (D).
@@ -317,7 +325,7 @@ mizFirstPos(a : int, b : int) -> int {
 	if (a < 0) b else if (b < 0) a else min(a, b);
 }
 
-mizArticleTheorems(xmlContent : string, mizSource : string, sig : MizSig) -> Maybe<[MizThm]> {
+mizArticleTheorems(xmlContent : string, mizSource : string, sig : MizSig, refTable : Tree<string, string>) -> Maybe<[MizThm]> {
 	lines = strSplit(mizSource, "\n");
 	switch (mizParseXml(xmlContent)) {
 		None(): None();
@@ -328,19 +336,69 @@ mizArticleTheorems(xmlContent : string, mizSource : string, sig : MizSig) -> May
 				Some(a): {
 					aid  = toLowerCase(mizAttr(a, "aid"));
 					thms = mizKidsTagged(a, "JustifiedTheorem");
-					Some(filtermap(mapi(thms, \i, thm -> mizTheorem(sig, lines, aid, i, thm)), \m -> m));
+					localTbl = foldi(thms, makeTree(), \i, acc, thm ->
+						switch (mizFindFirst([thm], "Proposition")) {
+							Some(prop): {
+								k = mizAttr(prop, "nr") + ":" + mizAttr(prop, "vid");
+								if (k == ":") acc else setTree(acc, k, "t" + i2s(i + 1) + "_" + aid);
+							}
+							None(): acc;
+						});
+					Some(filtermap(mapi(thms, \i, thm -> mizTheorem(sig, lines, aid, i, thm, Pair(refTable, localTbl))), \m -> m));
 				}
 			}
 		}
 	}
 }
 
-MizWalk(hyps : [FolForm], steps : [FolForm], unhandled : [string]);
+MizWalk(hyps : [FolForm], steps : [FolForm], refs : [[string]], unhandled : [string]);
+
+mizRefTable(ethContent : string) -> Tree<string, string> {
+	switch (mizParseXml(ethContent)) {
+		None(): makeTree();
+		Some(root): {
+			ths = if (root.tag == "Theorems") root.kids else
+				switch (mizFindFirst(root.kids, "Theorems")) { Some(t): t.kids; None(): []; };
+			fold(ths, makeTree(), \acc, t ->
+				if (t.tag != "Theorem") acc
+				else {
+					anr = mizAttr(t, "articlenr"); nr = mizAttr(t, "nr");
+					kind = mizAttr(t, "kind"); aid = toLowerCase(mizAttr(t, "aid"));
+					if (anr == "" || nr == "" || aid == "") acc
+					else setTree(acc, anr + ":" + nr + ":" + kind,
+						(if (kind == "D") "d" else "t") + nr + "_" + aid);
+				});
+		}
+	}
+}
+
+// The <By> justification's refs. Environment refs (articlenr set) resolve through the
+// .eth table; LOCAL label refs (nr/vid, no articlenr) through the article's own label
+// table — the article's PRIOR THEOREMS are cited by local label in the XML (each
+// JustifiedTheorem's <Proposition nr vid> is its label). Local refs that name proof-
+// internal propositions resolve to nothing — they are already the skeleton's hyps/steps.
+mizByRefs(tbls : Pair<Tree<string, string>, Tree<string, string>>, by : MizXml) -> [string] {
+	filtermap(by.kids, \r ->
+		if (r.tag != "Ref") None()
+		else {
+			anr = mizAttr(r, "articlenr");
+			if (anr == "") lookupTree(tbls.second, mizAttr(r, "nr") + ":" + mizAttr(r, "vid"))
+			else lookupTree(tbls.first, anr + ":" + mizAttr(r, "nr") + ":" + mizAttr(r, "kind"));
+		});
+}
+
+// attach refs to the LAST collected step (a <By> follows its <Proposition>)
+mizAttachRefs(w : MizWalk, rs : [string]) -> MizWalk {
+	n = length(w.refs);
+	if (rs == [] || n == 0) w
+	else MizWalk(w.hyps, w.steps,
+		replace(w.refs, n - 1, concat(w.refs[n - 1], rs)), w.unhandled);
+}
 
 // One <JustifiedTheorem> -> a MizThm. Direct/no-proof theorem: a single open step proving
 // the statement. With a proof: the let/assume context as hyps + the proof step props as
 // open steps. Falls back to the single-step form if the skeleton yielded no steps.
-mizTheorem(sig : MizSig, lines : [string], aid : string, idx : int, thm : MizXml) -> Maybe<MizThm> {
+mizTheorem(sig : MizSig, lines : [string], aid : string, idx : int, thm : MizXml, tbl : Pair<Tree<string, string>, Tree<string, string>>) -> Maybe<MizThm> {
 	name = "t" + i2s(idx + 1) + "_" + aid;
 	src  = mizSourceStatement(lines, s2i(mizAttr(thm, "line")));
 	ref  = toUpperCase(aid) + ":" + i2s(idx + 1) + (if (src == "") "" else "  ::  " + src);
@@ -354,10 +412,31 @@ mizTheorem(sig : MizSig, lines : [string], aid : string, idx : int, thm : MizXml
 				// theorem slot) — nothing to prove, drop it (t115_xboole_1-class)
 				if (statement == FolPred("$true", [])) None() else
 				switch (mizFindFirst([thm], "Proof")) {
-					None(): Some(MizThm(name, ref, [], [statement], statement, []));
+					None(): {
+						// a DIRECT `by`-justified theorem: the By is a kid of the
+						// JustifiedTheorem itself — its refs are the whole premise list
+						drefs = switch (mizFindFirst(thm.kids, "By")) {
+							Some(by): mizByRefs(tbl, by);
+							None(): [];
+						};
+						Some(MizThm(name, ref, [], [statement], [drefs], statement, []));
+					}
 					Some(proof): {
-						w = mizWalkProof(sig, proof);
-						if (w.steps == []) Some(MizThm(name, ref, [], [statement], statement, w.unhandled))
+						w0 = mizWalkProof(sig, proof, tbl);
+						// A coarse skeleton loses nested justifications (`now`-blocks etc. are
+						// not walked). When NO step carries refs, attach the DEEP UNION of all
+						// citations in the proof subtree to the QED step — the whole by-set is
+						// that gap's premise pool. Where per-step refs exist, keep them exact.
+						w = if (exists(w0.refs, \rs -> rs != []) || w0.steps == []) w0
+							else {
+								deep = uniq(concatA(map(mizCollectAll(proof.kids, "By"), \by -> mizByRefs(tbl, by))));
+								if (deep == []) w0
+								else MizWalk(w0.hyps, w0.steps,
+									replace(w0.refs, length(w0.refs) - 1, deep), w0.unhandled);
+							}
+						if (w.steps == []) Some(MizThm(name, ref, [], [statement],
+							[uniq(concatA(map(mizCollectAll(proof.kids, "By"), \by -> mizByRefs(tbl, by))))],
+							statement, w.unhandled))
 						else {
 							hyps0  = map(w.hyps, mizResugar);
 							steps0 = map(w.steps, mizResugar);
@@ -370,7 +449,7 @@ mizTheorem(sig : MizSig, lines : [string], aid : string, idx : int, thm : MizXml
 							ctr = ref 0;
 							hyps1  = map(hyps0,  \h -> mizFreshenBound(h, avoid, ctr));
 							steps1 = map(steps0, \s -> mizFreshenBound(s, avoid, ctr));
-							Some(MizThm(name, ref, hyps1, steps1, statement, w.unhandled));
+							Some(MizThm(name, ref, hyps1, steps1, w.refs, statement, w.unhandled));
 						}
 					}
 				}
@@ -380,11 +459,11 @@ mizTheorem(sig : MizSig, lines : [string], aid : string, idx : int, thm : MizXml
 
 // Walk a proof skeleton: `let x:T` / `assume H` -> hypotheses (shared context); each
 // `by`-justified step (Conclusion or labeled Proposition) -> an open proof step.
-mizWalkProof(sig : MizSig, proof : MizXml) -> MizWalk {
-	fold(proof.kids, MizWalk([], [], []), \w, item -> mizWalkItem(sig, w, item));
+mizWalkProof(sig : MizSig, proof : MizXml, tbl : Pair<Tree<string, string>, Tree<string, string>>) -> MizWalk {
+	fold(proof.kids, MizWalk([], [], [], []), \w, item -> mizWalkItem(sig, w, item, tbl));
 }
 
-mizWalkItem(sig : MizSig, w : MizWalk, item : MizXml) -> MizWalk {
+mizWalkItem(sig : MizSig, w : MizWalk, item : MizXml, tbl : Pair<Tree<string, string>, Tree<string, string>>) -> MizWalk {
 	tag = item.tag;
 	if (tag == "Let") {
 		if (item.kids == []) w
@@ -394,11 +473,11 @@ mizWalkItem(sig : MizSig, w : MizWalk, item : MizXml) -> MizWalk {
 			// A NON-trivial sort or an adjective (`non empty`) becomes a guard hypothesis.
 			// X still gets declared as a theorem var wherever it actually occurs in the steps.
 			gs = mizTypGuards(sig, [], typ, FolVar("X" + mizAttr(typ, "vid")));
-			MizWalk(concat(w.hyps, gs), w.steps, w.unhandled);
+			MizWalk(concat(w.hyps, gs), w.steps, w.refs, w.unhandled);
 		}
 	} else if (tag == "Assume") {
 		hs = filtermap(item.kids, \k -> if (k.tag == "Proposition" && k.kids != []) Some(mizForm(sig, [], k.kids[0])) else None());
-		MizWalk(concat(w.hyps, hs), w.steps, w.unhandled);
+		MizWalk(concat(w.hyps, hs), w.steps, w.refs, w.unhandled);
 	} else if (tag == "Given" || tag == "Consider") {
 		// `given x such that P` (the existential HYPOTHESIS of an iff-backward direction) and
 		// `consider x such that P` (∃-elimination): both introduce a witness variable and an
@@ -408,22 +487,32 @@ mizWalkItem(sig : MizSig, w : MizWalk, item : MizXml) -> MizWalk {
 		// unconditional — and often FALSE, e.g. XBOOLE_0:3 became `¬(X∩Y=∅)` with no hypothesis.
 		hs = filtermap(item.kids, \k -> if (k.tag == "Proposition" && k.kids != []) Some(mizForm(sig, [], k.kids[0])) else None());
 		gs = concatA(filtermap(item.kids, \k -> if (k.tag == "Typ" && mizAttr(k, "vid") != "") Some(mizTypGuards(sig, [], k, FolVar("X" + mizAttr(k, "vid")))) else None()));
-		MizWalk(concatA([w.hyps, hs, gs]), w.steps, w.unhandled);
+		MizWalk(concatA([w.hyps, hs, gs]), w.steps, w.refs, w.unhandled);
 	} else if (tag == "Conclusion") {
-		mizAddStep(sig, w, mizFindFirst(item.kids, "Proposition"));
+		// a Conclusion carries its <By> as an INNER kid (Proposition + By)
+		w1 = mizAddStep(sig, w, mizFindFirst(item.kids, "Proposition"));
+		switch (mizFindFirst(item.kids, "By")) {
+			Some(by): mizAttachRefs(w1, mizByRefs(tbl, by));
+			None(): w1;
+		}
 	} else if (tag == "Proposition") {
 		mizAddStep(sig, w, Some(item));
-	} else if (tag == "BlockThesis" || tag == "Thesis" || tag == "EndPosition" || tag == "By") {
+	} else if (tag == "By") {
+		// a top-level <By> justifies the PRECEDING sibling <Proposition>
+		mizAttachRefs(w, mizByRefs(tbl, item));
+	} else if (tag == "BlockThesis" || tag == "Thesis" || tag == "EndPosition") {
 		w;
 	} else {
-		MizWalk(w.hyps, w.steps, arrayPush(w.unhandled, tag));
+		MizWalk(w.hyps, w.steps, w.refs, arrayPush(w.unhandled, tag));
 	}
 }
 
 mizAddStep(sig : MizSig, w : MizWalk, mprop : Maybe<MizXml>) -> MizWalk {
 	switch (mprop) {
 		None(): w;
-		Some(prop): if (prop.kids == []) w else MizWalk(w.hyps, arrayPush(w.steps, mizForm(sig, [], prop.kids[0])), w.unhandled);
+		Some(prop): if (prop.kids == []) w
+			else MizWalk(w.hyps, arrayPush(w.steps, mizForm(sig, [], prop.kids[0])),
+				arrayPush(w.refs, []), w.unhandled);
 	}
 }
 
