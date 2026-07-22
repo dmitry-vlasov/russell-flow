@@ -247,11 +247,36 @@ ruRunScript(unit : RuUnit) -> Maybe<RuState> {
 
 ruCommVerifyMetamath = RuComm(
 	RuCommInfo(
-		"verify-mm", "misc", "verify a file with Metamath", "file", true, false, 
-		[RuCommArg("file", false, "the Metamath file", "")], []
+		"verify-mm", "misc", "verify a file with the ORIGINAL Metamath checker (the final gate)", "file", true, false,
+		[
+			RuCommArg("file", false, "the Metamath file", ""),
+			RuCommArg("count-suffix", true, "also count verified $p statements whose label ends with this suffix (e.g. _tarski — the per-article honest metric)", "")
+		], []
 	),
 	ruRunVerifyMetamath
 );
+
+// Count $p / $a statements in raw Metamath text, comments stripped ($( ... $) do not
+// nest). Token-exact: a statement keyword is a standalone whitespace-delimited token,
+// and the token immediately BEFORE it is the statement's label — used for the suffix
+// count. This counts from the ARTIFACT, which is the point of the metamath-gate law:
+// the prover's own "proved" report can be inflated by proofs that optimization passes
+// later delete (the circular-proof laundering), but a $p in the verified export cannot.
+ruMmStatementCounts(content : string, suffix : string) -> Triple<int, int, int> {
+	segs = strSplit(content, "$(");
+	nocom = fold(tail(segs), if (segs == []) "" else segs[0], \acc, seg -> {
+		i = strIndexOf(seg, "$)");
+		if (i < 0) acc else acc + " " + strRight(seg, i + 2);
+	});
+	normalized = strReplace(strReplace(strReplace(nocom, "\n", " "), "\t", " "), "\r", " ");
+	toks = filter(strSplit(normalized, " "), \t -> t != "");
+	foldi(toks, Triple(0, 0, 0), \i, acc, t ->
+		if (t == "$p") Triple(acc.first + 1, acc.second,
+			acc.third + (if (suffix != "" && i > 0 && endsWith(toks[i - 1], suffix)) 1 else 0))
+		else if (t == "$a") Triple(acc.first, acc.second + 1, acc.third)
+		else acc
+	);
+}
 
 ruRunVerifyMetamath(unit : RuUnit) -> Maybe<RuState> {
 	env = ruUnitEnv(unit);
@@ -259,35 +284,63 @@ ruRunVerifyMetamath(unit : RuUnit) -> Maybe<RuState> {
 	state = unit.state;
 	conf = env.conf;
 	file = changeFileExt(ruTaskStringArg(task, "file", ""), ".mm");
+	suffix = ruTaskStringArg(task, "count-suffix", "");
 	resolved = ruResolveRelativeFile(file, conf.workingDir);
 	dir = ruDirName(resolved);
 	if (ruVerbose(env.conf) > 1) {
 		env.out.println("Going to verify file: '" + file + "' with Metamath, dir: '" + dir + "', resolved: '" + resolved);
 	}
+	// THE METAMATH GATE (the metamath-gate law): this command's verdict must be REAL.
+	// The metamath CLI is interactive and exits 0 even when proofs FAIL, so the exit
+	// code alone proves nothing — the old code checked only that, and the harness told
+	// the reader to "look for 'All proofs in the database were verified' above" by eye.
+	// Now: success requires the checker's own success marker in its output and no
+	// "?Error" lines; the $p/$a counts come from the artifact; and with
+	// die-at-verify-failure=1 (conf) a failed — or MISSING — artifact crashes the run,
+	// so a test suite cannot report success past a failed gate.
+	die = ruOptsString(env.conf.opts, "die-at-verify-failure", "") == "1";
 	timer = ruMakeTimer();
-	if (!fileExists(resolved)) {
+	result = if (!fileExists(resolved)) {
 		env.out.error("mm file '" + file + "' doesn't exist", []);
+		if (die) ruCrash("verify-mm: die-at-verify-failure: mm file '" + file + "' doesn't exist");
+		Triple(false, Triple(0, 0, 0), "");
 	} else {
 		lines = ref [];
 		code = execSystemProcess(
-			"metamath", 
+			"metamath",
 			["read " + fileNameOnly(file), "verify proof *", "exit"],
 			if (dir == "") "." else dir,
 			\out -> refArrayPush(lines, out),
 			\err -> refArrayPush(lines, err),
 		);
-		env.out.println(strGlue(^lines, "\n"));
-		if (code != 0) {
-			env.out.error("Verification of '" + file + "' with Metamath eneded up with return code: " + i2s(code), []);
+		outStr = strGlue(^lines, "\n");
+		env.out.println(outStr);
+		counts = ruMmStatementCounts(getFileContent(resolved), suffix);
+		verified = code == 0 && !strContains(outStr, "?Error")
+			// a database with zero $p has nothing to verify — the marker is not printed then
+			&& (counts.first == 0 || strContains(outStr, "All proofs in the database were verified"));
+		if (!verified) {
+			env.out.error("METAMATH GATE FAILED for '" + fileNameOnly(file) + "': exit=" + i2s(code)
+				+ (if (strContains(outStr, "?Error")) ", checker reported ?Error" else "")
+				+ (if (counts.first > 0 && !strContains(outStr, "All proofs in the database were verified")) ", success marker absent" else ""), []);
+			if (die) ruCrash("verify-mm: die-at-verify-failure: metamath gate failed for '" + fileNameOnly(file) + "'");
 		} else {
 			if (ruVerbose(env.conf) > 0) {
-				env.out.println("mm file '" + fileNameOnly(file) + "' is verified with Metamath in " + ruTimePassed2s(timer));
+				env.out.println("mm file '" + fileNameOnly(file) + "' is verified with Metamath in " + ruTimePassed2s(timer)
+					+ " ($p proofs: " + i2s(counts.first)
+					+ (if (suffix != "") ", with suffix '" + suffix + "': " + i2s(counts.third) else "")
+					+ ", $a axioms: " + i2s(counts.second) + ")");
 			}
 		}
+		Triple(verified, counts, outStr);
 	}
 	Some(RuState(state with
 		vars = setTree(state.vars, "verify-mm", pairs2tree([
-			Pair("time", flow(ruTimePassed(timer)))
+			Pair("time", flow(ruTimePassed(timer))),
+			Pair("success", flow(result.first)),
+			Pair("proofs", flow(result.second.first)),
+			Pair("axioms", flow(result.second.second)),
+			Pair("suffix-proofs", flow(result.second.third))
 		]))
 	));
 }
