@@ -1,0 +1,92 @@
+import ru/prover/core/controls;
+import ru/prover/core/tree;
+import ru/prover/tactics/board;
+
+// PLANNER / EXECUTOR — the planner-executor architecture (user directive 2026-07-22).
+//
+// The split: a special tactic (e.g. of the Mizar family) becomes TWO tactics.
+//
+//  PLANNER  — does the actual proving work: navigates the space of possible proofs with
+//             ANY internal reasoning it likes (union-find, canonical term DAGs, the
+//             verbatim Mizar checker algorithms) and NEVER mutates the PVT. Its output
+//             is a PLAN: string labels attached to PVT nodes through the blackboard's
+//             per-node scope (ruPlanSetLabel). Richer per-node data — numbers, arrays,
+//             structs, expressions — goes under the planner's OWN board keys; planners
+//             may read each other's data, reusing established routes and facts.
+//
+//  EXECUTOR — contains no proving logic at all. ONE generic tactic shared by every
+//             planner: `executor(label)` expands exactly the accessible (frontier)
+//             nodes carrying that label, and concludes when a proof is found or no
+//             labeled node remains. In simple cases the label is just the name of a
+//             tactic. Deliberately primitive; richer label kinds only when needed.
+//
+// This decouples free-form deduction from tree modification: the engine (L1) still
+// builds every proof by ordinary expansion — the plan only chooses WHERE. The split
+// stays fully inside the engine-owns-proofs law: both halves are L2, the planner never
+// instantiates vars or installs proofs, the executor is a plain node selector.
+
+export {
+	// the well-known per-node board key the generic executor consumes
+	ruPlanLabelKey : string = "plan.label";
+
+	ruPlanSetLabel(b : RuTacticBoard, node : int, label : string) -> void;
+	// "" when the node carries no plan label (or a non-string was stored there)
+	ruPlanGetLabel(b : RuTacticBoard, node : int) -> string;
+	// Drop every stored plan label. A planner refreshing its whole plan calls this;
+	// planner BUILDERS also call it at build time, because the board outlives the
+	// prove step when no or-else wraps the tactic (only the outermost or-else runs
+	// ruBoardStepReset) and node ids restart per step — a stale label from the
+	// previous theorem would alias a fresh node and mis-target the executor.
+	ruPlanClearLabels(b : RuTacticBoard) -> void;
+
+	// THE GENERIC EXECUTOR: expand all accessible nodes carrying `label`.
+	ruExecutorTactic(b : RuTacticBoard, label : string) -> RuProverTactic;
+
+	// The TRIVIAL planner (the mechanism's end-to-end proof, and the template for real
+	// planners): label every current frontier node with `label`, then conclude. The
+	// equivalence loop(seq(plan-frontier(l), executor(l))) == bfs is the mechanism test.
+	ruPlanFrontierTactic(b : RuTacticBoard, label : string) -> RuProverTactic;
+}
+
+ruPlanSetLabel(b : RuTacticBoard, node : int, label : string) -> void {
+	ruBoardNodeSet(b, node, ruPlanLabelKey, flow(label));
+}
+
+ruPlanGetLabel(b : RuTacticBoard, node : int) -> string {
+	switch (ruBoardNodeGet(b, node, ruPlanLabelKey)) {
+		Some(v): if (runtimeValueType(v) == "string") cast(v : flow -> string) else "";
+		None(): "";
+	}
+}
+
+ruPlanClearLabels(b : RuTacticBoard) -> void {
+	b.nodes := mapTree(^(b.nodes), \keys -> removeFromTree(keys, ruPlanLabelKey));
+}
+
+ruExecutorTactic(b : RuTacticBoard, label : string) -> RuProverTactic {
+	RuProverTactic("executor", "executor:" + label,
+		\tree ->
+			if (length(^(tree.proofs)) > 0) RuTacticDone()
+			else {
+				selected = filter(getTreeValues(tree.leafs), \p -> ruPlanGetLabel(b, p.id) == label);
+				// no labeled frontier node left: the plan is executed — CONCLUDE (an empty
+				// Expand reads as "stop" in the prove loop and would abort enclosing stages;
+				// the bfs empty-frontier lesson, breadth_first.flow)
+				if (selected == []) RuTacticDone()
+				else RuTacticExpand(selected);
+			},
+		ruTreeNotProved
+	);
+}
+
+ruPlanFrontierTactic(b : RuTacticBoard, label : string) -> RuProverTactic {
+	RuProverTactic("plan-frontier", "plan-frontier",
+		\tree ->
+			if (length(^(tree.proofs)) > 0) RuTacticDone()
+			else {
+				iter(getTreeValues(tree.leafs), \p -> ruPlanSetLabel(b, p.id, label));
+				RuTacticDone();
+			},
+		ruTreeNotProved
+	);
+}
