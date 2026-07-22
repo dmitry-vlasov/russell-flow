@@ -57,9 +57,10 @@ export {
 	);
 
 	// Decide `goal` (a possibly ∀-closed equality) from ground equality hyps + the
-	// universal equality premises. stmtClass = the statement class of the theorem.
+	// universal equality premises + the element rules. stmtClass = the statement class.
 	ruEqzPlanDecide(math : RuMath, env : RuEnv, stmtClass : int,
-		prems : [RuEqzPremise], hyps : [RuExp], goal : RuExp) -> RuEqzPlan;
+		prems : [RuEqzPremise], elemRules : Tree<int, [RuEqzElemRule]>,
+		hyps : [RuExp], goal : RuExp) -> RuEqzPlan;
 
 	// A universal equality premise, pre-split: ∀-stripped matrix sides + matrix vars.
 	RuEqzPremise(assId : int, lhs : RuExp, rhs : RuExp, vars : [int], foundational : bool);
@@ -72,6 +73,23 @@ export {
 	// constructor — Mizar carries these as constructor PROPERTIES, equalizer.pas).
 	// Wholesale foundation admission floods the caps (measured).
 	ruEqzScopePremises(math : RuMath, env : RuEnv, thInfo : RuDeclInfo) -> [RuEqzPremise];
+
+	// AN ELEMENT RULE — the definition-consumption channel (Mizar's InferConstDef:
+	// definitions are available WITHOUT citation, expanded at Equate start). For a
+	// constructor C whose membership characterization is a PURE DISJUNCTION,
+	//   t ∈ C(a1…an)  ↔  ⋁ t = a_i (i in eqArgs)  ∨  ⋁ t ∈ a_j (j in memArgs),
+	// the term C(ā) IS the finite set with elements ā|eqArgs ∪ elems(ā|memArgs). Two
+	// DAG terms with the SAME element set (modulo eq-classes) are equal by
+	// extensionality — that is how a k-enum term meets its {·,·}∪{·}-composite twin.
+	// Scanned from two mechanical sources, each VERIFIED BY TRUTH TABLE (only the
+	// sound purely-disjunctive fragment registers; ∧/¬/⊆ shapes fail the check):
+	//  - membership biconds `t ∈ C(ā) ↔ rhs` (elun/elpr/elsn family; setness-only
+	//    hyps admitted — the planner decides, the executor discharges them);
+	//  - means-definitions `∀ (xd = k(ā) ↔ ∀t body)` with body ≡ (t∈xd ↔ ⋁…) — the
+	//    Mizar `func … means` family (enumset1's d2…d8), NOT plain equalities, which
+	//    is why the wceq premise scan could never use them.
+	RuEqzElemRule(assId : int, cId : int, arity : int, eqArgs : [int], memArgs : [int]);
+	ruEqzElemRules(math : RuMath, env : RuEnv, thInfo : RuDeclInfo) -> Tree<int, [RuEqzElemRule]>;
 
 	ruEqzStripAlls(e : RuExp) -> RuExp;
 	ruEqzCoercionId(math : RuMath, env : RuEnv) -> int;
@@ -314,10 +332,270 @@ ruEqzScopePremises(math : RuMath, env : RuEnv, thInfo : RuDeclInfo) -> [RuEqzPre
 	});
 }
 
+// ---- element rules (definition consumption, Mizar's InferConstDef) ----------
+
+// atom kinds inside a characterization formula, relative to (t, xd, args)
+RuEqzAtom ::= RuEqzAtomEq, RuEqzAtomMem, RuEqzAtomSelf;
+	RuEqzAtomEq(pos : int);    // t = args[pos]
+	RuEqzAtomMem(pos : int);   // t ∈ args[pos]
+	RuEqzAtomSelf();           // t ∈ xd (means-definitions only)
+
+ruEqzElemCache : ref [Pair<int, [Pair<RuDeclInfo, RuEqzElemRule>]>] = ref [];
+
+ruEqzElemRules(math : RuMath, env : RuEnv, thInfo : RuDeclInfo) -> Tree<int, [RuEqzElemRule]> {
+	n = sizeTree(math.decls.assertions);
+	c = ^ruEqzElemCache;
+	all = if (c != [] && c[0].first == n) c[0].second else {
+		coId = ruEqzCoercionId(math, env);
+		scanned = filtermap(getTreeValues(math.decls.assertions), \ass ->
+			maybeMap(ruEqzAnalyzeElemRule(math, ass, coId), \r -> Pair(ruEqzInfo(ass), r)));
+		ruEqzElemCache := [Pair(n, scanned)];
+		scanned;
+	}
+	imported = ruVerifyImportedMap(math, env);
+	fold(all, makeTree(), \acc, p ->
+		if (!ruDeclInfoPreceeds(p.first, thInfo, imported)) acc
+		else treePushToArrayValue(acc, p.second.cId, p.second));
+}
+
+// a plain var: bare, or the coercion over a var; -1 otherwise
+ruEqzPlainVar(nodes : [RuExpNode], coId : int) -> int {
+	if (length(nodes) == 1) ruEqzVarAt(nodes, 0)
+	else if (length(nodes) == 2 && ruEqzIsCoercionAt(nodes, 0, coId)) ruEqzVarAt(nodes, 1)
+	else -1;
+}
+
+// setness-shaped hypothesis: `A ∈ _V`
+ruEqzIsSetnessHyp(e : RuExp) -> bool {
+	ruInHead(e) == s2id("wcel") && ruInArity(e) == 2
+		&& { args = ruInArgs(e); ruInHead(args[1]) == s2id("cvv"); }
+}
+
+ruEqzAnalyzeElemRule(math : RuMath, ass : RuAssertion, coId : int) -> Maybe<RuEqzElemRule> {
+	inf = ruEqzInfer(ass);
+	info = ruEqzInfo(ass);
+	if (inf.prop.exps == []) None()
+	else {
+		matrix = ruEqzStripAlls(ruExp(inf.prop.exps[0]));
+		if (ruInHead(matrix) != s2id("wb") || ruInArity(matrix) != 2) None()
+		else {
+			sides = ruInArgs(matrix);
+			lhs = sides[0]; rhs = sides[1];
+			if (ruInHead(lhs) == s2id("wcel") && ruInArity(lhs) == 2
+				&& forall(inf.hyps, \h -> h.stmt.exps != [] && ruEqzIsSetnessHyp(ruExp(h.stmt.exps[0])))) {
+				// SOURCE A: membership bicond `t ∈ C(ā) ↔ rhs`
+				mArgs = ruInArgs(lhs);
+				t = ruEqzPlainVar(mArgs[0].nodes, coId);
+				obj = mArgs[1];
+				cId = ruInHead(obj);
+				args = ruInArgs(obj);
+				argVs = map(args, \a -> ruEqzPlainVar(a.nodes, coId));
+				if (t < 0 || cId < 0 || cId == coId || args == []
+					|| exists(argVs, \v -> v < 0 || v == t)
+					|| sizeSet(buildSet(argVs)) != length(argVs)) None()
+				else ruEqzCheckElemRule(info.id, cId, length(args), rhs, t, -1, argVs, coId, false);
+			} else if (inf.hyps == [] && ruInHead(lhs) == s2id("wceq") && ruInArity(lhs) == 2) {
+				// SOURCE B: means-definition `(xd = k(ā)) ↔ ∀t body`
+				eqSides = ruInArgs(lhs);
+				pick = \xdSide : RuExp, kSide : RuExp -> {
+					xd = ruEqzPlainVar(xdSide.nodes, coId);
+					cId = ruInHead(kSide);
+					args = ruInArgs(kSide);
+					argVs = map(args, \a -> ruEqzPlainVar(a.nodes, coId));
+					if (xd < 0 || cId < 0 || cId == coId || args == []
+						|| exists(argVs, \v -> v < 0 || v == xd)
+						|| sizeSet(buildSet(argVs)) != length(argVs)
+						|| ruInHead(rhs) != s2id("wal") || ruInArity(rhs) != 2) None()
+					else {
+						walArgs = ruInArgs(rhs);
+						t = ruEqzPlainVar(walArgs[0].nodes, coId);
+						body = walArgs[1];
+						if (t < 0 || t == xd || contains(argVs, t)) None()
+						else ruEqzCheckElemRule(info.id, cId, length(args), body, t, xd, argVs, coId, true);
+					}
+				}
+				switch (pick(eqSides[0], eqSides[1])) {
+					Some(r): Some(r);
+					None(): pick(eqSides[1], eqSides[0]);
+				}
+			} else None();
+		}
+	}
+}
+
+// Parse `formula` over connectives {¬ ∧ ∨ → ↔} with atoms t=arg / t∈arg / t∈xd, then
+// VERIFY BY TRUTH TABLE that it is equivalent to the pure disjunction (means form:
+// t∈xd ↔ disjunction). Only then the rule is sound for element-set comparison.
+ruEqzCheckElemRule(assId : int, cId : int, arity : int, formula : RuExp,
+	t : int, xd : int, argVs : [int], coId : int, meansForm : bool) -> Maybe<RuEqzElemRule> {
+	conn = buildSet([s2id("wn"), s2id("wa"), s2id("wo"), s2id("wi"), s2id("wb")]);
+	atomsM = ruEqzCollectAtoms(formula.nodes, 0, conn, Some([]));
+	switch (atomsM) {
+		None(): None();
+		Some(atomSlices): {
+			classified = filtermap(atomSlices, \sl -> maybeMap(
+				ruEqzClassifyAtom(sl, t, xd, argVs, coId), \k -> Pair(sl, k)));
+			nAtoms = length(atomSlices);
+			hasSelf = exists(classified, \p -> p.second == RuEqzAtomSelf());
+			if (length(classified) != nAtoms || nAtoms == 0 || nAtoms > 12
+				|| (meansForm && !hasSelf) || (!meansForm && hasSelf)) None()
+			else {
+				ok = forall(enumFromTo(0, pow(2, nAtoms) - 1), \mask -> {
+					vals = mapi(classified, \i, p -> Pair(p.first, (mask / pow(2, i)) % 2 == 1));
+					disj = exists(mapi(classified, \i, p ->
+						Pair(p.second, vals[i].second)), \pv ->
+							pv.second && pv.first != RuEqzAtomSelf());
+					selfV = fold(mapi(classified, \i, p -> Pair(p.second, vals[i].second)),
+						false, \acc, pv -> acc || (pv.first == RuEqzAtomSelf() && pv.second));
+					target = ruEqzEvalF(formula.nodes, 0, conn, vals).first;
+					if (meansForm) target == (selfV == disj) else target == disj;
+				});
+				if (!ok) None()
+				else {
+					eqArgs = filtermap(classified, \p -> switch (p.second) {
+						RuEqzAtomEq(pos): Some(pos); default: None(); });
+					memArgs = filtermap(classified, \p -> switch (p.second) {
+						RuEqzAtomMem(pos): Some(pos); default: None(); });
+					Some(RuEqzElemRule(assId, cId, arity,
+						set2array(buildSet(eqArgs)), set2array(buildSet(memArgs))));
+				}
+			}
+		}
+	}
+}
+
+// collect the maximal non-connective subformula slices (the atoms), left to right
+ruEqzCollectAtoms(nodes : [RuExpNode], i : int, conn : Set<int>,
+	accM : Maybe<[[RuExpNode]]>) -> Maybe<[[RuExpNode]]> {
+	switch (accM) {
+		None(): None();
+		Some(acc): {
+			switch (nodes[i]) {
+				RuVar(__, __): None();   // a bare wff metavar has no element reading
+				RuRuleNode(idT, al): {
+					if (containsSet(conn, ruIdType2Id(idT))) {
+						fold(enumFromTo(1, ruArityLen2Arity(al)), Pair(accM, i + 1),
+							\st : Pair<Maybe<[[RuExpNode]]>, int>, __ -> {
+								sp = ruEqzSpan(nodes, st.second);
+								Pair(ruEqzCollectAtoms(nodes, st.second, conn, st.first), st.second + sp);
+							}).first;
+					} else {
+						sl = subrange(nodes, i, ruEqzSpan(nodes, i));
+						if (contains(acc, sl)) accM else Some(arrayPush(acc, sl));
+					}
+				}
+			}
+		}
+	}
+}
+
+ruEqzClassifyAtom(sl : [RuExpNode], t : int, xd : int, argVs : [int], coId : int) -> Maybe<RuEqzAtom> {
+	e = RuExp(sl, -1);
+	h = ruInHead(e);
+	if (ruInArity(e) != 2) None()
+	else {
+		args = ruInArgs(e);
+		a = ruEqzPlainVar(args[0].nodes, coId);
+		b = ruEqzPlainVar(args[1].nodes, coId);
+		if (h == s2id("wceq") || h == s2id("weq")) {
+			if (a == t && contains(argVs, b)) Some(RuEqzAtomEq(elemIndex(argVs, b, -1)))
+			else if (b == t && contains(argVs, a)) Some(RuEqzAtomEq(elemIndex(argVs, a, -1)))
+			else None();
+		} else if (h == s2id("wcel") || h == s2id("wel")) {
+			if (a != t) None()
+			else if (b == xd) Some(RuEqzAtomSelf())
+			else if (contains(argVs, b)) Some(RuEqzAtomMem(elemIndex(argVs, b, -1)))
+			else None();
+		} else None();
+	}
+}
+
+// evaluate the formula at `i` under the atom assignment; returns (value, span)
+ruEqzEvalF(nodes : [RuExpNode], i : int, conn : Set<int>, vals : [Pair<[RuExpNode], bool>]) -> Pair<bool, int> {
+	switch (nodes[i]) {
+		RuVar(__, __): Pair(false, 1);
+		RuRuleNode(idT, al): {
+			id = ruIdType2Id(idT);
+			if (containsSet(conn, id)) {
+				ar = ruArityLen2Arity(al);
+				kids = fold(enumFromTo(1, ar), Pair([], i + 1),
+					\st : Pair<[bool], int>, __ -> {
+						k = ruEqzEvalF(nodes, st.second, conn, vals);
+						Pair(arrayPush(st.first, k.first), st.second + k.second);
+					});
+				v = if (id == s2id("wn")) !(kids.first)[0]
+					else if (id == s2id("wa")) (kids.first)[0] && (kids.first)[1]
+					else if (id == s2id("wo")) (kids.first)[0] || (kids.first)[1]
+					else if (id == s2id("wi")) !(kids.first)[0] || (kids.first)[1]
+					else (kids.first)[0] == (kids.first)[1];
+				Pair(v, kids.second - i);
+			} else {
+				sp = ruEqzSpan(nodes, i);
+				sl = subrange(nodes, i, sp);
+				v = fold(vals, false, \acc, p -> acc || (p.first == sl && p.second));
+				Pair(v, sp);
+			}
+		}
+	}
+}
+
+// ---- element sets over the DAG ----------------------------------------------
+
+// The canonical element set of a term (None = no element reading). Elements are
+// eq-class representative keys, so the comparison is modulo the current closure.
+ruEqzElemsOf(rules : Tree<int, [RuEqzElemRule]>, st : RuCongSt,
+	memo : ref Tree<[RuExpNode], Maybe<Set<string>>>, t : RuExp) -> Maybe<Set<string>> {
+	switch (lookupTree(^memo, t.nodes)) {
+		Some(r): r;
+		None(): {
+			h = ruInHead(t);
+			ar = ruInArity(t);
+			r = switch (find(lookupTreeDef(rules, h, []), \rl -> rl.arity == ar)) {
+				None(): None();
+				Some(rl): {
+					args = ruInArgs(t);
+					base = fold(rl.eqArgs, Some(makeSet()), \acc : Maybe<Set<string>>, i ->
+						maybeMap(acc, \s -> insertSet(s, ruCongRepr(st, args[i]))));
+					fold(rl.memArgs, base, \acc : Maybe<Set<string>>, j ->
+						maybeBind(acc, \s -> maybeMap(ruEqzElemsOf(rules, st, memo, args[j]),
+							\s2 -> mergeSets(s, s2))));
+				}
+			}
+			memo := setTree(^memo, t.nodes, r);
+			r;
+		}
+	}
+}
+
+// New equality facts from element-set coincidence: group the DAG terms by their
+// canonical element set; within a group, equate the first with each not-yet-equal rest.
+ruEqzElemFacts(rules : Tree<int, [RuEqzElemRule]>, st : RuCongSt, subs : [RuExp],
+	seen : Set<[RuExpNode]>, stmtClass : int) -> [Pair<RuProofTree, RuExp>] {
+	if (isEmptyTree(rules)) [] else {
+		memo : ref Tree<[RuExpNode], Maybe<Set<string>>> = ref makeTree();
+		groups = fold(subs, makeTree(), \acc : Tree<string, [RuExp]>, t ->
+			switch (ruEqzElemsOf(rules, st, memo, t)) {
+				None(): acc;
+				Some(s): treePushToArrayValue(acc, strGlue(set2array(s), "|"), t);
+			});
+		wffT = tp2id_("wff");
+		foldTree(groups, [], \__, ts, acc ->
+			if (length(ts) < 2) acc
+			else fold(tail(ts), acc, \a, t2 ->
+				if (ruCongEqual(st, ts[0], t2)) a
+				else {
+					inst = ruFwdMkRule(s2id("wceq"), wffT, [ts[0], t2]);
+					if (containsSet(seen, inst.nodes)) a
+					else arrayPush(a, Pair(RuProofHyp(-1, RuStmt(stmtClass, [inst], -1)), inst));
+				}));
+	}
+}
+
 // ---- the decision loop ------------------------------------------------------
 
 ruEqzPlanDecide(math : RuMath, env : RuEnv, stmtClass : int,
-	prems : [RuEqzPremise], hyps : [RuExp], goal : RuExp) -> RuEqzPlan {
+	prems : [RuEqzPremise], elemRules : Tree<int, [RuEqzElemRule]>,
+	hyps : [RuExp], goal : RuExp) -> RuEqzPlan {
 	matrix = ruEqzStripAlls(goal);
 	if (ruInHead(matrix) != s2id("wceq") || ruInArity(matrix) != 2)
 		RuEqzPlan(false, 0, 0, length(prems), false)
@@ -348,11 +626,12 @@ ruEqzPlanDecide(math : RuMath, env : RuEnv, stmtClass : int,
 			else None();
 		});
 		terms0 = concat([gs[0], gs[1]], concatA(map(hypFacts, \f -> ruInArgs(f.second))));
-		decideLoop(math, env, stmtClass, relPrems, rules, coId, hypFacts, terms0, 0, gs);
+		decideLoop(math, env, stmtClass, relPrems, elemRules, rules, coId, hypFacts, terms0, 0, gs);
 	}
 }
 
 decideLoop(math : RuMath, env : RuEnv, stmtClass : int, prems : [RuEqzPremise],
+	elemRules : Tree<int, [RuEqzElemRule]>,
 	rules : Tree<int, [RuCongRule]>, coId : int, facts : [Pair<RuProofTree, RuExp>], terms : [RuExp],
 	round : int, gs : [RuExp]) -> RuEqzPlan {
 	st = ruCongClose(rules, facts, terms, stmtClass, math, env);
@@ -365,7 +644,10 @@ decideLoop(math : RuMath, env : RuEnv, stmtClass : int, prems : [RuEqzPremise],
 		if (length(subs) > ruEqzMaxTerms)
 			RuEqzPlan(false, round, length(facts), length(prems), true)
 		else {
-			seen0 = buildSet(map(facts, \f -> f.second.nodes));
+			seen00 = buildSet(map(facts, \f -> f.second.nodes));
+			// definition consumption: terms whose canonical element sets coincide are equal
+			elemFacts = ruEqzElemFacts(elemRules, st, subs, seen00, stmtClass);
+			seen0 = fold(elemFacts, seen00, \acc, f -> insertSet(acc, f.second.nodes));
 			wceqW = tp2id_("wff");
 			foundCnt = ref 0;   // per-round foundation-instance budget (comm/assoc fan out hard)
 			newFacts = fold(prems, Pair([], seen0), \acc : Pair<[Pair<RuProofTree, RuExp>], Set<[RuExpNode]>>, p -> {
@@ -390,6 +672,9 @@ decideLoop(math : RuMath, env : RuEnv, stmtClass : int, prems : [RuEqzPremise],
 										if (containsSet(a.second, inst.nodes)) a
 										else {
 											if (p.foundational) foundCnt := ^foundCnt + 1 else {};
+											if (env.conf.verbose > 3) {
+												env.out.println("        inst-src " + id2s(p.assId) + ": " + ru2s(inst, math));
+											} else {};
 											Pair(arrayPush(a.first,
 												Pair(RuProofHyp(-1, RuStmt(stmtClass, [inst], -1)), inst)),
 												insertSet(a.second, inst.nodes));
@@ -401,15 +686,18 @@ decideLoop(math : RuMath, env : RuEnv, stmtClass : int, prems : [RuEqzPremise],
 					}));
 			});
 			if (env.conf.verbose > 2) {
+				iter(take(elemFacts, 100), \f -> env.out.println("      elem: " + ru2s(f.second, math)));
 				iter(take(newFacts.first, 100), \f -> env.out.println("      inst: " + ru2s(f.second, math)));
-				env.out.println("      round " + i2s(round) + ": +" + i2s(length(newFacts.first)) + " instances, " + i2s(length(subs)) + " subterms");
+				env.out.println("      round " + i2s(round) + ": +" + i2s(length(elemFacts)) + " elem-eqs, +"
+					+ i2s(length(newFacts.first)) + " instances, " + i2s(length(subs)) + " subterms");
 			} else {};
-			if (newFacts.first == [])
+			combined = concat(elemFacts, newFacts.first);
+			if (combined == [])
 				RuEqzPlan(false, round, length(facts), length(prems), length(facts) >= ruEqzMaxInstances)
 			else {
-				facts1 = concat(facts, newFacts.first);
+				facts1 = concat(facts, combined);
 				terms1 = concat(terms, concatA(map(newFacts.first, \f -> ruInArgs(f.second))));
-				decideLoop(math, env, stmtClass, prems, rules, coId, facts1, terms1, round + 1, gs);
+				decideLoop(math, env, stmtClass, prems, elemRules, rules, coId, facts1, terms1, round + 1, gs);
 			}
 		}
 	}
