@@ -18,6 +18,7 @@ import ru/prover/tactics/congruence;
 import ru/prover/tactics/equalizer;
 import ru/prover/tactics/equalizer_plan;
 import ru/prover/tactics/equalizer_ext;
+import ru/prover/tactics/unifier_gen;
 import ru/prover/tactics/refiners;
 import ru/prover/tactics/literal_closers;
 import ru/prover/tactics/tac_file;
@@ -488,7 +489,9 @@ ruTacticDocs() -> [RuTacticDoc] {
 		dp("atoms", "plan-frontier(label)",         "the TRIVIAL planner: label every current frontier node with `label`, then conclude. loop(seq(plan-frontier(l), executor(l))) == bfs — the planner/executor mechanism test; real planners (Equalizer, Unifier) follow the same shape", [p("label", "the plan label to write")]),
 		d ("atoms", "kalmar-closer",                "propositional closer: unfold membership atoms + Kalmar certificate [PRUNE-CANDIDATE]"),
 		d ("atoms", "hilbert",                      "the Hilbert-certificate emitter PRIMITIVE: unfold membership atoms + fresh refutation certificate (hilbert.flow), installed directly; no-op when the gap is not certifiable. Composable in any combinator."),
-		df("atoms", "equalizer-gen",                "the EQUALIZER DIRECT GENERATOR: decide an equality goal, assemble the complete proof deterministically, verify, install; concludes silently when it does not apply",
+		df("atoms", "unifier-gen",                  "the UNIFIER DIRECT GENERATOR: decide a non-equality goal by Mizar Unification (per-disjunct refutation via universal-premise instantiation), assemble the proof deterministically, verify, install; silent no-op otherwise",
+			"The Mizar Unification procedure as a PROOF GENERATOR (planner-executor campaign): DNF(hyps ∧ ¬goal) per-disjunct refutation — reflexivity/atom clashes over the congruence closure, universal premises instantiated through the InstCollection substitution lattice (inner ∃-position binders standardized into fresh vars; foundation membership characterizations admitted uncited) — then assemble with NO SEARCH: σP instances (class-metavar application with setness hyps discharged + the spcv/instTerm chain per bound setvar), basis hyp leaves, the complete propositional certificate as glue, ax-gen re-quantification; verify with the standard verifier and install via the sanctioned path. Uses the board's by.refs citation list. Equality goals are the Equalizer's fragment — this atom declines them by pre-check."),
+	df("atoms", "equalizer-gen",                "the EQUALIZER DIRECT GENERATOR: decide an equality goal, assemble the complete proof deterministically, verify, install; concludes silently when it does not apply",
 			"The Mizar Equate procedure as a PROOF GENERATOR (planner-executor campaign): decide the equality by premise instantiation + definition consumption (element-set semantics over truth-table-verified rules), then assemble the whole proof with NO SEARCH — hyp leaves, 0-ref premise application steps (eqcomi-bridged when flipped), extensionality subproofs for element-set equalities (membership biconds folded by orbi12i/bitri, ∨-ACI normalization, the means-def NNF bridge, witness mediation for k-terms), ax-gen re-quantification — verify with the standard verifier and install via the sanctioned path. Uses the board's by.refs citation list when the step carries one. enumset1: 86/86."),
 		df("atoms", "congruence",                   "proof-producing congruence closure: decide an equality goal from the premise equalities (replaces equality saturation)",
 			"The equality DECISION PROCEDURE. Premise equalities merge congruence classes; consequences are found by matching term signatures, not by applying congruence lemmas wave after wave (which regenerates the equality theory as junk). If the goal equality is entailed, ruCongExplain emits an eqtri/eqcomi certificate over the proof-carrying merge edges and installs it. Closes whole-or-nothing, so it is safe anywhere in an or-else. The congruence lemmas are discovered mechanically from the loaded math (106 rules / 38 constructors on miz_set) — nothing is hand-listed."),
@@ -634,6 +637,7 @@ ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTactic
 	else if (n == "kalmar-closer")   ruTagBuilder("kalmar-closer", ruDslBuildKalmarCloser(ast, ctx))
 	else if (n == "checker")         ruTagBuilder("checker", ruDslBuildCheckerCloser(ast, ctx))
 	else if (n == "equalizer-gen")   ruTagBuilder("equalizer-gen", ruDslBuildEqualizerGen(ast, ctx))
+	else if (n == "unifier-gen")     ruTagBuilder("unifier-gen", ruDslBuildUnifierGen(ast, ctx))
 	else if (n == "congruence")      ruTagBuilder("congruence", ruDslBuildCongruence(ast, ctx))
 	else if (n == "hilbert")         ruTagBuilder("hilbert", ruDslBuildHilbert(ast, ctx))
 	else if (n == "replay")          ruDslBuildRealizer(ast, ctx, "replay", ruReplayRealize)
@@ -947,6 +951,95 @@ ruDslBuildEqualizerGen(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTact
 						mergeSets(a, ruStmt2Vars(pr.stmt))));
 				prf = RuProof(RuVarsDisjs(values2tree(set2array(extra), \v -> v.id),
 					plan.disjs), steps, -1);
+				// the install path bypasses the engine — verify FIRST (we own soundness)
+				res = ruVerifyProof(prf, task.premises, goalStmt, math, env);
+				if (res.errs == []) ruInstallProofTactic(res.proof) else ruDoneTactic;
+			}
+		}
+		Pair(penv, tactic);
+		}
+	}))
+}
+
+// THE UNIFIER-GENERATOR ATOM (the second planner's install path, on the
+// equalizer-gen template): tight budgets, by.refs from the board, verify-first.
+ruUnfGenScopeCache : ref [Triple<int, int, [RuUnfPremise]>] = ref [];
+ruUnfGenScopeCached(math : RuMath, env : RuEnv, thInfo : RuDeclInfo) -> [RuUnfPremise] {
+	n = sizeTree(math.decls.assertions);
+	c = ^ruUnfGenScopeCache;
+	if (c != [] && c[0].first == n && c[0].second == thInfo.id) c[0].third
+	else {
+		ps = ruUnfScopePremises(math, env, thInfo);
+		ruUnfGenScopeCache := [Triple(n, thInfo.id, ps)];
+		ps;
+	}
+}
+
+ruDslBuildUnifierGen(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+	Some(RuTacticBuilder(\penv -> {
+		task      = penv.conf.task;
+		goalStmt  = task.goal.stmt;
+		stmtClass = goalStmt.class;
+		goal      = ruExp(goalStmt.exps[0]);
+		// PRE-CHECK before any index scan: equality steps are the Equalizer's
+		// fragment, and undecidable shapes must cost nothing
+		matrix = ruEqzStripAlls(goal);
+		isEq = ruInHead(matrix) == s2id("wceq") && ruInArity(matrix) == 2;
+		if (isEq) Pair(penv, ruDoneTactic) else {
+		math      = ctx.math;
+		env       = ctx.env;
+		walId     = s2id("wal");
+		allPrems  = mapi(task.premises, \i, pr -> Pair(ruExp(pr.stmt.exps[0]), i));
+		basisIdx  = filter(allPrems, \p -> ruInHead(p.first) != walId);
+		hyps      = map(basisIdx, \b -> b.first);
+		// ∀-closed premises (prior steps / ∀ hyps) are UNIVERSAL facts
+		stepPremIdx : ref Tree<int, Pair<int, RuExp>> = ref makeTree();
+		stepPrems = filtermap(allPrems, \p ->
+			if (ruInHead(p.first) != walId) None()
+			else {
+				pm = ruEqzStripAlls(p.first);
+				if (ruInHead(pm) == s2id("wceq") && ruInArity(pm) == 2) None()
+				else {
+					vars = fold(pm.nodes, makeSet(), \a, n -> switch (n) {
+						RuVar(id, __): insertSet(a, id);
+						RuRuleNode(__, __): a;
+					});
+					if (isEmptySet(vars)) None()
+					else {
+						sid = s2id("taskprem" + i2s(p.second));
+						stepPremIdx := setTree(^stepPremIdx, sid, Pair(p.second, p.first));
+						Some(RuUnfPremise(sid, pm, set2array(vars), false, false));
+					}
+				}
+			});
+		prems0 = ruUnfGenScopeCached(math, env, task.info);
+		byRefs = switch (ctx.board) {
+			None(): [];
+			Some(b): switch (ruBoardGet(b, "by.refs")) {
+				None(): [];
+				Some(v): cast(v : flow -> [string]);
+			}
+		}
+		isDef = \nm : string -> startsWith(nm, "d") && strlen(nm) > 1
+			&& isDigits(substring(nm, 1, 1)) && strContains(nm, "_");
+		prems = concat(
+			if (byRefs == []) filter(prems0, \pp -> !pp.foundational || pp.charShape)
+			else filter(prems0, \pp -> contains(byRefs, id2s(pp.assId))
+				|| isDef(id2s(pp.assId)) || (pp.foundational && pp.charShape)),
+			stepPrems);
+		// TIGHT budgets in-pipeline (the equalizer-gen starvation lesson)
+		plan = ruUnfPlanDecide(math, env, stmtClass, prems, hyps, goal, 64, 128, 400.0);
+		tactic = if (!plan.provable) ruDoneTactic
+		else switch (ruUnfStepProof(math, env, stmtClass, plan, basisIdx, ^stepPremIdx, goal)) {
+			None(): ruDoneTactic;
+			Some(gp): {
+				steps = ruMakeLinearProof(gp.first);
+				extra = differenceSets(
+					fold(steps, makeSet(), \a, stp -> mergeSets(a, ruStmt2Vars(stp.stmt))),
+					fold(task.premises, ruStmt2Vars(goalStmt), \a, pr ->
+						mergeSets(a, ruStmt2Vars(pr.stmt))));
+				prf = RuProof(RuVarsDisjs(values2tree(set2array(extra), \v -> v.id),
+					gp.second), steps, -1);
 				// the install path bypasses the engine — verify FIRST (we own soundness)
 				res = ruVerifyProof(prf, task.premises, goalStmt, math, env);
 				if (res.errs == []) ruInstallProofTactic(res.proof) else ruDoneTactic;
