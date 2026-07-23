@@ -16,6 +16,8 @@ import ru/prover/tactics/hilbert;
 import ru/prover/tactics/unfold;
 import ru/prover/tactics/congruence;
 import ru/prover/tactics/equalizer;
+import ru/prover/tactics/equalizer_plan;
+import ru/prover/tactics/equalizer_ext;
 import ru/prover/tactics/refiners;
 import ru/prover/tactics/literal_closers;
 import ru/prover/tactics/tac_file;
@@ -486,6 +488,8 @@ ruTacticDocs() -> [RuTacticDoc] {
 		dp("atoms", "plan-frontier(label)",         "the TRIVIAL planner: label every current frontier node with `label`, then conclude. loop(seq(plan-frontier(l), executor(l))) == bfs — the planner/executor mechanism test; real planners (Equalizer, Unifier) follow the same shape", [p("label", "the plan label to write")]),
 		d ("atoms", "kalmar-closer",                "propositional closer: unfold membership atoms + Kalmar certificate [PRUNE-CANDIDATE]"),
 		d ("atoms", "hilbert",                      "the Hilbert-certificate emitter PRIMITIVE: unfold membership atoms + fresh refutation certificate (hilbert.flow), installed directly; no-op when the gap is not certifiable. Composable in any combinator."),
+		df("atoms", "equalizer-gen",                "the EQUALIZER DIRECT GENERATOR: decide an equality goal, assemble the complete proof deterministically, verify, install; concludes silently when it does not apply",
+			"The Mizar Equate procedure as a PROOF GENERATOR (planner-executor campaign): decide the equality by premise instantiation + definition consumption (element-set semantics over truth-table-verified rules), then assemble the whole proof with NO SEARCH — hyp leaves, 0-ref premise application steps (eqcomi-bridged when flipped), extensionality subproofs for element-set equalities (membership biconds folded by orbi12i/bitri, ∨-ACI normalization, the means-def NNF bridge, witness mediation for k-terms), ax-gen re-quantification — verify with the standard verifier and install via the sanctioned path. Uses the board's by.refs citation list when the step carries one. enumset1: 86/86."),
 		df("atoms", "congruence",                   "proof-producing congruence closure: decide an equality goal from the premise equalities (replaces equality saturation)",
 			"The equality DECISION PROCEDURE. Premise equalities merge congruence classes; consequences are found by matching term signatures, not by applying congruence lemmas wave after wave (which regenerates the equality theory as junk). If the goal equality is entailed, ruCongExplain emits an eqtri/eqcomi certificate over the proof-carrying merge edges and installs it. Closes whole-or-nothing, so it is safe anywhere in an or-else. The congruence lemmas are discovered mechanically from the loaded math (106 rules / 38 constructors on miz_set) — nothing is hand-listed."),
 		dp("atoms", "checker(closer=<tactic>)",     "Mizar-style refutation-closer PRESET = hilbert + an optional fallback finisher; checker(closer=X) == or-else(hilbert, X)", [p("closer", "fallback tactic when the emitter cannot certify (e.g. limited(bfs,...)); omit for a no-op")]),
@@ -629,6 +633,7 @@ ruBuildTacticFromAst(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTactic
 	else if (n == "ap")              ruTagBuilder("ap", ruDslBuildAp(ast, ctx))
 	else if (n == "kalmar-closer")   ruTagBuilder("kalmar-closer", ruDslBuildKalmarCloser(ast, ctx))
 	else if (n == "checker")         ruTagBuilder("checker", ruDslBuildCheckerCloser(ast, ctx))
+	else if (n == "equalizer-gen")   ruTagBuilder("equalizer-gen", ruDslBuildEqualizerGen(ast, ctx))
 	else if (n == "congruence")      ruTagBuilder("congruence", ruDslBuildCongruence(ast, ctx))
 	else if (n == "hilbert")         ruTagBuilder("hilbert", ruDslBuildHilbert(ast, ctx))
 	else if (n == "replay")          ruDslBuildRealizer(ast, ctx, "replay", ruReplayRealize)
@@ -884,6 +889,53 @@ ruDslBuildHilbert(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBui
 // are found by signature, and the goal equality is either entailed or it is not. Whole-or-
 // nothing, so it cannot preempt anything in an or-else. The certificate is built by
 // ruCongExplain (eqtri/eqcomi chains over the proof-carrying edges) and installed.
+ruDslBuildEqualizerGen(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
+	Some(RuTacticBuilder(\penv -> {
+		task      = penv.conf.task;
+		goalStmt  = task.goal.stmt;
+		stmtClass = goalStmt.class;
+		goal      = ruExp(goalStmt.exps[0]);
+		hyps      = map(task.premises, \pr -> ruExp(pr.stmt.exps[0]));
+		math      = ctx.math;
+		env       = ctx.env;
+		prems0    = ruEqzScopePremises(math, env, task.info);
+		// the by-list from the board (prove.flow publishes the step's citations);
+		// definitions stay in scope uncited (InferConstDef), as does the foundation family
+		byRefs = switch (ctx.board) {
+			None(): [];
+			Some(b): switch (ruBoardGet(b, "by.refs")) {
+				None(): [];
+				Some(v): cast(v : flow -> [string]);
+			}
+		}
+		isDef = \nm : string -> startsWith(nm, "d") && strlen(nm) > 1
+			&& isDigits(substring(nm, 1, 1)) && strContains(nm, "_");
+		prems = if (byRefs == []) prems0
+			else filter(prems0, \pp -> pp.foundational
+				|| contains(byRefs, id2s(pp.assId)) || isDef(id2s(pp.assId)));
+		elemRules = ruEqzElemRules(math, env, task.info);
+		plan = ruEqzPlanDecide(math, env, stmtClass, prems, elemRules,
+			\ea, eb -> ruEqzElemEqProof(math, env, stmtClass, ea, eb),
+			hyps, goal);
+		tactic = switch (plan.proof) {
+			None(): ruDoneTactic;
+			Some(tr): {
+				steps = ruMakeLinearProof(tr);
+				extra = differenceSets(
+					fold(steps, makeSet(), \a, stp -> mergeSets(a, ruStmt2Vars(stp.stmt))),
+					fold(task.premises, ruStmt2Vars(goalStmt), \a, pr ->
+						mergeSets(a, ruStmt2Vars(pr.stmt))));
+				prf = RuProof(RuVarsDisjs(values2tree(set2array(extra), \v -> v.id),
+					plan.disjs), steps, -1);
+				// the install path bypasses the engine — verify FIRST (we own soundness)
+				res = ruVerifyProof(prf, task.premises, goalStmt, math, env);
+				if (res.errs == []) ruInstallProofTactic(res.proof) else ruDoneTactic;
+			}
+		}
+		Pair(penv, tactic);
+	}))
+}
+
 ruDslBuildCongruence(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTacticBuilder> {
 	Some(RuTacticBuilder(\penv -> {
 		task      = penv.conf.task;
