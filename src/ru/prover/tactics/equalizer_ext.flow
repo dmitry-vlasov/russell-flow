@@ -180,7 +180,9 @@ ruEqzElemEqComposite(math : RuMath, env : RuEnv, stmtClass : int,
 					st = \e : RuExp -> RuStmt(stmtClass, [e], -1);
 					wb3 = \x : RuExp, y : RuExp -> ruFwdMkRule(s2id("wb"), wffT, [x, y]);
 					switch (ruEqzOrACI(stmtClass, wffT, dA, dB)) {
-						None(): { if (env.conf.verbose > 3) env.out.println("      kdbg: or-assoc failed") else {}; None(); }
+						None(): { if (env.conf.verbose > 3) {
+							env.out.println("      kdbg: or-assoc failed dA=" + ru2s(dA, math) + " dB=" + ru2s(dB, math));
+						} else {}; None(); }
 						Some(oa): {
 							t1 = RuProofStep(s2id("bitri"), [fA.second, oa], st(wb3(mA, dB)));
 							bc = RuProofStep(s2id("bicomi"), [fB.second], st(wb3(dB, mB)));
@@ -389,10 +391,28 @@ ruEqzKTermEq(math : RuMath, env : RuEnv, stmtClass : int,
 							});
 							switch (ruEqzMatch(k.nodes, kPat.nodes, defVars, coId)) {
 								None(): { if (env.conf.verbose > 3) env.out.println("      kdbg: k pattern no match") else {}; None(); };
-								Some(bind): { if (env.conf.verbose > 3) env.out.println("      kdbg: kTermEq def=" + id2s(rl.assId)) else {}; ruEqzKChain(math, env, stmtClass, coId, wffT, comp, k,
-									prop0,
-									RuProofStep(rl.assId, [], RuStmt(stmtClass, [prop0], -1)),
-									bind, makeSet()); }
+								Some(bind): {
+									if (env.conf.verbose > 3) env.out.println("      kdbg: kTermEq def=" + id2s(rl.assId)) else {};
+									// SIMULTANEOUS loci renaming (uniform, capture-free — the
+									// one-at-a-time chain captured on permuted args: x3:=x4
+									// under a pending ∀x4), then the strip chain is identity-only
+									xdSide = if (kPat.nodes == sides[1].nodes) sides[0] else sides[1];
+									xdId = ruEqzPlainVar(xdSide.nodes, coId);
+									bareBind = foldTree(bind, makeTree(), \v, sl, acc ->
+										if (length(sl) == 2 && ruEqzIsCoercionAt(sl, 0, coId))
+											setTree(acc, v, [sl[1]])
+										else setTree(acc, v, sl));
+									switch (ruEqzApply(prop0.nodes, bareBind, coId)) {
+										None(): None();
+										Some(instN): {
+											inst0 = RuExp(instN, -1);
+											ruEqzKChain(math, env, stmtClass, coId, wffT, comp, k,
+												inst0,
+												RuProofStep(rl.assId, [], RuStmt(stmtClass, [inst0], -1)),
+												xdId, makeSet());
+										}
+									}
+								}
 							}
 						}
 					}
@@ -407,7 +427,7 @@ ruEqzKTermEq(math : RuMath, env : RuEnv, stmtClass : int,
 // (a locus — at a setvar or a class slice) or is the definiendum xd (→ comp)
 ruEqzKChain(math : RuMath, env : RuEnv, stmtClass : int, coId : int, wffT : int,
 	comp : RuExp, k : RuExp, f : RuExp, fp : RuProofTree,
-	bind : Tree<int, [RuExpNode]>, dvs : Set<RuDisj>) -> Maybe<Pair<RuProofTree, Set<RuDisj>>> {
+	xdId : int, dvs : Set<RuDisj>) -> Maybe<Pair<RuProofTree, Set<RuDisj>>> {
 	if (env.conf.verbose > 3) {
 		env.out.println("      kdbg: kChain |f|=" + i2s(length(f.nodes)));
 	} else {};
@@ -423,25 +443,15 @@ ruEqzKChain(math : RuMath, env : RuEnv, stmtClass : int, coId : int, wffT : int,
 				Some(Triple(body, RuProofStep(s2id("sp"), [], RuStmt(stmtClass, [imp], -1)),
 					makeSet()));
 			}
-			instM = switch (lookupTree(bind, xb)) {
-				Some(sl): {
-					tv = if (length(sl) == 1) ruEqzVarAt(sl, 0)
-						else if (length(sl) == 2 && ruEqzIsCoercionAt(sl, 0, coId)) ruEqzVarAt(sl, 1)
-						else -1;
-					if (tv == xb) spAt()
-					else if (tv >= 0)
-						ruInForallInstVar(math, env, stmtClass, f, RuVar(tv, tp2id_("setvar")))
-					else ruInForallInstTerm(math, env, stmtClass, f, RuExp(sl, -1));
-				}
-				None(): ruInForallInstTerm(math, env, stmtClass, f, comp);   // the definiendum
-			}
+			instM = if (xb == xdId) ruInForallInstTerm(math, env, stmtClass, f, comp)
+				else spAt();
 			switch (instM) {
 				None(): { if (env.conf.verbose > 3) env.out.println("      kdbg: forall inst failed") else {}; None(); };
 				Some(tr): {
 					fp1 = RuProofStep(s2id("ax-mp"), [fp, tr.second],
 						RuStmt(stmtClass, [tr.first], -1));
 					ruEqzKChain(math, env, stmtClass, coId, wffT, comp, k, tr.first, fp1,
-						bind, mergeSets(dvs, tr.third));
+						xdId, mergeSets(dvs, tr.third));
 				}
 			}
 		}
@@ -680,12 +690,22 @@ ruEqzOrNorm(stmtClass : int, wffT : int, d : RuExp) -> Pair<RuExp, RuProofTree> 
 	else {
 		da = ruInArgs(d);
 		e = da[0];
-		nR = ruEqzOrNorm(stmtClass, wffT, da[1]);
-		p1 = RuProofStep(s2id("orbi2i"), [nR.second],
-			st(wb2(d, ruFwdMkRule(s2id("wo"), wffT, [e, nR.first]))));
-		ins = ruEqzOrInsert(stmtClass, wffT, e, nR.first);
-		Pair(ins.first, RuProofStep(s2id("bitri"), [p1, ins.second],
-			st(wb2(d, ins.first))));
+		if (ruInHead(e) == s2id("wo")) {
+			// LEFT-nested head: rotate right first — ((A∨B)∨C) ↔ (A∨(B∨C)) — then normalize
+			ha = ruInArgs(e);
+			rot = ruFwdMkRule(s2id("wo"), wffT, [ha[0],
+				ruFwdMkRule(s2id("wo"), wffT, [ha[1], da[1]])]);
+			pr = RuProofStep(s2id("orass"), [], st(wb2(d, rot)));
+			nr = ruEqzOrNorm(stmtClass, wffT, rot);
+			Pair(nr.first, RuProofStep(s2id("bitri"), [pr, nr.second], st(wb2(d, nr.first))));
+		} else {
+			nR = ruEqzOrNorm(stmtClass, wffT, da[1]);
+			p1 = RuProofStep(s2id("orbi2i"), [nR.second],
+				st(wb2(d, ruFwdMkRule(s2id("wo"), wffT, [e, nR.first]))));
+			ins = ruEqzOrInsert(stmtClass, wffT, e, nR.first);
+			Pair(ins.first, RuProofStep(s2id("bitri"), [p1, ins.second],
+				st(wb2(d, ins.first))));
+		}
 	}
 }
 
