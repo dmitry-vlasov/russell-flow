@@ -1,6 +1,8 @@
 import ru/prover/tactics/equalizer_plan;
 import ru/prover/tactics/unfold;
+import ru/prover/tactics/instantiate;
 import ru/prover/tactics/hilbert;
+import ru/prover/tactics/kalmar;
 
 // THE EXTENSIONALITY BUILDER — proofs for the Equalizer's elem-eq facts.
 //
@@ -25,6 +27,122 @@ export {
 
 ruEqzElemEqProof(math : RuMath, env : RuEnv, stmtClass : int,
 	a : RuExp, b : RuExp) -> Maybe<Pair<RuProofTree, Set<RuDisj>>> {
+	switch (ruEqzElemEqComposite(math, env, stmtClass, a, b)) {
+		Some(r): Some(r);
+		None(): ruEqzWitnessRoute(math, env, stmtClass, a, b);
+	}
+}
+
+// THE WITNESS ROUTE: when a side is a k-term (or both are), mediate through a CANONICAL
+// COMPOSITE with the same elements — W = {e1} ∪ ({e2} ∪ …) — which is source-A by
+// construction: prove a = W and b = W (composite route, or the means-def route against
+// W), then join a = W, W = b by eqtri.
+ruEqzWitnessRoute(math : RuMath, env : RuEnv, stmtClass : int,
+	a : RuExp, b : RuExp) -> Maybe<Pair<RuProofTree, Set<RuDisj>>> {
+	wffT = tp2id_("wff");
+	rules = ruEqzElemRulesAll(math, env);
+	ea = ruEqzElemsList(rules, a, Some([]));
+	eb = ruEqzElemsList(rules, b, Some([]));
+	if (env.conf.verbose > 3) {
+		env.out.println("      kdbg: witnessRoute a=" + ru2s(a, math) + " ea=" + b2s(isSome(ea)) + " eb=" + b2s(isSome(eb)));
+	} else {};
+	switch (ea) {
+		None(): None();
+		Some(la): switch (eb) {
+			None(): None();
+			Some(lb): {
+				// the witness needs TEXTUALLY identical element sets (closure-equal-only
+				// element pairs would need transport — not built)
+				if (buildSet(la) != buildSet(lb) || la == []) { if (env.conf.verbose > 3) env.out.println("      kdbg: elem sets differ") else {}; None(); }
+				else switch (ruEqzWitness(math, env, rules, la)) {
+					None(): None();
+					Some(w): {
+						paM = ruEqzProveToW(math, env, stmtClass, a, w);
+						pbM = ruEqzProveToW(math, env, stmtClass, b, w);
+						if (env.conf.verbose > 3) {
+							env.out.println("      kdbg: witness pa=" + b2s(isSome(paM))
+								+ " pb=" + b2s(isSome(pbM)) + " W=" + ru2s(w, math));
+						} else {};
+						switch (paM) {
+							None(): None();
+							Some(pa): switch (pbM) {
+								None(): None();
+								Some(pb): {
+									wb2 = RuStmt(stmtClass, [ruFwdMkRule(s2id("wceq"), wffT, [w, b])], -1);
+									concl = RuStmt(stmtClass, [ruFwdMkRule(s2id("wceq"), wffT, [a, b])], -1);
+									Some(Pair(
+										RuProofStep(s2id("eqtri"), [pa.first,
+											RuProofStep(s2id("eqcomi"), [pb.first], wb2)], concl),
+										mergeSets(pa.second, pb.second)));
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// t = W: identity, the composite route, or the means-def route (W is always source-A)
+ruEqzProveToW(math : RuMath, env : RuEnv, stmtClass : int,
+	t : RuExp, w : RuExp) -> Maybe<Pair<RuProofTree, Set<RuDisj>>> {
+	wffT = tp2id_("wff");
+	if (t.nodes == w.nodes)
+		Some(Pair(RuProofStep(s2id("eqid"), [],
+			RuStmt(stmtClass, [ruFwdMkRule(s2id("wceq"), wffT, [t, w])], -1)), makeSet()))
+	else switch (ruEqzElemEqComposite(math, env, stmtClass, t, w)) {
+		Some(r): Some(r);
+		None(): switch (ruEqzKTermEq(math, env, stmtClass, w, t)) {
+			None(): None();
+			Some(pk): {
+				concl = RuStmt(stmtClass, [ruFwdMkRule(s2id("wceq"), wffT, [t, w])], -1);
+				Some(Pair(RuProofStep(s2id("eqcomi"), [pk.first], concl), pk.second));
+			}
+		}
+	}
+}
+
+// the TEXTUAL element list of t (first-occurrence order, deduped); None = no reading
+ruEqzElemsList(rules : Tree<int, [RuEqzElemRule]>, t : RuExp,
+	accM : Maybe<[[RuExpNode]]>) -> Maybe<[[RuExpNode]]> {
+	switch (accM) {
+		None(): None();
+		Some(acc): switch (find(lookupTreeDef(rules, ruInHead(t), []),
+				\rl -> rl.arity == ruInArity(t))) {
+			None(): None();
+			Some(rl): {
+				args = ruInArgs(t);
+				acc1 = fold(rl.eqArgs, acc, \a2, i ->
+					if (contains(a2, (args[i]).nodes)) a2 else arrayPush(a2, (args[i]).nodes));
+				fold(rl.memArgs, Some(acc1), \a2, j -> ruEqzElemsList(rules, args[j], a2));
+			}
+		}
+	}
+}
+
+// W = {e1} ∪ ({e2} ∪ …): the singleton/union constructors identified by their ELEM-RULE
+// SHAPE (arity-1 eqArgs=[0] / arity-2 memArgs=[0,1]) — never by name
+ruEqzWitness(math : RuMath, env : RuEnv, rules : Tree<int, [RuEqzElemRule]>,
+	els : [[RuExpNode]]) -> Maybe<RuExp> {
+	classT = tp2id_("class");
+	snId = foldTree(rules, -1, \cid, rls, acc ->
+		if (acc >= 0) acc
+		else if (exists(rls, \r -> r.arity == 1 && r.eqArgs == [0] && r.memArgs == [])) cid else acc);
+	unId = foldTree(rules, -1, \cid, rls, acc ->
+		if (acc >= 0) acc
+		else if (exists(rls, \r -> r.arity == 2 && r.eqArgs == [] && length(r.memArgs) == 2)) cid else acc);
+	if (snId < 0 || unId < 0) None()
+	else {
+		sn = \e : [RuExpNode] -> ruFwdMkRule(snId, classT, [RuExp(e, -1)]);
+		Some(fold(reverseA(take(els, length(els) - 1)), sn(els[length(els) - 1]), \acc, e ->
+			ruFwdMkRule(unId, classT, [sn(e), acc])));
+	}
+}
+
+// v1: both sides characterized by SOURCE-A membership biconds
+ruEqzElemEqComposite(math : RuMath, env : RuEnv, stmtClass : int,
+	a : RuExp, b : RuExp) -> Maybe<Pair<RuProofTree, Set<RuDisj>>> {
 	coId = ruEqzCoercionId(math, env);
 	wffT = tp2id_("wff");
 	// the fresh setvar: a name no translated article uses; type/coercion node harvested
@@ -40,30 +158,41 @@ ruEqzElemEqProof(math : RuMath, env : RuEnv, stmtClass : int,
 			xId = ruEqzFreshName(usedIds, 0);
 			xVar = RuVar(xId, tc.first);
 			xExp = RuExp([tc.second, xVar], -1);
-			// bicond facts for both sides
-			factsM = ruEqzCharFacts(math, env, stmtClass, coId, xExp, a,
-				ruEqzCharFacts(math, env, stmtClass, coId, xExp, b, Some([])));
-			switch (factsM) {
+			// FOLDED bicond facts for both sides (raw per-subterm facts made the
+			// certificate wander; folded, the atom world is memberships + eq-atoms only)
+			factsM = switch (ruEqzCharBicond(math, env, stmtClass, coId, xExp, a)) {
 				None(): None();
-				Some(facts): {
-					atomA = ruFwdMkRule(s2id("wcel"), wffT, [xExp, a]);
-					atomB = ruFwdMkRule(s2id("wcel"), wffT, [xExp, b]);
-					g = ruFwdMkRule(s2id("wb"), wffT, [atomA, atomB]);
-					em = RuEnvMath(math, env);
-					switch (ruHilbertCertificateTimed(em, ruPConnectives(), wffT, stmtClass,
-							map(facts, \f -> f.first), g, 2000.0, None())) {
-						None(): None();
-						Some(cert): {
-							spliced = ruUnfoldSplice(cert.first, 0, map(facts, \f -> f.second));
+				Some(ca): switch (ruEqzCharBicond(math, env, stmtClass, coId, xExp, b)) {
+					None(): None();
+					Some(cb2): Some([Pair(ca.first, ca.second), Pair(cb2.first, cb2.second)]);
+				}
+			}
+			switch (factsM) {
+				None(): { if (env.conf.verbose > 3) env.out.println("      kdbg: composite fold failed") else {}; None(); }
+				Some(fpair): {
+					// DETERMINISTIC join: (m_a ↔ D_a), (D_a ↔ D_b) by ∨-reassociation,
+					// (D_b ↔ m_b) by bicomi — bitri chain; no propositional search at all
+					fA = fpair[0]; fB = fpair[1];
+					dA = (ruInArgs(fA.first))[1];
+					dB = (ruInArgs(fB.first))[1];
+					mA = (ruInArgs(fA.first))[0];
+					mB = (ruInArgs(fB.first))[0];
+					st = \e : RuExp -> RuStmt(stmtClass, [e], -1);
+					wb3 = \x : RuExp, y : RuExp -> ruFwdMkRule(s2id("wb"), wffT, [x, y]);
+					switch (ruEqzOrAssoc(stmtClass, wffT, dA, dB)) {
+						None(): { if (env.conf.verbose > 3) env.out.println("      kdbg: or-assoc failed") else {}; None(); }
+						Some(oa): {
+							t1 = RuProofStep(s2id("bitri"), [fA.second, oa], st(wb3(mA, dB)));
+							bc = RuProofStep(s2id("bicomi"), [fB.second], st(wb3(dB, mB)));
+							g = RuProofStep(s2id("bitri"), [t1, bc], st(wb3(mA, mB)));
 							concl = RuStmt(stmtClass, [ruFwdMkRule(s2id("wceq"), wffT, [a, b])], -1);
-							// eqriv's instantiated DV: x against every var of A and of B
 							dvs = fold(set2array(fold(concat(a.nodes, b.nodes), makeSet(), \acc, n ->
 								switch (n) {
 									RuVar(id, tp): insertSet(acc, RuVar(id, tp));
 									RuRuleNode(__, __): acc;
-								})), cert.second.disjs, \acc, v -> insertSet(acc, RuDisj(v, xVar)));
+								})), makeSet(), \acc, v -> insertSet(acc, RuDisj(v, xVar)));
 							Some(Pair(
-								RuProofStep(s2id("eqriv"), [spliced], concl),
+								RuProofStep(s2id("eqriv"), [g], concl),
 								dvs));
 						}
 					}
@@ -175,5 +304,348 @@ ruEqzCharFact(math : RuMath, env : RuEnv, stmtClass : int, coId : int, xExp : Ru
 				}
 			}
 		}
+	}
+}
+
+
+// The FOLDED characterization bicond (x∈t ↔ D) with D a pure right-nested eq-atom
+// disjunction: singleton/pr/tp lemmas give it directly; union composes children by
+// orbi12i + bitri. Shrinks the k-body certificate to the def's own 5-atom world.
+ruEqzCharBicond(math : RuMath, env : RuEnv, stmtClass : int, coId : int, xExp : RuExp,
+	t : RuExp) -> Maybe<Triple<RuExp, RuProofTree, RuExp>> {
+	wffT = tp2id_("wff");
+	rules = ruEqzElemRulesAll(math, env);
+	switch (find(lookupTreeDef(rules, ruInHead(t), []), \rl -> rl.arity == ruInArity(t))) {
+		None(): None();
+		Some(rl): switch (ruEqzCharFact(math, env, stmtClass, coId, xExp, t, rl)) {
+			None(): None();
+			Some(fact): {
+				instArgs = ruInArgs(fact.first);
+				if (rl.memArgs == []) Some(Triple(fact.first, fact.second, instArgs[1]))
+				else if (rl.eqArgs == [] && length(rl.memArgs) == 2) {
+					args = ruInArgs(t);
+					switch (ruEqzCharBicond(math, env, stmtClass, coId, xExp, args[rl.memArgs[0]])) {
+						None(): None();
+						Some(c1): switch (ruEqzCharBicond(math, env, stmtClass, coId, xExp, args[rl.memArgs[1]])) {
+							None(): None();
+							Some(c2): {
+								m1 = (ruInArgs(c1.first))[0];
+								m2 = (ruInArgs(c2.first))[0];
+								dd = ruFwdMkRule(s2id("wo"), wffT, [c1.third, c2.third]);
+								orbConcl = ruFwdMkRule(s2id("wb"), wffT,
+									[ruFwdMkRule(s2id("wo"), wffT, [m1, m2]), dd]);
+								orb = RuProofStep(s2id("orbi12i"), [c1.second, c2.second],
+									RuStmt(stmtClass, [orbConcl], -1));
+								bitConcl = ruFwdMkRule(s2id("wb"), wffT, [instArgs[0], dd]);
+								Some(Triple(bitConcl,
+									RuProofStep(s2id("bitri"), [fact.second, orb],
+										RuStmt(stmtClass, [bitConcl], -1)),
+									dd));
+							}
+						}
+					}
+				} else None();
+			}
+		}
+	}
+}
+
+// ---- the k-term route (source-B means-definitions) ---------------------------
+
+// A proof of (comp = k) from k's means-definition. comp must be SOURCE-A
+// characterizable; k's head rule must come from a hyp-free DV-free ∀-closed def.
+ruEqzKTermEq(math : RuMath, env : RuEnv, stmtClass : int,
+	comp : RuExp, k : RuExp) -> Maybe<Pair<RuProofTree, Set<RuDisj>>> {
+	coId = ruEqzCoercionId(math, env);
+	wffT = tp2id_("wff");
+	rules = ruEqzElemRulesAll(math, env);
+	switch (find(lookupTreeDef(rules, ruInHead(k), []), \rl -> rl.arity == ruInArity(k))) {
+		None(): { if (env.conf.verbose > 3) env.out.println("      kdbg: no k rule") else {}; None(); };
+		Some(rl): switch (lookupTree(math.decls.assertions, rl.assId)) {
+			None(): None();
+			Some(ass): {
+				inf = switch (ass) {
+					RuAxiom(__, i): i; RuCong(__, i): i;
+					RuTheorem(__, i, __, __): i; RuDef(__, i, __, __): i;
+				};
+				if (inf.hyps != [] || inf.prop.exps == [] || !isEmptySet(inf.vars.disjs)) { if (env.conf.verbose > 3) env.out.println("      kdbg: def hyps/disjs") else {}; None(); }
+				else {
+					prop0 = ruExp(inf.prop.exps[0]);
+					// a real means-DEFINITION is ∀-closed — bare bicond lemmas (elun) are
+					// source-A material, not defs, and must not enter the chain
+					if (ruInHead(prop0) != s2id("wal")) None() else {
+					matrix = ruEqzStripAlls(prop0);
+					// the matrix must be source-B shaped: (xd = k(loci-vars)) ↔ …
+					if (ruInHead(matrix) != s2id("wb")) None()
+					else {
+						sides = ruInArgs((ruInArgs(matrix))[0]);
+						if (length(sides) != 2) None()
+						else {
+							// which equality side is the k-pattern; bind its loci to k's args
+							kPat = if (ruInHead(sides[1]) == ruInHead(k)) sides[1] else sides[0];
+							defVars = fold(prop0.nodes, makeSet(), \acc, n -> switch (n) {
+								RuVar(id, __): insertSet(acc, id);
+								RuRuleNode(__, __): acc;
+							});
+							switch (ruEqzMatch(k.nodes, kPat.nodes, defVars, coId)) {
+								None(): { if (env.conf.verbose > 3) env.out.println("      kdbg: k pattern no match") else {}; None(); };
+								Some(bind): { if (env.conf.verbose > 3) env.out.println("      kdbg: kTermEq def=" + id2s(rl.assId)) else {}; ruEqzKChain(math, env, stmtClass, coId, wffT, comp, k,
+									prop0,
+									RuProofStep(rl.assId, [], RuStmt(stmtClass, [prop0], -1)),
+									bind, makeSet()); }
+							}
+						}
+					}
+					}
+				}
+			}
+		}
+	}
+}
+
+// strip the def's ∀-prefix by instantiation: each binder either maps through `bind`
+// (a locus — at a setvar or a class slice) or is the definiendum xd (→ comp)
+ruEqzKChain(math : RuMath, env : RuEnv, stmtClass : int, coId : int, wffT : int,
+	comp : RuExp, k : RuExp, f : RuExp, fp : RuProofTree,
+	bind : Tree<int, [RuExpNode]>, dvs : Set<RuDisj>) -> Maybe<Pair<RuProofTree, Set<RuDisj>>> {
+	if (env.conf.verbose > 3) {
+		env.out.println("      kdbg: kChain |f|=" + i2s(length(f.nodes)));
+	} else {};
+	if (ruInHead(f) == s2id("wal") && ruInArity(f) == 2) {
+		xb = ruEqzVarAt(((ruInArgs(f))[0]).nodes, 0);
+		if (xb < 0) None()
+		else {
+			// IDENTITY instantiation (the def's locus name equals the theorem's var —
+			// the articles reuse x2,x3,… on both sides) is just sp: ∀xφ → φ
+			spAt = \ -> {
+				body = (ruInArgs(f))[1];
+				imp = ruFwdMkRule(s2id("wi"), wffT, [f, body]);
+				Some(Triple(body, RuProofStep(s2id("sp"), [], RuStmt(stmtClass, [imp], -1)),
+					makeSet()));
+			}
+			instM = switch (lookupTree(bind, xb)) {
+				Some(sl): {
+					tv = if (length(sl) == 1) ruEqzVarAt(sl, 0)
+						else if (length(sl) == 2 && ruEqzIsCoercionAt(sl, 0, coId)) ruEqzVarAt(sl, 1)
+						else -1;
+					if (tv == xb) spAt()
+					else if (tv >= 0)
+						ruInForallInstVar(math, env, stmtClass, f, RuVar(tv, tp2id_("setvar")))
+					else ruInForallInstTerm(math, env, stmtClass, f, RuExp(sl, -1));
+				}
+				None(): ruInForallInstTerm(math, env, stmtClass, f, comp);   // the definiendum
+			}
+			switch (instM) {
+				None(): { if (env.conf.verbose > 3) env.out.println("      kdbg: forall inst failed") else {}; None(); };
+				Some(tr): {
+					fp1 = RuProofStep(s2id("ax-mp"), [fp, tr.second],
+						RuStmt(stmtClass, [tr.first], -1));
+					ruEqzKChain(math, env, stmtClass, coId, wffT, comp, k, tr.first, fp1,
+						bind, mergeSets(dvs, tr.third));
+				}
+			}
+		}
+	} else if (ruInHead(f) == s2id("wb") && ruInArity(f) == 2) {
+		fargs = ruInArgs(f);
+		want = ruFwdMkRule(s2id("wceq"), wffT, [comp, k]);
+		if ((fargs[0]).nodes != want.nodes) { if (env.conf.verbose > 3) env.out.println("      kdbg: lhs mismatch after chain") else {}; None(); }
+		else {
+			rhs = fargs[1];
+			if (ruInHead(rhs) != s2id("wal") || ruInArity(rhs) != 2) None()
+			else {
+				rargs = ruInArgs(rhs);
+				x1 = ruEqzVarAt((rargs[0]).nodes, 0);
+				if (x1 < 0 || exists(ruInVarsOf(comp), \u -> u.id == x1)) None()
+				else {
+					body = rargs[1];
+					xTpl = ruEqzXTemplate(comp.nodes, coId);
+					switch (xTpl) {
+						None(): None();
+						Some(tc): {
+							xExp = RuExp([tc.second, RuVar(x1, tc.first)], -1);
+							switch (ruEqzCharBicond(math, env, stmtClass, coId, xExp, comp)) {
+								None(): { if (env.conf.verbose > 3) env.out.println("      kdbg: charFacts(comp) failed") else {}; None(); };
+								Some(cb): {
+									facts = [Pair(cb.first, cb.second)];
+									em = RuEnvMath(math, env);
+									switch (switch (ruEqzNnfBridge(stmtClass, wffT, cb.second, cb.first, body)) {
+										Some(bp): Some(Pair(bp, RuVarsDisjs(makeTree(), makeSet())));
+										None(): ruEqzBodyCert(em, wffT, stmtClass,
+											map(facts, \ff -> ff.first), body);
+									}) {
+										None(): {
+											if (env.conf.verbose > 3) {
+												env.out.println("      kdbg: k-body certificate failed");
+												bodyAtoms = getTreeKeys(ruPAtomNodes(ruPConnectives(), body));
+												factAtoms = getTreeKeys(ruPAtomNodes(ruPConnectives(), cb.first));
+												env.out.println("        body atoms: " + strGlue(map(bodyAtoms, \k2 -> strLeft(k2, 30)), " | "));
+												env.out.println("        fact atoms: " + strGlue(map(factAtoms, \k2 -> strLeft(k2, 30)), " | "));
+												env.out.println("        body: " + ru2s(body, math));
+												iter(facts, \ff -> env.out.println("        fact: " + ru2s(ff.first, math)));
+												eqi = fold(enumFromTo(0, length(body.nodes) - 1), -1, \ai, ii ->
+													switch (body.nodes[ii]) {
+														RuVar(vid, __): if (vid == 280) ii else ai;
+														RuRuleNode(__, __): ai;
+													});
+												feq = (ruInArgs(facts[1].first))[1];
+												env.out.println("        fact-eq-raw: " + toString(feq.nodes));
+												hasSl = exists(enumFromTo(0, length(body.nodes) - length(feq.nodes)),
+													\ii -> subrange(body.nodes, ii, length(feq.nodes)) == feq.nodes);
+												env.out.println("        body has fact-eq slice: " + b2s(hasSl));
+												bmem = (ruInArgs(facts[0].first))[0];
+												hasM = exists(enumFromTo(0, length(body.nodes) - length(bmem.nodes)),
+													\ii -> subrange(body.nodes, ii, length(bmem.nodes)) == bmem.nodes);
+												env.out.println("        body has W-membership slice: " + b2s(hasM));
+												if (length(facts) > 1) env.out.println("        factraw: " + strLeft(toString((facts[1].first).nodes), 300)) else {};
+											} else {};
+											None();
+										};
+										Some(cert): {
+											spliced = ruUnfoldSplice(cert.first, 0, map(facts, \ff -> ff.second));
+											rhsProof = RuProofStep(s2id("ax-gen"), [spliced],
+												RuStmt(stmtClass, [rhs], -1));
+											concl = RuStmt(stmtClass, [want], -1);
+											Some(Pair(
+												RuProofStep(s2id("mpbir"), [rhsProof, fp], concl),
+												mergeSets(dvs, cert.second.disjs)));
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	} else None();
+}
+
+
+// The def-body certificate with a WIDER SPLIT BUDGET: the emitter's defaults (depth 6 /
+// 400 global) are tuned for checker residuals and starve the 5-atom full case analysis
+// the means-def body needs (hSplit hit budget=1 with 5 undecided). Same machinery,
+// deeper allowance, own 8s wall.
+ruEqzBodyCert(em : RuEnvMath, wffT : int, stmtClass : int,
+	hyps : [RuExp], goal : RuExp) -> Maybe<Pair<RuProofTree, RuVarsDisjs>> {
+	conn = ruPConnectives();
+	atomNodes = fold(hyps, ruPAtomNodes(conn, goal), \acc, h -> mergeTree(acc, ruPAtomNodes(conn, h)));
+	ctx = RuHCtx(ruHCtx(em, wffT, stmtClass, atomNodes) with timer = ruMakeLimitedTimer(8000.0));
+	ctx.splitBudget := 16;
+	ctx.globalSplits := 100000;
+	maybeMap(ruHilbertProve(ctx, map(hyps, \h -> ruPAtomize(conn, h)), ruPAtomize(conn, goal)),
+		\tree -> Pair(tree, RuVarsDisjs(
+			fold(^(ctx.freshVars), makeTree(), \acc, v -> setTree(acc, v.id, v)), ^(ctx.disjs))));
+}
+
+
+// ---- the NNF bridge ----------------------------------------------------------
+// The translator emits every means-def body in ONE fixed shape:
+//   body = ¬(m ∧ N) ∧ (N ∨ m),   N = ¬e1 ∧ (¬e2 ∧ …)   (the De Morgan dual of D).
+// Given ⊢ (m ↔ D) with D = e1 ∨ (e2 ∨ …), the body follows DETERMINISTICALLY:
+//   ¬(m∧N): biimpi → (m→D); iman+mpbi → ¬(m∧¬D); (¬D↔N) De-Morgan-chained
+//           (ioran+anbi2i+bitri per disjunct, biid at the leaf) → bicomi+anbi2i
+//           → ((m∧N)↔(m∧¬D)); mtbir → ¬(m∧N).
+//   (N∨m):  biimpri → (D→m); imor+mpbi → (¬D∨m); orbi1i(¬D↔N)+mpbi → (N∨m).
+//   pm3.2i joins. No search anywhere — shape mismatch = None (the cert fallback).
+ruEqzNnfBridge(stmtClass : int, wffT : int, factProof : RuProofTree, factExp : RuExp,
+	body : RuExp) -> Maybe<RuProofTree> {
+	wn = \e : RuExp -> ruFwdMkRule(s2id("wn"), wffT, [e]);
+	wa = \x : RuExp, y : RuExp -> ruFwdMkRule(s2id("wa"), wffT, [x, y]);
+	wo = \x : RuExp, y : RuExp -> ruFwdMkRule(s2id("wo"), wffT, [x, y]);
+	wb2 = \x : RuExp, y : RuExp -> ruFwdMkRule(s2id("wb"), wffT, [x, y]);
+	wi2 = \x : RuExp, y : RuExp -> ruFwdMkRule(s2id("wi"), wffT, [x, y]);
+	st = \e : RuExp -> RuStmt(stmtClass, [e], -1);
+	if (ruInHead(factExp) != s2id("wb") || ruInHead(body) != s2id("wa")) None()
+	else {
+		fa = ruInArgs(factExp);
+		m = fa[0]; d = fa[1];
+		ba = ruInArgs(body);
+		c1 = ba[0]; c2 = ba[1];
+		okShape = ruInHead(c1) == s2id("wn") && ruInHead(c2) == s2id("wo")
+			&& { i1 = (ruInArgs(c1))[0]; ruInHead(i1) == s2id("wa")
+				&& ((ruInArgs(i1))[0]).nodes == m.nodes
+				&& ((ruInArgs(c2))[1]).nodes == m.nodes
+				&& ((ruInArgs(i1))[1]).nodes == ((ruInArgs(c2))[0]).nodes; };
+		if (!okShape) None()
+		else {
+			n = (ruInArgs(c2))[0];
+			switch (ruEqzDeMorgan(stmtClass, wffT, d, n)) {
+				None(): None();
+				Some(dm): {   // dm : ⊢ (¬D ↔ N)
+					// C1 = ¬(m ∧ N)
+					b1 = RuProofStep(s2id("biimpi"), [factProof], st(wi2(m, d)));
+					b2i = RuProofStep(s2id("iman"), [], st(wb2(wi2(m, d), wn(wa(m, wn(d))))));
+					b2 = RuProofStep(s2id("mpbi"), [b1, b2i], st(wn(wa(m, wn(d)))));
+					dmc = RuProofStep(s2id("bicomi"), [dm], st(wb2(n, wn(d))));
+					b3 = RuProofStep(s2id("anbi2i"), [dmc], st(wb2(wa(m, n), wa(m, wn(d)))));
+					pc1 = RuProofStep(s2id("mtbir"), [b2, b3], st(wn(wa(m, n))));
+					// C2 = (N ∨ m)
+					q1 = RuProofStep(s2id("biimpri"), [factProof], st(wi2(d, m)));
+					q2i = RuProofStep(s2id("imor"), [], st(wb2(wi2(d, m), wo(wn(d), m))));
+					q2 = RuProofStep(s2id("mpbi"), [q1, q2i], st(wo(wn(d), m)));
+					q3 = RuProofStep(s2id("orbi1i"), [dm], st(wb2(wo(wn(d), m), wo(n, m))));
+					pc2 = RuProofStep(s2id("mpbi"), [q2, q3], st(wo(n, m)));
+					Some(RuProofStep(s2id("pm3.2i"), [pc1, pc2], st(body)));
+				}
+			}
+		}
+	}
+}
+
+// ⊢ (¬D ↔ N) for D = e ∨ R vs N = ¬e ∧ N_R (right-nested; leaf: N = ¬D → biid)
+ruEqzDeMorgan(stmtClass : int, wffT : int, d : RuExp, n : RuExp) -> Maybe<RuProofTree> {
+	wn = \e : RuExp -> ruFwdMkRule(s2id("wn"), wffT, [e]);
+	wa = \x : RuExp, y : RuExp -> ruFwdMkRule(s2id("wa"), wffT, [x, y]);
+	wb2 = \x : RuExp, y : RuExp -> ruFwdMkRule(s2id("wb"), wffT, [x, y]);
+	st = \e : RuExp -> RuStmt(stmtClass, [e], -1);
+	if (ruInHead(d) == s2id("wo") && ruInHead(n) == s2id("wa")) {
+		da = ruInArgs(d);
+		na = ruInArgs(n);
+		if ((na[0]).nodes != (wn(da[0])).nodes) None()
+		else switch (ruEqzDeMorgan(stmtClass, wffT, da[1], na[1])) {
+			None(): None();
+			Some(dmR): {
+				ior = RuProofStep(s2id("ioran"), [],
+					st(wb2(wn(d), wa(wn(da[0]), wn(da[1])))));
+				an = RuProofStep(s2id("anbi2i"), [dmR],
+					st(wb2(wa(wn(da[0]), wn(da[1])), wa(wn(da[0]), na[1]))));
+				Some(RuProofStep(s2id("bitri"), [ior, an], st(wb2(wn(d), n))));
+			}
+		}
+	} else if (n.nodes == (wn(d)).nodes)
+		Some(RuProofStep(s2id("biid"), [], st(wb2(wn(d), wn(d)))))
+	else None();
+}
+
+
+// ⊢ (d1 ↔ d2) for the SAME flat ∨-sequence under different association (d2 the
+// right-nested canon): biid at equality, orbi2i under a shared head, orass to rotate
+// a left-nested head right. Termination: left depth strictly decreases.
+ruEqzOrAssoc(stmtClass : int, wffT : int, d1 : RuExp, d2 : RuExp) -> Maybe<RuProofTree> {
+	wo = \x : RuExp, y : RuExp -> ruFwdMkRule(s2id("wo"), wffT, [x, y]);
+	wb2 = \x : RuExp, y : RuExp -> ruFwdMkRule(s2id("wb"), wffT, [x, y]);
+	st = \e : RuExp -> RuStmt(stmtClass, [e], -1);
+	if (d1.nodes == d2.nodes)
+		Some(RuProofStep(s2id("biid"), [], st(wb2(d1, d2))))
+	else if (ruInHead(d1) != s2id("wo") || ruInHead(d2) != s2id("wo")) None()
+	else {
+		a1 = ruInArgs(d1);
+		a2 = ruInArgs(d2);
+		if ((a1[0]).nodes == (a2[0]).nodes) {
+			// same head element: recurse on the tails under orbi2i
+			switch (ruEqzOrAssoc(stmtClass, wffT, a1[1], a2[1])) {
+				None(): None();
+				Some(r): Some(RuProofStep(s2id("orbi2i"), [r], st(wb2(d1, d2))));
+			}
+		} else if (ruInHead(a1[0]) == s2id("wo")) {
+			// left-nested head: ((A∨B)∨C) ↔ (A∨(B∨C)), then recurse
+			ha = ruInArgs(a1[0]);
+			rot = wo(ha[0], wo(ha[1], a1[1]));
+			or1 = RuProofStep(s2id("orass"), [], st(wb2(d1, rot)));
+			switch (ruEqzOrAssoc(stmtClass, wffT, rot, d2)) {
+				None(): None();
+				Some(r): Some(RuProofStep(s2id("bitri"), [or1, r], st(wb2(d1, d2))));
+			}
+		} else None();
 	}
 }
