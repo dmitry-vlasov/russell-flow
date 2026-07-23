@@ -1,0 +1,500 @@
+import ru/prover/tactics/equalizer_plan;
+
+// THE UNIFIER PLANNER — decision core (planner-executor architecture).
+//
+// Transcribed from the original Mizar checker (~/dev/system/kernel/):
+//   checker.pas   InferenceChecker: PreCheck normalizes premises ∧ ¬conclusion into
+//                 DNF over literals; EVERY disjunct must be refuted (Contr > 0).
+//   equalizer.pas Equate builds eq-classes from the disjunct's positive equalities;
+//                 ContradictionVerify refutes by reflexivity (Contr 19) or by a
+//                 PosBas/NegBas literal clash modulo classes (Contr 20).
+//   unifier.pas   Unification: for each UNIVERSAL premise P, Verify(P) strips the
+//                 quantifiers into FREE unification variables, normalizes ¬P into
+//                 clauses (NormalizeAsFalse), computes per signed literal the
+//                 InstCollection — the set of partial substitutions
+//                 freeVar -> eq-class under which the basis FORCES that literal
+//                 (COMPInstAsTrue/AsFalse: match against PosBas/NegBas modulo
+//                 eq-classes, UNITrm descends through per-functor occurrence
+//                 lists) — and MEETS them across the clause (JoinInstList). A
+//                 nonempty meet = an instance of P false against the basis =
+//                 contradiction (Contr 45). Premise PAIRS (Contr 47) and the
+//                 Fraenkel cases (48/49) are NOT transcribed in this first cut.
+//
+// The mapping into our context: the theorem's ∀-stripped goal matrix, negated, is
+// conjoined with the hypotheses and normalized to DNF — each disjunct is one ground
+// literal set (one PreCheck case). Eq-classes over the disjunct come from the EXISTING
+// proof-producing congruence closure (congruence.flow). Universal premises are the
+// ∀-closed cited assertions, their matrices' vars the free unification variables; the
+// InstCollection lattice is transcribed directly (substitutions are partial maps
+// var -> eq-class representative key; UnionWith = OR with dedup, JoinWith = AND by
+// compatible merge, Top = the empty substitution, Bottom = the empty collection).
+//
+// This module is the PLANNER'S BRAIN only: it decides and records WHAT refutes each
+// disjunct (premise + binding); it never touches the PVT and builds no proofs. The
+// deterministic generator comes on top of the decision (the Equalizer pattern).
+//
+// KNOWN v1 INCOMPLETENESS (each a measured Mizar feature, deferred):
+//  - ground subterms of a premise pattern are compared by KEY, not registered into the
+//    DAG first (Mizar YTerm-registers them; unknown-term reprs are their own keys);
+//  - no premise pairs (Contr 47), no Fraenkel (48/49), no arithmetic requirements;
+//  - inner-quantified subformulas are OPAQUE atoms, matched structurally modulo
+//    classes (Mizar standardizes bound vars; we require same binder skeleton).
+
+export {
+	RuUnfPlan(
+		provable  : bool,
+		disjuncts : int,           // PreCheck cases (DNF disjuncts of hyps ∧ ¬goal)
+		refuted   : int,           // how many of them closed
+		premises  : int,           // universal premises offered
+		overflow  : bool,          // a cap fired — verdict only "not decided"
+		refutations : [RuUnfRefutation]  // one per refuted disjunct, in order
+	);
+
+	// How one disjunct was refuted — the generator's replay currency.
+	RuUnfRefutation ::= RuUnfByContradiction, RuUnfByReflexivity, RuUnfByAtomClash, RuUnfByPremise;
+		// complementary literal pair, syntactic (PreCheck-trivial)
+		RuUnfByContradiction(lit : RuExp);
+		// ¬(l = r) with l ~ r in the closure (Contr 19)
+		RuUnfByReflexivity(l : RuExp, r : RuExp);
+		// A and ¬A' with A ~ A' modulo classes (Contr 20)
+		RuUnfByAtomClash(pos : RuExp, neg : RuExp);
+		// an instance of universal premise assId is false against the basis (Contr 45):
+		// bind maps the premise's matrix vars to eq-class REPRESENTATIVE terms
+		RuUnfByPremise(assId : int, bind : Tree<int, RuExp>);
+
+	// A signed ground literal of a disjunct.
+	RuUnfLit(pos : bool, atom : RuExp);
+
+	// A universal premise: the ∀-stripped matrix (any wff shape, EXCLUDING plain
+	// equalities — those are the Equalizer's fragment) and its matrix vars.
+	RuUnfPremise(assId : int, matrix : RuExp, vars : [int], foundational : bool);
+
+	// Every ∀-closed 0-hyp non-equality assertion PRECEDING the theorem (the
+	// reachability law). The caller narrows by the by-list (the probe does).
+	ruUnfScopePremises(math : RuMath, env : RuEnv, thInfo : RuDeclInfo) -> [RuUnfPremise];
+
+	// Decide `goal` (a possibly ∀-closed wff) from the hyps + universal premises.
+	ruUnfPlanDecide(math : RuMath, env : RuEnv, stmtClass : int,
+		prems : [RuUnfPremise], hyps : [RuExp], goal : RuExp,
+		maxClauses : int, maxSubsts : int, budgetMs : double) -> RuUnfPlan;
+}
+
+// ---- caps (Mizar's LatOvfl analogues) ---------------------------------------
+
+ruUnfMaxLitsPerClause = 32;
+
+// ---- DNF over literals ------------------------------------------------------
+
+// DNF of e (pos) / ¬e (neg) as clauses of signed literals; None = the clause cap
+// fired. Inner-quantified subformulas and unknown heads are ATOMS.
+ruUnfDnf(e : RuExp, pos : bool, maxClauses : int) -> Maybe<[[RuUnfLit]]> {
+	h = ruInHead(e);
+	ar = ruInArity(e);
+	args = \ -> ruInArgs(e);
+	prod = \dl : Maybe<[[RuUnfLit]]>, dr : Maybe<[[RuUnfLit]]> ->
+		maybeBind(dl, \l -> maybeBind(dr, \r ->
+			if (length(l) * length(r) > maxClauses) None()
+			else Some(concatA(map(l, \cl -> filtermap(r, \cr -> {
+				cls = concat(cl, cr);
+				if (length(cls) > ruUnfMaxLitsPerClause) None() else Some(cls);
+			}))))));
+	sum = \dl : Maybe<[[RuUnfLit]]>, dr : Maybe<[[RuUnfLit]]> ->
+		maybeBind(dl, \l -> maybeBind(dr, \r ->
+			if (length(l) + length(r) > maxClauses) None() else Some(concat(l, r))));
+	if (h == s2id("wn") && ar == 1) ruUnfDnf((args())[0], !pos, maxClauses)
+	else if (h == s2id("wa") && ar == 2) {
+		a = (args())[0]; b = (args())[1];
+		if (pos) prod(ruUnfDnf(a, true, maxClauses), ruUnfDnf(b, true, maxClauses))
+		else sum(ruUnfDnf(a, false, maxClauses), ruUnfDnf(b, false, maxClauses));
+	} else if (h == s2id("wo") && ar == 2) {
+		a = (args())[0]; b = (args())[1];
+		if (pos) sum(ruUnfDnf(a, true, maxClauses), ruUnfDnf(b, true, maxClauses))
+		else prod(ruUnfDnf(a, false, maxClauses), ruUnfDnf(b, false, maxClauses));
+	} else if (h == s2id("wi") && ar == 2) {
+		a = (args())[0]; b = (args())[1];
+		if (pos) sum(ruUnfDnf(a, false, maxClauses), ruUnfDnf(b, true, maxClauses))
+		else prod(ruUnfDnf(a, true, maxClauses), ruUnfDnf(b, false, maxClauses));
+	} else if (h == s2id("wb") && ar == 2) {
+		a = (args())[0]; b = (args())[1];
+		if (pos) sum(
+			prod(ruUnfDnf(a, true, maxClauses), ruUnfDnf(b, true, maxClauses)),
+			prod(ruUnfDnf(a, false, maxClauses), ruUnfDnf(b, false, maxClauses)))
+		else sum(
+			prod(ruUnfDnf(a, true, maxClauses), ruUnfDnf(b, false, maxClauses)),
+			prod(ruUnfDnf(a, false, maxClauses), ruUnfDnf(b, true, maxClauses)));
+	} else Some([[RuUnfLit(pos, e)]]);
+}
+
+// ---- the substitution lattice (InstCollection) ------------------------------
+//
+// A substitution is a partial map matrixVar -> eq-class representative key.
+// A collection is an array of substitutions: [] = Bottom, [empty map] = Top.
+
+ruUnfTop() -> [Tree<int, string>] { [makeTree()] }
+
+ruUnfSubKey(s : Tree<int, string>) -> string {
+	foldTree(s, "", \k, v, acc -> acc + i2s(k) + ":" + v + ";");
+}
+
+// AND: pairwise compatible merge (Mizar JoinWith / JoinAtom)
+ruUnfJoin(a : [Tree<int, string>], b : [Tree<int, string>], maxSubsts : int,
+	ovfl : ref bool) -> [Tree<int, string>] {
+	merged = fold(a, Pair([], makeSet()), \acc : Pair<[Tree<int, string>], Set<string>>, s1 ->
+		fold(b, acc, \ac, s2 -> {
+			if (length(ac.first) >= maxSubsts) { ovfl := true; ac; }
+			else switch (fold(tree2pairs(s2), Some(s1), \m : Maybe<Tree<int, string>>, p ->
+				maybeBind(m, \t -> switch (lookupTree(t, p.first)) {
+					Some(v0): if (v0 == p.second) Some(t) else None();
+					None(): Some(setTree(t, p.first, p.second));
+				}))) {
+				None(): ac;
+				Some(m): {
+					k = ruUnfSubKey(m);
+					if (containsSet(ac.second, k)) ac
+					else Pair(arrayPush(ac.first, m), insertSet(ac.second, k));
+				}
+			}
+		}));
+	merged.first;
+}
+
+// OR: union with dedup (Mizar UnionWith; the antichain absorption is skipped —
+// dedup + the cap bound the collection instead)
+ruUnfUnion(a : [Tree<int, string>], b : [Tree<int, string>], maxSubsts : int,
+	ovfl : ref bool) -> [Tree<int, string>] {
+	fold(b, Pair(a, buildSet(map(a, ruUnfSubKey))), \acc : Pair<[Tree<int, string>], Set<string>>, s -> {
+		k = ruUnfSubKey(s);
+		if (containsSet(acc.second, k)) acc
+		else if (length(acc.first) >= maxSubsts) { ovfl := true; acc; }
+		else Pair(arrayPush(acc.first, s), insertSet(acc.second, k));
+	}).first;
+}
+
+// ---- the per-disjunct basis -------------------------------------------------
+
+RuUnfBasis(
+	st       : RuCongSt,                  // eq-classes over the disjunct's equalities
+	members  : Tree<string, [RuExp]>,     // class representative key -> member terms
+	reprTerm : Tree<string, RuExp>,       // representative key -> one member (readout)
+	posAtoms : [RuExp],                   // non-equality atoms asserted true
+	negAtoms : [RuExp],                   // non-equality atoms asserted false
+	negEqs   : [Pair<RuExp, RuExp>],      // sides of negative equalities
+	classTp  : int,
+	coId     : int,
+	maxSubsts : int,
+	ovfl     : ref bool
+);
+
+ruUnfIsClassNode(n : RuExpNode, classTp : int) -> bool {
+	switch (n) {
+		RuVar(__, tp): tp == classTp;
+		RuRuleNode(idT, __): ruIdType2Type(idT) == classTp;
+	}
+}
+
+// maximal class-typed subterm slices of a wff
+ruUnfClassTerms(e : RuExp, classTp : int) -> [RuExp] {
+	ruUnfDoClassTerms(e.nodes, 0, length(e.nodes), classTp, []);
+}
+
+ruUnfDoClassTerms(nodes : [RuExpNode], i : int, end : int, classTp : int, acc : [RuExp]) -> [RuExp] {
+	if (i >= end) acc
+	else if (ruUnfIsClassNode(nodes[i], classTp)) {
+		span = ruEqzSpan(nodes, i);
+		ruUnfDoClassTerms(nodes, i + span, end, classTp, arrayPush(acc, RuExp(subrange(nodes, i, span), -1)));
+	} else ruUnfDoClassTerms(nodes, i + 1, end, classTp, acc);
+}
+
+ruUnfIsEq(e : RuExp) -> bool { ruInHead(e) == s2id("wceq") && ruInArity(e) == 2 }
+
+ruUnfMakeBasis(math : RuMath, env : RuEnv, stmtClass : int, lits : [RuUnfLit],
+	maxSubsts : int) -> RuUnfBasis {
+	classTp = tp2id_("class");
+	coId = ruEqzCoercionId(math, env);
+	rules = ruCongRulesCached(math);
+	posEqs = filter(lits, \l -> l.pos && ruUnfIsEq(l.atom));
+	facts = mapi(posEqs, \i, l -> Pair(RuProofHyp(i, RuStmt(stmtClass, [l.atom], -1)), l.atom));
+	terms = fold(lits, [], \acc, l -> concat(acc, ruUnfClassTerms(l.atom, classTp)));
+	st = ruCongClose(rules, facts, terms, stmtClass, math, env);
+	// class-membership index over the closure's whole universe
+	grouped = foldTree(^(st.terms), Pair(makeTree(), makeTree()),
+		\k, t, acc : Pair<Tree<string, [RuExp]>, Tree<string, RuExp>> -> {
+			r = ruCongRepr(st, t);
+			Pair(setTree(acc.first, r, arrayPush(lookupTreeDef(acc.first, r, []), t)),
+				if (containsKeyTree(acc.second, r)) acc.second else setTree(acc.second, r, t));
+		});
+	RuUnfBasis(st, grouped.first, grouped.second,
+		filtermap(lits, \l -> if (l.pos && !ruUnfIsEq(l.atom)) Some(l.atom) else None()),
+		filtermap(lits, \l -> if (!l.pos && !ruUnfIsEq(l.atom)) Some(l.atom) else None()),
+		filtermap(lits, \l -> if (!l.pos && ruUnfIsEq(l.atom)) {
+			ss = ruInArgs(l.atom);
+			Some(Pair(ss[0], ss[1]));
+		} else None()),
+		classTp, coId, maxSubsts, ref false);
+}
+
+// ---- matching modulo eq-classes (UNITrm) ------------------------------------
+
+// substitutions under which pattern CAN denote the class `classKey`
+ruUnfMatchClass(b : RuUnfBasis, pat : [RuExpNode], patVars : Set<int>,
+	classKey : string) -> [Tree<int, string>] {
+	ground = !exists(pat, \n -> switch (n) {
+		RuVar(id, __): containsSet(patVars, id);
+		RuRuleNode(__, __): false;
+	});
+	if (ground) {
+		if (ruCongRepr(b.st, RuExp(pat, -1)) == classKey) ruUnfTop() else [];
+	} else {
+		bindable =
+			if (length(pat) == 1) ruEqzVarAt(pat, 0)
+			else if (length(pat) == 2 && ruEqzIsCoercionAt(pat, 0, b.coId)) ruEqzVarAt(pat, 1)
+			else -1;
+		if (bindable >= 0 && containsSet(patVars, bindable))
+			[setTree(makeTree(), bindable, classKey)]
+		else {
+			// structured pattern: descend through every same-head member of the class
+			// (Mizar's per-functor EqList occurrence walk)
+			members = lookupTreeDef(b.members, classKey, []);
+			fold(members, [], \acc, m ->
+				if (length(m.nodes) == 0 || !ruEqzSameNode(pat[0], m.nodes[0])) acc
+				else {
+					pArgs = ruInArgs(RuExp(pat, -1));
+					mArgs = ruInArgs(m);
+					if (length(pArgs) != length(mArgs)) acc
+					else {
+						joined = foldi(pArgs, ruUnfTop(), \i, ac, pa ->
+							if (ac == []) ac
+							else ruUnfJoin(ac,
+								ruUnfMatchClass(b, pa.nodes, patVars, ruCongRepr(b.st, mArgs[i])),
+								b.maxSubsts, b.ovfl));
+						ruUnfUnion(acc, joined, b.maxSubsts, b.ovfl);
+					}
+				});
+		}
+	}
+}
+
+// wff-level structural match modulo classes: class-term boundaries delegate to
+// ruUnfMatchClass; everything above them must agree node by node (opaque atoms
+// with binders included — same skeleton, class holes modulo classes)
+ruUnfMatchModC(b : RuUnfBasis, pat : [RuExpNode], patVars : Set<int>,
+	term : [RuExpNode]) -> [Tree<int, string>] {
+	if (length(pat) == 0 || length(term) == 0) []
+	else if (ruUnfIsClassNode(pat[0], b.classTp)) {
+		if (!ruUnfIsClassNode(term[0], b.classTp)) []
+		else ruUnfMatchClass(b, pat, patVars, ruCongRepr(b.st, RuExp(term, -1)));
+	} else {
+		switch (pat[0]) {
+			RuVar(vid, __): {
+				// a bare setvar at a non-class position (a binder slot of an opaque
+				// atom): only a bare var can stand in
+				if (containsSet(patVars, vid)) {
+					if (length(term) == 1 && ruEqzVarAt(term, 0) >= 0)
+						[setTree(makeTree(), vid, ruCongRepr(b.st, RuExp(term, -1)))]
+					else [];
+				} else if (length(term) == 1 && term[0] == pat[0]) ruUnfTop() else [];
+			}
+			RuRuleNode(__, __): {
+				if (!ruEqzSameNode(pat[0], term[0])) []
+				else {
+					pArgs = ruInArgs(RuExp(pat, -1));
+					tArgs = ruInArgs(RuExp(term, -1));
+					if (length(pArgs) != length(tArgs)) []
+					else foldi(pArgs, ruUnfTop(), \i, ac, pa ->
+						if (ac == []) ac
+						else ruUnfJoin(ac, ruUnfMatchModC(b, pa.nodes, patVars, tArgs[i].nodes),
+							b.maxSubsts, b.ovfl));
+				}
+			}
+		}
+	}
+}
+
+// ---- literal evaluators (COMPInstAsFalse / COMPInstAsTrue) ------------------
+
+// substitutions under which the basis FORCES the literal's atom TRUE
+ruUnfForcedTrue(b : RuUnfBasis, atom : RuExp, patVars : Set<int>) -> [Tree<int, string>] {
+	if (ruUnfIsEq(atom)) {
+		ss = ruInArgs(atom);
+		// σl ~ σr: both sides denote ONE class (UnifyReflexive's shape)
+		foldTree(b.members, [], \classKey, __, acc ->
+			ruUnfUnion(acc,
+				ruUnfJoin(
+					ruUnfMatchClass(b, ss[0].nodes, patVars, classKey),
+					ruUnfMatchClass(b, ss[1].nodes, patVars, classKey),
+					b.maxSubsts, b.ovfl),
+				b.maxSubsts, b.ovfl));
+	} else {
+		h = ruInHead(atom);
+		fold(b.posAtoms, [], \acc, ba ->
+			if (ruInHead(ba) != h) acc
+			else ruUnfUnion(acc, ruUnfMatchModC(b, atom.nodes, patVars, ba.nodes),
+				b.maxSubsts, b.ovfl));
+	}
+}
+
+// substitutions under which the basis FORCES the literal's atom FALSE
+ruUnfForcedFalse(b : RuUnfBasis, atom : RuExp, patVars : Set<int>) -> [Tree<int, string>] {
+	if (ruUnfIsEq(atom)) {
+		ss = ruInArgs(atom);
+		// σ(l) in class(a), σ(r) in class(b) for a recorded ¬(a = b), both orientations
+		fold(b.negEqs, [], \acc, ne -> {
+			ka = ruCongRepr(b.st, ne.first);
+			kb = ruCongRepr(b.st, ne.second);
+			acc1 = ruUnfUnion(acc,
+				ruUnfJoin(
+					ruUnfMatchClass(b, ss[0].nodes, patVars, ka),
+					ruUnfMatchClass(b, ss[1].nodes, patVars, kb),
+					b.maxSubsts, b.ovfl),
+				b.maxSubsts, b.ovfl);
+			ruUnfUnion(acc1,
+				ruUnfJoin(
+					ruUnfMatchClass(b, ss[0].nodes, patVars, kb),
+					ruUnfMatchClass(b, ss[1].nodes, patVars, ka),
+					b.maxSubsts, b.ovfl),
+				b.maxSubsts, b.ovfl);
+		});
+	} else {
+		h = ruInHead(atom);
+		fold(b.negAtoms, [], \acc, ba ->
+			if (ruInHead(ba) != h) acc
+			else ruUnfUnion(acc, ruUnfMatchModC(b, atom.nodes, patVars, ba.nodes),
+				b.maxSubsts, b.ovfl));
+	}
+}
+
+// ---- the per-premise Verify (Contr 45) --------------------------------------
+
+// a nonempty substitution set under which an instance of the premise is FALSE
+// against the basis; None = no clash
+ruUnfVerifyPremise(b : RuUnfBasis, p : RuUnfPremise, maxClauses : int) -> Maybe<Tree<int, string>> {
+	patVars = buildSet(p.vars);
+	switch (ruUnfDnf(p.matrix, false, maxClauses)) {
+		None(): { b.ovfl := true; None(); }
+		Some(clauses): fold(clauses, None(), \found, clause ->
+			if (isSome(found)) found
+			else {
+				met = fold(clause, ruUnfTop(), \acc, lit ->
+					if (acc == []) acc
+					else {
+						forced = if (lit.pos) ruUnfForcedTrue(b, lit.atom, patVars)
+							else ruUnfForcedFalse(b, lit.atom, patVars);
+						ruUnfJoin(acc, forced, b.maxSubsts, b.ovfl);
+					});
+				// only substitutions that ground EVERY matrix var stand (a partial
+				// instance is not a premise instance)
+				full = filter(met, \s -> forall(p.vars, \v -> containsKeyTree(s, v)));
+				if (full == []) found else Some(full[0]);
+			})
+	}
+}
+
+// ---- the per-disjunct refutation --------------------------------------------
+
+ruUnfRefuteDisjunct(math : RuMath, env : RuEnv, stmtClass : int, prems : [RuUnfPremise],
+	lits : [RuUnfLit], maxClauses : int, maxSubsts : int, timer : RuTimer,
+	ovflOut : ref bool) -> Maybe<RuUnfRefutation> {
+	// PreCheck-trivial: complementary syntactic pair
+	posKeys = buildSet(filtermap(lits, \l -> if (l.pos) Some(l.atom.nodes) else None()));
+	trivial = find(lits, \l -> !l.pos && containsSet(posKeys, l.atom.nodes));
+	switch (trivial) {
+		Some(l): Some(RuUnfByContradiction(l.atom));
+		None(): {
+			b = ruUnfMakeBasis(math, env, stmtClass, lits, maxSubsts);
+			// Contr 19: ¬(l = r) with l ~ r
+			refl = find(b.negEqs, \ne -> ruCongEqual(b.st, ne.first, ne.second));
+			res = switch (refl) {
+				Some(ne): Some(RuUnfByReflexivity(ne.first, ne.second));
+				None(): {
+					// Contr 20: A vs ¬A' modulo classes (ground modC match, no vars)
+					clash = fold(b.posAtoms, None(), \acc, pa ->
+						if (isSome(acc)) acc
+						else fold(b.negAtoms, acc, \ac, na ->
+							if (isSome(ac)) ac
+							else if (ruInHead(pa) != ruInHead(na)) ac
+							else if (ruUnfMatchModC(b, pa.nodes, makeSet(), na.nodes) != [])
+								Some(RuUnfByAtomClash(pa, na))
+							else ac));
+					switch (clash) {
+						Some(__): clash;
+						None():
+							// Contr 45: one universal premise clashes
+							fold(prems, None(), \acc, p ->
+								if (isSome(acc) || ruTimeIsOver(timer)) acc
+								else switch (ruUnfVerifyPremise(b, p, maxClauses)) {
+									None(): acc;
+									Some(s): Some(RuUnfByPremise(p.assId,
+										foldTree(s, makeTree(), \v, k, bt ->
+											switch (lookupTree(b.reprTerm, k)) {
+												Some(t): setTree(bt, v, t);
+												None(): bt;
+											})));
+								});
+					}
+				}
+			}
+			ovflOut := ^ovflOut || ^(b.ovfl);
+			res;
+		}
+	}
+}
+
+// ---- the decision -----------------------------------------------------------
+
+ruUnfPlanDecide(math : RuMath, env : RuEnv, stmtClass : int,
+	prems : [RuUnfPremise], hyps : [RuExp], goal : RuExp,
+	maxClauses : int, maxSubsts : int, budgetMs : double) -> RuUnfPlan {
+	timer = ruMakeLimitedTimer(budgetMs);
+	matrix = ruEqzStripAlls(goal);
+	// disjuncts = DNF(¬matrix ∧ hyps) — Mizar PreCheck's normal form
+	dnfM = fold(hyps, ruUnfDnf(matrix, false, maxClauses), \acc, h ->
+		maybeBind(acc, \cls -> maybeBind(ruUnfDnf(ruEqzStripAlls(h), true, maxClauses), \hc ->
+			if (length(cls) * length(hc) > maxClauses) None()
+			else Some(concatA(map(cls, \cl -> map(hc, \hcl -> concat(cl, hcl))))))));
+	switch (dnfM) {
+		None(): RuUnfPlan(false, 0, 0, length(prems), true, []);
+		Some(disjuncts): {
+			ovfl = ref false;
+			refs = fold(disjuncts, Pair([], true), \acc : Pair<[RuUnfRefutation], bool>, d ->
+				if (!acc.second || ruTimeIsOver(timer)) Pair(acc.first, false)
+				else switch (ruUnfRefuteDisjunct(math, env, stmtClass, prems, d,
+						maxClauses, maxSubsts, timer, ovfl)) {
+					None(): Pair(acc.first, false);
+					Some(r): Pair(arrayPush(acc.first, r), true);
+				});
+			RuUnfPlan(refs.second && length(refs.first) == length(disjuncts),
+				length(disjuncts), length(refs.first), length(prems),
+				^ovfl || ruTimeIsOver(timer), refs.first);
+		}
+	}
+}
+
+// ---- scope premises ---------------------------------------------------------
+
+ruUnfScopePremises(math : RuMath, env : RuEnv, thInfo : RuDeclInfo) -> [RuUnfPremise] {
+	imported = ruVerifyImportedMap(math, env);
+	isFoundation = \src : int -> switch (lookupTree(math.sources, src)) {
+		Some(sc): { m = sc.info.module; m == "miz_set" || endsWith(m, "/miz_set"); }
+		None(): true;
+	}
+	filtermap(getTreeValues(math.decls.assertions), \ass -> {
+		inf = ruEqzInfer(ass);
+		info = ruEqzInfo(ass);
+		if (inf.hyps != [] || inf.prop.exps == []) None()
+		else if (!ruDeclInfoPreceeds(info, thInfo, imported)) None()
+		else {
+			matrix = ruEqzStripAlls(ruExp(inf.prop.exps[0]));
+			// plain equalities are the Equalizer's premise fragment — the Unifier
+			// works the rest (implications, biconds, memberships, predicates)
+			if (ruUnfIsEq(matrix)) None()
+			else {
+				vars = fold(matrix.nodes, makeSet(), \acc, n -> switch (n) {
+					RuVar(id, __): insertSet(acc, id);
+					RuRuleNode(__, __): acc;
+				});
+				if (isEmptySet(vars)) None()
+				else Some(RuUnfPremise(info.id, matrix, set2array(vars), isFoundation(info.src)));
+			}
+		}
+	});
+}
