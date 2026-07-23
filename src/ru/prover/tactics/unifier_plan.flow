@@ -67,7 +67,11 @@ export {
 
 	// A universal premise: the ∀-stripped matrix (any wff shape, EXCLUDING plain
 	// equalities — those are the Equalizer's fragment) and its matrix vars.
-	RuUnfPremise(assId : int, matrix : RuExp, vars : [int], foundational : bool);
+	// charShape marks a membership CHARACTERIZATION (bicond with a ∈-headed lhs,
+	// the elpr/elsn/elun family) — the A-map reuse keeps these in the FOUNDATION
+	// under set.mm names, so by-lists never cite them; admit them like defs.
+	RuUnfPremise(assId : int, matrix : RuExp, vars : [int], foundational : bool,
+		charShape : bool);
 
 	// Every ∀-closed 0-hyp non-equality assertion PRECEDING the theorem (the
 	// reachability law). The caller narrows by the by-list (the probe does).
@@ -88,6 +92,16 @@ ruUnfMaxLitsPerClause = 32;
 // DNF of e (pos) / ¬e (neg) as clauses of signed literals; None = the clause cap
 // fired. Inner-quantified subformulas and unknown heads are ATOMS.
 ruUnfDnf(e : RuExp, pos : bool, maxClauses : int) -> Maybe<[[RuUnfLit]]> {
+	ruUnfDnfX(e, pos, maxClauses, ref [], ref makeSet());
+}
+
+// The standardizing DNF (Mizar RemoveIntQuantifier): a binder in EXISTENTIAL
+// position — ¬∀xφ (≡ ∃x¬φ) or ∃xφ — strips into a FRESH free variable, recorded
+// in `fresh`: a unification var on the premise side, a Skolem constant on the
+// basis side. Universal-position binders stay OPAQUE atoms. A re-bound or
+// non-simple binder var bails to opaque (no renaming machinery in v2).
+ruUnfDnfX(e : RuExp, pos : bool, maxClauses : int, fresh : ref [int],
+	bound : ref Set<int>) -> Maybe<[[RuUnfLit]]> {
 	h = ruInHead(e);
 	ar = ruInArity(e);
 	args = \ -> ruInArgs(e);
@@ -101,27 +115,39 @@ ruUnfDnf(e : RuExp, pos : bool, maxClauses : int) -> Maybe<[[RuUnfLit]]> {
 	sum = \dl : Maybe<[[RuUnfLit]]>, dr : Maybe<[[RuUnfLit]]> ->
 		maybeBind(dl, \l -> maybeBind(dr, \r ->
 			if (length(l) + length(r) > maxClauses) None() else Some(concat(l, r))));
-	if (h == s2id("wn") && ar == 1) ruUnfDnf((args())[0], !pos, maxClauses)
+	rec = \x : RuExp, p : bool -> ruUnfDnfX(x, p, maxClauses, fresh, bound);
+	if (h == s2id("wn") && ar == 1) rec((args())[0], !pos)
 	else if (h == s2id("wa") && ar == 2) {
 		a = (args())[0]; b = (args())[1];
-		if (pos) prod(ruUnfDnf(a, true, maxClauses), ruUnfDnf(b, true, maxClauses))
-		else sum(ruUnfDnf(a, false, maxClauses), ruUnfDnf(b, false, maxClauses));
+		if (pos) prod(rec(a, true), rec(b, true))
+		else sum(rec(a, false), rec(b, false));
 	} else if (h == s2id("wo") && ar == 2) {
 		a = (args())[0]; b = (args())[1];
-		if (pos) sum(ruUnfDnf(a, true, maxClauses), ruUnfDnf(b, true, maxClauses))
-		else prod(ruUnfDnf(a, false, maxClauses), ruUnfDnf(b, false, maxClauses));
+		if (pos) sum(rec(a, true), rec(b, true))
+		else prod(rec(a, false), rec(b, false));
 	} else if (h == s2id("wi") && ar == 2) {
 		a = (args())[0]; b = (args())[1];
-		if (pos) sum(ruUnfDnf(a, false, maxClauses), ruUnfDnf(b, true, maxClauses))
-		else prod(ruUnfDnf(a, true, maxClauses), ruUnfDnf(b, false, maxClauses));
+		if (pos) sum(rec(a, false), rec(b, true))
+		else prod(rec(a, true), rec(b, false));
 	} else if (h == s2id("wb") && ar == 2) {
 		a = (args())[0]; b = (args())[1];
 		if (pos) sum(
-			prod(ruUnfDnf(a, true, maxClauses), ruUnfDnf(b, true, maxClauses)),
-			prod(ruUnfDnf(a, false, maxClauses), ruUnfDnf(b, false, maxClauses)))
+			prod(rec(a, true), rec(b, true)),
+			prod(rec(a, false), rec(b, false)))
 		else sum(
-			prod(ruUnfDnf(a, true, maxClauses), ruUnfDnf(b, false, maxClauses)),
-			prod(ruUnfDnf(a, false, maxClauses), ruUnfDnf(b, true, maxClauses)));
+			prod(rec(a, true), rec(b, false)),
+			prod(rec(a, false), rec(b, true)));
+	} else if ((h == s2id("wal") && ar == 2 && !pos)
+			|| (h == s2id("wex") && ar == 2 && pos)) {
+		// existential position: strip the binder into a fresh free var
+		bv = (args())[0];
+		v = if (length(bv.nodes) == 1) ruEqzVarAt(bv.nodes, 0) else -1;
+		if (v < 0 || containsSet(^bound, v)) Some([[RuUnfLit(pos, e)]])
+		else {
+			bound := insertSet(^bound, v);
+			fresh := arrayPush(^fresh, v);
+			rec((args())[1], pos);
+		}
 	} else Some([[RuUnfLit(pos, e)]]);
 }
 
@@ -368,8 +394,13 @@ ruUnfForcedFalse(b : RuUnfBasis, atom : RuExp, patVars : Set<int>) -> [Tree<int,
 // a nonempty substitution set under which an instance of the premise is FALSE
 // against the basis; None = no clash
 ruUnfVerifyPremise(b : RuUnfBasis, p : RuUnfPremise, maxClauses : int) -> Maybe<Tree<int, string>> {
-	patVars = buildSet(p.vars);
-	switch (ruUnfDnf(p.matrix, false, maxClauses)) {
+	// fresh vars from standardized inner binders (∃-position) are unification
+	// vars too — Mizar's ExGenerators; they need no grounding (an unbound one
+	// means the clause is forced for an arbitrary witness)
+	freshR : ref [int] = ref [];
+	dnfM = ruUnfDnfX(p.matrix, false, maxClauses, freshR, ref buildSet(p.vars));
+	patVars = buildSet(concat(p.vars, ^freshR));
+	switch (dnfM) {
 		None(): { b.ovfl := true; None(); }
 		Some(clauses): fold(clauses, None(), \found, clause ->
 			if (isSome(found)) found
@@ -446,9 +477,14 @@ ruUnfPlanDecide(math : RuMath, env : RuEnv, stmtClass : int,
 	maxClauses : int, maxSubsts : int, budgetMs : double) -> RuUnfPlan {
 	timer = ruMakeLimitedTimer(budgetMs);
 	matrix = ruEqzStripAlls(goal);
-	// disjuncts = DNF(¬matrix ∧ hyps) — Mizar PreCheck's normal form
-	dnfM = fold(hyps, ruUnfDnf(matrix, false, maxClauses), \acc, h ->
-		maybeBind(acc, \cls -> maybeBind(ruUnfDnf(ruEqzStripAlls(h), true, maxClauses), \hc ->
+	// disjuncts = DNF(¬matrix ∧ hyps) — Mizar PreCheck's normal form. One SHARED
+	// binder set across goal + hyps: ∃-position binders strip into Skolem
+	// CONSTANTS, and a reused binder name must bail to opaque, not alias two
+	// distinct witnesses.
+	skBound : ref Set<int> = ref makeSet();
+	skFresh : ref [int] = ref [];
+	dnfM = fold(hyps, ruUnfDnfX(matrix, false, maxClauses, skFresh, skBound), \acc, h ->
+		maybeBind(acc, \cls -> maybeBind(ruUnfDnfX(ruEqzStripAlls(h), true, maxClauses, skFresh, skBound), \hc ->
 			if (length(cls) * length(hc) > maxClauses) None()
 			else Some(concatA(map(cls, \cl -> map(hc, \hcl -> concat(cl, hcl))))))));
 	switch (dnfM) {
@@ -480,7 +516,11 @@ ruUnfScopePremises(math : RuMath, env : RuEnv, thInfo : RuDeclInfo) -> [RuUnfPre
 	filtermap(getTreeValues(math.decls.assertions), \ass -> {
 		inf = ruEqzInfer(ass);
 		info = ruEqzInfo(ass);
-		if (inf.hyps != [] || inf.prop.exps == []) None()
+		// setness-only hyps (T ∈ _V) are admissible side conditions — the elpr
+		// family carries them; the executor discharges them mechanically
+		hypsOk = forall(inf.hyps, \h -> h.stmt.exps != []
+			&& ruEqzIsSetnessHyp(ruExp(h.stmt.exps[0])));
+		if (!hypsOk || inf.prop.exps == []) None()
 		else if (!ruDeclInfoPreceeds(info, thInfo, imported)) None()
 		else {
 			matrix = ruEqzStripAlls(ruExp(inf.prop.exps[0]));
@@ -492,8 +532,11 @@ ruUnfScopePremises(math : RuMath, env : RuEnv, thInfo : RuDeclInfo) -> [RuUnfPre
 					RuVar(id, __): insertSet(acc, id);
 					RuRuleNode(__, __): acc;
 				});
+				charShape = ruInHead(matrix) == s2id("wb") && ruInArity(matrix) == 2
+					&& ruInHead((ruInArgs(matrix))[0]) == s2id("wcel");
 				if (isEmptySet(vars)) None()
-				else Some(RuUnfPremise(info.id, matrix, set2array(vars), isFoundation(info.src)));
+				else Some(RuUnfPremise(info.id, matrix, set2array(vars),
+					isFoundation(info.src), charShape));
 			}
 		}
 	});
