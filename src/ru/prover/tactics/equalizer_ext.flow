@@ -53,7 +53,7 @@ ruEqzWitnessRoute(math : RuMath, env : RuEnv, stmtClass : int,
 			Some(lb): {
 				// the witness needs TEXTUALLY identical element sets (closure-equal-only
 				// element pairs would need transport — not built)
-				if (buildSet(la) != buildSet(lb) || la == []) { if (env.conf.verbose > 3) env.out.println("      kdbg: elem sets differ") else {}; None(); }
+				if (set2array(buildSet(la)) != set2array(buildSet(lb)) || la == []) { if (env.conf.verbose > 3) env.out.println("      kdbg: elem sets differ") else {}; None(); }
 				else switch (ruEqzWitness(math, env, rules, la)) {
 					None(): None();
 					Some(w): {
@@ -94,10 +94,111 @@ ruEqzProveToW(math : RuMath, env : RuEnv, stmtClass : int,
 	else switch (ruEqzElemEqComposite(math, env, stmtClass, t, w)) {
 		Some(r): Some(r);
 		None(): switch (ruEqzKTermEq(math, env, stmtClass, w, t)) {
-			None(): None();
 			Some(pk): {
 				concl = RuStmt(stmtClass, [ruFwdMkRule(s2id("wceq"), wffT, [t, w])], -1);
 				Some(Pair(RuProofStep(s2id("eqcomi"), [pk.first], concl), pk.second));
+			}
+			None(): {
+				// MIXED term: k-subterms INSIDE a composite (k7(…) ∪ {x}) — rewrite each
+				// k-subterm to its own witness by congruence lifting, then the all-source-A
+				// term goes through the composite route; join by eqtri
+				rw = ruEqzRewriteK(math, env, stmtClass, t);
+				switch (rw.second) {
+					None(): None();
+					Some(pr): switch (ruEqzProveToW(math, env, stmtClass, rw.first, w)) {
+						None(): None();
+						Some(pw): {
+							concl = RuStmt(stmtClass, [ruFwdMkRule(s2id("wceq"), wffT, [t, w])], -1);
+							Some(Pair(RuProofStep(s2id("eqtri"), [pr.first, pw.first], concl),
+								mergeSets(pr.second, pw.second)));
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// Rewrite every k-subterm of t to its witness: (t', Some(⊢ t = t', DVs)) when something
+// changed; (t, None()) otherwise. Source-A nodes recurse into mem-args and lift changed
+// children through the scanned congruence rules (hyp- or implication-form).
+ruEqzRewriteK(math : RuMath, env : RuEnv, stmtClass : int,
+	t : RuExp) -> Pair<RuExp, Maybe<Pair<RuProofTree, Set<RuDisj>>>> {
+	wffT = tp2id_("wff");
+	classT = tp2id_("class");
+	st = \e : RuExp -> RuStmt(stmtClass, [e], -1);
+	unchanged = Pair(t, None());
+	rules = ruEqzElemRulesAll(math, env);
+	switch (find(lookupTreeDef(rules, ruInHead(t), []), \rl -> rl.arity == ruInArity(t))) {
+		None(): unchanged;
+		Some(rl): {
+			isDef = switch (lookupTree(math.decls.assertions, rl.assId)) {
+				None(): false;
+				Some(ass): {
+					inf = switch (ass) {
+						RuAxiom(__, i): i; RuCong(__, i): i;
+						RuTheorem(__, i, __, __): i; RuDef(__, i, __, __): i;
+					};
+					inf.prop.exps != [] && ruInHead(ruExp(inf.prop.exps[0])) == s2id("wal");
+				}
+			}
+			if (isDef) {
+				// a k-term: its witness + the def route
+				switch (ruEqzElemsList(rules, t, Some([]))) {
+					None(): unchanged;
+					Some(els): switch (ruEqzWitness(math, env, rules, els)) {
+						None(): unchanged;
+						Some(wt): if (wt.nodes == t.nodes) unchanged
+						else switch (ruEqzKTermEq(math, env, stmtClass, wt, t)) {
+							None(): unchanged;
+							Some(pk): Pair(wt, Some(Pair(
+								RuProofStep(s2id("eqcomi"), [pk.first],
+									st(ruFwdMkRule(s2id("wceq"), wffT, [t, wt]))),
+								pk.second)));
+						}
+					}
+				}
+			} else {
+				// source-A: rewrite mem-arg children, lift left to right
+				args = ruInArgs(t);
+				congs = ruCongRulesCached(math);
+				res = fold(rl.memArgs, Pair(Pair(t, args), None()),
+					\acc : Pair<Pair<RuExp, [RuExp]>, Maybe<Pair<RuProofTree, Set<RuDisj>>>>, j -> {
+						cur = acc.first.first;
+						curArgs = acc.first.second;
+						cw = ruEqzRewriteK(math, env, stmtClass, curArgs[j]);
+						switch (cw.second) {
+							None(): acc;
+							Some(cp): {
+								newArgs = replace(curArgs, j, cw.first);
+								nxt = ruFwdMkRule(ruInHead(t), classT, newArgs);
+								switch (find(lookupTreeDef(congs, ruInHead(t), []),
+										\cr -> cr.argPos == j)) {
+									None(): acc;   // no congruence rule for this position — keep old
+									Some(cr): {
+										eqExp = ruFwdMkRule(s2id("wceq"), wffT, [cur, nxt]);
+										stepP = if (cr.hypForm)
+											RuProofStep(cr.lemmaId, [cp.first], st(eqExp))
+										else {
+											childEq = ruFwdMkRule(s2id("wceq"), wffT, [curArgs[j], cw.first]);
+											imp = ruFwdMkRule(s2id("wi"), wffT, [childEq, eqExp]);
+											RuProofStep(s2id("ax-mp"),
+												[cp.first, RuProofStep(cr.lemmaId, [], st(imp))], st(eqExp));
+										}
+										joined = switch (acc.second) {
+											None(): Pair(stepP, cp.second);
+											Some(prev): Pair(
+												RuProofStep(s2id("eqtri"), [prev.first, stepP],
+													st(ruFwdMkRule(s2id("wceq"), wffT, [t, nxt]))),
+												mergeSets(prev.second, cp.second));
+										}
+										Pair(Pair(nxt, newArgs), Some(joined));
+									}
+								}
+							}
+						}
+					});
+				Pair(res.first.first, res.second);
 			}
 		}
 	}
