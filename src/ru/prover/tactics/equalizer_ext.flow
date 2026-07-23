@@ -23,6 +23,157 @@ import ru/prover/tactics/kalmar;
 export {
 	ruEqzElemEqProof(math : RuMath, env : RuEnv, stmtClass : int,
 		a : RuExp, b : RuExp) -> Maybe<Pair<RuProofTree, Set<RuDisj>>>;
+
+	// The full prover bundle for the planner's fact kinds (elem-eqs, singleton
+	// extractions, membership goals) — the one callers hand to ruEqzPlanDecide.
+	ruEqzProversOf(math : RuMath, env : RuEnv, stmtClass : int) -> RuEqzProvers;
+}
+
+ruEqzProversOf(math : RuMath, env : RuEnv, stmtClass : int) -> RuEqzProvers {
+	RuEqzProvers(
+		\a, b -> ruEqzElemEqProof(math, env, stmtClass, a, b),
+		\st, f, sp -> ruEqzExtractProof(math, env, stmtClass, st, f, sp),
+		\st, x, c, sp -> ruEqzMemGoalProof(math, env, stmtClass, st, x, c, sp)
+	);
+}
+
+// a closure explain, spliced to REAL leaves right away (fact-indexed leaves must
+// never leak into a builder's tree — the enclosing splice would re-index our own
+// theorem-hyp leaves)
+ruEqzExplainSp(st : RuCongSt, a : RuExp, b : RuExp,
+	sp : (RuProofTree) -> Maybe<RuProofTree>) -> Maybe<RuProofTree> {
+	maybeBind(ruCongExplain(st, a, b), sp);
+}
+
+// ---- singleton extraction proofs ---------------------------------------------
+
+// A proof of (x ∈ m) by ELEMENT INTRO: the membership bicond (x∈m ↔ D), the true
+// disjunct of D established by eqid / the closure's explain / recursion into a
+// mem-arg, or-introduced into D, then mpbir. Explain subtrees carry indexed fact
+// leaves — the caller re-splices them.
+ruEqzElemIntro(math : RuMath, env : RuEnv, stmtClass : int, st : RuCongSt,
+	x : RuExp, m : RuExp,
+	sp : (RuProofTree) -> Maybe<RuProofTree>) -> Maybe<Pair<RuProofTree, Set<RuDisj>>> {
+	coId = ruEqzCoercionId(math, env);
+	rules = ruEqzElemRulesAll(math, env);
+	switch (find(lookupTreeDef(rules, ruInHead(m), []), \rl -> rl.arity == ruInArity(m))) {
+		None(): None();
+		Some(rl): switch (ruEqzCharFact(math, env, stmtClass, coId, x, m, rl)) {
+			None(): None();
+			Some(fact): {
+				instArgs = ruInArgs(fact.first);
+				switch (ruEqzProveDisj(math, env, stmtClass, st, instArgs[1], sp)) {
+					None(): None();
+					Some(dp): Some(Pair(
+						RuProofStep(s2id("mpbir"), [dp.first, fact.second],
+							RuStmt(stmtClass, [instArgs[0]], -1)),
+						dp.second));
+				}
+			}
+		}
+	}
+}
+
+// prove a subformula of a characterization disjunction: ∨ by orci/olci on the
+// provable branch, (a = b) by eqid or the closure's explain, (x ∈ t) by recursion
+ruEqzProveDisj(math : RuMath, env : RuEnv, stmtClass : int, st : RuCongSt,
+	f : RuExp,
+	sp : (RuProofTree) -> Maybe<RuProofTree>) -> Maybe<Pair<RuProofTree, Set<RuDisj>>> {
+	h = ruInHead(f);
+	if (h == s2id("wo") && ruInArity(f) == 2) {
+		args = ruInArgs(f);
+		stmt = RuStmt(stmtClass, [f], -1);
+		switch (ruEqzProveDisj(math, env, stmtClass, st, args[0], sp)) {
+			Some(pl): Some(Pair(RuProofStep(s2id("orci"), [pl.first], stmt), pl.second));
+			None(): switch (ruEqzProveDisj(math, env, stmtClass, st, args[1], sp)) {
+				Some(pr): Some(Pair(RuProofStep(s2id("olci"), [pr.first], stmt), pr.second));
+				None(): None();
+			}
+		}
+	} else if (h == s2id("wceq") && ruInArity(f) == 2) {
+		args = ruInArgs(f);
+		if ((args[0]).nodes == (args[1]).nodes)
+			Some(Pair(RuProofStep(s2id("eqid"), [], RuStmt(stmtClass, [f], -1)), makeSet()))
+		else if (ruCongEqual(st, args[0], args[1]))
+			maybeMap(ruEqzExplainSp(st, args[0], args[1], sp), \tr -> Pair(tr, makeSet()))
+		else None();
+	} else if (h == s2id("wcel") && ruInArity(f) == 2) {
+		args = ruInArgs(f);
+		ruEqzElemIntro(math, env, stmtClass, st, args[0], args[1], sp);
+	} else None();
+}
+
+// The extraction fact's proof: x ∈ via (hyp leaf / element intro) → eleqtri along
+// the closure's via = sing → the singleton bicond (x∈{t} ↔ x = t), mpbi.
+ruEqzExtractProof(math : RuMath, env : RuEnv, stmtClass : int, st : RuCongSt,
+	fact : RuEqzRouteFact,
+	sp : (RuProofTree) -> Maybe<RuProofTree>) -> Maybe<Pair<RuProofTree, Set<RuDisj>>> {
+	wffT = tp2id_("wff");
+	switch (fact.src) {
+		RuEqzSrcExtract(x, t, sing, via, hypIdx): {
+			baseM = if (hypIdx >= 0)
+				Some(Pair(
+					RuProofHyp(hypIdx,
+						RuStmt(stmtClass, [ruFwdMkRule(s2id("wcel"), wffT, [x, via])], -1)),
+					makeSet()))
+				else ruEqzElemIntro(math, env, stmtClass, st, x, via, sp);
+			switch (baseM) {
+				None(): None();
+				Some(base): {
+					inSingM = if (via.nodes == sing.nodes) Some(base)
+						else maybeMap(ruEqzExplainSp(st, via, sing, sp), \eq ->
+							Pair(RuProofStep(s2id("eleqtri"), [base.first, eq],
+								RuStmt(stmtClass, [ruFwdMkRule(s2id("wcel"), wffT, [x, sing])], -1)),
+								base.second));
+					switch (inSingM) {
+						None(): None();
+						Some(inSing): {
+							coId = ruEqzCoercionId(math, env);
+							rules = ruEqzElemRulesAll(math, env);
+							switch (find(lookupTreeDef(rules, ruInHead(sing), []),
+									\rl -> rl.arity == ruInArity(sing)
+										&& rl.memArgs == [] && length(rl.eqArgs) == 1)) {
+								None(): None();
+								Some(rl): switch (ruEqzCharFact(math, env, stmtClass, coId, x, sing, rl)) {
+									None(): None();
+									Some(bic): {
+										eqAtom = (ruInArgs(bic.first))[1];
+										// the concluded atom must BE the planned fact statement
+										if (eqAtom.nodes != fact.exp.nodes) None()
+										else Some(Pair(
+											RuProofStep(s2id("mpbi"), [inSing.first, bic.second],
+												RuStmt(stmtClass, [eqAtom], -1)),
+											inSing.second));
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		default: None();
+	}
+}
+
+// The membership GOAL's proof: some closure-equal member m ~ c admits an element
+// intro of x; transport along m = c by eleqtri.
+ruEqzMemGoalProof(math : RuMath, env : RuEnv, stmtClass : int, st : RuCongSt,
+	x : RuExp, c : RuExp,
+	sp : (RuProofTree) -> Maybe<RuProofTree>) -> Maybe<Pair<RuProofTree, Set<RuDisj>>> {
+	wffT = tp2id_("wff");
+	ck = ruCongRepr(st, c);
+	foldTree(^(st.terms), None(), \__, m, acc ->
+		if (isSome(acc) || ruCongRepr(st, m) != ck) acc
+		else switch (ruEqzElemIntro(math, env, stmtClass, st, x, m, sp)) {
+			None(): acc;
+			Some(im):
+				if (m.nodes == c.nodes) Some(im)
+				else maybeMap(ruEqzExplainSp(st, m, c, sp), \eq ->
+					Pair(RuProofStep(s2id("eleqtri"), [im.first, eq],
+						RuStmt(stmtClass, [ruFwdMkRule(s2id("wcel"), wffT, [x, c])], -1)),
+						im.second));
+		});
 }
 
 ruEqzElemEqProof(math : RuMath, env : RuEnv, stmtClass : int,
