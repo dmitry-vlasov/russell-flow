@@ -179,7 +179,7 @@ ruEqzElemEqComposite(math : RuMath, env : RuEnv, stmtClass : int,
 					mB = (ruInArgs(fB.first))[0];
 					st = \e : RuExp -> RuStmt(stmtClass, [e], -1);
 					wb3 = \x : RuExp, y : RuExp -> ruFwdMkRule(s2id("wb"), wffT, [x, y]);
-					switch (ruEqzOrAssoc(stmtClass, wffT, dA, dB)) {
+					switch (ruEqzOrACI(stmtClass, wffT, dA, dB)) {
 						None(): { if (env.conf.verbose > 3) env.out.println("      kdbg: or-assoc failed") else {}; None(); }
 						Some(oa): {
 							t1 = RuProofStep(s2id("bitri"), [fA.second, oa], st(wb3(mA, dB)));
@@ -468,7 +468,10 @@ ruEqzKChain(math : RuMath, env : RuEnv, stmtClass : int, coId : int, wffT : int,
 								Some(cb): {
 									facts = [Pair(cb.first, cb.second)];
 									em = RuEnvMath(math, env);
-									switch (switch (ruEqzNnfBridge(stmtClass, wffT, cb.second, cb.first, body)) {
+									// align the fact's D with the DEF's D (the body's N dualized):
+									// duplicate loci / order differences are ACI-equal
+									fact1 = ruEqzAlignFact(stmtClass, wffT, cb.first, cb.second, body);
+									switch (switch (ruEqzNnfBridge(stmtClass, wffT, fact1.second, fact1.first, body)) {
 										Some(bp): Some(Pair(bp, RuVarsDisjs(makeTree(), makeSet())));
 										None(): ruEqzBodyCert(em, wffT, stmtClass,
 											map(facts, \ff -> ff.first), body);
@@ -648,4 +651,119 @@ ruEqzOrAssoc(stmtClass : int, wffT : int, d1 : RuExp, d2 : RuExp) -> Maybe<RuPro
 			}
 		} else None();
 	}
+}
+
+
+// ---- ∨-ACI normalization (proof-producing) -----------------------------------
+
+// ⊢ (d1 ↔ d2) whenever the two ∨-chains have the SAME FLAT ATOM SET (association,
+// order and duplicates may differ): normalize both to the sorted-deduped right-nested
+// canon with proofs, join by bitri + bicomi. None when the sets differ.
+ruEqzOrACI(stmtClass : int, wffT : int, d1 : RuExp, d2 : RuExp) -> Maybe<RuProofTree> {
+	n1 = ruEqzOrNorm(stmtClass, wffT, d1);
+	n2 = ruEqzOrNorm(stmtClass, wffT, d2);
+	if ((n1.first).nodes != (n2.first).nodes) None()
+	else {
+		wb2 = ruFwdMkRule(s2id("wb"), wffT, [d1, d2]);
+		bc = RuProofStep(s2id("bicomi"), [n2.second],
+			RuStmt(stmtClass, [ruFwdMkRule(s2id("wb"), wffT, [n2.first, d2])], -1));
+		Some(RuProofStep(s2id("bitri"), [n1.second, bc], RuStmt(stmtClass, [wb2], -1)));
+	}
+}
+
+// (canon, ⊢ d ↔ canon): canon = sorted (by node-key), deduped, right-nested
+ruEqzOrNorm(stmtClass : int, wffT : int, d : RuExp) -> Pair<RuExp, RuProofTree> {
+	wb2 = \x : RuExp, y : RuExp -> ruFwdMkRule(s2id("wb"), wffT, [x, y]);
+	st = \e : RuExp -> RuStmt(stmtClass, [e], -1);
+	if (ruInHead(d) != s2id("wo"))
+		Pair(d, RuProofStep(s2id("biid"), [], st(wb2(d, d))))
+	else {
+		da = ruInArgs(d);
+		e = da[0];
+		nR = ruEqzOrNorm(stmtClass, wffT, da[1]);
+		p1 = RuProofStep(s2id("orbi2i"), [nR.second],
+			st(wb2(d, ruFwdMkRule(s2id("wo"), wffT, [e, nR.first]))));
+		ins = ruEqzOrInsert(stmtClass, wffT, e, nR.first);
+		Pair(ins.first, RuProofStep(s2id("bitri"), [p1, ins.second],
+			st(wb2(d, ins.first))));
+	}
+}
+
+// insert atom e into canonical C: (result, ⊢ (e ∨ C) ↔ result)
+ruEqzOrInsert(stmtClass : int, wffT : int, e : RuExp, c : RuExp) -> Pair<RuExp, RuProofTree> {
+	wo = \x : RuExp, y : RuExp -> ruFwdMkRule(s2id("wo"), wffT, [x, y]);
+	wb2 = \x : RuExp, y : RuExp -> ruFwdMkRule(s2id("wb"), wffT, [x, y]);
+	st = \ex : RuExp -> RuStmt(stmtClass, [ex], -1);
+	key = \ex : RuExp -> strGlue(map(ex.nodes, \n -> switch (n) {
+		RuRuleNode(idT, __): "R" + i2s(ruIdType2Id(idT));
+		RuVar(id, __): "V" + i2s(id);
+	}), ",");
+	if (ruInHead(c) != s2id("wo")) {
+		if (e.nodes == c.nodes)
+			Pair(c, RuProofStep(s2id("oridm"), [], st(wb2(wo(e, e), e))))
+		else if (key(e) < key(c))
+			Pair(wo(e, c), RuProofStep(s2id("biid"), [], st(wb2(wo(e, c), wo(e, c)))))
+		else
+			Pair(wo(c, e), RuProofStep(s2id("orcom"), [], st(wb2(wo(e, c), wo(c, e)))));
+	} else {
+		ca = ruInArgs(c);
+		h = ca[0];
+		if (e.nodes == h.nodes) {
+			// (e∨(e∨C')) ↔ ((e∨e)∨C') ↔ (e∨C') = C
+			r1 = RuProofStep(s2id("bicomi"),
+				[RuProofStep(s2id("orass"), [], st(wb2(wo(wo(e, e), ca[1]), wo(e, wo(e, ca[1])))))],
+				st(wb2(wo(e, c), wo(wo(e, e), ca[1]))));
+			r2 = RuProofStep(s2id("orbi1i"),
+				[RuProofStep(s2id("oridm"), [], st(wb2(wo(e, e), e)))],
+				st(wb2(wo(wo(e, e), ca[1]), c)));
+			Pair(c, RuProofStep(s2id("bitri"), [r1, r2], st(wb2(wo(e, c), c))));
+		} else if (key(e) < key(h))
+			Pair(wo(e, c), RuProofStep(s2id("biid"), [], st(wb2(wo(e, c), wo(e, c)))))
+		else {
+			// (e∨(h∨C')) ↔ (h∨(e∨C')) [or12], then insert into C' under orbi2i
+			ins = ruEqzOrInsert(stmtClass, wffT, e, ca[1]);
+			p12 = RuProofStep(s2id("or12"), [],
+				st(wb2(wo(e, c), wo(h, wo(e, ca[1])))));
+			pIn = RuProofStep(s2id("orbi2i"), [ins.second],
+				st(wb2(wo(h, wo(e, ca[1])), wo(h, ins.first))));
+			Pair(wo(h, ins.first), RuProofStep(s2id("bitri"), [p12, pIn],
+				st(wb2(wo(e, c), wo(h, ins.first)))));
+		}
+	}
+}
+
+// Rewrite the folded fact (m ↔ D_W) into (m ↔ D_def), where D_def is the dual of the
+// body's ¬-chain N — identity when they already agree; unchanged if ACI can't join.
+ruEqzAlignFact(stmtClass : int, wffT : int, factExp : RuExp, factProof : RuProofTree,
+	body : RuExp) -> Pair<RuExp, RuProofTree> {
+	same = Pair(factExp, factProof);
+	if (ruInHead(body) != s2id("wa")) same
+	else {
+		c2 = (ruInArgs(body))[1];
+		if (ruInHead(c2) != s2id("wo")) same
+		else {
+			n = (ruInArgs(c2))[0];
+			dDef = ruEqzOrDual(wffT, n);
+			fa = ruInArgs(factExp);
+			if (dDef.nodes == (fa[1]).nodes) same
+			else switch (ruEqzOrACI(stmtClass, wffT, fa[1], dDef)) {
+				None(): same;
+				Some(aci): {
+					ne = ruFwdMkRule(s2id("wb"), wffT, [fa[0], dDef]);
+					Pair(ne, RuProofStep(s2id("bitri"), [factProof, aci],
+						RuStmt(stmtClass, [ne], -1)));
+				}
+			}
+		}
+	}
+}
+
+// the ∨-dual of a ¬-conjunction chain: ¬e ∧ N' → e ∨ dual(N'); leaf ¬e → e
+ruEqzOrDual(wffT : int, n : RuExp) -> RuExp {
+	if (ruInHead(n) == s2id("wa") && ruInArity(n) == 2) {
+		na = ruInArgs(n);
+		ruFwdMkRule(s2id("wo"), wffT, [ruEqzOrDual(wffT, na[0]), ruEqzOrDual(wffT, na[1])]);
+	} else if (ruInHead(n) == s2id("wn") && ruInArity(n) == 1)
+		(ruInArgs(n))[0]
+	else n;
 }
