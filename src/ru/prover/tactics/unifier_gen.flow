@@ -49,14 +49,28 @@ ruUnfStepProof(math : RuMath, env : RuEnv, stmtClass : int, plan : RuUnfPlan,
 			uinsts = fold(insts, Pair([], makeSet()), \acc : Pair<[Triple<RuExp, RuProofTree, Set<RuDisj>>], Set<[RuExpNode]>>, t ->
 				if (containsSet(acc.second, t.first.nodes)) acc
 				else Pair(arrayPush(acc.first, t), insertSet(acc.second, t.first.nodes))).first;
-			facts = concat(map(basis, \b -> b.first), map(uinsts, \t -> t.first));
+			// SKOLEM DISCHARGE (Mizar's ∃-hyp opening, the S4 pattern): an ∃-headed
+			// basis fact contributes its STRIPPED body — the certificate proves the
+			// implication chain (body_1 → … → goal), then exlimiv per binder
+			// (innermost first, DV(consequent, x)) and ax-mp against the ∃-hyp leaf
+			// discharge each antecedent
+			wffT = tp2id_("wff");
+			exFacts = filtermap(basis, \b ->
+				if (ruInHead(b.first) != s2id("wex")) None()
+				else {
+					sb = ruUnfStripExes(b.first);
+					if (sb.first == []) None() else Some(Triple(sb.first, sb.second, b));
+				});
+			plain = filter(basis, \b -> ruInHead(b.first) != s2id("wex"));
+			certGoal = fold(reverseA(exFacts), matrix, \acc, xf ->
+				ruFwdMkRule(s2id("wi"), wffT, [xf.second, acc]));
+			facts = concat(map(plain, \b -> b.first), map(uinsts, \t -> t.first));
 			factProofs = concat(
-				map(basis, \b -> RuProofHyp(b.second, RuStmt(stmtClass, [b.first], -1))),
+				map(plain, \b -> RuProofHyp(b.second, RuStmt(stmtClass, [b.first], -1))),
 				map(uinsts, \t -> t.second));
 			em = RuEnvMath(math, env);
 			conn = ruPConnectives();
-			wffT = tp2id_("wff");
-			switch (ruHilbertCertificateTimed(em, conn, wffT, stmtClass, facts, matrix, 1000.0, None())) {
+			switch (ruHilbertCertificateTimed(em, conn, wffT, stmtClass, facts, certGoal, 1000.0, None())) {
 				None(): None();
 				Some(cert): {
 					spliced = ruUnfoldSplice(cert.first, 0, factProofs);
@@ -65,20 +79,57 @@ ruUnfStepProof(math : RuMath, env : RuEnv, stmtClass : int, plan : RuUnfPlan,
 					rooted = switch (spliced) {
 						RuProofHyp(__, __): {
 							nn = ruFwdMkRule(s2id("wn"), wffT,
-								[ruFwdMkRule(s2id("wn"), wffT, [matrix])]);
+								[ruFwdMkRule(s2id("wn"), wffT, [certGoal])]);
 							RuProofStep(s2id("notnotri"),
 								[RuProofStep(s2id("notnoti"), [spliced],
 									RuStmt(stmtClass, [nn], -1))],
-								RuStmt(stmtClass, [matrix], -1));
+								RuStmt(stmtClass, [certGoal], -1));
 						}
 						RuProofStep(__, __, __): spliced;
 					}
-					dvs = fold(uinsts, cert.second.disjs, \acc, t -> mergeSets(acc, t.third));
-					Some(Pair(ruEqzGenWrap(goal, rooted, stmtClass), dvs));
+					dvs0 = fold(uinsts, cert.second.disjs, \acc, t -> mergeSets(acc, t.third));
+					// discharge the ∃-antecedents, outermost first
+					dvsR = ref dvs0;
+					discharged = fold(exFacts, Pair(rooted, certGoal), \cur : Pair<RuProofTree, RuExp>, xf -> {
+						rest = (ruInArgs(cur.second))[1];
+						restVars = fold(rest.nodes, makeSet(), \a, n -> switch (n) {
+							RuVar(id, tp): insertSet(a, RuVar(id, tp));
+							RuRuleNode(__, __): a;
+						});
+						impl = foldi(reverseA(xf.first), Pair(cur.first, xf.second), \bi, ac : Pair<RuProofTree, RuExp>, xv -> {
+							ante = ruFwdMkRule(s2id("wex"), wffT, [RuExp([xv], -1), ac.second]);
+							dvsR := fold(set2array(restVars), ^dvsR, \a, rv ->
+								switch (xv) {
+									RuVar(vid, vtp): insertSet(a, RuDisj(rv, RuVar(vid, vtp)));
+									RuRuleNode(__, __): a;
+								});
+							Pair(RuProofStep(s2id("exlimiv"), [ac.first],
+								RuStmt(stmtClass, [ruFwdMkRule(s2id("wi"), wffT, [ante, rest])], -1)),
+								ante);
+						});
+						Pair(RuProofStep(s2id("ax-mp"), [
+								RuProofHyp(xf.third.second, RuStmt(stmtClass, [xf.third.first], -1)),
+								impl.first],
+							RuStmt(stmtClass, [rest], -1)),
+							rest);
+					});
+					Some(Pair(ruEqzGenWrap(goal, discharged.first, stmtClass), ^dvsR));
 				}
 			}
 		}
 	}
+}
+
+// strip the leading ∃-binders: ([binder var NODES, outermost first], the body)
+ruUnfStripExes(e : RuExp) -> Pair<[RuExpNode], RuExp> {
+	if (ruInHead(e) == s2id("wex") && ruInArity(e) == 2) {
+		args = ruInArgs(e);
+		if (length((args[0]).nodes) != 1) Pair([], e)
+		else {
+			inner = ruUnfStripExes(args[1]);
+			Pair(concat([(args[0]).nodes[0]], inner.first), inner.second);
+		}
+	} else Pair([], e);
 }
 
 // The σP fact: base = a prior ∀-step's hyp leaf, or the assertion applied over
@@ -101,7 +152,37 @@ ruUnfPremInstance(math : RuMath, env : RuEnv, stmtClass : int, assId : int,
 				else {
 					p0 = ruExp(inf.prop.exps[0]);
 					binders = ruUnfBinders(p0);
-					classBind = foldTree(bind, makeTree(), \v, t, acc ->
+					// SIMULTANEOUS LOCI RENAMING (the eqz t62 lesson): article premises
+					// reuse the theorem's own var NAMES (∀x5∀x7 … instantiated at x5) —
+					// instTerm rightly declines when the bound var occurs in the term.
+					// Binder vars bound to PLAIN (coerced) vars are renamed in the ONE
+					// 0-ref application (1-node slices keep the body coercion), then
+					// stripped by sp; class-term-valued binders stay for instTerm.
+					plainVarOf = \sl : [RuExpNode] ->
+						if (length(sl) == 1) ruEqzVarAt(sl, 0)
+						else if (length(sl) == 2 && ruEqzIsCoercionAt(sl, 0, coId)) ruEqzVarAt(sl, 1)
+						else -1;
+					p0VarIds = fold(p0.nodes, makeSet(), \a, n -> switch (n) {
+						RuVar(id, __): insertSet(a, id);
+						RuRuleNode(__, __): a;
+					});
+					renamed0 = filtermap(binders, \v -> switch (lookupTree(bind, v)) {
+						None(): None();
+						Some(t): {
+							tv = plainVarOf(t.nodes);
+							if (tv < 0) None() else Some(Pair(v, tv));
+						}
+					});
+					// capture guard: a target either IS its own binder (identity) or a
+					// name foreign to the whole premise; targets pairwise distinct
+					renameOk = sizeSet(buildSet(map(renamed0, \r -> r.second))) == length(renamed0)
+						&& forall(renamed0, \r -> r.second == r.first
+							|| !containsSet(p0VarIds, r.second));
+					renamed = if (renameOk) renamed0 else [];
+					renamedSet = buildSet(map(renamed, \r -> r.first));
+					setvarT = tp2id_("setvar");
+					classBind = foldTree(bind, fold(renamed, makeTree(), \a, r ->
+							setTree(a, r.first, [RuVar(r.second, setvarT)])), \v, t, acc ->
 						if (contains(binders, v)) acc else setTree(acc, v, t.nodes));
 					switch (ruEqzApply(p0.nodes, classBind, coId)) {
 						None(): None();
@@ -121,15 +202,55 @@ ruUnfPremInstance(math : RuMath, env : RuEnv, stmtClass : int, assId : int,
 												\p -> arrayPush(harr, p));
 										}
 									}));
-							maybeMap(hypProofs, \hp -> Triple(inst0,
-								RuProofStep(assId, hp, RuStmt(stmtClass, [inst0], -1)), makeSet()));
+							// the strip plan, binder by binder: None = sp (renamed),
+							// Some(t) = instTerm; the plan ends at the first unbound binder
+							acts = fold(binders, Pair([], true), \ac : Pair<[Maybe<RuExp>], bool>, v ->
+								if (!ac.second) ac
+								else if (containsSet(renamedSet, v))
+									Pair(arrayPush(ac.first, None()), true)
+								else switch (lookupTree(bind, v)) {
+									None(): Pair(ac.first, false);
+									Some(t): Pair(arrayPush(ac.first, Some(t)), true);
+								}).first;
+							maybeBind(hypProofs, \hp -> ruUnfInstChain(math, env, stmtClass,
+								Triple(inst0, RuProofStep(assId, hp, RuStmt(stmtClass, [inst0], -1)),
+									makeSet()), acts));
 						}
 					}
 				}
 			}
 		}
 	}
-	maybeBind(baseM, \base -> ruUnfInstChain(math, env, stmtClass, base, bind));
+	switch (lookupTree(stepPrems, assId)) {
+		// a prior-step ∀-fact: no renaming machinery — instantiate what instTerm can
+		Some(__): maybeBind(baseM, \base -> ruUnfInstChainBind(math, env, stmtClass, base, bind));
+		None(): baseM;
+	}
+}
+
+// strip chain over a prior-step ∀-fact: consult the bind per leading binder
+ruUnfInstChainBind(math : RuMath, env : RuEnv, stmtClass : int,
+	cur : Triple<RuExp, RuProofTree, Set<RuDisj>>,
+	bind : Tree<int, RuExp>) -> Maybe<Triple<RuExp, RuProofTree, Set<RuDisj>>> {
+	e = cur.first;
+	if (ruInHead(e) != s2id("wal") || ruInArity(e) != 2) Some(cur)
+	else {
+		args = ruInArgs(e);
+		v = if (length((args[0]).nodes) == 1) ruEqzVarAt((args[0]).nodes, 0) else -1;
+		if (v < 0) Some(cur)
+		else switch (lookupTree(bind, v)) {
+			None(): Some(cur);
+			Some(t): switch (ruInForallInstTerm(math, env, stmtClass, e, t)) {
+				None(): None();
+				Some(it): ruUnfInstChainBind(math, env, stmtClass,
+					Triple(it.first,
+						RuProofStep(s2id("ax-mp"), [cur.second, it.second],
+							RuStmt(stmtClass, [it.first], -1)),
+						mergeSets(cur.third, it.third)),
+					bind);
+			}
+		}
+	}
 }
 
 // outermost-first ∀-binder var ids of a ∀-closed expression
@@ -141,19 +262,27 @@ ruUnfBinders(e : RuExp) -> [int] {
 	} else [];
 }
 
+// strip chain by explicit plan: None = sp-strip a RENAMED binder (the target is
+// already in place from the simultaneous application), Some(t) = instTerm at t
 ruUnfInstChain(math : RuMath, env : RuEnv, stmtClass : int,
 	cur : Triple<RuExp, RuProofTree, Set<RuDisj>>,
-	bind : Tree<int, RuExp>) -> Maybe<Triple<RuExp, RuProofTree, Set<RuDisj>>> {
+	acts : [Maybe<RuExp>]) -> Maybe<Triple<RuExp, RuProofTree, Set<RuDisj>>> {
 	e = cur.first;
-	if (ruInHead(e) != s2id("wal") || ruInArity(e) != 2) Some(cur)
+	if (acts == [] || ruInHead(e) != s2id("wal") || ruInArity(e) != 2) Some(cur)
 	else {
-		args = ruInArgs(e);
-		v = if (length((args[0]).nodes) == 1) ruEqzVarAt((args[0]).nodes, 0) else -1;
-		if (v < 0) Some(cur)
-		else switch (lookupTree(bind, v)) {
-			// an unbound binder: the decision never constrained it — keep the
-			// remaining ∀-closed form as the fact
-			None(): Some(cur);
+		rest = (ruInArgs(e))[1];
+		wffT = tp2id_("wff");
+		switch (acts[0]) {
+			None(): {
+				impl = ruFwdMkRule(s2id("wi"), wffT, [e, rest]);
+				ruUnfInstChain(math, env, stmtClass,
+					Triple(rest,
+						RuProofStep(s2id("ax-mp"), [cur.second,
+							RuProofStep(s2id("sp"), [], RuStmt(stmtClass, [impl], -1))],
+							RuStmt(stmtClass, [rest], -1)),
+						cur.third),
+					tail(acts));
+			}
 			Some(t): switch (ruInForallInstTerm(math, env, stmtClass, e, t)) {
 				None(): None();
 				Some(it): ruUnfInstChain(math, env, stmtClass,
@@ -161,7 +290,7 @@ ruUnfInstChain(math : RuMath, env : RuEnv, stmtClass : int,
 						RuProofStep(s2id("ax-mp"), [cur.second, it.second],
 							RuStmt(stmtClass, [it.first], -1)),
 						mergeSets(cur.third, it.third)),
-					bind);
+					tail(acts));
 			}
 		}
 	}
