@@ -1,0 +1,168 @@
+import ru/prover/tactics/unifier_plan;
+import ru/prover/tactics/instantiate;
+import ru/prover/tactics/unfold;
+import ru/prover/tactics/hilbert;
+
+// THE UNIFIER DIRECT GENERATOR (v1) — proofs for the planner's decisions, on the
+// Equalizer's assembly-first pattern: NO proof search on any path.
+//
+// A decided step's refutations name the universal premises and their bindings
+// (RuUnfByPremise). Constructively: the premise INSTANCES σP plus the step's
+// basis facts entail the goal matrix PROPOSITIONALLY (the refutation showed
+// basis ∧ ¬goal ∧ σP inconsistent), so:
+//   facts   = basis literals (leaf-indexed into the REAL premise list)
+//           + σP instances (assertion application over class metavars, setness
+//             side hyps discharged mechanically, then the spcv/instTerm chain
+//             per bound setvar, ax-mp-folded);
+//   glue    = the COMPLETE propositional certificate (1 s wall);
+//   closure = ruUnfoldSplice replaces the certificate's fact leaves with the
+//             real proofs; ax-gen re-quantifies a ∀-closed goal.
+// Declines are SAFE (no proof — the step just stays open): unbound binders stop
+// the instantiation chain early (the remaining ∀ stays a fact as-is), Skolem-
+// dependent decisions fail the certificate (its facts are the UNSTRIPPED hyps).
+
+export {
+	// basis: (fact expression, its index in the REAL premise list the enclosing
+	// proof verifies against). stepPrems: synthetic ∀-premise assIds (prior
+	// steps offered as universal premises) -> (real premise index, the ∀-closed
+	// step expression).
+	ruUnfStepProof(math : RuMath, env : RuEnv, stmtClass : int, plan : RuUnfPlan,
+		basis : [Pair<RuExp, int>], stepPrems : Tree<int, Pair<int, RuExp>>,
+		goal : RuExp) -> Maybe<Pair<RuProofTree, Set<RuDisj>>>;
+}
+
+ruUnfStepProof(math : RuMath, env : RuEnv, stmtClass : int, plan : RuUnfPlan,
+	basis : [Pair<RuExp, int>], stepPrems : Tree<int, Pair<int, RuExp>>,
+	goal : RuExp) -> Maybe<Pair<RuProofTree, Set<RuDisj>>> {
+	matrix = ruEqzStripAlls(goal);
+	instsM = fold(plan.refutations, Some([]), \accM : Maybe<[Triple<RuExp, RuProofTree, Set<RuDisj>>]>, r ->
+		maybeBind(accM, \acc -> switch (r) {
+			RuUnfByPremise(assId, bind):
+				maybeMap(ruUnfPremInstance(math, env, stmtClass, assId, bind, basis, stepPrems),
+					\p -> arrayPush(acc, p));
+			default: Some(acc);
+		}));
+	switch (instsM) {
+		None(): None();
+		Some(insts): {
+			// dedup instances (several disjuncts may use the same one)
+			uinsts = fold(insts, Pair([], makeSet()), \acc : Pair<[Triple<RuExp, RuProofTree, Set<RuDisj>>], Set<[RuExpNode]>>, t ->
+				if (containsSet(acc.second, t.first.nodes)) acc
+				else Pair(arrayPush(acc.first, t), insertSet(acc.second, t.first.nodes))).first;
+			facts = concat(map(basis, \b -> b.first), map(uinsts, \t -> t.first));
+			factProofs = concat(
+				map(basis, \b -> RuProofHyp(b.second, RuStmt(stmtClass, [b.first], -1))),
+				map(uinsts, \t -> t.second));
+			em = RuEnvMath(math, env);
+			conn = ruPConnectives();
+			wffT = tp2id_("wff");
+			switch (ruHilbertCertificateTimed(em, conn, wffT, stmtClass, facts, matrix, 1000.0, None())) {
+				None(): None();
+				Some(cert): {
+					spliced = ruUnfoldSplice(cert.first, 0, factProofs);
+					// goal == a fact verbatim: a bare hyp-leaf tree linearizes to an
+					// EMPTY step list — wrap in notnoti/notnotri (the two cancel)
+					rooted = switch (spliced) {
+						RuProofHyp(__, __): {
+							nn = ruFwdMkRule(s2id("wn"), wffT,
+								[ruFwdMkRule(s2id("wn"), wffT, [matrix])]);
+							RuProofStep(s2id("notnotri"),
+								[RuProofStep(s2id("notnoti"), [spliced],
+									RuStmt(stmtClass, [nn], -1))],
+								RuStmt(stmtClass, [matrix], -1));
+						}
+						RuProofStep(__, __, __): spliced;
+					}
+					dvs = fold(uinsts, cert.second.disjs, \acc, t -> mergeSets(acc, t.third));
+					Some(Pair(ruEqzGenWrap(goal, rooted, stmtClass), dvs));
+				}
+			}
+		}
+	}
+}
+
+// The σP fact: base = a prior ∀-step's hyp leaf, or the assertion applied over
+// its CLASS metavars (setness hyps discharged); then the ∀-chain instantiated
+// binder by binder at the bound terms, ax-mp against instTerm's implication.
+ruUnfPremInstance(math : RuMath, env : RuEnv, stmtClass : int, assId : int,
+	bind : Tree<int, RuExp>, basis : [Pair<RuExp, int>],
+	stepPrems : Tree<int, Pair<int, RuExp>>) -> Maybe<Triple<RuExp, RuProofTree, Set<RuDisj>>> {
+	coId = ruEqzCoercionId(math, env);
+	baseM = switch (lookupTree(stepPrems, assId)) {
+		Some(bi): {
+			e = bi.second;
+			Some(Triple(e, RuProofHyp(bi.first, RuStmt(stmtClass, [e], -1)), makeSet()));
+		}
+		None(): switch (lookupTree(math.decls.assertions, assId)) {
+			None(): None();
+			Some(ass): {
+				inf = ruEqzInfer(ass);
+				if (inf.prop.exps == []) None()
+				else {
+					p0 = ruExp(inf.prop.exps[0]);
+					binders = ruUnfBinders(p0);
+					classBind = foldTree(bind, makeTree(), \v, t, acc ->
+						if (contains(binders, v)) acc else setTree(acc, v, t.nodes));
+					switch (ruEqzApply(p0.nodes, classBind, coId)) {
+						None(): None();
+						Some(instNodes): {
+							inst0 = RuExp(instNodes, -1);
+							reg = ruSetnessRegistry(math);
+							hypProofs = fold(inf.hyps, Some([]), \hacc : Maybe<[RuProofTree]>, hyp ->
+								maybeBind(hacc, \harr ->
+									if (hyp.stmt.exps == []) None()
+									else switch (ruEqzApply((ruExp(hyp.stmt.exps[0])).nodes, classBind, coId)) {
+										None(): None();
+										Some(hn): {
+											he = RuExp(hn, -1);
+											if (ruInHead(he) != s2id("wcel")) None()
+											else maybeMap(
+												ruSetnessProof2(reg, (ruInArgs(he))[0], stmtClass, math, env),
+												\p -> arrayPush(harr, p));
+										}
+									}));
+							maybeMap(hypProofs, \hp -> Triple(inst0,
+								RuProofStep(assId, hp, RuStmt(stmtClass, [inst0], -1)), makeSet()));
+						}
+					}
+				}
+			}
+		}
+	}
+	maybeBind(baseM, \base -> ruUnfInstChain(math, env, stmtClass, base, bind));
+}
+
+// outermost-first ∀-binder var ids of a ∀-closed expression
+ruUnfBinders(e : RuExp) -> [int] {
+	if (ruInHead(e) == s2id("wal") && ruInArity(e) == 2) {
+		args = ruInArgs(e);
+		v = if (length((args[0]).nodes) == 1) ruEqzVarAt((args[0]).nodes, 0) else -1;
+		if (v < 0) [] else concat([v], ruUnfBinders(args[1]));
+	} else [];
+}
+
+ruUnfInstChain(math : RuMath, env : RuEnv, stmtClass : int,
+	cur : Triple<RuExp, RuProofTree, Set<RuDisj>>,
+	bind : Tree<int, RuExp>) -> Maybe<Triple<RuExp, RuProofTree, Set<RuDisj>>> {
+	e = cur.first;
+	if (ruInHead(e) != s2id("wal") || ruInArity(e) != 2) Some(cur)
+	else {
+		args = ruInArgs(e);
+		v = if (length((args[0]).nodes) == 1) ruEqzVarAt((args[0]).nodes, 0) else -1;
+		if (v < 0) Some(cur)
+		else switch (lookupTree(bind, v)) {
+			// an unbound binder: the decision never constrained it — keep the
+			// remaining ∀-closed form as the fact
+			None(): Some(cur);
+			Some(t): switch (ruInForallInstTerm(math, env, stmtClass, e, t)) {
+				None(): None();
+				Some(it): ruUnfInstChain(math, env, stmtClass,
+					Triple(it.first,
+						RuProofStep(s2id("ax-mp"), [cur.second, it.second],
+							RuStmt(stmtClass, [it.first], -1)),
+						mergeSets(cur.third, it.third)),
+					bind);
+			}
+		}
+	}
+}

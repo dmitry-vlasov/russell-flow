@@ -1,4 +1,5 @@
 import ru/prover/tactics/unifier_plan;
+import ru/prover/tactics/unifier_gen;
 import ru/verify/math;
 import ru/math;
 import comm;
@@ -166,6 +167,7 @@ ruUnfProbeSteps(env : RuEnv, state : RuState, math : RuMath, target : string,
 	timer = ruMakeTimer();
 	byPrem = ref 0; byClash = ref 0; byEq = ref 0; byTriv = ref 0;
 	eqSteps = ref 0;
+	asmOk = ref 0; asmBad = ref 0;
 	parseBy = \tac : string -> {
 		t = trim2(tac, " ");
 		if (!startsWith(t, "by(")) makeSet()
@@ -188,7 +190,11 @@ ruUnfProbeSteps(env : RuEnv, state : RuState, math : RuMath, target : string,
 					acc;
 				} else {
 					prior = map(take(th.proof.steps, si), \ps -> ruExp(ps.stmt.exps[0]));
+					// the REAL premise list an assembled step proof verifies against:
+					// theorem hyps then ALL prior steps, leaf-indexed in order
+					allPrems = concat(thHyps, prior);
 					// ∀-closed prior steps are UNIVERSAL facts — offer them as premises
+					stepPremIdx : ref Tree<int, Pair<int, RuExp>> = ref makeTree();
 					stepPrems = filtermapi(prior, \pi, p ->
 						if (ruInHead(p) != s2id("wal")) None()
 						else {
@@ -200,11 +206,17 @@ ruUnfProbeSteps(env : RuEnv, state : RuState, math : RuMath, target : string,
 									RuRuleNode(__, __): a;
 								});
 								if (isEmptySet(vars)) None()
-								else Some(RuUnfPremise(s2id("step" + i2s(pi + 1)), pm,
-									set2array(vars), false, false));
+								else {
+									sid = s2id("step" + i2s(pi + 1));
+									stepPremIdx := setTree(^stepPremIdx, sid,
+										Pair(length(thHyps) + pi, p));
+									Some(RuUnfPremise(sid, pm, set2array(vars), false, false));
+								}
 							}
 						});
-					hyps = concat(thHyps, filter(prior, \p -> ruInHead(p) != s2id("wal")));
+					basisIdx = filtermapi(allPrems, \bi, p ->
+						if (ruInHead(p) == s2id("wal")) None() else Some(Pair(p, bi)));
+					hyps = map(basisIdx, \b -> b.first);
 					byRefs = parseBy(step.tactic);
 					prems = concat(
 						if (isEmptySet(byRefs)) filter(prems0, \pp -> !pp.foundational || pp.charShape)
@@ -226,10 +238,41 @@ ruUnfProbeSteps(env : RuEnv, state : RuState, math : RuMath, target : string,
 						else if (containsSet(kinds, "eq")) byEq := ^byEq + 1
 						else byTriv := ^byTriv + 1;
 					} else {};
+					// the direct generator + the standard verifier (assembly-first gate)
+					asmV = if (!plan.provable) false
+					else switch (ruUnfStepProof(math, env, th.infer.prop.class, plan,
+							basisIdx, ^stepPremIdx, goal)) {
+						None(): false;
+						Some(gp): {
+							steps = ruMakeLinearProof(gp.first);
+							vhyps = mapi(allPrems, \hi, hp ->
+								RuHyp(hi, RuStmt(th.infer.prop.class, [hp], -1), -1));
+							propStmt = RuStmt(th.infer.prop.class, [goal], -1);
+							extra = differenceSets(
+								fold(steps, makeSet(), \a, stp -> mergeSets(a, ruStmt2Vars(stp.stmt))),
+								fold(vhyps, ruStmt2Vars(propStmt), \a, h ->
+									mergeSets(a, ruStmt2Vars(h.stmt))));
+							prf = RuProof(RuVarsDisjs(values2tree(set2array(extra), \v -> v.id),
+								gp.second), steps, -1);
+							res = ruVerifyProof(prf, vhyps, propStmt, math, env);
+							ok = res.errs == [];
+							if (ok) asmOk := ^asmOk + 1 else {
+								asmBad := ^asmBad + 1;
+								if (ruVerbose(env.conf) > 1) {
+									iter(res.errs, \e -> env.out.println("      asm verify err ["
+										+ id2s(th.info.id) + " step " + i2s(si + 1) + "]: "
+										+ strLeft(toString(e), 400)));
+								} else {};
+							}
+							ok;
+						}
+					}
 					if (ruVerbose(env.conf) > 0) {
 						env.out.println("  " + (if (plan.provable) "+ " else "- ")
 							+ id2s(th.info.id) + " step " + i2s(si + 1)
 							+ (if (plan.provable) " DECIDED" else " open")
+							+ (if (asmV) " ASSEMBLED+VERIFIED"
+								else if (plan.provable) " no-assembly" else "")
 							+ " (disjuncts=" + i2s(plan.disjuncts) + ", refuted=" + i2s(plan.refuted)
 							+ ", premises=" + i2s(plan.premises)
 							+ (if (plan.overflow) ", OVERFLOW" else "") + ")");
@@ -246,6 +289,9 @@ ruUnfProbeSteps(env : RuEnv, state : RuState, math : RuMath, target : string,
 	env.out.println("  refutations: premise-instance " + i2s(^byPrem)
 		+ ", atom-clash " + i2s(^byClash) + ", reflexivity " + i2s(^byEq)
 		+ ", trivial " + i2s(^byTriv));
+	env.out.println("  direct generator: assembled+verified " + i2s(^asmOk)
+		+ ", no-assembly " + i2s(counts.first - ^asmOk - ^asmBad)
+		+ ", REJECTED " + i2s(^asmBad));
 	Some(RuState(state with
 		vars = setTree(state.vars, "unifier-probe", pairs2tree([
 			Pair("decided", flow(counts.first)),
