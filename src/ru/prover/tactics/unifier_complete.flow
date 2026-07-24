@@ -1,0 +1,99 @@
+import ru/prover/tactics/unifier_plan;
+import ru/prover/core/forward;
+
+// THE COMPLETER (three-layer architecture, phase 2 v1) — turns the planner's
+// recorded reasons into Russell proofs by a FINITE CATALOG of fixed patterns.
+// NO SEARCH anywhere: every step is dictated by the RuUnfCase records.
+//
+// V1 CATALOG (the single-case fragment): plans with EXACTLY ONE disjunct —
+// no ∨-branching in DNF(¬matrix ∧ hyps), hence no or-elimination and no
+// deduction ambients; pure inference-form fragments. Covered reasons:
+//   - RuUnfByContradiction, SYNTACTIC complement between a case literal and
+//     a basis fact:
+//       goal-side literal (¬l in the case, fact l in the basis) — descend
+//       the matrix to that literal with orci/olci (∨), a1i/pm2.21 (→),
+//       leaf reuse (¬, atoms);
+//       fact-side pair (facts contradict) — ex falso: pm2.21 + double ax-mp.
+// Everything else DECLINES (None) — the caller falls back to the searching
+// glue during the migration; a decline is a census entry, never an error.
+
+export {
+	// Inference-form proof of `matrix` from the basis facts, or None when the
+	// plan is outside the v1 catalog. basis = (fact expression, hyp leaf index).
+	ruUnfCompleteProof(stmtClass : int, wffT : int, plan : RuUnfPlan,
+		basis : [Pair<RuExp, int>], matrix : RuExp) -> Maybe<RuProofTree>;
+}
+
+ruUnfCompleteProof(stmtClass : int, wffT : int, plan : RuUnfPlan,
+	basis : [Pair<RuExp, int>], matrix : RuExp) -> Maybe<RuProofTree> {
+	if (!plan.provable || plan.disjuncts != 1 || length(plan.cases) != 1) None()
+	else switch (plan.cases[0].refutation) {
+		RuUnfByContradiction(lit): {
+			// `lit` is the NEGATIVE case literal whose atom also occurs positively
+			// in the case. Two sub-patterns by where the complement pair lives.
+			leaf = \e : RuExp -> maybeMap(
+				find(basis, \b -> b.first.nodes == e.nodes),
+				\b -> RuProofHyp(b.second, RuStmt(stmtClass, [b.first], -1)));
+			neg = \e : RuExp -> ruFwdMkRule(s2id("wn"), wffT, [e]);
+			posFact = leaf(lit);
+			negFact = leaf(neg(lit));
+			switch (posFact) {
+				None(): None();
+				Some(pf): switch (negFact) {
+					Some(nf): {
+						// FACT-SIDE contradiction: basis holds l and ¬l — ex falso.
+						// pm2.21: (¬φ → (φ → ψ)); two ax-mp give ψ = matrix.
+						imp1 = ruFwdMkRule(s2id("wi"), wffT, [lit, matrix]);
+						pm = RuProofStep(s2id("pm2.21"), [],
+							RuStmt(stmtClass, [ruFwdMkRule(s2id("wi"), wffT, [neg(lit), imp1])], -1));
+						mp1 = RuProofStep(s2id("ax-mp"), [nf, pm], RuStmt(stmtClass, [imp1], -1));
+						Some(RuProofStep(s2id("ax-mp"), [pf, mp1], RuStmt(stmtClass, [matrix], -1)));
+					}
+					None():
+						// GOAL-SIDE: the case's ¬(lit) comes from DNF(¬matrix);
+						// the basis proves lit — descend the matrix to it.
+						ruUnfDescend(stmtClass, wffT, matrix, lit, pf, \e -> leaf(e));
+				}
+			}
+		}
+		default: None();
+	}
+}
+
+// Prove `form` (positively) given a proof `pf` of the literal `target` that
+// DNF(¬form) put into the single case, plus leaf lookup for side branches.
+// Mirrors ruUnfDnfX's single-clause connective cases; every step is forced.
+ruUnfDescend(stmtClass : int, wffT : int, form : RuExp, target : RuExp,
+	pf : RuProofTree, leaf : (RuExp) -> Maybe<RuProofTree>) -> Maybe<RuProofTree> {
+	h = ruInHead(form);
+	ar = ruInArity(form);
+	stmt = \e : RuExp -> RuStmt(stmtClass, [e], -1);
+	if (form.nodes == target.nodes) Some(pf)
+	else if (h == s2id("wn") && ar == 1) {
+		// goal ¬X: single case ⇒ X is the (positive) case literal; a basis fact
+		// ¬X proves it verbatim
+		leaf(form);
+	} else if (h == s2id("wo") && ar == 2) {
+		args = ruInArgs(form);
+		// ∨ under ¬ is a PRODUCT — both sides landed in the one case; the
+		// refuted literal sits in exactly one. orci/olci re-introduce.
+		switch (ruUnfDescend(stmtClass, wffT, args[0], target, pf, leaf)) {
+			Some(pl): Some(RuProofStep(s2id("orci"), [pl], stmt(form)));
+			None(): maybeMap(ruUnfDescend(stmtClass, wffT, args[1], target, pf, leaf),
+				\pr -> RuProofStep(s2id("olci"), [pr], stmt(form)));
+		}
+	} else if (h == s2id("wi") && ar == 2) {
+		args = ruInArgs(form);
+		// A→B: the case holds A and ¬B. Refuted A ⇒ fact ¬A ⇒ pm2.21 + ax-mp;
+		// refuted ¬B ⇒ proof of B ⇒ a1i.
+		neg = \e : RuExp -> ruFwdMkRule(s2id("wn"), wffT, [e]);
+		if ((args[0]).nodes == target.nodes) {
+			maybeMap(leaf(neg(args[0])), \na -> {
+				pm = RuProofStep(s2id("pm2.21"), [],
+					stmt(ruFwdMkRule(s2id("wi"), wffT, [neg(args[0]), form])));
+				RuProofStep(s2id("ax-mp"), [na, pm], stmt(form));
+			});
+		} else maybeMap(ruUnfDescend(stmtClass, wffT, args[1], target, pf, leaf),
+			\pb -> RuProofStep(s2id("a1i"), [pb], stmt(form)));
+	} else None();
+}
