@@ -46,7 +46,8 @@ export {
 	RuHCtx(conn : RuPConnectives, wff : int, stmtClass : int, atomNodes : ref Tree<string, [RuExpNode]>,
 		splitBudget : ref int, globalSplits : ref int, disjs : ref Set<RuDisj>, freshVars : ref [RuVar], em : RuEnvMath,
 		timer : RuTimer, fo : Maybe<Tree<int, [RuInAtomCong]>>, inClash : ref bool,
-		exElims : ref int, exSeen : ref Set<string>, exElimsGlobal : ref int, exNoMatch : ref Set<string>);
+		exElims : ref int, exSeen : ref Set<string>, exElimsGlobal : ref int, exNoMatch : ref Set<string>,
+		topFo : bool);
 	// `wff` (the wff type id) and `stmtClass` (the |- turnstile id) MUST come from the loaded math — derive
 	// them from a real expression (ruIdType2Type of a connective node / the prop's class), never from the
 	// memoized ruIdWff/ruIdTurnstile helpers (they cache -1 if interned before the library loads).
@@ -61,6 +62,12 @@ export {
 	// (returns None) once the deadline passes. Callers with their own slice discipline use this.
 	// `fo` = Some(atom-congruence table) turns on the per-branch equality transport.
 	ruHilbertCertificateTimed(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, limit_ms : double, fo : Maybe<Tree<int, [RuInAtomCong]>>) -> Maybe<Pair<RuProofTree, RuVarsDisjs>>;
+	// ruHilbertCertificateTimed + one TOP-LEVEL transport round over the certificate hyps
+	// (the unifier-gen t85 class: the driving equality is a top-level fact, not a branch
+	// assumption, so the per-branch transport never sees it). Kept out of the full-stack
+	// residual paths — the extra entry cost measurably starves slice-budget borderliners
+	// (t101 flipped 89->88 when this ran unconditionally).
+	ruHilbertCertificateTimedTop(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, limit_ms : double, fo : Maybe<Tree<int, [RuInAtomCong]>>) -> Maybe<Pair<RuProofTree, RuVarsDisjs>>;
 	// Realize a propositional form as a statement `|- f` (for building the hyps/conclusion of a test theorem).
 	ruHStmt(ctx : RuHCtx, f : RuPForm) -> RuStmt;
 	// Build a certificate for a residual `hyps |- goal` (the equalizer's output): atomize over the real
@@ -76,10 +83,18 @@ ruHilbertCertificate(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass
 }
 
 ruHilbertCertificateTimed(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, limit_ms : double, fo : Maybe<Tree<int, [RuInAtomCong]>>) -> Maybe<Pair<RuProofTree, RuVarsDisjs>> {
+	ruHilbertCertificateTimed0(em, conn, wff, stmtClass, hyps, goal, limit_ms, fo, false);
+}
+
+ruHilbertCertificateTimedTop(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, limit_ms : double, fo : Maybe<Tree<int, [RuInAtomCong]>>) -> Maybe<Pair<RuProofTree, RuVarsDisjs>> {
+	ruHilbertCertificateTimed0(em, conn, wff, stmtClass, hyps, goal, limit_ms, fo, true);
+}
+
+ruHilbertCertificateTimed0(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, limit_ms : double, fo : Maybe<Tree<int, [RuInAtomCong]>>, topFo : bool) -> Maybe<Pair<RuProofTree, RuVarsDisjs>> {
 	atomNodes = fold(hyps, ruPAtomNodes(conn, goal), \acc, h -> mergeTree(acc, ruPAtomNodes(conn, h)));
 	hypForms  = map(hyps, \h -> ruPAtomize(conn, h));
 	goalForm  = ruPAtomize(conn, goal);
-	ctx = RuHCtx(ruHCtx(em, wff, stmtClass, atomNodes) with timer = ruMakeLimitedTimer(limit_ms), fo = fo);
+	ctx = RuHCtx(ruHCtx(em, wff, stmtClass, atomNodes) with timer = ruMakeLimitedTimer(limit_ms), fo = fo, topFo = topFo);
 	if (em.env.conf.verbose >= 5) {
 		em.env.out.println("      hCert: goal=" + ruHFormShape(goalForm) + " hyps=" + strGlue(map(hypForms, ruHFormShape), " ; "));
 	} else {};
@@ -128,7 +143,7 @@ ruHFormShape(f : RuPForm) -> string {
 
 ruHCtx(em : RuEnvMath, wff : int, stmtClass : int, atomNodes : Tree<string, [RuExpNode]>) -> RuHCtx {
 	RuHCtx(ruPConnectives(), wff, stmtClass, ref atomNodes, ref 6, ref 400, ref makeSet(), ref [], em,
-		ruMakeLimitedTimer(60000.0), None(), ref false, ref 3, ref makeSet(), ref 16, ref makeSet());
+		ruMakeLimitedTimer(60000.0), None(), ref false, ref 3, ref makeSet(), ref 16, ref makeSet(), false);
 }
 
 // ---- RuPForm -> RuExp / RuStmt (own copy; mirrors the kalmar pattern, no kalmar dependency) ----
@@ -1135,7 +1150,7 @@ ruHRefute(ctx : RuHCtx, hypFacts : [RuHF], goal : RuPForm) -> Maybe<RuProofTree>
 }
 
 ruHilbertProve(ctx : RuHCtx, hyps : [RuPForm], goal : RuPForm) -> Maybe<RuProofTree> {
-	hypFacts = mapi(hyps, \i, h -> RuHF(h, RuProofHyp(i, ruHStmt(ctx, h))));
+	hypFacts = ruHTopTransport(ctx, mapi(hyps, \i, h -> RuHF(h, RuProofHyp(i, ruHStmt(ctx, h)))));
 	switch (ruHProve(ctx, None(), hypFacts, goal, 48)) {
 		Some(r): Some(r.tree);
 		None():  ruHRefute(ctx, hypFacts, goal);
@@ -1143,6 +1158,21 @@ ruHilbertProve(ctx : RuHCtx, hyps : [RuPForm], goal : RuPForm) -> Maybe<RuProofT
 }
 
 ruHilbertProveUnder(ctx : RuHCtx, hyps : [RuPForm], assume : RuPForm, goal : RuPForm) -> Maybe<RuProofTree> {
-	hypFacts = mapi(hyps, \i, h -> RuHF(h, RuProofHyp(i, ruHStmt(ctx, h))));
+	hypFacts = ruHTopTransport(ctx, mapi(hyps, \i, h -> RuHF(h, RuProofHyp(i, ruHStmt(ctx, h)))));
 	maybeMap(ruHProveUnder(ctx, None(), hypFacts, assume, goal, 48), \r -> r.tree);
+}
+
+// TOP-LEVEL transport round: the per-branch transport (ruHWithTransport) fires only
+// for facts introduced at branch entry, so an equality arriving as a certificate
+// HYP transported nothing (the unifier-gen t85 class: goal x9∈X, facts x10∈X and
+// x9=x10 all top-level). One round over the hyp facts closes that — each eq-atom
+// hyp transports the others; ruHWithTransport self-gates on non-eq facts.
+// ctx.topFo-gated: only the ...TimedTop entry (unifier-gen) pays for it — run
+// unconditionally it starved the full-stack slice borderliners (t101, 89->88).
+ruHTopTransport(ctx : RuHCtx, hypFacts : [RuHF]) -> [RuHF] {
+	if (!ctx.topFo) hypFacts
+	else switch (ctx.fo) {
+		None(): hypFacts;
+		Some(__): fold(hypFacts, hypFacts, \acc, f -> ruHWithTransport(ctx, None(), acc, f));
+	}
 }
