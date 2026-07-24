@@ -318,8 +318,32 @@ ruUnfLeafTransport(math : RuMath, env : RuEnv, congs : Tree<int, [RuInAtomCong]>
 			if (ruInHead(g.first) == wnId && ruInArity(g.first) == 1)
 				Some(Triple((ruInArgs(g.first))[0], g.second, true))
 			else Some(Triple(g.first, g.second, false)));
-		fold(atoms, fs, \acc, fa -> if (length(acc) - length(fs) >= 32) acc else
-			fold(eqs, acc, \ac, eq -> if (length(ac) - length(fs) >= 32) ac else {
+		// DEEP-TERM derived equalities: an eq (l=r) with l strictly inside a
+		// direct argument t of some literal atom lifts to (t=t') through the
+		// term-congruence chain — the derived eq drives the atom transport below
+		// AND satisfies non-identity ¬(t=t') reflexivity leaves directly
+		teqs = ruInTermCongsCached(math);
+		deepEqs = fold(eqs, [], \dacc : [Pair<RuExp, RuProofTree>], eq ->
+			if (length(dacc) >= 16) dacc else {
+				sides = ruInArgs(eq.first);
+				fold(atoms, dacc, \da, fa -> if (length(da) >= 16 || ruInArity(fa.first) == 0) da else
+					fold(ruInArgs(fa.first), da, \d2, t ->
+						if (length(d2) >= 16 || t.nodes == sides[0].nodes
+							|| !ruUnfHasSub(t, sides[0])) d2
+						else switch (ruUnfDeepEq(math, env, teqs, stmtClass, wffT, sides[0], sides[1], t)) {
+							None(): d2;
+							Some(ch): {
+								de = ruFwdMkRule(wceqId, wffT, [t, ch.first]);
+								if (has(de) || exists(d2, \g -> g.first.nodes == de.nodes)) d2
+								else arrayPush(d2, Pair(de,
+									RuProofStep(s2id("syl"), [eq.second, ch.second], stmt(imp(de)))));
+							}
+						}));
+			});
+		eqs2 = concat(eqs, deepEqs);
+		base = concat(fs, deepEqs);
+		fold(atoms, base, \acc, fa -> if (length(acc) - length(base) >= 32) acc else
+			fold(eqs2, acc, \ac, eq -> if (length(ac) - length(base) >= 32) ac else {
 				sides = ruInArgs(eq.first);
 				fold(lookupTreeDef(congs, ruInHead(fa.first), []), ac, \a, r ->
 					switch (ruMatchExp(fa.first, r.lhs, math, env)) {
@@ -357,4 +381,60 @@ ruUnfLeafTransport(math : RuMath, env : RuEnv, congs : Tree<int, [RuInAtomCong]>
 			}));
 	};
 	round(round(done));
+}
+
+// Does `small` occur as a (contiguous, prefix-form) subterm slice of `big`?
+ruUnfHasSub(big : RuExp, small : RuExp) -> bool {
+	m = length(small.nodes);
+	n = length(big.nodes);
+	m <= n && exists(enumFromTo(0, n - m), \i ->
+		subrange(big.nodes, i, m) == small.nodes);
+}
+
+// ⊢ ((l=r) → (term = term')) for l occurring inside `term`: recurse to the
+// LEFTMOST argument containing l, base = the occurrence itself (id), each
+// level up applies the op's implication-form term congruence and syl-composes
+// (the arbitrary-lhs generalization of ruInTermEqChain).
+ruUnfDeepEq(math : RuMath, env : RuEnv, teqs : Tree<int, [RuInAtomCong]>,
+	stmtClass : int, wffT : int, l : RuExp, r : RuExp,
+	term : RuExp) -> Maybe<Pair<RuExp, RuProofTree>> {
+	mkImp = \a : RuExp, b : RuExp -> ruFwdMkRule(s2id("wi"), wffT, [a, b]);
+	mkEq  = \a : RuExp, b : RuExp -> ruFwdMkRule(s2id("wceq"), wffT, [a, b]);
+	eqLR = mkEq(l, r);
+	if (term.nodes == l.nodes)
+		Some(Pair(r, RuProofStep(s2id("id"), [], RuStmt(stmtClass, [mkImp(eqLR, eqLR)], -1))))
+	else {
+		args = ruInArgs(term);
+		if (args == []) None()
+		else {
+			occ = filter(enumFromTo(0, length(args) - 1), \i -> ruUnfHasSub(args[i], l));
+			if (occ == []) None()
+			else {
+				j = occ[0];
+				switch (ruUnfDeepEq(math, env, teqs, stmtClass, wffT, l, r, args[j])) {
+					None(): None();
+					Some(subC): fold(lookupTreeDef(teqs, ruInHead(term), []), None(),
+						\found : Maybe<Pair<RuExp, RuProofTree>>, rr -> switch (found) {
+						Some(__): found;
+						None(): switch (ruMatchExp(term, rr.lhs, math, env)) {
+							None(): None();
+							Some(sub0): if (!(switch (lookupHashMap(sub0.map, rr.va.id)) {
+								None(): false;
+								Some(se): se.exp.nodes == args[j].nodes;
+							})) None() else {
+								m = copyHashMap(sub0.map);
+								setHashMap(m, rr.vb.id, RuSubExpr(rr.vb, subC.first, ruExpVarIdsHashSet(subC.first)));
+								sub = RuSubst(m);
+								term2 = ruApplySubst(rr.rhs, sub);
+								inst = ruApplySubst(rr.prop, sub);   // (aj=aj') → (term=term2)
+								Some(Pair(term2, RuProofStep(s2id("syl"),
+									[subC.second, RuProofStep(rr.lemmaId, [], RuStmt(stmtClass, [inst], -1))],
+									RuStmt(stmtClass, [mkImp(eqLR, mkEq(term, term2))], -1))));
+							}
+						}
+					});
+				}
+			}
+		}
+	}
 }
