@@ -1,4 +1,5 @@
 import ru/prover/tactics/unifier_plan;
+import ru/prover/tactics/instantiate;   // RuInAtomCong — the leaf transport table
 import ru/prover/core/forward;
 
 // THE COMPLETER (three-layer architecture, phase 2 v1) — turns the planner's
@@ -29,9 +30,9 @@ export {
 	// `insts` = proved σP premise instances (unifier_gen's uinsts) — offered as
 	// extra facts, so RuUnfByPremise cases whose σP falsity is SYNTACTIC after
 	// decomposition close with no new machinery.
-	ruUnfCompleteTableau(stmtClass : int, wffT : int, plan : RuUnfPlan,
-		basis : [Pair<RuExp, int>], insts : [Pair<RuExp, RuProofTree>],
-		matrix : RuExp) -> Maybe<RuProofTree>;
+	ruUnfCompleteTableau(math : RuMath, env : RuEnv, stmtClass : int, wffT : int,
+		plan : RuUnfPlan, basis : [Pair<RuExp, int>],
+		insts : [Pair<RuExp, RuProofTree>], matrix : RuExp) -> Maybe<RuProofTree>;
 }
 
 ruUnfCompleteProof(stmtClass : int, wffT : int, plan : RuUnfPlan,
@@ -80,9 +81,9 @@ ruUnfCompleteProof(stmtClass : int, wffT : int, plan : RuUnfPlan,
 // structural (ops, the LatOvfl analogue). ↔-shapes and non-syntactic clashes
 // decline in v2.
 
-ruUnfCompleteTableau(stmtClass : int, wffT : int, plan : RuUnfPlan,
-	basis : [Pair<RuExp, int>], insts : [Pair<RuExp, RuProofTree>],
-	matrix : RuExp) -> Maybe<RuProofTree> {
+ruUnfCompleteTableau(math : RuMath, env : RuEnv, stmtClass : int, wffT : int,
+	plan : RuUnfPlan, basis : [Pair<RuExp, int>],
+	insts : [Pair<RuExp, RuProofTree>], matrix : RuExp) -> Maybe<RuProofTree> {
 	covered = forall(plan.cases, \c -> switch (c.refutation) {
 		RuUnfByContradiction(__): true;
 		RuUnfByPremise(__, __): true;
@@ -104,7 +105,7 @@ ruUnfCompleteTableau(stmtClass : int, wffT : int, plan : RuUnfPlan,
 					stmt(wi(amb0, b.first))))),
 			map(insts, \p -> Pair(p.first,
 				RuProofStep(s2id("a1i"), [p.second], stmt(wi(amb0, p.first)))))]);
-		switch (ruUnfTab(stmtClass, wffT, matrix, amb0, [], pending0, ops)) {
+		switch (ruUnfTab(math, env, ruInAtomCongsCached(math), stmtClass, wffT, matrix, amb0, [], pending0, ops)) {
 			None(): None();
 			Some(t): {
 				// Clavius: (¬M → M) ⊢ M
@@ -118,7 +119,8 @@ ruUnfCompleteTableau(stmtClass : int, wffT : int, plan : RuUnfPlan,
 
 // Prove (amb → matrix) from facts: `done` are literals (each proof concludes
 // amb → lit), `pending` still decompose. Linear except at ∨-splits.
-ruUnfTab(stmtClass : int, wffT : int, matrix : RuExp, amb : RuExp,
+ruUnfTab(math : RuMath, env : RuEnv, congs : Tree<int, [RuInAtomCong]>,
+	stmtClass : int, wffT : int, matrix : RuExp, amb : RuExp,
 	done : [Pair<RuExp, RuProofTree>], pending : [Pair<RuExp, RuProofTree>],
 	ops : ref int) -> Maybe<RuProofTree> {
 	ops := ^ops + 1;
@@ -142,14 +144,17 @@ ruUnfTab(stmtClass : int, wffT : int, matrix : RuExp, amb : RuExp,
 					RuStmt(stmtClass, [ruFwdMkRule(s2id("wb"), wffT, [f, g])], -1))],
 				stmt(wi(f, g)))], stmt(imp(g)));
 	if (pending == []) {
-		// LEAF: syntactic complementary pair among the literals, or a ¬(t=t)
-		// literal (Contr 19's identity case) refuted by eqid
-		clash = fold(done, None(), \acc : Maybe<RuProofTree>, nf ->
+		// LEAF: scan for a syntactic complementary pair or a ¬(t=t) literal
+		// (Contr 19) refuted by eqid; only when the PLAIN scan fails, saturate
+		// with equality-transported variants (Mizar's Equate at the leaf — the
+		// modulo-class clashes) and scan once more
+		scan = \fs : [Pair<RuExp, RuProofTree>] ->
+		fold(fs, None(), \acc : Maybe<RuProofTree>, nf ->
 			if (isSome(acc)) acc
 			else if (!(ruInHead(nf.first) == s2id("wn") && ruInArity(nf.first) == 1)) acc
 			else {
 				p = (ruInArgs(nf.first))[0];
-				mpp = switch (find(done, \pp -> pp.first.nodes == p.nodes)) {
+				mpp = switch (find(fs, \pp -> pp.first.nodes == p.nodes)) {
 					Some(pp): Some(pp.second);
 					None():
 						if (ruInHead(p) == s2id("wceq") && ruInArity(p) == 2
@@ -169,7 +174,10 @@ ruUnfTab(stmtClass : int, wffT : int, matrix : RuExp, amb : RuExp,
 					}
 				}
 			});
-		clash;
+		switch (scan(done)) {
+			Some(c): Some(c);
+			None(): scan(ruUnfLeafTransport(math, env, congs, stmtClass, wffT, amb, done));
+		}
 	} else {
 		f = pending[0].first;
 		pf = pending[0].second;
@@ -177,7 +185,7 @@ ruUnfTab(stmtClass : int, wffT : int, matrix : RuExp, amb : RuExp,
 		h = ruInHead(f);
 		ar = ruInArity(f);
 		rec = \d2 : [Pair<RuExp, RuProofTree>], p2 : [Pair<RuExp, RuProofTree>] ->
-			ruUnfTab(stmtClass, wffT, matrix, amb, d2, p2, ops);
+			ruUnfTab(math, env, congs, stmtClass, wffT, matrix, amb, d2, p2, ops);
 		push = \items : [Pair<RuExp, RuProofTree>] -> rec(done, concat(items, rest));
 		split = \a : RuExp, b : RuExp, pd : RuProofTree -> {
 			branch = \x : RuExp -> {
@@ -187,7 +195,7 @@ ruUnfTab(stmtClass : int, wffT : int, matrix : RuExp, amb : RuExp,
 						RuStmt(stmtClass, [ruFwdMkRule(s2id("wi"), wffT, [ambx, g.first])], -1))));
 				xFact = Pair(x, RuProofStep(s2id("simpr"), [],
 					RuStmt(stmtClass, [ruFwdMkRule(s2id("wi"), wffT, [ambx, x])], -1)));
-				ruUnfTab(stmtClass, wffT, matrix, ambx, lift(done),
+				ruUnfTab(math, env, congs, stmtClass, wffT, matrix, ambx, lift(done),
 					arrayPush(lift(rest), xFact), ops);
 			}
 			switch (branch(a)) {
@@ -278,4 +286,75 @@ ruUnfDescend(stmtClass : int, wffT : int, form : RuExp, target : RuExp,
 		} else maybeMap(ruUnfDescend(stmtClass, wffT, args[1], target, pf, leaf),
 			\pb -> RuProofStep(s2id("a1i"), [pb], stmt(form)));
 	} else None();
+}
+
+// The LEAF TRANSPORT closure — Mizar's Equate for the completer: transported
+// variants of the literal facts across the leaf's equality literals (both
+// orientations, eqcomd), via the scanned atom congruences. Two rounds, product
+// cap 32 — structural bounds, no search: every product is forced by matching.
+ruUnfLeafTransport(math : RuMath, env : RuEnv, congs : Tree<int, [RuInAtomCong]>,
+	stmtClass : int, wffT : int, amb : RuExp,
+	done : [Pair<RuExp, RuProofTree>]) -> [Pair<RuExp, RuProofTree>] {
+	wceqId = s2id("wceq");
+	wnId = s2id("wn");
+	stmt = \e : RuExp -> RuStmt(stmtClass, [e], -1);
+	imp = \f : RuExp -> ruFwdMkRule(s2id("wi"), wffT, [amb, f]);
+	round = \fs : [Pair<RuExp, RuProofTree>] -> {
+		has = \e : RuExp -> exists(fs, \g -> g.first.nodes == e.nodes);
+		// equality facts, both orientations
+		eqs0 = filtermap(fs, \g ->
+			if (ruInHead(g.first) == wceqId && ruInArity(g.first) == 2
+				&& (ruInArgs(g.first))[0].nodes != (ruInArgs(g.first))[1].nodes)
+				Some(g) else None());
+		eqs = fold(eqs0, eqs0, \acc, e -> {
+			sides = ruInArgs(e.first);
+			fl = ruFwdMkRule(wceqId, wffT, [sides[1], sides[0]]);
+			if (exists(acc, \g -> g.first.nodes == fl.nodes)) acc
+			else arrayPush(acc, Pair(fl,
+				RuProofStep(s2id("eqcomd"), [e.second], stmt(imp(fl)))));
+		});
+		// literal facts as (atom, proof, negated)
+		atoms = filtermap(fs, \g ->
+			if (ruInHead(g.first) == wnId && ruInArity(g.first) == 1)
+				Some(Triple((ruInArgs(g.first))[0], g.second, true))
+			else Some(Triple(g.first, g.second, false)));
+		fold(atoms, fs, \acc, fa -> if (length(acc) - length(fs) >= 32) acc else
+			fold(eqs, acc, \ac, eq -> if (length(ac) - length(fs) >= 32) ac else {
+				sides = ruInArgs(eq.first);
+				fold(lookupTreeDef(congs, ruInHead(fa.first), []), ac, \a, r ->
+					switch (ruMatchExp(fa.first, r.lhs, math, env)) {
+						None(): a;
+						Some(sub0): {
+							va = lookupHashMap(sub0.map, r.va.id);
+							vaIsX = switch (va) {
+								Some(se): se.exp.nodes == sides[0].nodes;
+								None(): false;
+							};
+							if (!vaIsX) a else {
+								m = copyHashMap(sub0.map);
+								setHashMap(m, r.vb.id, RuSubExpr(r.vb, sides[1], ruExpVarIdsHashSet(sides[1])));
+								sub = RuSubst(m);
+								f2exp = ruApplySubst(r.rhs, sub);
+								f2refl = ruInHead(f2exp) == wceqId && ruInArity(f2exp) == 2
+									&& (ruInArgs(f2exp))[0].nodes == (ruInArgs(f2exp))[1].nodes;
+								f2lit = if (fa.third) ruFwdMkRule(wnId, wffT, [f2exp]) else f2exp;
+								if (f2refl || f2exp.nodes == fa.first.nodes
+									|| exists(a, \g -> g.first.nodes == f2lit.nodes)) a
+								else {
+									inst = ruApplySubst(r.prop, sub);   // (X=Y) → (F ↔ F')
+									biExp = (ruInArgs(inst))[1];
+									pInst = RuProofStep(r.lemmaId, [], stmt(inst));
+									pBi = RuProofStep(s2id("syl"), [eq.second, pInst], stmt(imp(biExp)));
+									tree = if (fa.third)
+										RuProofStep(s2id("mtbid"), [fa.second, pBi], stmt(imp(f2lit)))
+									else
+										RuProofStep(s2id("mpbid"), [fa.second, pBi], stmt(imp(f2lit)));
+									arrayPush(a, Pair(f2lit, tree));
+								}
+							}
+						}
+					});
+			}));
+	};
+	round(round(done));
 }
