@@ -48,6 +48,18 @@ setup_sandbox() {
 
 run_article() {   # <article> <off> <tl> [par]   (stage slices via env: DCMS/MZMS/EQMS)
 	local article="$1" off="$2" tl="$3" par="${4:-0}"
+	# PREFLIGHT: the stage slices are wall-clock, so outer CPU load silently
+	# eats theorems (a loaded run reads as a tail of unattempted theorems).
+	# Record the environment INTO the result so every number carries its
+	# context; warn loudly when contention is visible. Warn, never refuse.
+	local loadavg other_java
+	loadavg="$(cut -d' ' -f1 /proc/loadavg)"
+	other_java="$(pgrep -x java | while read -r p; do
+		grep -qE 'flowc_lsp|server=lsp' "/proc/$p/cmdline" 2>/dev/null || echo "$p"; done | wc -l)"
+	echo "PREFLIGHT [$article]: loadavg=$loadavg other-jvm=$other_java"
+	if awk "BEGIN{exit !($loadavg > 2.0)}" || [ "$other_java" -gt 0 ]; then
+		echo "PREFLIGHT WARNING [$article]: contended environment — numbers from this run are NOT quotable as floors"
+	fi
 	setup_sandbox
 	local out
 	out="$(RUSSELL_MATH="$SANDBOX" "$RUSSELL_BIN" no-server=1 mem=16g \
