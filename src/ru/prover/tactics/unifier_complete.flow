@@ -33,6 +33,16 @@ export {
 	ruUnfCompleteTableau(math : RuMath, env : RuEnv, stmtClass : int, wffT : int,
 		plan : RuUnfPlan, basis : [Pair<RuExp, int>],
 		insts : [Pair<RuExp, RuProofTree>], matrix : RuExp) -> Maybe<RuProofTree>;
+
+	// The ∃-ANTECEDENT CHAIN entry: proves the Skolem-discharge obligation
+	// (b1 → (b2 → … → matrix)) — the stripped ∃-bodies as antecedents — by the
+	// same tableau under the ambient ((b1∧…∧bk) ∧ ¬matrix) (its ∧-decomposition
+	// distributes the bodies into facts), then ex-exportation + one Clavius syl
+	// rebuild the exact chain the caller's exlimiv discharge consumes.
+	ruUnfCompleteChain(math : RuMath, env : RuEnv, stmtClass : int, wffT : int,
+		plan : RuUnfPlan, plain : [Pair<RuExp, int>],
+		insts : [Pair<RuExp, RuProofTree>], bodies : [RuExp],
+		matrix : RuExp) -> Maybe<RuProofTree>;
 }
 
 ruUnfCompleteProof(stmtClass : int, wffT : int, plan : RuUnfPlan,
@@ -451,5 +461,64 @@ ruUnfDeepEq(math : RuMath, env : RuEnv, teqs : Tree<int, [RuInAtomCong]>,
 				}
 			}
 		}
+	}
+}
+
+ruUnfCompleteChain(math : RuMath, env : RuEnv, stmtClass : int, wffT : int,
+	plan : RuUnfPlan, plain : [Pair<RuExp, int>],
+	insts : [Pair<RuExp, RuProofTree>], bodies : [RuExp],
+	matrix : RuExp) -> Maybe<RuProofTree> {
+	covered = forall(plan.cases, \c -> switch (c.refutation) {
+		RuUnfByContradiction(__): true;
+		RuUnfByPremise(__, __): true;
+		RuUnfByReflexivity(__, __): true;
+		default: false;
+	});
+	if (!plan.provable || !covered || bodies == []) None()
+	else {
+		wn = \e : RuExp -> ruFwdMkRule(s2id("wn"), wffT, [e]);
+		wi = \a : RuExp, b : RuExp -> ruFwdMkRule(s2id("wi"), wffT, [a, b]);
+		wa = \a : RuExp, b : RuExp -> ruFwdMkRule(s2id("wa"), wffT, [a, b]);
+		stmt = \e : RuExp -> RuStmt(stmtClass, [e], -1);
+		nM = wn(matrix);
+		wb = fold(tail(bodies), bodies[0], wa);
+		amb = wa(wb, nM);
+		ops = ref 0;
+		pending0 = concatA([
+			[Pair(amb, RuProofStep(s2id("id"), [], stmt(wi(amb, amb))))],
+			map(plain, \b -> Pair(b.first,
+				RuProofStep(s2id("a1i"),
+					[RuProofHyp(b.second, stmt(b.first))],
+					stmt(wi(amb, b.first))))),
+			map(insts, \p -> Pair(p.first,
+				RuProofStep(s2id("a1i"), [p.second], stmt(wi(amb, p.first)))))]);
+		switch (ruUnfTab(math, env, ruInAtomCongsCached(math), stmtClass, wffT, matrix, amb, [], pending0, ops)) {
+			None(): None();
+			Some(t): {
+				// ((wb ∧ ¬M) → M) ⇒ ex ⇒ (wb → (¬M → M)) ⇒ Clavius syl ⇒ (wb → M)
+				e1 = RuProofStep(s2id("ex"), [t], stmt(wi(wb, wi(nM, matrix))));
+				pm = RuProofStep(s2id("pm2.18"), [],
+					stmt(wi(wi(nM, matrix), matrix)));
+				clav = RuProofStep(s2id("syl"), [e1, pm], stmt(wi(wb, matrix)));
+				// unfold the left-nested body conjunction into the antecedent chain
+				Some(ruUnfChainUnfold(stmtClass, wffT, clav, wb, matrix));
+			}
+		}
+	}
+}
+
+// ((a∧b) → X) ⇒ ex ⇒ (a → (b → X)), recursing into `a` — turns the left-nested
+// conjunction ((b1∧b2)∧…) into the right-nested chain b1→(b2→(…→X)).
+ruUnfChainUnfold(stmtClass : int, wffT : int, tree : RuProofTree, conj : RuExp,
+	concl : RuExp) -> RuProofTree {
+	waId = s2id("wa");
+	if (ruInHead(conj) != waId || ruInArity(conj) != 2) tree
+	else {
+		args = ruInArgs(conj);
+		wi = \a : RuExp, b : RuExp -> ruFwdMkRule(s2id("wi"), wffT, [a, b]);
+		inner = wi(args[1], concl);
+		t2 = RuProofStep(s2id("ex"), [tree],
+			RuStmt(stmtClass, [wi(args[0], inner)], -1));
+		ruUnfChainUnfold(stmtClass, wffT, t2, args[0], inner);
 	}
 }

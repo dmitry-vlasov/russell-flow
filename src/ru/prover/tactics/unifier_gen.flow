@@ -113,6 +113,36 @@ ruUnfStepProof(math : RuMath, env : RuEnv, stmtClass : int, plan : RuUnfPlan,
 				}
 				RuProofStep(__, __, __): tr;
 			};
+			// the ∃-antecedent DISCHARGE (shared by the glue and the completer's
+			// chain path): rooted0 proves certGoal; exlimiv per binder + ax-mp
+			// against each ∃-hyp leaf, outermost first
+			dischargeF = \rooted0 : RuProofTree, dvsInit : Set<RuDisj> -> {
+				dvsR = ref fold(uinsts, dvsInit, \acc, t -> mergeSets(acc, t.third));
+				discharged = fold(exFacts, Pair(rooted0, certGoal), \cur : Pair<RuProofTree, RuExp>, xf -> {
+					rest = (ruInArgs(cur.second))[1];
+					restVars = fold(rest.nodes, makeSet(), \a, n -> switch (n) {
+						RuVar(id, tp): insertSet(a, RuVar(id, tp));
+						RuRuleNode(__, __): a;
+					});
+					impl = foldi(reverseA(xf.first), Pair(cur.first, xf.second), \bi, ac : Pair<RuProofTree, RuExp>, xv -> {
+						ante = ruFwdMkRule(s2id("wex"), wffT, [RuExp([xv], -1), ac.second]);
+						dvsR := fold(set2array(restVars), ^dvsR, \a, rv ->
+							switch (xv) {
+								RuVar(vid, vtp): insertSet(a, RuDisj(rv, RuVar(vid, vtp)));
+								RuRuleNode(__, __): a;
+							});
+						Pair(RuProofStep(s2id("exlimiv"), [ac.first],
+							RuStmt(stmtClass, [ruFwdMkRule(s2id("wi"), wffT, [ante, rest])], -1)),
+							ante);
+					});
+					Pair(RuProofStep(s2id("ax-mp"), [
+							RuProofHyp(xf.third.second, RuStmt(stmtClass, [xf.third.first], -1)),
+							impl.first],
+						RuStmt(stmtClass, [rest], -1)),
+						rest);
+				});
+				Some(Pair(ruEqzGenWrap(goal, discharged.first, stmtClass), ^dvsR));
+			};
 			// THE COMPLETER (three-layer architecture): fixed fragments from the
 			// plan's recorded reasons — no search. TRANSITIONAL ORDER: the searching
 			// glue still runs FIRST — completer-first was measured to cost slice
@@ -120,26 +150,38 @@ ruUnfStepProof(math : RuMath, env : RuEnv, stmtClass : int, plan : RuUnfPlan,
 			// bigger proof objects tax every step under wall-clock slices); the
 			// completer catches the glue's DECLINES, so coverage only grows at zero
 			// cost. The order flips (and the glue call dies) when the catalog covers
-			// ByPremise + transport ([[planner-executor-architecture]]).
+			// the remaining declines ([[planner-executor-architecture]]).
 			completer = \ -> {
-				cm = if (exFacts != []) None()
-					else {
-						v1 = if (uinsts != []) None()
-							else ruUnfCompleteProof(stmtClass, wffT, plan, basis, matrix);
-						switch (v1) {
-							Some(t): Some(t);
-							None(): ruUnfCompleteTableau(math, env, stmtClass, wffT, plan, basis,
-								map(uinsts, \t -> Pair(t.first, t.second)), matrix);
+				if (exFacts != []) {
+					// ∃-antecedent steps: the chain entry proves certGoal itself
+					switch (ruUnfCompleteChain(math, env, stmtClass, wffT, plan, plain,
+						map(uinsts, \t -> Pair(t.first, t.second)),
+						map(exFacts, \xf -> xf.second), matrix)) {
+						None(): None();
+						Some(ct): {
+							if (env.conf.verbose >= 4) {
+								env.out.println("      unf-completer: hit (∃-chain, glue declined)");
+							} else {};
+							dischargeF(ct, makeSet());
 						}
+					}
+				} else {
+					v1 = if (uinsts != []) None()
+						else ruUnfCompleteProof(stmtClass, wffT, plan, basis, matrix);
+					cm = switch (v1) {
+						Some(t): Some(t);
+						None(): ruUnfCompleteTableau(math, env, stmtClass, wffT, plan, basis,
+							map(uinsts, \t -> Pair(t.first, t.second)), matrix);
 					};
-				switch (cm) {
-					None(): None();
-					Some(ct): {
-						if (env.conf.verbose >= 4) {
-							env.out.println("      unf-completer: hit (glue declined)");
-						} else {};
-						Some(Pair(ruEqzGenWrap(goal, mkRooted(ct), stmtClass),
-							fold(uinsts, makeSet(), \a, t -> mergeSets(a, t.third))));
+					switch (cm) {
+						None(): None();
+						Some(ct): {
+							if (env.conf.verbose >= 4) {
+								env.out.println("      unf-completer: hit (glue declined)");
+							} else {};
+							Some(Pair(ruEqzGenWrap(goal, mkRooted(ct), stmtClass),
+								fold(uinsts, makeSet(), \a, t -> mergeSets(a, t.third))));
+						}
 					}
 				}
 			};
@@ -148,37 +190,7 @@ ruUnfStepProof(math : RuMath, env : RuEnv, stmtClass : int, plan : RuUnfPlan,
 			// the congruence class the DECISION already used)
 			switch (ruHilbertPropProofTimedTop(em, conn, wffT, stmtClass, facts, certGoal, 1000.0, Some(ruInAtomCongsCached(math)))) {
 				None(): completer();
-				Some(cert): {
-					spliced = ruUnfoldSplice(cert.first, 0, factProofs);
-					rooted = mkRooted(spliced);
-					dvs0 = fold(uinsts, cert.second.disjs, \acc, t -> mergeSets(acc, t.third));
-					// discharge the ∃-antecedents, outermost first
-					dvsR = ref dvs0;
-					discharged = fold(exFacts, Pair(rooted, certGoal), \cur : Pair<RuProofTree, RuExp>, xf -> {
-						rest = (ruInArgs(cur.second))[1];
-						restVars = fold(rest.nodes, makeSet(), \a, n -> switch (n) {
-							RuVar(id, tp): insertSet(a, RuVar(id, tp));
-							RuRuleNode(__, __): a;
-						});
-						impl = foldi(reverseA(xf.first), Pair(cur.first, xf.second), \bi, ac : Pair<RuProofTree, RuExp>, xv -> {
-							ante = ruFwdMkRule(s2id("wex"), wffT, [RuExp([xv], -1), ac.second]);
-							dvsR := fold(set2array(restVars), ^dvsR, \a, rv ->
-								switch (xv) {
-									RuVar(vid, vtp): insertSet(a, RuDisj(rv, RuVar(vid, vtp)));
-									RuRuleNode(__, __): a;
-								});
-							Pair(RuProofStep(s2id("exlimiv"), [ac.first],
-								RuStmt(stmtClass, [ruFwdMkRule(s2id("wi"), wffT, [ante, rest])], -1)),
-								ante);
-						});
-						Pair(RuProofStep(s2id("ax-mp"), [
-								RuProofHyp(xf.third.second, RuStmt(stmtClass, [xf.third.first], -1)),
-								impl.first],
-							RuStmt(stmtClass, [rest], -1)),
-							rest);
-					});
-					Some(Pair(ruEqzGenWrap(goal, discharged.first, stmtClass), ^dvsR));
-				}
+				Some(cert): dischargeF(mkRooted(ruUnfoldSplice(cert.first, 0, factProofs)), cert.second.disjs);
 			}
 		}
 	}
