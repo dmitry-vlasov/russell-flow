@@ -47,7 +47,7 @@ export {
 		splitBudget : ref int, globalSplits : ref int, disjs : ref Set<RuDisj>, freshVars : ref [RuVar], em : RuEnvMath,
 		timer : RuTimer, fo : Maybe<Tree<int, [RuInAtomCong]>>, inClash : ref bool,
 		exElims : ref int, exSeen : ref Set<string>, exElimsGlobal : ref int, exNoMatch : ref Set<string>,
-		topFo : bool);
+		topFo : bool, setPool : Tree<string, RuProofTree>);
 	// `wff` (the wff type id) and `stmtClass` (the |- turnstile id) MUST come from the loaded math — derive
 	// them from a real expression (ruIdType2Type of a connective node / the prop's class), never from the
 	// memoized ruIdWff/ruIdTurnstile helpers (they cache -1 if interned before the library loads).
@@ -95,7 +95,8 @@ ruHilbertPropProofTimed0(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtC
 	atomNodes = fold(hyps, ruPAtomNodes(conn, goal), \acc, h -> mergeTree(acc, ruPAtomNodes(conn, h)));
 	hypForms  = map(hyps, \h -> ruPAtomize(conn, h));
 	goalForm  = ruPAtomize(conn, goal);
-	ctx = RuHCtx(ruHCtx(em, wff, stmtClass, atomNodes) with timer = ruMakeLimitedTimer(limit_ms), fo = fo, topFo = topFo);
+	ctx = RuHCtx(ruHCtx(em, wff, stmtClass, atomNodes) with timer = ruMakeLimitedTimer(limit_ms), fo = fo, topFo = topFo,
+		setPool = ruSetnessPoolOf(mapi(hyps, \i, h -> Pair(h, i)), stmtClass));
 	// NB a split-budget lift for plan-backed (topFo) calls was TRIED AND MEASURED
 	// OUT (2026-07-24): although no or-split picks a refutable-branch wrong, the
 	// DFS still wanders 64-deep into SHAPE-GAP subtrees (e.g. iff-congruence over
@@ -151,7 +152,8 @@ ruHFormShape(f : RuPForm) -> string {
 
 ruHCtx(em : RuEnvMath, wff : int, stmtClass : int, atomNodes : Tree<string, [RuExpNode]>) -> RuHCtx {
 	RuHCtx(ruPConnectives(), wff, stmtClass, ref atomNodes, ref 6, ref 400, ref makeSet(), ref [], em,
-		ruMakeLimitedTimer(60000.0), None(), ref false, ref 3, ref makeSet(), ref 16, ref makeSet(), false);
+		ruMakeLimitedTimer(60000.0), None(), ref false, ref 3, ref makeSet(), ref 16, ref makeSet(), false,
+		makeTree());
 }
 
 // ---- RuPForm -> RuExp / RuStmt (own copy; mirrors the kalmar pattern, no kalmar dependency) ----
@@ -266,21 +268,38 @@ ruHRegAtom(ctx : RuHCtx, ex : RuExp) -> RuPForm {                   // register 
 	ctx.atomNodes := mergeTree(^(ctx.atomNodes), ruPAtomNodes(ctx.conn, ex));
 	ruPAtomize(ctx.conn, ex);
 }
-// element `e` (class) ∈ a COMPOUND `set` → (unfolded RHS form, el-lemma name). None for a base set.
-ruHMembUnfold(ctx : RuHCtx, e : RuExp, set : RuExp) -> Maybe<Pair<RuPForm, string>> {
+// element `e` (class) ∈ a COMPOUND `set` → (unfolded RHS form, el-lemma name, the
+// lemma's extra hyp-proof children — the G-form setness antecedent). None for a base set.
+ruHMembUnfold(ctx : RuHCtx, e : RuExp, set : RuExp) -> Maybe<Triple<RuPForm, string, [RuProofTree]>> {
 	h = ruEqHead(set);
 	memb = \x -> ruHRegAtom(ctx, ruHMkExp(ruHwcel(), ctx.wff, [e, x]));
-	if (h == s2id_("cun"))       { a = ruEqArgs(set); Some(Pair(RuPOr(memb(a.first), memb(a.second)), "elun")); }
-	else if (h == s2id_("cin"))  { a = ruEqArgs(set); Some(Pair(RuPAnd(memb(a.first), memb(a.second)), "elin")); }
-	else if (h == s2id_("cdif")) { a = ruEqArgs(set); Some(Pair(RuPAnd(memb(a.first), RuPNot(memb(a.second))), "eldif")); }
-	// velpw/velsn carry a SETVAR element locus — legal ONLY for a plain (coerced)
-	// setvar element. A CLASS-metavar or compound element (class-loci articles)
-	// must DECLINE: the substitution could never verify (the G-form lemmas with a
-	// setness antecedent are the follow-up route). elun/elin/eldif are class-general.
-	else if (h == s2id_("cpw") && ruHPlainSetvar(e))
-		Some(Pair(ruHRegAtom(ctx, ruHMkExp(ruHwss(), ctx.wff, [e, ruHUnaryArg(set)])), "velpw"))   // e⊆A
-	else if (h == s2id_("csn") && ruHPlainSetvar(e))
-		Some(Pair(ruHRegAtom(ctx, ruHMkExp(ruHwceq(), ctx.wff, [e, ruHUnaryArg(set)])), "velsn"))  // e=A
+	// velpw/velsn carry a SETVAR element locus — legal only for a plain (coerced)
+	// setvar element; a CLASS-metavar or compound element (class-loci articles) uses
+	// the HYP-CARRYING twin (elpw/elsn: A ∈ _V ⊢ bicond) with the setness discharged
+	// from the certificate's own setness facts (the pool) or the mechanical registry.
+	// elun/elin/eldif are class-general and need no setness.
+	setnessOf = \ -> if (ruHPlainSetvar(e)) None()
+		else ruSetnessProofPool(ruSetnessRegistry(ctx.em.math), ctx.setPool, e,
+			ctx.stmtClass, ctx.em.math, ctx.em.env, 8);
+	if (h == s2id_("cun"))       { a = ruEqArgs(set); Some(Triple(RuPOr(memb(a.first), memb(a.second)), "elun", [])); }
+	else if (h == s2id_("cin"))  { a = ruEqArgs(set); Some(Triple(RuPAnd(memb(a.first), memb(a.second)), "elin", [])); }
+	else if (h == s2id_("cdif")) { a = ruEqArgs(set); Some(Triple(RuPAnd(memb(a.first), RuPNot(memb(a.second))), "eldif", [])); }
+	else if (h == s2id_("cpw")) {
+		if (ruHPlainSetvar(e))
+			Some(Triple(ruHRegAtom(ctx, ruHMkExp(ruHwss(), ctx.wff, [e, ruHUnaryArg(set)])), "velpw", []))   // e⊆A
+		else switch (setnessOf()) {
+			Some(sp): Some(Triple(ruHRegAtom(ctx, ruHMkExp(ruHwss(), ctx.wff, [e, ruHUnaryArg(set)])), "elpw", [sp]));
+			None(): None();
+		}
+	}
+	else if (h == s2id_("csn")) {
+		if (ruHPlainSetvar(e))
+			Some(Triple(ruHRegAtom(ctx, ruHMkExp(ruHwceq(), ctx.wff, [e, ruHUnaryArg(set)])), "velsn", []))  // e=A
+		else switch (setnessOf()) {
+			Some(sp): Some(Triple(ruHRegAtom(ctx, ruHMkExp(ruHwceq(), ctx.wff, [e, ruHUnaryArg(set)])), "elsn", [sp]));
+			None(): None();
+		}
+	}
 	else None();
 }
 // a plain (coerced) setvar element: [cv, x] — a 1-ary class-typed head over a setvar var
@@ -296,8 +315,8 @@ ruHPlainSetvar(e : RuExp) -> bool {
 	};
 }
 // from a fact `e∈S` derive its unfold RHS via the el-lemma iff (mpbi bare / sylib in deduction form).
-ruHMembFact(ctx : RuHCtx, amb : Maybe<RuPForm>, f : RuHF, key : string, rhs : RuPForm, lemma : string) -> RuHF {
-	iff = ruHStep(ctx, lemma, [], RuPIff(RuPAtom(key), rhs));
+ruHMembFact(ctx : RuHCtx, amb : Maybe<RuPForm>, f : RuHF, key : string, rhs : RuPForm, lemma : string, lemmaKids : [RuProofTree]) -> RuHF {
+	iff = ruHStep(ctx, lemma, lemmaKids, RuPIff(RuPAtom(key), rhs));
 	switch (amb) {
 		None():  RuHF(rhs, ruHStep(ctx, "mpbi", [f.tree, iff], rhs));
 		Some(w): RuHF(rhs, ruHStep(ctx, "sylib", [f.tree, iff], RuPImp(w, rhs)));
@@ -309,10 +328,10 @@ ruHMembFact(ctx : RuHCtx, amb : Maybe<RuPForm>, f : RuHF, key : string, rhs : Ru
 // unrelated searches (t48 flipped when it joined the saturation).
 //   ¬(v∈X) --sylnib/mtbi across the unfold bicond--> ¬(a∧b)
 //   --mpbir/sylibr across imnan--> (a→¬b) --ax-mp/mpd with a--> ¬b   (symmetrically for b)
-ruHMembNegResolve(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], f : RuHF, key : string, rhs : RuPForm, lemma : string) -> [RuHF] {
+ruHMembNegResolve(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], f : RuHF, key : string, rhs : RuPForm, lemma : string, lemmaKids : [RuProofTree]) -> [RuHF] {
 	switch (rhs) {
 		RuPAnd(a, b): {
-			iff = ruHStep(ctx, lemma, [], RuPIff(RuPAtom(key), rhs));
+			iff = ruHStep(ctx, lemma, lemmaKids, RuPIff(RuPAtom(key), rhs));
 			nAnd = switch (amb) {
 				None():  ruHStep(ctx, "mtbi", [f.tree, iff], RuPNot(rhs));
 				Some(w): ruHStep(ctx, "sylnib", [f.tree, iff], RuPImp(w, RuPNot(rhs)));
@@ -346,7 +365,7 @@ ruHMembGoal(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], key : string, fu
 	switch (ruHMembUnfold(ctx, args.first, args.second)) {
 		None(): None();
 		Some(p): maybeMap(ruHProve(ctx, amb, facts, p.first, fuel - 1), \sub -> {
-			iff = ruHStep(ctx, p.second, [], RuPIff(RuPAtom(key), p.first));
+			iff = ruHStep(ctx, p.second, p.third, RuPIff(RuPAtom(key), p.first));
 			switch (amb) {
 				None():  RuHF(RuPAtom(key), ruHStep(ctx, "mpbir", [sub.tree, iff], RuPAtom(key)));
 				Some(w): RuHF(RuPAtom(key), ruHStep(ctx, "sylibr", [sub.tree, iff], RuPImp(w, RuPAtom(key))));
@@ -659,7 +678,7 @@ ruHForward(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF]) -> [RuHF] {
 					if (ruEqHead(ea) != ruHwcel()) [] else {
 						ar = ruEqArgs(ea);
 						switch (ruHMembUnfold(ctx, ar.first, ar.second)) {
-							Some(p): ruHMembNegResolve(ctx, amb, facts, f, k, p.first, p.second);
+							Some(p): ruHMembNegResolve(ctx, amb, facts, f, k, p.first, p.second, p.third);
 							None(): [];
 						}
 					}
@@ -671,7 +690,7 @@ ruHForward(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF]) -> [RuHF] {
 				refl = h == ruHwceq() && { s = ruEqArgs(ea); s.first.nodes == s.second.nodes; };
 				if (h == ruHwss() && witnesses != []) ruHRelInst(ctx, amb, f, k, witnesses)
 					else if (h == ruHwceq() && !refl && witnesses != []) ruHEqInst(ctx, amb, f, k, witnesses)
-				else if (h == ruHwcel()) { ar = ruEqArgs(ea); if (ruEqHead(ar.second) == s2id_("c0")) [ruHNoel(ctx, amb, k)] else switch (ruHMembUnfold(ctx, ar.first, ar.second)) { Some(p): [ruHMembFact(ctx, amb, f, k, p.first, p.second)]; None(): []; }; }
+				else if (h == ruHwcel()) { ar = ruEqArgs(ea); if (ruEqHead(ar.second) == s2id_("c0")) [ruHNoel(ctx, amb, k)] else switch (ruHMembUnfold(ctx, ar.first, ar.second)) { Some(p): [ruHMembFact(ctx, amb, f, k, p.first, p.second, p.third)]; None(): []; }; }
 				else [];
 			};
 			default: [];
@@ -739,7 +758,7 @@ ruHCheapMemb(ctx : RuHCtx, amb : Maybe<RuPForm>, facts : [RuHF], key : string) -
 		switch (ruHMembUnfold(ctx, args.first, args.second)) {
 			None(): None();
 			Some(p): maybeMap(ruHCheapProve(ctx, amb, facts, p.first), \sub -> {
-				iff = ruHStep(ctx, p.second, [], RuPIff(RuPAtom(key), p.first));
+				iff = ruHStep(ctx, p.second, p.third, RuPIff(RuPAtom(key), p.first));
 				switch (amb) {
 					None():  RuHF(RuPAtom(key), ruHStep(ctx, "mpbir", [sub.tree, iff], RuPAtom(key)));
 					Some(w): RuHF(RuPAtom(key), ruHStep(ctx, "sylibr", [sub.tree, iff], RuPImp(w, RuPAtom(key))));

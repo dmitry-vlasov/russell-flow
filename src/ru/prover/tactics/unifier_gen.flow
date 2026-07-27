@@ -205,6 +205,40 @@ ruUnfStepProof(math : RuMath, env : RuEnv, stmtClass : int, plan : RuUnfPlan,
 	}
 }
 
+// Discharge a σ-instantiated FOLDED hyp from the basis: exact fact; ∧-intro from
+// recursively discharged conjuncts (pm3.2i — the decision's DNF is conjunct-order-
+// free, the fact list is not); or extraction from a conjunctive basis fact
+// (simpli/simpri). Depth-bounded; None = the instance declines (verify-first).
+ruUnfDischargeHyp(basis : [Pair<RuExp, int>], stmtClass : int, he : RuExp, fuel : int) -> Maybe<RuProofTree> {
+	hn = he.nodes;
+	waId = s2id("wa");
+	switch (find(basis, \b -> b.first.nodes == hn)) {
+		Some(b): Some(RuProofHyp(b.second, RuStmt(stmtClass, [b.first], -1)));
+		None(): if (fuel <= 0) None() else {
+			extr = fold(basis, None(), \acc : Maybe<RuProofTree>, b ->
+				if (isSome(acc) || ruInHead(b.first) != waId || ruInArity(b.first) != 2) acc
+				else {
+					args = ruInArgs(b.first);
+					bh = RuProofHyp(b.second, RuStmt(stmtClass, [b.first], -1));
+					if ((args[0]).nodes == hn)
+						Some(RuProofStep(s2id("simpli"), [bh], RuStmt(stmtClass, [he], -1)))
+					else if ((args[1]).nodes == hn)
+						Some(RuProofStep(s2id("simpri"), [bh], RuStmt(stmtClass, [he], -1)))
+					else None();
+				});
+			switch (extr) {
+				Some(__): extr;
+				None(): if (ruInHead(he) == waId && ruInArity(he) == 2) {
+					args = ruInArgs(he);
+					maybeBind(ruUnfDischargeHyp(basis, stmtClass, args[0], fuel - 1), \pa ->
+						maybeMap(ruUnfDischargeHyp(basis, stmtClass, args[1], fuel - 1), \pb ->
+							RuProofStep(s2id("pm3.2i"), [pa, pb], RuStmt(stmtClass, [he], -1))));
+				} else None();
+			}
+		}
+	}
+}
+
 // strip the leading ∃-binders: ([binder var NODES, outermost first], the body)
 ruUnfStripExes(e : RuExp) -> Pair<[RuExpNode], RuExp> {
 	if (ruInHead(e) == s2id("wex") && ruInArity(e) == 2) {
@@ -308,10 +342,13 @@ ruUnfPremInstance(math : RuMath, env : RuEnv, stmtClass : int, assId : int,
 						Some(instNodes): {
 							inst0 = RuExp(instNodes, -1);
 							reg = ruSetnessRegistry(math);
-							// a SETNESS hyp discharges mechanically; a FOLDED real hyp
-							// discharges from an EXACTLY matching basis fact (the plan
-							// forced it true against the basis; a modulo-class residue
-							// declines the instance — verify-first keeps declines safe)
+							spool = ruSetnessPoolOf(basis, stmtClass);
+							// a SETNESS hyp discharges mechanically (pool = the theorem's
+							// own `v ∈ _V` hyps); a FOLDED real hyp discharges from the
+							// basis: exact fact, ∧-recomposition (pm3.2i — the plan's DNF
+							// is conjunct-order-free but facts are not: the t119 s5 swap),
+							// or ∧-extraction (simpli/simpri); a modulo-class residue
+							// declines the instance — verify-first keeps declines safe
 							hypProofs = fold(inf.hyps, Some([]), \hacc : Maybe<[RuProofTree]>, hyp ->
 								maybeBind(hacc, \harr ->
 									if (hyp.stmt.exps == []) None()
@@ -320,14 +357,11 @@ ruUnfPremInstance(math : RuMath, env : RuEnv, stmtClass : int, assId : int,
 										Some(hn): {
 											he = RuExp(hn, -1);
 											setnessM = if (ruInHead(he) != s2id("wcel")) None()
-												else ruSetnessProof2(reg, (ruInArgs(he))[0], stmtClass, math, env);
+												else ruSetnessProofPool(reg, spool, (ruInArgs(he))[0], stmtClass, math, env, 8);
 											switch (setnessM) {
 												Some(p): Some(arrayPush(harr, p));
-												None(): switch (find(basis, \b -> b.first.nodes == hn)) {
-													Some(b): Some(arrayPush(harr,
-														RuProofHyp(b.second, RuStmt(stmtClass, [b.first], -1))));
-													None(): None();
-												}
+												None(): maybeMap(ruUnfDischargeHyp(basis, stmtClass, he, 3),
+													\p -> arrayPush(harr, p));
 											}
 										}
 									}));
@@ -341,7 +375,7 @@ ruUnfPremInstance(math : RuMath, env : RuEnv, stmtClass : int, assId : int,
 									None(): Pair(ac.first, false);
 									Some(t): Pair(arrayPush(ac.first, Some(t)), true);
 								}).first;
-							maybeBind(hypProofs, \hp -> ruUnfInstChain(math, env, stmtClass,
+							maybeBind(hypProofs, \hp -> ruUnfInstChain(math, env, stmtClass, spool,
 								Triple(inst0, RuProofStep(assId, hp, RuStmt(stmtClass, [inst0], -1)),
 									makeSet()), acts));
 						}
@@ -353,13 +387,14 @@ ruUnfPremInstance(math : RuMath, env : RuEnv, stmtClass : int, assId : int,
 	}
 	switch (lookupTree(stepPrems, assId)) {
 		// a prior-step ∀-fact: no renaming machinery — instantiate what instTerm can
-		Some(__): maybeBind(baseM, \base -> ruUnfInstChainBind(math, env, stmtClass, base, bind));
+		Some(__): maybeBind(baseM, \base -> ruUnfInstChainBind(math, env, stmtClass,
+			ruSetnessPoolOf(basis, stmtClass), base, bind));
 		None(): baseM;
 	}
 }
 
 // strip chain over a prior-step ∀-fact: consult the bind per leading binder
-ruUnfInstChainBind(math : RuMath, env : RuEnv, stmtClass : int,
+ruUnfInstChainBind(math : RuMath, env : RuEnv, stmtClass : int, spool : Tree<string, RuProofTree>,
 	cur : Triple<RuExp, RuProofTree, Set<RuDisj>>,
 	bind : Tree<int, RuExp>) -> Maybe<Triple<RuExp, RuProofTree, Set<RuDisj>>> {
 	e = cur.first;
@@ -370,9 +405,9 @@ ruUnfInstChainBind(math : RuMath, env : RuEnv, stmtClass : int,
 		if (v < 0) Some(cur)
 		else switch (lookupTree(bind, v)) {
 			None(): Some(cur);
-			Some(t): switch (ruInForallInstTerm(math, env, stmtClass, e, t)) {
+			Some(t): switch (ruInForallInstTermH(math, env, stmtClass, e, t, spool)) {
 				None(): None();
-				Some(it): ruUnfInstChainBind(math, env, stmtClass,
+				Some(it): ruUnfInstChainBind(math, env, stmtClass, spool,
 					Triple(it.first,
 						RuProofStep(s2id("ax-mp"), [cur.second, it.second],
 							RuStmt(stmtClass, [it.first], -1)),
@@ -394,7 +429,7 @@ ruUnfBinders(e : RuExp) -> [int] {
 
 // strip chain by explicit plan: None = sp-strip a RENAMED binder (the target is
 // already in place from the simultaneous application), Some(t) = instTerm at t
-ruUnfInstChain(math : RuMath, env : RuEnv, stmtClass : int,
+ruUnfInstChain(math : RuMath, env : RuEnv, stmtClass : int, spool : Tree<string, RuProofTree>,
 	cur : Triple<RuExp, RuProofTree, Set<RuDisj>>,
 	acts : [Maybe<RuExp>]) -> Maybe<Triple<RuExp, RuProofTree, Set<RuDisj>>> {
 	e = cur.first;
@@ -405,7 +440,7 @@ ruUnfInstChain(math : RuMath, env : RuEnv, stmtClass : int,
 		switch (acts[0]) {
 			None(): {
 				impl = ruFwdMkRule(s2id("wi"), wffT, [e, rest]);
-				ruUnfInstChain(math, env, stmtClass,
+				ruUnfInstChain(math, env, stmtClass, spool,
 					Triple(rest,
 						RuProofStep(s2id("ax-mp"), [cur.second,
 							RuProofStep(s2id("sp"), [], RuStmt(stmtClass, [impl], -1))],
@@ -413,9 +448,9 @@ ruUnfInstChain(math : RuMath, env : RuEnv, stmtClass : int,
 						cur.third),
 					tail(acts));
 			}
-			Some(t): switch (ruInForallInstTerm(math, env, stmtClass, e, t)) {
+			Some(t): switch (ruInForallInstTermH(math, env, stmtClass, e, t, spool)) {
 				None(): None();
-				Some(it): ruUnfInstChain(math, env, stmtClass,
+				Some(it): ruUnfInstChain(math, env, stmtClass, spool,
 					Triple(it.first,
 						RuProofStep(s2id("ax-mp"), [cur.second, it.second],
 							RuStmt(stmtClass, [it.first], -1)),

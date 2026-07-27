@@ -85,14 +85,39 @@ export {
 	// depth-parameterized form: deep nested witnesses (10-element enum composites)
 	// overrun the default 8
 	ruSetnessProofDeep(reg : Tree<int, [RuSetLemma]>, t : RuExp, stmtClass : int, math : RuMath, env : RuEnv, depth : int) -> Maybe<RuProofTree>;
+
+	// SETNESS FROM HYPS (the class-loci campaign's A2): a pool of ALREADY-PROVED
+	// setness facts — the theorem's own `v ∈ _V` hyps as leaf proofs — consulted
+	// as a BASE CASE of the recursive prover. A bare class metavar has no
+	// registry lemma (vex is setvar-only); its setness lives ONLY in the pool,
+	// and compounds over metavars ({v} ∈ _V) close by snex-recursion INTO it.
+	ruSetnessPoolOf(basis : [Pair<RuExp, int>], stmtClass : int) -> Tree<string, RuProofTree>;
+	ruSetnessProofPool(reg : Tree<int, [RuSetLemma]>, pool : Tree<string, RuProofTree>,
+		t : RuExp, stmtClass : int, math : RuMath, env : RuEnv, depth : int) -> Maybe<RuProofTree>;
 }
 
 ruSetnessProof2(reg : Tree<int, [RuSetLemma]>, t : RuExp, stmtClass : int, math : RuMath, env : RuEnv) -> Maybe<RuProofTree> {
-	ruSetnessProof(reg, t, s2id("wcel"), s2id("cvv"), stmtClass, math, env, 8);
+	ruSetnessProof(reg, makeTree(), t, s2id("wcel"), s2id("cvv"), stmtClass, math, env, 8);
 }
 
 ruSetnessProofDeep(reg : Tree<int, [RuSetLemma]>, t : RuExp, stmtClass : int, math : RuMath, env : RuEnv, depth : int) -> Maybe<RuProofTree> {
-	ruSetnessProof(reg, t, s2id("wcel"), s2id("cvv"), stmtClass, math, env, depth);
+	ruSetnessProof(reg, makeTree(), t, s2id("wcel"), s2id("cvv"), stmtClass, math, env, depth);
+}
+
+ruSetnessProofPool(reg : Tree<int, [RuSetLemma]>, pool : Tree<string, RuProofTree>,
+	t : RuExp, stmtClass : int, math : RuMath, env : RuEnv, depth : int) -> Maybe<RuProofTree> {
+	ruSetnessProof(reg, pool, t, s2id("wcel"), s2id("cvv"), stmtClass, math, env, depth);
+}
+
+// basis facts shaped `T ∈ _V` keyed by T's structural key, as hyp-leaf proofs
+ruSetnessPoolOf(basis : [Pair<RuExp, int>], stmtClass : int) -> Tree<string, RuProofTree> {
+	wcelId = s2id("wcel");
+	cvvId = s2id("cvv");
+	fold(basis, makeTree(), \acc, b -> switch (ruUSetnessHyp(b.first, wcelId, cvvId)) {
+		None(): acc;
+		Some(term): setTree(acc, ruUKey(term),
+			RuProofHyp(b.second, RuStmt(stmtClass, [b.first], -1)));
+	});
 }
 
 // ---- subtree span (flat prefix array, by arity) ----------------------------
@@ -176,31 +201,37 @@ ruSetnessRegistryUncached(math : RuMath) -> Tree<int, [RuSetLemma]> {
 	});
 }
 
-// Prove `t ∈ _V` for a concrete term t, recursively: match t against a registered setness
-// lemma, then discharge that lemma's own setness hypotheses the same way. Fuel-bounded (the
-// recursion descends into subterms, so the term size bounds it anyway).
-ruSetnessProof(reg : Tree<int, [RuSetLemma]>, t : RuExp, wcelId : int, cvvId : int,
+// Prove `t ∈ _V` for a concrete term t, recursively: a POOL fact (the theorem's own
+// setness hyps — the only setness source for a bare class metavar) closes directly;
+// else match t against a registered setness lemma and discharge that lemma's own
+// setness hypotheses the same way. Fuel-bounded (the recursion descends into
+// subterms, so the term size bounds it anyway).
+ruSetnessProof(reg : Tree<int, [RuSetLemma]>, pool : Tree<string, RuProofTree>,
+	t : RuExp, wcelId : int, cvvId : int,
 	stmtClass : int, math : RuMath, env : RuEnv, fuel : int) -> Maybe<RuProofTree> {
 	if (fuel <= 0) None() else {
-		fold(lookupTreeDef(reg, ruUNodeId(t.nodes[0]), []), None(), \acc, sl -> switch (acc) {
-			Some(__): acc;
-			None(): switch (ruMatchExp(t, sl.term, math, env)) {
-				None(): None();
-				Some(sub): {
-					// the lemma's own prop, instantiated — never hand-build the node array
-					goal = ruApplySubst(sl.prop, sub);
-					hypProofs = filtermap(sl.hyps, \h -> {
-						hi = ruApplySubst(h, sub);
-						switch (ruUSetnessHyp(hi, wcelId, cvvId)) {
-							None(): None();
-							Some(ht): ruSetnessProof(reg, ht, wcelId, cvvId, stmtClass, math, env, fuel - 1);
-						}
-					});
-					if (length(hypProofs) != length(sl.hyps)) None()
-					else Some(RuProofStep(sl.lemmaId, hypProofs, RuStmt(stmtClass, [goal], -1)));
+		switch (lookupTree(pool, ruUKey(t))) {
+			Some(p): Some(p);
+			None(): fold(lookupTreeDef(reg, ruUNodeId(t.nodes[0]), []), None(), \acc, sl -> switch (acc) {
+				Some(__): acc;
+				None(): switch (ruMatchExp(t, sl.term, math, env)) {
+					None(): None();
+					Some(sub): {
+						// the lemma's own prop, instantiated — never hand-build the node array
+						goal = ruApplySubst(sl.prop, sub);
+						hypProofs = filtermap(sl.hyps, \h -> {
+							hi = ruApplySubst(h, sub);
+							switch (ruUSetnessHyp(hi, wcelId, cvvId)) {
+								None(): None();
+								Some(ht): ruSetnessProof(reg, pool, ht, wcelId, cvvId, stmtClass, math, env, fuel - 1);
+							}
+						});
+						if (length(hypProofs) != length(sl.hyps)) None()
+						else Some(RuProofStep(sl.lemmaId, hypProofs, RuStmt(stmtClass, [goal], -1)));
+					}
 				}
-			}
-		});
+			});
+		}
 	}
 }
 
@@ -567,7 +598,7 @@ ruUnfoldAtom(registry : Tree<int, [RuMembLemma]>, setReg : Tree<int, [RuSetLemma
 					hi = ruApplySubst(h, sub);
 					switch (ruUSetnessHyp(hi, wcelId, cvvId)) {
 						None(): None();
-						Some(ht): ruSetnessProof(setReg, ht, wcelId, cvvId, stmtClass, math, env, 8);
+						Some(ht): ruSetnessProof(setReg, makeTree(), ht, wcelId, cvvId, stmtClass, math, env, 8);
 					}
 				});
 				if (length(hypProofs) != length(ml.hyps)) None()
