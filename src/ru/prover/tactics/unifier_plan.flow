@@ -56,7 +56,7 @@ export {
 	RuUnfCase(lits : [RuUnfLit], refutation : RuUnfRefutation);
 
 	// How one disjunct was refuted — the generator's replay currency.
-	RuUnfRefutation ::= RuUnfByContradiction, RuUnfByReflexivity, RuUnfByAtomClash, RuUnfByPremise;
+	RuUnfRefutation ::= RuUnfByContradiction, RuUnfByReflexivity, RuUnfByAtomClash, RuUnfByPremise, RuUnfByPair;
 		// complementary literal pair, syntactic (PreCheck-trivial)
 		RuUnfByContradiction(lit : RuExp);
 		// ¬(l = r) with l ~ r in the closure (Contr 19)
@@ -66,6 +66,13 @@ export {
 		// an instance of universal premise assId is false against the basis (Contr 45):
 		// bind maps the premise's matrix vars to eq-class REPRESENTATIVE terms
 		RuUnfByPremise(assId : int, bind : Tree<int, RuExp>);
+		// a PAIR of premise instances is jointly false (Contr 47, resolution-lite):
+		// the two instances contain a complementary literal pair that unifies, and
+		// every remaining literal is forced against the basis. May pair a premise
+		// WITH ITSELF (two instances). Replay = both σP instances as facts — the
+		// complementary pair clashes syntactically after instantiation.
+		RuUnfByPair(assId1 : int, bind1 : Tree<int, RuExp>,
+			assId2 : int, bind2 : Tree<int, RuExp>);
 
 	// A signed ground literal of a disjunct.
 	RuUnfLit(pos : bool, atom : RuExp);
@@ -81,6 +88,9 @@ export {
 	// Every ∀-closed 0-hyp non-equality assertion PRECEDING the theorem (the
 	// reachability law). The caller narrows by the by-list (the probe does).
 	ruUnfScopePremises(math : RuMath, env : RuEnv, thInfo : RuDeclInfo) -> [RuUnfPremise];
+
+	// pair-loop diagnostics: (entries, unified candidate pairs, refutations)
+	ruUnfPairStats : ref Triple<int, int, int>;
 
 	// Decide `goal` (a possibly ∀-closed wff) from the hyps + universal premises.
 	ruUnfPlanDecide(math : RuMath, env : RuEnv, stmtClass : int,
@@ -453,9 +463,9 @@ ruUnfRefuteDisjunct(math : RuMath, env : RuEnv, stmtClass : int, prems : [RuUnfP
 							else ac));
 					switch (clash) {
 						Some(__): clash;
-						None():
+						None(): {
 							// Contr 45: one universal premise clashes
-							fold(prems, None(), \acc, p ->
+							c45 = fold(prems, None(), \acc, p ->
 								if (isSome(acc) || ruTimeIsOver(timer)) acc
 								else switch (ruUnfVerifyPremise(b, p, maxClauses)) {
 									None(): acc;
@@ -475,6 +485,14 @@ ruUnfRefuteDisjunct(math : RuMath, env : RuEnv, stmtClass : int, prems : [RuUnfP
 										else acc;
 									}
 								});
+							switch (c45) {
+								Some(__): c45;
+								None():
+									// Contr 47: a PAIR of premises clashes jointly
+									// (resolution-lite; Mizar's UNIVPair loop)
+									ruUnfPairs(math, env, b, prems, maxClauses, timer);
+							}
+						}
 					}
 				}
 			}
@@ -594,5 +612,145 @@ ruUnfBindTyped(math : RuMath, env : RuEnv, p : RuUnfPremise, bt : Tree<int, RuEx
 						|| plainVar(t.nodes)));
 			}
 		}
+	}
+}
+
+// ---- Contr 47: premise pairs (unifier.pas Unification's UNIVPair loop) ------
+
+// The var-id offset distinguishing the SECOND copy's variables (a premise may
+// pair with itself — two independent instances).
+ruUnfPairOffset = 1073741824;
+
+// diagnostics: pair-loop entries / candidate pairs unified / refutations found
+ruUnfPairStats : ref Triple<int, int, int> = ref Triple(0, 0, 0);
+
+// Bilateral structural unification modulo eq-classes: like ruUnfMatchModC but
+// with pattern vars on BOTH sides — at a class boundary the two sides must
+// denote ONE common class (enumerated; var-var pairs unify through it).
+ruUnfUnifyModC(b : RuUnfBasis, pat1 : [RuExpNode], patVars : Set<int>,
+	pat2 : [RuExpNode]) -> [Tree<int, string>] {
+	if (length(pat1) == 0 || length(pat2) == 0) []
+	else if (ruUnfIsClassNode(pat1[0], b.classTp) && ruUnfIsClassNode(pat2[0], b.classTp))
+		foldTree(b.members, [], \classKey, __, acc ->
+			ruUnfUnion(acc,
+				ruUnfJoin(
+					ruUnfMatchClass(b, pat1, patVars, classKey),
+					ruUnfMatchClass(b, pat2, patVars, classKey),
+					b.maxSubsts, b.ovfl),
+				b.maxSubsts, b.ovfl))
+	else {
+		switch (pat1[0]) {
+			RuVar(__, __):
+				// non-class (binder-slot) positions: identical nodes only in v1
+				if (length(pat1) == 1 && length(pat2) == 1 && ruEqzSameNode(pat1[0], pat2[0]))
+					ruUnfTop() else [];
+			RuRuleNode(__, __): {
+				if (!ruEqzSameNode(pat1[0], pat2[0])) []
+				else {
+					args1 = ruInArgs(RuExp(pat1, -1));
+					args2 = ruInArgs(RuExp(pat2, -1));
+					if (length(args1) != length(args2)) []
+					else foldi(args1, ruUnfTop(), \i, ac, a1 ->
+						if (ac == []) ac
+						else ruUnfJoin(ac, ruUnfUnifyModC(b, a1.nodes, patVars, args2[i].nodes),
+							b.maxSubsts, b.ovfl));
+				}
+			}
+		}
+	}
+}
+
+// The pair loop: for each premise pair (i, j >= i — self-pairs included), the
+// second copy's vars offset; both matrices normalized AS FALSE to ONE clause
+// each (the v1 shape gate); across the two clauses EXACTLY ONE complementary
+// same-head literal pair must unify (Mizar's <=1 limit), and every remaining
+// literal of both clauses must be forced against the basis. Structural gates:
+// premise count <= 24, single-clause DNFs.
+ruUnfPairs(math : RuMath, env : RuEnv, b : RuUnfBasis, prems0 : [RuUnfPremise],
+	maxClauses : int, timer : RuTimer) -> Maybe<RuUnfRefutation> {
+	// Mizar's UNIV is the BASIS's universal statements — small by construction.
+	// With a narrow (by-cited) scope, pair everything; in wholesale mode pair
+	// only the synthetic prior-step ∀-premises (ids outside the assertion
+	// index) — the closest analog of "universal statements present in PosBas".
+	prems = if (length(prems0) <= 24) prems0
+		else filter(prems0, \p -> !containsKeyTree(math.decls.assertions, p.assId));
+	if (length(prems) > 24) None()
+	else {
+		ruUnfPairStats := Triple((^ruUnfPairStats).first + 1, (^ruUnfPairStats).second, (^ruUnfPairStats).third);
+		shift = \e : RuExp, vs : [int] -> RuExp(map(e.nodes, \n -> switch (n) {
+			RuVar(vid, vtp): if (contains(vs, vid)) RuVar(vid + ruUnfPairOffset, vtp) else n;
+			RuRuleNode(__, __): n;
+		}), e.pos);
+		clauseOf = \m : RuExp -> switch (ruUnfDnf(m, false, maxClauses)) {
+			Some(cls): if (length(cls) == 1) Some(cls[0]) else None();
+			None(): None();
+		};
+		foldi(prems, None(), \i, accI : Maybe<RuUnfRefutation>, p1 ->
+			if (isSome(accI) || ruTimeIsOver(timer)) accI
+			else switch (clauseOf(p1.matrix)) {
+				None(): accI;
+				Some(c1): fold(enumFromTo(i, length(prems) - 1), accI, \accJ : Maybe<RuUnfRefutation>, j ->
+					if (isSome(accJ) || ruTimeIsOver(timer)) accJ
+					else {
+						p2 = prems[j];
+						switch (clauseOf(shift(p2.matrix, p2.vars))) {
+							None(): accJ;
+							Some(c2): {
+								patVars = buildSet(concat(p1.vars, map(p2.vars, \v -> v + ruUnfPairOffset)));
+								// complementary same-head literal pairs across the clauses
+								cands = fold(enumFromTo(0, length(c1) - 1), [], \ca : [Triple<int, int, [Tree<int, string>]>], ai ->
+									fold(enumFromTo(0, length(c2) - 1), ca, \ca2, bi -> {
+										la = c1[ai]; lb = c2[bi];
+										if (la.pos == lb.pos || ruInHead(la.atom) != ruInHead(lb.atom)) ca2
+										else {
+											sh = ^ruUnfPairStats;
+											ruUnfPairStats := Triple(sh.first, sh.second + 1, sh.third);
+											u = ruUnfUnifyModC(b, la.atom.nodes, patVars, lb.atom.nodes);
+											if (u == []) ca2 else arrayPush(ca2, Triple(ai, bi, u));
+										}
+									}));
+								if (length(cands) != 1) accJ   // Mizar's exactly-one limit
+								else {
+									cand = cands[0];
+									// join with every remaining literal, both clauses
+									rem = concat(
+										filtermap(mapi(c1, \ai, l -> Pair(ai, l)), \pr ->
+											if (pr.first == cand.first) None() else Some(pr.second)),
+										filtermap(mapi(c2, \bi, l -> Pair(bi, l)), \pr ->
+											if (pr.first == cand.second) None() else Some(pr.second)));
+									met = fold(rem, cand.third, \ac, lit ->
+										if (ac == []) ac
+										else ruUnfJoin(ac,
+											if (lit.pos) ruUnfForcedTrue(b, lit.atom, patVars)
+											else ruUnfForcedFalse(b, lit.atom, patVars),
+											b.maxSubsts, b.ovfl));
+									allVars = concat(p1.vars, map(p2.vars, \v -> v + ruUnfPairOffset));
+									full = filter(met, \sub -> forall(allVars, \v -> containsKeyTree(sub, v)));
+									if (full == []) accJ
+									else {
+										sub = full[0];
+										mkBind = \vs : [int], off : int ->
+											fold(vs, makeTree(), \bt, v ->
+												switch (lookupTree(sub, v + off)) {
+													None(): bt;
+													Some(k): switch (lookupTree(b.reprTerm, k)) {
+														Some(t): setTree(bt, v, t);
+														None(): bt;
+													}
+												});
+										bind1 = mkBind(p1.vars, 0);
+										bind2 = mkBind(p2.vars, ruUnfPairOffset);
+										if (ruUnfBindTyped(math, env, p1, bind1)
+											&& ruUnfBindTyped(math, env, p2, bind2)) {
+											s1 = ^ruUnfPairStats;
+											ruUnfPairStats := Triple(s1.first, s1.second, s1.third + 1);
+											Some(RuUnfByPair(p1.assId, bind1, p2.assId, bind2));
+										} else accJ;
+									}
+								}
+							}
+						}
+					});
+			});
 	}
 }
