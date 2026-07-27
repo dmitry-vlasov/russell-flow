@@ -923,13 +923,18 @@ ruDslBuildEqualizerGen(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTact
 		prems0    = ruEqzGenScopeCached(math, env, task.info);
 		// the by-list from the board (prove.flow publishes the step's citations);
 		// definitions stay in scope uncited (InferConstDef), as does the foundation family
-		byRefs = switch (ctx.board) {
+		byRefs0 = switch (ctx.board) {
 			None(): [];
 			Some(b): switch (ruBoardGet(b, "by.refs")) {
 				None(): [];
 				Some(v): cast(v : flow -> [string]);
 			}
 		}
+		// local citation tokens (hypK/stepK) are NOT premise names — a step citing
+		// only locals has an EMPTY global scope (legacy wholesale), not a narrow one
+		byRefs = filter(byRefs0, \rn -> !(
+			(startsWith(rn, "hyp") && isDigits(substring(rn, 3, strlen(rn) - 3)))
+			|| (startsWith(rn, "step") && isDigits(substring(rn, 4, strlen(rn) - 4)))));
 		isDef = \nm : string -> startsWith(nm, "d") && strlen(nm) > 1
 			&& isDigits(substring(nm, 1, 1)) && strContains(nm, "_");
 		prems = if (byRefs == []) prems0
@@ -991,7 +996,20 @@ ruDslBuildUnifierGen(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTactic
 		walId     = s2id("wal");
 		allPrems  = mapi(task.premises, \i, pr -> Pair(ruExp(pr.stmt.exps[0]), i));
 		basisIdx  = filter(allPrems, \p -> ruInHead(p.first) != walId);
-		hyps      = map(basisIdx, \b -> b.first);
+		byLocal = switch (ctx.board) {
+			None(): [];
+			Some(b): switch (ruBoardGet(b, "by.local")) {
+				None(): [];
+				Some(v): cast(v : flow -> [int]);
+			}
+		}
+		// CITED-FIRST basis (Mizar checks one inference against its cited
+		// premises; the wholesale DNF blew up on late steps — the 92% census);
+		// the wholesale set stays as the decide-fallback below
+		hypsAll   = map(basisIdx, \b -> b.first);
+		hyps      = if (byLocal == []) hypsAll
+			else filtermap(basisIdx, \b ->
+				if (contains(byLocal, b.second)) Some(b.first) else None());
 		// ∀-closed premises (prior steps / ∀ hyps) are UNIVERSAL facts
 		stepPremIdx : ref Tree<int, Pair<int, RuExp>> = ref makeTree();
 		stepPrems = filtermap(allPrems, \p ->
@@ -1013,13 +1031,18 @@ ruDslBuildUnifierGen(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTactic
 				}
 			});
 		prems0 = ruUnfGenScopeCached(math, env, task.info);
-		byRefs = switch (ctx.board) {
+		byRefs0 = switch (ctx.board) {
 			None(): [];
 			Some(b): switch (ruBoardGet(b, "by.refs")) {
 				None(): [];
 				Some(v): cast(v : flow -> [string]);
 			}
 		}
+		// local citation tokens (hypK/stepK) are NOT premise names — a step citing
+		// only locals has an EMPTY global scope (legacy wholesale), not a narrow one
+		byRefs = filter(byRefs0, \rn -> !(
+			(startsWith(rn, "hyp") && isDigits(substring(rn, 3, strlen(rn) - 3)))
+			|| (startsWith(rn, "step") && isDigits(substring(rn, 4, strlen(rn) - 4)))));
 		isDef = \nm : string -> startsWith(nm, "d") && strlen(nm) > 1
 			&& isDigits(substring(nm, 1, 1)) && strContains(nm, "_");
 		prems = concat(
@@ -1031,7 +1054,11 @@ ruDslBuildUnifierGen(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTactic
 		// the lattice caps were the binding constraint, not time — the golden-probe
 		// sweep at bm=400 measured 64/128→392 decided vs 4096/8192→634 (zfmisc),
 		// wall +6s per 2592 steps, 0 rejected at every cap point
-		plan = ruUnfPlanDecide(math, env, stmtClass, prems, hyps, goal, 4096, 8192, 400.0);
+		plan0 = ruUnfPlanDecide(math, env, stmtClass, prems, hyps, goal, 4096, 8192, 400.0);
+		// the wholesale retry is SKIPPED when the cited pass already overflowed —
+		// a bigger basis can only overflow harder (pure double-cost otherwise)
+		plan = if (plan0.provable || byLocal == [] || plan0.overflow) plan0
+			else ruUnfPlanDecide(math, env, stmtClass, prems, hypsAll, goal, 4096, 8192, 400.0);
 		tactic = if (!plan.provable) ruDoneTactic
 		else switch (ruUnfStepProof(math, env, stmtClass, plan, basisIdx, ^stepPremIdx, goal)) {
 			None(): ruDoneTactic;

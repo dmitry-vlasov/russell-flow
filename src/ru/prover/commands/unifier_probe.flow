@@ -211,9 +211,21 @@ ruUnfProbeSteps(env : RuEnv, state : RuState, math : RuMath, target : string,
 					// the REAL premise list an assembled step proof verifies against:
 					// theorem hyps then ALL prior steps, leaf-indexed in order
 					allPrems = concat(thHyps, prior);
+					byRefs = parseBy(step.tactic);
+					// LOCAL CITATIONS (hypK/stepK tokens, carried through translation):
+					// Mizar checks one inference against its CITED premises only —
+					// with local tokens present, ONLY the cited facts enter the DNF
+					// (the 92% decision-gap fix); legacy articles keep the old wholesale
+					// basis. Assembly indices (basisIdx) stay FULL either way.
+					localCited = fold(set2array(byRefs), makeSet(), \lc, rn ->
+						if (startsWith(rn, "hyp") && isDigits(substring(rn, 3, strlen(rn) - 3)))
+							insertSet(lc, s2i(substring(rn, 3, strlen(rn) - 3)) - 1)
+						else if (startsWith(rn, "step") && isDigits(substring(rn, 4, strlen(rn) - 4)))
+							insertSet(lc, length(thHyps) + s2i(substring(rn, 4, strlen(rn) - 4)) - 1)
+						else lc);
 					// ∀-closed prior steps are UNIVERSAL facts — offer them as premises
 					stepPremIdx : ref Tree<int, Pair<int, RuExp>> = ref makeTree();
-					stepPrems = filtermapi(prior, \pi, p ->
+					stepPremsAll = filtermapi(prior, \pi, p ->
 						if (ruInHead(p) != s2id("wal")) None()
 						else {
 							pm = ruEqzStripAlls(p);
@@ -228,22 +240,47 @@ ruUnfProbeSteps(env : RuEnv, state : RuState, math : RuMath, target : string,
 									sid = s2id("step" + i2s(pi + 1));
 									stepPremIdx := setTree(^stepPremIdx, sid,
 										Pair(length(thHyps) + pi, p));
-									Some(RuUnfPremise(sid, pm, set2array(vars), false, false));
+									Some(Pair(pi, RuUnfPremise(sid, pm, set2array(vars), false, false)));
 								}
 							}
 						});
+				stepPrems = filtermap(stepPremsAll, \sp ->
+						if (!isEmptySet(localCited)
+							&& !containsSet(localCited, length(thHyps) + sp.first)) None()
+						else Some(sp.second));
 					basisIdx = filtermapi(allPrems, \bi, p ->
 						if (ruInHead(p) == s2id("wal")) None() else Some(Pair(p, bi)));
-					hyps = map(basisIdx, \b -> b.first);
-					byRefs = parseBy(step.tactic);
+					hyps = if (isEmptySet(localCited)) map(basisIdx, \b -> b.first)
+						else filtermap(basisIdx, \b ->
+							if (containsSet(localCited, b.second)) Some(b.first) else None());
 					prems = concat(
 						if (isEmptySet(byRefs)) filter(prems0, \pp -> !pp.foundational || pp.charShape)
 						else filter(prems0, \pp ->
 							containsSet(byRefs, id2s(pp.assId)) || isDef(id2s(pp.assId))
 							|| (pp.foundational && pp.charShape)),
 						stepPrems);
-					plan = ruUnfPlanDecide(math, env, th.infer.prop.class, prems, hyps, goal,
+					// CITED-FIRST, WHOLESALE FALLBACK: the cited basis is Mizar's own
+					// shape (and the only one that survives the DNF on late golden
+					// steps); the wholesale retry keeps every decision the generous
+					// legacy basis could make (citation carrying is not yet complete).
+					plan0 = ruUnfPlanDecide(math, env, th.infer.prop.class, prems, hyps, goal,
 						maxClauses, maxSubsts, budgetMs);
+					plan = if (plan0.provable || isEmptySet(localCited) || plan0.overflow) plan0
+						else {
+							allHyps = map(basisIdx, \b -> b.first);
+							globals = fold(set2array(byRefs), makeSet(), \g, rn ->
+								if ((startsWith(rn, "hyp") && isDigits(substring(rn, 3, strlen(rn) - 3)))
+									|| (startsWith(rn, "step") && isDigits(substring(rn, 4, strlen(rn) - 4)))) g
+								else insertSet(g, rn));
+							premsW = concat(
+								if (isEmptySet(globals)) filter(prems0, \pp -> !pp.foundational || pp.charShape)
+								else filter(prems0, \pp ->
+									containsSet(globals, id2s(pp.assId)) || isDef(id2s(pp.assId))
+									|| (pp.foundational && pp.charShape)),
+								map(stepPremsAll, \sp -> sp.second));
+							ruUnfPlanDecide(math, env, th.infer.prop.class, premsW, allHyps, goal,
+								maxClauses, maxSubsts, budgetMs);
+						};
 					if (plan.provable) {
 						kinds = fold(map(plan.cases, \c -> c.refutation), makeSet(), \ks, r -> insertSet(ks, switch (r) {
 							RuUnfByContradiction(__): "triv";
