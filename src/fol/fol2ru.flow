@@ -19,6 +19,7 @@ export {
 	folArticleSource(tptp : FolSource, sigForms : [FolForm], extra : [RuParseDecl], import_ids : [int], module : string, conf : RuConf, notationOf : (string) -> string, emit : FolEmit) -> RuParseSource;
 	folHypTheorem(name : string, hyps : [FolForm], goal : FolForm) -> RuParseTheorem;
 	folProofTheorem(name : string, comment : string, hyps : [FolForm], steps : [FolForm], stepRefs : [[string]]) -> RuParseTheorem;
+	folProofTheoremC(name : string, comment : string, hyps : [FolForm], steps : [FolForm], stepRefs : [[string]], classLoci : bool) -> RuParseTheorem;
 	folAxiomC(name : string, comment : string, form : FolForm) -> RuParseAxiom;
 
 	// How an article's signature is emitted, parameterised by the target foundation:
@@ -474,6 +475,26 @@ folDoTermVars(t : FolTerm) -> [string] {
 	}
 }
 
+// vars BOUND by a quantifier (∀/∃) or a class abstraction anywhere in the form
+folFormBoundVars(f : FolForm, acc : Set<string>) -> Set<string> {
+	switch (f) {
+		FolPred(__, args): fold(args, acc, \a, t -> folTermBoundVars(t, a));
+		FolEq(l, r): folTermBoundVars(r, folTermBoundVars(l, acc));
+		FolNeg(g): folFormBoundVars(g, acc);
+		FolBin(__, l, r): folFormBoundVars(r, folFormBoundVars(l, acc));
+		FolQuant(__, vs, body): folFormBoundVars(body,
+			fold(vs, acc, \a, v -> insertSet(a, folVrename(v))));
+	}
+}
+
+folTermBoundVars(t : FolTerm, acc : Set<string>) -> Set<string> {
+	switch (t) {
+		FolVar(__): acc;
+		FolAbs(v, body): folFormBoundVars(body, insertSet(acc, folVrename(v)));
+		FolApp(__, args): fold(args, acc, \a, t2 -> folTermBoundVars(t2, a));
+	}
+}
+
 folDeclAxiom(d : FolDecl) -> RuParseAxiom {
 	folAxiom(d.name, folFormVars(d.form), folFormToks(d.form));
 }
@@ -616,12 +637,34 @@ folHypTheorem(name : string, hyps : [FolForm], goal : FolForm) -> RuParseTheorem
 // prop) is the LAST step. Filling the open steps yields a complete proof — no separate
 // assembly. (`steps` must be non-empty; for a direct/no-proof theorem pass [statement].)
 folProofTheorem(name : string, comment : string, hyps : [FolForm], steps : [FolForm], stepRefs : [[string]]) -> RuParseTheorem {
+	folProofTheoremC(name, comment, hyps, steps, stepRefs, false);
+}
+
+// classLoci=true — MIZAR LOCI AS CLASS METAVARS (the elpr/velpr twin pattern,
+// EXPERIMENTAL behind mizar-to-ru class-loci=1): a var FREE in the deduction context
+// (hyps/conclusion) and never bound anywhere is a Mizar locus — a SET. As a setvar it
+// could never take a class term, so citing the theorem at a compound term was
+// structurally unreplayable (the Unifier's dominant decision gap); as a CLASS metavar
+// with a setness hyp ( v ∈ _V ) it instantiates by plain substitution and the executor
+// discharges the setness mechanically. The setness hyps are APPENDED so the positional
+// hypK local-citation tokens keep their indices. MEASURED (2026-07-27, zfmisc hermetic):
+// unifier per-step decisions 117→123, but the PIPELINE 90→65/140 — the emitter stack
+// needs setness-from-hyps + G-form membership chars before this can be the default.
+folProofTheoremC(name : string, comment : string, hyps : [FolForm], steps : [FolForm], stepRefs : [[string]], classLoci : bool) -> RuParseTheorem {
 	goal = if (steps == []) FolPred("$true", []) else steps[length(steps) - 1];
 	allForms = concat(hyps, steps);
-	// object variables are setvars (they are bound by ∀/∃ = wal/wex, which take a setvar, and
-	// coerce into term positions via the setvar<:set super) — NOT plain `set` terms. This is
-	// what makes disjoint-variable theorems sound: a setvar can't be a compound term.
-	vars = map(uniq(concatA(map(allForms, folFormVars))), \v -> folVar(v, "setvar"));
+	// QUANTIFIED object variables are setvars (bound by ∀/∃ = wal/wex, which take a setvar,
+	// and coerced into term positions via the setvar<:set super — a setvar can't be a
+	// compound term, which keeps disjoint-variable theorems sound).
+	bound = fold(allForms, makeSet(), \a, f -> folFormBoundVars(f, a));
+	ctxVars = uniq(concatA(map(concat(hyps, [goal]), folFormVars)));
+	classVars = if (!classLoci) []
+		else filter(ctxVars, \v -> !containsSet(bound, v));
+	isClass = buildSet(classVars);
+	vars = map(uniq(concatA(map(allForms, folFormVars))), \v ->
+		folVar(v, if (containsSet(isClass, v)) "class" else "setvar"));
+	hypsAll = concat(hyps, map(classVars, \v ->
+		FolPred("∈", [FolVar(v), FolApp("_V", [])])));
 	// Each open step carries its Mizar BY-CITATION list as the inline tactic annotation
 	// `by(ref1, ref2, ...)` — pure DATA riding the existing per-step tactic slot: the prove
 	// command publishes it to the tactic board instead of treating it as an overriding
@@ -633,7 +676,7 @@ folProofTheorem(name : string, comment : string, hyps : [FolForm], steps : [FolF
 			RuParseStmt(s2id("|-"), [tp2id("wff")], folExpr(folFormToks(sp)), -1), ruParseNoProof, tactic, -1);
 	});
 	RuParseTheorem(s2id(name), folComment(comment), vars, [], RuParseMeta([], -1),
-		mapi(hyps, \i, h -> RuParseHyp(i, folStmt(folFormToks(h)), -1)),
+		mapi(hypsAll, \i, h -> RuParseHyp(i, folStmt(folFormToks(h)), -1)),
 		folStmt(folFormToks(goal)), RuParseProof([], [], proofSteps, -1), -1);
 }
 
