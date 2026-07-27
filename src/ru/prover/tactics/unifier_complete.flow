@@ -43,7 +43,18 @@ export {
 		plan : RuUnfPlan, plain : [Pair<RuExp, int>],
 		insts : [Pair<RuExp, RuProofTree>], bodies : [RuExp],
 		matrix : RuExp) -> Maybe<RuProofTree>;
+
+	// perf accumulators (sequential runs only): total ms spent in the leaf
+	// transport and how many times it ran — the flip's speed prerequisite is
+	// measured against these ([[unifier-planner]]).
+	ruUnfTransTime : ref double;
+	ruUnfTransCalls : ref int;
+	ruUnfBuildTime : ref double;
 }
+
+ruUnfTransTime : ref double = ref 0.0;
+ruUnfTransCalls : ref int = ref 0;
+ruUnfBuildTime : ref double = ref 0.0;
 
 ruUnfCompleteProof(stmtClass : int, wffT : int, plan : RuUnfPlan,
 	basis : [Pair<RuExp, int>], matrix : RuExp) -> Maybe<RuProofTree> {
@@ -102,20 +113,21 @@ ruUnfCompleteTableau(math : RuMath, env : RuEnv, stmtClass : int, wffT : int,
 	});
 	if (!plan.provable || !covered) None()
 	else {
+		bt = ruMakeTimer();
 		wn = \e : RuExp -> ruFwdMkRule(s2id("wn"), wffT, [e]);
 		wi = \a : RuExp, b : RuExp -> ruFwdMkRule(s2id("wi"), wffT, [a, b]);
 		stmt = \e : RuExp -> RuStmt(stmtClass, [e], -1);
 		amb0 = wn(matrix);
 		ops = ref 0;
 		pending0 = concatA([
-			[Pair(amb0, RuProofStep(s2id("id"), [], stmt(wi(amb0, amb0))))],
-			map(basis, \b -> Pair(b.first,
+			[RuUnfTabF(amb0, 0, RuProofStep(s2id("id"), [], stmt(wi(amb0, amb0))))],
+			map(basis, \b -> RuUnfTabF(b.first, 0,
 				RuProofStep(s2id("a1i"),
 					[RuProofHyp(b.second, stmt(b.first))],
 					stmt(wi(amb0, b.first))))),
-			map(insts, \p -> Pair(p.first,
+			map(insts, \p -> RuUnfTabF(p.first, 0,
 				RuProofStep(s2id("a1i"), [p.second], stmt(wi(amb0, p.first)))))]);
-		switch (ruUnfTab(math, env, ruInAtomCongsCached(math), stmtClass, wffT, matrix, amb0, [], pending0, ops)) {
+		r = switch (ruUnfTab(math, env, ruInAtomCongsCached(math), stmtClass, wffT, matrix, [amb0], [], pending0, ops)) {
 			None(): None();
 			Some(t): {
 				// Clavius: (¬M → M) ⊢ M
@@ -124,14 +136,22 @@ ruUnfCompleteTableau(math : RuMath, env : RuEnv, stmtClass : int, wffT : int,
 				Some(RuProofStep(s2id("ax-mp"), [t, pm], stmt(matrix)));
 			}
 		}
+		ruUnfBuildTime := ^ruUnfBuildTime + ruTimePassed(bt);
+		r;
 	}
 }
 
 // Prove (amb → matrix) from facts: `done` are literals (each proof concludes
 // amb → lit), `pending` still decompose. Linear except at ∨-splits.
+// A tableau fact: `tree` proves (ambs[depth] -> exp). Facts are lifted to
+// deeper ambients LAZILY (adantr chains materialize at USE, not at split) —
+// wholesale lifting inflated proofs as facts x splits and the verify time
+// with them (measured: the whole flip cost lived there).
+RuUnfTabF(exp : RuExp, depth : int, tree : RuProofTree);
+
 ruUnfTab(math : RuMath, env : RuEnv, congs : Tree<int, [RuInAtomCong]>,
-	stmtClass : int, wffT : int, matrix : RuExp, amb : RuExp,
-	done : [Pair<RuExp, RuProofTree>], pending : [Pair<RuExp, RuProofTree>],
+	stmtClass : int, wffT : int, matrix : RuExp, ambs : [RuExp],
+	done : [RuUnfTabF], pending : [RuUnfTabF],
 	ops : ref int) -> Maybe<RuProofTree> {
 	ops := ^ops + 1;
 	if (^ops > 65536) None()
@@ -141,143 +161,155 @@ ruUnfTab(math : RuMath, env : RuEnv, congs : Tree<int, [RuInAtomCong]>,
 	wa = \a : RuExp, b : RuExp -> ruFwdMkRule(s2id("wa"), wffT, [a, b]);
 	wo = \a : RuExp, b : RuExp -> ruFwdMkRule(s2id("wo"), wffT, [a, b]);
 	stmt = \e : RuExp -> RuStmt(stmtClass, [e], -1);
+	cur = length(ambs) - 1;
+	amb = ambs[cur];
 	imp = \f : RuExp -> wi(amb, f);
-	// a 0-hyp lemma instance used through syl: (amb→f) + (f→g) ⊢ (amb→g)
-	via = \pf : RuProofTree, lemma : string, f : RuExp, g : RuExp ->
+	// materialize a fact at the CURRENT ambient: adantr per level it missed
+	matz = \f : RuUnfTabF -> fold(enumFromTo(f.depth + 1, cur), f.tree, \t, i ->
+		RuProofStep(s2id("adantr"), [t], stmt(wi(ambs[i], f.exp))));
+	// a 0-hyp lemma instance used through syl AT THE SOURCE DEPTH d:
+	// (ambs[d]->f) + (f->g) |- (ambs[d]->g)
+	via = \pf : RuProofTree, d : int, lemma : string, f : RuExp, g : RuExp ->
 		RuProofStep(s2id("syl"), [pf,
-			RuProofStep(s2id(lemma), [], stmt(wi(f, g)))], stmt(imp(g)));
-	// a bicond lemma taken forward: (amb→f) + biimpi(f↔g) ⊢ (amb→g)
-	viaBi = \pf : RuProofTree, lemma : string, f : RuExp, g : RuExp ->
+			RuProofStep(s2id(lemma), [], stmt(wi(f, g)))], stmt(wi(ambs[d], g)));
+	viaBi = \pf : RuProofTree, d : int, lemma : string, f : RuExp, g : RuExp ->
 		RuProofStep(s2id("syl"), [pf,
 			RuProofStep(s2id("biimpi"),
 				[RuProofStep(s2id(lemma), [],
 					RuStmt(stmtClass, [ruFwdMkRule(s2id("wb"), wffT, [f, g])], -1))],
-				stmt(wi(f, g)))], stmt(imp(g)));
+				stmt(wi(f, g)))], stmt(wi(ambs[d], g)));
 	if (pending == []) {
-		// LEAF: scan for a syntactic complementary pair or a ¬(t=t) literal
-		// (Contr 19) refuted by eqid; only when the PLAIN scan fails, saturate
-		// with equality-transported variants (Mizar's Equate at the leaf — the
-		// modulo-class clashes) and scan once more
-		scan = \fs : [Pair<RuExp, RuProofTree>] ->
-		fold(fs, None(), \acc : Maybe<RuProofTree>, nf ->
+		// LEAF: complementary pair / ¬(t=t) over `done` (materialize ONLY the
+		// two facts the clash uses); if the plain scan fails, saturate with
+		// equality-transported variants (materialized — transport is rare)
+		closeWith = \ppTree : RuProofTree, nfTree : RuProofTree, p : RuExp -> {
+			dd = RuProofStep(s2id("pm2.21d"), [nfTree], stmt(imp(wi(p, matrix))));
+			RuProofStep(s2id("mpd"), [ppTree, dd], stmt(imp(matrix)));
+		};
+		scanF = fold(done, None(), \acc : Maybe<RuProofTree>, nf ->
 			if (isSome(acc)) acc
-			else if (!(ruInHead(nf.first) == s2id("wn") && ruInArity(nf.first) == 1)) acc
+			else if (!(ruInHead(nf.exp) == s2id("wn") && ruInArity(nf.exp) == 1)) acc
 			else {
-				p = (ruInArgs(nf.first))[0];
-				mpp = switch (find(fs, \pp -> pp.first.nodes == p.nodes)) {
-					Some(pp): Some(pp.second);
+				p = (ruInArgs(nf.exp))[0];
+				switch (find(done, \pp -> pp.exp.nodes == p.nodes)) {
+					Some(pp): Some(closeWith(matz(pp), matz(nf), p));
 					None():
 						if (ruInHead(p) == s2id("wceq") && ruInArity(p) == 2
 							&& (ruInArgs(p))[0].nodes == (ruInArgs(p))[1].nodes)
-							Some(RuProofStep(s2id("a1i"),
-								[RuProofStep(s2id("eqid"), [], stmt(p))],
-								stmt(imp(p))))
-						else None();
-				}
-				switch (mpp) {
-					None(): acc;
-					Some(pp): {
-						// (amb→¬p) ⊢ (amb→(p→M)) by pm2.21d; mpd with (amb→p)
-						d = RuProofStep(s2id("pm2.21d"), [nf.second],
-							stmt(imp(wi(p, matrix))));
-						Some(RuProofStep(s2id("mpd"), [pp, d], stmt(imp(matrix))));
-					}
+							Some(closeWith(
+								RuProofStep(s2id("a1i"),
+									[RuProofStep(s2id("eqid"), [], stmt(p))], stmt(imp(p))),
+								matz(nf), p))
+						else acc;
 				}
 			});
-		switch (scan(done)) {
+		switch (scanF) {
 			Some(c): Some(c);
 			None(): {
-				r = scan(ruUnfLeafTransport(math, env, congs, stmtClass, wffT, amb, done));
+				tmr = ruMakeTimer();
+				doneM = map(done, \f -> Pair(f.exp, matz(f)));
+				trans = ruUnfLeafTransport(math, env, congs, stmtClass, wffT, amb, doneM);
+				ruUnfTransTime := ^ruUnfTransTime + ruTimePassed(tmr);
+				ruUnfTransCalls := ^ruUnfTransCalls + 1;
+				r = fold(trans, None(), \acc : Maybe<RuProofTree>, nf ->
+					if (isSome(acc)) acc
+					else if (!(ruInHead(nf.first) == s2id("wn") && ruInArity(nf.first) == 1)) acc
+					else {
+						p = (ruInArgs(nf.first))[0];
+						switch (find(trans, \pp -> pp.first.nodes == p.nodes)) {
+							Some(pp): Some(closeWith(pp.second, nf.second, p));
+							None(): acc;
+						}
+					});
 				if (isNone(r) && ruVerbose(env.conf) >= 6) {
 					env.out.println("      tabLeaf FAIL (" + i2s(length(done)) + " lits): "
-						+ strGlue(map(done, \d -> ru2s(d.first, math)), " | "));
+						+ strGlue(map(done, \d -> ru2s(d.exp, math)), " | "));
 				} else {};
 				r;
 			}
 		}
 	} else {
-		f = pending[0].first;
-		pf = pending[0].second;
+		f0 = pending[0];
+		f = f0.exp;
+		pf = f0.tree;
+		fd = f0.depth;
 		rest = tail(pending);
 		h = ruInHead(f);
 		ar = ruInArity(f);
-		rec = \d2 : [Pair<RuExp, RuProofTree>], p2 : [Pair<RuExp, RuProofTree>] ->
-			ruUnfTab(math, env, congs, stmtClass, wffT, matrix, amb, d2, p2, ops);
-		push = \items : [Pair<RuExp, RuProofTree>] -> rec(done, concat(items, rest));
-		split = \a : RuExp, b : RuExp, pd : RuProofTree -> {
+		rec = \d2 : [RuUnfTabF], p2 : [RuUnfTabF] ->
+			ruUnfTab(math, env, congs, stmtClass, wffT, matrix, ambs, d2, p2, ops);
+		push = \items : [RuUnfTabF] -> rec(done, concat(items, rest));
+		mk = \e : RuExp, t : RuProofTree -> RuUnfTabF(e, fd, t);
+		split = \a : RuExp, b : RuExp -> {
 			branch = \x : RuExp -> {
 				ambx = wa(amb, x);
-				lift = \fs : [Pair<RuExp, RuProofTree>] -> map(fs, \g ->
-					Pair(g.first, RuProofStep(s2id("adantr"), [g.second],
-						RuStmt(stmtClass, [ruFwdMkRule(s2id("wi"), wffT, [ambx, g.first])], -1))));
-				xFact = Pair(x, RuProofStep(s2id("simpr"), [],
+				xFact = RuUnfTabF(x, cur + 1, RuProofStep(s2id("simpr"), [],
 					RuStmt(stmtClass, [ruFwdMkRule(s2id("wi"), wffT, [ambx, x])], -1)));
-				ruUnfTab(math, env, congs, stmtClass, wffT, matrix, ambx, lift(done),
-					arrayPush(lift(rest), xFact), ops);
+				ruUnfTab(math, env, congs, stmtClass, wffT, matrix,
+					arrayPush(ambs, ambx), done, arrayPush(rest, xFact), ops);
 			}
 			switch (branch(a)) {
 				None(): None();
 				Some(pa): switch (branch(b)) {
 					None(): None();
-					Some(pb): Some(RuProofStep(s2id("mpjaodan"), [pa, pb, pd],
+					Some(pb): Some(RuProofStep(s2id("mpjaodan"), [pa, pb, matz(f0)],
 						stmt(imp(matrix))));
 				}
 			}
 		}
 		if (h == s2id("wa") && ar == 2) {
 			args = ruInArgs(f);
+			di = \e : RuExp -> wi(ambs[fd], e);
 			push([
-				Pair(args[0], RuProofStep(s2id("simpld"), [pf], stmt(imp(args[0])))),
-				Pair(args[1], RuProofStep(s2id("simprd"), [pf], stmt(imp(args[1]))))]);
+				mk(args[0], RuProofStep(s2id("simpld"), [pf], stmt(di(args[0])))),
+				mk(args[1], RuProofStep(s2id("simprd"), [pf], stmt(di(args[1]))))]);
 		} else if (h == s2id("wo") && ar == 2) {
 			args = ruInArgs(f);
-			split(args[0], args[1], pf);
+			split(args[0], args[1]);
 		} else if (h == s2id("wi") && ar == 2) {
 			args = ruInArgs(f);
 			// (a→b) ⇒ (¬a∨b) by imor
-			push([Pair(wo(wn(args[0]), args[1]),
-				viaBi(pf, "imor", f, wo(wn(args[0]), args[1])))]);
+			push([mk(wo(wn(args[0]), args[1]),
+				viaBi(pf, fd, "imor", f, wo(wn(args[0]), args[1])))]);
 		} else if (h == s2id("wn") && ar == 1) {
 			g = (ruInArgs(f))[0];
 			gh = ruInHead(g);
 			gar = ruInArity(g);
 			if (gh == s2id("wn") && gar == 1) {
 				a = (ruInArgs(g))[0];
-				push([Pair(a, via(pf, "notnotr", f, a))]);
+				push([mk(a, via(pf, fd, "notnotr", f, a))]);
 			} else if (gh == s2id("wo") && gar == 2) {
 				gargs = ruInArgs(g);
 				push([
-					Pair(wn(gargs[0]), via(pf, "pm2.45", f, wn(gargs[0]))),
-					Pair(wn(gargs[1]), via(pf, "pm2.46", f, wn(gargs[1])))]);
+					mk(wn(gargs[0]), via(pf, fd, "pm2.45", f, wn(gargs[0]))),
+					mk(wn(gargs[1]), via(pf, fd, "pm2.46", f, wn(gargs[1])))]);
 			} else if (gh == s2id("wa") && gar == 2) {
 				gargs = ruInArgs(g);
 				// ¬(a∧b) ⇒ (¬a∨¬b) by pm3.13
-				push([Pair(wo(wn(gargs[0]), wn(gargs[1])),
-					via(pf, "pm3.13", f, wo(wn(gargs[0]), wn(gargs[1]))))]);
+				push([mk(wo(wn(gargs[0]), wn(gargs[1])),
+					via(pf, fd, "pm3.13", f, wo(wn(gargs[0]), wn(gargs[1]))))]);
 			} else if (gh == s2id("wi") && gar == 2) {
 				gargs = ruInArgs(g);
 				// ¬(a→b) ⇒ (a∧¬b) by pm4.61
-				push([Pair(wa(gargs[0], wn(gargs[1])),
-					viaBi(pf, "pm4.61", f, wa(gargs[0], wn(gargs[1]))))]);
+				push([mk(wa(gargs[0], wn(gargs[1])),
+					viaBi(pf, fd, "pm4.61", f, wa(gargs[0], wn(gargs[1]))))]);
 			} else if (gh == s2id("wb") && gar == 2) {
 				gargs = ruInArgs(g);
-				// ¬(a↔b) ⇒ (¬a↔b) by nbbn taken BACKWARD (biimpri); the (¬a↔b)
-				// then decomposes through the positive ↔ case (dfbi3)
+				// ¬(a↔b) ⇒ (¬a↔b) by nbbn taken BACKWARD (biimpri)
 				tgt = ruFwdMkRule(s2id("wb"), wffT, [wn(gargs[0]), gargs[1]]);
 				nb = RuProofStep(s2id("nbbn"), [],
 					RuStmt(stmtClass, [ruFwdMkRule(s2id("wb"), wffT, [tgt, f])], -1));
 				bi = RuProofStep(s2id("biimpri"), [nb], stmt(wi(f, tgt)));
-				push([Pair(tgt, RuProofStep(s2id("syl"), [pf, bi], stmt(imp(tgt))))]);
+				push([mk(tgt, RuProofStep(s2id("syl"), [pf, bi], stmt(wi(ambs[fd], tgt))))]);
 			}
-			else rec(arrayPush(done, pending[0]), rest);       // literal
+			else rec(arrayPush(done, f0), rest);       // literal
 		} else if (h == s2id("wb") && ar == 2) {
 			args = ruInArgs(f);
-			// (a↔b) ⇒ ((a∧b)∨(¬a∧¬b)) by dfbi3 — the σP characterization
-			// instances (elpr/elsn biconds) enter the case fold through here
+			// (a↔b) ⇒ ((a∧b)∨(¬a∧¬b)) by dfbi3
 			rhs = wo(wa(args[0], args[1]), wa(wn(args[0]), wn(args[1])));
-			push([Pair(rhs, viaBi(pf, "dfbi3", f, rhs))]);
+			push([mk(rhs, viaBi(pf, fd, "dfbi3", f, rhs))]);
 		}
-		else rec(arrayPush(done, pending[0]), rest);           // literal (atoms, ∀/∃)
+		else rec(arrayPush(done, f0), rest);           // literal (atoms, ∀/∃)
 	}
 	}
 }
@@ -492,14 +524,14 @@ ruUnfCompleteChain(math : RuMath, env : RuEnv, stmtClass : int, wffT : int,
 		amb = wa(wb, nM);
 		ops = ref 0;
 		pending0 = concatA([
-			[Pair(amb, RuProofStep(s2id("id"), [], stmt(wi(amb, amb))))],
-			map(plain, \b -> Pair(b.first,
+			[RuUnfTabF(amb, 0, RuProofStep(s2id("id"), [], stmt(wi(amb, amb))))],
+			map(plain, \b -> RuUnfTabF(b.first, 0,
 				RuProofStep(s2id("a1i"),
 					[RuProofHyp(b.second, stmt(b.first))],
 					stmt(wi(amb, b.first))))),
-			map(insts, \p -> Pair(p.first,
+			map(insts, \p -> RuUnfTabF(p.first, 0,
 				RuProofStep(s2id("a1i"), [p.second], stmt(wi(amb, p.first)))))]);
-		switch (ruUnfTab(math, env, ruInAtomCongsCached(math), stmtClass, wffT, matrix, amb, [], pending0, ops)) {
+		switch (ruUnfTab(math, env, ruInAtomCongsCached(math), stmtClass, wffT, matrix, [amb], [], pending0, ops)) {
 			None(): None();
 			Some(t): {
 				// ((wb ∧ ¬M) → M) ⇒ ex ⇒ (wb → (¬M → M)) ⇒ Clavius syl ⇒ (wb → M)
