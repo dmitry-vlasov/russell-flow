@@ -94,7 +94,7 @@ case "${1:-}" in
 			n=$((n+1))
 			setup_sandbox
 			r="$(RUSSELL_MATH="$SANDBOX" "$RUSSELL_BIN" no-server=1 mem=16g \
-				test/prover/mizar/general_probe module="$article" target="$th" off="$off" v=1 thr=0 cl="${CL:-0}" 2>&1 \
+				test/prover/mizar/general_probe module="$article" target="$th" off="$off" v=1 thr=0 cl="${CL:-0}" tl="${TL:-10s}" 2>&1 \
 				| grep -c '^prove: 1/1' || true)"
 			if [ "$r" = "1" ]; then ok=$((ok+1)); echo "  + $th"; else echo "  - $th"; fi
 		done

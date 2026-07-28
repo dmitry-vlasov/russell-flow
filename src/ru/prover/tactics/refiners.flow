@@ -353,9 +353,9 @@ ruResidualVerdicts(b : RuTacticBoard) -> Tree<Pair<string, [RuExpNode]>, RuResid
 ruRewriteCacheKey = "rewrite.cache";
 
 ruMemoRewrite(memo : Maybe<RuResidualMemo>, em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int,
-	e : RuExp, nnf : bool, precedes : (int) -> bool) -> RuEqRewrite {
+	e : RuExp, nnf : bool, precedes : (int) -> bool, pool : Tree<string, RuProofTree>) -> RuEqRewrite {
 	switch (memo) {
-		None(): ruEqualizerRewrite(em, conn, wff, stmtClass, [], e, nnf, precedes);
+		None(): ruEqualizerRewrite(em, conn, wff, stmtClass, [], e, nnf, precedes, pool);
 		Some(m): {
 			cache = switch (ruBoardGet(m.board, ruRewriteCacheKey)) {
 				None(): makeTree();
@@ -365,7 +365,7 @@ ruMemoRewrite(memo : Maybe<RuResidualMemo>, em : RuEnvMath, conn : RuPConnective
 			switch (lookupTree(cache, key)) {
 				Some(r): r;
 				None(): {
-					r = ruEqualizerRewrite(em, conn, wff, stmtClass, [], e, nnf, precedes);
+					r = ruEqualizerRewrite(em, conn, wff, stmtClass, [], e, nnf, precedes, pool);
 					ruBoardSet(m.board, ruRewriteCacheKey, setTree(cache, key, r));
 					r;
 				}
@@ -484,10 +484,18 @@ ruCheckerResidualRun(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : 
 	fbRef : ref [RuTimer] = ref [];
 	em = RuEnvMath(math, env); conn = ruPConnectives(); wff = tp2id_("wff");
 	nh = length(hyps);
+	// the problem's SETNESS POOL (class-loci): the per-premise rewrites below are each called
+	// with hyps=[], so without this the theorem's own `T ∈ _V` facts are invisible and the
+	// hyp-carrying membership lemmas (elpr/elsn/elpw) decline at every class metavar.
+	hypPool = ruSetnessPoolOf(mapi(hyps, \i, h -> Pair(h, i)), stmtClass);
 	// HYP-REWRITING: unfold each hyp the same way the goal was unfolded, so a gap like
 	// `x∈(A∪B) ⊢ (x∈A)∨(x∈B)` connects (the hyp is rewritten to the goal's normal form). A hyp that
 	// changes becomes a DERIVED premise `hyp'`, proven from the real hyp by mpbi(hyp, hyp↔hyp').
-	hRw = map(hyps, \h -> ruMemoRewrite(memo, em, conn, wff, stmtClass, h, nnf, precedes));
+	// a SETNESS hyp is a type fact, not a literal to decompose: its rewrite (`x ∈ _V` → `x ⊆ x`)
+	// is pure junk that then crowds the certificate's premise selection (class-loci t32).
+	isSetnessExp = \e : RuExp -> ruUSetnessHyp(e, s2id("wcel"), s2id("cvv")) != None();
+	hRw = map(hyps, \h -> if (isSetnessExp(h)) RuEqRewrite(h, None(), makeSet())
+		else ruMemoRewrite(memo, em, conn, wff, stmtClass, h, nnf, precedes, hypPool));
 	changed = filtermapi(hyps, \i, __ -> switch (hRw[i].proof) { None(): None(); Some(p): Some(Pair(i, p)); });
 	derivedHyps = map(changed, \c -> hRw[c.first].residual);
 	derivedProofs = map(changed, \c -> {
@@ -549,7 +557,7 @@ ruCheckerResidualRun(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : 
 			sides.first.nodes == sides.second.nodes;
 		};
 		if (isRefl) [f] else {
-			rw2 = ruMemoRewrite(memo, em, conn, wff, stmtClass, f.first, nnf, precedes);
+			rw2 = ruMemoRewrite(memo, em, conn, wff, stmtClass, f.first, nnf, precedes, hypPool);
 			switch (rw2.proof) {
 				None(): [f];
 				Some(p2): [f, Pair(rw2.residual,
@@ -598,10 +606,10 @@ ruCheckerResidualRun(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : 
 					if (env.conf.verbose >= 4) { env.out.println("  resid: fallback memo hit (failed) goal=" + ru2s(goal, math)); } else {};
 					None();
 				} else ruResidualFallback(memo, math, env, stmtClass, goal, nnf, precedes, conn, wff, em,
-					premiseExps2, spliceAll, hypDisjs2, fbRef);
+					premiseExps2, spliceAll, hypDisjs2, fbRef, hypPool);
 			}
 			None(): ruResidualFallback(memo, math, env, stmtClass, goal, nnf, precedes, conn, wff, em,
-				premiseExps2, spliceAll, hypDisjs2, fbRef);
+				premiseExps2, spliceAll, hypDisjs2, fbRef, hypPool);
 		}
 	};
 	// GENERAL-PATH OR-ELIM (last resort): a pooled disjunction fact P∨Q closes the
@@ -718,7 +726,11 @@ ruResidualOrElim(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int,
 ruResidualFallback(memo : Maybe<RuResidualMemo>, math : RuMath, env : RuEnv, stmtClass : int,
 	goal : RuExp, nnf : bool, precedes : (int) -> bool, conn : RuPConnectives, wff : int, em : RuEnvMath,
 	premiseExps2 : [RuExp], spliceAll : (RuProofTree) -> RuProofTree, hypDisjs2 : Set<RuDisj>,
-	fbRef : ref [RuTimer]) -> Maybe<RuRefineResult> {
+	fbRef : ref [RuTimer], hypPool : Tree<string, RuProofTree>) -> Maybe<RuRefineResult> {
+	// hypPool = the CALLER's setness pool (built over the real hyps, leaf indices < nh). It is
+	// threaded in rather than rebuilt over `premiseExps2` on purpose: the rewrite memo is keyed
+	// by (expr, nnf) only, so two differently-numbered pools would let a cached rewrite proof
+	// carry hyp leaves from the wrong numbering into another residual run.
 	res = {
 			// THE EQUALIZER'S SECOND ROUND: an EQUALITY goal gets the congruence-closure
 			// decision over the SATURATED premise set — the derived ground equalities
@@ -799,7 +811,7 @@ ruResidualFallback(memo : Maybe<RuResidualMemo>, math : RuMath, env : RuEnv, stm
 					// unfold the ∃-body the same way real hyps are unfolded (its atoms — x∈(A∩B)
 					// composites — are otherwise opaque to the propositional check); the bridge
 					// (body → body') is biimpi of the rewrite bicond, syl-composed below.
-					bodyRw = ruMemoRewrite(memo, em, conn, wff, stmtClass, body, nnf, precedes);
+					bodyRw = ruMemoRewrite(memo, em, conn, wff, stmtClass, body, nnf, precedes, hypPool);
 					body2 = bodyRw.residual;
 					natoms = sizeTree(fold(concat(otherExps, [body2, goal]), ruPAtomNodes(conn, goal), \acc, e -> mergeTree(acc, ruPAtomNodes(conn, e))));
 					if (env.conf.verbose >= 4) {
@@ -912,12 +924,28 @@ ruResidualFallback(memo : Maybe<RuResidualMemo>, math : RuMath, env : RuEnv, stm
 			// args re-inflated t86's certificate past its gate)
 			bridged = differenceSets(terms2, terms0);
 			atomPick = pickA(ks2);
+			// SETNESS and REFLEXIVE relation facts are NOT transport links: `x ∈ _V` / `x ⊆ x`
+			// carry no information across the bridge, and being the SHORTEST premises they win
+			// the smallest-first cap below and crowd the real ∨/∧ premises out (class-loci t32:
+			// the elpr disjunction lost its slot to four such facts). Setness reaches the
+			// emitter through the pool instead.
+			isJunkPremise = \e : RuExp ->
+				ruUSetnessHyp(e, s2id("wcel"), s2id("cvv")) != None()
+				|| (ruInArity(e) == 2 && { a = ruInArgs(e); a[0].nodes == a[1].nodes; });
 			bridgeOnly = filtermapi(premiseExps2, \i, e ->
-				if (!contains(atomPick, i) && !isEmptySet(intersectSets(argTerms(e), bridged))) Some(i) else None());
+				if (!contains(atomPick, i) && !isJunkPremise(e) && !isEmptySet(intersectSets(argTerms(e), bridged))) Some(i) else None());
 			// the bridge allowance shrinks as the atom-connected set grows — on rich sets
 			// (t86's final step) additions are mostly junk that burns the emitter's budgets;
 			// on sparse ones (t32/t19) the transport link is the missing piece
-			bridgeAdds = take(mergeSort(bridgeOnly, \a, b -> length(premiseExps2[a].nodes) - length(premiseExps2[b].nodes)),
+			// GOAL-TERM FIRST, then smallest: a bridge premise that mentions one of the GOAL's own
+			// terms is the transport link we are looking for; one that mentions only the bridged
+			// terms is background. Size alone let short background facts (enum memberships) take
+			// the whole cap and leave the ∨-premise out (class-loci t32).
+			bridgeRank = \i : int -> if (isEmptySet(intersectSets(argTerms(premiseExps2[i]), terms0))) 1 else 0;
+			bridgeAdds = take(mergeSort(bridgeOnly, \a, b -> {
+					r = bridgeRank(a) - bridgeRank(b);
+					if (r != 0) r else length(premiseExps2[a].nodes) - length(premiseExps2[b].nodes);
+				}),
 				if (length(atomPick) > 8) 2 else 4);
 			// SETNESS IS ALWAYS AVAILABLE (the class-loci campaign): a `T ∈ _V` premise shares no
 			// atom with the goal, so the relevance closure drops it — but it is the INDUCTION BASE
@@ -1023,7 +1051,8 @@ ruStripForallRefiner(stmtClass : int, precedes : (int) -> bool) -> RuRefiner {
 // identity when nothing rewrote), carrying the rewrite's DV provisos.
 ruEqRewriteRefiner(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], nnf : bool, precedes : (int) -> bool) -> RuRefiner {
 	RuRefiner("eq-rewrite", \goal -> {
-		rw = ruEqualizerRewrite(em, conn, wff, stmtClass, hyps, goal, nnf, precedes);
+		rw = ruEqualizerRewrite(em, conn, wff, stmtClass, hyps, goal, nnf, precedes,
+			ruSetnessPoolOf(mapi(hyps, \i, h -> Pair(h, i)), stmtClass));
 		Some(RuRefineStep([rw.residual],
 			\proofs -> switch (rw.proof) {
 				None():        proofs[0];   // nothing rewrote: residual proof IS the goal proof
@@ -1044,7 +1073,8 @@ ruEqRewriteRefiner(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass :
 			\goal -> {
 				svEq = ruEqHead(goal) == s2id("wceq") && ruRelIsSetvarEq(goal);
 				hypForms = if (^hypFormsC != []) (^hypFormsC)[0] else {
-					hf = map(hyps, \h -> (ruEqualizerRewrite(em, conn, wff, stmtClass, [], h, nnf, precedes)).residual);
+					hf = map(hyps, \h -> (ruEqualizerRewrite(em, conn, wff, stmtClass, [], h, nnf, precedes,
+						ruSetnessPoolOf(mapi(hyps, \i, h2 -> Pair(h2, i)), stmtClass))).residual);
 					hypFormsC := [hf];
 					hf;
 				};

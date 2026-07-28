@@ -22,7 +22,10 @@ import ds/set;
 export {
 	// Membership-lemma instances relevant to `exps`' compound membership atoms (recursively: a
 	// fact's RHS may expose further compound atoms). Each pair = (instance formula, its proof tree).
-	ruUnfoldFacts(math : RuMath, env : RuEnv, stmtClass : int, exps : [RuExp]) -> [Pair<RuExp, RuProofTree>];
+	// `pool` = the caller's setness facts (`T ∈ _V` hyps, ruSetnessPoolOf) — the induction base
+	// for the hyp-carrying membership lemmas (elpr/elsn/elpw) at CLASS metavars, whose setness no
+	// registry lemma can supply. Pass makeTree() where there are no hyps.
+	ruUnfoldFacts(math : RuMath, env : RuEnv, stmtClass : int, exps : [RuExp], pool : Tree<string, RuProofTree>) -> [Pair<RuExp, RuProofTree>];
 
 	// Relation-lemma instances: for every `( A = B )` atom in `exps`, the eqss fact
 	// `(A = B) ↔ (A ⊆ B ∧ B ⊆ A)` (no quantifier — stays propositional, ⊆ kept as atoms). Lets the
@@ -555,31 +558,31 @@ ruUMembAtoms(exp : RuExp, wcelId : int, ops : Set<int>) -> [RuExp] {
 }
 
 // ---- unfold ----------------------------------------------------------------
-ruUnfoldFacts(math : RuMath, env : RuEnv, stmtClass : int, exps : [RuExp]) -> [Pair<RuExp, RuProofTree>] {
+ruUnfoldFacts(math : RuMath, env : RuEnv, stmtClass : int, exps : [RuExp], pool : Tree<string, RuProofTree>) -> [Pair<RuExp, RuProofTree>] {
 	registry = ruMembRegistry(math);
 	setReg   = ruSetnessRegistry(math);
 	wcelId   = s2id("wcel");
 	ops      = buildSet(getTreeKeys(registry));
 	// Iterate to a fixpoint: a fact's RHS may expose further compound membership atoms.
-	ruUnfoldLoop(math, env, stmtClass, registry, setReg, wcelId, ops, exps, makeTree(), 6);
+	ruUnfoldLoop(math, env, stmtClass, registry, setReg, pool, wcelId, ops, exps, makeTree(), 6);
 }
 
 ruUnfoldLoop(
 	math : RuMath, env : RuEnv, stmtClass : int, registry : Tree<int, [RuMembLemma]>,
-	setReg : Tree<int, [RuSetLemma]>,
+	setReg : Tree<int, [RuSetLemma]>, pool : Tree<string, RuProofTree>,
 	wcelId : int, ops : Set<int>, frontier : [RuExp], seen : Tree<string, Pair<RuExp, RuProofTree>>, fuel : int
 ) -> [Pair<RuExp, RuProofTree>] {
 	atoms = concatA(map(frontier, \e -> ruUMembAtoms(e, wcelId, ops)));
 	newFacts = filtermap(atoms, \atom -> {
 		key = ruUKey(atom);
 		if (containsKeyTree(seen, key)) None()
-		else ruUnfoldAtom(registry, setReg, wcelId, stmtClass, atom, math, env);
+		else ruUnfoldAtom(registry, setReg, pool, wcelId, stmtClass, atom, math, env);
 	});
 	if (newFacts == [] || fuel <= 0) getTreeValues(seen)
 	else {
 		seen1 = fold(newFacts, seen, \acc, f -> setTree(acc, ruUKey(ruUnfoldAtomOf(f)), f));
 		// scan the new facts' instance formulas for further compound atoms.
-		ruUnfoldLoop(math, env, stmtClass, registry, setReg, wcelId, ops, map(newFacts, \f -> f.first), seen1, fuel - 1);
+		ruUnfoldLoop(math, env, stmtClass, registry, setReg, pool, wcelId, ops, map(newFacts, \f -> f.first), seen1, fuel - 1);
 	}
 }
 
@@ -587,7 +590,8 @@ ruUnfoldLoop(
 ruUnfoldAtomOf(f : Pair<RuExp, RuProofTree>) -> RuExp { ruUChild0(f.first); }
 
 // One atom -> its lemma instance + proof, or None if the lemma does not match.
-ruUnfoldAtom(registry : Tree<int, [RuMembLemma]>, setReg : Tree<int, [RuSetLemma]>, wcelId : int,
+ruUnfoldAtom(registry : Tree<int, [RuMembLemma]>, setReg : Tree<int, [RuSetLemma]>,
+	pool : Tree<string, RuProofTree>, wcelId : int,
 	stmtClass : int, atom : RuExp, math : RuMath, env : RuEnv) -> Maybe<Pair<RuExp, RuProofTree>> {
 	cvvId = s2id("cvv");
 	opId = ruUNodeId(atom.nodes[ruUSpanEnd(atom.nodes, 1)]);   // object's head rule
@@ -603,10 +607,16 @@ ruUnfoldAtom(registry : Tree<int, [RuMembLemma]>, setReg : Tree<int, [RuSetLemma
 					hi = ruApplySubst(h, sub);
 					switch (ruUSetnessHyp(hi, wcelId, cvvId)) {
 						None(): None();
-						Some(ht): ruSetnessProof(setReg, makeTree(), ht, wcelId, cvvId, stmtClass, math, env, 8);
+						Some(ht): ruSetnessProof(setReg, pool, ht, wcelId, cvvId, stmtClass, math, env, 8);
 					}
 				});
-				if (length(hypProofs) != length(ml.hyps)) None()
+				if (length(hypProofs) != length(ml.hyps)) {
+					if (env.conf.verbose >= 6) {
+						env.out.println("    unfoldDecline: atom=" + ru2s(atom, math) + " lemma=" + id2s(ml.lemmaId)
+							+ " hyps=" + strGlue(map(ml.hyps, \h -> ru2s(h, math)), " ; ") + " pool=" + i2s(sizeTree(pool)));
+					} else {};
+					None();
+				}
 				else {
 					inst  = ruApplySubst(ml.prop, sub);
 					proof = RuProofStep(ml.lemmaId, hypProofs, RuStmt(stmtClass, [inst], -1));
@@ -628,7 +638,8 @@ ruUnfoldSplice(tree : RuProofTree, base : int, factProofs : [RuProofTree]) -> Ru
 }
 
 ruUnfoldPropTactic(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp) -> Maybe<RuProverTactic> {
-	facts    = ruUnfoldFacts(em.math, em.env, stmtClass, arrayPush(hyps, goal));
+	facts    = ruUnfoldFacts(em.math, em.env, stmtClass, arrayPush(hyps, goal),
+		ruSetnessPoolOf(mapi(hyps, \i, h -> Pair(h, i)), stmtClass));
 	factExps = map(facts, \f -> f.first);
 	switch (ruKalmarSkeleton(conn, wff, stmtClass, concat(hyps, factExps), goal)) {
 		Some(tree): switch (tree) {
