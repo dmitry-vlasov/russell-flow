@@ -105,7 +105,7 @@ case "${1:-}" in
 		article="${2:?article}"; theorem="${3:?theorem}"; off="${4:-1}"; v="${5:-1}"; thr="${6:-0}"
 		setup_sandbox
 		RUSSELL_MATH="$SANDBOX" "$RUSSELL_BIN" no-server=1 mem=16g \
-			test/prover/mizar/general_probe module="$article" target="$theorem" off="$off" v="$v" thr="$thr" cl="${CL:-0}"
+			test/prover/mizar/general_probe module="$article" target="$theorem" off="$off" v="$v" thr="$thr" cl="${CL:-0}" tl="${TL:-10s}"
 		;;
 	"" | -h | --help)
 		sed -n '2,30p' "${BASH_SOURCE[0]}"

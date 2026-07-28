@@ -579,6 +579,9 @@ ruCheckerResidualRun(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : 
 	spliceAll = \unc : RuProofTree -> ruUnfoldSplice(unc, nh, concat(derivedProofs, map(satAll, \p -> p.second)));
 	if (env.conf.verbose >= 4) {
 		env.out.println("  resid: goal=" + ru2s(goal, math) + " hyps=" + i2s(nh) + " derived=" + i2s(nd) + " sat=" + i2s(length(satAll)));
+		if (env.conf.verbose >= 6) {
+			iter(premises, \pr -> env.out.println("    residPrem: " + ru2s(ruExp(pr.stmt.exps[0]), math)));
+		} else {};
 	} else {};
 	res0 = switch (ruRunCloser(math, env, info, stmtClass, premises, goal, scope, mkCloser(), limit)) {
 		Some(unc): Some(RuRefineResult(spliceAll(unc), hypDisjs2));
@@ -916,6 +919,19 @@ ruResidualFallback(memo : Maybe<RuResidualMemo>, math : RuMath, env : RuEnv, stm
 			// on sparse ones (t32/t19) the transport link is the missing piece
 			bridgeAdds = take(mergeSort(bridgeOnly, \a, b -> length(premiseExps2[a].nodes) - length(premiseExps2[b].nodes)),
 				if (length(atomPick) > 8) 2 else 4);
+			// SETNESS IS ALWAYS AVAILABLE (the class-loci campaign): a `T ∈ _V` premise shares no
+			// atom with the goal, so the relevance closure drops it — but it is the INDUCTION BASE
+			// of every setness proof, and without it the emitter's hyp-carrying membership biconds
+			// (elsn/elpr/elpw) decline at a class metavar and the whole branch dies (t12: the
+			// branch fact x5∈{x8} never unfolds to x5=x8). Mizar keeps the type layer of every
+			// term regardless of the literal's connectivity — the same law.
+			// It does NOT join the certificate's HYPS: an extra propositional atom per setness
+			// fact pushes rich problems past the atom gate and eats the split budget (measured:
+			// t19 flipped when they joined the subset). They travel as the certificate's setness
+			// POOL instead — a side channel with no atom cost — with hyp leaves numbered AFTER
+			// the subset positions, so the leaf remap below reaches their real premise indices.
+			setnessIdxs = filtermapi(premiseExps2, \i, e ->
+				if (ruUSetnessHyp(e, s2id("wcel"), s2id("cvv")) != None()) Some(i) else None());
 			subset0 = mergeSort(concat(atomPick, bridgeAdds), \a, b -> a - b);
 			// DEDUP by expression: the saturation re-derives the same fact (three copies of one
 			// ∨-premise = three case-split candidates burning the split budget — t86)
@@ -928,11 +944,16 @@ ruResidualFallback(memo : Maybe<RuResidualMemo>, math : RuMath, env : RuEnv, stm
 			// near-gate certificates once turned a 7-min article run into 6.5h).
 			tryHilb = \idxs : [int], atomGate : int -> {
 				exps = map(idxs, \i -> premiseExps2[i]);
+				// the setness side channel: premises not already in the subset, as pool leaves
+				// numbered from length(exps) upward (the remap array is extended to match).
+				poolIdxs = filter(setnessIdxs, \i -> !contains(idxs, i));
+				pool = ruSetnessPoolOf(mapi(poolIdxs, \j, i -> Pair(premiseExps2[i], length(exps) + j)), stmtClass);
 				natoms = sizeTree(fold(arrayPush(exps, goal), ruPAtomNodes(conn, goal), \acc, e -> mergeTree(acc, ruPAtomNodes(conn, e))));
 				if (natoms > atomGate || ruTimeIsOver(fbTimer)) None()
-				else maybeMap(ruHilbertPropProofTimed(em, conn, wff, stmtClass, exps, goal, ruTimeLeft(fbTimer),
-						Some(ruInAtomCongsCached(math))),
-					\pr -> RuRefineResult(spliceAll(ruInRemapLeaves(pr.first, idxs)), mergeSets(hypDisjs2, pr.second.disjs)));
+				else maybeMap(ruHilbertPropProofTimedPool(em, conn, wff, stmtClass, exps, goal, ruTimeLeft(fbTimer),
+						Some(ruInAtomCongsCached(math)), pool),
+					\pr -> RuRefineResult(spliceAll(ruInRemapLeaves(pr.first, concat(idxs, poolIdxs))),
+						mergeSets(hypDisjs2, pr.second.disjs)));
 			};
 			switch (tryHilb(subset, 24)) {
 				Some(r): Some(r);

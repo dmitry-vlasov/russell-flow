@@ -47,7 +47,7 @@ export {
 		splitBudget : ref int, globalSplits : ref int, disjs : ref Set<RuDisj>, freshVars : ref [RuVar], em : RuEnvMath,
 		timer : RuTimer, fo : Maybe<Tree<int, [RuInAtomCong]>>, inClash : ref bool,
 		exElims : ref int, exSeen : ref Set<string>, exElimsGlobal : ref int, exNoMatch : ref Set<string>,
-		topFo : bool, setPool : Tree<string, RuProofTree>);
+		topFo : bool, setPool : Tree<string, RuProofTree>, setMemo : ref Tree<string, Maybe<RuProofTree>>);
 	// `wff` (the wff type id) and `stmtClass` (the |- turnstile id) MUST come from the loaded math — derive
 	// them from a real expression (ruIdType2Type of a connective node / the prop's class), never from the
 	// memoized ruIdWff/ruIdTurnstile helpers (they cache -1 if interned before the library loads).
@@ -62,6 +62,11 @@ export {
 	// (returns None) once the deadline passes. Callers with their own slice discipline use this.
 	// `fo` = Some(atom-congruence table) turns on the per-branch equality transport.
 	ruHilbertPropProofTimed(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, limit_ms : double, fo : Maybe<Tree<int, [RuInAtomCong]>>) -> Maybe<Pair<RuProofTree, RuVarsDisjs>>;
+	// ruHilbertPropProofTimed + an EXTERNAL setness pool: `T ∈ _V` facts that are NOT certificate
+	// hyps (the relevance filter drops them — they share no atom with the goal) but must still be
+	// available as the induction base of the hyp-carrying membership biconds at class metavars.
+	// Their proof leaves are the caller's, so no atom is added to the exponential check.
+	ruHilbertPropProofTimedPool(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, limit_ms : double, fo : Maybe<Tree<int, [RuInAtomCong]>>, pool : Tree<string, RuProofTree>) -> Maybe<Pair<RuProofTree, RuVarsDisjs>>;
 	// ruHilbertPropProofTimed + one TOP-LEVEL transport round over the certificate hyps
 	// (the unifier-gen t85 class: the driving equality is a top-level fact, not a branch
 	// assumption, so the per-branch transport never sees it). Kept out of the full-stack
@@ -84,19 +89,23 @@ ruHilbertPropProof(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass :
 }
 
 ruHilbertPropProofTimed(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, limit_ms : double, fo : Maybe<Tree<int, [RuInAtomCong]>>) -> Maybe<Pair<RuProofTree, RuVarsDisjs>> {
-	ruHilbertPropProofTimed0(em, conn, wff, stmtClass, hyps, goal, limit_ms, fo, false);
+	ruHilbertPropProofTimed0(em, conn, wff, stmtClass, hyps, goal, limit_ms, fo, false, makeTree());
+}
+
+ruHilbertPropProofTimedPool(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, limit_ms : double, fo : Maybe<Tree<int, [RuInAtomCong]>>, pool : Tree<string, RuProofTree>) -> Maybe<Pair<RuProofTree, RuVarsDisjs>> {
+	ruHilbertPropProofTimed0(em, conn, wff, stmtClass, hyps, goal, limit_ms, fo, false, pool);
 }
 
 ruHilbertPropProofTimedTop(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, limit_ms : double, fo : Maybe<Tree<int, [RuInAtomCong]>>) -> Maybe<Pair<RuProofTree, RuVarsDisjs>> {
-	ruHilbertPropProofTimed0(em, conn, wff, stmtClass, hyps, goal, limit_ms, fo, true);
+	ruHilbertPropProofTimed0(em, conn, wff, stmtClass, hyps, goal, limit_ms, fo, true, makeTree());
 }
 
-ruHilbertPropProofTimed0(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, limit_ms : double, fo : Maybe<Tree<int, [RuInAtomCong]>>, topFo : bool) -> Maybe<Pair<RuProofTree, RuVarsDisjs>> {
+ruHilbertPropProofTimed0(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], goal : RuExp, limit_ms : double, fo : Maybe<Tree<int, [RuInAtomCong]>>, topFo : bool, extPool : Tree<string, RuProofTree>) -> Maybe<Pair<RuProofTree, RuVarsDisjs>> {
 	atomNodes = fold(hyps, ruPAtomNodes(conn, goal), \acc, h -> mergeTree(acc, ruPAtomNodes(conn, h)));
 	hypForms  = map(hyps, \h -> ruPAtomize(conn, h));
 	goalForm  = ruPAtomize(conn, goal);
 	ctx = RuHCtx(ruHCtx(em, wff, stmtClass, atomNodes) with timer = ruMakeLimitedTimer(limit_ms), fo = fo, topFo = topFo,
-		setPool = ruSetnessPoolOf(mapi(hyps, \i, h -> Pair(h, i)), stmtClass));
+		setPool = mergeTree(ruSetnessPoolOf(mapi(hyps, \i, h -> Pair(h, i)), stmtClass), extPool));
 	// NB a split-budget lift for plan-backed (topFo) calls was TRIED AND MEASURED
 	// OUT (2026-07-24): although no or-split picks a refutable-branch wrong, the
 	// DFS still wanders 64-deep into SHAPE-GAP subtrees (e.g. iff-congruence over
@@ -106,6 +115,10 @@ ruHilbertPropProofTimed0(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtC
 	// ([[mizar-fidelity-budgets]]).
 	if (em.env.conf.verbose >= 5) {
 		em.env.out.println("      hCert: goal=" + ruHFormShape(goalForm) + " hyps=" + strGlue(map(hypForms, ruHFormShape), " ; "));
+		if (em.env.conf.verbose >= 6) {
+			em.env.out.println("        hCertGoal: " + ru2s(goal, em.math));
+			iter(hyps, \h -> em.env.out.println("        hCertHyp: " + ru2s(h, em.math)));
+		} else {};
 	} else {};
 	maybeMap(ruHilbertProve(ctx, hypForms, goalForm), \tree ->
 		Pair(tree, RuVarsDisjs(fold(^(ctx.freshVars), makeTree(), \acc, v -> setTree(acc, v.id, v)), ^(ctx.disjs))));
@@ -153,7 +166,7 @@ ruHFormShape(f : RuPForm) -> string {
 ruHCtx(em : RuEnvMath, wff : int, stmtClass : int, atomNodes : Tree<string, [RuExpNode]>) -> RuHCtx {
 	RuHCtx(ruPConnectives(), wff, stmtClass, ref atomNodes, ref 6, ref 400, ref makeSet(), ref [], em,
 		ruMakeLimitedTimer(60000.0), None(), ref false, ref 3, ref makeSet(), ref 16, ref makeSet(), false,
-		makeTree());
+		makeTree(), ref makeTree());
 }
 
 // ---- RuPForm -> RuExp / RuStmt (own copy; mirrors the kalmar pattern, no kalmar dependency) ----
@@ -278,9 +291,22 @@ ruHMembUnfold(ctx : RuHCtx, e : RuExp, set : RuExp) -> Maybe<Triple<RuPForm, str
 	// the HYP-CARRYING twin (elpw/elsn: A ∈ _V ⊢ bicond) with the setness discharged
 	// from the certificate's own setness facts (the pool) or the mechanical registry.
 	// elun/elin/eldif are class-general and need no setness.
-	setnessOf = \ -> if (ruHPlainSetvar(e)) None()
-		else ruSetnessProofPool(ruSetnessRegistry(ctx.em.math), ctx.setPool, e,
-			ctx.stmtClass, ctx.em.math, ctx.em.env, 8);
+	// MEMOIZED per certificate: the recursive setness prover runs at every unfold attempt, and
+	// the same handful of terms recur down the whole emitter recursion — with the pool making
+	// class-metavar setness PROVABLE, the uncached scans measurably slow big certificates
+	// (t19 needed 60 s instead of 10 s).
+	setnessOf = \ -> if (ruHPlainSetvar(e)) None() else {
+		key = ruUKey(e);
+		switch (lookupTree(^(ctx.setMemo), key)) {
+			Some(m): m;
+			None(): {
+				m = ruSetnessProofPool(ruSetnessRegistry(ctx.em.math), ctx.setPool, e,
+					ctx.stmtClass, ctx.em.math, ctx.em.env, 8);
+				ctx.setMemo := setTree(^(ctx.setMemo), key, m);
+				m;
+			}
+		}
+	};
 	if (h == s2id_("cun"))       { a = ruEqArgs(set); Some(Triple(RuPOr(memb(a.first), memb(a.second)), "elun", [])); }
 	else if (h == s2id_("cin"))  { a = ruEqArgs(set); Some(Triple(RuPAnd(memb(a.first), memb(a.second)), "elin", [])); }
 	else if (h == s2id_("cdif")) { a = ruEqArgs(set); Some(Triple(RuPAnd(memb(a.first), RuPNot(memb(a.second))), "eldif", [])); }
