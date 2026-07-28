@@ -48,6 +48,7 @@ setup_sandbox() {
 
 run_article() {   # <article> <off> <tl> [par]   (stage slices via env: DCMS/MZMS/EQMS)
 	local article="$1" off="$2" tl="$3" par="${4:-0}"
+	local run_t0=$(date +%s)
 	# PREFLIGHT: the stage slices are wall-clock, so outer CPU load silently
 	# eats theorems (a loaded run reads as a tail of unattempted theorems).
 	# Record the environment INTO the result so every number carries its
@@ -67,6 +68,7 @@ run_article() {   # <article> <off> <tl> [par]   (stage slices via env: DCMS/MZM
 		tac="${TAC:-generators-first}" cl="${CL:-0}" \
 		dcms="${DCMS:-4500}" mzms="${MZMS:-1500}" eqms="${EQMS:-1000}" 2>&1)"
 	if [ -n "${MLOG:-}" ]; then printf '%s\n' "$out" > "$MLOG"; fi
+	echo "DURATION [$article off=$off cl=${CL:-0}]: $(( $(date +%s) - run_t0 )) s"
 	local open verify total
 	open="$(grep -oP 'open theorems -> axioms: \K[0-9]+' <<<"$out" || echo '?')"
 	verify="$(grep -oP 'Russell verify \(all proofs valid\): \K\w+' <<<"$out" || echo '?')"
@@ -81,6 +83,23 @@ case "${1:-}" in
 		off="${2:-1}"; tl="${3:-10s}"; par="${4:-0}"
 		echo "== hermetic measurement, off=$off (1 = general path only), tl=$tl, par=$par"
 		for a in "${CHAIN[@]}"; do run_article "$a" "$off" "$tl" "$par"; done
+		;;
+	--subset)
+		# FAST TIER: prove a fixed theorem subset (one probe each, ~12-25s/theorem)
+		# — the iteration gate; the full article gate is the COMMIT gate only.
+		article="${2:?article}"; thlist="${3:?comma-separated theorems}"; off="${4:-1}"
+		sub_t0=$(date +%s)
+		ok=0; n=0
+		for th in $(echo "$thlist" | tr ',' ' '); do
+			n=$((n+1))
+			setup_sandbox
+			r="$(RUSSELL_MATH="$SANDBOX" "$RUSSELL_BIN" no-server=1 mem=16g \
+				test/prover/mizar/general_probe module="$article" target="$th" off="$off" v=1 thr=0 cl="${CL:-0}" 2>&1 \
+				| grep -c '^prove: 1/1' || true)"
+			if [ "$r" = "1" ]; then ok=$((ok+1)); echo "  + $th"; else echo "  - $th"; fi
+		done
+		echo "SUBSET [$article off=$off cl=${CL:-0}]: $ok/$n proved"
+		echo "DURATION [subset $article]: $(( $(date +%s) - sub_t0 )) s"
 		;;
 	--probe)
 		article="${2:?article}"; theorem="${3:?theorem}"; off="${4:-1}"; v="${5:-1}"; thr="${6:-0}"

@@ -36,13 +36,19 @@ mmCommExtractVars = RuComm(
 	}
 );
 
-mmSourcesExtractVars(sources : Tree<int, MmSource>, shorten_vars : bool, env : RuEnv) -> Tree<int, MmSource> {
+mmSourcesExtractVars(sources0 : Tree<int, MmSource>, shorten_vars : bool, env : RuEnv) -> Tree<int, MmSource> {
+	// TYPE-COLLIDED VAR DISAMBIGUATION (the class-loci export blocker): one
+	// variable symbol may appear setvar-typed in one assertion and class-typed
+	// in another (CL=1 loci); Metamath forbids two active $f for one symbol in
+	// the GLOBAL var block this refactor builds. Rename every typed instance of
+	// a collided symbol to <var>_<type>, per assertion (inside one frame a
+	// symbol has exactly one type, so whole-assertion renaming is sound; proofs
+	// reference labels, not symbols). No collisions -> sources unchanged.
+	sources = mmDisambiguateVarTypes(sources0, env);
 	decls = mmSources2structs(sources);
 	assertions = mmAssertions(sources);
 	vars = mmAllVars(sources, env);
 	vars_names = mmAllVarIds(vars, env);
-
-	println("containsSet(vars_names, s2id(x-setvar-class)) (1): " + b2s(containsSet(vars_names, s2id("x-setvar-class"))));
 
 	vars_labels = if (shorten_vars) {
 		mmVarsShortRelabling(vars, assertions, decls.consts, env);
@@ -483,4 +489,56 @@ mmVarTypeShortLabelsHaveCollision(relabling : Tree<int, int>, vars : [MmFloating
 	vars_collision = sizeSet(buildSet(getTreeValues(relabling))) < length(vars);
 	labels_collision = exists(getTreeValues(relabling), \lab -> containsSet(labels, lab));
 	vars_collision || labels_collision;
+}
+
+
+// rename type-collided variable symbols per assertion (see mmSourcesExtractVars)
+mmDisambiguateVarTypes(sources : Tree<int, MmSource>, env : RuEnv) -> Tree<int, MmSource> {
+	// var symbol -> the set of $f types it occurs with, over all assertions
+	varTypes = foldTree(sources, makeTree(), \__, src, acc0 ->
+		fold(src.decls, acc0, \acc, decl -> switch (decl) {
+			MmAssertion(__,__,__, hyps, inner, __):
+				fold(concat(hyps, inner), acc, \a, hyp -> switch (hyp) {
+					MmFloating(__, tp, v): setTree(a, v, insertSet(lookupTreeDef(a, v, makeSet()), tp));
+					MmEssential(__, __): a;
+				});
+			MmFloating(__, tp, v): setTree(acc, v, insertSet(lookupTreeDef(acc, v, makeSet()), tp));
+			default: acc;
+		}));
+	collided = foldTree(varTypes, makeSet(), \v, tps, acc ->
+		if (sizeSet(tps) > 1) insertSet(acc, v) else acc);
+	if (isEmptySet(collided)) sources
+	else {
+		env.out.println("mm export: disambiguating " + i2s(sizeSet(collided))
+			+ " type-collided variable symbol(s): "
+			+ strGlue(map(set2array(collided), id2s), " "));
+		typed = \v : int, tp : int -> s2id(id2s(v) + "_" + id2s(tp));
+		mapTree(sources, \src -> MmSource(src with decls = map(src.decls, \decl -> switch (decl) {
+			MmAssertion(comm, disjs, outer, hyps, inner, stat): {
+				local = fold(concat(hyps, inner), makeTree(), \a, hyp -> switch (hyp) {
+					MmFloating(__, tp, v):
+						if (containsSet(collided, v)) setTree(a, v, typed(v, tp)) else a;
+					MmEssential(__, __): a;
+				});
+				if (isEmptyTree(local)) decl
+				else {
+					rn = \sym : int -> lookupTreeDef(local, sym, sym);
+					rnHyp = \hyp : MmHyp -> switch (hyp) {
+						MmFloating(l, tp, v): MmFloating(l, tp, rn(v));
+						MmEssential(l, ex): MmEssential(l, MmExp(map(ex.symbs, rn)));
+					};
+					rnStat = \st : MmStat -> switch (st) {
+						MmAxiomatic(l, ex): MmAxiomatic(l, MmExp(map(ex.symbs, rn)));
+						MmProvable(l, ex, pf): MmProvable(l, MmExp(map(ex.symbs, rn)), pf);
+					};
+					MmAssertion(comm,
+						map(disjs, \d -> MmDisj(map(d.vars, rn))),
+						outer, map(hyps, rnHyp), map(inner, rnHyp), rnStat(stat));
+				}
+			}
+			MmFloating(l, tp, v):
+				if (containsSet(collided, v)) MmFloating(l, tp, typed(v, tp)) else decl;
+			default: decl;
+		})));
+	}
 }
