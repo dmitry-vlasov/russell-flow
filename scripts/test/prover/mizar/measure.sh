@@ -94,7 +94,7 @@ case "${1:-}" in
 			n=$((n+1))
 			setup_sandbox
 			r="$(RUSSELL_MATH="$SANDBOX" "$RUSSELL_BIN" no-server=1 mem=16g \
-				test/prover/mizar/general_probe module="$article" target="$th" off="$off" v=1 thr=0 cl="${CL:-0}" tl="${TL:-10s}" 2>&1 \
+				test/prover/mizar/general_probe module="$article" target="$th" off="$off" v=1 thr=0 cl="${CL:-0}" tl="${TL:-10s}" declines="${DECL:-0}" 2>&1 \
 				| grep -c '^prove: 1/1' || true)"
 			if [ "$r" = "1" ]; then ok=$((ok+1)); echo "  + $th"; else echo "  - $th"; fi
 		done
@@ -105,7 +105,7 @@ case "${1:-}" in
 		article="${2:?article}"; theorem="${3:?theorem}"; off="${4:-1}"; v="${5:-1}"; thr="${6:-0}"
 		setup_sandbox
 		RUSSELL_MATH="$SANDBOX" "$RUSSELL_BIN" no-server=1 mem=16g \
-			test/prover/mizar/general_probe module="$article" target="$theorem" off="$off" v="$v" thr="$thr" cl="${CL:-0}" tl="${TL:-10s}"
+			test/prover/mizar/general_probe module="$article" target="$theorem" off="$off" v="$v" thr="$thr" cl="${CL:-0}" tl="${TL:-10s}" declines="${DECL:-0}"
 		;;
 	"" | -h | --help)
 		sed -n '2,30p' "${BASH_SOURCE[0]}"

@@ -1,0 +1,84 @@
+import base/env;
+import base/conf;
+import ds/tree;
+
+// THE DECLINATION LOG (`declines=1`).
+//
+// Every gate in the prover — a shape test, a setness discharge, a candidate filter, a premise
+// selector — answers "no" silently. That is right for the search, and wrong for the engineer: a
+// theorem that fails leaves no record of WHICH gate refused it, so finding the cause means adding
+// a print, rebuilding, re-running and reading a 100k-line trace. Six fixes in the class-loci
+// campaign were one-line shape gates found exactly that way, at roughly an hour of archaeology
+// each.
+//
+// With `declines=1` every such refusal records (site, reason, subject). The prove command prints
+// the grouped report after a FAILED theorem. Off by default and gated at the call site, so a
+// normal run pays one boolean test per decline.
+//
+// It is a process-global ref on purpose: the sites are deep inside pure recursions (the emitter,
+// the substitution chain, the unfold scan) and threading a log through them would change dozens of
+// signatures for a diagnostic. Same pattern as the registry caches. Single-theorem probes are the
+// intended use; under `par=N` the entries of concurrent theorems interleave, which is why the
+// report names the theorem it was reset for.
+
+export {
+	// is the log on? (conf opt `declines=1`)
+	ruDeclinesOn(env : RuEnv) -> bool;
+	// record one refusal: WHERE it happened, WHY, and WHAT was refused
+	ruDecline(env : RuEnv, site : string, reason : string, subject : string) -> void;
+	// start a fresh log for `owner` (a theorem id) — called per theorem by the prove loop
+	ruDeclineReset(owner : string) -> void;
+	// the grouped report: counts per (site, reason) with example subjects, most frequent first
+	ruDeclineReport(owner : string) -> string;
+	// how many refusals are recorded
+	ruDeclineCount() -> int;
+}
+
+// (site, reason) -> (count, up to 3 example subjects)
+RuDeclEntry(count : int, examples : [string]);
+
+ruDeclOwner : ref string = ref "";
+ruDeclLog : ref Tree<string, RuDeclEntry> = ref makeTree();
+ruDeclTotal : ref int = ref 0;
+
+// hard cap: a runaway scan must not turn the diagnostic into the cost bomb it is meant to find
+ruDeclCap = 20000;
+
+ruDeclinesOn(env : RuEnv) -> bool {
+	ruOptsString(env.conf.opts, "declines", "") == "1";
+}
+
+ruDeclineReset(owner : string) -> void {
+	ruDeclOwner := owner;
+	ruDeclLog := makeTree();
+	ruDeclTotal := 0;
+}
+
+ruDecline(env : RuEnv, site : string, reason : string, subject : string) -> void {
+	if (^ruDeclTotal >= ruDeclCap) {} else {
+		ruDeclTotal := ^ruDeclTotal + 1;
+		key = site + " | " + reason;
+		e = lookupTreeDef(^ruDeclLog, key, RuDeclEntry(0, []));
+		ruDeclLog := setTree(^ruDeclLog, key,
+			RuDeclEntry(e.count + 1,
+				if (length(e.examples) >= 3 || exists(e.examples, \x -> x == subject)) e.examples
+				else arrayPush(e.examples, subject)));
+	}
+}
+
+ruDeclineCount() -> int { ^ruDeclTotal }
+
+ruDeclineReport(owner : string) -> string {
+	rows = map(tree2pairs(^ruDeclLog), \p -> Pair(p.first, p.second));
+	sorted = mergeSort(rows, \a, b -> b.second.count - a.second.count);
+	if (sorted == []) "  declines: none recorded for " + owner
+	else "  DECLINES for " + owner + " (" + i2s(^ruDeclTotal) + " total"
+		+ (if (^ruDeclTotal >= ruDeclCap) ", CAPPED" else "") + "):\n"
+		+ strGlue(map(sorted, \r ->
+			"    " + ruDeclPad(i2s(r.second.count), 5) + "  " + r.first
+			+ strGlue(map(r.second.examples, \x -> "\n             " + x), "")), "\n");
+}
+
+ruDeclPad(s : string, n : int) -> string {
+	if (strlen(s) >= n) s else ruDeclPad(" " + s, n);
+}
