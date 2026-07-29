@@ -89,7 +89,7 @@ ruInRemapLeaves(t : RuProofTree, subset : [int]) -> RuProofTree {
 	// The orthogonal Checker phases, as refiners, + the name registry that `refine(...)` resolves against.
 	// `nnf` toggles De Morgan in the eq-rewrite canon pass (checker tries false then true). `precedes(aid)`
 	// = does assertion aid precede the theorem — eq-rewrite uses it to decline precedence-violating guides.
-	ruStripForallRefiner(stmtClass : int, precedes : (int) -> bool) -> RuRefiner;
+	ruStripForallRefiner(stmtClass : int, precedes : (int) -> bool, setTerms : Set<string>) -> RuRefiner;
 	ruEqRewriteRefiner(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], nnf : bool, precedes : (int) -> bool) -> RuRefiner;
 	ruRefinerByName(name : string, em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], nnf : bool, precedes : (int) -> bool) -> Maybe<RuRefiner>;
 	ruRefinerNames() -> [string];
@@ -1028,7 +1028,7 @@ ruResidualFallback(memo : Maybe<RuResidualMemo>, math : RuMath, env : RuEnv, stm
 
 // Phase 1: strip the leading ∀-chain; validation re-quantifies the matrix proof with ax-gen. Declines
 // (no strip) if there is a ∀ but ax-gen does not precede the theorem — the guide would be invalid.
-ruStripForallRefiner(stmtClass : int, precedes : (int) -> bool) -> RuRefiner {
+ruStripForallRefiner(stmtClass : int, precedes : (int) -> bool, setTerms : Set<string>) -> RuRefiner {
 	RuRefiner("strip-forall", \goal -> {
 		sp = ruStripForall(goal);   // (matrix, [the quantified levels, innermost first])
 		if (sp.second != [] && !precedes(s2id_("ax-gen")))
@@ -1042,7 +1042,7 @@ ruStripForallRefiner(stmtClass : int, precedes : (int) -> bool) -> RuRefiner {
 		// un-reduced goal — the saturation in the residual can often decide `x = y` directly from
 		// the instantiated literal set (zfmisc t15: ¬((x5=x5) ∧ ¬(x5=x8)) + x5=x5 ⊢ x5=x8).
 		// Shape-gated, so the extra residual run is paid only where the literal route exists.
-		\goal -> if (ruEqHead(goal) == s2id("wceq") && ruRelIsSetvarEq(goal))
+		\goal -> if (ruEqHead(goal) == s2id("wceq") && ruRelIsSetvarEqIn(goal, setTerms))
 			Some(RuRefineStep([goal], \proofs -> proofs[0], makeSet()))
 		else None());
 }
@@ -1071,7 +1071,7 @@ ruEqRewriteRefiner(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass :
 		{
 			hypFormsC : ref [[RuExp]] = ref [];
 			\goal -> {
-				svEq = ruEqHead(goal) == s2id("wceq") && ruRelIsSetvarEq(goal);
+				svEq = ruEqHead(goal) == s2id("wceq") && ruRelIsSetvarEqIn(goal, ruRelSetTerms(hyps));
 				hypForms = if (^hypFormsC != []) (^hypFormsC)[0] else {
 					hf = map(hyps, \h -> (ruEqualizerRewrite(em, conn, wff, stmtClass, [], h, nnf, precedes,
 						ruSetnessPoolOf(mapi(hyps, \i, h2 -> Pair(h2, i)), stmtClass))).residual);
@@ -1089,11 +1089,29 @@ ruEqRewriteRefiner(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass :
 // ssriv/eqriv to a fresh-setvar membership subgoal `(v∈A)→(v∈B)` / `(v∈A)↔(v∈B)`, which then flows to
 // eq-rewrite (membership unfold) + the bounded BFS closer — no Kalmár, so proofs stay small. Non-
 // Both sides of this `=` are setvars (each a class coercion of a setvar variable)?
-ruRelIsSetvarEq(goal : RuExp) -> bool {
+// Is the goal an ATOM equality — one the literal set can decide directly, as opposed to a
+// set-level equality that wants extensionality? Both sides must be a coerced setvar, or (the
+// class-loci spelling of the same thing) a class metavar the theorem DECLARES AS A SET via its
+// own `T ∈ _V` hypothesis. Without the class arm the alternative below never fires at class
+// loci and the pointwise reduction is irreversible (t130: the `trivial` instance concludes the
+// literal `x5 = x8`, which the extensionality form can no longer use).
+ruRelIsSetvarEqIn(goal : RuExp, setTerms : Set<string>) -> bool {
 	setvarT = tp2id_("setvar");
+	clsT = tp2id_("class");
 	sides = ruEqArgs(goal);
-	isSv = \e : RuExp -> length(e.nodes) == 2 && (switch (e.nodes[1]) { RuVar(__, tp): tp == setvarT; RuRuleNode(__, __): false; });
+	isSv = \e : RuExp ->
+		(length(e.nodes) == 2 && (switch (e.nodes[1]) { RuVar(__, tp): tp == setvarT; RuRuleNode(__, __): false; }))
+		|| (length(e.nodes) == 1 && (switch (e.nodes[0]) { RuVar(__, tp): tp == clsT; RuRuleNode(__, __): false; })
+			&& containsSet(setTerms, ruUKey(e)));
 	isSv(sides.first) && isSv(sides.second);
+}
+
+// the terms a hyp list declares as sets (`T ∈ _V`), keyed structurally
+ruRelSetTerms(hyps : [RuExp]) -> Set<string> {
+	fold(hyps, makeSet(), \acc, h -> switch (ruUSetnessHyp(h, s2id("wcel"), s2id("cvv"))) {
+		None(): acc;
+		Some(t): insertSet(acc, ruUKey(t));
+	});
 }
 
 // relation goals pass through unchanged. This unlocks the ⊆/= gaps the prop-only residual can't.
@@ -1124,7 +1142,7 @@ ruRelIntroRefiner(em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : 
 		// congruence closure chains them to the goal (the t5-class: {x5}={x9,x10} ⊢ x9=x10). The
 		// pointwise reduction is BACKWARDS for this class: it needs the equality it is trying to
 		// prove. Same shape gate as eq-rewrite's alt, so the extra residual run stays rare.
-		\goal -> if (ruEqHead(goal) == s2id("wceq") && ruRelIsSetvarEq(goal))
+		\goal -> if (ruEqHead(goal) == s2id("wceq") && ruRelIsSetvarEqIn(goal, ruRelSetTerms(hyps)))
 			Some(RuRefineStep([goal], \proofs -> proofs[0], makeSet()))
 		else None());
 }
@@ -1169,7 +1187,7 @@ ruRebuildConj(pm32i : int, stmtClass : int, conn : RuPConnectives, goal : RuExp,
 // Resolve a refiner NAME (a `refine(...)` argument) to its RuRefiner. `nnf` toggles De Morgan in the
 // eq-rewrite canon pass (the checker tries nnf=false then nnf=true).
 ruRefinerByName(name : string, em : RuEnvMath, conn : RuPConnectives, wff : int, stmtClass : int, hyps : [RuExp], nnf : bool, precedes : (int) -> bool) -> Maybe<RuRefiner> {
-	if (name == "strip-forall") Some(ruStripForallRefiner(stmtClass, precedes))
+	if (name == "strip-forall") Some(ruStripForallRefiner(stmtClass, precedes, ruRelSetTerms(hyps)))
 	else if (name == "conj-split") Some(ruConjSplitRefiner(conn, stmtClass, hyps, precedes))
 	else if (name == "rel-intro") Some(ruRelIntroRefiner(em, conn, wff, stmtClass, hyps, precedes))
 	else if (name == "eq-rewrite") Some(ruEqRewriteRefiner(em, conn, wff, stmtClass, hyps, nnf, precedes))
