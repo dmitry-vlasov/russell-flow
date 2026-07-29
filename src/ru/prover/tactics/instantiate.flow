@@ -887,7 +887,8 @@ ruInForallInstTermH(math : RuMath, env : RuEnv, stmtClass : int, fexp : RuExp, t
 					RuRuleNode(idT, al): if (ruArityLen2Arity(al) == 1 && ruIdType2Type(idT) == tp2id_("class") && bn[i + 1] == x) i else ci;
 				});
 			if (coerceIdx < 0 || exists(ruInVarsOf(t), \u -> u.id == xVar.id)) {
-				if (env.conf.verbose > 3) env.out.println("      itdbg: coerce/varclash") else {};
+				if (env.conf.verbose > 3) env.out.println("      itdbg: coerce/varclash coerceIdx=" + i2s(coerceIdx)
+					+ " x=" + id2s(xVar.id) + " t=" + ru2s(t, math) + " body=" + ru2s(body, math)) else {};
 				None();
 			} else {
 				xC = RuExp([bn[coerceIdx], x], -1);
@@ -1260,6 +1261,95 @@ ruInPredInstances(math : RuMath, env : RuEnv, stmtClass : int,
 	}
 }
 
+// CLASS-ARGUMENT predicate instances (the class-loci twin of ruInPredInstances): with Mizar
+// loci translated as CLASS metavars, `trivial x16` has a class argument, so the setvar path
+// above declines — sp strips a ∀ only at a setvar. Here every ∀ level (the definition's own
+// prefix AND the RHS binders) is stripped by the CLASS-TERM chain instead (spcv + the subst
+// chain + setness from the pool, ruInForallInstTermH), which is the same instantiation the
+// rest of the saturation uses for class terms. Same caps as the setvar path.
+ruInPredInstancesClass(math : RuMath, env : RuEnv, stmtClass : int,
+	hyps : [Pair<RuProofTree, RuExp>], cands : [RuExp], pool : Tree<string, RuProofTree>)
+	-> Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>> {
+	reg = ruPredRegistry(math);
+	if (isEmptyTree(reg)) Pair([], makeSet()) else {
+		walId = s2id("wal");
+		// every var id the problem already mentions — the fresh binders must avoid all of them
+		used0 = fold(concat(map(hyps, \h -> h.second), cands), makeSet(), \a, e ->
+			fold(ruInVarsOf(e), a, \a2, v -> insertSet(a2, v.id)));
+		// strip one ∀ level at a class term: (fexp, proof) -> (instance, proof, disjs)
+		instAt = \cur : Triple<RuExp, RuProofTree, Set<RuDisj>>, t : RuExp -> {
+			if (ruInHead(cur.first) != walId) None()
+			else maybeMap(ruInForallInstTermH(math, env, stmtClass, cur.first, t, pool), \r ->
+				Triple(r.first,
+					RuProofStep(s2id_("ax-mp"), [cur.second, r.second], RuStmt(stmtClass, [r.first], -1)),
+					mergeSets(cur.third, r.third)));
+		};
+		instAll = \start : Triple<RuExp, RuProofTree, Set<RuDisj>>, ts : [RuExp] ->
+			fold(ts, Some(start), \ac, t -> maybeBind(ac, \c -> instAt(c, t)));
+		fold(hyps, Pair([], makeSet()), \acc, h -> {
+			if (length(acc.first) >= 6) acc else
+			switch (lookupTree(reg, ruInHead(h.second))) {
+				None(): acc;
+				Some(pu): {
+					args = ruInArgs(h.second);
+					// CLASS args only — the setvar path (ruInPredInstances) owns the rest
+					if (length(args) != length(pu.prefix) || args == []
+						|| forall(args, \a -> length(a.nodes) == 2)) acc
+					else {
+						// ALPHA-RENAME the definition's setvars first. The translator names a
+						// definition's loci after the Mizar locus, so d10's binder is literally
+						// `x16` — the SAME id as the theorem's class metavar x16 (and its RHS
+						// binder x5 = the metavar x5). Substitution is keyed by var id alone, so
+						// instantiating without renaming is a variable capture; the class-term
+						// chain refuses it (itdbg: coerce/varclash) and the whole definition was
+						// unreachable at CL=1.
+						renamed = {
+							vs = filter(ruInVarsOf(pu.prop), \v -> v.type == tp2id_("setvar"));
+							r = fold(vs, Pair(makeHashMap(idfn), used0), \ac, v -> {
+								f = ruInFreshSetvar(ac.second, tp2id_("setvar"), 0);
+								fE = RuExp([RuVar(f.id, f.type)], -1);
+								setHashMap(ac.first, v.id, RuSubExpr(v, fE, ruExpVarIdsHashSet(fE)));
+								Pair(ac.first, insertSet(ac.second, f.id));
+							});
+							ruApplySubst(pu.prop, RuSubst(r.first));
+						};
+						pf0 = RuProofStep(pu.lemmaId, [], RuStmt(stmtClass, [renamed], -1));
+						switch (instAll(Triple(renamed, pf0, makeSet()), args)) {
+							None(): acc;
+							Some(bi): {
+								biArgs = ruInArgs(bi.first);
+								if (ruInHead(bi.first) != s2id("wb") || length(biArgs) != 2
+									|| biArgs[0].nodes != h.second.nodes) acc
+								else {
+									// the premise gives the RHS: ∀v1..vm matrix
+									rhsPf = RuProofStep(s2id_("mpbi"), [h.first, bi.second],
+										RuStmt(stmtClass, [biArgs[1]], -1));
+									binders = (ruUStripWal(biArgs[1].nodes, [], walId)).first;
+									m = length(binders);
+									if (m < 1 || m > 2) acc else {
+										base = take(cands, 3);
+										tuples : [[RuExp]] = if (m == 1) map(base, \c -> [c])
+											else concatA(map(base, \c1 -> map(base, \c2 -> [c1, c2])));
+										fold(take(tuples, 6), acc, \ac2, tp ->
+											if (length(ac2.first) >= 6) ac2
+											else switch (instAll(Triple(biArgs[1], rhsPf, bi.third), tp)) {
+												None(): ac2;
+												Some(mx):
+													if (exists(ac2.first, \pr -> pr.first.nodes == mx.first.nodes)) ac2
+													else Pair(arrayPush(ac2.first, Pair(mx.first, mx.second)),
+														mergeSets(ac2.second, mx.third));
+											});
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		});
+	}
+}
+
 ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
 	hyps : [Pair<RuProofTree, RuExp>], goal : RuExp, cap : int) -> Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>> {
 	walId   = s2id("wal");
@@ -1282,6 +1372,10 @@ ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
 	exImps = ruInExGoalImps(math, env, stmtClass, goal, hyps, 4);
 	// (7) ∀-closed predicate definitions instantiated directly at candidate setvars (trivial-class)
 	predInsts = ruInPredInstances(math, env, stmtClass, hyps, ruInCandidates(goal, hyps, tp2id_("setvar"), cap));
+	// (7b) the CLASS-ARG twin (class-loci): `trivial x16` with x16 a class metavar — every ∀
+	// level stripped by the class-term chain instead of sp. Empty whenever no premise has a
+	// class-argument predicate atom, so the setvar world is untouched.
+	predInstsC = ruInPredInstancesClass(math, env, stmtClass, hyps, cands, satPool);
 	// (4) definitional enumeration memberships, (5) their transport across premise equalities
 	enumFacts = ruInEnumFacts(math, env, stmtClass, tabs, hyps, goal);
 	moved = ruInTransport(math, env, stmtClass, tabs, hyps, enumFacts);
@@ -1296,7 +1390,7 @@ ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
 	// normalization is pure cost).
 	pool0 = concat(filter(hyps, \h -> ruInHead(h.second) == walId && ruInArity(h.second) == 2), emp.first);
 	pool = mergeSort(pool0, \a, b -> length(a.second.nodes) - length(b.second.nodes));
-	if (pool == [] && eqlz == [] && exImps.first == [] && predInsts == []) Pair([], makeSet()) else {
+	if (pool == [] && eqlz == [] && exImps.first == [] && predInsts == [] && predInstsC.first == []) Pair([], makeSet()) else {
 	instantiateRound = \poolIn : [Pair<RuProofTree, RuExp>], acc0 : Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>> ->
 	fold(poolIn, acc0, \acc : Pair<[Pair<RuExp, RuProofTree>], Set<RuDisj>>, h -> {
 		pa = ruInArgs(h.second);
@@ -1365,7 +1459,7 @@ ruInSaturate(math : RuMath, env : RuEnv, stmtClass : int,
 	// instances (variables, singletons) and sheds the big-product tail. Without it the
 	// pool x candidates product multiplied the per-instance normalization cost and starved
 	// the general path's slices (zfmisc general 98 -> 92 when compounds landed uncapped).
-	Pair(concatA([eqlz, take(instAcc.first, 8), refl, exImps.first, predInsts]),
-		mergeSets(instAcc.second, exImps.second));
+	Pair(concatA([eqlz, take(instAcc.first, 8), refl, exImps.first, predInsts, predInstsC.first]),
+		mergeSets(mergeSets(instAcc.second, exImps.second), predInstsC.second));
 	}
 }
