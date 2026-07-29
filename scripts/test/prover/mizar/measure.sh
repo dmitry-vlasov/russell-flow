@@ -64,7 +64,7 @@ run_article() {   # <article> <off> <tl> [par]   (stage slices via env: DCMS/MZM
 	setup_sandbox
 	local out
 	out="$(RUSSELL_MATH="$SANDBOX" "$RUSSELL_BIN" no-server=1 mem=16g \
-		test/prover/mizar/general_only article="$article" off="$off" tl="$tl" par="$par" \
+		test/prover/mizar/general_only article="$article" off="$off" tl="$tl" par="$par" wu="${WU:-0}" \
 		tac="${TAC:-generators-first}" cl="${CL:-0}" \
 		dcms="${DCMS:-4500}" mzms="${MZMS:-1500}" eqms="${EQMS:-1000}" 2>&1)"
 	if [ -n "${MLOG:-}" ]; then printf '%s\n' "$out" > "$MLOG"; fi
@@ -94,7 +94,7 @@ case "${1:-}" in
 			n=$((n+1))
 			setup_sandbox
 			r="$(RUSSELL_MATH="$SANDBOX" "$RUSSELL_BIN" no-server=1 mem=16g \
-				test/prover/mizar/general_probe module="$article" target="$th" off="$off" v=1 thr=0 cl="${CL:-0}" tl="${TL:-10s}" declines="${DECL:-0}" 2>&1 \
+				test/prover/mizar/general_probe module="$article" target="$th" off="$off" v=1 thr=0 cl="${CL:-0}" tl="${TL:-10s}" declines="${DECL:-0}" wu="${WU:-0}" 2>&1 \
 				| grep -c '^prove: 1/1' || true)"
 			if [ "$r" = "1" ]; then ok=$((ok+1)); echo "  + $th"; else echo "  - $th"; fi
 		done

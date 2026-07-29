@@ -10,15 +10,39 @@ export {
 	// Current time in milliseconds.
 	ruTime() -> double;
 
+	// A BUDGET. Historically wall-clock only: `started` + `limit` ms. A wall-clock budget makes
+	// every result depend on machine load and temperature — theorems near the budget flip between
+	// runs, so a real regression cannot be told from noise without a cooled repeat, and each
+	// repeat costs a full article run.
+	//
+	// `work`/`workLimit` are the deterministic alternative: the prover TICKS the budget at its
+	// real units of work (an emitter proof attempt, a search expansion, a forward fact), and the
+	// budget expires after a fixed number of them regardless of the clock. Switched on globally by
+	// ruSetWorkUnitsPerSec(u) — every budget of `ms` milliseconds then becomes `ms * u / 1000`
+	// work units and the CLOCK IS IGNORED, so the same jar on the same input gives the same
+	// answer on a loaded machine as on an idle one.
 	RuTimer(
-		started : double, // The time when timer was created.
-		limit   : double  // The time limit for the timer.
+		started   : double,   // The time when timer was created.
+		limit     : double,   // The wall-clock limit in ms (-1 = none).
+		work      : ref int,  // Work units consumed on this budget.
+		workLimit : int       // The work-unit limit (-1 = none, then the wall limit governs).
 	);
 
 	// Unlimited timer
 	ruMakeTimer() -> RuTimer;
 	// Timer with a limit
 	ruMakeLimitedTimer(limit : double) -> RuTimer;
+
+	// WORK-UNIT MODE: u > 0 converts every subsequent budget from wall-clock ms to work units at
+	// `u` units per second of nominal budget, and stops the clock being consulted. u = 0 restores
+	// wall-clock budgets. Process-global on purpose — it is a measurement mode, set once at
+	// startup from the `work-units` option, exactly like ruStartTime.
+	ruSetWorkUnitsPerSec(u : int) -> void;
+	ruWorkUnitsPerSec() -> int;
+	// Spend `n` units on this budget. Free (one ref read) when work mode is off.
+	ruWorkTick(timer : RuTimer, n : int) -> void;
+	// Units spent on this budget so far.
+	ruWorkSpent(timer : RuTimer) -> int;
 
 	ruTimeIsOver(timer : RuTimer) -> bool;
 	ruTimeLeft(timer : RuTimer) -> double;
@@ -34,22 +58,45 @@ ruTime() -> double {
 	timestamp()
 }
 
+ruWorkUnits : ref int = ref 0;
+
+ruSetWorkUnitsPerSec(u : int) -> void { ruWorkUnits := u; }
+ruWorkUnitsPerSec() -> int { ^ruWorkUnits }
+
 ruMakeTimer() -> RuTimer {
-	RuTimer(ruTime(), -1.0);
+	RuTimer(ruTime(), -1.0, ref 0, -1);
 }
 
 ruMakeLimitedTimer(limit : double) -> RuTimer {
-	RuTimer(ruTime(), limit);
+	u = ^ruWorkUnits;
+	if (u <= 0) RuTimer(ruTime(), limit, ref 0, -1)
+	else if (limit < 0.0) RuTimer(ruTime(), -1.0, ref 0, -1)
+	// the wall limit is dropped (-1): in work mode the clock must not decide anything
+	else RuTimer(ruTime(), -1.0, ref 0, max(1, round(limit * i2d(u) / 1000.0)));
 }
+
+ruWorkTick(timer : RuTimer, n : int) -> void {
+	if (timer.workLimit < 0) {} else timer.work := ^(timer.work) + n;
+}
+
+ruWorkSpent(timer : RuTimer) -> int { ^(timer.work) }
 
 ruTimeIsOver(timer : RuTimer) -> bool {
-	if (timer.limit == -1.0) false else 
-	(ruTime() - timer.started) > timer.limit;
+	if (timer.workLimit >= 0) ^(timer.work) > timer.workLimit
+	else if (timer.limit == -1.0) false
+	else (ruTime() - timer.started) > timer.limit;
 }
 
+// The budget REMAINING, always in milliseconds — callers pass it to nested budgets, so in work
+// mode it is the remaining units converted back at the same rate (a nested budget then gets its
+// proportional share of units, exactly as it got its share of milliseconds).
 ruTimeLeft(timer : RuTimer) -> double {
-	if (timer.limit == -1.0) doubleMax else 
-	timer.limit - (ruTime() - timer.started);
+	if (timer.workLimit >= 0) {
+		u = ^ruWorkUnits;
+		left = timer.workLimit - ^(timer.work);
+		if (left <= 0 || u <= 0) 0.0 else i2d(left) * 1000.0 / i2d(u);
+	} else if (timer.limit == -1.0) doubleMax
+	else timer.limit - (ruTime() - timer.started);
 }
 
 ruTimePassed(timer : RuTimer) -> double {
