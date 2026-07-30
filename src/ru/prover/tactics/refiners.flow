@@ -624,10 +624,10 @@ ruCheckerResidualRun(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : 
 					if (env.conf.verbose >= 4) { env.out.println("  resid: fallback memo hit (failed) goal=" + ru2s(goal, math)); } else {};
 					None();
 				} else ruResidualFallback(memo, math, env, stmtClass, goal, nnf, precedes, conn, wff, em,
-					premiseExps2, spliceAll, hypDisjs2, fbRef, hypPool);
+					premiseExps2, spliceAll, hypDisjs2, fbRef, hypPool, tyHeads);
 			}
 			None(): ruResidualFallback(memo, math, env, stmtClass, goal, nnf, precedes, conn, wff, em,
-				premiseExps2, spliceAll, hypDisjs2, fbRef, hypPool);
+				premiseExps2, spliceAll, hypDisjs2, fbRef, hypPool, tyHeads);
 		}
 	};
 	// GENERAL-PATH OR-ELIM (last resort): a pooled disjunction fact P∨Q closes the
@@ -744,7 +744,7 @@ ruResidualOrElim(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int,
 ruResidualFallback(memo : Maybe<RuResidualMemo>, math : RuMath, env : RuEnv, stmtClass : int,
 	goal : RuExp, nnf : bool, precedes : (int) -> bool, conn : RuPConnectives, wff : int, em : RuEnvMath,
 	premiseExps2 : [RuExp], spliceAll : (RuProofTree) -> RuProofTree, hypDisjs2 : Set<RuDisj>,
-	fbRef : ref [RuTimer], hypPool : Tree<string, RuProofTree>) -> Maybe<RuRefineResult> {
+	fbRef : ref [RuTimer], hypPool : Tree<string, RuProofTree>, tyHeads : Set<int>) -> Maybe<RuRefineResult> {
 	// hypPool = the CALLER's setness pool (built over the real hyps, leaf indices < nh). It is
 	// threaded in rather than rebuilt over `premiseExps2` on purpose: the rewrite memo is keyed
 	// by (expr, nnf) only, so two differently-numbered pools would let a cached rewrite proof
@@ -993,9 +993,27 @@ ruResidualFallback(memo : Maybe<RuResidualMemo>, math : RuMath, env : RuEnv, stm
 			// t19 flipped when they joined the subset). They travel as the certificate's setness
 			// POOL instead — a side channel with no atom cost — with hyp leaves numbered AFTER
 			// the subset positions, so the leaf remap below reaches their real premise indices.
+			// THE TYPE CONTEXT TRAVELS WITH ITS TERMS. A typed atom (`element x12 x5`), the
+			// biconditional that characterises it, and a guard fact (`¬(x5 = ∅)`) share TERMS with
+			// the goal but rarely an ATOM, so atom connectivity drops exactly the type layer's own
+			// premises — 167 refusals on subset_1, led by `element x12 x5` (40) and `¬(x5 = ∅)`
+			// (39). Admit those three shapes when their terms meet the goal's, capped.
+			// Gated on the type table being non-empty, i.e. on the type layer being ON, so the
+			// setvar floors cannot move.
+			isTypeCtx = \e : RuExp -> {
+				h = ruInHead(e);
+				containsSet(tyHeads, h)
+				|| (h == s2id("wb") && ruInArity(e) == 2 && containsSet(tyHeads, ruInHead((ruInArgs(e))[0])))
+				|| (h == conn.wn && ruInArity(e) == 1 && ruEqHead((ruInArgs(e))[0]) == s2id("wceq"));
+			};
+			typeAdds = if (isEmptySet(tyHeads)) [] else
+				take(filtermapi(premiseExps2, \i, e ->
+					if (contains(atomPick, i) || !isTypeCtx(e)) None()
+					else if (isEmptySet(intersectSets(argTerms(e), terms0))) None()
+					else Some(i)), 6);
 			setnessIdxs = filtermapi(premiseExps2, \i, e ->
 				if (ruUSetnessHyp(e, s2id("wcel"), s2id("cvv")) != None()) Some(i) else None());
-			subset0 = mergeSort(concat(atomPick, bridgeAdds), \a, b -> a - b);
+			subset0 = mergeSort(concat3(atomPick, bridgeAdds, typeAdds), \a, b -> a - b);
 			// DEDUP by expression: the saturation re-derives the same fact (three copies of one
 			// ∨-premise = three case-split candidates burning the split budget — t86)
 			subset = (fold(subset0, Pair([], makeSet()), \acc : Pair<[int], Set<[RuExpNode]>>, i -> {
