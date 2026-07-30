@@ -391,6 +391,43 @@ ruFallbackCacheKey = "residual.fallback";
 // the step reads the same one — which is the whole point of making it a phase.
 ruTypeEnvKey = "types.env";
 
+// The step's Mizar citations, resolved to the facts they name. Only 0-hypothesis assertions are
+// turned into facts here (their statement, proved by applying the assertion); a citation that
+// carries hypotheses stays for the ordinary search, which can discharge them. Local citations
+// (this theorem's own hyps/steps) are already premises, so they are skipped.
+ruCitedFacts(memo : Maybe<RuResidualMemo>, math : RuMath, stmtClass : int,
+	precedes : (int) -> bool) -> [Pair<RuProofTree, RuExp>] {
+	switch (memo) {
+		None(): [];
+		Some(m): switch (ruBoardGet(m.board, "by.refs")) {
+			None(): [];
+			Some(v): {
+				names = cast(v : flow -> [string]);
+				filtermap(names, \nm ->
+					if (startsWith(nm, "hyp") || startsWith(nm, "step")) None()
+					else {
+						id = s2id(nm);
+						if (!precedes(id)) None()
+						else switch (lookupTree(math.decls.assertions, id)) {
+							None(): None();
+							Some(a): {
+								inf = ruTyInfer2(a);
+								if (inf.hyps != []) None() else {
+									e = ruExp(inf.prop.exps[0]);
+									Some(Pair(RuProofStep(id, [], RuStmt(stmtClass, [e], -1)), e));
+								}
+							}
+						};
+					});
+			}
+		}
+	}
+}
+
+ruTyInfer2(a : RuAssertion) -> RuInference {
+	switch (a) { RuAxiom(__, i): i; RuCong(__, i): i; RuTheorem(__, i, __, __): i; RuDef(__, i, __, __): i; }
+}
+
 ruMemoTypeEnv(memo : Maybe<RuResidualMemo>, math : RuMath, env : RuEnv, stmtClass : int,
 	tyTable : RuTypeTable, instHyps : [Pair<RuProofTree, RuExp>], goal : RuExp) -> [Pair<RuProofTree, RuExp>] {
 	build = \ -> ruTyEnvironment(math, env, stmtClass, tyTable, instHyps, goal, 3);
@@ -574,10 +611,20 @@ ruCheckerResidualRun(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : 
 	// GUARD DISCHARGE comes first: for a GUARDED definition the raw axiom is useless (its usable
 	// biconditional sits behind `X ≠ ∅`), so build the discharged instance directly — see
 	// ruTyGuardFacts. The unguarded definitions are still seeded as before.
+	// THE STEP'S OWN MIZAR CITATIONS. Mizar hands its checker the author's `by` list — that IS
+	// its premise selection, and it is why the original never has to guess. We carry those names
+	// through translation and then the main search ignored them, selecting premises by a
+	// connectivity heuristic of our own instead; that heuristic is the largest single cause of
+	// failure we measure (90-160 refusals per article). A cited assertion with no hypotheses is
+	// simply a fact: add it, with its one-step proof, so the decision procedures receive what
+	// Mizar's receive. Hypothesis-carrying citations are left to the ordinary search, which knows
+	// how to discharge them.
+	citedFacts = ruCitedFacts(memo, math, stmtClass, precedes);
 	// THE TYPE ENVIRONMENT PHASE. Built ONCE for this hypothesis context and kept on the shared
 	// board, instead of being re-derived inside every goal's search — the arrangement Mizar uses,
 	// where the environment is settled before the checker runs and simply handed over.
-	tyGuard = if (!tyOn) [] else ruMemoTypeEnv(memo, math, env, stmtClass, tyTable, instHyps, goal);
+	tyGuard = concat(citedFacts,
+		if (!tyOn) [] else ruMemoTypeEnv(memo, math, env, stmtClass, tyTable, instHyps, goal));
 	tyFacts = if (isEmptySet(tyHeads)) [] else concat(tyGuard,
 		filtermap(filter(tyTable.all, \r -> r.role == RuTyDef() && !r.guarded && containsSet(tyHeads, r.head)),
 			\r -> ruTyRuleFact(math, stmtClass, r)));
@@ -632,6 +679,8 @@ ruCheckerResidualRun(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : 
 	// cheap search failed, and only under an atom-count gate (running it FIRST on every residual
 	// starved the fixed wall-clock stage slices: zfmisc full stack 126 -> 109).
 	premiseExps2 = map(premises, \pr -> ruExp(pr.stmt.exps[0]));
+	// the facts the type-environment phase established and the ones the author cited
+	knownExps = map(tyGuard, \f -> f.second);
 	spliceAll = \unc : RuProofTree -> ruUnfoldSplice(unc, nh, concat(derivedProofs, map(satAll, \p -> p.second)));
 	if (env.conf.verbose >= 4) {
 		env.out.println("  resid: goal=" + ru2s(goal, math) + " hyps=" + i2s(nh) + " derived=" + i2s(nd) + " sat=" + i2s(length(satAll)));
@@ -654,10 +703,10 @@ ruCheckerResidualRun(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : 
 					if (env.conf.verbose >= 4) { env.out.println("  resid: fallback memo hit (failed) goal=" + ru2s(goal, math)); } else {};
 					None();
 				} else ruResidualFallback(memo, math, env, stmtClass, goal, nnf, precedes, conn, wff, em,
-					premiseExps2, spliceAll, hypDisjs2, fbRef, hypPool, tyHeads);
+					premiseExps2, spliceAll, hypDisjs2, fbRef, hypPool, tyHeads, knownExps);
 			}
 			None(): ruResidualFallback(memo, math, env, stmtClass, goal, nnf, precedes, conn, wff, em,
-				premiseExps2, spliceAll, hypDisjs2, fbRef, hypPool, tyHeads);
+				premiseExps2, spliceAll, hypDisjs2, fbRef, hypPool, tyHeads, knownExps);
 		}
 	};
 	// GENERAL-PATH OR-ELIM (last resort): a pooled disjunction fact P∨Q closes the
@@ -774,7 +823,8 @@ ruResidualOrElim(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : int,
 ruResidualFallback(memo : Maybe<RuResidualMemo>, math : RuMath, env : RuEnv, stmtClass : int,
 	goal : RuExp, nnf : bool, precedes : (int) -> bool, conn : RuPConnectives, wff : int, em : RuEnvMath,
 	premiseExps2 : [RuExp], spliceAll : (RuProofTree) -> RuProofTree, hypDisjs2 : Set<RuDisj>,
-	fbRef : ref [RuTimer], hypPool : Tree<string, RuProofTree>, tyHeads : Set<int>) -> Maybe<RuRefineResult> {
+	fbRef : ref [RuTimer], hypPool : Tree<string, RuProofTree>, tyHeads : Set<int>,
+	knownExps : [RuExp]) -> Maybe<RuRefineResult> {
 	// hypPool = the CALLER's setness pool (built over the real hyps, leaf indices < nh). It is
 	// threaded in rather than rebuilt over `premiseExps2` on purpose: the rewrite memo is keyed
 	// by (expr, nnf) only, so two differently-numbered pools would let a cached rewrite proof
@@ -1036,11 +1086,17 @@ ruResidualFallback(memo : Maybe<RuResidualMemo>, math : RuMath, env : RuEnv, stm
 				|| (h == s2id("wb") && ruInArity(e) == 2 && containsSet(tyHeads, ruInHead((ruInArgs(e))[0])))
 				|| (h == conn.wn && ruInArity(e) == 1 && ruEqHead((ruInArgs(e))[0]) == s2id("wceq"));
 			};
-			typeAdds = if (isEmptySet(tyHeads)) [] else
+			// WHAT THE ENVIRONMENT ESTABLISHED, AND WHAT THE AUTHOR CITED, ARE NOT GUESSES —
+			// they are the two things Mizar's checker is handed outright, so the selection must
+			// not throw them away again. Admitted when they touch a term of the goal; the cap is
+			// generous because these sets are small and precise, unlike the connectivity closure.
+			typeAdds = if (isEmptySet(tyHeads) && knownExps == []) [] else
 				take(filtermapi(premiseExps2, \i, e ->
-					if (contains(atomPick, i) || !isTypeCtx(e)) None()
+					if (contains(atomPick, i)) None()
+					else if (exists(knownExps, \k -> k.nodes == e.nodes)) Some(i)
+					else if (!isTypeCtx(e)) None()
 					else if (isEmptySet(intersectSets(argTerms(e), terms0))) None()
-					else Some(i)), 6);
+					else Some(i)), 12);
 			setnessIdxs = filtermapi(premiseExps2, \i, e ->
 				if (ruUSetnessHyp(e, s2id("wcel"), s2id("cvv")) != None()) Some(i) else None());
 			subset0 = mergeSort(concat3(atomPick, bridgeAdds, typeAdds), \a, b -> a - b);
