@@ -1,4 +1,5 @@
 import ru/prover/tactics/instantiate;
+import ru/prover/core/declines;
 import ru/unify/index;
 import ru/verify/math;
 import base/ids;
@@ -53,6 +54,12 @@ export {
 	// only pull in definitions for notions the problem actually mentions).
 	ruTyHeadsOf(t : RuTypeTable, exps : [RuExp]) -> Set<int>;
 	ruTyRole2s(r : RuTyRole) -> string;
+
+	// GUARD DISCHARGE: the usable biconditional of a GUARDED mode definition, assembled for each
+	// type-layer atom of the problem — see the construction note further down. Each fact carries
+	// its whole proof, so consuming one is an ordinary proof step.
+	ruTyGuardFacts(math : RuMath, env : RuEnv, stmtClass : int, t : RuTypeTable,
+		facts : [Pair<RuProofTree, RuExp>], goal : RuExp) -> [Pair<RuProofTree, RuExp>];
 }
 
 ruTyRole2s(r : RuTyRole) -> string {
@@ -241,3 +248,254 @@ ruTyBuild(math : RuMath) -> RuTypeTable {
 	byHead = fold(all, makeTree(), \acc, r -> setTree(acc, r.head, arrayPush(lookupTreeDef(acc, r.head, []), r)));
 	RuTypeTable(all, byHead);
 }
+
+// ---- GUARD DISCHARGE (soft-type-layer.md §4.3) -------------------------------
+//
+// A Mizar mode definition is almost always GUARDED — d1_subset_1 says
+//   ∀X ∀t ( ( (X = ∅) ∨ (element t X ↔ t ∈ X) ) ∧ ( (X = ∅) → (element t X ↔ t = ∅) ) )
+// because the notion has an "if X is non empty otherwise" clause. Seeding that axiom into the
+// premise pool — what ensure-type did — cannot help: the usable biconditional is the SECOND
+// DISJUNCT of the first conjunct, reachable only after `X ≠ ∅` is discharged. Measured, that seed
+// fired 648 times on ordinal1 and closed nothing.
+//
+// This builds the usable biconditional directly. For each atom `P(t, X)` of the problem whose head
+// has a guarded definition, the instance is assembled deterministically:
+//   assertion at (X, t) → sp-strip the binders → simpli → ( (X=∅) ∨ BICOND )
+//   ¬(X = ∅) from one of two sources (both ordinary lemmas, nothing new trusted):
+//     (a) a MEMBERSHIP fact `u ∈ X` in the problem  — ne0i then df-ne
+//     (b) a 0-hypothesis NON-EMPTINESS lemma matching X — pwne0 for `𝒫A`, i.e. exactly the
+//         functorial cluster registrations the type table already scans
+//   orel1 resolves the disjunction → BICOND, emitted as a fact carrying its whole proof.
+// No search: every step is a named lemma applied to a known instance.
+ruTyGuardFacts(math : RuMath, env : RuEnv, stmtClass : int, t : RuTypeTable,
+	facts : [Pair<RuProofTree, RuExp>], goal : RuExp) -> [Pair<RuProofTree, RuExp>] {
+	wffT = tp2id_("wff");
+	c0 = s2id("c0");
+	guarded = filter(t.all, \r -> r.role == RuTyDef() && r.guarded);
+	if (guarded == []) [] else {
+		exps = arrayPush(map(facts, \f -> f.second), goal);
+		// every type-layer atom of the problem, with its argument terms
+		atoms = concatA(map(exps, \e -> ruTyAtomsOf(e, buildSet(map(guarded, \r -> r.head)))));
+		fold(atoms, [], \acc, atom -> {
+			if (length(acc) >= 8) acc else {
+				h = ruTyHeadOf(atom);
+				fold(filter(guarded, \r -> r.head == h), acc, \ac, r ->
+					if (length(ac) >= 8) ac
+					else switch (ruTyGuardFact(math, env, stmtClass, r, atom, facts, wffT, c0)) {
+						None(): ac;
+						Some(f): if (exists(ac, \p -> p.second.nodes == f.second.nodes)) ac else arrayPush(ac, f);
+					});
+			}
+		});
+	}
+}
+
+// atoms of `e` headed by one of `heads`
+ruTyAtomsOf(e : RuExp, heads : Set<int>) -> [RuExp] {
+	n = e.nodes;
+	filtermap(enumFromTo(0, length(n) - 1), \i -> switch (n[i]) {
+		RuVar(__, __): None();
+		RuRuleNode(idT, __):
+			if (!containsSet(heads, ruIdType2Id(idT))) None()
+			else Some(RuExp(subrange(n, i, ruTySpanEnd(n, i) - i), -1));
+	});
+}
+
+ruTySpanEnd(nodes : [RuExpNode], i : int) -> int {
+	switch (nodes[i]) {
+		RuVar(__, __): i + 1;
+		RuRuleNode(__, al): fold(enumFromTo(1, ruArityLen2Arity(al)), i + 1, \pos, __ -> ruTySpanEnd(nodes, pos));
+	}
+}
+
+ruTyHeadOf(e : RuExp) -> int {
+	switch (e.nodes[0]) { RuRuleNode(idT, __): ruIdType2Id(idT); RuVar(__, __): -1; }
+}
+
+ruTyArgsOf(e : RuExp) -> [RuExp] {
+	n = e.nodes;
+	arity = switch (n[0]) { RuRuleNode(__, al): ruArityLen2Arity(al); RuVar(__, __): 0; };
+	(fold(enumFromTo(1, arity), Pair([], 1), \acc, __ -> {
+		end = ruTySpanEnd(n, acc.second);
+		Pair(arrayPush(acc.first, RuExp(subrange(n, acc.second, end - acc.second), -1)), end);
+	})).first;
+}
+
+// One atom `P(ā)` + one guarded definition -> the unguarded biconditional with its proof.
+ruTyGuardFact(math : RuMath, env : RuEnv, stmtClass : int, r : RuTyRule, atom : RuExp,
+	facts : [Pair<RuProofTree, RuExp>], wffT : int, c0 : int) -> Maybe<Pair<RuProofTree, RuExp>> {
+	switch (lookupTree(math.decls.assertions, r.assId)) {
+		None(): None();
+		Some(ass): {
+			inf = ruTyInfer(ass);
+			if (inf.hyps != []) None() else {
+				prop = ruExp(inf.prop.exps[0]);
+				// the definition's own atom, to learn which binder sits in which argument position
+				pat = ruTyAtomsOf(prop, makeSet1(r.head));
+				aArgs = ruTyArgsOf(atom);
+				if (pat == [] || length(ruTyArgsOf(pat[0])) != length(aArgs)) {
+					if (ruDeclinesOn(env)) ruDecline(env, "type/guard-discharge", "definition atom does not line up with the problem atom", ru2s(atom, math)) else {};
+					None();
+				} else {
+					pArgs = ruTyArgsOf(pat[0]);
+					// bind each definition binder to the corresponding argument of the problem's atom
+					sub = fold(enumFromTo(0, length(pArgs) - 1), makeHashMap(idfn), \m, i ->
+						switch (pArgs[i].nodes[0]) {
+							RuVar(vid, vtp): { v = RuVar(vid, vtp);
+								setHashMap(m, vid, RuSubExpr(v, aArgs[i], ruExpVarIdsHashSet(aArgs[i]))); m; }
+							RuRuleNode(__, __): {
+								// a coerced binder: [cv, x] — bind the inner var
+								nn = pArgs[i].nodes;
+								if (length(nn) != 2) m else switch (nn[1]) {
+									RuVar(vid, vtp): { v = RuVar(vid, vtp);
+										setHashMap(m, vid, RuSubExpr(v, aArgs[i], ruExpVarIdsHashSet(aArgs[i]))); m; }
+									RuRuleNode(__, __): m;
+								};
+							}
+						});
+					inst = ruApplySubst(prop, RuSubst(sub));
+					// strip the definition's ∀ prefix: sp + ax-mp per level (setvar-for-setvar, licensed)
+					stripped = ruTyStripForallsP(inst, RuProofStep(r.assId, [], RuStmt(stmtClass, [inst], -1)),
+						stmtClass, wffT);
+					body = stripped.first;
+					// ( (X = ∅) ∨ BICOND ) ∧ ( (X = ∅) → … )   ->  take the first conjunct
+					if (ruTyHeadOf(body) != s2id("wa")) {
+						if (ruDeclinesOn(env)) ruDecline(env, "type/guard-discharge", "stripped definition body is not a conjunction", ru2s(body, math)) else {};
+						None();
+					} else {
+						conj = ruTyArgsOf(body);
+						disj = conj[0];
+						pDisj = RuProofStep(s2id_("simpli"), [stripped.second], RuStmt(stmtClass, [disj], -1));
+						if (ruTyHeadOf(disj) != s2id("wo")) {
+							if (ruDeclinesOn(env)) ruDecline(env, "type/guard-discharge", "first conjunct is not the empty-case disjunction", ru2s(disj, math)) else {};
+							None();
+						} else {
+							dArgs = ruTyArgsOf(disj);
+							emptyEq = dArgs[0];         // (X = ∅)
+							bicond  = dArgs[1];         // the usable characterisation
+							if (ruTyHeadOf(emptyEq) != s2id("wceq")) {
+								if (ruDeclinesOn(env)) ruDecline(env, "type/guard-discharge", "left disjunct is not an equality", ru2s(emptyEq, math)) else {};
+								None();
+							} else {
+								xTerm = (ruTyArgsOf(emptyEq))[0];
+								switch (ruTyNonEmpty(math, env, stmtClass, xTerm, emptyEq, facts, wffT, c0)) {
+									None(): {
+										if (ruDeclinesOn(env)) ruDecline(env, "type/guard-discharge", "cannot prove the guard (no membership fact, no non-emptiness lemma)", ru2s(xTerm, math)) else {};
+										None();
+									}
+									Some(pNot): {
+										// orel1: ¬ph → ((ph ∨ ps) → ps)
+										impl = ruTyMkImp(disj, bicond, wffT);
+										o1 = RuProofStep(s2id_("orel1"), [],
+											RuStmt(stmtClass, [ruTyMkImp(ruTyMkNot(emptyEq, wffT), impl, wffT)], -1));
+										step1 = RuProofStep(s2id_("ax-mp"), [pNot, o1], RuStmt(stmtClass, [impl], -1));
+										Some(Pair(RuProofStep(s2id_("ax-mp"), [pDisj, step1],
+											RuStmt(stmtClass, [bicond], -1)), bicond));
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// ¬(X = ∅), from a membership fact about X, or from a 0-hyp non-emptiness lemma matching X.
+ruTyNonEmpty(math : RuMath, env : RuEnv, stmtClass : int, xTerm : RuExp, emptyEq : RuExp,
+	facts : [Pair<RuProofTree, RuExp>], wffT : int, c0 : int) -> Maybe<RuProofTree> {
+	notEq = ruTyMkNot(emptyEq, wffT);
+	// THE EMPTY SET AS THE GUARD SPELLS IT. A translated article declares its own ∅ (and its own
+	// 𝒫): the rule ids differ from the foundation's even though both print as `∅`, so a hardcoded
+	// c0 matches nothing in a Mizar article. Take the term straight out of the guard.
+	emptyTerm = (ruTyArgsOf(emptyEq))[1];
+	neExp = ruFwdMkRule(s2id("wne"), wffT, [xTerm, emptyTerm]);
+	// (X ≠ ∅) ↔ ¬(X = ∅) — df-ne, then mpbi
+	viaNe = \pNe : RuProofTree -> {
+		dfne = RuProofStep(s2id_("df-ne"), [],
+			RuStmt(stmtClass, [ruFwdMkRule(s2id("wb"), wffT, [neExp, notEq])], -1));
+		RuProofStep(s2id_("mpbi"), [pNe, dfne], RuStmt(stmtClass, [notEq], -1));
+	};
+	// (a) a membership fact `u ∈ X` in the problem
+	memb = fold(facts, None(), \acc, f -> switch (acc) {
+		Some(__): acc;
+		None(): {
+			e = f.second;
+			if (ruTyHeadOf(e) != s2id("wcel")) None() else {
+				args = ruTyArgsOf(e);
+				if (length(args) != 2 || args[1].nodes != xTerm.nodes) None() else {
+					// ne0i: (B ∈ A) → (A ≠ ∅)
+					ne0i = RuProofStep(s2id_("ne0i"), [], RuStmt(stmtClass, [ruTyMkImp(e, neExp, wffT)], -1));
+					Some(viaNe(RuProofStep(s2id_("ax-mp"), [f.first, ne0i], RuStmt(stmtClass, [neExp], -1))));
+				}
+			}
+		}
+	});
+	switch (memb) {
+		Some(__): memb;
+		// (b) a 0-hypothesis NON-EMPTINESS lemma whose subject matches X. Two spellings both occur
+		// and both are wanted: the foundation states `𝒫A ≠ ∅` (pwne0) while a translated
+		// FUNCTORIAL REGISTRATION states the ∀-closed `∀X ¬(𝒫X = ∅)` (fc1_subset_1) — which is
+		// precisely where Mizar keeps this knowledge. So: strip any ∀ prefix, accept either `T ≠ ∅`
+		// or `¬(T = ∅)`, match T against X, then re-apply the assertion at that instance and
+		// sp-strip it back down.
+		None(): fold(getTreeValues(math.decls.assertions), None(), \acc, a -> switch (acc) {
+			Some(__): acc;
+			None(): {
+				inf = ruTyInfer(a);
+				if (inf.hyps != [] || !isEmptySet(inf.vars.disjs)) None() else {
+					p = ruExp(inf.prop.exps[0]);
+					core = ruTyStripForalls(p);
+					// the two spellings, reduced to "the subject term"
+					subj = if (ruTyHeadOf(core) == s2id("wne")) {
+							ca = ruTyArgsOf(core);
+							if (length(ca) == 2 && ruTyHeadOf(ca[1]) == ruTyHeadOf(emptyTerm)) Some(ca[0]) else None();
+						} else if (ruTyHeadOf(core) == s2id("wn")) {
+							inner = (ruTyArgsOf(core))[0];
+							if (ruTyHeadOf(inner) != s2id("wceq")) None() else {
+								ia = ruTyArgsOf(inner);
+								if (length(ia) == 2 && ruTyHeadOf(ia[1]) == ruTyHeadOf(emptyTerm)) Some(ia[0]) else None();
+							}
+						} else None();
+					switch (subj) {
+						None(): None();
+						Some(tm): if (!ruTyIsCompound(tm) || ruTyHeadOf(tm) != ruTyHeadOf(xTerm)) None()
+							else switch (ruMatchExp(xTerm, tm, math, env)) {
+								None(): {
+									if (ruDeclinesOn(env)) ruDecline(env, "type/guard-discharge",
+										"non-emptiness lemma head matches but the term does not",
+										ru2s(tm, math) + "  vs  " + ru2s(xTerm, math)) else {};
+									None();
+								}
+								Some(sg): {
+									instP = ruApplySubst(p, sg);
+									pf0 = RuProofStep(ruTyId(a), [], RuStmt(stmtClass, [instP], -1));
+									st = ruTyStripForallsP(instP, pf0, stmtClass, wffT);
+									// normalise to ¬(X = ∅): a `≠` statement crosses via df-ne
+									if (ruTyHeadOf(st.first) == s2id("wn")) Some(st.second)
+									else if (ruTyHeadOf(st.first) == s2id("wne")) Some(viaNe(st.second))
+									else None();
+								}
+							};
+					}
+				}
+			}
+		})
+	}
+}
+
+// the ∀-strip that also BUILDS the proof (sp + ax-mp per level); the plain ruTyStripForalls
+// above only peels the expression
+ruTyStripForallsP(e : RuExp, pf : RuProofTree, stmtClass : int, wffT : int) -> Pair<RuExp, RuProofTree> {
+	if (ruTyHeadOf(e) != s2id("wal")) Pair(e, pf) else {
+		n = e.nodes;
+		bodyStart = ruTySpanEnd(n, 1);
+		body = RuExp(subrange(n, bodyStart, length(n) - bodyStart), -1);
+		sp = RuProofStep(s2id_("sp"), [], RuStmt(stmtClass, [ruTyMkImp(e, body, wffT)], -1));
+		ruTyStripForallsP(body, RuProofStep(s2id_("ax-mp"), [pf, sp], RuStmt(stmtClass, [body], -1)), stmtClass, wffT);
+	}
+}
+
+ruTyMkImp(a : RuExp, b : RuExp, wffT : int) -> RuExp { ruFwdMkRule(s2id("wi"), wffT, [a, b]) }
+ruTyMkNot(a : RuExp, wffT : int) -> RuExp { ruFwdMkRule(s2id("wn"), wffT, [a]) }
