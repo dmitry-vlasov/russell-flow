@@ -281,7 +281,7 @@ ruTyGuardFacts(math : RuMath, env : RuEnv, stmtClass : int, t : RuTypeTable,
 				h = ruTyHeadOf(atom);
 				fold(filter(guarded, \r -> r.head == h), acc, \ac, r ->
 					if (length(ac) >= 8) ac
-					else switch (ruTyGuardFact(math, env, stmtClass, r, atom, facts, wffT, c0)) {
+					else switch (ruTyGuardFact(math, env, stmtClass, r, atom, facts, [goal], wffT, c0)) {
 						None(): ac;
 						Some(f): if (exists(ac, \p -> p.second.nodes == f.second.nodes)) ac else arrayPush(ac, f);
 					});
@@ -323,7 +323,7 @@ ruTyArgsOf(e : RuExp) -> [RuExp] {
 
 // One atom `P(ā)` + one guarded definition -> the unguarded biconditional with its proof.
 ruTyGuardFact(math : RuMath, env : RuEnv, stmtClass : int, r : RuTyRule, atom : RuExp,
-	facts : [Pair<RuProofTree, RuExp>], wffT : int, c0 : int) -> Maybe<Pair<RuProofTree, RuExp>> {
+	facts : [Pair<RuProofTree, RuExp>], goalExps : [RuExp], wffT : int, c0 : int) -> Maybe<Pair<RuProofTree, RuExp>> {
 	switch (lookupTree(math.decls.assertions, r.assId)) {
 		None(): None();
 		Some(ass): {
@@ -353,10 +353,33 @@ ruTyGuardFact(math : RuMath, env : RuEnv, stmtClass : int, r : RuTyRule, atom : 
 								};
 							}
 						});
-					inst = ruApplySubst(prop, RuSubst(sub));
-					// strip the definition's ∀ prefix: sp + ax-mp per level (setvar-for-setvar, licensed)
-					stripped = ruTyStripForallsP(inst, RuProofStep(r.assId, [], RuStmt(stmtClass, [inst], -1)),
-						stmtClass, wffT);
+					// INSTANTIATE THROUGH THE CLASS-TERM CHAIN, not by substitution. A Mizar mode's
+					// binders are SETVARS; the problem applies the mode at COMPOUND CLASS TERMS
+					// (`element x28 𝒫x4`). Substituting a setvar binder by a class term does not
+					// give an instance — it leaves a coercion wrapper, and the guard's subject then
+					// comes back headed by the coercion rule instead of by 𝒫, so no non-emptiness
+					// lemma can ever match it. spcv + the substitution chain + setness is the
+					// licensed route (the same one the class-loci work needed).
+					// The definition is ALPHA-RENAMED first: the translator names a definition's
+					// loci after the Mizar locus, so its binder can carry the very id the problem
+					// uses, and instantiating without renaming is variable capture.
+					pool = ruSetnessPoolOfProofs(facts);
+					renamed = ruTyRenameBinders(prop, facts, goalExps);
+					// the ∀ prefix, outermost first, each at the argument the definition's own atom
+					// puts in that position
+					order = ruTyBinderOrder(renamed, r.head, length(aArgs));
+					if (length(order) != length(aArgs)) None() else {
+					instR = ruTyInstAll(math, env, stmtClass,
+						Triple(renamed, RuProofStep(r.assId, [], RuStmt(stmtClass, [renamed], -1)), makeSet()),
+						map(order, \i -> aArgs[i]), pool);
+					switch (instR) {
+					None(): {
+						if (ruDeclinesOn(env)) ruDecline(env, "type/guard-discharge",
+							"class-term instantiation of the definition failed", ru2s(atom, math)) else {};
+						None();
+					}
+					Some(inst3): {
+					stripped = Pair(inst3.first, inst3.second);
 					body = stripped.first;
 					// ( (X = ∅) ∨ BICOND ) ∧ ( (X = ∅) → … )   ->  take the first conjunct
 					if (ruTyHeadOf(body) != s2id("wa")) {
@@ -395,6 +418,9 @@ ruTyGuardFact(math : RuMath, env : RuEnv, stmtClass : int, r : RuTyRule, atom : 
 								}
 							}
 						}
+					}
+					}
+					}
 					}
 				}
 			}
@@ -499,3 +525,61 @@ ruTyStripForallsP(e : RuExp, pf : RuProofTree, stmtClass : int, wffT : int) -> P
 
 ruTyMkImp(a : RuExp, b : RuExp, wffT : int) -> RuExp { ruFwdMkRule(s2id("wi"), wffT, [a, b]) }
 ruTyMkNot(a : RuExp, wffT : int) -> RuExp { ruFwdMkRule(s2id("wn"), wffT, [a]) }
+
+// ---- helpers for the class-term instantiation of a definition ----------------
+
+// Alpha-rename every setvar of the definition to an id the problem does not use. The translator
+// names a definition's loci after the Mizar locus, so `∀x5` in the definition and the theorem's own
+// `x5` can be the SAME id; instantiating then captures. Costs nothing when there is no clash.
+ruTyRenameBinders(prop : RuExp, facts : [Pair<RuProofTree, RuExp>], goalExps : [RuExp]) -> RuExp {
+	setvarT = tp2id_("setvar");
+	used0 = fold(concat(map(facts, \f -> f.second), goalExps), makeSet(), \a, e ->
+		fold(ruInVarsOf(e), a, \a2, v -> insertSet(a2, v.id)));
+	vs = filter(ruInVarsOf(prop), \v -> v.type == setvarT);
+	r = fold(vs, Pair(makeHashMap(idfn), used0), \ac, v -> {
+		f = ruInFreshSetvar(ac.second, setvarT, 0);
+		fE = RuExp([RuVar(f.id, f.type)], -1);
+		setHashMap(ac.first, v.id, RuSubExpr(v, fE, ruExpVarIdsHashSet(fE)));
+		Pair(ac.first, insertSet(ac.second, f.id));
+	});
+	ruApplySubst(prop, RuSubst(r.first));
+}
+
+// For each ∀ of the prefix (outermost first) the index of the ARGUMENT POSITION it occupies in the
+// definition's own atom — so the caller can instantiate binder i at the problem atom's matching
+// argument rather than assuming the two orders agree.
+ruTyBinderOrder(prop : RuExp, head : int, arity : int) -> [int] {
+	binders = ruTyBindersOf(prop);
+	pat = ruTyAtomsOf(ruTyStripForalls(prop), makeSet1(head));
+	if (pat == []) [] else {
+		pArgs = ruTyArgsOf(pat[0]);
+		if (length(pArgs) != arity) [] else
+			filtermap(binders, \b -> {
+				pos = findiDef(pArgs, \a -> exists(ruInVarsOf(a), \v -> v.id == b.id), -1);
+				if (pos < 0) None() else Some(pos);
+			});
+	}
+}
+
+ruTyBindersOf(e : RuExp) -> [RuVar] {
+	if (ruInHead(e) != s2id("wal") || ruInArity(e) != 2) []
+	else {
+		args = ruInArgs(e);
+		v = if (length(args[0].nodes) != 1) [] else switch (args[0].nodes[0]) {
+			RuVar(id, tp): [RuVar(id, tp)];
+			RuRuleNode(__, __): [];
+		};
+		concat(v, ruTyBindersOf(args[1]));
+	}
+}
+
+// instantiate the whole ∀ prefix at `ts`, one class-term step per level
+ruTyInstAll(math : RuMath, env : RuEnv, stmtClass : int, start : Triple<RuExp, RuProofTree, Set<RuDisj>>,
+	ts : [RuExp], pool : Tree<string, RuProofTree>) -> Maybe<Triple<RuExp, RuProofTree, Set<RuDisj>>> {
+	fold(ts, Some(start), \acc, t -> maybeBind(acc, \cur ->
+		if (ruInHead(cur.first) != s2id("wal")) None()
+		else maybeMap(ruInForallInstTermH(math, env, stmtClass, cur.first, t, pool), \r ->
+			Triple(r.first,
+				RuProofStep(s2id_("ax-mp"), [cur.second, r.second], RuStmt(stmtClass, [r.first], -1)),
+				mergeSets(cur.third, r.third)))));
+}
