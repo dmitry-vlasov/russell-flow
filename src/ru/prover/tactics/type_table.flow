@@ -60,6 +60,13 @@ export {
 	// its whole proof, so consuming one is an ordinary proof step.
 	ruTyGuardFacts(math : RuMath, env : RuEnv, stmtClass : int, t : RuTypeTable,
 		facts : [Pair<RuProofTree, RuExp>], goal : RuExp) -> [Pair<RuProofTree, RuExp>];
+
+	// FUNCTOR DEFINITIONS: what a defined TERM means. A Mizar functor is defined by a ∀-closed
+	// `∀ā ∀d ( d = f(ā) ↔ Φ(d, ā) )`, so instantiating d at the term ITSELF turns the left side
+	// into `f(t̄) = f(t̄)` — true by reflexivity — and mpbi hands back Φ(f(t̄), t̄): the meaning of
+	// the term as it occurs in the problem. Deterministic; no search.
+	ruTyFunctorFacts(math : RuMath, env : RuEnv, stmtClass : int, t : RuTypeTable,
+		facts : [Pair<RuProofTree, RuExp>], goal : RuExp) -> [Pair<RuProofTree, RuExp>];
 }
 
 ruTyRole2s(r : RuTyRole) -> string {
@@ -661,5 +668,120 @@ ruTyFactProof(facts : [Pair<RuProofTree, RuExp>], e : RuExp) -> Maybe<RuProofTre
 	fold(facts, None(), \acc, f -> switch (acc) {
 		Some(__): acc;
 		None(): if (f.second.nodes == e.nodes) Some(f.first) else None();
+	});
+}
+
+ruTyFunctorFacts(math : RuMath, env : RuEnv, stmtClass : int, t : RuTypeTable,
+	facts : [Pair<RuProofTree, RuExp>], goal : RuExp) -> [Pair<RuProofTree, RuExp>] {
+	wffT = tp2id_("wff");
+	wceq = s2id("wceq");
+	defs = filter(t.all, \r -> r.role == RuTyDef() && r.head == wceq);
+	if (defs == []) [] else {
+		exps = arrayPush(map(facts, \f -> f.second), goal);
+		pool = ruSetnessPoolOfProofs(facts);
+		fold(defs, [], \acc, r -> if (length(acc) >= 4) acc else
+			switch (lookupTree(math.decls.assertions, r.assId)) {
+				None(): acc;
+				Some(ass): {
+					inf = ruTyInfer(ass);
+					if (inf.hyps != []) acc else {
+						prop = ruExp(inf.prop.exps[0]);
+						core0 = ruTyStripForalls(prop);
+						// A functor definition can be GUARDED exactly like a mode's — setfam_1's
+						// `meet` carries Mizar's empty-case split — and then the definiens sits
+						// inside `( (X=∅) ∨ BICOND ) ∧ ( (X=∅) → … )`. Reach through to the
+						// biconditional; the instance is emitted whole further down, so the
+						// propositional layer still gets the case split.
+						core = if (ruTyHeadOf(core0) != s2id("wa")) core0 else {
+							c1 = (ruTyArgsOf(core0))[0];
+							if (ruTyHeadOf(c1) != s2id("wo") || ruInArity(c1) != 2) core0
+							else (ruTyArgsOf(c1))[1];
+						};
+						if (ruTyHeadOf(core) != s2id("wb") || ruInArity(core) != 2) acc else {
+							ca = ruTyArgsOf(core);
+							if (ruTyHeadOf(ca[0]) != wceq) acc else {
+								ea = ruTyArgsOf(ca[0]);
+								// one side is the lone definiendum binder, the other the functor term
+								dv = ruTyLoneVar(ea[0]);
+								fterm = ea[1];
+								if (dv == -1 || !ruTyIsCompound(fterm)) acc else {
+									fh = ruTyHeadOf(fterm);
+									fargs = ruTyArgsOf(fterm);
+									binders = ruTyBindersOf(prop);
+									occs = ruTyOccurrences(exps, fh, length(fargs));
+									fold(occs, acc, \ac, occ -> if (length(ac) >= 4) ac else {
+										oargs = ruTyArgsOf(occ);
+										//每 binder: the definiendum goes to the term itself, an
+										// argument binder to that argument of the occurrence
+										ts = map(binders, \b ->
+											if (b.id == dv) occ
+											else {
+												pos = findiDef(fargs, \a -> ruTyLoneVar(a) == b.id, -1);
+												if (pos < 0 || pos >= length(oargs)) occ else oargs[pos];
+											});
+										if (length(ts) != length(binders)) ac
+										else switch (ruTyInstAll(math, env, stmtClass,
+												Triple(prop, RuProofStep(r.assId, [], RuStmt(stmtClass, [prop], -1)), makeSet()),
+												ts, pool)) {
+											None(): {
+												if (ruDeclinesOn(env)) ruDecline(env, "type/functor-def",
+													"instantiation at the occurrence failed", ru2s(occ, math)) else {};
+												ac;
+											}
+											Some(inst): {
+												// guarded instance: hand over the whole body, as in the
+												// mode path — the propositional layer case-splits it
+												if (ruTyHeadOf(inst.first) == s2id("wa")) {
+													if (exists(ac, \p -> p.second.nodes == inst.first.nodes)) ac
+													else arrayPush(ac, Pair(inst.second, inst.first));
+												} else {
+												ia = ruTyArgsOf(inst.first);
+												if (ruTyHeadOf(inst.first) != s2id("wb") || length(ia) != 2) ac else {
+													refl = ia[0];
+													if (ruTyHeadOf(refl) != wceq) ac else {
+														rr = ruTyArgsOf(refl);
+														if (rr[0].nodes != rr[1].nodes) ac else {
+															pEq = RuProofStep(s2id_("eqid"), [], RuStmt(stmtClass, [refl], -1));
+															body = ia[1];
+															if (exists(ac, \p -> p.second.nodes == body.nodes)) ac
+															else arrayPush(ac, Pair(RuProofStep(s2id_("mpbi"),
+																[pEq, inst.second], RuStmt(stmtClass, [body], -1)), body));
+														}
+													}
+												}
+												}
+											}
+										};
+									});
+								}
+							}
+						}
+					}
+				}
+			});
+	}
+}
+
+// the variable id if `e` is a lone (possibly coerced) variable, else -1
+ruTyLoneVar(e : RuExp) -> int {
+	n = e.nodes;
+	if (length(n) == 1) switch (n[0]) { RuVar(id, __): id; RuRuleNode(__, __): -1; }
+	else if (length(n) == 2) switch (n[1]) { RuVar(id, __): id; RuRuleNode(__, __): -1; }
+	else -1;
+}
+
+// every occurrence of a `head`-rooted term of the given arity in `exps`
+ruTyOccurrences(exps : [RuExp], head : int, arity : int) -> [RuExp] {
+	fold(exps, [], \acc, e -> {
+		n = e.nodes;
+		fold(enumFromTo(0, length(n) - 1), acc, \ac, i -> switch (n[i]) {
+			RuVar(__, __): ac;
+			RuRuleNode(idT, al):
+				if (ruIdType2Id(idT) != head || ruArityLen2Arity(al) != arity) ac
+				else {
+					sub = RuExp(subrange(n, i, ruTySpanEnd(n, i) - i), -1);
+					if (exists(ac, \x -> x.nodes == sub.nodes)) ac else arrayPush(ac, sub);
+				};
+		});
 	});
 }
