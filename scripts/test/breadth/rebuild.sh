@@ -31,6 +31,9 @@ mkdir -p "$OUT/mizar"
 cp "$RUSSELL_MATH/mizar/miz_set.ru" "$OUT/mizar/"
 cp "$RUSSELL_MATH/mizar/miz_aux.ru" "$OUT/mizar/" 2>/dev/null || true
 cp "$RUSSELL_MATH/mizar/mizar_root.ru" "$OUT/mizar/" 2>/dev/null || true
+# the project conf MUST come along: without it `import-roots` is empty and every article in the
+# rebuilt library fails to resolve its imports — the library translates fine and then cannot be read
+cp "$RUSSELL_MATH/mizar/russell.conf" "$OUT/mizar/" 2>/dev/null || true
 ln -sfn "$RUSSELL_MATH/MML" "$OUT/MML"
 
 articles=$(head -n "$N" "$LAR" | tr -d '\r' | awk 'NF')
