@@ -28,6 +28,8 @@ import mizar/original/iocorrel;
 import mizar/original/roundcl;
 import mizar/original/schemes;
 import mizar/original/definientia;
+import mizar/original/identify;
+import mizar/original/builtin;
 import mizar/original/prep;
 
 export {
@@ -85,6 +87,22 @@ export {
 	// prel/*.def). directive = "definitions" | "equalities" | "expansions".
 	mizAccomDefinientia(acc : MizAccom, evl : MizEvl, directive : string)
 		-> Vector<MizDefiniens>;
+
+	// build the identification / reduction tables, exactly as .eid and .erd
+	// would have them (acc_han.pas ProcessIdentify / ProcessReductions, over
+	// prel/*.did and prel/*.drd). Only the functor identifications are kept —
+	// the checker consumes no others.
+	mizAccomIdentifications(acc : MizAccom, evl : MizEvl, idn : MizIdentify) -> void;
+	mizAccomReductions(acc : MizAccom, evl : MizEvl, idn : MizIdentify) -> void;
+
+	// set env.builtIn from prel/*.dre, exactly as the .ere would have it
+	// (acc_han.pas ProcessRequirements)
+	mizAccomRequirements(acc : MizAccom, evl : MizEvl) -> void;
+
+	// THE WHOLE ACCOMMODATION as an environment loader: everything the checker
+	// reads is built from the article's .evl + prel/, never from the flat
+	// .atr/.ecl/.eth/... files. `mizarj article=X accom=1` runs this.
+	mizAccomEnvLoader(mmlDir : string, article : string) -> MizEnvLoader;
 }
 
 mizEvlDirective(evl : MizEvl, name : string) -> [string] {
@@ -853,4 +871,151 @@ mizAccomDefinientia(acc : MizAccom, evl : MizEvl, directive : string)
 		}
 	});
 	out;
+}
+
+// ---------------- the identify / reduce passes (.eid / .erd) ----------------
+
+// both passes walk the REGISTRATIONS directive and differ only in the file
+// they read and the item they keep
+mizAccomIdentifyPass(acc : MizAccom, evl : MizEvl, ext : string, rootEl : string,
+		read : (MizIdentify, MizVrfReader) -> void,
+		take : (MizIdentify, (int, int) -> int) -> void) -> void {
+	st = acc.st;
+	iter(mizEvlDirective(evl, "registrations"), \art -> {
+		path = mizPrelPath(acc.mmlDir, art, ext);
+		if (fileExists(path)) {
+			r = mizMakeVrfReaderMML(mizXmlInitParsing(getFileContent(path)), acc.env);
+			x = r.x;
+			mizXmlNextElementState(x);
+			mizXmlAssert(x.nElName == rootEl);
+			mizXmlNextElementState(x);
+			sig = mizReadDcoHeader(x).signature;
+			savedMerged = st.merged;
+			added = mizAccomEnsureBases(acc, sig);
+			tr = \k, nr -> mizAccomTranslateIn(st, sig, k, nr);
+			scratch = mizMakeIdentify(acc.env);
+			while(\ -> x.nState == MizEStart, \ -> read(scratch, r));
+			take(scratch, tr);
+			st.merged ::= savedMerged;
+			iter(added, \a -> {
+				st.info ::= removeFromTree(st.info, a);
+				st.baseOf ::= removeFromTree(st.baseOf, a);
+			});
+		}
+	});
+}
+
+mizAccomIdentifications(acc : MizAccom, evl : MizEvl, idn : MizIdentify) -> void {
+	mizAccomIdentifyPass(acc, evl, ".did", "IdentifyRegistrations",
+		\scratch, r -> {
+			if (r.x.nElName == "Identify") mizReadOneIdentify(scratch, r)
+			else mizXmlSkipElement(r.x);
+		},
+		\scratch, tr -> iterVector(scratch.identifications, \it -> {
+			iterVector(it.primaries, \t -> mizAccomRenumberTyp(tr, t));
+			mizAccomRenumberTrm(tr, it.pattern0);
+			mizAccomRenumberTrm(tr, it.pattern1);
+			// AccesibleIdentify
+			if (mizAccTypColl(acc.env, it.primaries)
+				&& mizAccTrm(acc.env, it.pattern0)
+				&& mizAccTrm(acc.env, it.pattern1)) {
+				pushVector(idn.identifications, it);
+			}
+		}));
+}
+
+mizAccomReductions(acc : MizAccom, evl : MizEvl, idn : MizIdentify) -> void {
+	mizAccomIdentifyPass(acc, evl, ".drd", "ReductionRegistrations",
+		\scratch, r -> {
+			if (r.x.nElName == "Reduction") mizReadOneReduction(scratch, r)
+			else mizXmlSkipElement(r.x);
+		},
+		\scratch, tr -> iterVector(scratch.reductions, \rd -> {
+			iterVector(rd.primaries, \t -> mizAccomRenumberTyp(tr, t));
+			mizAccomRenumberTrm(tr, rd.t0);
+			mizAccomRenumberTrm(tr, rd.t1);
+			// AccesibleReduction
+			if (mizAccTypColl(acc.env, rd.primaries)
+				&& mizAccTrm(acc.env, rd.t0) && mizAccTrm(acc.env, rd.t1)) {
+				pushVector(idn.reductions, rd);
+			}
+		}));
+}
+
+// ---------------- the requirements pass (.ere) ----------------
+
+// ProcessRequirements: one (constructor kind, nr) per requirement, translated
+// into the merged frame. The original then maps it through gChosen.ElemNr+1,
+// which is the identity over the merged table, so the translated number IS
+// the value written to the .ere.
+mizAccomRequirements(acc : MizAccom, evl : MizEvl) -> void {
+	st = acc.st;
+	iter(mizEvlDirective(evl, "requirements"), \art -> {
+		path = mizPrelPath(acc.mmlDir, art, ".dre");
+		if (fileExists(path)) {
+			r = mizMakeVrfReaderMML(mizXmlInitParsing(getFileContent(path)), acc.env);
+			x = r.x;
+			mizXmlNextElementState(x);
+			mizXmlAssert(x.nElName == "Requirements");
+			mizXmlNextElementState(x);
+			sig = mizReadDcoHeader(x).signature;
+			savedMerged = st.merged;
+			added = mizAccomEnsureBases(acc, sig);
+			while(\ -> x.nState == MizEStart, \ -> {
+				if (x.nElName == "Requirement") {
+					kindS = mizXmlAttr(x, "constrkind");
+					kind = mizConstructorKind(getCharCodeAt(kindS, 0));
+					nr = mizXmlIntAttrDef(x, "constrnr", 0);
+					reqNr = mizXmlIntAttrDef(x, "nr", 0);
+					merged = mizAccomTranslateIn(st, sig, kind, nr);
+					if (reqNr >= 0 && reqNr <= rqLAST
+						&& mizAccChosen(acc.env, kind, merged)) {
+						mizSetBuiltIn(acc.env.builtIn, reqNr, merged);
+					}
+				}
+				mizXmlSkipElement(x);
+			});
+			st.merged ::= savedMerged;
+			iter(added, \a -> {
+				st.info ::= removeFromTree(st.info, a);
+				st.baseOf ::= removeFromTree(st.baseOf, a);
+			});
+		}
+	});
+}
+
+// ---------------- the whole accommodation ----------------
+
+mizAccomEnvLoader(mmlDir : string, article : string) -> MizEnvLoader {
+	evl = mizLoadEvl(mmlDir + "/" + article + ".evl");
+	// the state is shared by the two phases
+	accRef : ref Maybe<MizAccom> = ref None();
+	MizEnvLoader(
+		\env -> {
+			acc = mizMakeAccom(env, mmlDir);
+			accRef := Some(acc);
+			mizAccomConstructors(acc, evl);
+			mizAccomRequirements(acc, evl);
+		},
+		\env, cl, idn, defs, p -> {
+			switch (^accRef) {
+				None(): mizRunTimeError(2805);
+				Some(acc): {
+					th = mizAccomTheorems(acc, evl);
+					p.theorems ::= th.first;
+					p.ownArticleNr ::= th.second;
+					mizAccomClusters(acc, cl, evl);
+					mizAccomReductions(acc, evl, idn);
+					mizAccomIdentifications(acc, evl, idn);
+					iterVector(mizAccomSchemes(acc, evl).items,
+						\sc -> pushVector(p.schemes.items, sc));
+					iterVector(mizAccomDefinientia(acc, evl, "definitions"),
+						\d -> pushVector(defs.all, d));
+					iterVector(mizAccomDefinientia(acc, evl, "expansions"),
+						\d -> pushVector(defs.expansions, d));
+					iterVector(mizAccomDefinientia(acc, evl, "equalities"),
+						\d -> mizAddEqualsDef(env, defs, d));
+				}
+			}
+		});
 }

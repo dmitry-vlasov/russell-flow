@@ -65,9 +65,21 @@ export {
 		stats : MizPrepStats,
 	);
 
+	// where a checked article's environment comes from
+	MizEnvLoader(
+		early : (MizCorrelEnv) -> void,
+		late : (MizCorrelEnv, MizClusters, MizIdentify, MizDefinientia, MizPrep) -> void,
+	);
+	mizFileEnvLoader(mmlDir : string, article : string) -> MizEnvLoader;
+
 	// Load the environment and check one article's analyzer report.
 	// mmlDir = …/mml, article = base name. Returns the stats.
 	mizCheckArticle(mmlDir : string, article : string) -> MizPrepStats;
+	mizCheckArticleWith(mmlDir : string, article : string,
+		loader : MizEnvLoader) -> MizPrepStats;
+
+	// the schemes registry of a MizPrep (the accommodated loader fills it)
+	mizLoadSchemes(p : MizPrep, content : string) -> void;
 
 	// MML-format reader (one cluster per Typ)
 	mizMakeVrfReaderMML(x : MizXmlParser, env : MizCorrelEnv) -> MizVrfReader;
@@ -87,6 +99,15 @@ export {
 
 	// .esh: schemes into an existing registry
 	mizLoadSchemesInto(env : MizCorrelEnv, schemes : MizSchemes, content : string) -> void;
+
+	// .ere: the flat requirement list
+	mizLoadRequirementsFile(env : MizCorrelEnv, path : string) -> void;
+
+	// .eid / .erd (and prel .did / .drd): one item into a registry
+	mizReadOneIdentify(idn : MizIdentify, r2 : MizVrfReader) -> void;
+	mizReadOneReduction(idn : MizIdentify, r2 : MizVrfReader) -> void;
+	mizLoadIdentifications(env : MizCorrelEnv, idn : MizIdentify, content : string) -> void;
+	mizLoadReductions(env : MizCorrelEnv, idn : MizIdentify, content : string) -> void;
 }
 
 kindT = 1;
@@ -98,7 +119,7 @@ mizThKey(kind : int, articlenr : int, nr : int) -> int {
 
 // ---------------- environment loading ----------------
 
-mizLoadRequirements(env : MizCorrelEnv, path : string) -> void {
+mizLoadRequirementsFile(env : MizCorrelEnv, path : string) -> void {
 	content = getFileContent(path);
 	lines = strSplit(content, "\n");
 	fori(0, min(length(lines) - 1, rqLAST), \i -> {
@@ -360,7 +381,12 @@ mizMakeVrfReaderMML(x : MizXmlParser, env : MizCorrelEnv) -> MizVrfReader {
 
 // ---------------- the walker ----------------
 
-mizCheckArticle(mmlDir : string, article : string) -> MizPrepStats {
+// The environment can come from the flat files Mizar's accom wrote, or be
+// accommodated from `prel/` by accom.flow — hence the two hooks. `early` runs
+// before the built-in types are derived (it must supply constructors and
+// requirements), `late` after (registrations, theorems, schemes, definientia).
+mizCheckArticleWith(mmlDir : string, article : string,
+		loader : MizEnvLoader) -> MizPrepStats {
 	env = mizMakeCorrelEnv();
 	cl = mizMakeClusters();
 	mizWireRoundcl(env, cl);
@@ -368,10 +394,8 @@ mizCheckArticle(mmlDir : string, article : string) -> MizPrepStats {
 	chk = mizMakeChecker(env, idn, cl);
 	mizWireUnifier(chk);
 
-	// environment
-	r0 = mizMakeVrfReader(mizXmlInitParsing(""), env);
-	mizLoadConstructors(r0, getFileContent(mmlDir + "/" + article + ".atr"));
-	mizLoadRequirements(env, mmlDir + "/" + article + ".ere");
+	// environment: constructors + requirements
+	loader.early(env);
 	env.itTyp ::= mizNewStandardTyp(ikTypMode, mizNewEmptyCluster(),
 		mizNewEmptyCluster(), mizBuiltIn(env.builtIn, rqAny), mizNil);
 	rqElemB = mizBuiltIn(env.builtIn, rqElement);
@@ -390,11 +414,7 @@ mizCheckArticle(mmlDir : string, article : string) -> MizPrepStats {
 	r = mizMakeVrfReader(x, env);
 	defs = mizMakeDefinientia();
 	p = MizPrep(chk, r, makeVector(64), makeVector(64), None(), None(), makeTree(), defs, mizMakeSchemes(), 2, 0, 0, stats);
-	mizLoadTheorems(p, getFileContent(mmlDir + "/" + article + ".eth"));
-	mizLoadClusters(env, cl, getFileContent(mmlDir + "/" + article + ".ecl"));
-	mizLoadReductions(env, idn, getFileContent(mmlDir + "/" + article + ".erd"));
-	mizLoadIdentifications(env, idn, getFileContent(mmlDir + "/" + article + ".eid"));
-	mizLoadSchemes(p, getFileContent(mmlDir + "/" + article + ".esh"));
+	loader.late(env, cl, idn, defs, p);
 	// NonZeroTyp upper cluster: non-zero (+ positive), rounded with the
 	// loaded registrations (iocorrel.pas 3283-3294)
 	nzCl = mizNewEmptyCluster();
@@ -407,7 +427,6 @@ mizCheckArticle(mmlDir : string, article : string) -> MizPrepStats {
 	env.roundUpCluster(env, nzCl, env.nonZeroTyp);
 	nzT = env.nonZeroTyp;
 	nzT.upper ::= nzCl;
-	mizLoadDefinientia(env, defs, mmlDir, article);
 	chk.atomicExpansions ::= \f -> mizAtomicExpansions(env, defs, f);
 	idn.equalsExpand ::= \idn2, funcNr, args -> mizEqualsExpandHook(defs, idn2, funcNr, args);
 
@@ -416,6 +435,28 @@ mizCheckArticle(mmlDir : string, article : string) -> MizPrepStats {
 	mizXmlNextElementState(x);
 	mizWalkItems(p);
 	stats;
+}
+
+// the environment Mizar's own accom wrote next to the .xml
+mizFileEnvLoader(mmlDir : string, article : string) -> MizEnvLoader {
+	MizEnvLoader(
+		\env -> {
+			r0 = mizMakeVrfReader(mizXmlInitParsing(""), env);
+			mizLoadConstructors(r0, getFileContent(mmlDir + "/" + article + ".atr"));
+			mizLoadRequirementsFile(env, mmlDir + "/" + article + ".ere");
+		},
+		\env, cl, idn, defs, p -> {
+			mizLoadTheorems(p, getFileContent(mmlDir + "/" + article + ".eth"));
+			mizLoadClusters(env, cl, getFileContent(mmlDir + "/" + article + ".ecl"));
+			mizLoadReductions(env, idn, getFileContent(mmlDir + "/" + article + ".erd"));
+			mizLoadIdentifications(env, idn, getFileContent(mmlDir + "/" + article + ".eid"));
+			mizLoadSchemes(p, getFileContent(mmlDir + "/" + article + ".esh"));
+			mizLoadDefinientia(env, defs, mmlDir, article);
+		});
+}
+
+mizCheckArticle(mmlDir : string, article : string) -> MizPrepStats {
+	mizCheckArticleWith(mmlDir, article, mizFileEnvLoader(mmlDir, article));
 }
 
 mizSetLabeled(p : MizPrep, nr : int, f : MizFrm) -> void {
