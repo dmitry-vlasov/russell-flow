@@ -54,6 +54,11 @@ export {
 	mizWidening(env : MizCorrelEnv, t : MizTyp) -> Maybe<MizTyp>;
 	mizWidenToStruct(env : MizCorrelEnv, t : MizTyp) -> Maybe<MizTyp>;
 	mizWideningOf(env : MizCorrelEnv, target : MizTyp, source : MizTyp) -> Maybe<MizTyp>;
+	mizMotherStructNr(env : MizCorrelEnv, selNr : int) -> int;
+	mizReconSelectTrm(env : MizCorrelEnv, selNr : int, lastArg : MizTrm,
+		typ : MizTyp) -> Maybe<MizTrm>;
+	mizReconAggregTrm(env : MizCorrelEnv, structNr : int, lastArg : MizTrm,
+		typ : MizTyp) -> MizTrm;
 	mizIsWiderThan(env : MizCorrelEnv, wider : MizTyp, narrower : MizTyp) -> bool;
 	mizCopyAllowed(env : MizCorrelEnv, typ : MizTyp, origin : MizAttrColl) -> MizAttrColl;
 	mizAdjustedAttrNrOf(env : MizCorrelEnv, a : MizAttr) -> int;
@@ -704,4 +709,94 @@ mizCopyExpFrm(f : MizFrm) -> MizFrm {
 
 mizNewDisj(a : MizFrm, b : MizFrm) -> MizFrm {
 	mizNewNeg(mizNewConj(mizNewNeg(a), mizNewNeg(b)));
+}
+
+// ---------------- struct reconstruction (correl.pas ReconSelectTrm/ReconAggregTrm) ----------------
+
+// the selector's own struct (MotherStructNr): the struct whose fields contain it
+mizMotherStructNr(env : MizCorrelEnv, selNr : int) -> int {
+	res = ref 0;
+	n = mizConstrCount(env, coStructMode);
+	i = ref 1;
+	while(\ -> ^res == 0 && ^i <= n, \ -> {
+		c = mizConstr(env, coStructMode, ^i);
+		if (mizNatHasInDom(c.fields, selNr)) res := ^i;
+		i := ^i + 1;
+	});
+	^res;
+}
+
+// ReconSelectTrm: the selector term S(structArgs..., lastArg) for fTyp
+mizReconSelectTrm(env : MizCorrelEnv, selNr : int, lastArg : MizTrm,
+		typ : MizTyp) -> Maybe<MizTrm> {
+	motherNr = mizMotherStructNr(env, selNr);
+	if (motherNr == 0) {
+		None();
+	} else {
+		mother = mizNewStandardTyp(ikTypStruct, mizNewEmptyCluster(),
+			mizNewEmptyCluster(), motherNr, MizTrmNil());
+		switch (mizWideningOf(env, mother, mizCopyTyp(typ))) {
+			None(): None();
+			Some(wt): {
+				args = switch (wt.modArgs) {
+					MizTrmNil(): mizNewTrmList(lastArg, MizTrmNil());
+					default: mizAppendTrmL(mizCopyTrmList(wt.modArgs), lastArg);
+				};
+				Some(mizNewLocFuncTrm(ikTrmSelector, selNr, args));
+			}
+		}
+	}
+}
+
+mizAppendTrmL(l : MizTrmList, t : MizTrm) -> MizTrmList {
+	switch (l) {
+		MizTrmNil(): mizNewTrmList(t, MizTrmNil());
+		MizTrmElem(__, __): {
+			last = mizLastElemL(l);
+			last.next ::= mizNewTrmList(t, MizTrmNil());
+			l;
+		}
+	}
+}
+
+mizLastElemL(l : MizTrmList) -> MizTrmElem {
+	mizLastElem(l);
+}
+
+// ReconAggregTrm: the strict struct's aggregate term over its selectors
+mizReconAggregTrm(env : MizCorrelEnv, structNr : int, lastArg : MizTrm,
+		typ : MizTyp) -> MizTrm {
+	sc = mizConstr(env, coStructMode, structNr);
+	if (mizNatCount(sc.fields) == 0 || sc.structModeAggrNr == 0) {
+		mizNewIncorTrm();
+	} else {
+		aggrNr = sc.structModeAggrNr;
+		base = mizNewStandardTyp(ikTypStruct, mizNewEmptyCluster(),
+			mizNewEmptyCluster(), structNr, MizTrmNil());
+		switch (mizWideningOf(env, base, typ)) {
+			None(): mizNewIncorTrm();
+			Some(wt): {
+				args = ref mizCopyTrmList(wt.modArgs);
+				err = ref false;
+				ac = mizConstr(env, coAggregate, aggrNr);
+				fori(0, mizSeqCount(ac.aggrFields) - 1, \z -> {
+					selNr = mizSeqValue(ac.aggrFields, z);
+					switch (mizReconSelectTrm(env, selNr, mizCopyTrm(lastArg), wt)) {
+						Some(st): args := mizAppendTrmL(^args, st);
+						None(): {
+							err := true;
+							args := mizAppendTrmL(^args, mizNewIncorTrm());
+						}
+					}
+					selC = mizConstr(env, coSelector, selNr);
+					switch (selC.typ) {
+						Some(stp): if (stp.sort == ikError) err := true;
+						None(): err := true;
+					}
+				});
+				if (^err) mizNewIncorTrm()
+				else mizNewLocFuncTrm(ikTrmAggreg, aggrNr, ^args);
+			}
+		}
+	}
 }
