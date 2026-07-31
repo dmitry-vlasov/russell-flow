@@ -26,6 +26,8 @@ import mizar/original/xml_parser;
 import mizar/original/correl;
 import mizar/original/iocorrel;
 import mizar/original/roundcl;
+import mizar/original/schemes;
+import mizar/original/definientia;
 import mizar/original/prep;
 
 export {
@@ -63,6 +65,26 @@ export {
 	// build the registration table, exactly as the .ecl would have it
 	// (acc_han.pas ProcessClusters). Must run after mizAccomConstructors.
 	mizAccomClusters(acc : MizAccom, cl : MizClusters, evl : MizEvl) -> void;
+
+	// the imported articles in TOKEN order — the `articlenr` every reference
+	// in the .xml uses (accdict ProcessVocabularies: the theorems directive,
+	// then the schemes directive articles it does not already contain)
+	mizAccomArticleOrder(evl : MizEvl) -> [string];
+
+	// build the theorem table, exactly as the .eth would have it
+	// (acc_han.pas ProcessTheorems). Must run after mizAccomConstructors.
+	mizAccomTheorems(acc : MizAccom, evl : MizEvl) -> Pair<Tree<int, MizFrm>, int>;
+
+	// build the scheme table, exactly as the .esh would have it
+	// (acc_han.pas ProcessSchemes). Must run after mizAccomConstructors.
+	mizAccomSchemes(acc : MizAccom, evl : MizEvl) -> MizSchemes;
+
+	// build one definientia pool, exactly as .dfs / .dfe / .dfx would have it
+	// (acc_han.pas ProcessDefinitions / ProcessEqualities / ProcessExpansions —
+	// three copies of one procedure over three directives, all reading
+	// prel/*.def). directive = "definitions" | "equalities" | "expansions".
+	mizAccomDefinientia(acc : MizAccom, evl : MizEvl, directive : string)
+		-> Vector<MizDefiniens>;
 }
 
 mizEvlDirective(evl : MizEvl, name : string) -> [string] {
@@ -612,4 +634,223 @@ mizAccomClusters(acc : MizAccom, cl : MizClusters, evl : MizEvl) -> void {
 			});
 		}
 	});
+}
+
+// ---------------- the theorem pass (.eth) ----------------
+
+mizAccomArticleOrder(evl : MizEvl) -> [string] {
+	th = mizEvlDirective(evl, "theorems");
+	concat(th, filter(mizEvlDirective(evl, "schemes"), \a -> !contains(th, a)));
+}
+
+// ProcessTheorems: per directive article, translate every theorem into the
+// merged frame, drop the inaccessible ones, and number the two kinds
+// SEPARATELY in file order — the counters advance for dropped theorems too.
+mizAccomTheorems(acc : MizAccom, evl : MizEvl) -> Pair<Tree<int, MizFrm>, int> {
+	st = acc.st;
+	order = mizAccomArticleOrder(evl);
+	out = ref makeTree();
+	iter(mizEvlDirective(evl, "theorems"), \art -> {
+		artNr = 1 + elemIndex(order, art, -1);
+		path = mizPrelPath(acc.mmlDir, art, ".the");
+		if (artNr > 0 && fileExists(path)) {
+			r = mizMakeVrfReaderMML(mizXmlInitParsing(getFileContent(path)), acc.env);
+			x = r.x;
+			mizXmlNextElementState(x);
+			mizXmlAssert(x.nElName == "Theorems");
+			mizXmlNextElementState(x);
+			sig = mizReadDcoHeader(x).signature;
+			savedMerged = st.merged;
+			added = mizAccomEnsureBases(acc, sig);
+			tr = \k, nr -> mizAccomTranslateIn(st, sig, k, nr);
+			thNr = ref 0;
+			defNr = ref 0;
+			while(\ -> x.nState == MizEStart, \ -> {
+				if (x.nElName == "Theorem") {
+					kindS = mizXmlAttr(x, "kind");
+					kind = if (kindS == "T") kindT else kindD;
+					mizXmlNextElementState(x);
+					f = mizInFormula(r);
+					mizXmlNextElementState(x);
+					mizAccomRenumberFrm(tr, f);
+					curNr = if (kind == kindD) { defNr := ^defNr + 1; ^defNr }
+						else { thNr := ^thNr + 1; ^thNr };
+					if (mizAccFrm(acc.env, f)) {
+						out := setTree(^out, mizThKey(kind, artNr, curNr), f);
+					}
+				} else {
+					mizXmlSkipElement(x);
+				}
+			});
+			st.merged ::= savedMerged;
+			iter(added, \a -> {
+				st.info ::= removeFromTree(st.info, a);
+				st.baseOf ::= removeFromTree(st.baseOf, a);
+			});
+		}
+	});
+	Pair(^out, length(order) + 1);
+}
+
+// ---------------- the scheme pass (.esh) ----------------
+
+// ProcessSchemes: like the theorems, but the number is the scheme's INDEX in
+// its file (accessible or not) and both the argument types and every
+// proposition must be accessible.
+mizAccomSchemes(acc : MizAccom, evl : MizEvl) -> MizSchemes {
+	st = acc.st;
+	order = mizAccomArticleOrder(evl);
+	out = mizMakeSchemes();
+	iter(mizEvlDirective(evl, "schemes"), \art -> {
+		artNr = 1 + elemIndex(order, art, -1);
+		path = mizPrelPath(acc.mmlDir, art, ".sch");
+		if (artNr > 0 && fileExists(path)) {
+			r = mizMakeVrfReaderMML(mizXmlInitParsing(getFileContent(path)), acc.env);
+			x = r.x;
+			mizXmlNextElementState(x);
+			mizXmlAssert(x.nElName == "Schemes");
+			mizXmlNextElementState(x);
+			sig = mizReadDcoHeader(x).signature;
+			savedMerged = st.merged;
+			added = mizAccomEnsureBases(acc, sig);
+			tr = \k, nr -> mizAccomTranslateIn(st, sig, k, nr);
+			schNr = ref 0;
+			while(\ -> x.nState == MizEStart, \ -> {
+				if (x.nElName == "Scheme") {
+					mizXmlNextElementState(x);
+					types = if (x.nState == MizEStart && x.nElName == "ArgTypes") {
+						mizInArgColl(r);
+					} else {
+						makeVector(0);
+					}
+					props = ref [];
+					bad = ref false;
+					while(\ -> x.nState == MizEStart, \ -> {
+						if (mizIsFrmEl(x.nElName)) {
+							props := arrayPush(^props, mizInFormula(r));
+						} else {
+							if (x.nElName == "Canceled" || x.nElName == "ErrorScheme") {
+								bad := true;
+							}
+							mizXmlSkipElement(x);
+						}
+					});
+					mizXmlNextElementState(x);
+					schNr := ^schNr + 1;
+					iterVector(types, \ty -> mizAccomRenumberTyp(tr, ty));
+					iter(^props, \f -> mizAccomRenumberFrm(tr, f));
+					if (mizAccTypColl(acc.env, types)
+						&& forall(^props, \f -> mizAccFrm(acc.env, f))) {
+						pushVector(out.items,
+							MizSchemeDef(artNr, ^schNr, types, ^props, !^bad));
+					}
+				} else {
+					mizXmlSkipElement(x);
+				}
+			});
+			st.merged ::= savedMerged;
+			iter(added, \a -> {
+				st.info ::= removeFromTree(st.info, a);
+				st.baseOf ::= removeFromTree(st.baseOf, a);
+			});
+		}
+	});
+	out;
+}
+
+// ---------------- the definientia passes (.dfs / .dfe / .dfx) ----------------
+
+mizAccomDefConstrKind(k : int) -> int {
+	if (k == ikFrmPred) coPredicate
+	else if (k == ikTypMode) coMode
+	else if (k == ikTrmFunctor) coFunctor
+	else if (k == ikFrmAttr) coAttribute
+	else -1;
+}
+
+mizAccomRenumberDefBody(tr : (int, int) -> int, b : MizDefBody) -> void {
+	switch (b) {
+		MizDefFrm(f): mizAccomRenumberFrm(tr, f);
+		MizDefTrm(t): mizAccomRenumberTrm(tr, t);
+	}
+}
+
+// TransMMLDefiniens
+mizAccomRenumberDefiniens(tr : (int, int) -> int, d : MizDefiniens) -> void {
+	k = mizAccomDefConstrKind(d.constrKind);
+	if (k >= 0) d.constrNr ::= tr(k, d.constrNr);
+	iterVector(d.primaries, \t -> mizAccomRenumberTyp(tr, t));
+	mizAccomRenumberFrm(tr, d.assumptions);
+	switch (d.def) {
+		None(): {}
+		Some(def): {
+			switch (def.otherwise) {
+				Some(b): mizAccomRenumberDefBody(tr, b);
+				None(): {}
+			}
+			iterVector(def.partials, \pd -> {
+				mizAccomRenumberDefBody(tr, pd.body);
+				mizAccomRenumberFrm(tr, pd.guard);
+			});
+		}
+	}
+}
+
+// AccesibleDefiniens
+mizAccDefiniens(env : MizCorrelEnv, d : MizDefiniens) -> bool {
+	k = mizAccomDefConstrKind(d.constrKind);
+	(k < 0 || mizAccChosen(env, k, d.constrNr))
+	&& mizAccTypColl(env, d.primaries)
+	&& mizAccFrm(env, d.assumptions)
+	&& (switch (d.def) {
+		None(): false;      // `if Definiens = nil then exit` — inaccessible
+		Some(def): {
+			mizAccForall(def.partials, \pd -> (switch (pd.body) {
+					MizDefFrm(f): mizAccFrm(env, f);
+					MizDefTrm(t): mizAccTrm(env, t);
+				}) && mizAccFrm(env, pd.guard))
+			&& (switch (def.otherwise) {
+				None(): true;
+				Some(b): switch (b) {
+					MizDefFrm(f): mizAccFrm(env, f);
+					MizDefTrm(t): mizAccTrm(env, t);
+				}
+			});
+		}
+	});
+}
+
+mizAccomDefinientia(acc : MizAccom, evl : MizEvl, directive : string)
+		-> Vector<MizDefiniens> {
+	st = acc.st;
+	out : Vector<MizDefiniens> = makeVector(16);
+	iter(mizEvlDirective(evl, directive), \art -> {
+		path = mizPrelPath(acc.mmlDir, art, ".def");
+		if (fileExists(path)) {
+			r = mizMakeVrfReaderMML(mizXmlInitParsing(getFileContent(path)), acc.env);
+			x = r.x;
+			mizXmlNextElementState(x);
+			mizXmlAssert(x.nElName == "Definientia");
+			mizXmlNextElementState(x);
+			sig = mizReadDcoHeader(x).signature;
+			savedMerged = st.merged;
+			added = mizAccomEnsureBases(acc, sig);
+			tr = \k, nr -> mizAccomTranslateIn(st, sig, k, nr);
+			while(\ -> x.nState == MizEStart, \ -> {
+				if (x.nElName == "Definiens") {
+					d = mizInDefiniens(r);
+					mizAccomRenumberDefiniens(tr, d);
+					if (mizAccDefiniens(acc.env, d)) pushVector(out, d);
+				} else {
+					mizXmlSkipElement(x);
+				}
+			});
+			st.merged ::= savedMerged;
+			iter(added, \a -> {
+				st.info ::= removeFromTree(st.info, a);
+				st.baseOf ::= removeFromTree(st.baseOf, a);
+			});
+		}
+	});
+	out;
 }
