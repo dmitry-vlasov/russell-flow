@@ -1,0 +1,399 @@
+// Transcription of ~/dev/system/kernel/roundcl.pas (MCondClList: indexed
+// conditional-cluster rounding by graph-chasing) together with the cluster
+// registrations and the functor-cluster rounding from correl.pas
+// (RoundUpWith at 4278, RoundUpTrmTypeWithType at 1104).
+//
+// The registries (RegisteredCluster / FunctorCluster / ConditionalCluster
+// unit globals) become MizClusters, one per article. Wiring into
+// MizCorrelEnv is by the two hooks env.roundUpTrmType / env.roundUpCluster
+// (mizWireRoundcl) so correl-level code reaches rounding without a circular
+// import.
+
+import ds/vector;
+import loop;
+import math/math;
+import mizar/original/errhan;
+import mizar/original/mobjects;
+import mizar/original/limits;
+import mizar/original/lexicon;
+import mizar/original/builtin;
+import mizar/original/correl;
+import mizar/original/correl_inst;
+import mizar/original/correl_match;
+
+export {
+	// ClusterRec: Lower/Upper consequent pair
+	MizClusterRec(lower : MizAttrColl, upper : MizAttrColl);
+
+	MizRCluster(article : string, absNr : int, primaries : Vector<MizTyp>,
+		consequent : MizClusterRec, clusterType : MizTyp);
+	MizCCluster(article : string, absNr : int, primaries : Vector<MizTyp>,
+		antecedent : MizAttrColl, consequent : MizClusterRec, clusterType : MizTyp);
+	MizFCluster(article : string, absNr : int, primaries : Vector<MizTyp>,
+		consequent : MizClusterRec, clusterTerm : MizTrm,
+		clusterType : Maybe<MizTyp>);
+
+	MizClusters(
+		registered : Vector<MizRCluster>,
+		functor : Vector<MizFCluster>,        // sorted by CmpFuncCluster
+		conditional : Vector<MizCCluster>,
+		// nAttrClusters[neg][adjusted attr nr] -> set of conditional indices
+		condIndexPos : Vector<MizNatFunc>,    // index = adjusted attr nr
+		condIndexNeg : Vector<MizNatFunc>,
+		initClFire : MizIntSeq,               // antecedent sizes
+	);
+
+	mizMakeClusters() -> MizClusters;
+	mizInsertRCluster(cl : MizClusters, r : MizRCluster) -> void;
+	mizInsertCCluster(env : MizCorrelEnv, cl : MizClusters, c : MizCCluster) -> void;
+	mizInsertFCluster(env : MizCorrelEnv, cl : MizClusters, f : MizFCluster) -> void;
+
+	// wire the rounding hooks of the env to these registries
+	mizWireRoundcl(env : MizCorrelEnv, cl : MizClusters) -> void;
+
+	// MCondClList.RoundUpCluster: round aCluster (of aTyp) up in place
+	mizRoundUpCluster(env : MizCorrelEnv, cl : MizClusters,
+		cluster : MizAttrColl, typ : MizTyp) -> void;
+
+	// RoundUpTrmType: the term's type with functor + conditional rounding
+	mizRoundUpTrmType(env : MizCorrelEnv, cl : MizClusters, t : MizTrm) -> MizTyp;
+
+	// TypObj.RoundUp — round up a type's upper cluster in place
+	mizTypRoundUp(env : MizCorrelEnv, cl : MizClusters, typ : MizTyp) -> void;
+
+	mizSwapArguments(l : MizTrmList, first : int, second : int) -> MizTrmList;
+}
+
+mizMakeClusters() -> MizClusters {
+	MizClusters(makeVector(16), makeVector(16), makeVector(16),
+		makeVector(64), makeVector(64), mizInitIntSeq(16));
+}
+
+mizWireRoundcl(env : MizCorrelEnv, cl : MizClusters) -> void {
+	env.roundUpTrmType ::= \e, t -> mizRoundUpTrmType(e, cl, t);
+	env.roundUpCluster ::= \e, c, ty -> mizRoundUpCluster(e, cl, c, ty);
+}
+
+mizInsertRCluster(cl : MizClusters, r : MizRCluster) -> void {
+	pushVector(cl.registered, r);
+}
+
+mizCondIndex(cl : MizClusters, neg : int) -> Vector<MizNatFunc> {
+	if (neg == 0) cl.condIndexNeg else cl.condIndexPos;
+}
+
+mizCondIndexAt(cl : MizClusters, neg : int, adjNr : int) -> MizNatFunc {
+	idx = mizCondIndex(cl, neg);
+	while(\ -> sizeVector(idx) <= adjNr, \ -> pushVector(idx, mizInitNatSet(4)));
+	getVectorUnsafe(idx, adjNr);
+}
+
+// MCondClList.AddExtObject: index the antecedent attrs, record the fire count
+mizInsertCCluster(env : MizCorrelEnv, cl : MizClusters, c : MizCCluster) -> void {
+	pushVector(cl.conditional, c);
+	nr = sizeVector(cl.conditional) - 1;
+	iterVector(c.antecedent.items, \a -> {
+		mizNatInsertElem(mizCondIndexAt(cl, a.neg, mizAdjustedAttrNr(env, a)), nr);
+	});
+	mizSeqInsert(cl.initClFire, sizeVector(c.antecedent.items));
+	{}
+}
+
+// FuncRedefNr — adjusted functor number
+mizFuncRedefNr(env : MizCorrelEnv, funcNr : int) -> int {
+	c = mizConstr(env, coFunctor, funcNr);
+	if (c.whichConstrNr != 0) c.whichConstrNr else funcNr;
+}
+
+mizCmpFuncTrm(env : MizCorrelEnv, a : MizTrm, b : MizTrm) -> int {
+	fa = mizTrmSort(a) == ikTrmFunctor;
+	fb = mizTrmSort(b) == ikTrmFunctor;
+	if (!fa) {
+		if (!fb) 0 else -1;
+	} else if (!fb) {
+		1;
+	} else {
+		na = switch (a) { MizFuncTrm(__, funcNr, __, __): funcNr; default: 0; };
+		nb = switch (b) { MizFuncTrm(__, funcNr, __, __): funcNr; default: 0; };
+		mizCmpInt(mizFuncRedefNr(env, na), mizFuncRedefNr(env, nb));
+	}
+}
+
+// sorted insert into the functor registry
+mizInsertFCluster(env : MizCorrelEnv, cl : MizClusters, f : MizFCluster) -> void {
+	pos = ref sizeVector(cl.functor);
+	while(\ -> ^pos > 0 && mizCmpFuncTrm(env,
+			getVectorUnsafe(cl.functor, ^pos - 1).clusterTerm, f.clusterTerm) > 0,
+		\ -> pos := ^pos - 1);
+	mizVectorAtInsert(cl.functor, ^pos, f);
+}
+
+// FindInterval: [left, right] of functor clusters whose term compares 0
+mizFClusterInterval(env : MizCorrelEnv, cl : MizClusters, t : MizTrm) -> Maybe<Pair<int, int>> {
+	n = sizeVector(cl.functor);
+	left = ref -1;
+	fori(0, n - 1, \i -> {
+		if (^left < 0 && mizCmpFuncTrm(env, getVectorUnsafe(cl.functor, i).clusterTerm, t) == 0) {
+			left := i;
+		}
+	});
+	if (^left < 0) {
+		None();
+	} else {
+		right = ref ^left;
+		while(\ -> ^right + 1 < n && mizCmpFuncTrm(env,
+				getVectorUnsafe(cl.functor, ^right + 1).clusterTerm, t) == 0,
+			\ -> right := ^right + 1);
+		Some(Pair(^left, ^right));
+	}
+}
+
+// EnlargeBy under the loci substitution: insert instantiated copies
+mizEnlargeByInst(env : MizCorrelEnv, target : MizAttrColl, src : MizAttrColl) -> void {
+	mizInstFromSubstLocal(env);
+	iterVector(src.items, \a -> {
+		if (target.consistent) {
+			copied = MizAttr(a.neg, a.attrNr, mizInstCopyTrmList(env, a.args), false, a.pattNr);
+			mizAttrCollInsert(env, target, copied);
+		}
+	});
+	env.instantiated ::= false;
+}
+
+mizInstFromSubstLocal(env : MizCorrelEnv) -> void {
+	clearVector(env.instantiation);
+	pushVector(env.instantiation, mizNewIncorTrm());
+	brk = ref false;
+	k = ref 1;
+	while(\ -> !^brk && ^k < sizeVector(env.substTrm), \ -> {
+		switch (mizSubstTrmGet(env, ^k)) {
+			Some(t): pushVector(env.instantiation, t);
+			None(): brk := true;
+		}
+		k := ^k + 1;
+	});
+	env.instantiated ::= true;
+	env.boundBase ::= env.boundVarNbr;
+}
+
+// TryRounding (roundcl.pas:78)
+mizTryRounding(env : MizCorrelEnv, cond : MizCCluster, typ : MizTyp,
+		cluster : MizAttrColl) -> bool {
+	if (!mizTypReachable(env, cond.clusterType, typ)) {
+		false;
+	} else {
+		mizDisposeSubstTrm(env);
+		ok = mizAttrCollIsSubsetOf(env, cond.antecedent, cluster,
+				\x, y -> mizEsAttrRev(env, x, y))
+			&& !mizAttrCollIsSubsetOf(env, cond.consequent.upper, cluster,
+				\x, y -> mizAttrEquals(env, x, y));
+		res = if (ok) {
+			switch (mizWideningOf(env, cond.clusterType, mizCopyTyp(typ))) {
+				Some(lTyp): {
+					if (mizCompEsTyp(env, cond.clusterType, lTyp, false)
+						&& mizAttrCollIsSubsetOf(env, cond.clusterType.lower, lTyp.upper,
+							\x, y -> mizEsAttrRev(env, x, y))
+						&& mizCheckLociTypes(env, cond.primaries)) {
+						mizEnlargeByInst(env, cluster, cond.consequent.upper);
+						true;
+					} else {
+						false;
+					}
+				}
+				None(): false;
+			}
+		} else {
+			false;
+		}
+		mizDisposeSubstTrm(env);
+		res;
+	}
+}
+
+// MCondClList.RoundUpCluster — the graph-chasing loop
+mizRoundUpCluster(env : MizCorrelEnv, cl : MizClusters,
+		cluster : MizAttrColl, typ : MizTyp) -> void {
+	nCond = sizeVector(cl.conditional);
+	if (nCond > 0) {
+		clFire : Vector<int> = makeVector(nCond);
+		fori(0, nCond - 1, \j -> pushVector(clFire, mizSeqValue(cl.initClFire, j)));
+		jobs = mizInitNatSet(32);
+		oldPos = mizInitNatFunc(32);
+		oldNeg = mizInitNatFunc(32);
+
+		countAdj = \c : MizAttrColl -> {
+			np = mizInitNatFunc(32);
+			nn = mizInitNatFunc(32);
+			iterVector(c.items, \a -> {
+				if (a.neg == 1) mizNatUp(np, mizAdjustedAttrNr(env, a))
+				else mizNatUp(nn, mizAdjustedAttrNr(env, a));
+			});
+			Pair(np, nn);
+		};
+
+		handleUsageAndFire = \oldP : MizNatFunc, oldN : MizNatFunc -> {
+			pq = countAdj(cluster);
+			doSide = \newF : MizNatFunc, oldF : MizNatFunc, neg : int -> {
+				fori(0, mizNatCount(newF) - 1, \i -> {
+					it = mizNatItem(newF, i);
+					oldVal = if (mizNatHasInDom(oldF, it.x)) mizNatValue(oldF, it.x) else -1;
+					if (oldVal < it.y) {
+						idxSet = mizCondIndexAt(cl, neg, it.x);
+						fori(0, mizNatCount(idxSet) - 1, \k -> {
+							clNr = mizNatItem(idxSet, k).x;
+							setVectorUnsafe(clFire, clNr, getVectorUnsafe(clFire, clNr) - 1);
+							if (getVectorUnsafe(clFire, clNr) <= 0) {
+								mizNatInsertElem(jobs, clNr);
+							}
+						});
+					}
+				});
+			};
+			doSide(pq.first, oldP, 1);
+			doSide(pq.second, oldN, 0);
+			pq;
+		};
+
+		// clusters with empty antecedent fire immediately
+		fori(0, nCond - 1, \j -> {
+			if (getVectorUnsafe(clFire, j) == 0) mizNatInsertElem(jobs, j);
+		});
+		cur = ref handleUsageAndFire(oldPos, oldNeg);
+		while(\ -> cluster.consistent && mizNatCount(jobs) > 0, \ -> {
+			last = mizNatItem(jobs, mizNatCount(jobs) - 1).x;
+			mizNatDeleteElem(jobs, last);
+			if (mizTryRounding(env, getVectorUnsafe(cl.conditional, last), typ, cluster)) {
+				cur := handleUsageAndFire((^cur).first, (^cur).second);
+			}
+		});
+	}
+}
+
+// SwapArguments (1-based positions)
+mizSwapArguments(l : MizTrmList, first : int, second : int) -> MizTrmList {
+	v = mizTrmList2Vector(l);
+	n = sizeVector(v);
+	if (first >= 1 && first <= n && second >= 1 && second <= n) {
+		a : MizTrm = getVectorUnsafe(v, first - 1);
+		b : MizTrm = getVectorUnsafe(v, second - 1);
+		setVectorUnsafe(v, first - 1, b);
+		setVectorUnsafe(v, second - 1, a);
+	}
+	mizVector2TrmList(v);
+}
+
+// RoundUpWith for one functor cluster (correl.pas:4278)
+mizFClusterRoundUpWith(env : MizCorrelEnv, fc : MizFCluster, t : MizTrm,
+		typ : MizTyp, cluster : MizAttrColl) -> bool {
+	mizDisposeSubstTrm(env);
+	snap = mapVector(env.substTrm, \m -> isSome(m));
+	lEq0 = mizEsTrm(env, fc.clusterTerm, t) && mizCheckLociTypes(env, fc.primaries);
+	lEq = if (!lEq0 && mizTrmSort(t) == ikTrmFunctor) {
+		ft = switch (t) {
+			MizFuncTrm(__, __, __, __): t;
+			default: MizFuncTrm(ikError, 0, MizTrmNil(), 0);
+		}
+		c = mizConstr(env, coFunctor, ft.funcNr);
+		if (mizHasProperty(c, syCommutativity)) {
+			lTrm = mizNewFuncTrm(ft.funcNr,
+				mizSwapArguments(ft.args, c.firstArg, c.secondArg));
+			// undo bindings from the failed direct match
+			mizResetSubstToSnap(env, snap);
+			mizEsTrm(env, fc.clusterTerm, lTrm) && mizCheckLociTypes(env, fc.primaries);
+		} else {
+			false;
+		}
+	} else {
+		lEq0;
+	}
+	res = if (lEq) {
+		typOk = switch (fc.clusterType) {
+			Some(ct): {
+				switch (mizWideningOf(env, ct, mizCopyTyp(typ))) {
+					Some(lTyp): {
+						mizCompEsTyp(env, ct, lTyp, false)
+						&& mizAttrCollIsSubsetOf(env, ct.lower, lTyp.upper,
+							\x, y -> mizEsAttrRev(env, x, y))
+						&& mizCheckLociTypes(env, fc.primaries);
+					}
+					None(): false;
+				}
+			}
+			None(): true;
+		}
+		if (typOk) {
+			mizEnlargeByInst(env, cluster, fc.consequent.upper);
+			true;
+		} else {
+			false;
+		}
+	} else {
+		false;
+	}
+	mizDisposeSubstTrm(env);
+	res;
+}
+
+mizResetSubstToSnap(env : MizCorrelEnv, snap : Vector<bool>) -> void {
+	fori(1, sizeVector(env.substTrm) - 1, \k -> {
+		if (!getVectorDef(snap, k, false)) setVectorUnsafe(env.substTrm, k, None());
+	});
+}
+
+// RoundUpTrmTypeWithType (correl.pas:1104)
+mizRoundUpTrmTypeWithType(env : MizCorrelEnv, cl : MizClusters,
+		typ0 : MizTyp, t : MizTrm) -> MizTyp {
+	srt = mizTrmSort(t);
+	typ = typ0;
+	if (srt == ikTrmFunctor || srt == ikTrmSelector || srt == ikTrmAggreg) {
+		switch (mizFClusterInterval(env, cl, t)) {
+			None(): {}
+			Some(iv): {
+				used = mizInitIntSeq(4);
+				cluster = ref mizCopyCluster(typ.upper);
+				i = ref iv.first;
+				inconsistent = ref false;
+				while(\ -> !^inconsistent && ^i <= iv.second, \ -> {
+					if (mizIntSetIsInSet(used, ^i)) {
+						i := ^i + 1;
+					} else {
+						fc : MizFCluster = getVectorUnsafe(cl.functor, ^i);
+						if (mizFClusterRoundUpWith(env, fc, t, typ, ^cluster)) {
+							mizRoundUpCluster(env, cl, ^cluster, typ);
+							typ.upper ::= ^cluster;
+							if (!(^cluster).consistent) {
+								inconsistent := true;
+							} else {
+								cluster := mizCopyCluster(typ.upper);
+								__u2 = mizIntSetInsert(used, ^i);
+								if (isSome(fc.clusterType)) {
+									i := iv.first; // restart the interval
+								} else {
+									i := ^i + 1;
+								}
+							}
+						} else {
+							if (isNone(fc.clusterType)) {
+								__u = mizIntSetInsert(used, ^i);
+								{}
+							}
+							i := ^i + 1;
+						}
+					}
+				});
+			}
+		}
+	}
+	typ;
+}
+
+mizRoundUpTrmType(env : MizCorrelEnv, cl : MizClusters, t0 : MizTrm) -> MizTyp {
+	t = mizSkipPrivFunc(t0);
+	mizRoundUpTrmTypeWithType(env, cl, mizCopyTrmType(env, t), t);
+}
+
+mizTypRoundUp(env : MizCorrelEnv, cl : MizClusters, typ : MizTyp) -> void {
+	cluster = mizCopyCluster(typ.upper);
+	mizRoundUpCluster(env, cl, cluster, typ);
+	typ.upper ::= cluster;
+}

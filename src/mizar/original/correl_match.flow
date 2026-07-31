@@ -1,0 +1,475 @@
+// Transcription of ~/dev/system/kernel/correl.pas (part 3): the Es* loci
+// MATCHING family over gSubstTrm, and CheckLociTypes — the backtracking
+// verification that matched terms fit the loci types.
+//
+// gSubstTrm lives in MizCorrelEnv.substTrm (1-based, Maybe). EsTrm fills an
+// empty locus slot with a COPY of the matched term; a filled slot must match
+// by EqTrm. The invariant "slots are only ever filled, never replaced" makes
+// the original's pointer-identity snapshot tests equivalent to nil-tracking,
+// which is what mizSnapshotSubst/mizResetNewerSubst implement.
+
+import ds/vector;
+import loop;
+import mizar/original/errhan;
+import mizar/original/mobjects;
+import mizar/original/limits;
+import mizar/original/lexicon;
+import mizar/original/builtin;
+import mizar/original/correl;
+import mizar/original/correl_inst;
+
+export {
+	mizSubstTrmGet(env : MizCorrelEnv, k : int) -> Maybe<MizTrm>;
+	mizSubstTrmSet(env : MizCorrelEnv, k : int, t : Maybe<MizTrm>) -> void;
+	mizDisposeSubstTrm(env : MizCorrelEnv) -> void;    // clear all slots
+	mizCreateArgList(env : MizCorrelEnv, len : int) -> MizTrmList;
+	// InstSubstTrm/InstSubstFrm: instantiate through gSubstTrm
+	mizInstSubstTrm(env : MizCorrelEnv, t : MizTrm) -> MizTrm;
+	mizInstSubstFrm(env : MizCorrelEnv, f : MizFrm) -> MizFrm;
+
+	mizEsTrm(env : MizCorrelEnv, f : MizTrm, a : MizTrm) -> bool;
+	mizEsTrmList(env : MizCorrelEnv, f : MizTrmList, a : MizTrmList) -> bool;
+	mizEsAttr(env : MizCorrelEnv, f : MizAttr, a : MizAttr) -> bool;
+	mizEsAttrRev(env : MizCorrelEnv, f : MizAttr, a : MizAttr) -> bool;
+	mizEsTyp(env : MizCorrelEnv, f : MizTyp, a : MizTyp) -> bool;
+	mizEsFrm(env : MizCorrelEnv, f : MizFrm, a : MizFrm) -> bool;
+	mizCompEsTyp(env : MizCorrelEnv, f : MizTyp, a : MizTyp, exactly : bool) -> bool;
+	mizAttrEquals(env : MizCorrelEnv, a : MizAttr, b : MizAttr) -> bool;
+
+	mizCheckLociTypes(env : MizCorrelEnv, list : Vector<MizTyp>) -> bool;
+}
+
+mizSubstTrmGet(env : MizCorrelEnv, k : int) -> Maybe<MizTrm> {
+	getVectorDef(env.substTrm, k, None());
+}
+
+mizSubstTrmSet(env : MizCorrelEnv, k : int, t : Maybe<MizTrm>) -> void {
+	setVectorUnsafe(env.substTrm, k, t);
+}
+
+mizDisposeSubstTrm(env : MizCorrelEnv) -> void {
+	fori(1, sizeVector(env.substTrm) - 1, \k -> setVectorUnsafe(env.substTrm, k, None()));
+}
+
+mizCreateArgList(env : MizCorrelEnv, len : int) -> MizTrmList {
+	r = ref MizTrmNil();
+	k = ref len;
+	while(\ -> ^k >= 1, \ -> {
+		switch (mizSubstTrmGet(env, ^k)) {
+			Some(t): r := MizTrmElem(t, ^r);
+			None(): r := MizTrmElem(mizNewIncorTrm(), ^r);
+		}
+		k := ^k - 1;
+	});
+	^r;
+}
+
+// InitInst: load Instantiation[] from gSubstTrm, then env-aware copy.
+mizInstFromSubst(env : MizCorrelEnv) -> void {
+	clearVector(env.instantiation);
+	pushVector(env.instantiation, mizNewIncorTrm());
+	brk = ref false;
+	k = ref 1;
+	while(\ -> !^brk && ^k < sizeVector(env.substTrm), \ -> {
+		switch (mizSubstTrmGet(env, ^k)) {
+			Some(t): pushVector(env.instantiation, t);
+			None(): brk := true;
+		}
+		k := ^k + 1;
+	});
+	env.instantiated ::= true;
+	env.boundBase ::= env.boundVarNbr;
+}
+
+mizInstSubstTrm(env : MizCorrelEnv, t : MizTrm) -> MizTrm {
+	mizInstFromSubst(env);
+	res = mizInstCopyTrm(env, t);
+	env.instantiated ::= false;
+	res;
+}
+
+mizInstSubstFrm(env : MizCorrelEnv, f : MizFrm) -> MizFrm {
+	mizInstFromSubst(env);
+	res = mizInstCopyFrm(env, f);
+	env.instantiated ::= false;
+	res;
+}
+
+// snapshot: which slots are filled now
+mizSnapshotSubst(env : MizCorrelEnv) -> Vector<bool> {
+	mapVector(env.substTrm, \m -> isSome(m));
+}
+
+// reset every slot that was empty at the snapshot
+mizResetNewerSubst(env : MizCorrelEnv, snap : Vector<bool>) -> void {
+	fori(1, sizeVector(env.substTrm) - 1, \k -> {
+		if (!getVectorDef(snap, k, false)) {
+			setVectorUnsafe(env.substTrm, k, None());
+		}
+	});
+}
+
+// ---------------- Es matching ----------------
+
+mizEsTrm(env : MizCorrelEnv, f0 : MizTrm, a : MizTrm) -> bool {
+	sf = mizTrmSort(f0);
+	if (sf == ikTrmLocus) {
+		vf = mizEsAsVar(f0);
+		switch (mizSubstTrmGet(env, vf.varNr)) {
+			None(): {
+				mizSubstTrmSet(env, vf.varNr, Some(mizCopyTrm(a)));
+				true;
+			}
+			Some(bound): {
+				if (mizTrmSort(bound) == ikTrmQua) {
+					qb = mizEsAsQua(bound);
+					mizEqTrm(env, a, qb.trmProper);
+				} else {
+					mizEqTrm(env, a, bound);
+				}
+			}
+		}
+	} else {
+		sa = mizTrmSort(a);
+		if (sf == sa) {
+			switch (f0) {
+				MizVarTrm(__, varNr, __): {
+					va = mizEsAsVar(a);
+					varNr == va.varNr;
+				}
+				MizFuncTrm(srt, funcNr, args, __): {
+					fa = mizEsAsFunc(a);
+					if (srt == ikTrmFunctor) {
+						if (funcNr == fa.funcNr) {
+							mizEsTrmList(env, args, fa.args);
+						} else {
+							ff : MizFuncTrm = mizEsAsFunc(f0);
+							p1 = mizAdjustTrm(env, ff);
+							p2 = mizAdjustTrm(env, fa);
+							p1.first == p2.first && mizEsTrmList(env, p1.second, p2.second);
+						}
+					} else {
+						funcNr == fa.funcNr && mizEsTrmList(env, args, fa.args);
+					}
+				}
+				MizPrivFuncTrm(funcNr, args, __, __): {
+					pa = mizEsAsPriv(a);
+					funcNr == pa.funcNr && mizEsTrmList(env, args, pa.args);
+				}
+				MizFraenkelTrm(lambdaArgs, scope, compr, __, __): {
+					ka = mizEsAsFraenkel(a);
+					if (sizeVector(lambdaArgs) != sizeVector(ka.lambdaArgs)) {
+						false;
+					} else {
+						ok = ref true;
+						i = ref 0;
+						while(\ -> ^i < sizeVector(lambdaArgs) && ^ok, \ -> {
+							if (!mizEsTyp(env, getVectorUnsafe(lambdaArgs, ^i),
+									getVectorUnsafe(ka.lambdaArgs, ^i))) ok := false;
+							i := ^i + 1;
+						});
+						^ok && mizEsTrm(env, scope, ka.scope)
+							&& mizEsFrm(env, compr, ka.compr);
+					}
+				}
+				MizChoiceTrm(typ, __): {
+					ha = mizEsAsChoice(a);
+					mizEsTyp(env, typ, ha.choiceTyp);
+				}
+				MizBaseTrm(srt): srt == ikTrmIt;
+				MizQuaTrm(__, __, __): false;
+			}
+		} else if (sa == ikTrmInfConst) {
+			va = mizEsAsVar(a);
+			cd : MizConstDef = getVectorUnsafe(env.inferConstDef, va.varNr);
+			mizEsTrm(env, f0, cd.def);
+		} else if (sf == ikTrmInfConst) {
+			vf2 = mizEsAsVar(f0);
+			cd2 : MizConstDef = getVectorUnsafe(env.inferConstDef, vf2.varNr);
+			mizEsTrm(env, cd2.def, a);
+		} else if (sf == ikTrmPrivFunc || sa == ikTrmPrivFunc) {
+			f1 = mizSkipPrivFunc(f0);
+			a1 = mizSkipPrivFunc(a);
+			if (mizTrmSort(f1) == ikTrmPrivFunc || mizTrmSort(a1) == ikTrmPrivFunc) {
+				false; // an incorrect expansion blocks
+			} else {
+				mizEsTrm(env, f1, a1);
+			}
+		} else {
+			false;
+		}
+	}
+}
+
+mizEsTrmList(env : MizCorrelEnv, f : MizTrmList, a : MizTrmList) -> bool {
+	switch (f) {
+		MizTrmNil(): switch (a) {
+			MizTrmNil(): true;
+			MizTrmElem(__, __): false;
+		}
+		MizTrmElem(tf, nf): switch (a) {
+			MizTrmNil(): false;
+			MizTrmElem(ta, na): mizEsTrm(env, tf, ta) && mizEsTrmList(env, nf, na);
+		}
+	}
+}
+
+mizEsAttr(env : MizCorrelEnv, f : MizAttr, a : MizAttr) -> bool {
+	pf = mizAdjustAttr(env, f);
+	pa = mizAdjustAttr(env, a);
+	pf.first == pa.first && f.neg == a.neg && mizEsTrmList(env, pf.second, pa.second);
+}
+
+mizEsAttrRev(env : MizCorrelEnv, f : MizAttr, a : MizAttr) -> bool {
+	mizEsAttr(env, a, f);
+}
+
+mizEsTyp(env : MizCorrelEnv, f : MizTyp, a : MizTyp) -> bool {
+	if (f.sort != a.sort) {
+		false;
+	} else if (!mizAttrCollIsSubsetOf(env, f.lower, a.upper, \x, y -> mizEsAttrRev(env, x, y))
+		|| !mizAttrCollIsSubsetOf(env, a.lower, f.upper, \x, y -> mizEsAttr(env, x, y))) {
+		false;
+	} else if (f.modNr == a.modNr) {
+		mizEsTrmList(env, f.modArgs, a.modArgs);
+	} else if (f.sort == ikTypMode) {
+		pa = mizAdjustTyp(env, a);
+		f.modNr == pa.first && mizEsTrmList(env, f.modArgs, pa.second);
+	} else {
+		false;
+	}
+}
+
+mizEsFrm(env : MizCorrelEnv, f0 : MizFrm, a0 : MizFrm) -> bool {
+	f = mizSkipLocPred(f0);
+	a = mizSkipLocPred(a0);
+	sf = mizFrmSort(f);
+	if (sf != mizFrmSort(a)) {
+		false;
+	} else if (sf == ikFrmVerum || sf == ikFrmThesis) {
+		true;
+	} else {
+		switch (f) {
+			MizNegFrm(arg, __): {
+				na = mizEsAsNeg(a);
+				mizEsFrm(env, arg, na.arg);
+			}
+			MizQualFrm(trm, typ, __): {
+				qa = mizEsAsQual(a);
+				mizEsTrm(env, trm, qa.trm) && mizEsTyp(env, typ, qa.typ);
+			}
+			MizConjFrm(conjuncts, __): {
+				ca = mizEsAsConj(a);
+				if (sizeVector(conjuncts) != sizeVector(ca.conjuncts)) {
+					false;
+				} else {
+					ok = ref true;
+					i = ref 0;
+					while(\ -> ^i < sizeVector(conjuncts) && ^ok, \ -> {
+						if (!mizEsFrm(env, getVectorUnsafe(conjuncts, ^i),
+								getVectorUnsafe(ca.conjuncts, ^i))) ok := false;
+						i := ^i + 1;
+					});
+					^ok;
+				}
+			}
+			MizPredFrm(srt, predNr, args, __): {
+				pa = mizEsAsPred(a);
+				if (predNr == pa.predNr) {
+					mizEsTrmList(env, args, pa.args);
+				} else if (srt == ikFrmAttr) {
+					q = mizAdjustAttrFrm(env, pa);
+					predNr == q.first && mizEsTrmList(env, args, q.second);
+				} else if (srt == ikFrmPred) {
+					q = mizAdjustFrm(env, pa);
+					predNr == q.first && mizEsTrmList(env, args, q.second);
+				} else {
+					false;
+				}
+			}
+			MizLocPredFrm(predNr, args, __, __): {
+				la = mizEsAsLocPred(a);
+				predNr == la.predNr && mizEsTrmList(env, args, la.args);
+			}
+			MizUnivFrm(__, __, quantified, scope, __): {
+				ua = mizEsAsUniv(a);
+				mizEsTyp(env, quantified, ua.quantified) && mizEsFrm(env, scope, ua.scope);
+			}
+			default: {
+				mizRunTimeError(2103);
+				false;
+			}
+		}
+	}
+}
+
+mizCompEsTyp(env : MizCorrelEnv, f : MizTyp, a : MizTyp, exactly : bool) -> bool {
+	if (f.sort != a.sort) {
+		false;
+	} else if (f.modNr == a.modNr) {
+		mizEsTrmList(env, f.modArgs, a.modArgs);
+	} else if (f.sort == ikTypMode && !exactly) {
+		pa = mizAdjustTyp(env, a);
+		f.modNr == pa.first && mizEsTrmList(env, f.modArgs, pa.second);
+	} else {
+		false;
+	}
+}
+
+mizAttrEquals(env : MizCorrelEnv, a : MizAttr, b : MizAttr) -> bool {
+	pa = mizAdjustAttr(env, a);
+	pb = mizAdjustAttr(env, b);
+	pa.first == pb.first && a.neg == b.neg;
+}
+
+// ---------------- CheckLociTypes ----------------
+// Backtracking verification of the loci substitution against the loci type
+// list: for each filled slot (right to left), the term's (rounded-up) type
+// must widen onto the locus type with matching args; on failure, try the
+// next Widening of a previous level's reached type.
+
+mizCheckLociTypes(env : MizCorrelEnv, list : Vector<MizTyp>) -> bool {
+	n = sizeVector(list);
+	// per-level snapshots of the substitution and the reached type
+	snaps : Vector<Vector<bool>> = makeVector(n + 1);
+	fori(0, n, \__ -> pushVector(snaps, makeVector(0)));
+	substTyp : Vector<Maybe<MizTyp>> = makeVector(n + 1);
+	fori(0, n, \__ -> pushVector(substTyp, None()));
+
+	// find the last filled slot
+	firstFilled = \from -> {
+		k = ref from;
+		while(\ -> ^k != 0 && isNone(mizSubstTrmGet(env, ^k)), \ -> k := ^k - 1);
+		^k;
+	};
+
+	locusNr = ref firstFilled(n);        // 1-based; 0 = done
+	result = ref true;
+	finished = ref false;
+	// wTyp of the current step (the type being widened)
+	pending : ref Maybe<MizTyp> = ref None();
+	mode = ref 0; // 0 = descend (take next slot), 1 = again (widen pending), 2 = backtrack
+
+	while(\ -> !^finished, \ -> {
+		if (^mode == 0) {
+			if (^locusNr == 0) {
+				finished := true;
+			} else {
+				setVectorUnsafe(snaps, ^locusNr - 1, mizSnapshotSubst(env));
+				trm = either(mizSubstTrmGet(env, ^locusNr), mizNewIncorTrm());
+				wTyp = if (env.itIsChecker) env.roundUpTrmType(env, trm)
+					else mizGetTrmType(env, trm);
+				locusNr := ^locusNr - 1;
+				target : MizTyp = getVectorUnsafe(list, ^locusNr);
+				if (!mizDecreasingAttrs(env, wTyp, target, \x, y -> mizEsAttrRev(env, x, y))) {
+					mode := 2;
+				} else {
+					pending := Some(wTyp);
+					mode := 1;
+				}
+			}
+		} else if (^mode == 1) {
+			// Again: widen pending onto the locus type
+			target : MizTyp = getVectorUnsafe(list, ^locusNr);
+			w = mizWideningOf(env, target, either(^pending, mizNewIncorTyp()));
+			switch (w) {
+				Some(wt): {
+					setVectorUnsafe(substTyp, ^locusNr, Some(wt));
+					if (mizCompEsTyp(env, target, wt, false)) {
+						locusNr := firstFilled(^locusNr);
+						mode := 0;
+					} else {
+						// undo bindings made during the failed arg match
+						mizResetNewerSubst(env, getVectorUnsafe(snaps, ^locusNr));
+						mode := 2;
+					}
+				}
+				None(): mode := 2;
+			}
+		} else {
+			// BackTrack: move up to a previous level whose reached type can
+			// widen further (a non-redefined mode locus)
+			setVectorUnsafe(substTyp, ^locusNr, None());
+			found = ref false;
+			while(\ -> !^found && !^finished, \ -> {
+				ll = ref ^locusNr + 1;
+				while(\ -> ^ll < n && isNone(mizSubstTrmGet(env, ^ll + 1)),
+					\ -> ll := ^ll + 1);
+				if (^ll >= n) {
+					mizDisposeSubstTrm(env);
+					result := false;
+					finished := true;
+				} else {
+					locusNr := ^ll;
+					st = getVectorUnsafe(substTyp, ^locusNr);
+					target2 : MizTyp = getVectorUnsafe(list, ^locusNr);
+					c2 = mizConstr(env, coMode, target2.modNr);
+					okLevel = switch (st) {
+						Some(stt): (stt.sort == ikTypMode || stt.modNr != mizBuiltIn(env.builtIn, rqAny))
+							&& target2.sort == ikTypMode
+							&& c2.whichConstrNr == 0;
+						None(): false;
+					}
+					if (okLevel) found := true
+					else setVectorUnsafe(substTyp, ^locusNr, None());
+				}
+			});
+			if (!^finished) {
+				st2 = getVectorUnsafe(substTyp, ^locusNr);
+				setVectorUnsafe(substTyp, ^locusNr, None());
+				switch (st2) {
+					Some(stt2): {
+						switch (mizWidening(env, stt2)) {
+							Some(w2): {
+								mizResetNewerSubst(env, getVectorUnsafe(snaps, ^locusNr));
+								pending := Some(w2);
+								mode := 1;
+							}
+							None(): {} // stay in backtrack
+						}
+					}
+					None(): {}
+				}
+			}
+		}
+	});
+	^result;
+}
+
+// local typed downcasts
+mizEsAsVar(t : MizTrm) -> MizVarTrm {
+	switch (t) { MizVarTrm(__, __, __): t; default: { mizRunTimeError(2901); MizVarTrm(ikError, 0, 0); } }
+}
+mizEsAsFunc(t : MizTrm) -> MizFuncTrm {
+	switch (t) { MizFuncTrm(__, __, __, __): t; default: { mizRunTimeError(2902); MizFuncTrm(ikError, 0, MizTrmNil(), 0); } }
+}
+mizEsAsPriv(t : MizTrm) -> MizPrivFuncTrm {
+	switch (t) { MizPrivFuncTrm(__, __, __, __): t; default: { mizRunTimeError(2903); MizPrivFuncTrm(0, MizTrmNil(), MizBaseTrm(ikError), 0); } }
+}
+mizEsAsFraenkel(t : MizTrm) -> MizFraenkelTrm {
+	switch (t) { MizFraenkelTrm(__, __, __, __, __): t; default: { mizRunTimeError(2904); MizFraenkelTrm(makeVector(0), MizBaseTrm(ikError), MizUniqFrm(ikError), mizInitIntSeq(0), 0); } }
+}
+mizEsAsChoice(t : MizTrm) -> MizChoiceTrm {
+	switch (t) { MizChoiceTrm(__, __): t; default: { mizRunTimeError(2906); MizChoiceTrm(mizNewIncorTyp(), 0); } }
+}
+mizEsAsQua(t : MizTrm) -> MizQuaTrm {
+	switch (t) { MizQuaTrm(__, __, __): t; default: { mizRunTimeError(2905); MizQuaTrm(MizBaseTrm(ikError), mizNewIncorTyp(), 0); } }
+}
+mizEsAsNeg(f : MizFrm) -> MizNegFrm {
+	switch (f) { MizNegFrm(__, __): f; default: { mizRunTimeError(2911); MizNegFrm(MizUniqFrm(ikError), 0); } }
+}
+mizEsAsQual(f : MizFrm) -> MizQualFrm {
+	switch (f) { MizQualFrm(__, __, __): f; default: { mizRunTimeError(2910); MizQualFrm(MizBaseTrm(ikError), mizNewIncorTyp(), 0); } }
+}
+mizEsAsConj(f : MizFrm) -> MizConjFrm {
+	switch (f) { MizConjFrm(__, __): f; default: { mizRunTimeError(2912); MizConjFrm(makeVector(0), 0); } }
+}
+mizEsAsPred(f : MizFrm) -> MizPredFrm {
+	switch (f) { MizPredFrm(__, __, __, __): f; default: { mizRunTimeError(2908); MizPredFrm(ikError, 0, MizTrmNil(), 0); } }
+}
+mizEsAsLocPred(f : MizFrm) -> MizLocPredFrm {
+	switch (f) { MizLocPredFrm(__, __, __, __): f; default: { mizRunTimeError(2909); MizLocPredFrm(0, MizTrmNil(), MizUniqFrm(ikError), 0); } }
+}
+mizEsAsUniv(f : MizFrm) -> MizUnivFrm {
+	switch (f) { MizUnivFrm(__, __, __, __, __): f; default: { mizRunTimeError(2913); MizUnivFrm(ikError, 0, mizNewIncorTyp(), MizUniqFrm(ikError), 0); } }
+}

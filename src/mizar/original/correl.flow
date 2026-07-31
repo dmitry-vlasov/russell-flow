@@ -152,6 +152,14 @@ export {
 		locFuncDef : Vector<MizFuncDef>,     // LocFuncDef (0-based, FuncNr-1)
 		mutable itTyp : MizTyp,              // ItTyp
 		mutable nonZeroTyp : MizTyp,         // NonZeroTyp (numeral type)
+		substTrm : Vector<Maybe<MizTrm>>,    // gSubstTrm[1..2*MaxArgNbr]; slot 0 dummy
+		mutable itIsChecker : bool,          // ItIsChecker
+		// RoundUpTrmType hook: set by the equalizer support (functor-cluster
+		// rounding); defaults to plain CopyTrmType-based typing
+		mutable roundUpTrmType : (MizCorrelEnv, MizTrm) -> MizTyp,
+		// MAttrCollection.RoundUpWith(aTyp) — conditional-cluster rounding of
+		// a cluster in place; wired by roundcl. Default: no-op.
+		mutable roundUpCluster : (MizCorrelEnv, MizAttrColl, MizTyp) -> void,
 	);
 
 	// FixedVar record
@@ -239,6 +247,7 @@ export {
 	mizCompareTyps(a : MizTyp, b : MizTyp) -> int;
 	mizCompareFrms(a : MizFrm, b : MizFrm) -> int;
 	mizCompareClusters(a : MizAttrColl, b : MizAttrColl) -> int;
+	mizCmpInt(a : int, b : int) -> int;
 
 	// ---------------- adjusted access (constructor table) ----------------
 	// AdjustTrm/AdjustTyp/AdjustAttr/AdjustFrm: map through redefinitions.
@@ -371,6 +380,14 @@ mizMakeCorrelEnv() -> MizCorrelEnv {
 		makeVector(8),
 		mizNewIncorTyp(),
 		mizNewIncorTyp(),
+		{
+			st : Vector<Maybe<MizTrm>> = makeVector(28);
+			fori(0, 26, \__ -> pushVector(st, None())); // 2*MaxArgNbr + dummy 0
+			st;
+		},
+		false,
+		\e, __ -> mizNewIncorTyp(), // replaced by roundcl wiring
+		\__, __, __ -> {},          // replaced by roundcl wiring
 	);
 }
 
@@ -1094,21 +1111,39 @@ mizStrictEqAttr(env : MizCorrelEnv, a : MizAttr, b : MizAttr) -> bool {
 }
 
 mizEqualClusters(a : MizTyp, b : MizTyp, eqAttr : (MizAttr, MizAttr) -> bool) -> bool {
-	// EqualClusters compares the LOWER clusters item by item
-	na = sizeVector(a.lower.items);
-	if (na != sizeVector(b.lower.items)) {
+	// the real EqualClusters (correl.pas:4849): mutual inclusion —
+	// a.lower ⊆ b.upper and b.lower ⊆ a.upper under the given attr equality.
+	// The subset walk (MAttrCollection.IsSubsetOf) needs the ADJUSTED attr
+	// number order; it is threaded via mizEqualClustersEnv below. This
+	// two-arg form is kept for callers that already closed over the env.
+	mizEqCluIsSubsetOf(a.lower, b.upper, eqAttr)
+	&& mizEqCluIsSubsetOf(b.lower, a.upper, eqAttr);
+}
+
+// MAttrCollection.IsSubsetOf without the adjusted-nr fast-skip: the sorted
+// order is by CompAbsAttr, so the plain merge over indices with the pairwise
+// eqAttr test is equivalent for the equality functions used here.
+mizEqCluIsSubsetOf(c : MizAttrColl, other : MizAttrColl,
+		eqAttr : (MizAttr, MizAttr) -> bool) -> bool {
+	n = sizeVector(c.items);
+	m = sizeVector(other.items);
+	if (m < n) {
 		false;
 	} else {
-		ok = ref true;
+		res = ref true;
 		i = ref 0;
-		while(\ -> ^i < na && ^ok, \ -> {
-			if (!eqAttr(getVectorUnsafe(a.lower.items, ^i),
-					getVectorUnsafe(b.lower.items, ^i))) {
-				ok := false;
-			}
+		while(\ -> ^i < n && ^res, \ -> {
+			a : MizAttr = getVectorUnsafe(c.items, ^i);
+			found = ref false;
+			j = ref 0;
+			while(\ -> ^j < m && !^found, \ -> {
+				if (eqAttr(getVectorUnsafe(other.items, ^j), a)) found := true;
+				j := ^j + 1;
+			});
+			if (!^found) res := false;
 			i := ^i + 1;
 		});
-		^ok;
+		^res;
 	}
 }
 
