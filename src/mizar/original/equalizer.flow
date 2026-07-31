@@ -1389,7 +1389,7 @@ mizEquatePhase2(eq : MizEqualizer) -> void {
 	if (eq.contr == 0) mizEquatePolynomialValues(eq);
 	if (eq.contr == 0) mizEquatePolynomials(eq);
 	if (eq.contr == 0) mizClearPolynomialValues(eq);
-	// ProcessLinearEquations (Gauss, Contr 44) — staged
+	if (eq.contr == 0) mizProcessLinearEquations(eq);
 	if (eq.contr == 0) {
 		iterVector(eq.eqPend, \p -> if (eq.contr == 0) mizUnionTrms(eq, p.x, p.y));
 		clearVector(eq.eqPend);
@@ -3438,5 +3438,141 @@ mizUnionEqualsForNonComplex(eq : MizEqualizer) -> void {
 	});
 	if (eq.contr == 0 && before != sizeVector(eq.eqPend)) {
 		mizIdentities(eq);
+	}
+}
+
+// ProcessLinearEquations (equalizer.pas 1349-1447): the pending equalities
+// as linear equations over MONOMIAL variables (each distinct power product
+// recoded as one variable), Gauss-triangularized; numerically impossible
+// pendings give Contr 7, an inconsistent system Contr 44, and class pairs
+// whose value difference reduces to zero become new pending equalities.
+mizProcessLinearEquations(eq : MizEqualizer) -> void {
+	if (sizeVector(eq.eqPend) > 0) {
+		vars : Vector<MizNatFunc> = makeVector(8);
+		lookupVar = \pp : MizNatFunc -> {
+			n = sizeVector(vars);
+			pos = ref 0;
+			found = ref false;
+			brk = ref false;
+			while(\ -> !^brk && ^pos < n, \ -> {
+				c = mizNatCompareGraph(getVectorUnsafe(vars, ^pos), pp);
+				if (c == 0) {
+					found := true;
+					brk := true;
+				} else if (c > 0) {
+					brk := true;
+				} else {
+					pos := ^pos + 1;
+				}
+			});
+			if (!^found) {
+				pushVector(vars, pp);
+				i = ref sizeVector(vars) - 1;
+				while(\ -> ^i > ^pos, \ -> {
+					setVectorUnsafe(vars, ^i, getVectorUnsafe(vars, ^i - 1));
+					i := ^i - 1;
+				});
+				setVectorUnsafe(vars, ^pos, pp);
+			}
+			Pair(^found, ^pos);
+		};
+		recode = \p : MizPolynomial, mustExist : bool -> {
+			r = MizPolynomial(makeVector(sizeVector(p.monos)));
+			ok = ref true;
+			iterVector(p.monos, \m -> {
+				if (^ok) {
+					if (mizNatCount(m.powers) == 0) {
+						mizPolyInsert(r, mizNewMonomialPub(m.coeff));
+					} else {
+						lp = lookupVar(m.powers);
+						if (mustExist && !lp.first) {
+							ok := false;
+						} else {
+							nm = mizNewMonomialPub(m.coeff);
+							mizNatAssign(nm.powers, lp.second, 1);
+							mizPolyInsert(r, nm);
+						}
+					}
+				}
+			});
+			if (^ok) Some(r) else None();
+		};
+		lPolys : Vector<MizPolynomial> = makeVector(8);
+		iterVector(eq.eqPend, \p -> {
+			if (eq.contr == 0) {
+				rx = mizTrmSAt(eq, mizClassOf(eq, p.x));
+				ry = mizTrmSAt(eq, mizClassOf(eq, p.y));
+				if (sizeVector(rx.polynomialValues) > 0
+					&& sizeVector(ry.polynomialValues) > 0) {
+					d = mizDiffPolynomials(getVectorUnsafe(rx.polynomialValues, 0),
+						getVectorUnsafe(ry.polynomialValues, 0));
+					if (mizPolyIsNumeric(d)) {
+						if (!mizPolyIsNumericEqualWith(d, MizComplex(0.0, 0.0))) {
+							mizSetContr(eq, 7);
+						}
+					} else {
+						pushVector(lPolys, d);
+					}
+				}
+			}
+		});
+		if (eq.contr == 0 && sizeVector(lPolys) > 0) {
+			raw : Vector<MizPolynomial> = makeVector(sizeVector(lPolys));
+			iterVector(lPolys, \p -> {
+				switch (recode(p, false)) {
+					Some(r): pushVector(raw, r);
+					None(): {}
+				}
+			});
+			gp = mizGaussElimination(raw);
+			if (gp.second != 0) {
+				mizSetContr(eq, gp.second);
+			} else {
+				lEquations = gp.first;
+				// class pairs whose value difference reduces to zero
+				t1 = ref 1;
+				while(\ -> eq.contr == 0 && ^t1 <= mizTrmNbr(eq), \ -> {
+					r1 = mizTrmSAt(eq, ^t1);
+					live1 = switch (r1.eqClass) { MizTrmNil(): false; default: true; };
+					if (live1 && sizeVector(r1.polynomialValues) > 0) {
+						t2 = ref ^t1 + 1;
+						while(\ -> eq.contr == 0 && ^t2 <= mizTrmNbr(eq), \ -> {
+							r2 = mizTrmSAt(eq, ^t2);
+							live2 = switch (r2.eqClass) { MizTrmNil(): false; default: true; };
+							already = ref false;
+							iterVector(eq.eqPend, \pp2 -> {
+								if ((pp2.x == ^t1 && pp2.y == ^t2)
+									|| (pp2.x == ^t2 && pp2.y == ^t1)) already := true;
+							});
+							if (live2 && !^already && sizeVector(r2.polynomialValues) > 0) {
+								hit = ref false;
+								iterVector(r1.polynomialValues, \p1 -> {
+									iterVector(r2.polynomialValues, \p2 -> {
+										if (!^hit) {
+											d = mizDiffPolynomials(p1, p2);
+											switch (recode(d, true)) {
+												Some(le0): {
+													le = if (mizPolyIsNumeric(le0)) le0
+														else mizLinearEquationReduce(le0, lEquations);
+													if (mizPolyIsNumeric(le)
+														&& mizPolyIsNumericEqualWith(le,
+															MizComplex(0.0, 0.0))) {
+														mizAddEquality(eq.eqPend, ^t1, ^t2);
+														hit := true;
+													}
+												}
+												None(): {}
+											}
+										}
+									});
+								});
+							}
+							t2 := ^t2 + 1;
+						});
+					}
+					t1 := ^t1 + 1;
+				});
+			}
+		}
 	}
 }
