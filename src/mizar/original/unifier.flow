@@ -1,0 +1,1566 @@
+// Transcription of ~/dev/system/kernel/unifier.pas — Unification, the only
+// phase that instantiates universal statements: standardize each positive
+// universal literal, replace its external quantifiers by FREE VARIABLES,
+// normalize the body as false, and per literal compute the set of
+// substitutions (free var -> equality class) under which it contradicts the
+// basis (COMPInstAsTrue/AsFalse); the intersection across a clause
+// (JoinInstList) being non-empty refutes the disjunct (Contr 45).
+//
+// SLICE 1: Verify (Contr 45) complete for the set-theoretic fragment —
+// UNITrm/UNITyp/UNIFrm instantiation against classes, the free-variable
+// substitution lattice with the (class, var) memo, UniAttrFrm, reflexivity/
+// irreflexivity unification, BelongsTo/Inclusion requirement rules.
+// STAGED (marked): Unifiable resolution over pairs (Contr 47), Fraenkel
+// membership rules (Contr 48/49), numeric requirement branches
+// (LessOrEqual/Divides/'=' over determined values — polynom.pas values).
+
+import ds/vector;
+import ds/tree;
+import loop;
+import math/math;
+import mizar/original/errhan;
+import mizar/original/mobjects;
+import mizar/original/limits;
+import mizar/original/lexicon;
+import mizar/original/builtin;
+import mizar/original/correl;
+import mizar/original/correl_inst;
+import mizar/original/correl_match;
+import mizar/original/roundcl;
+import mizar/original/identify;
+import mizar/original/prechecker;
+import mizar/original/equalizer;
+import mizar/original/checker;
+
+export {
+	MizUnifier(
+		env : MizCorrelEnv,
+		idn : MizIdentify,
+		eq : MizEqualizer,
+		eqClassNbr : int,
+		// EqList[kind][classNr] -> member terms; kinds 0..6:
+		// functor aggreg selector privfunc schfunc fraenkel choice
+		eqList : Vector<Vector<Vector<MizTrm>>>,
+		dConstEqClass : MizNatFunc,          // InfConst nr -> class nr
+		eqClassVal : Vector<Maybe<MizComplex>>,   // 1-based
+		eqClassType : Vector<Vector<MizTyp>>,     // 1-based
+		eqClassSuper : Vector<MizAttrColl>,       // 1-based
+		eTrm : Vector<MizTrm>,               // 1-based canonical EqConst terms
+		freeVarType : Vector<MizTyp>,        // FreeVarType (0-based; var nr - 1)
+		mutable freeVarBase : int,
+		mutable unifBase : int,
+		mutable freeVarUnifs : Tree<int, MizPreInst>, // (var*MaxTrmNbr+eq) memo
+		pre : MizPre,                        // FreeBasic normalizer state
+	);
+
+	// InitUnifier over a finished (unrefuted) equalizer state
+	mizInitUnifier(chk : MizChecker, eq : MizEqualizer) -> MizUnifier;
+
+	// the phase: returns the Contr code (0 = still open)
+	mizUnification(chk : MizChecker, eq : MizEqualizer) -> int;
+
+	// Verify a single universal literal
+	mizVerify(u : MizUnifier, f : MizFrm) -> bool;
+
+	// wire the Unification phase into a checker
+	mizWireUnifier(chk : MizChecker) -> void;
+}
+
+mizWireUnifier(chk : MizChecker) -> void {
+	chk.unification ::= \c, e -> mizUnification(c, e);
+}
+
+expUFunctor = 0;
+expUAggreg = 1;
+expUSelector = 2;
+expUPrivFunc = 3;
+expUSchFunc = 4;
+expUFraenkel = 5;
+expUChoice = 6;
+
+mizInitUnifier(chk : MizChecker, eq : MizEqualizer) -> MizUnifier {
+	env = chk.env;
+	n = eq.eqClassNbr;
+	el : Vector<Vector<Vector<MizTrm>>> = makeVector(7);
+	fori(0, 6, \__ -> {
+		byClass : Vector<Vector<MizTrm>> = makeVector(n + 1);
+		fori(0, n, \__u -> pushVector(byClass, makeVector(2)));
+		pushVector(el, byClass);
+	});
+	dConst = mizInitNatFunc(16);
+	vals : Vector<Maybe<MizComplex>> = makeVector(n + 1);
+	typs : Vector<Vector<MizTyp>> = makeVector(n + 1);
+	supers : Vector<MizAttrColl> = makeVector(n + 1);
+	eTrms : Vector<MizTrm> = makeVector(n + 1);
+	fori(0, n, \i -> {
+		pushVector(vals, None());
+		pushVector(typs, makeVector(2));
+		pushVector(supers, mizNewEmptyCluster());
+		et = mizNewVarTrm(ikTrmEqConst, i);
+		mizUSetTrmInfo(et, i);
+		pushVector(eTrms, et);
+	});
+	fori(1, mizTrmNbr(eq), \ii -> {
+		rec = mizTrmSAt(eq, ii);
+		live = switch (rec.eqClass) { MizTrmNil(): false; default: true; };
+		if (live) {
+			clNr = mizUVarNr(rec.term); // renumbered class number
+			cur = ref rec.eqClass;
+			while(\ -> switch (^cur) { MizTrmNil(): false; default: true; }, \ -> {
+				switch (^cur) {
+					MizTrmElem(trm, next): {
+						srt = mizTrmSort(trm);
+						if (srt == ikTrmInfConst) {
+							mizNatAssign(dConst, mizUVarNr(trm), clNr);
+						} else if (srt == ikTrmFunctor) {
+							pushVector(getVectorUnsafe(getVectorUnsafe(el, expUFunctor), clNr), trm);
+						} else if (srt == ikTrmSchFunc) {
+							pushVector(getVectorUnsafe(getVectorUnsafe(el, expUSchFunc), clNr), trm);
+						} else if (srt == ikTrmPrivFunc) {
+							pushVector(getVectorUnsafe(getVectorUnsafe(el, expUPrivFunc), clNr), trm);
+						} else if (srt == ikTrmAggreg) {
+							pushVector(getVectorUnsafe(getVectorUnsafe(el, expUAggreg), clNr), trm);
+						} else if (srt == ikTrmSelector) {
+							pushVector(getVectorUnsafe(getVectorUnsafe(el, expUSelector), clNr), trm);
+						} else if (srt == ikTrmFraenkel) {
+							pushVector(getVectorUnsafe(getVectorUnsafe(el, expUFraenkel), clNr), trm);
+						} else if (srt == ikTrmChoice) {
+							pushVector(getVectorUnsafe(getVectorUnsafe(el, expUChoice), clNr), trm);
+						}
+						cur := next;
+					}
+					MizTrmNil(): {}
+				}
+			});
+			if (rec.numDetermined) setVectorUnsafe(vals, clNr, Some(rec.numValue));
+			setVectorUnsafe(typs, clNr, rec.xTypClass);
+			setVectorUnsafe(supers, clNr, rec.superCluster);
+		}
+	});
+	upre = mizMakePre(env); // the FreeBasic normalization state
+	MizUnifier(env, chk.idn, eq, n, el, dConst, vals, typs, supers, eTrms,
+		makeVector(8), 0, 0, makeTree(), upre);
+}
+
+mizUVarNr(t : MizTrm) -> int {
+	switch (t) {
+		MizVarTrm(__, varNr, __, __): varNr;
+		default: 0;
+	}
+}
+
+mizUSetTrmInfo(t : MizTrm, v : int) -> void {
+	switch (t) {
+		MizVarTrm(__, __, __, __): { x : MizVarTrm = t; x.trmInfo ::= v; }
+		default: {}
+	}
+}
+
+mizUEqListAt(u : MizUnifier, kind : int, classNr : int) -> Vector<MizTrm> {
+	byClass = getVectorUnsafe(u.eqList, kind);
+	if (classNr >= 0 && classNr < sizeVector(byClass)) {
+		getVectorUnsafe(byClass, classNr);
+	} else {
+		makeVector(0);
+	}
+}
+
+// ---------------- class-membership equality ----------------
+
+mizEqClassNr(u : MizUnifier, t : MizTrm) -> int {
+	env = u.env;
+	switch (t) {
+		MizVarTrm(srt, varNr, __, __): {
+			if (srt == ikTrmEqConst) {
+				varNr;
+			} else if (srt == ikTrmNumeral) {
+				res = ref 0;
+				fori(1, u.eqClassNbr, \i -> {
+					if (^res == 0) {
+						switch (getVectorUnsafe(u.eqClassVal, i)) {
+							Some(v): if (v.re == i2d(varNr) && v.im == 0.0) res := i;
+							None(): {}
+						}
+					}
+				});
+				^res;
+			} else if (srt == ikTrmInfConst) {
+				if (mizNatHasInDom(u.dConstEqClass, varNr))
+					mizNatValue(u.dConstEqClass, varNr)
+				else 0;
+			} else {
+				0; // Bound / Locus / Constant
+			}
+		}
+		MizFuncTrm(srt, funcNr, args, __, __): {
+			// class-number the args first; then search the member lists
+			argNrs : Vector<int> = makeVector(4);
+			ok = ref true;
+			cur = ref args;
+			while(\ -> ^ok && switch (^cur) { MizTrmNil(): false; default: true; }, \ -> {
+				switch (^cur) {
+					MizTrmElem(ta, na): {
+						an = mizEqClassNr(u, ta);
+						if (an == 0) ok := false
+						else pushVector(argNrs, an);
+						cur := na;
+					}
+					MizTrmNil(): {}
+				}
+			});
+			if (!^ok) {
+				0;
+			} else {
+				kind = if (srt == ikTrmFunctor) expUFunctor
+					else if (srt == ikTrmSchFunc) expUSchFunc
+					else if (srt == ikTrmAggreg) expUAggreg
+					else expUSelector;
+				res = ref 0;
+				fori(1, u.eqClassNbr, \j -> {
+					if (^res == 0) {
+						members = mizUEqListAt(u, kind, j);
+						iterVector(members, \m -> {
+							if (^res == 0 && mizUMemberMatches(u, t, m, argNrs, kind)) {
+								res := j;
+							}
+						});
+					}
+				});
+				^res;
+			}
+		}
+		MizPrivFuncTrm(__, __, __, __, __): {
+			// same walk over the privfunc lists
+			argNrs : Vector<int> = makeVector(4);
+			ok = ref true;
+			cur = ref mizUArgs(t);
+			while(\ -> ^ok && switch (^cur) { MizTrmNil(): false; default: true; }, \ -> {
+				switch (^cur) {
+					MizTrmElem(ta, na): {
+						an = mizEqClassNr(u, ta);
+						if (an == 0) ok := false
+						else pushVector(argNrs, an);
+						cur := na;
+					}
+					MizTrmNil(): {}
+				}
+			});
+			if (!^ok) {
+				0;
+			} else {
+				res = ref 0;
+				fori(1, u.eqClassNbr, \j -> {
+					if (^res == 0) {
+						iterVector(mizUEqListAt(u, expUPrivFunc, j), \m -> {
+							if (^res == 0 && mizUMemberMatches(u, t, m, argNrs, expUPrivFunc)) {
+								res := j;
+							}
+						});
+					}
+				});
+				^res;
+			}
+		}
+		MizFraenkelTrm(__, __, __, __, __, __): {
+			res = ref 0;
+			fori(1, u.eqClassNbr, \j -> {
+				if (^res == 0) {
+					iterVector(mizUEqListAt(u, expUFraenkel, j), \m -> {
+						if (^res == 0 && mizEqTrmsClassU(u, t, m)) res := j;
+					});
+				}
+			});
+			^res;
+		}
+		MizChoiceTrm(__, __, __): {
+			res = ref 0;
+			fori(1, u.eqClassNbr, \j -> {
+				if (^res == 0) {
+					iterVector(mizUEqListAt(u, expUChoice, j), \m -> {
+						if (^res == 0 && mizEqTrmsClassU(u, t, m)) res := j;
+					});
+				}
+			});
+			^res;
+		}
+		default: 0;
+	}
+}
+
+mizUArgs(t : MizTrm) -> MizTrmList {
+	switch (t) {
+		MizFuncTrm(__, __, args, __, __): args;
+		MizPrivFuncTrm(__, args, __, __, __): args;
+		default: MizTrmNil();
+	}
+}
+
+mizUFuncNr(t : MizTrm) -> int {
+	switch (t) {
+		MizFuncTrm(__, funcNr, __, __, __): funcNr;
+		MizPrivFuncTrm(funcNr, __, __, __, __): funcNr;
+		default: 0;
+	}
+}
+
+// does member m (whose args are EqConst nodes) match t with arg class nrs?
+mizUMemberMatches(u : MizUnifier, t : MizTrm, m : MizTrm, argNrs : Vector<int>,
+		kind : int) -> bool {
+	env = u.env;
+	tNr = mizUFuncNr(t);
+	mNr = mizUFuncNr(m);
+	if (kind == expUFunctor && tNr != mNr) {
+		// adjusted match with superfluous skip on both
+		tf = switch (t) { MizFuncTrm(__, __, __, __, __): t; default: MizFuncTrm(ikError, 0, MizTrmNil(), 0, 0); };
+		mf = switch (m) { MizFuncTrm(__, __, __, __, __): m; default: MizFuncTrm(ikError, 0, MizTrmNil(), 0, 0); };
+		pt = mizAdjustTrm(env, tf);
+		pm = mizAdjustTrm(env, mf);
+		if (pt.first != pm.first) {
+			false;
+		} else {
+			skipT = mizTrmListLength(tf.args) - mizTrmListLength(pt.second);
+			okRef = ref true;
+			i = ref skipT;
+			cur = ref pm.second;
+			while(\ -> ^okRef && switch (^cur) { MizTrmNil(): false; default: true; }, \ -> {
+				switch (^cur) {
+					MizTrmElem(tm, nm): {
+						if (^i >= sizeVector(argNrs) || mizUVarNr(tm) != getVectorUnsafe(argNrs, ^i)) {
+							okRef := false;
+						}
+						i := ^i + 1;
+						cur := nm;
+					}
+					MizTrmNil(): {}
+				}
+			});
+			^okRef;
+		}
+	} else if (tNr != mNr) {
+		false;
+	} else {
+		okRef = ref true;
+		i = ref 0;
+		cur = ref mizUArgs(m);
+		while(\ -> ^okRef && switch (^cur) { MizTrmNil(): false; default: true; }, \ -> {
+			switch (^cur) {
+				MizTrmElem(tm, nm): {
+					if (^i >= sizeVector(argNrs) || mizUVarNr(tm) != getVectorUnsafe(argNrs, ^i)) {
+						okRef := false;
+					}
+					i := ^i + 1;
+					cur := nm;
+				}
+				MizTrmNil(): {}
+			}
+		});
+		^okRef && ^i == sizeVector(argNrs);
+	}
+}
+
+// EqTrmsClass: structural equality mod class numbers
+mizEqTrmsClassU(u : MizUnifier, a : MizTrm, b : MizTrm) -> bool {
+	env = u.env;
+	sa = mizTrmSort(a);
+	sb = mizTrmSort(b);
+	if (sa == sb) {
+		switch (a) {
+			MizVarTrm(__, varNr, __, __): varNr == mizUVarNr(b);
+			MizFuncTrm(srt, funcNr, args, __, __): {
+				if (srt == ikTrmFunctor) {
+					fa = switch (a) { MizFuncTrm(__, __, __, __, __): a; default: MizFuncTrm(ikError, 0, MizTrmNil(), 0, 0); };
+					fb = switch (b) { MizFuncTrm(__, __, __, __, __): b; default: MizFuncTrm(ikError, 0, MizTrmNil(), 0, 0); };
+					pa = mizAdjustTrm(env, fa);
+					pb = mizAdjustTrm(env, fb);
+					pa.first == pb.first && mizEqTLClassU(u, pa.second, pb.second);
+				} else {
+					funcNr == mizUFuncNr(b) && mizEqTLClassU(u, args, mizUArgs(b));
+				}
+			}
+			MizPrivFuncTrm(funcNr, args, __, __, __):
+				funcNr == mizUFuncNr(b) && mizEqTLClassU(u, args, mizUArgs(b));
+			MizFraenkelTrm(lambdaArgs, scope, compr, __, __, __): {
+				kb = switch (b) {
+					MizFraenkelTrm(__, __, __, __, __, __): b;
+					default: MizFraenkelTrm(makeVector(0), MizBaseTrm(ikError, 0), MizUniqFrm(ikError), mizInitIntSeq(0), 0, 0);
+				};
+				if (sizeVector(lambdaArgs) != sizeVector(kb.lambdaArgs)) {
+					false;
+				} else {
+					ok = ref true;
+					i = ref 0;
+					while(\ -> ^i < sizeVector(lambdaArgs) && ^ok, \ -> {
+						if (!mizEqClassTypsU(u, getVectorUnsafe(lambdaArgs, ^i),
+								getVectorUnsafe(kb.lambdaArgs, ^i))) ok := false;
+						i := ^i + 1;
+					});
+					^ok && mizEqTrmsClassU(u, scope, kb.scope)
+						&& mizEqFrmsClassU(u, compr, kb.compr);
+				}
+			}
+			MizChoiceTrm(typ, __, __): {
+				cb = switch (b) { MizChoiceTrm(__, __, __): b; default: MizChoiceTrm(mizNewIncorTyp(), 0, 0); };
+				mizEqClassTypsU(u, typ, cb.choiceTyp);
+			}
+			default: false;
+		}
+	} else if (sb == ikTrmEqConst) {
+		mizEqClassNr(u, a) == mizUVarNr(b);
+	} else {
+		false;
+	}
+}
+
+mizEqTLClassU(u : MizUnifier, a : MizTrmList, b : MizTrmList) -> bool {
+	switch (a) {
+		MizTrmNil(): switch (b) { MizTrmNil(): true; MizTrmElem(__, __): false; }
+		MizTrmElem(ta, na): switch (b) {
+			MizTrmNil(): false;
+			MizTrmElem(tb, nb): mizEqTrmsClassU(u, ta, tb) && mizEqTLClassU(u, na, nb);
+		}
+	}
+}
+
+mizEqClassTypsU(u : MizUnifier, a : MizTyp, b : MizTyp) -> bool {
+	env = u.env;
+	if (!mizEqualClusters(a, b, \x, y -> {
+		px = mizAdjustAttr(env, x);
+		py = mizAdjustAttr(env, y);
+		px.first == py.first && x.neg == y.neg && mizEqTLClassU(u, px.second, py.second);
+	})) {
+		false;
+	} else if (a.sort != b.sort) {
+		false;
+	} else if (a.sort == ikTypMode) {
+		pa = mizAdjustTyp(env, a);
+		pb = mizAdjustTyp(env, b);
+		pa.first == pb.first && mizEqTLClassU(u, pa.second, pb.second);
+	} else {
+		a.modNr == b.modNr && mizEqTLClassU(u, a.modArgs, b.modArgs);
+	}
+}
+
+mizEqFrmsClassU(u : MizUnifier, a : MizFrm, b : MizFrm) -> bool {
+	env = u.env;
+	sa = mizFrmSort(a);
+	if (sa != mizFrmSort(b)) {
+		false;
+	} else if (sa == ikFrmVerum) {
+		true;
+	} else {
+		switch (a) {
+			MizNegFrm(arg, __): {
+				nb = switch (b) { MizNegFrm(__, __): b; default: MizNegFrm(MizUniqFrm(ikError), 0); };
+				mizEqFrmsClassU(u, arg, nb.arg);
+			}
+			MizConjFrm(conjuncts, __): {
+				cb = switch (b) { MizConjFrm(__, __): b; default: MizConjFrm(makeVector(0), 0); };
+				if (sizeVector(conjuncts) != sizeVector(cb.conjuncts)) {
+					false;
+				} else {
+					ok = ref true;
+					i = ref 0;
+					while(\ -> ^i < sizeVector(conjuncts) && ^ok, \ -> {
+						if (!mizEqFrmsClassU(u, getVectorUnsafe(conjuncts, ^i),
+								getVectorUnsafe(cb.conjuncts, ^i))) ok := false;
+						i := ^i + 1;
+					});
+					^ok;
+				}
+			}
+			MizPredFrm(srt, predNr, args, __): {
+				pb = switch (b) { MizPredFrm(__, __, __, __): b; default: MizPredFrm(ikError, 0, MizTrmNil(), 0); };
+				pa2 = switch (a) { MizPredFrm(__, __, __, __): a; default: MizPredFrm(ikError, 0, MizTrmNil(), 0); };
+				if (srt == ikFrmPred) {
+					qa = mizAdjustFrm(env, pa2);
+					qb = mizAdjustFrm(env, pb);
+					if (qa.first != qb.first) {
+						false;
+					} else if (mizEqTLClassU(u, qa.second, qb.second)) {
+						true;
+					} else {
+						c = mizConstr(env, coPredicate, pa2.predNr);
+						if (mizHasProperty(c, sySymmetry)) {
+							sw = mizSwapArguments(pa2.args, c.firstArg, c.secondArg);
+							swAdj = mizUAdjustArgs(env, pa2.predNr, sw);
+							mizEqTLClassU(u, swAdj, qb.second);
+						} else {
+							false;
+						}
+					}
+				} else if (srt == ikFrmAttr) {
+					qa = mizAdjustAttrFrm(env, pa2);
+					qb = mizAdjustAttrFrm(env, pb);
+					qa.first == qb.first && mizEqTLClassU(u, qa.second, qb.second);
+				} else {
+					predNr == pb.predNr && mizEqTLClassU(u, args, pb.args);
+				}
+			}
+			MizLocPredFrm(predNr, args, __, __): {
+				lb = switch (b) { MizLocPredFrm(__, __, __, __): b; default: MizLocPredFrm(0, MizTrmNil(), MizUniqFrm(ikError), 0); };
+				predNr == lb.predNr && mizEqTLClassU(u, args, lb.args);
+			}
+			MizUnivFrm(__, __, quantified, scope, __): {
+				ub = switch (b) { MizUnivFrm(__, __, __, __, __): b; default: MizUnivFrm(ikError, 0, mizNewIncorTyp(), MizUniqFrm(ikError), 0); };
+				mizEqClassTypsU(u, quantified, ub.quantified) && mizEqFrmsClassU(u, scope, ub.scope);
+			}
+			MizQualFrm(trm, typ, __): {
+				qb = switch (b) { MizQualFrm(__, __, __): b; default: MizQualFrm(MizBaseTrm(ikError, 0), mizNewIncorTyp(), 0); };
+				mizEqTrmsClassU(u, trm, qb.trm) && mizEqClassTypsU(u, typ, qb.typ);
+			}
+			default: false;
+		}
+	}
+}
+
+mizUAdjustArgs(env : MizCorrelEnv, predNr : int, args : MizTrmList) -> MizTrmList {
+	c = mizConstr(env, coPredicate, predNr);
+	if (c.whichConstrNr != 0) mizTrmListDrop(args, c.superfluous) else args;
+}
+
+// ---------------- standarization ----------------
+
+mizStandarizeTrmList(u : MizUnifier, l : MizTrmList) -> MizTrmList {
+	switch (l) {
+		MizTrmNil(): l;
+		MizTrmElem(trm, next):
+			MizTrmElem(mizCopyTrm(trm), mizStandarizeTrmList(u, next));
+	}
+}
+
+mizStandarizeType(u : MizUnifier, t : MizTyp) -> MizTyp {
+	env = u.env;
+	lArgs = mizStandarizeTrmList(u, t.modArgs);
+	MizTyp(t.sort, mizInstCluster(env, t.lower, lArgs),
+		mizInstCluster(env, t.upper, lArgs), t.modNr, lArgs, 0);
+}
+
+// ChReconQualFrm: subject `is` type-with-attr
+mizChReconQualFrm(u : MizUnifier, subject : MizTrm, attrNr : int, sign : int,
+		args : MizTrmList) -> MizFrm {
+	env = u.env;
+	lTyp = mizCopyTrmType(env, subject);
+	lCluster = mizCopyCluster(lTyp.lower);
+	mizAttrCollInsert(env, lCluster, MizAttr(sign, attrNr, mizCopyTrmList(args), false, 0));
+	if (!lCluster.consistent) {
+		mizNewNeg(mizNewVerum());
+	} else {
+		lTyp.lower ::= lCluster;
+		lTyp.upper ::= mizCopyCluster(lCluster);
+		mizNewQualFrm(subject, lTyp);
+	}
+}
+
+mizPositivelyStandarized(u : MizUnifier, f : MizFrm) -> MizFrm {
+	env = u.env;
+	switch (f) {
+		MizConjFrm(conjuncts, __):
+			MizConjFrm(mapVector(conjuncts, \g -> mizPositivelyStandarized(u, g)), 0);
+		MizUnivFrm(__, __, quantified, scope, __): {
+			env.boundVarNbr ::= env.boundVarNbr + 1;
+			q = mizStandarizeType(u, quantified);
+			mizSetBoundVar(env, env.boundVarNbr, q);
+			r = MizUnivFrm(ikFrmUniv, 0, q, mizPositivelyStandarized(u, scope), 0);
+			env.boundVarNbr ::= env.boundVarNbr - 1;
+			r;
+		}
+		MizQualFrm(trm, typ, __):
+			MizQualFrm(mizCopyTrm(trm), mizStandarizeType(u, typ), 0);
+		MizPredFrm(srt, predNr, args, __): {
+			if (srt == ikFrmAttr) {
+				lTrm = mizCopyTrm(mizLastElem(args).trm);
+				if (mizTrmSort(lTrm) != ikTrmEqConst) {
+					rq = mizChReconQualFrm(u, lTrm, predNr, 1, mizUAllButLast(args));
+					mizPositivelyStandarized(u, rq);
+				} else {
+					mizCopyFrm(f);
+				}
+			} else {
+				MizPredFrm(srt, predNr, mizStandarizeTrmList(u, args), 0);
+			}
+		}
+		MizLocPredFrm(predNr, args, expn, __):
+			MizLocPredFrm(predNr, mizStandarizeTrmList(u, args), mizCopyExpFrm(expn), 0);
+		MizNegFrm(arg, __): mizNewNeg(mizNegativelyStandarized(u, arg));
+		MizFlexFrm(__, __, __, __, __, __, __): mizCopyFrm(f);
+		MizUniqFrm(srt): MizUniqFrm(srt);
+		MizBinFrm(__, __, __, __): {
+			mizRunTimeError(2043);
+			f;
+		}
+	}
+}
+
+mizNegativelyStandarized(u : MizUnifier, f : MizFrm) -> MizFrm {
+	switch (f) {
+		MizConjFrm(conjuncts, __):
+			MizConjFrm(mapVector(conjuncts, \g -> mizNegativelyStandarized(u, g)), 0);
+		MizUnivFrm(__, __, __, __, __): mizCopyFrm(f);
+		MizQualFrm(trm, typ, __):
+			MizQualFrm(mizCopyTrm(trm), mizStandarizeType(u, typ), 0);
+		MizPredFrm(srt, predNr, args, __): {
+			if (srt == ikFrmAttr) {
+				lTrm = mizCopyTrm(mizLastElem(args).trm);
+				if (mizTrmSort(lTrm) != ikTrmEqConst) {
+					rq = mizChReconQualFrm(u, lTrm, predNr, 1, mizUAllButLast(args));
+					mizNegativelyStandarized(u, rq);
+				} else {
+					mizCopyFrm(f);
+				}
+			} else {
+				MizPredFrm(srt, predNr, mizStandarizeTrmList(u, args), 0);
+			}
+		}
+		MizLocPredFrm(predNr, args, expn, __):
+			MizLocPredFrm(predNr, mizStandarizeTrmList(u, args), mizCopyExpFrm(expn), 0);
+		MizNegFrm(arg, __): mizNewNeg(mizPositivelyStandarized(u, arg));
+		MizFlexFrm(__, __, __, __, __, __, __): mizCopyFrm(f);
+		MizUniqFrm(srt): MizUniqFrm(srt);
+		MizBinFrm(__, __, __, __): {
+			mizRunTimeError(2043);
+			f;
+		}
+	}
+}
+
+mizUAllButLast(l : MizTrmList) -> MizTrmList {
+	switch (l) {
+		MizTrmNil(): l;
+		MizTrmElem(trm, next): {
+			switch (next) {
+				MizTrmNil(): MizTrmNil();
+				MizTrmElem(__, __): MizTrmElem(trm, mizUAllButLast(next));
+			}
+		}
+	}
+}
+
+// ---------------- free variables ----------------
+
+// SetFreeVarInTrm hook: bound above the prefix renumber down; the freed
+// binders become FREE VARIABLES numbered from FreeVarBase
+mizSetFreeVarInTrm(u : MizUnifier, t : MizTrm) -> MizTrm {
+	env = u.env;
+	switch (t) {
+		MizVarTrm(srt, varNr, __, __): {
+			if (srt == ikTrmBound) {
+				vt : MizVarTrm = t;
+				if (varNr > env.boundVarNbr) {
+					vt.varNr ::= varNr - env.boundVarNbr;
+				} else {
+					vt.sort ::= ikTrmFreeVar;
+					vt.varNr ::= varNr + u.freeVarBase;
+				}
+			}
+			t;
+		}
+		default: t;
+	}
+}
+
+mizNewFreeVar(u : MizUnifier, typ : MizTyp) -> void {
+	lTyp = mizCopyTyp(typ);
+	w = mizMakeWithin(\__, trm -> mizSetFreeVarInTrm(u, trm));
+	mizWithinTyp(w, lTyp);
+	pushVector(u.freeVarType, lTyp);
+}
+
+// ---------------- the substitution lattice constructors ----------------
+
+mizUniBottom() -> MizPreInst { mizPreInstBottom(); }
+mizUniTop() -> MizPreInst { mizPreInstTop(); }
+
+mizUniJoin(u : MizUnifier, p : MizPreInst, q : MizPreInst) -> void {
+	mizPreInstJoinWith(u.pre, p, q);
+}
+
+mizUniUnion(u : MizUnifier, p : MizPreInst, q : MizPreInst) -> void {
+	mizPreInstUnionWith(u.pre, p, q);
+}
+
+// UNITrmList
+mizUniTrmList(u : MizUnifier, a : MizTrmList, b : MizTrmList) -> MizPreInst {
+	switch (a) {
+		MizTrmNil(): {
+			switch (b) {
+				MizTrmNil(): mizUniTop();
+				MizTrmElem(__, __): mizUniBottom();
+			}
+		}
+		MizTrmElem(ta, na): {
+			switch (b) {
+				MizTrmNil(): mizUniBottom();
+				MizTrmElem(tb, nb): {
+					res = mizUniTrm(u, ta, tb);
+					cont = ref Pair(na, nb);
+					go = ref true;
+					while(\ -> ^go && sizeVector(res.evals) + b2i(res.top) > 0, \ -> {
+						pr = ^cont;
+						switch (pr.first) {
+							MizTrmNil(): go := false;
+							MizTrmElem(ta2, na2): {
+								switch (pr.second) {
+									MizTrmNil(): {
+										// length mismatch
+										clearVector(res.evals);
+										res.top ::= false;
+										go := false;
+									}
+									MizTrmElem(tb2, nb2): {
+										l1 = mizUniTrm(u, ta2, tb2);
+										mizUniJoin(u, res, l1);
+										cont := Pair(na2, nb2);
+									}
+								}
+							}
+						}
+					});
+					res;
+				}
+			}
+		}
+	}
+}
+
+// UNIRadices
+mizUniRadices(u : MizUnifier, a : MizTyp, b : MizTyp) -> MizPreInst {
+	env = u.env;
+	if (a.sort != b.sort) {
+		mizUniBottom();
+	} else {
+		p = if (a.sort == ikTypMode) {
+			Pair(mizAdjustTyp(env, a), mizAdjustTyp(env, b));
+		} else {
+			Pair(Pair(a.modNr, a.modArgs), Pair(b.modNr, b.modArgs));
+		}
+		if (p.first.first == p.second.first) {
+			mizUniTrmList(u, p.first.second, p.second.second);
+		} else {
+			mizUniBottom();
+		}
+	}
+}
+
+// UNIAttr / UNIAttr1 (same sign / opposite sign)
+mizUniAttr(u : MizUnifier, a : MizAttr, b : MizAttr, sameSign : bool) -> MizPreInst {
+	env = u.env;
+	pa = mizAdjustAttr(env, a);
+	pb = mizAdjustAttr(env, b);
+	signOk = if (sameSign) a.neg == b.neg else a.neg != b.neg;
+	if (pa.first == pb.first && signOk) {
+		mizUniTrmList(u, pa.second, pb.second);
+	} else {
+		mizUniBottom();
+	}
+}
+
+// UNIInclClusters: clu1 ⊆ clu2 under substitutions
+mizUniInclClusters(u : MizUnifier, c1 : MizAttrColl, c2 : MizAttrColl,
+		argOrd : bool) -> MizPreInst {
+	env = u.env;
+	res = mizUniBottom();
+	acc = mizUniTop();
+	failed = ref false;
+	j = ref 0;
+	i = ref 0;
+	n1 = sizeVector(c1.items);
+	n2 = sizeVector(c2.items);
+	while(\ -> !^failed && ^i < n1, \ -> {
+		a : MizAttr = getVectorUnsafe(c1.items, ^i);
+		lAttrNr = mizAdjustedAttrNr(env, a);
+		while(\ -> ^j < n2
+				&& mizAdjustedAttrNr(env, getVectorUnsafe(c2.items, ^j)) < lAttrNr,
+			\ -> j := ^j + 1);
+		if (^j == n2) {
+			failed := true;
+		} else {
+			l1 = mizUniBottom();
+			k = ref ^j;
+			go = ref true;
+			while(\ -> ^go, \ -> {
+				b : MizAttr = getVectorUnsafe(c2.items, ^k);
+				l2 = if (argOrd) mizUniAttr(u, a, b, true) else mizUniAttr(u, b, a, true);
+				mizUniUnion(u, l1, l2);
+				k := ^k + 1;
+				if (^k >= n2 || mizAdjustedAttrNr(env, getVectorUnsafe(c2.items, ^k)) > lAttrNr) {
+					go := false;
+				}
+			});
+			mizUniJoin(u, acc, l1);
+			if (mizPreInstCount(acc) == 0) failed := true;
+		}
+		i := ^i + 1;
+	});
+	if (^failed) {
+		res;
+	} else {
+		mizUniUnion(u, res, acc);
+		res;
+	}
+}
+
+// UNIEqClassTyps: type fits the class
+mizUniEqClassTyps(u : MizUnifier, eqNr : int, typ : MizTyp) -> MizPreInst {
+	res = mizUniBottom();
+	iterVector(getVectorUnsafe(u.eqClassType, eqNr), \xt -> {
+		l = mizUniRadices(u, typ, xt);
+		mizUniUnion(u, res, l);
+	});
+	l2 = mizUniInclClusters(u, typ.lower, getVectorUnsafe(u.eqClassSuper, eqNr), true);
+	mizUniJoin(u, res, l2);
+	res;
+}
+
+// UniEqClassAndFreeVar — the ATOM of the lattice: free var := class, guarded
+// by the type check; memoized per (class, var).
+mizUniEqClassAndFreeVar(u : MizUnifier, eqNr : int, varNr : int) -> MizPreInst {
+	key = varNr * MaxTrmNbr + eqNr;
+	switch (lookupTree(u.freeVarUnifs, key)) {
+		Some(cached): mizUniCopy(cached);
+		None(): {
+			base = mizUniEqClassTyps(u, eqNr, getVectorUnsafe(u.freeVarType, varNr - 1));
+			res = if (mizPreInstCount(base) == 0) {
+				base;
+			} else if (base.top) {
+				lInst = mizInitNatFunc(2);
+				mizNatAssign(lInst, varNr - 1, eqNr);
+				mizPreInstSingle(lInst);
+			} else {
+				iterVector(base.evals, \e -> mizNatAssign(e, varNr - 1, eqNr));
+				base;
+			}
+			u.freeVarUnifs ::= setTree(u.freeVarUnifs, key, res);
+			mizUniCopy(res);
+		}
+	}
+}
+
+mizUniCopy(p : MizPreInst) -> MizPreInst {
+	r = MizPreInst(makeVector(sizeVector(p.evals)), p.top, p.overflow);
+	iterVector(p.evals, \e -> pushVector(r.evals, mizCopyNatFunc(e)));
+	r;
+}
+
+// UNIFraenkelTrm
+mizUniFraenkelTrm(u : MizUnifier, a : MizTrm, b : MizTrm) -> MizPreInst {
+	env = u.env;
+	ka = switch (a) { MizFraenkelTrm(__, __, __, __, __, __): a; default: MizFraenkelTrm(makeVector(0), MizBaseTrm(ikError, 0), MizUniqFrm(ikError), mizInitIntSeq(0), 0, 0); };
+	kb = switch (b) { MizFraenkelTrm(__, __, __, __, __, __): b; default: MizFraenkelTrm(makeVector(0), MizBaseTrm(ikError, 0), MizUniqFrm(ikError), mizInitIntSeq(0), 0, 0); };
+	if (sizeVector(ka.lambdaArgs) != sizeVector(kb.lambdaArgs)) {
+		mizUniBottom();
+	} else {
+		lB = env.boundVarNbr;
+		res = mizUniTop();
+		fori(0, sizeVector(ka.lambdaArgs) - 1, \i -> {
+			env.boundVarNbr ::= env.boundVarNbr + 1;
+			l = mizUniTyp(u, getVectorUnsafe(ka.lambdaArgs, i),
+				getVectorUnsafe(kb.lambdaArgs, i));
+			mizUniJoin(u, res, l);
+		});
+		if (mizPreInstCount(res) != 0) {
+			l1 = mizUniTrm(u, ka.scope, kb.scope);
+			mizUniJoin(u, res, l1);
+		}
+		if (mizPreInstCount(res) != 0) {
+			l2 = mizUniFrm(u, ka.compr, kb.compr);
+			mizUniJoin(u, res, l2);
+		}
+		env.boundVarNbr ::= lB;
+		res;
+	}
+}
+
+// UNIFunc
+mizUniFunc(u : MizUnifier, a : MizTrm, b : MizTrm) -> MizPreInst {
+	env = u.env;
+	if (mizTrmSort(b) != ikTrmFunctor) {
+		mizUniBottom();
+	} else {
+		fa = switch (a) { MizFuncTrm(__, __, __, __, __): a; default: MizFuncTrm(ikError, 0, MizTrmNil(), 0, 0); };
+		fb = switch (b) { MizFuncTrm(__, __, __, __, __): b; default: MizFuncTrm(ikError, 0, MizTrmNil(), 0, 0); };
+		if (fa.funcNr == fb.funcNr) {
+			mizUniTrmList(u, fa.args, fb.args);
+		} else {
+			pa = mizAdjustTrm(env, fa);
+			pb = mizAdjustTrm(env, fb);
+			if (pa.first == pb.first) {
+				mizUniTrmList(u, pa.second, pb.second);
+			} else {
+				mizUniBottom();
+			}
+		}
+	}
+}
+
+// UNITrm: the substitutions making a (with free vars) equal b (class terms)
+mizUniTrm(u : MizUnifier, a : MizTrm, b : MizTrm) -> MizPreInst {
+	env = u.env;
+	sa = mizTrmSort(a);
+	if (sa == ikTrmFreeVar) {
+		lEq = mizEqClassNr(u, b);
+		if (lEq > 0) mizUniEqClassAndFreeVar(u, lEq, mizUVarNr(a))
+		else mizUniBottom();
+	} else if (sa == ikTrmBound) {
+		if (mizTrmSort(b) == ikTrmBound && mizUVarNr(a) - u.unifBase == mizUVarNr(b)) {
+			mizUniTop();
+		} else {
+			mizUniBottom();
+		}
+	} else if (sa == ikTrmFunctor) {
+		res = mizUniFunc(u, a, b);
+		bClass = mizEqClassNr(u, b);
+		if (bClass > 0) {
+			iterVector(mizUEqListAt(u, expUFunctor, bClass), \m -> {
+				l = mizUniFunc(u, a, m);
+				mizUniUnion(u, res, l);
+			});
+		}
+		res;
+	} else if (sa == ikTrmSchFunc || sa == ikTrmPrivFunc || sa == ikTrmSelector
+		|| sa == ikTrmAggreg) {
+		kind = if (sa == ikTrmSchFunc) expUSchFunc
+			else if (sa == ikTrmPrivFunc) expUPrivFunc
+			else if (sa == ikTrmSelector) expUSelector
+			else expUAggreg;
+		res = if (mizTrmSort(b) == sa && mizUFuncNr(b) == mizUFuncNr(a)) {
+			mizUniTrmList(u, mizUArgs(a), mizUArgs(b));
+		} else {
+			mizUniBottom();
+		}
+		bClass = mizEqClassNr(u, b);
+		if (bClass > 0) {
+			iterVector(mizUEqListAt(u, kind, bClass), \m -> {
+				if (mizUFuncNr(m) == mizUFuncNr(a)) {
+					l = mizUniTrmList(u, mizUArgs(a), mizUArgs(m));
+					mizUniUnion(u, res, l);
+				}
+			});
+		}
+		res;
+	} else if (sa == ikTrmFraenkel) {
+		res = if (mizTrmSort(b) == ikTrmFraenkel) mizUniFraenkelTrm(u, a, b)
+			else mizUniBottom();
+		bClass = mizEqClassNr(u, b);
+		if (bClass > 0) {
+			iterVector(mizUEqListAt(u, expUFraenkel, bClass), \m -> {
+				lUB = u.unifBase;
+				u.unifBase ::= env.boundVarNbr;
+				l = mizUniFraenkelTrm(u, a, m);
+				mizUniUnion(u, res, l);
+				u.unifBase ::= lUB;
+			});
+		}
+		res;
+	} else if (sa == ikTrmChoice) {
+		ca = switch (a) { MizChoiceTrm(__, __, __): a; default: MizChoiceTrm(mizNewIncorTyp(), 0, 0); };
+		res = if (mizTrmSort(b) == ikTrmChoice) {
+			cb = switch (b) { MizChoiceTrm(__, __, __): b; default: MizChoiceTrm(mizNewIncorTyp(), 0, 0); };
+			mizUniTyp(u, ca.choiceTyp, cb.choiceTyp);
+		} else {
+			mizUniBottom();
+		}
+		bClass = mizEqClassNr(u, b);
+		if (bClass > 0) {
+			iterVector(mizUEqListAt(u, expUChoice, bClass), \m -> {
+				cm = switch (m) { MizChoiceTrm(__, __, __): m; default: MizChoiceTrm(mizNewIncorTyp(), 0, 0); };
+				l = mizUniTyp(u, ca.choiceTyp, cm.choiceTyp);
+				mizUniUnion(u, res, l);
+			});
+		}
+		res;
+	} else if (sa == ikTrmEqConst) {
+		if (mizUVarNr(a) == mizEqClassNr(u, b)) mizUniTop() else mizUniBottom();
+	} else if (sa == ikTrmNumeral || sa == ikTrmConstant || sa == ikTrmInfConst) {
+		if (mizEqClassNr(u, a) != 0 && mizEqClassNr(u, a) == mizEqClassNr(u, b)) {
+			mizUniTop();
+		} else {
+			mizUniBottom();
+		}
+	} else {
+		mizRunTimeError(2035);
+		mizUniBottom();
+	}
+}
+
+// UNITyp
+mizUniTyp(u : MizUnifier, a : MizTyp, b : MizTyp) -> MizPreInst {
+	res = mizUniBottom();
+	if (a.sort == b.sort) {
+		l = mizUniInclClusters(u, a.lower, b.upper, true);
+		if (mizPreInstCount(l) != 0) {
+			l1 = mizUniInclClusters(u, b.lower, a.upper, false);
+			mizUniJoin(u, l, l1);
+			if (mizPreInstCount(l) != 0) {
+				l2 = mizUniRadices(u, a, b);
+				mizUniJoin(u, l, l2);
+				mizUniUnion(u, res, l);
+			}
+		}
+	}
+	res;
+}
+
+// UNIFrm: formula with free vars against a ground basis formula
+mizUniFrm(u : MizUnifier, a : MizFrm, b : MizFrm) -> MizPreInst {
+	env = u.env;
+	sa = mizFrmSort(a);
+	if (sa != mizFrmSort(b)) {
+		mizUniBottom();
+	} else if (sa == ikFrmVerum) {
+		mizUniTop();
+	} else {
+		switch (a) {
+			MizNegFrm(arg, __): {
+				nb = switch (b) { MizNegFrm(__, __): b; default: MizNegFrm(MizUniqFrm(ikError), 0); };
+				mizUniFrm(u, arg, nb.arg);
+			}
+			MizConjFrm(conjuncts, __): {
+				cb = switch (b) { MizConjFrm(__, __): b; default: MizConjFrm(makeVector(0), 0); };
+				if (sizeVector(conjuncts) != sizeVector(cb.conjuncts)) {
+					mizUniBottom();
+				} else {
+					res = mizUniTop();
+					i = ref 0;
+					while(\ -> ^i < sizeVector(conjuncts) && mizPreInstCount(res) != 0, \ -> {
+						l = mizUniFrm(u, getVectorUnsafe(conjuncts, ^i),
+							getVectorUnsafe(cb.conjuncts, ^i));
+						mizUniJoin(u, res, l);
+						i := ^i + 1;
+					});
+					res;
+				}
+			}
+			MizPredFrm(srt, predNr, args, __): {
+				pa2 = switch (a) { MizPredFrm(__, __, __, __): a; default: MizPredFrm(ikError, 0, MizTrmNil(), 0); };
+				pb = switch (b) { MizPredFrm(__, __, __, __): b; default: MizPredFrm(ikError, 0, MizTrmNil(), 0); };
+				if (srt == ikFrmPred) {
+					qa = mizAdjustFrm(env, pa2);
+					qb = mizAdjustFrm(env, pb);
+					if (qa.first != qb.first) {
+						mizUniBottom();
+					} else {
+						res = mizUniTrmList(u, qa.second, qb.second);
+						c = mizConstr(env, coPredicate, pa2.predNr);
+						if (mizHasProperty(c, sySymmetry)) {
+							sw = mizSwapArguments(pa2.args, c.firstArg, c.secondArg);
+							swAdj = mizUAdjustArgs(env, pa2.predNr, sw);
+							l = mizUniTrmList(u, swAdj, qb.second);
+							mizUniUnion(u, res, l);
+						} else {
+							c2 = mizConstr(env, coPredicate, pb.predNr);
+							if (mizHasProperty(c2, sySymmetry)) {
+								sw = mizSwapArguments(pb.args, c2.firstArg, c2.secondArg);
+								swAdj = mizUAdjustArgs(env, pb.predNr, sw);
+								l = mizUniTrmList(u, qa.second, swAdj);
+								mizUniUnion(u, res, l);
+							}
+						}
+						res;
+					}
+				} else if (srt == ikFrmAttr) {
+					qa = mizAdjustAttrFrm(env, pa2);
+					qb = mizAdjustAttrFrm(env, pb);
+					if (qa.first == qb.first) mizUniTrmList(u, qa.second, qb.second)
+					else mizUniBottom();
+				} else {
+					if (predNr == pb.predNr) mizUniTrmList(u, args, pb.args)
+					else mizUniBottom();
+				}
+			}
+			MizLocPredFrm(predNr, args, __, __): {
+				lb = switch (b) { MizLocPredFrm(__, __, __, __): b; default: MizLocPredFrm(0, MizTrmNil(), MizUniqFrm(ikError), 0); };
+				if (predNr == lb.predNr) mizUniTrmList(u, args, lb.args)
+				else mizUniBottom();
+			}
+			MizUnivFrm(__, __, quantified, scope, __): {
+				ub = switch (b) { MizUnivFrm(__, __, __, __, __): b; default: MizUnivFrm(ikError, 0, mizNewIncorTyp(), MizUniqFrm(ikError), 0); };
+				res = mizUniTyp(u, quantified, ub.quantified);
+				if (mizPreInstCount(res) != 0) {
+					env.boundVarNbr ::= env.boundVarNbr + 1;
+					mizSetBoundVar(env, env.boundVarNbr, ub.quantified);
+					l = mizUniFrm(u, scope, ub.scope);
+					mizUniJoin(u, res, l);
+					env.boundVarNbr ::= env.boundVarNbr - 1;
+				}
+				res;
+			}
+			MizQualFrm(trm, typ, __): {
+				qb = switch (b) { MizQualFrm(__, __, __): b; default: MizQualFrm(MizBaseTrm(ikError, 0), mizNewIncorTyp(), 0); };
+				res = mizUniTrm(u, trm, qb.trm);
+				if (mizPreInstCount(res) != 0) {
+					l = mizUniTyp(u, typ, qb.typ);
+					mizUniJoin(u, res, l);
+				}
+				res;
+			}
+			MizFlexFrm(__, lo, ro, __, __, __, __): {
+				xb = switch (b) { MizFlexFrm(__, __, __, __, __, __, __): b; default: MizFlexFrm(ikError, MizUniqFrm(ikError), MizUniqFrm(ikError), MizBaseTrm(ikError, 0), MizBaseTrm(ikError, 0), MizUniqFrm(ikError), 0); };
+				res = mizUniFrm(u, lo, xb.leftOrig);
+				if (mizPreInstCount(res) != 0) {
+					l = mizUniFrm(u, ro, xb.rightOrig);
+					mizUniJoin(u, res, l);
+				}
+				res;
+			}
+			default: {
+				mizRunTimeError(2034);
+				mizUniBottom();
+			}
+		}
+	}
+}
+
+// UniAttrFrm: attribute literal against a class supercluster
+mizUniAttrFrm(u : MizUnifier, f : MizFrm, sign : int) -> MizPreInst {
+	pf = switch (f) { MizPredFrm(__, __, __, __): f; default: MizPredFrm(ikError, 0, MizTrmNil(), 0); };
+	lLeft = mizLastElem(pf.args).trm;
+	res = mizUniBottom();
+	if (mizTrmSort(lLeft) == ikTrmEqConst) {
+		lAttrArgs = mizUAllButLast(pf.args);
+		sc = getVectorUnsafe(u.eqClassSuper, mizUVarNr(lLeft));
+		iterVector(sc.items, \at -> {
+			if (at.attrNr == pf.predNr && at.neg == sign) {
+				l = mizUniTrmList(u, lAttrArgs, at.args);
+				mizUniUnion(u, res, l);
+			}
+		});
+	}
+	res;
+}
+
+// UnifyReflexive: both args of the property unify with a common class
+mizUnifyReflexive(u : MizUnifier, f : MizFrm) -> MizPreInst {
+	env = u.env;
+	pf = switch (f) { MizPredFrm(__, __, __, __): f; default: MizPredFrm(ikError, 0, MizTrmNil(), 0); };
+	c = mizConstr(env, coPredicate, pf.predNr);
+	lLeft = mizTrmListNth(pf.args, c.firstArg - 1);
+	lRight = mizTrmListNth(pf.args, c.secondArg - 1);
+	res = mizUniBottom();
+	fori(1, u.eqClassNbr, \k -> {
+		et = getVectorUnsafe(u.eTrm, k);
+		l = mizUniTrm(u, lLeft, et);
+		if (mizPreInstCount(l) != 0) {
+			l1 = mizUniTrm(u, lRight, et);
+			mizUniJoin(u, l, l1);
+			mizUniUnion(u, res, l);
+		}
+	});
+	res;
+}
+
+// ---------------- COMPInst ----------------
+// The set of substitutions making fFrm TRUE (contradicting a negative
+// occurrence) / FALSE (contradicting a positive occurrence) in the basis.
+
+mizCompInstAsTrue(u : MizUnifier, f : MizFrm) -> MizPreInst {
+	env = u.env;
+	eq = u.eq;
+	res = mizUniBottom();
+	srt = mizFrmSort(f);
+	skipNegSweep = ref false;
+	if (srt == ikFrmPred) {
+		pf = switch (f) { MizPredFrm(__, __, __, __): f; default: MizPredFrm(ikError, 0, MizTrmNil(), 0); };
+		pa = mizAdjustFrm(env, pf);
+		c = mizConstr(env, coPredicate, pf.predNr);
+		if (mizHasProperty(c, syIrreflexivity)) {
+			l = mizUnifyReflexive(u, f);
+			mizUniUnion(u, res, l);
+		}
+		rqBel = mizBuiltIn(env.builtIn, rqBelongsTo);
+		rqIncl = mizBuiltIn(env.builtIn, rqInclusion);
+		rqElem = mizBuiltIn(env.builtIn, rqElement);
+		rqPow = mizBuiltIn(env.builtIn, rqPowerSet);
+		rqEmp = mizBuiltIn(env.builtIn, rqEmpty);
+		if (pa.first == rqBel && rqBel != 0) {
+			lLeft = mizTrmListNth(pa.second, 0);
+			lRight = mizTrmListNth(pa.second, 1);
+			// x in EMPTY class is false
+			fori(1, u.eqClassNbr, \k -> {
+				sc = getVectorUnsafe(u.eqClassSuper, k);
+				found = ref false;
+				iterVector(sc.items, \at ->
+					if (at.attrNr == rqEmp && rqEmp != 0 && at.neg == 1) found := true);
+				if (^found) {
+					l = mizUniTrm(u, lRight, getVectorUnsafe(u.eTrm, k));
+					mizUniUnion(u, res, l);
+				}
+			});
+			// against negative Element-of qualifications
+			iterVector(eq.negBas, \nf -> {
+				switch (nf) {
+					MizQualFrm(qtrm, qtyp, __): {
+						if (qtyp.sort == ikTypMode) {
+							pm = mizAdjustTyp(env, qtyp);
+							if (pm.first == rqElem && rqElem != 0) {
+								l = mizUniTrm(u, lLeft, qtrm);
+								if (mizPreInstCount(l) != 0) {
+									l1 = mizUniTrm(u, lRight, mizTrmListNth(pm.second, 0));
+									mizUniJoin(u, l, l1);
+									mizUniUnion(u, res, l);
+								}
+							}
+						}
+					}
+					default: {}
+				}
+			});
+		} else if (pa.first == rqIncl && rqIncl != 0 && rqPow > 0) {
+			lLeft = mizTrmListNth(pa.second, 0);
+			lRight = mizTrmListNth(pa.second, 1);
+			iterVector(eq.negBas, \nf -> {
+				switch (nf) {
+					MizQualFrm(qtrm, qtyp, __): {
+						if (qtyp.sort == ikTypMode) {
+							pm = mizAdjustTyp(env, qtyp);
+							rqElem2 = mizBuiltIn(env.builtIn, rqElement);
+							if (pm.first == rqElem2 && rqElem2 != 0) {
+								l = mizUniTrm(u, lLeft, qtrm);
+								if (mizPreInstCount(l) != 0) {
+									lTrm = mizNewFuncTrm(rqPow,
+										mizNewTrmList(mizCopyTrm(lRight), MizTrmNil()));
+									l1 = mizUniTrm(u, lTrm, mizTrmListNth(pm.second, 0));
+									mizUniJoin(u, l, l1);
+									mizUniUnion(u, res, l);
+								}
+							}
+						}
+					}
+					default: {}
+				}
+			});
+		}
+		// LessOrEqual / Divides / '=' numeric branches — slice 2 (polynom)
+	} else if (srt == ikFrmAttr) {
+		l = mizUniAttrFrm(u, f, 0);
+		mizUniUnion(u, res, l);
+		skipNegSweep := true;
+	} else if (srt == ikFrmQual) {
+		qf = switch (f) { MizQualFrm(__, __, __): f; default: MizQualFrm(MizBaseTrm(ikError, 0), mizNewIncorTyp(), 0); };
+		// against negative Qual literals: widen this type onto theirs
+		iterVector(eq.negBas, \nf -> {
+			switch (nf) {
+				MizQualFrm(qtrm, qtyp, __): {
+					l = mizUniTrm(u, qf.trm, qtrm);
+					if (mizPreInstCount(l) != 0) {
+						l1 = mizUniBottom();
+						if (qtyp.sort == ikTypMode && qf.typ.sort == ikTypMode) {
+							pm = mizAdjustTyp(env, qtyp);
+							cur = ref mizCopyTyp(qf.typ);
+							go = ref true;
+							while(\ -> ^go && (^cur).sort == ikTypMode
+									&& (^cur).modNr >= pm.first, \ -> {
+								l2 = mizUniRadices(u, ^cur, qtyp);
+								mizUniUnion(u, l1, l2);
+								switch (mizWidening(env, ^cur)) {
+									Some(w): cur := w;
+									None(): go := false;
+								}
+							});
+						} else if (qtyp.sort == ikTypStruct) {
+							switch (mizWideningOf(env, qtyp, mizCopyTyp(qf.typ))) {
+								Some(w): {
+									l2 = mizUniRadices(u, w, qtyp);
+									mizUniUnion(u, l1, l2);
+								}
+								None(): {}
+							}
+						}
+						mizUniJoin(u, l, l1);
+						mizUniUnion(u, res, l);
+					}
+				}
+				default: {}
+			}
+		});
+		// counter-attributes in the class superclusters
+		fori(1, u.eqClassNbr, \k -> {
+			l = mizUniTrm(u, qf.trm, getVectorUnsafe(u.eTrm, k));
+			if (mizPreInstCount(l) != 0) {
+				l1 = mizUniBottom();
+				iterVector(qf.typ.upper.items, \x -> {
+					iterVector(getVectorUnsafe(u.eqClassSuper, k).items, \v -> {
+						ll = mizUniAttr(u, x, v, false);
+						mizUniUnion(u, l1, ll);
+					});
+				});
+				mizUniJoin(u, l, l1);
+				mizUniUnion(u, res, l);
+			}
+		});
+		skipNegSweep := true;
+	}
+	if (!^skipNegSweep) {
+		iterVector(eq.negBas, \nf -> {
+			l = mizUniFrm(u, f, nf);
+			mizUniUnion(u, res, l);
+		});
+	}
+	res;
+}
+
+mizCompInstAsFalse(u : MizUnifier, f : MizFrm) -> MizPreInst {
+	env = u.env;
+	eq = u.eq;
+	res = mizUniBottom();
+	srt = mizFrmSort(f);
+	handled = ref false;
+	if (srt == ikFrmPred) {
+		pf = switch (f) { MizPredFrm(__, __, __, __): f; default: MizPredFrm(ikError, 0, MizTrmNil(), 0); };
+		pa = mizAdjustFrm(env, pf);
+		c = mizConstr(env, coPredicate, pf.predNr);
+		if (mizHasProperty(c, syReflexivity)) {
+			l = mizUnifyReflexive(u, f);
+			mizUniUnion(u, res, l);
+		}
+		rqBel = mizBuiltIn(env.builtIn, rqBelongsTo);
+		rqIncl = mizBuiltIn(env.builtIn, rqInclusion);
+		rqElem = mizBuiltIn(env.builtIn, rqElement);
+		rqPow = mizBuiltIn(env.builtIn, rqPowerSet);
+		rqEmp = mizBuiltIn(env.builtIn, rqEmpty);
+		rqEq = mizBuiltIn(env.builtIn, rqEqualsTo);
+		if (pa.first == rqBel && rqBel != 0 && rqElem > 0) {
+			// ¬(x in Y) false when Y non empty and x : Element of Y-class
+			lLeft = mizTrmListNth(pa.second, 0);
+			lRight = mizTrmListNth(pa.second, 1);
+			fori(1, u.eqClassNbr, \k -> {
+				sc = getVectorUnsafe(u.eqClassSuper, k);
+				nonEmpty = ref false;
+				iterVector(sc.items, \at ->
+					if (at.attrNr == rqEmp && rqEmp != 0 && at.neg == 0) nonEmpty := true);
+				if (^nonEmpty) {
+					l = mizUniTrm(u, lRight, getVectorUnsafe(u.eTrm, k));
+					if (mizPreInstCount(l) != 0) {
+						lTyp = mizNewStandardTyp(ikTypMode, mizNewEmptyCluster(),
+							mizNewEmptyCluster(), rqElem,
+							mizNewTrmList(getVectorUnsafe(u.eTrm, k), MizTrmNil()));
+						l1 = mizUniBottom();
+						fori(1, u.eqClassNbr, \i -> {
+							hit = ref false;
+							iterVector(getVectorUnsafe(u.eqClassType, i), \xt ->
+								if (!^hit && mizEqRadices(env, xt, lTyp)) hit := true);
+							if (^hit) {
+								l2 = mizUniTrm(u, lLeft, getVectorUnsafe(u.eTrm, i));
+								mizUniUnion(u, l1, l2);
+							}
+						});
+						mizUniJoin(u, l, l1);
+						mizUniUnion(u, res, l);
+					}
+				}
+			});
+			handled := true;
+		} else if (pa.first == rqIncl && rqIncl != 0 && rqElem > 0 && rqPow > 0) {
+			lLeft = mizTrmListNth(pa.second, 0);
+			lRight = mizTrmListNth(pa.second, 1);
+			fori(1, u.eqClassNbr, \k -> {
+				l = mizUniTrm(u, lRight, getVectorUnsafe(u.eTrm, k));
+				if (mizPreInstCount(l) != 0) {
+					lTrm = mizNewFuncTrm(rqPow,
+						mizNewTrmList(getVectorUnsafe(u.eTrm, k), MizTrmNil()));
+					lEqNr = mizEqClassNr(u, lTrm);
+					l1 = mizUniBottom();
+					if (lEqNr != 0) {
+						lTyp = mizNewStandardTyp(ikTypMode, mizNewEmptyCluster(),
+							mizNewEmptyCluster(), rqElem,
+							mizNewTrmList(getVectorUnsafe(u.eTrm, lEqNr), MizTrmNil()));
+						fori(1, u.eqClassNbr, \i -> {
+							hit = ref false;
+							iterVector(getVectorUnsafe(u.eqClassType, i), \xt ->
+								if (!^hit && mizEqRadices(env, xt, lTyp)) hit := true);
+							if (^hit) {
+								l2 = mizUniTrm(u, lLeft, getVectorUnsafe(u.eTrm, i));
+								mizUniUnion(u, l1, l2);
+							}
+						});
+					}
+					mizUniJoin(u, l, l1);
+					mizUniUnion(u, res, l);
+				}
+			});
+		} else if (pa.first == rqEq && rqEq != 0) {
+			// equalities are gone from the basis; nothing to match
+			handled := true;
+		}
+		// LessOrEqual / Divides numeric branches — slice 2
+		if (!^handled) {
+			iterVector(eq.posBas, \pfb -> {
+				l = mizUniFrm(u, f, pfb);
+				mizUniUnion(u, res, l);
+			});
+			handled := true;
+		}
+	} else if (srt == ikFrmAttr) {
+		l = mizUniAttrFrm(u, f, 1);
+		mizUniUnion(u, res, l);
+		handled := true;
+	} else if (srt == ikFrmQual) {
+		qf = switch (f) { MizQualFrm(__, __, __): f; default: MizQualFrm(MizBaseTrm(ikError, 0), mizNewIncorTyp(), 0); };
+		fori(1, u.eqClassNbr, \k -> {
+			l = mizUniTrm(u, qf.trm, getVectorUnsafe(u.eTrm, k));
+			if (mizPreInstCount(l) != 0) {
+				l1 = mizUniEqClassTyps(u, k, qf.typ);
+				mizUniJoin(u, l, l1);
+				mizUniUnion(u, res, l);
+			}
+		});
+		handled := true;
+	}
+	if (!^handled) {
+		iterVector(eq.posBas, \pfb -> {
+			l = mizUniFrm(u, f, pfb);
+			mizUniUnion(u, res, l);
+		});
+	}
+	res;
+}
+
+// ---------------- Verify ----------------
+
+mizVerify(u : MizUnifier, f0 : MizFrm) -> bool {
+	env = u.env;
+	pre = u.pre;
+	env.boundVarNbr ::= 0;
+	lFrm0 = mizPositivelyStandarized(u, f0);
+	// free-var hooks for the quantifier removal
+	clearVector(u.freeVarType);
+	u.unifBase ::= 0;
+	u.freeVarUnifs ::= makeTree();
+	pre.setVarInTrm ::= \t -> mizSetFreeVarInTrm(u, t);
+	pre.newVariable ::= \__, typ -> mizNewFreeVar(u, typ);
+	// InitVarBase hook: FreeVarBase := FreeVarType.Count. mizRemoveExtQuantifier
+	// sets pre.constBase; mirror it into freeVarBase through the hook order:
+	env.boundVarNbr ::= 0;
+	u.freeVarBase ::= sizeVector(u.freeVarType);
+	lFrm = mizURemoveExtQuantifier(u, lFrm0);
+	env.boundVarNbr ::= 0;
+	clearVector(pre.basic);
+	normalForm = mizNormalizeAsFalse(pre, lFrm);
+	verified = ref false;
+	i = ref 0;
+	while(\ -> !^verified && ^i < mizPreInstCount(normalForm), \ -> {
+		if (normalForm.top) {
+			verified := true;
+		} else {
+			ev : MizNatFunc = getVectorUnsafe(normalForm.evals, ^i);
+			colls : Vector<MizPreInst> = makeVector(4);
+			dead = ref false;
+			j = ref 0;
+			while(\ -> !^dead && ^j < mizNatCount(ev), \ -> {
+				it = mizNatItem(ev, ^j);
+				bf : MizFrm = getVectorUnsafe(pre.basic, it.x);
+				lInsts = if (it.y == 1) mizCompInstAsFalse(u, bf)
+					else mizCompInstAsTrue(u, bf);
+				if (mizPreInstCount(lInsts) == 0) {
+					dead := true;
+				} else if (!lInsts.top) {
+					pushVector(colls, lInsts);
+				}
+				j := ^j + 1;
+			});
+			if (!^dead) {
+				joined = mizPreInstJoinList(pre, colls);
+				if (mizPreInstCount(joined) != 0) verified := true;
+			}
+		}
+		i := ^i + 1;
+	});
+	^verified;
+}
+
+// the unifier's RemoveExtQuantifier (free-var variant of the prechecker's)
+mizURemoveExtQuantifier(u : MizUnifier, f0 : MizFrm) -> MizFrm {
+	env = u.env;
+	pre = u.pre;
+	switch (f0) {
+		MizNegFrm(arg, __): {
+			na = mizURemoveIntQuantifier(u, arg);
+			f1 : MizNegFrm = f0;
+			f1.arg ::= na;
+			switch (na) {
+				MizNegFrm(inner, __): inner;
+				default: f0;
+			}
+		}
+		MizUnivFrm(__, __, __, __, __): {
+			u.freeVarBase ::= sizeVector(u.freeVarType);
+			env.boundVarNbr ::= 0;
+			cur = ref f0;
+			cont = ref true;
+			while(\ -> ^cont, \ -> {
+				switch (^cur) {
+					MizUnivFrm(__, __, q, s, __): {
+						env.boundVarNbr ::= env.boundVarNbr + 1;
+						mizNewFreeVar(u, q);
+						cur := s;
+					}
+					default: cont := false;
+				}
+			});
+			body = ^cur;
+			w = mizMakeWithin(\__, trm -> mizSetFreeVarInTrm(u, trm));
+			mizWithinFrm(w, body);
+			mizURemoveExtQuantifier(u, body);
+		}
+		MizConjFrm(conjuncts, __): {
+			out : Vector<MizFrm> = makeVector(sizeVector(conjuncts));
+			iterVector(conjuncts, \g0 -> {
+				g = mizURemoveExtQuantifier(u, g0);
+				switch (g) {
+					MizConjFrm(inner, __): iterVector(inner, \h -> pushVector(out, h));
+					default: pushVector(out, g);
+				}
+			});
+			MizConjFrm(out, 0);
+		}
+		default: f0;
+	}
+}
+
+mizURemoveIntQuantifier(u : MizUnifier, f0 : MizFrm) -> MizFrm {
+	switch (f0) {
+		MizNegFrm(arg, __): {
+			na = mizURemoveExtQuantifier(u, arg);
+			f1 : MizNegFrm = f0;
+			f1.arg ::= na;
+			switch (na) {
+				MizNegFrm(inner, __): inner;
+				default: f0;
+			}
+		}
+		MizConjFrm(conjuncts, __): {
+			out : Vector<MizFrm> = makeVector(sizeVector(conjuncts));
+			iterVector(conjuncts, \g0 -> {
+				g = mizURemoveIntQuantifier(u, g0);
+				switch (g) {
+					MizConjFrm(inner, __): iterVector(inner, \h -> pushVector(out, h));
+					default: pushVector(out, g);
+				}
+			});
+			MizConjFrm(out, 0);
+		}
+		default: f0;
+	}
+}
+
+// ---------------- Unification ----------------
+
+mizUnification(chk : MizChecker, eq : MizEqualizer) -> int {
+	env = chk.env;
+	u = mizInitUnifier(chk, eq);
+	env.boundVarNbr ::= 0;
+	univ : Vector<MizFrm> = makeVector(4);
+	iterVector(eq.posBas, \pf -> {
+		if (mizFrmSort(pf) == ikFrmUniv) pushVector(univ, pf);
+	});
+	contr = ref 0;
+	i = ref 0;
+	while(\ -> ^contr == 0 && ^i < sizeVector(univ), \ -> {
+		if (mizVerify(u, getVectorUnsafe(univ, ^i))) {
+			contr := 45;
+		}
+		i := ^i + 1;
+	});
+	// Unifiable over pairs (Contr 47) — slice 2 (resolution)
+	// Fraenkel membership rules (Contr 48/49) — slice 2
+	^contr;
+}
