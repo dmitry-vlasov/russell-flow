@@ -156,13 +156,50 @@ mizReadOneCluster(env : MizCorrelEnv, cl : MizClusters, r2 : MizVrfReader) -> vo
 		prims = mizInArgColl(r2);
 		trm = mizInTerm(r2);
 		lower = mizInAttrColl(r2);
+		// VRF carries Lower + Upper; MML only one cluster
+		upper = if (x.nState == MizEStart && x.nElName == "Cluster") mizInAttrColl(r2)
+			else mizCopyCluster(lower);
 		typ : Maybe<MizTyp> = if (x.nState == MizEStart && x.nElName == "Typ")
 			Some(mizInType(r2)) else None();
 		mizInsertFCluster(env, cl, MizFCluster(aid, nr, prims,
-			MizClusterRec(lower, mizCopyCluster(lower)), trm, typ));
+			MizClusterRec(lower, upper), trm, typ));
 		mizXmlNextElementState(x);
 	} else {
 		mizXmlSkipElement(x);
+	}
+}
+
+// one <Reduction>: primaries as bare Typ*, then the two terms (In_Reduction)
+mizReadOneReduction(idn : MizIdentify, r2 : MizVrfReader) -> void {
+	x = r2.x;
+	aid = mizXmlAttr(x, "aid");
+	nr = mizXmlIntAttrDef(x, "nr", 0);
+	mizXmlNextElementState(x);
+	if (x.nState == MizEStart && x.nElName == "ErrorReduction") {
+		while(\ -> x.nState == MizEStart, \ -> mizXmlSkipElement(x));
+	} else {
+		prims : Vector<MizTyp> = makeVector(4);
+		while(\ -> x.nState == MizEStart && x.nElName == "Typ",
+			\ -> pushVector(prims, mizInType(r2)));
+		t0 = mizInTerm(r2);
+		t1 = mizInTerm(r2);
+		pushVector(idn.reductions, MizReduction(aid, nr, prims, t0, t1));
+	}
+	mizXmlNextElementState(x);
+}
+
+// .erd: <ReductionRegistrations> with Reduction*
+mizLoadReductions(env : MizCorrelEnv, idn : MizIdentify, content : string) -> void {
+	if (content != "") {
+		r2 = mizMakeVrfReaderMML(mizXmlInitParsing(content), env);
+		x = r2.x;
+		mizXmlNextElementState(x);
+		mizXmlAssert(x.nElName == "ReductionRegistrations");
+		mizXmlNextElementState(x);
+		while(\ -> x.nState == MizEStart, \ -> {
+			if (x.nElName == "Reduction") mizReadOneReduction(idn, r2)
+			else mizXmlSkipElement(x);
+		});
 	}
 }
 
@@ -200,6 +237,7 @@ mizCheckArticle(mmlDir : string, article : string) -> MizPrepStats {
 	p = MizPrep(chk, r, makeVector(64), makeVector(64), None(), None(), makeTree(), defs, 2, 0, 0, stats);
 	mizLoadTheorems(p, getFileContent(mmlDir + "/" + article + ".eth"));
 	mizLoadClusters(env, cl, getFileContent(mmlDir + "/" + article + ".ecl"));
+	mizLoadReductions(env, idn, getFileContent(mmlDir + "/" + article + ".erd"));
 	mizLoadDefinientia(env, defs, mmlDir, article);
 	chk.atomicExpansions ::= \f -> mizAtomicExpansions(env, defs, f);
 	idn.equalsExpand ::= \idn2, funcNr, args -> mizEqualsExpandHook(defs, idn2, funcNr, args);
@@ -285,6 +323,9 @@ mizJustify(p : MizPrep, claim : MizFrm, posLine : int) -> void {
 			}
 		});
 		mizXmlNextElementState(x); // past </By>
+		if (getUrlParameterDef("trace", "") == "1") {
+			println("by at " + i2s(line) + ":" + i2s(col));
+		}
 		{ st1 = p.stats; st1.checked ::= st1.checked + 1; }
 		if (^ok) {
 			dbgLine = s2i(getUrlParameterDef("debug-line", "-1"));
@@ -408,11 +449,14 @@ mizWalkItems(p : MizPrep) -> void {
 			});
 			mizXmlNextElementState(x);
 		} else if (name == "Consider" || name == "Given") {
+			// Consider: the existence Proposition is JUSTIFIED; Given
+			// (existential assumption) has NO justification after it
+			// (Parse_ExistentialAssumption)
+			justified = name == "Consider";
 			mizXmlNextElementState(x);
-			// existence Proposition + its justification
 			if (x.nState == MizEStart && x.nElName == "Proposition") {
 				pr = mizReadProposition(p);
-				mizJustify(p, pr.second, 0);
+				if (justified) mizJustify(p, pr.second, 0);
 			}
 			// new constants + assumed property propositions
 			while(\ -> x.nState == MizEStart, \ -> {
@@ -427,6 +471,46 @@ mizWalkItems(p : MizPrep) -> void {
 					mizXmlSkipElement(x);
 				}
 			});
+			mizXmlNextElementState(x);
+		} else if (name == "Reconsider") {
+			// (Typ Term)+ Proposition Justification: each pair makes a new
+			// constant of the given type whose definition is the term; the
+			// typing proposition is justified (Parse_Reconsidering +
+			// StdItemObj.Start/FinishReconsideredTerm)
+			mizXmlNextElementState(x);
+			while(\ -> x.nState == MizEStart && x.nElName == "Typ", \ -> {
+				typ = mizInType(p.r);
+				mizPushFixed(p, typ);
+				trm = mizInTerm(p.r);
+				fv : MizFixedVar = getVectorUnsafe(env.fixedVar, env.fixedVarNbr);
+				fv.def ::= Some(trm);
+			});
+			if (x.nState == MizEStart && x.nElName == "Proposition") {
+				pr = mizReadProposition(p);
+				mizJustify(p, pr.second, 0);
+			}
+			while(\ -> x.nState == MizEStart, \ -> mizXmlSkipElement(x));
+			mizXmlNextElementState(x);
+		} else if (name == "TakeAsVar") {
+			// take c = t: Typ Term — a new constant of the type with the
+			// term as its definition (Start/FinishExemplifyingTerm)
+			mizXmlNextElementState(x);
+			typ3 = mizInType(p.r);
+			mizPushFixed(p, typ3);
+			trm3 = mizInTerm(p.r);
+			fv3 : MizFixedVar = getVectorUnsafe(env.fixedVar, env.fixedVarNbr);
+			fv3.def ::= Some(trm3);
+			while(\ -> x.nState == MizEStart, \ -> mizXmlSkipElement(x));
+			mizXmlNextElementState(x);
+		} else if (name == "Set") {
+			// set c = t: Term Typ — a new constant of the type; the term was
+			// already expanded by the analyzer (FinishConstantDefinition:
+			// "the term is ignored", nDef stays nil)
+			mizXmlNextElementState(x);
+			__trm = mizInTerm(p.r);
+			typ2 = mizInType(p.r);
+			mizPushFixed(p, typ2);
+			while(\ -> x.nState == MizEStart, \ -> mizXmlSkipElement(x));
 			mizXmlNextElementState(x);
 		} else if (name == "Conclusion") {
 			mizXmlNextElementState(x);
@@ -472,7 +556,7 @@ mizWalkItems(p : MizPrep) -> void {
 			mizXmlNextElementState(x);
 		} else if (name == "Thesis"
 			|| name == "ThesisExpansions" || name == "EndPosition"
-			|| name == "Take" || name == "TakeAsVar" || name == "Reservation"
+			|| name == "Take" || name == "Reservation"
 			|| name == "Section" || name == "DefPred" || name == "DefFunc"
 			|| name == "SkippedProof") {
 			mizXmlSkipElement(x);
@@ -482,12 +566,15 @@ mizWalkItems(p : MizPrep) -> void {
 			{}
 		} else if (name == "RCluster" || name == "CCluster" || name == "FCluster") {
 			mizReadOneCluster(p.chk.env, p.chk.clusters, p.r);
+		} else if (name == "Reduction") {
+			mizReadOneReduction(p.chk.idn, p.r);
 		} else if (name == "DefinitionBlock" || name == "RegistrationBlock"
 			|| name == "NotationBlock" || name == "Registration"
 			|| name == "Definition" || name == "JustifiedProperty"
 			|| name == "Coherence" || name == "Existence" || name == "Uniqueness"
 			|| name == "Compatibility" || name == "Correctness"
-			|| name == "CaseBlock" || name == "SupposeBlock") {
+			|| name == "CaseBlock" || name == "SupposeBlock"
+			|| name == "ReductionRegistration" || name == "Reducibility") {
 			// walk inside: these contain items/justifications of the same shape
 			mizWalkBlock(p);
 		} else if (name == "Definiens") {
@@ -530,7 +617,7 @@ mizWalkItems(p : MizPrep) -> void {
 		} else if (name == "PerCasesReasoning" || name == "PerCases"
 			|| name == "SchemeBlock"
 			|| name == "Canceled" || name == "Pattern"
-			|| name == "Identify" || name == "Reduction") {
+			|| name == "Identify") {
 			{ st7 = p.stats; st7.skippedBlocks ::= st7.skippedBlocks + 1; }
 			mizXmlSkipElement(x);
 		} else {
