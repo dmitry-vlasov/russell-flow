@@ -1,0 +1,420 @@
+// Transcription of ~/dev/system/kernel/checker.pas — the decision loop:
+//
+//   PreCheck -> per disjunct: Equate; PreUnification; Unification
+//   success = every disjunct refuted; else ChError(4) "unsolved inference".
+//   Resource codes: 1 trivial, 8/9 lattice, 11 constants, 14 terms.
+//
+// PreUnification derives the INEQUALITIES the Unifier needs: irreflexivity/
+// reflexivity property pairs, contradictory attribute clusters between
+// classes, and the one-difference rule.
+//
+// Unification arrives with unifier.flow — the `unification` hook below; until
+// wired, an unrefuted disjunct simply yields error 4 (never a false success).
+
+import ds/vector;
+import loop;
+import math/math;
+import mizar/original/errhan;
+import mizar/original/mobjects;
+import mizar/original/limits;
+import mizar/original/lexicon;
+import mizar/original/builtin;
+import mizar/original/correl;
+import mizar/original/correl_inst;
+import mizar/original/correl_match;
+import mizar/original/roundcl;
+import mizar/original/identify;
+import mizar/original/prechecker;
+import mizar/original/equalizer;
+
+export {
+	MizChecker(
+		env : MizCorrelEnv,
+		idn : MizIdentify,
+		clusters : MizClusters,
+		chErrNr : MizIntSeq,                 // ChErrNr (IntSet of error codes)
+		// Unification hook (unifier.flow); returns the Contr code (0 = open)
+		mutable unification : (MizChecker, MizEqualizer) -> int,
+	);
+
+	mizMakeChecker(env : MizCorrelEnv, idn : MizIdentify, clusters : MizClusters) -> MizChecker;
+
+	// InferenceChecker: premises (¬thesis + linked + cited) -> error codes in
+	// chk.chErrNr. Empty = the inference is ACCEPTED.
+	mizInferenceChecker(chk : MizChecker, inference : Vector<MizFrm>) -> void;
+
+	// PreUnification over a refuted-in-progress disjunct
+	mizPreUnification(chk : MizChecker, eq : MizEqualizer) -> void;
+}
+
+mizMakeChecker(env : MizCorrelEnv, idn : MizIdentify, clusters : MizClusters) -> MizChecker {
+	MizChecker(env, idn, clusters, mizInitIntSeq(4), \__, __ -> 0);
+}
+
+mizChError(chk : MizChecker, e : int) -> void {
+	if (!mizIntSetIsInSet(chk.chErrNr, e)) {
+		__x = mizIntSetInsert(chk.chErrNr, e);
+		{}
+	}
+}
+
+// ContradictoryAttrs: merge-walk two sorted clusters, same attr with
+// opposite sign
+mizContradictoryAttrs(chk : MizChecker, c1 : MizAttrColl, c2 : MizAttrColl) -> bool {
+	env = chk.env;
+	n1 = sizeVector(c1.items);
+	n2 = sizeVector(c2.items);
+	if (n1 == 0 || n2 == 0) {
+		false;
+	} else {
+		res = ref false;
+		i = ref 0;
+		j = ref 0;
+		while(\ -> !^res && ^i < n1 && ^j < n2, \ -> {
+			a : MizAttr = getVectorUnsafe(c1.items, ^i);
+			b : MizAttr = getVectorUnsafe(c2.items, ^j);
+			c = mizCompAbsAttr(env, a, b);
+			if (c == -1) {
+				i := ^i + 1;
+			} else {
+				if (c == 0) {
+					if (a.neg != b.neg) res := true;
+					i := ^i + 1;
+				}
+				j := ^j + 1;
+			}
+		});
+		^res;
+	}
+}
+
+// AllocInequality: record ¬(t1 = t2) in NegBas (deduplicated) and transfer
+// non-empty / non-zero
+mizAllocInequality(chk : MizChecker, eq : MizEqualizer, t1 : MizTrm, t2 : MizTrm) -> void {
+	env = chk.env;
+	rqEq = mizBuiltIn(env.builtIn, rqEqualsTo);
+	i1 = mizTrmInfoOf(t1);
+	i2 = mizTrmInfoOf(t2);
+	dup = ref false;
+	iterVector(eq.negBas, \nf -> {
+		switch (nf) {
+			MizPredFrm(srt, predNr, args, __): {
+				if (srt == ikFrmPred && predNr == rqEq) {
+					l = mizTrmInfoOf(mizTrmListNth(args, 0));
+					r = mizTrmInfoOf(mizTrmListNth(args, 1));
+					if ((l == i1 && r == i2) || (l == i2 && r == i1)) dup := true;
+				}
+			}
+			default: {}
+		}
+	});
+	if (!^dup) {
+		pushVector(eq.negBas, mizNewEqFrm(env, t1, t2));
+		mizInsertNonEmptyPub(eq, i1, i2);
+		mizInsertNonEmptyPub(eq, i2, i1);
+		mizInsertNonZeroPub(eq, i1, i2);
+		mizInsertNonZeroPub(eq, i2, i1);
+	}
+}
+
+// OneDiffInTrmLists: exactly one class-different position
+mizOneDiffInTrmLists(a0 : MizTrmList, b0 : MizTrmList) -> Maybe<Pair<MizTrm, MizTrm>> {
+	diff : ref Maybe<Pair<MizTrm, MizTrm>> = ref None();
+	multi = ref false;
+	a = ref a0;
+	b = ref b0;
+	while(\ -> !^multi && switch (^a) { MizTrmNil(): false; default: true; }, \ -> {
+		switch (^a) {
+			MizTrmElem(ta, na): {
+				switch (^b) {
+					MizTrmElem(tb, nb): {
+						if (mizTrmInfoOf(ta) != mizTrmInfoOf(tb)) {
+							switch (^diff) {
+								Some(__): multi := true;
+								None(): diff := Some(Pair(ta, tb));
+							}
+						}
+						a := na;
+						b := nb;
+					}
+					MizTrmNil(): multi := true;
+				}
+			}
+			MizTrmNil(): {}
+		}
+	});
+	if (^multi) None() else ^diff;
+}
+
+mizPreUnification(chk : MizChecker, eq : MizEqualizer) -> void {
+	env = chk.env;
+	rqEq = mizBuiltIn(env.builtIn, rqEqualsTo);
+
+	// positive irreflexive predicates force the two args apart
+	iterVector(copyVector(eq.posBas), \pf -> {
+		if (eq.contr == 0) {
+			switch (pf) {
+				MizPredFrm(srt, predNr, args, __): {
+					if (srt == ikFrmPred) {
+						c = mizConstr(env, coPredicate, predNr);
+						if (mizHasProperty(c, syIrreflexivity)) {
+							l = mizTrmListNth(args, c.firstArg - 1);
+							r = mizTrmListNth(args, c.secondArg - 1);
+							if (mizTrmInfoOf(l) == mizTrmInfoOf(r)) {
+								eq.contr ::= 50;
+							} else {
+								mizAllocInequality(chk, eq,
+									mizTrmSAt(eq, mizTrmInfoOf(l)).term,
+									mizTrmSAt(eq, mizTrmInfoOf(r)).term);
+							}
+						}
+					}
+				}
+				default: {}
+			}
+		}
+	});
+	if (eq.contr == 0) {
+		// negative reflexive predicates likewise
+		iterVector(copyVector(eq.negBas), \nf -> {
+			if (eq.contr == 0) {
+				switch (nf) {
+					MizPredFrm(srt, predNr, args, __): {
+						if (srt == ikFrmPred) {
+							c = mizConstr(env, coPredicate, predNr);
+							if (mizHasProperty(c, syReflexivity)) {
+								l = mizTrmListNth(args, c.firstArg - 1);
+								r = mizTrmListNth(args, c.secondArg - 1);
+								if (mizTrmInfoOf(l) == mizTrmInfoOf(r)) {
+									eq.contr ::= 51;
+								} else {
+									mizAllocInequality(chk, eq,
+										mizTrmSAt(eq, mizTrmInfoOf(l)).term,
+										mizTrmSAt(eq, mizTrmInfoOf(r)).term);
+								}
+							}
+						}
+					}
+					default: {}
+				}
+			}
+		});
+	}
+	if (eq.contr == 0) {
+		// contradictory attribute clusters between classes
+		n = mizTrmNbr(eq);
+		fori(1, n, \ii -> {
+			if (eq.contr == 0) {
+				ri = mizTrmSAt(eq, ii);
+				liveI = switch (ri.eqClass) { MizTrmNil(): false; default: true; };
+				if (liveI) {
+					fori(ii + 1, n, \jj -> {
+						if (eq.contr == 0) {
+							rj = mizTrmSAt(eq, jj);
+							liveJ = switch (rj.eqClass) { MizTrmNil(): false; default: true; };
+							if (liveJ && mizContradictoryAttrs(chk, ri.superCluster, rj.superCluster)) {
+								mizAllocInequality(chk, eq, ri.term, rj.term);
+							}
+						}
+					});
+				}
+			}
+		});
+	}
+	if (eq.contr == 0) {
+		// the one-difference rule
+		ii = ref 0;
+		while(\ -> eq.contr == 0 && ^ii < sizeVector(eq.negBas), \ -> {
+			nf : MizFrm = getVectorUnsafe(eq.negBas, ^ii);
+			switch (nf) {
+				MizPredFrm(srt, predNr, args, __): {
+					if (srt == ikFrmPred) {
+						pfN : MizPredFrm = mizChkAsPred(nf);
+						pa = mizAdjustFrm(env, pfN);
+						// same-head functor pairs across two class members of a
+						// reflexive predicate's args
+						c = mizConstr(env, coPredicate, predNr);
+						if (mizHasProperty(c, syReflexivity)) {
+							l = mizTrmListNth(args, c.firstArg - 1);
+							r = mizTrmListNth(args, c.secondArg - 1);
+							curL = ref mizTrmSAt(eq, mizTrmInfoOf(l)).eqClass;
+							while(\ -> switch (^curL) { MizTrmNil(): false; default: true; }, \ -> {
+								switch (^curL) {
+									MizTrmElem(tl, nl): {
+										sl = mizTrmSort(tl);
+										if (sl == ikTrmFunctor || sl == ikTrmSchFunc
+											|| sl == ikTrmPrivFunc || sl == ikTrmAggreg
+											|| sl == ikTrmSelector) {
+											curR = ref mizTrmSAt(eq, mizTrmInfoOf(r)).eqClass;
+											while(\ -> switch (^curR) { MizTrmNil(): false; default: true; }, \ -> {
+												switch (^curR) {
+													MizTrmElem(tr, nr): {
+														if (mizTrmSort(tr) == sl
+															&& mizChkFuncNr(tl) == mizChkFuncNr(tr)) {
+															switch (mizOneDiffInTrmLists(
+																mizChkArgs(tl), mizChkArgs(tr))) {
+																Some(p): mizAllocInequality(chk, eq, p.first, p.second);
+																None(): {}
+															}
+														}
+														curR := nr;
+													}
+													MizTrmNil(): {}
+												}
+											});
+										}
+										curL := nl;
+									}
+									MizTrmNil(): {}
+								}
+							});
+						}
+						// negative vs positive same-head literal, one diff
+						if (pa.first != mizBuiltIn(env.builtIn, rqEqualsTo)) {
+							iterVector(eq.posBas, \pf -> {
+								switch (pf) {
+									MizPredFrm(s2, __, __, __): {
+										if (s2 == ikFrmPred) {
+											pfP : MizPredFrm = mizChkAsPred(pf);
+											pb = mizAdjustFrm(env, pfP);
+											if (pb.first == pa.first) {
+												switch (mizOneDiffInTrmLists(pb.second, pa.second)) {
+													Some(p): mizAllocInequality(chk, eq, p.first, p.second);
+													None(): {}
+												}
+											}
+										}
+									}
+									default: {}
+								}
+							});
+						}
+					} else {
+						// SchPred / PrivPred / Attr: same nr, one diff
+						iterVector(eq.posBas, \pf -> {
+							switch (pf) {
+								MizPredFrm(s2, p2, args2, __): {
+									if (s2 == srt && p2 == predNr) {
+										switch (mizOneDiffInTrmLists(args2, args)) {
+											Some(p): mizAllocInequality(chk, eq, p.first, p.second);
+											None(): {}
+										}
+									}
+								}
+								default: {}
+							}
+						});
+					}
+				}
+				MizQualFrm(trm, typ, __): {
+					// qualification one-diff: matching types in the class
+					rec = mizTrmSAt(eq, mizTrmInfoOf(trm));
+					iterVector(rec.xTypClass, \xt -> {
+						if (xt.sort == typ.sort
+							&& mizAttrCollIsSubsetOf(env, typ.lower, rec.superCluster,
+								\x, y -> mizAttrEquals(env, x, y))
+							&& xt.sort == ikTypMode) {
+							p1 = mizAdjustTyp(env, xt);
+							p2 = mizAdjustTyp(env, typ);
+							if (p1.first == p2.first) {
+								switch (mizOneDiffInTrmLists(p1.second, p2.second)) {
+									Some(p): mizAllocInequality(chk, eq, p.first, p.second);
+									None(): {}
+								}
+							}
+						}
+					});
+					// classes with a radix-equal type must differ from this term
+					fori(1, mizTrmNbr(eq), \j -> {
+						if (j != mizTrmInfoOf(trm)) {
+							rj = mizTrmSAt(eq, j);
+							liveJ = switch (rj.eqClass) { MizTrmNil(): false; default: true; };
+							if (liveJ) {
+								hit = ref false;
+								iterVector(rj.xTypClass, \xt ->
+									if (!^hit && mizEqRadices(env, typ, xt)) hit := true);
+								if (^hit) {
+									mizAllocInequality(chk, eq, trm, rj.term);
+								}
+							}
+						}
+					});
+				}
+				default: {}
+			}
+			ii := ^ii + 1;
+		});
+	}
+}
+
+mizChkAsPred(f : MizFrm) -> MizPredFrm {
+	switch (f) { MizPredFrm(__, __, __, __): f; default: { mizRunTimeError(2908); MizPredFrm(ikError, 0, MizTrmNil(), 0); } }
+}
+
+mizChkFuncNr(t : MizTrm) -> int {
+	switch (t) {
+		MizFuncTrm(__, funcNr, __, __, __): funcNr;
+		MizPrivFuncTrm(funcNr, __, __, __, __): funcNr;
+		default: 0;
+	}
+}
+
+mizChkArgs(t : MizTrm) -> MizTrmList {
+	switch (t) {
+		MizFuncTrm(__, __, args, __, __): args;
+		MizPrivFuncTrm(__, args, __, __, __): args;
+		default: MizTrmNil();
+	}
+}
+
+// ---------------- InferenceChecker ----------------
+
+mizInferenceChecker(chk : MizChecker, inference : Vector<MizFrm>) -> void {
+	env = chk.env;
+	idn = chk.idn;
+	mizSeqClear(chk.chErrNr);
+	// marks: collected constants added during THIS inference are dropped after
+	infMark = sizeVector(env.inferConstDef);
+	fixedMark = env.fixedVarNbr;
+	env.boundVarNbr ::= 0;
+
+	pre = mizMakePre(env);
+	pre.collectConst ::= \f -> mizCollectConstInFrm(idn, f);
+	env.itIsChecker ::= true;
+
+	normalForm = mizPreCheck(pre, inference);
+
+	if (pre.trivialError) {
+		mizChError(chk, 1);
+	} else if (pre.latOvfl) {
+		mizChError(chk, 8);
+	} else {
+		anyTrmOvfl = ref false;
+		anyLatOvfl = ref false;
+		iterVector(normalForm.evals, \eval -> {
+			env.boundVarNbr ::= 0;
+			eq = mizMakeEqualizer(env, idn, chk.clusters, pre);
+			mizEquate(eq, eval);
+			if (eq.contr == 0) {
+				mizPreUnification(chk, eq);
+				if (eq.contr == 0) {
+					uContr = chk.unification(chk, eq);
+					if (uContr > 0) {
+						eq.contr ::= uContr;
+					} else {
+						mizChError(chk, 4);
+					}
+				}
+			}
+			if (eq.trmOvfl) anyTrmOvfl := true;
+		});
+		if (^anyLatOvfl || pre.latOvfl) mizChError(chk, 9);
+		if (^anyTrmOvfl) mizChError(chk, 14);
+	}
+	if (pre.constOvfl) mizChError(chk, 11);
+
+	env.itIsChecker ::= false;
+	// release per-inference state
+	env.fixedVarNbr ::= fixedMark;
+	mizInferRelease(idn, infMark);
+}
