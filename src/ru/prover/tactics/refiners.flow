@@ -399,33 +399,62 @@ ruCitedFacts(memo : Maybe<RuResidualMemo>, math : RuMath, stmtClass : int,
 	precedes : (int) -> bool) -> [Pair<RuProofTree, RuExp>] {
 	switch (memo) {
 		None(): [];
-		Some(m): switch (ruBoardGet(m.board, "by.refs")) {
-			None(): [];
-			Some(v): {
-				names = cast(v : flow -> [string]);
-				filtermap(names, \nm ->
-					if (startsWith(nm, "hyp") || startsWith(nm, "step")) None()
-					else {
-						id = s2id(nm);
-						if (!precedes(id)) None()
-						else switch (lookupTree(math.decls.assertions, id)) {
-							None(): None();
-							Some(a): {
-								inf = ruTyInfer2(a);
-								if (inf.hyps != []) None() else {
-									e = ruExp(inf.prop.exps[0]);
-									Some(Pair(RuProofStep(id, [], RuStmt(stmtClass, [e], -1)), e));
-								}
-							}
-						};
-					});
-			}
-		}
+		Some(m): filtermap(ruByRefs(m.board), \nm ->
+			if (startsWith(nm, "hyp") || startsWith(nm, "step")) None()
+			else {
+				id = s2id(nm);
+				if (!precedes(id)) None()
+				else switch (lookupTree(math.decls.assertions, id)) {
+					None(): None();
+					Some(a): {
+						inf = ruTyInfer2(a);
+						if (inf.hyps != []) None() else {
+							e = ruExp(inf.prop.exps[0]);
+							Some(Pair(RuProofStep(id, [], RuStmt(stmtClass, [e], -1)), e));
+						}
+					}
+				};
+			});
 	}
 }
 
 ruTyInfer2(a : RuAssertion) -> RuInference {
 	switch (a) { RuAxiom(__, i): i; RuCong(__, i): i; RuTheorem(__, i, __, __): i; RuDef(__, i, __, __): i; }
+}
+
+// The non-local names of the step's `by` list, as assertion ids. Local citations (hypK/stepK) are
+// premises already and carry no id.
+ruCitedIds(memo : Maybe<RuResidualMemo>) -> Set<int> {
+	switch (memo) {
+		None(): makeSet();
+		Some(m): fold(ruByRefs(m.board), makeSet(), \acc, nm ->
+			if (startsWith(nm, "hyp") || startsWith(nm, "step")) acc else insertSet(acc, s2id(nm)));
+	}
+}
+
+// The step`s citation list off the board. It is published in the step scope AND in the session
+// scope, because the outermost or-else clears the step scope when it builds the step`s tactic —
+// after the list was published — so the step scope alone is always empty by the time a consumer
+// looks. Read the step scope first all the same: it is the correct home, and a future publisher
+// that survives the reset needs no change here.
+ruByRefs(board : RuTacticBoard) -> [string] {
+	step = switch (ruBoardGet(board, "by.refs")) { None(): []; Some(v): cast(v : flow -> [string]); };
+	if (step != []) step
+	else switch (ruBoardSessionGet(board, "by.refs")) { None(): []; Some(v): cast(v : flow -> [string]); };
+}
+
+// Does this proof use one of the cited assertions? A fact DERIVED from a citation is itself a
+// cited fact: the saturation instantiates a cited ∀-form at the problem's terms, and it is the
+// INSTANCE the checker needs — dropping it because the instance shares no atom with the goal
+// throws away exactly what the author handed over. Depth-bounded: the seeded facts' proofs are
+// shallow (an assertion application plus its instantiation chain), and an unbounded walk over
+// every premise would be a cost unit on every failing residual.
+ruProofUsesCited(pf : RuProofTree, ids : Set<int>, depth : int) -> bool {
+	if (depth <= 0) false else switch (pf) {
+		RuProofHyp(__, __): false;
+		RuProofStep(ass, ch, __):
+			containsSet(ids, ass) || exists(ch, \c -> ruProofUsesCited(c, ids, depth - 1));
+	}
 }
 
 ruMemoTypeEnv(memo : Maybe<RuResidualMemo>, math : RuMath, env : RuEnv, stmtClass : int,
@@ -619,15 +648,28 @@ ruCheckerResidualRun(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : 
 	// simply a fact: add it, with its one-step proof, so the decision procedures receive what
 	// Mizar's receive. Hypothesis-carrying citations are left to the ordinary search, which knows
 	// how to discharge them.
-	citedFacts = ruCitedFacts(memo, math, stmtClass, precedes);
+	// OPT-IN (`conf-set citations=1`), off by default. The mechanism is correct and now actually
+	// runs, but handing the author's `by` list to a checker whose premise SELECTION is the
+	// bottleneck adds facts where facts are the problem: measured on the floors it costs theorems
+	// and ~15% wall. So it stays available and inert until the selection can absorb it.
+	citeOn = ruOptsString(env.conf.opts, "citations", "") == "1";
+	citedFacts = if (!citeOn) [] else ruCitedFacts(memo, math, stmtClass, precedes);
+	if (citeOn && env.conf.verbose >= 4) {
+		env.out.println("  cited: " + i2s(length(citedFacts)) + " fact(s) from the by-list, "
+			+ i2s(sizeSet(ruCitedIds(memo))) + " name(s) cited");
+	} else {};
 	// THE TYPE ENVIRONMENT PHASE. Built ONCE for this hypothesis context and kept on the shared
 	// board, instead of being re-derived inside every goal's search — the arrangement Mizar uses,
 	// where the environment is settled before the checker runs and simply handed over.
-	tyGuard = concat(citedFacts,
-		if (!tyOn) [] else ruMemoTypeEnv(memo, math, env, stmtClass, tyTable, instHyps, goal));
-	tyFacts = if (isEmptySet(tyHeads)) [] else concat(tyGuard,
+	envFacts = if (!tyOn) [] else ruMemoTypeEnv(memo, math, env, stmtClass, tyTable, instHyps, goal);
+	tyGuard = concat(citedFacts, envFacts);
+	// THE CITATIONS ARE NOT TYPE CONTENT: they are the author's own premise list, and every
+	// article has one whether or not it has a type layer. They were reaching the saturation only
+	// through the type-head gate, so with the type layer off the `by` list was carried through
+	// translation and then dropped again — the very thing this phase exists to stop.
+	tyFacts = concat(citedFacts, if (isEmptySet(tyHeads)) [] else concat(envFacts,
 		filtermap(filter(tyTable.all, \r -> r.role == RuTyDef() && !r.guarded && containsSet(tyHeads, r.head)),
-			\r -> ruTyRuleFact(math, stmtClass, r)));
+			\r -> ruTyRuleFact(math, stmtClass, r))));
 	if (env.conf.verbose >= 4 && tyOn && tyFacts == []) {
 		env.out.println("  ensure-type: ON but nothing seeded — table " + i2s(length(tyTable.all))
 			+ " rules, heads matched " + i2s(sizeSet(tyHeads)));
@@ -681,6 +723,13 @@ ruCheckerResidualRun(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : 
 	premiseExps2 = map(premises, \pr -> ruExp(pr.stmt.exps[0]));
 	// the facts the type-environment phase established and the ones the author cited
 	knownExps = map(tyGuard, \f -> f.second);
+	// …and everything the saturation DERIVED FROM a citation. A cited ∀-form is rarely usable as
+	// it stands; what closes the step is its instance at the problem's own terms, and that
+	// instance shares no atom with the goal often enough that connectivity drops it. Provenance
+	// travels with the proof, so read it there.
+	citedIds = if (!citeOn) makeSet() else ruCitedIds(memo);
+	citedIdx = if (isEmptySet(citedIds)) [] else
+		filtermapi(satAll, \k, p -> if (ruProofUsesCited(p.second, citedIds, 6)) Some(nh + nd + k) else None());
 	spliceAll = \unc : RuProofTree -> ruUnfoldSplice(unc, nh, concat(derivedProofs, map(satAll, \p -> p.second)));
 	if (env.conf.verbose >= 4) {
 		env.out.println("  resid: goal=" + ru2s(goal, math) + " hyps=" + i2s(nh) + " derived=" + i2s(nd) + " sat=" + i2s(length(satAll)));
@@ -703,10 +752,10 @@ ruCheckerResidualRun(math : RuMath, env : RuEnv, info : RuDeclInfo, stmtClass : 
 					if (env.conf.verbose >= 4) { env.out.println("  resid: fallback memo hit (failed) goal=" + ru2s(goal, math)); } else {};
 					None();
 				} else ruResidualFallback(memo, math, env, stmtClass, goal, nnf, precedes, conn, wff, em,
-					premiseExps2, spliceAll, hypDisjs2, fbRef, hypPool, tyHeads, knownExps);
+					premiseExps2, spliceAll, hypDisjs2, fbRef, hypPool, tyHeads, knownExps, citedIdx);
 			}
 			None(): ruResidualFallback(memo, math, env, stmtClass, goal, nnf, precedes, conn, wff, em,
-				premiseExps2, spliceAll, hypDisjs2, fbRef, hypPool, tyHeads, knownExps);
+				premiseExps2, spliceAll, hypDisjs2, fbRef, hypPool, tyHeads, knownExps, citedIdx);
 		}
 	};
 	// GENERAL-PATH OR-ELIM (last resort): a pooled disjunction fact P∨Q closes the
@@ -824,7 +873,7 @@ ruResidualFallback(memo : Maybe<RuResidualMemo>, math : RuMath, env : RuEnv, stm
 	goal : RuExp, nnf : bool, precedes : (int) -> bool, conn : RuPConnectives, wff : int, em : RuEnvMath,
 	premiseExps2 : [RuExp], spliceAll : (RuProofTree) -> RuProofTree, hypDisjs2 : Set<RuDisj>,
 	fbRef : ref [RuTimer], hypPool : Tree<string, RuProofTree>, tyHeads : Set<int>,
-	knownExps : [RuExp]) -> Maybe<RuRefineResult> {
+	knownExps : [RuExp], citedIdx : [int]) -> Maybe<RuRefineResult> {
 	// hypPool = the CALLER's setness pool (built over the real hyps, leaf indices < nh). It is
 	// threaded in rather than rebuilt over `premiseExps2` on purpose: the rewrite memo is keyed
 	// by (expr, nnf) only, so two differently-numbered pools would let a cached rewrite proof
@@ -1097,9 +1146,16 @@ ruResidualFallback(memo : Maybe<RuResidualMemo>, math : RuMath, env : RuEnv, stm
 					else if (!isTypeCtx(e)) None()
 					else if (isEmptySet(intersectSets(argTerms(e), terms0))) None()
 					else Some(i)), 12);
+			// WHAT THE AUTHOR CITED, AND WHAT THE SATURATION MADE OF IT. Mizar's checker is handed
+			// its premises and never guesses; these are that list, so they get their own allowance
+			// rather than competing with the type context for its cap. Smallest first, and capped
+			// all the same — an instance chain can produce many variants of one citation, and every
+			// admitted premise is an atom the (exponential) certificate must carry.
+			citedAdds = take(mergeSort(filter(citedIdx, \i -> !contains(atomPick, i)),
+				\a, b -> length(premiseExps2[a].nodes) - length(premiseExps2[b].nodes)), 6);
 			setnessIdxs = filtermapi(premiseExps2, \i, e ->
 				if (ruUSetnessHyp(e, s2id("wcel"), s2id("cvv")) != None()) Some(i) else None());
-			subset0 = mergeSort(concat3(atomPick, bridgeAdds, typeAdds), \a, b -> a - b);
+			subset0 = mergeSort(concat(concat3(atomPick, bridgeAdds, typeAdds), citedAdds), \a, b -> a - b);
 			// DEDUP by expression: the saturation re-derives the same fact (three copies of one
 			// ∨-premise = three case-split candidates burning the split budget — t86)
 			subset = (fold(subset0, Pair([], makeSet()), \acc : Pair<[int], Set<[RuExpNode]>>, i -> {

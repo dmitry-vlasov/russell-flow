@@ -38,7 +38,10 @@ export {
 
 	// head  = the guard/predicate symbol the rule is keyed under (its CONCLUSION head)
 	// arity = that predicate's arity (1 = bare attribute, 2+ = parameterised mode/attribute)
-	RuTyRule(assId : int, role : RuTyRole, head : int, arity : int, guarded : bool);
+	// `fhead` = for a FUNCTOR definition (`∀ā∀d (d = f(ā) ↔ Φ)`, head wceq) the head of the defined
+	// term f, else -1. It is the cheap gate: a definition whose functor the problem never mentions
+	// must cost nothing, and without it every one of them paid a rename and a strip per residual.
+	RuTyRule(assId : int, role : RuTyRole, head : int, arity : int, guarded : bool, fhead : int);
 
 	RuTypeTable(all : [RuTyRule], byHead : Tree<int, [RuTyRule]>);
 
@@ -223,6 +226,17 @@ ruTyFindBicond(e : RuExp) -> Maybe<RuExp> {
 	else None();
 }
 
+// The head of the compound side of an equality atom `d = f(ā)` — the functor that a functor
+// definition defines. -1 when the atom is not an equality or neither side is compound.
+ruTyDefinedHead(lhs : RuExp) -> int {
+	if (ruTyHeadOf(lhs) != s2id("wceq") || ruInArity(lhs) != 2) -1 else {
+		a = ruTyArgsOf(lhs);
+		if (ruTyIsCompound(a[1])) ruTyHeadOf(a[1])
+		else if (ruTyIsCompound(a[0])) ruTyHeadOf(a[0])
+		else -1;
+	}
+}
+
 ruTyBuild(math : RuMath) -> RuTypeTable {
 	// The soft-type layer is MIZAR-side content. set.mm's own corpus (the miz_set foundation)
 	// is thousands of ordinary set-theory theorems whose shapes collide with the cluster
@@ -253,7 +267,8 @@ ruTyBuild(math : RuMath) -> RuTypeTable {
 					// a bicond whose LHS is an ATOM with a subject is a mode/attribute unfold;
 					// `guarded` records Mizar's empty-case split (the ∨/→ wrapper).
 					if (hd.first < 0 || hd.second == 0) None()
-					else Some(RuTyRule(ruTyId(ass), RuTyDef(), hd.first, hd.second, ruInHead(body) != s2id("wb")));
+					else Some(RuTyRule(ruTyId(ass), RuTyDef(), hd.first, hd.second,
+						ruInHead(body) != s2id("wb"), ruTyDefinedHead(lhs)));
 				}
 				None(): {
 					// A registration with NO locus guards is a bare conclusion rather than an
@@ -264,7 +279,7 @@ ruTyBuild(math : RuMath) -> RuTypeTable {
 					cl = ruTyClassifyImp(concl);
 					hd = cl.second;
 					if (hd.first < 0 || hd.second == 0) None()
-					else Some(RuTyRule(ruTyId(ass), cl.first, hd.first, hd.second, false));
+					else Some(RuTyRule(ruTyId(ass), cl.first, hd.first, hd.second, false, -1));
 				}
 			}
 		}
@@ -692,9 +707,18 @@ ruTyFunctorFacts(math : RuMath, env : RuEnv, stmtClass : int, t : RuTypeTable,
 	facts : [Pair<RuProofTree, RuExp>], goal : RuExp) -> [Pair<RuProofTree, RuExp>] {
 	wffT = tp2id_("wff");
 	wceq = s2id("wceq");
-	defs = filter(t.all, \r -> r.role == RuTyDef() && r.head == wceq);
-	if (defs == []) [] else {
+	defs0 = filter(t.all, \r -> r.role == RuTyDef() && r.head == wceq);
+	if (defs0 == []) [] else {
 		exps = arrayPush(map(facts, \f -> f.second), goal);
+		// GATE ON THE DEFINED FUNCTOR OCCURRING. Each definition below costs an alpha-rename and a
+		// binder strip before its occurrence scan can decline it, and the library holds one per
+		// Mizar functor — so an ungated pass makes every residual pay for the whole article family.
+		// The same law as the mode path's head gate.
+		occHeads = fold(exps, makeSet(), \acc, e -> fold(e.nodes, acc, \ac, n -> switch (n) {
+			RuVar(__, __): ac;
+			RuRuleNode(idT, __): insertSet(ac, ruIdType2Id(idT));
+		}));
+		defs = filter(defs0, \r -> r.fhead >= 0 && containsSet(occHeads, r.fhead));
 		pool = ruSetnessPoolOfProofs(facts);
 		fold(defs, [], \acc, r -> if (length(acc) >= 4) acc else
 			switch (lookupTree(math.decls.assertions, r.assId)) {
