@@ -1,0 +1,1337 @@
+// Transcription of ~/dev/system/kernel/correl.pas (part 1: the expression
+// representation and its structural operations).
+//
+// Object mapping (CONVENTIONS.md): each *Obj becomes a struct in a union,
+// discriminated by its Pascal sort char where several sorts share a struct
+// (VarTrmObj serves Locus/Bound/Constant/InfConst/EqConst/FreeVar/LambdaVar/
+// Numeral/It; FuncTrmObj serves Functor/Aggreg/Selector/SchFunc). TrmList is
+// the same mutable cons list as the original (splicing and in-place argument
+// replacement are used by the checker). `var fTrm: TrmPtr` callbacks become
+// (MizTrm) -> MizTrm replacements written back into the mutable parent slot.
+//
+// Unit globals (Constr, InferConstDef, gBuiltIn) become MizCorrelEnv, one per
+// article. Operations that consult the constructor table (Adjust*, Eq*) take
+// the env explicitly; purely structural ones (Compare*, SizeOf*, Copy*) do not.
+//
+// Part 2 (instantiation, type widening, rounding-up, term collection) follows
+// in correl_inst.flow / correl_typ.flow as the checker port needs them.
+
+import ds/vector;
+import loop;
+import math/math;
+import math/bits;
+import mizar/original/errhan;
+import mizar/original/mobjects;
+import mizar/original/lexicon;
+import mizar/original/builtin;
+
+export {
+	// ---------------- terms ----------------
+	MizTrm ::= MizVarTrm, MizFuncTrm, MizPrivFuncTrm, MizFraenkelTrm,
+		MizQuaTrm, MizChoiceTrm, MizBaseTrm;
+	// ikTrmLocus/Bound/Constant/InfConst/EqConst/SchFunc?—no: FreeVar/LambdaVar/Numeral
+	MizVarTrm(mutable sort : int, mutable varNr : int, mutable pattNr : int);
+	// ikTrmFunctor/Aggreg/Selector/SchFunc
+	MizFuncTrm(mutable sort : int, mutable funcNr : int, mutable args : MizTrmList,
+		mutable pattNr : int);
+	// ikTrmPrivFunc — LocFuncTrmObj: args + the expansion
+	MizPrivFuncTrm(mutable funcNr : int, mutable args : MizTrmList,
+		mutable funcExp : MizTrm, mutable pattNr : int);
+	MizFraenkelTrm(lambdaArgs : Vector<MizTyp>, mutable scope : MizTrm,
+		mutable compr : MizFrm, idents : MizIntSeq, mutable pattNr : int);
+	MizQuaTrm(mutable trmProper : MizTrm, mutable qua : MizTyp, mutable pattNr : int);
+	MizChoiceTrm(mutable choiceTyp : MizTyp, mutable pattNr : int);
+	// ikTrmIt / ikError — TrmObj with no fields
+	MizBaseTrm(mutable sort : int);
+
+	mizTrmSort(t : MizTrm) -> int;
+
+	// TrmList — the original mutable cons list.
+	MizTrmList ::= MizTrmElem, MizTrmNil;
+	MizTrmElem(mutable trm : MizTrm, mutable next : MizTrmList);
+	MizTrmNil();
+
+	// ---------------- attributes, clusters, types ----------------
+	MizAttr(mutable neg : int, mutable attrNr : int, mutable args : MizTrmList,
+		mutable collected : bool, mutable pattNr : int);
+	// MAttrCollection: sorted by the attribute order, consistent flag
+	MizAttrColl(items : Vector<MizAttr>, mutable consistent : bool);
+
+	MizTyp(mutable sort : int, mutable lower : MizAttrColl, mutable upper : MizAttrColl,
+		mutable modNr : int, mutable modArgs : MizTrmList, mutable pattNr : int);
+
+	// ---------------- formulas ----------------
+	MizFrm ::= MizPredFrm, MizLocPredFrm, MizQualFrm, MizNegFrm, MizBinFrm,
+		MizConjFrm, MizUnivFrm, MizUniqFrm, MizFlexFrm;
+	// ikFrmPred/ikFrmAttr/ikFrmSchPred/ikRSFrmPred
+	MizPredFrm(mutable sort : int, mutable predNr : int, mutable args : MizTrmList,
+		mutable pattNr : int);
+	// ikFrmPrivPred
+	MizLocPredFrm(mutable predNr : int, mutable args : MizTrmList,
+		mutable predExp : MizFrm, mutable pattNr : int);
+	MizQualFrm(mutable trm : MizTrm, mutable typ : MizTyp, mutable pattNr : int);
+	MizNegFrm(mutable arg : MizFrm, mutable pattNr : int);
+	// ikFrmOr/Iff/Implies/FlexDisj/FlexConj as connectives (analyzer only)
+	MizBinFrm(mutable sort : int, mutable left : MizFrm, mutable right : MizFrm,
+		mutable pattNr : int);
+	MizConjFrm(conjuncts : Vector<MizFrm>, mutable pattNr : int);
+	// ikFrmUniv / ikFrmEx
+	MizUnivFrm(mutable sort : int, mutable varId : int, mutable quantified : MizTyp,
+		mutable scope : MizFrm, mutable pattNr : int);
+	// ikFrmVerum / ikFrmThesis / ikError
+	MizUniqFrm(mutable sort : int);
+	// FlexFrmObj (ellipsis)
+	MizFlexFrm(mutable sort : int, mutable leftOrig : MizFrm, mutable rightOrig : MizFrm,
+		mutable leftTrm : MizTrm, mutable rightTrm : MizTrm,
+		mutable expansion : MizFrm, mutable pattNr : int);
+
+	mizFrmSort(f : MizFrm) -> int;
+
+	// ---------------- the constructor environment ----------------
+	// ConstructorsKind
+	coMode = 0; coStructMode = 1; coAttribute = 2; coPredicate = 3;
+	coFunctor = 4; coSelector = 5; coAggregate = 6; coLAST = 6;
+
+	// PropertyKind (mscanner.pas) as bit numbers for the properties mask
+	sySymmetry = 1; syReflexivity = 2; syIrreflexivity = 3;
+	syAssociativity = 4; syTransitivity = 5; syCommutativity = 6;
+	syConnectedness = 7; syAsymmetry = 8; syIdempotence = 9;
+	syInvolutiveness = 10; syProjectivity = 11; sySethood = 12; syAbstractness = 13;
+
+	// ConstrObj/ConstrTypObj flattened; struct/aggregate extras included.
+	MizConstr(
+		kind : int,
+		article : string,
+		absNr : int,
+		primaries : Vector<MizTyp>,          // nPrimaries (argument types)
+		mutable whichConstrNr : int,         // redefinition origin (or 0)
+		mutable superfluous : int,
+		mutable properties : int,            // bitmask by property bit numbers
+		mutable firstArg : int,
+		mutable secondArg : int,
+		mutable typ : Maybe<MizTyp>,         // ConstrTypObj.fConstrTyp
+		mutable structModeAggrNr : int,      // StructConstrObj
+		mutable aggregBase : int,            // AggrConstrObj
+		fields : MizNatFunc,                 // StructConstrObj.fFields (NatSet)
+	);
+
+	mizMakeConstr(kind : int, article : string, absNr : int) -> MizConstr;
+	mizHasProperty(c : MizConstr, prop : int) -> bool;
+
+	// ConstDefObj — the checker's collected inferred constants
+	MizConstDef(
+		mutable def : MizTrm,
+		eqConst : MizNatFunc,                // NatSet of equal constants
+		mutable setting : int,
+		mutable typ : MizTyp,
+		mutable determined : bool,
+	);
+
+	// The correl unit state, one per article: Constr tables + requirements +
+	// inferred constants.
+	MizCorrelEnv(
+		constrs : [Vector<MizConstr>],       // indexed by co*; slot 0 of each is a dummy
+		builtIn : MizBuiltIn,
+		inferConstDef : Vector<MizConstDef>, // InferConstDef; index = InfConst VarNr
+		inferConsts : MizIntSeq,             // InferConsts (IntSet)
+	);
+
+	mizMakeCorrelEnv() -> MizCorrelEnv;
+	mizConstr(env : MizCorrelEnv, kind : int, nr : int) -> MizConstr;
+	mizConstrCount(env : MizCorrelEnv, kind : int) -> int;
+	mizPushConstr(env : MizCorrelEnv, c : MizConstr) -> int;  // returns its nr
+
+	// ---------------- TrmList helpers ----------------
+	mizNil : MizTrmList;
+	mizNewTrmList(t : MizTrm, rest : MizTrmList) -> MizTrmList;
+	mizAddToTrmList(l : MizTrmList, t : MizTrm) -> MizTrmList; // append (mutates last elem)
+	mizTrmListLength(l : MizTrmList) -> int;
+	mizTrmListNth(l : MizTrmList, i : int) -> MizTrm;          // 0-based
+	mizTrmListDrop(l : MizTrmList, n : int) -> MizTrmList;     // for fSuperfluous skips
+	mizLastElem(l : MizTrmList) -> MizTrmElem;                 // aborts on nil
+	mizTrmList2Vector(l : MizTrmList) -> Vector<MizTrm>;
+	mizVector2TrmList(v : Vector<MizTrm>) -> MizTrmList;
+
+	// ---------------- builders (New*) ----------------
+	mizNewIncorTrm() -> MizTrm;
+	mizNewItTrm() -> MizTrm;
+	mizNewVarTrm(sort : int, nr : int) -> MizTrm;
+	mizNewFuncTrm(funcNr : int, args : MizTrmList) -> MizTrm;   // 0 => incorrect
+	mizNewLocFuncTrm(sort : int, funcNr : int, args : MizTrmList) -> MizTrm;
+	mizNewPrivFuncTrm(funcNr : int, args : MizTrmList, expn : MizTrm) -> MizTrm;
+	mizNewQuaTrm(trmProper : MizTrm, typ : MizTyp) -> MizTrm;
+	mizNewChoiceTrm(typ : MizTyp) -> MizTrm;
+
+	mizNewEmptyCluster() -> MizAttrColl;
+	mizNewIncorTyp() -> MizTyp;
+	mizNewStandardTyp(sort : int, lower : MizAttrColl, upper : MizAttrColl,
+		modNr : int, args : MizTrmList) -> MizTyp;
+
+	mizNewVerum() -> MizFrm;
+	mizNewIncorFrm() -> MizFrm;
+	mizNewNeg(arg : MizFrm) -> MizFrm;          // collapses double negation
+	mizNewConj(a : MizFrm, b : MizFrm) -> MizFrm; // flattens into ConjFrm
+	mizNewConjFrm(list : Vector<MizFrm>) -> MizFrm;
+	mizNewUniv(quant : MizTyp, scope : MizFrm) -> MizFrm;
+	mizNewUnivI(varId : int, quant : MizTyp, scope : MizFrm) -> MizFrm;
+	mizNewPredFrm(sort : int, predNr : int, args : MizTrmList, pattNr : int) -> MizFrm;
+	mizNewLocPredFrm(predNr : int, args : MizTrmList, expn : MizFrm) -> MizFrm;
+	mizNewQualFrm(trm : MizTrm, typ : MizTyp) -> MizFrm;
+	mizNewEqFrm(env : MizCorrelEnv, left : MizTrm, right : MizTrm) -> MizFrm;
+
+	// ---------------- copy ----------------
+	mizCopyTrm(t : MizTrm) -> MizTrm;
+	mizCopyTrmList(l : MizTrmList) -> MizTrmList;
+	mizCopyAttr(a : MizAttr) -> MizAttr;
+	mizCopyCluster(c : MizAttrColl) -> MizAttrColl;
+	mizCopyTyp(t : MizTyp) -> MizTyp;
+	mizCopyFrm(f : MizFrm) -> MizFrm;
+	mizCopyTypVector(v : Vector<MizTyp>) -> Vector<MizTyp>;
+
+	// ---------------- structural size / comparison ----------------
+	mizSizeOfTrm(t : MizTrm) -> int;
+	mizSizeOfTrmList(l : MizTrmList) -> int;
+	mizSizeOfTyp(t : MizTyp) -> int;
+
+	// SkipLocPred: strip PrivPred wrappers (formula view used everywhere)
+	mizSkipLocPred(f : MizFrm) -> MizFrm;
+	// the term analogue used inside EqTrm/CompareTrms: strip PrivFunc with
+	// a correct expansion
+	mizSkipPrivFunc(t : MizTrm) -> MizTrm;
+
+	mizCompareTrms(a : MizTrm, b : MizTrm) -> int;
+	mizCompareTrmLists(a : MizTrmList, b : MizTrmList) -> int;
+	mizCompareTyps(a : MizTyp, b : MizTyp) -> int;
+	mizCompareFrms(a : MizFrm, b : MizFrm) -> int;
+	mizCompareClusters(a : MizAttrColl, b : MizAttrColl) -> int;
+
+	// ---------------- adjusted access (constructor table) ----------------
+	// AdjustTrm/AdjustTyp/AdjustAttr/AdjustFrm: map through redefinitions.
+	// Returned pair: (adjusted nr, argument list with superfluous skipped).
+	mizAdjustTrm(env : MizCorrelEnv, t : MizFuncTrm) -> Pair<int, MizTrmList>;
+	mizAdjustTyp(env : MizCorrelEnv, t : MizTyp) -> Pair<int, MizTrmList>;
+	mizAdjustAttr(env : MizCorrelEnv, a : MizAttr) -> Pair<int, MizTrmList>;
+	mizAdjustedAttrNr(env : MizCorrelEnv, a : MizAttr) -> int;
+	mizAdjustFrm(env : MizCorrelEnv, f : MizPredFrm) -> Pair<int, MizTrmList>;
+	mizAdjustAttrFrm(env : MizCorrelEnv, f : MizPredFrm) -> Pair<int, MizTrmList>;
+
+	// ---------------- equality ----------------
+	mizEqTrm(env : MizCorrelEnv, a : MizTrm, b : MizTrm) -> bool;
+	mizEqTrmList(env : MizCorrelEnv, a : MizTrmList, b : MizTrmList) -> bool;
+	mizEqAttr(env : MizCorrelEnv, a : MizAttr, b : MizAttr) -> bool;
+	mizEqTyp(env : MizCorrelEnv, a : MizTyp, b : MizTyp) -> bool;
+	mizEqFrm(env : MizCorrelEnv, a : MizFrm, b : MizFrm) -> bool;
+	// EqualClusters: lower clusters equal under the given attr equality
+	mizEqualClusters(a : MizTyp, b : MizTyp, eqAttr : (MizAttr, MizAttr) -> bool) -> bool;
+	mizStrictEqAttr(env : MizCorrelEnv, a : MizAttr, b : MizAttr) -> bool;
+
+	// ---------------- walkers ----------------
+	// DoInTrm: the callback is applied at VARIABLE-LIKE leaves only
+	// (Locus/Bound/Constant/InfConst/EqConst/FreeVar/LambdaVar/It) and may
+	// return a replacement node. Fraenkel scopes bump boundVarNbr when
+	// incBound is set (IncBounVarNbr in the original).
+	MizWithin(
+		mutable p : (MizWithin, MizTrm) -> MizTrm,
+		mutable incBound : bool,
+		mutable boundVarNbr : int,
+	);
+	mizMakeWithin(p : (MizWithin, MizTrm) -> MizTrm) -> MizWithin;
+
+	mizWithinTrm(w : MizWithin, t : MizTrm) -> MizTrm;
+	mizWithinTrmList(w : MizWithin, l : MizTrmList) -> void;
+	mizWithinTyp(w : MizWithin, t : MizTyp) -> void;
+	mizWithinCluster(w : MizWithin, c : MizAttrColl) -> void;
+	mizWithinFrm(w : MizWithin, f : MizFrm) -> void;
+	mizWithinTypVector(w : MizWithin, v : Vector<MizTyp>) -> void;
+}
+
+mizNil = MizTrmNil();
+
+mizTrmSort(t : MizTrm) -> int {
+	switch (t) {
+		MizVarTrm(sort, __, __): sort;
+		MizFuncTrm(sort, __, __, __): sort;
+		MizPrivFuncTrm(__, __, __, __): ikTrmPrivFunc;
+		MizFraenkelTrm(__, __, __, __, __): ikTrmFraenkel;
+		MizQuaTrm(__, __, __): ikTrmQua;
+		MizChoiceTrm(__, __): ikTrmChoice;
+		MizBaseTrm(sort): sort;
+	}
+}
+
+mizFrmSort(f : MizFrm) -> int {
+	switch (f) {
+		MizPredFrm(sort, __, __, __): sort;
+		MizLocPredFrm(__, __, __, __): ikFrmPrivPred;
+		MizQualFrm(__, __, __): ikFrmQual;
+		MizNegFrm(__, __): ikFrmNeg;
+		MizBinFrm(sort, __, __, __): sort;
+		MizConjFrm(__, __): ikFrmConj;
+		MizUnivFrm(sort, __, __, __, __): sort;
+		MizUniqFrm(sort): sort;
+		MizFlexFrm(sort, __, __, __, __, __, __): sort;
+	}
+}
+
+// ---------------- environment ----------------
+
+mizMakeConstr(kind : int, article : string, absNr : int) -> MizConstr {
+	MizConstr(kind, article, absNr, makeVector(4), 0, 0, 0, 0, 0, None(),
+		0, 0, mizInitNatSet(0));
+}
+
+mizHasProperty(c : MizConstr, prop : int) -> bool {
+	bitAnd(c.properties, bitShl(1, prop)) != 0;
+}
+
+mizMakeCorrelEnv() -> MizCorrelEnv {
+	// slot 0 of each kind is a dummy so constructor numbers index directly
+	MizCorrelEnv(
+		map(enumFromTo(0, coLAST), \k -> {
+			v : Vector<MizConstr> = makeVector(64);
+			pushVector(v, mizMakeConstr(k, "", 0));
+			v;
+		}),
+		mizMakeBuiltIn(),
+		makeVector(64),
+		mizInitIntSeq(16),
+	);
+}
+
+mizConstr(env : MizCorrelEnv, kind : int, nr : int) -> MizConstr {
+	getVectorUnsafe(env.constrs[kind], nr);
+}
+
+mizConstrCount(env : MizCorrelEnv, kind : int) -> int {
+	sizeVector(env.constrs[kind]) - 1; // minus the dummy
+}
+
+mizPushConstr(env : MizCorrelEnv, c : MizConstr) -> int {
+	pushVector(env.constrs[c.kind], c);
+	sizeVector(env.constrs[c.kind]) - 1;
+}
+
+// ---------------- TrmList helpers ----------------
+
+mizNewTrmList(t : MizTrm, rest : MizTrmList) -> MizTrmList {
+	// NewTrmList: an error term poisons the whole list (InCorrTrmList).
+	// DEVIATION: the original shares one InCorrTrmList sentinel; we build a
+	// one-element list with the error term — consumers check the head's sort.
+	if (mizTrmSort(t) == ikError) {
+		MizTrmElem(mizNewIncorTrm(), MizTrmNil());
+	} else {
+		MizTrmElem(t, rest);
+	}
+}
+
+mizAddToTrmList(l : MizTrmList, t : MizTrm) -> MizTrmList {
+	if (mizTrmSort(t) == ikError) {
+		MizTrmElem(mizNewIncorTrm(), MizTrmNil());
+	} else {
+		switch (l) {
+			MizTrmNil(): MizTrmElem(t, MizTrmNil());
+			MizTrmElem(__, __): {
+				last = mizLastElem(l);
+				last.next ::= MizTrmElem(t, MizTrmNil());
+				l;
+			}
+		}
+	}
+}
+
+mizLastElem(l : MizTrmList) -> MizTrmElem {
+	switch (l) {
+		MizTrmNil(): {
+			mizRunTimeError(2102);
+			MizTrmElem(mizNewIncorTrm(), MizTrmNil());
+		}
+		MizTrmElem(__, next): {
+			switch (next) {
+				MizTrmNil(): l;
+				MizTrmElem(__, __): mizLastElem(next);
+			}
+		}
+	}
+}
+
+mizTrmListLength(l : MizTrmList) -> int {
+	switch (l) {
+		MizTrmNil(): 0;
+		MizTrmElem(__, next): 1 + mizTrmListLength(next);
+	}
+}
+
+mizTrmListNth(l : MizTrmList, i : int) -> MizTrm {
+	switch (l) {
+		MizTrmNil(): {
+			mizRunTimeError(2103);
+			mizNewIncorTrm();
+		}
+		MizTrmElem(trm, next): if (i == 0) trm else mizTrmListNth(next, i - 1);
+	}
+}
+
+mizTrmListDrop(l : MizTrmList, n : int) -> MizTrmList {
+	if (n <= 0) l
+	else switch (l) {
+		MizTrmNil(): l;
+		MizTrmElem(__, next): mizTrmListDrop(next, n - 1);
+	}
+}
+
+mizTrmList2Vector(l : MizTrmList) -> Vector<MizTrm> {
+	v = makeVector(8);
+	cur = ref l;
+	while(\ -> switch (^cur) { MizTrmNil(): false; default: true; }, \ -> {
+		switch (^cur) {
+			MizTrmElem(trm, next): {
+				pushVector(v, trm);
+				cur := next;
+			}
+			MizTrmNil(): {}
+		}
+	});
+	v;
+}
+
+mizVector2TrmList(v : Vector<MizTrm>) -> MizTrmList {
+	r = ref MizTrmNil();
+	i = ref sizeVector(v) - 1;
+	while(\ -> ^i >= 0, \ -> {
+		r := MizTrmElem(getVectorUnsafe(v, ^i), ^r);
+		i := ^i - 1;
+	});
+	^r;
+}
+
+// ---------------- builders ----------------
+
+mizNewIncorTrm() -> MizTrm { MizBaseTrm(ikError); }
+mizNewItTrm() -> MizTrm { MizBaseTrm(ikTrmIt); }
+
+mizNewVarTrm(sort : int, nr : int) -> MizTrm {
+	MizVarTrm(sort, nr, 0);
+}
+
+mizNewFuncTrm(funcNr : int, args : MizTrmList) -> MizTrm {
+	if (funcNr == 0) mizNewIncorTrm()
+	else MizFuncTrm(ikTrmFunctor, funcNr, args, 0);
+}
+
+mizNewLocFuncTrm(sort : int, funcNr : int, args : MizTrmList) -> MizTrm {
+	MizFuncTrm(sort, funcNr, args, 0);
+}
+
+mizNewPrivFuncTrm(funcNr : int, args : MizTrmList, expn : MizTrm) -> MizTrm {
+	MizPrivFuncTrm(funcNr, args, expn, 0);
+}
+
+mizNewQuaTrm(trmProper : MizTrm, typ : MizTyp) -> MizTrm {
+	MizQuaTrm(trmProper, typ, 0);
+}
+
+mizNewChoiceTrm(typ : MizTyp) -> MizTrm {
+	MizChoiceTrm(typ, 0);
+}
+
+mizNewEmptyCluster() -> MizAttrColl {
+	MizAttrColl(makeVector(4), true);
+}
+
+mizNewIncorTyp() -> MizTyp {
+	MizTyp(ikError, mizNewEmptyCluster(), mizNewEmptyCluster(), 0, MizTrmNil(), 0);
+}
+
+mizNewStandardTyp(sort : int, lower : MizAttrColl, upper : MizAttrColl,
+		modNr : int, args : MizTrmList) -> MizTyp {
+	if (modNr != 0) MizTyp(sort, lower, upper, modNr, args, 0)
+	else mizNewIncorTyp();
+}
+
+mizNewVerum() -> MizFrm { MizUniqFrm(ikFrmVerum); }
+mizNewIncorFrm() -> MizFrm { MizUniqFrm(ikError); }
+
+mizNewNeg(arg : MizFrm) -> MizFrm {
+	switch (arg) {
+		MizNegFrm(inner, __): inner;
+		default: {
+			if (mizFrmSort(arg) == ikError) arg
+			else MizNegFrm(arg, 0);
+		}
+	}
+}
+
+mizNewConjFrm(list : Vector<MizFrm>) -> MizFrm {
+	n = sizeVector(list);
+	if (n == 0) mizNewVerum()
+	else if (n == 1) getVectorUnsafe(list, 0)
+	else MizConjFrm(list, 0);
+}
+
+mizNewConj(a : MizFrm, b : MizFrm) -> MizFrm {
+	sa = mizFrmSort(a);
+	sb = mizFrmSort(b);
+	if (sa == ikError || sb == ikError) {
+		mizNewIncorFrm();
+	} else if (sa == ikFrmVerum) {
+		b;
+	} else if (sa == ikFrmConj) {
+		ca = mizAsConjFrm(a);
+		if (sb == ikFrmConj) {
+			cb = mizAsConjFrm(b);
+			iterVector(cb.conjuncts, \f -> pushVector(ca.conjuncts, f));
+		} else if (sb != ikFrmVerum) {
+			pushVector(ca.conjuncts, b);
+		}
+		a;
+	} else if (sb == ikFrmVerum) {
+		a;
+	} else if (sb == ikFrmConj) {
+		cb2 = mizAsConjFrm(b);
+		mizVectorAtInsert(cb2.conjuncts, 0, a);
+		b;
+	} else {
+		v : Vector<MizFrm> = makeVector(2);
+		pushVector(v, a);
+		pushVector(v, b);
+		mizNewConjFrm(v);
+	}
+}
+
+mizNewUniv(quant : MizTyp, scope : MizFrm) -> MizFrm {
+	if (quant.sort == ikError || mizFrmSort(scope) == ikError) mizNewIncorFrm()
+	else MizUnivFrm(ikFrmUniv, 0, quant, scope, 0);
+}
+
+mizNewUnivI(varId : int, quant : MizTyp, scope : MizFrm) -> MizFrm {
+	if (quant.sort == ikError || mizFrmSort(scope) == ikError) mizNewIncorFrm()
+	else MizUnivFrm(ikFrmUniv, varId, quant, scope, 0);
+}
+
+mizNewPredFrm(sort : int, predNr : int, args : MizTrmList, pattNr : int) -> MizFrm {
+	MizPredFrm(sort, predNr, args, pattNr);
+}
+
+mizNewLocPredFrm(predNr : int, args : MizTrmList, expn : MizFrm) -> MizFrm {
+	MizLocPredFrm(predNr, args, expn, 0);
+}
+
+mizNewQualFrm(trm : MizTrm, typ : MizTyp) -> MizFrm {
+	if (typ.sort == ikError || mizTrmSort(trm) == ikError) mizNewIncorFrm()
+	else MizQualFrm(trm, typ, 0);
+}
+
+mizNewEqFrm(env : MizCorrelEnv, left : MizTrm, right : MizTrm) -> MizFrm {
+	if (mizTrmSort(left) == ikError || mizTrmSort(right) == ikError) mizNewIncorFrm()
+	else MizPredFrm(ikFrmPred, mizBuiltIn(env.builtIn, rqEqualsTo),
+		mizNewTrmList(left, mizNewTrmList(right, MizTrmNil())), 0);
+}
+
+// ---------------- copy ----------------
+
+mizCopyTrm(t : MizTrm) -> MizTrm {
+	switch (t) {
+		MizVarTrm(sort, varNr, pattNr): MizVarTrm(sort, varNr, pattNr);
+		MizFuncTrm(sort, funcNr, args, pattNr):
+			MizFuncTrm(sort, funcNr, mizCopyTrmList(args), pattNr);
+		MizPrivFuncTrm(funcNr, args, funcExp, pattNr):
+			MizPrivFuncTrm(funcNr, mizCopyTrmList(args), mizCopyTrm(funcExp), pattNr);
+		MizFraenkelTrm(lambdaArgs, scope, compr, idents, pattNr):
+			MizFraenkelTrm(mizCopyTypVector(lambdaArgs), mizCopyTrm(scope),
+				mizCopyFrm(compr), mizCopyIntSeq(idents), pattNr);
+		MizQuaTrm(trmProper, qua, pattNr):
+			MizQuaTrm(mizCopyTrm(trmProper), mizCopyTyp(qua), pattNr);
+		MizChoiceTrm(typ, pattNr): MizChoiceTrm(mizCopyTyp(typ), pattNr);
+		MizBaseTrm(sort): MizBaseTrm(sort);
+	}
+}
+
+mizCopyTrmList(l : MizTrmList) -> MizTrmList {
+	switch (l) {
+		MizTrmNil(): l;
+		MizTrmElem(trm, next): MizTrmElem(mizCopyTrm(trm), mizCopyTrmList(next));
+	}
+}
+
+mizCopyAttr(a : MizAttr) -> MizAttr {
+	MizAttr(a.neg, a.attrNr, mizCopyTrmList(a.args), a.collected, a.pattNr);
+}
+
+mizCopyCluster(c : MizAttrColl) -> MizAttrColl {
+	MizAttrColl(mapVector(c.items, mizCopyAttr), c.consistent);
+}
+
+mizCopyTyp(t : MizTyp) -> MizTyp {
+	MizTyp(t.sort, mizCopyCluster(t.lower), mizCopyCluster(t.upper),
+		t.modNr, mizCopyTrmList(t.modArgs), t.pattNr);
+}
+
+mizCopyTypVector(v : Vector<MizTyp>) -> Vector<MizTyp> {
+	mapVector(v, mizCopyTyp);
+}
+
+mizCopyFrm(f : MizFrm) -> MizFrm {
+	switch (f) {
+		MizPredFrm(sort, predNr, args, pattNr):
+			MizPredFrm(sort, predNr, mizCopyTrmList(args), pattNr);
+		MizLocPredFrm(predNr, args, expn, pattNr):
+			MizLocPredFrm(predNr, mizCopyTrmList(args), mizCopyFrm(expn), pattNr);
+		MizQualFrm(trm, typ, pattNr):
+			MizQualFrm(mizCopyTrm(trm), mizCopyTyp(typ), pattNr);
+		MizNegFrm(arg, pattNr): MizNegFrm(mizCopyFrm(arg), pattNr);
+		MizBinFrm(sort, l, r, pattNr):
+			MizBinFrm(sort, mizCopyFrm(l), mizCopyFrm(r), pattNr);
+		MizConjFrm(conjuncts, pattNr):
+			MizConjFrm(mapVector(conjuncts, mizCopyFrm), pattNr);
+		MizUnivFrm(sort, varId, quantified, scope, pattNr):
+			MizUnivFrm(sort, varId, mizCopyTyp(quantified), mizCopyFrm(scope), pattNr);
+		MizUniqFrm(sort): MizUniqFrm(sort);
+		MizFlexFrm(sort, lo, ro, lt, rt, expn, pattNr):
+			MizFlexFrm(sort, mizCopyFrm(lo), mizCopyFrm(ro),
+				mizCopyTrm(lt), mizCopyTrm(rt), mizCopyFrm(expn), pattNr);
+	}
+}
+
+// ---------------- size / skip ----------------
+
+mizSizeOfTrmList(l : MizTrmList) -> int {
+	switch (l) {
+		MizTrmNil(): 0;
+		MizTrmElem(trm, next): mizSizeOfTrm(trm) + mizSizeOfTrmList(next);
+	}
+}
+
+mizSizeOfTyp(t : MizTyp) -> int {
+	if (t.sort == ikTypMode || t.sort == ikTypStruct) {
+		mizSizeOfTrmList(t.modArgs) + 1;
+	} else {
+		1;
+	}
+}
+
+mizSizeOfTrm(t : MizTrm) -> int {
+	switch (t) {
+		MizFuncTrm(__, __, args, __): mizSizeOfTrmList(args) + 1;
+		MizPrivFuncTrm(__, __, funcExp, __): mizSizeOfTrm(funcExp);
+		MizChoiceTrm(typ, __): mizSizeOfTyp(typ);
+		MizQuaTrm(trmProper, qua, __): mizSizeOfTrm(trmProper) + mizSizeOfTyp(qua);
+		default: 1;
+	}
+}
+
+mizSkipLocPred(f : MizFrm) -> MizFrm {
+	switch (f) {
+		MizLocPredFrm(__, __, expn, __): mizSkipLocPred(expn);
+		default: f;
+	}
+}
+
+mizSkipPrivFunc(t : MizTrm) -> MizTrm {
+	switch (t) {
+		MizPrivFuncTrm(__, __, funcExp, __):
+			if (mizTrmSort(funcExp) == ikError) t else mizSkipPrivFunc(funcExp);
+		default: t;
+	}
+}
+
+// ---------------- comparison (structural, no env) ----------------
+
+mizCmpInt(a : int, b : int) -> int {
+	if (a < b) -1 else if (a > b) 1 else 0;
+}
+
+mizCompareTrmLists(a : MizTrmList, b : MizTrmList) -> int {
+	switch (a) {
+		MizTrmNil(): switch (b) {
+			MizTrmNil(): 0;
+			MizTrmElem(__, __): -1;
+		}
+		MizTrmElem(ta, na): switch (b) {
+			MizTrmNil(): 1;
+			MizTrmElem(tb, nb): {
+				c = mizCompareTrms(ta, tb);
+				if (c != 0) c else mizCompareTrmLists(na, nb);
+			}
+		}
+	}
+}
+
+mizCompareClusters(a : MizAttrColl, b : MizAttrColl) -> int {
+	c = mizCmpInt(sizeVector(a.items), sizeVector(b.items));
+	if (c != 0) {
+		c;
+	} else {
+		res = ref 0;
+		i = ref 0;
+		n = sizeVector(a.items);
+		while(\ -> ^i < n && ^res == 0, \ -> {
+			x : MizAttr = getVectorUnsafe(a.items, ^i);
+			y : MizAttr = getVectorUnsafe(b.items, ^i);
+			c1 = mizCmpInt(x.attrNr, y.attrNr);
+			if (c1 != 0) {
+				res := c1;
+			} else {
+				c2 = mizCmpInt(x.neg, y.neg);
+				if (c2 != 0) {
+					res := c2;
+				} else {
+					res := mizCompareTrmLists(x.args, y.args);
+				}
+			}
+			i := ^i + 1;
+		});
+		^res;
+	}
+}
+
+mizCompareTyps(a : MizTyp, b : MizTyp) -> int {
+	c1 = mizCmpInt(a.sort, b.sort);
+	if (c1 != 0) c1
+	else {
+		c2 = mizCmpInt(a.modNr, b.modNr);
+		if (c2 != 0) c2
+		else {
+			c3 = mizCompareClusters(a.lower, b.lower);
+			if (c3 != 0) c3
+			else mizCompareTrmLists(a.modArgs, b.modArgs);
+		}
+	}
+}
+
+mizCompareTypVectors(a : Vector<MizTyp>, b : Vector<MizTyp>) -> int {
+	c = mizCmpInt(sizeVector(a), sizeVector(b));
+	if (c != 0) {
+		c;
+	} else {
+		res = ref 0;
+		i = ref 0;
+		while(\ -> ^i < sizeVector(a) && ^res == 0, \ -> {
+			res := mizCompareTyps(getVectorUnsafe(a, ^i), getVectorUnsafe(b, ^i));
+			i := ^i + 1;
+		});
+		^res;
+	}
+}
+
+mizCompareFrms(fa : MizFrm, fb : MizFrm) -> int {
+	a = mizSkipLocPred(fa); // the original skips only the left side
+	c0 = mizCmpInt(mizFrmSort(a), mizFrmSort(fb));
+	if (c0 != 0) {
+		c0;
+	} else {
+		switch (a) {
+			MizUniqFrm(__): 0; // Verum/Thesis/Error
+			MizNegFrm(arg, __): {
+				nb = mizAsNegFrm(fb);
+				mizCompareFrms(arg, nb.arg);
+			}
+			MizQualFrm(trm, typ, __): {
+				qb = mizAsQualFrm(fb);
+				c = mizCompareTrms(trm, qb.trm);
+				if (c != 0) c else mizCompareTyps(typ, qb.typ);
+			}
+			MizConjFrm(conjuncts, __): {
+				cb = mizAsConjFrm(fb);
+				c = mizCmpInt(sizeVector(conjuncts), sizeVector(cb.conjuncts));
+				if (c != 0) {
+					c;
+				} else {
+					res = ref 0;
+					i = ref 0;
+					while(\ -> ^i < sizeVector(conjuncts) && ^res == 0, \ -> {
+						res := mizCompareFrms(getVectorUnsafe(conjuncts, ^i),
+							getVectorUnsafe(cb.conjuncts, ^i));
+						i := ^i + 1;
+					});
+					^res;
+				}
+			}
+			MizPredFrm(__, predNr, args, __): {
+				pb = mizAsPredFrm(fb);
+				c = mizCmpInt(predNr, pb.predNr);
+				if (c != 0) c else mizCompareTrmLists(args, pb.args);
+			}
+			MizUnivFrm(__, __, quantified, scope, __): {
+				ub = mizAsUnivFrm(fb);
+				c = mizCompareTyps(quantified, ub.quantified);
+				if (c != 0) c else mizCompareFrms(scope, ub.scope);
+			}
+			default: {
+				mizRunTimeError(2049);
+				0;
+			}
+		}
+	}
+}
+
+mizCompareTrms(ta : MizTrm, tb : MizTrm) -> int {
+	c0 = mizCmpInt(mizSizeOfTrm(ta), mizSizeOfTrm(tb));
+	if (c0 != 0) {
+		c0;
+	} else {
+		a = mizSkipPrivFunc(ta);
+		b = mizSkipPrivFunc(tb);
+		c1 = mizCmpInt(mizTrmSort(a), mizTrmSort(b));
+		if (c1 != 0) {
+			c1;
+		} else {
+			switch (a) {
+				MizVarTrm(__, varNr, __): {
+					vb = mizAsVarTrm(b);
+					mizCmpInt(varNr, vb.varNr);
+				}
+				MizFuncTrm(__, funcNr, args, __): {
+					fb = mizAsFuncTrm(b);
+					c = mizCmpInt(funcNr, fb.funcNr);
+					if (c != 0) c else mizCompareTrmLists(args, fb.args);
+				}
+				MizPrivFuncTrm(funcNr, args, __, __): {
+					// only reachable when the expansion is incorrect
+					pb = mizAsPrivFuncTrm(b);
+					c = mizCmpInt(funcNr, pb.funcNr);
+					if (c != 0) c else mizCompareTrmLists(args, pb.args);
+				}
+				MizFraenkelTrm(lambdaArgs, scope, compr, __, __): {
+					kb = mizAsFraenkelTrm(b);
+					c = mizCompareTrms(scope, kb.scope);
+					if (c != 0) c
+					else {
+						c2 = mizCompareFrms(compr, kb.compr);
+						if (c2 != 0) c2
+						else mizCompareTypVectors(lambdaArgs, kb.lambdaArgs);
+					}
+				}
+				MizChoiceTrm(typ, __): {
+					hb = mizAsChoiceTrm(b);
+					mizCompareTyps(typ, hb.choiceTyp);
+				}
+				MizQuaTrm(trmProper, qua, __): {
+					qb = mizAsQuaTrm(b);
+					c = mizCompareTrms(trmProper, qb.trmProper);
+					if (c != 0) c else mizCompareTyps(qua, qb.qua);
+				}
+				MizBaseTrm(sort): {
+					if (sort == ikTrmIt) 0
+					else {
+						mizRunTimeError(2341);
+						0;
+					}
+				}
+			}
+		}
+	}
+}
+
+// ---------------- adjusted access ----------------
+
+mizAdjustTrm(env : MizCorrelEnv, t : MizFuncTrm) -> Pair<int, MizTrmList> {
+	c = mizConstr(env, coFunctor, t.funcNr);
+	if (c.whichConstrNr != 0) {
+		Pair(c.whichConstrNr, mizTrmListDrop(t.args, c.superfluous));
+	} else {
+		Pair(t.funcNr, t.args);
+	}
+}
+
+mizAdjustTyp(env : MizCorrelEnv, t : MizTyp) -> Pair<int, MizTrmList> {
+	mizAssert(2148, t.sort == ikTypStruct || t.sort == ikTypMode);
+	if (t.sort == ikTypStruct) {
+		Pair(t.modNr, t.modArgs);
+	} else {
+		c = mizConstr(env, coMode, t.modNr);
+		if (c.whichConstrNr != 0) {
+			Pair(c.whichConstrNr, mizTrmListDrop(t.modArgs, c.superfluous));
+		} else {
+			Pair(t.modNr, t.modArgs);
+		}
+	}
+}
+
+mizAdjustAttr(env : MizCorrelEnv, a : MizAttr) -> Pair<int, MizTrmList> {
+	c = mizConstr(env, coAttribute, a.attrNr);
+	if (c.whichConstrNr != 0) {
+		Pair(c.whichConstrNr, mizTrmListDrop(a.args, c.superfluous));
+	} else {
+		Pair(a.attrNr, a.args);
+	}
+}
+
+mizAdjustedAttrNr(env : MizCorrelEnv, a : MizAttr) -> int {
+	c = mizConstr(env, coAttribute, a.attrNr);
+	if (c.whichConstrNr != 0) c.whichConstrNr else a.attrNr;
+}
+
+mizAdjustFrm(env : MizCorrelEnv, f : MizPredFrm) -> Pair<int, MizTrmList> {
+	c = mizConstr(env, coPredicate, f.predNr);
+	if (c.whichConstrNr != 0) {
+		Pair(c.whichConstrNr, mizTrmListDrop(f.args, c.superfluous));
+	} else {
+		Pair(f.predNr, f.args);
+	}
+}
+
+mizAdjustAttrFrm(env : MizCorrelEnv, f : MizPredFrm) -> Pair<int, MizTrmList> {
+	c = mizConstr(env, coAttribute, f.predNr);
+	if (c.whichConstrNr != 0) {
+		Pair(c.whichConstrNr, mizTrmListDrop(f.args, c.superfluous));
+	} else {
+		Pair(f.predNr, f.args);
+	}
+}
+
+// ---------------- equality ----------------
+
+mizEqTrmList(env : MizCorrelEnv, a : MizTrmList, b : MizTrmList) -> bool {
+	switch (a) {
+		MizTrmNil(): switch (b) {
+			MizTrmNil(): true;
+			MizTrmElem(__, __): false;
+		}
+		MizTrmElem(ta, na): switch (b) {
+			MizTrmNil(): false;
+			MizTrmElem(tb, nb): mizEqTrm(env, ta, tb) && mizEqTrmList(env, na, nb);
+		}
+	}
+}
+
+mizEqTrm(env : MizCorrelEnv, ta : MizTrm, tb : MizTrm) -> bool {
+	a = mizSkipPrivFunc(ta);
+	b = mizSkipPrivFunc(tb);
+	sa = mizTrmSort(a);
+	sb = mizTrmSort(b);
+	if (sa != sb) {
+		false;
+	} else if (sa == ikTrmInfConst) {
+		va = mizAsVarTrm(a);
+		vb = mizAsVarTrm(b);
+		if (va.varNr == vb.varNr) {
+			true;
+		} else {
+			da : MizConstDef = getVectorUnsafe(env.inferConstDef, va.varNr);
+			db : MizConstDef = getVectorUnsafe(env.inferConstDef, vb.varNr);
+			mizEqTrm(env, da.def, db.def);
+		}
+	} else {
+		switch (a) {
+			MizVarTrm(__, varNr, __): {
+				vb2 = mizAsVarTrm(b);
+				varNr == vb2.varNr;
+			}
+			MizFuncTrm(sort, funcNr, args, __): {
+				fb = mizAsFuncTrm(b);
+				if (sort == ikTrmFunctor) {
+					fa2 = mizAsFuncTrm(a);
+					pa = mizAdjustTrm(env, fa2);
+					pb = mizAdjustTrm(env, fb);
+					pa.first == pb.first && mizEqTrmList(env, pa.second, pb.second);
+				} else {
+					funcNr == fb.funcNr && mizEqTrmList(env, args, fb.args);
+				}
+			}
+			MizPrivFuncTrm(funcNr, args, __, __): {
+				pb2 = mizAsPrivFuncTrm(b);
+				funcNr == pb2.funcNr && mizEqTrmList(env, args, pb2.args);
+			}
+			MizFraenkelTrm(lambdaArgs, scope, compr, __, __): {
+				kb = mizAsFraenkelTrm(b);
+				if (sizeVector(lambdaArgs) != sizeVector(kb.lambdaArgs)) {
+					false;
+				} else {
+					ok = ref true;
+					i = ref 0;
+					while(\ -> ^i < sizeVector(lambdaArgs) && ^ok, \ -> {
+						if (!mizEqTyp(env, getVectorUnsafe(lambdaArgs, ^i),
+								getVectorUnsafe(kb.lambdaArgs, ^i))) {
+							ok := false;
+						}
+						i := ^i + 1;
+					});
+					^ok && mizEqTrm(env, scope, kb.scope) && mizEqFrm(env, compr, kb.compr);
+				}
+			}
+			MizChoiceTrm(typ, __): {
+				hb = mizAsChoiceTrm(b);
+				mizEqTyp(env, typ, hb.choiceTyp);
+			}
+			MizQuaTrm(trmProper, qua, __): {
+				qb = mizAsQuaTrm(b);
+				mizEqTrm(env, trmProper, qb.trmProper) && mizEqTyp(env, qua, qb.qua);
+			}
+			MizBaseTrm(sort): sort == ikTrmIt || sort == ikError;
+		}
+	}
+}
+
+mizEqAttr(env : MizCorrelEnv, a : MizAttr, b : MizAttr) -> bool {
+	pa = mizAdjustAttr(env, a);
+	pb = mizAdjustAttr(env, b);
+	pa.first == pb.first && a.neg == b.neg && mizEqTrmList(env, pa.second, pb.second);
+}
+
+mizStrictEqAttr(env : MizCorrelEnv, a : MizAttr, b : MizAttr) -> bool {
+	a.attrNr == b.attrNr && a.neg == b.neg && mizEqTrmList(env, a.args, b.args);
+}
+
+mizEqualClusters(a : MizTyp, b : MizTyp, eqAttr : (MizAttr, MizAttr) -> bool) -> bool {
+	// EqualClusters compares the LOWER clusters item by item
+	na = sizeVector(a.lower.items);
+	if (na != sizeVector(b.lower.items)) {
+		false;
+	} else {
+		ok = ref true;
+		i = ref 0;
+		while(\ -> ^i < na && ^ok, \ -> {
+			if (!eqAttr(getVectorUnsafe(a.lower.items, ^i),
+					getVectorUnsafe(b.lower.items, ^i))) {
+				ok := false;
+			}
+			i := ^i + 1;
+		});
+		^ok;
+	}
+}
+
+mizEqTyp(env : MizCorrelEnv, a : MizTyp, b : MizTyp) -> bool {
+	if (a.sort != b.sort) {
+		false;
+	} else if (a.sort == ikTypMode) {
+		if (mizEqualClusters(a, b, \x, y -> mizEqAttr(env, x, y))) {
+			pa = mizAdjustTyp(env, a);
+			pb = mizAdjustTyp(env, b);
+			pa.first == pb.first && mizEqTrmList(env, pa.second, pb.second);
+		} else {
+			false;
+		}
+	} else if (a.sort == ikTypStruct) {
+		mizEqualClusters(a, b, \x, y -> mizEqAttr(env, x, y))
+			&& a.modNr == b.modNr
+			&& mizEqTrmList(env, a.modArgs, b.modArgs);
+	} else if (a.sort == ikError) {
+		true;
+	} else {
+		mizRunTimeError(2048);
+		false;
+	}
+}
+
+// Conjunct flattening used by EqFrm on unequal counts.
+mizFlattenConjuncts(v : Vector<MizFrm>) -> Vector<MizFrm> {
+	out : Vector<MizFrm> = makeVector(sizeVector(v));
+	iterVector(v, \f0 -> {
+		f = mizSkipLocPred(f0);
+		switch (f) {
+			MizConjFrm(inner, __): iterVector(inner, \g -> pushVector(out, g));
+			default: pushVector(out, f);
+		}
+	});
+	out;
+}
+
+mizEqFrm(env : MizCorrelEnv, fa : MizFrm, fb : MizFrm) -> bool {
+	a = mizSkipLocPred(fa);
+	b = mizSkipLocPred(fb);
+	sa = mizFrmSort(a);
+	sb = mizFrmSort(b);
+	if (sa != sb) {
+		false;
+	} else if (sa == ikFrmVerum || sa == ikFrmThesis || sa == ikError) {
+		true;
+	} else {
+		switch (a) {
+			MizNegFrm(arg, __): {
+				nb = mizAsNegFrm(b);
+				mizEqFrm(env, arg, nb.arg);
+			}
+			MizQualFrm(trm, typ, __): {
+				qb = mizAsQualFrm(b);
+				mizEqTrm(env, trm, qb.trm) && mizEqTyp(env, typ, qb.typ);
+			}
+			MizConjFrm(conjuncts, __): {
+				cb = mizAsConjFrm(b);
+				eqVec = \va : Vector<MizFrm>, vb : Vector<MizFrm> -> {
+					if (sizeVector(va) != sizeVector(vb)) {
+						false;
+					} else {
+						ok = ref true;
+						i = ref 0;
+						while(\ -> ^i < sizeVector(va) && ^ok, \ -> {
+							if (!mizEqFrm(env, getVectorUnsafe(va, ^i),
+									getVectorUnsafe(vb, ^i))) {
+								ok := false;
+							}
+							i := ^i + 1;
+						});
+						^ok;
+					}
+				};
+				if (sizeVector(conjuncts) == sizeVector(cb.conjuncts)) {
+					eqVec(conjuncts, cb.conjuncts);
+				} else {
+					eqVec(mizFlattenConjuncts(conjuncts), mizFlattenConjuncts(cb.conjuncts));
+				}
+			}
+			MizPredFrm(sort, predNr, args, __): {
+				pb = mizAsPredFrm(b);
+				pa2 = mizAsPredFrm(a);
+				if (sort == ikFrmSchPred) {
+					predNr == pb.predNr && mizEqTrmList(env, args, pb.args);
+				} else if (sort == ikFrmAttr) {
+					qa = mizAdjustAttrFrm(env, pa2);
+					qb = mizAdjustAttrFrm(env, pb);
+					qa.first == qb.first && mizEqTrmList(env, qa.second, qb.second);
+				} else {
+					// ikFrmPred: adjusted; equality predicate is SYMMETRIC
+					qa = mizAdjustFrm(env, pa2);
+					qb = mizAdjustFrm(env, pb);
+					if (qa.first != qb.first) {
+						false;
+					} else if (qa.first == mizBuiltIn(env.builtIn, rqEqualsTo)) {
+						l1 = mizTrmListNth(qa.second, 0);
+						r1 = mizTrmListNth(qa.second, 1);
+						l2 = mizTrmListNth(qb.second, 0);
+						r2 = mizTrmListNth(qb.second, 1);
+						(mizEqTrm(env, l1, l2) && mizEqTrm(env, r1, r2))
+						|| (mizEqTrm(env, r1, l2) && mizEqTrm(env, l1, r2));
+					} else {
+						mizEqTrmList(env, qa.second, qb.second);
+					}
+				}
+			}
+			MizLocPredFrm(predNr, args, __, __): {
+				// only reached when the expansion chain bottoms out incorrect
+				lb = mizAsLocPredFrm(b);
+				predNr == lb.predNr && mizEqTrmList(env, args, lb.args);
+			}
+			MizUnivFrm(__, __, quantified, scope, __): {
+				ub = mizAsUnivFrm(b);
+				mizEqTyp(env, quantified, ub.quantified) && mizEqFrm(env, scope, ub.scope);
+			}
+			MizFlexFrm(__, lo, ro, __, __, expn, __): {
+				xb = mizAsFlexFrm(b);
+				mizEqFrm(env, lo, xb.leftOrig) && mizEqFrm(env, ro, xb.rightOrig)
+					&& mizEqFrm(env, expn, xb.expansion);
+			}
+			default: {
+				mizRunTimeError(2049);
+				false;
+			}
+		}
+	}
+}
+
+// ---------------- walkers ----------------
+
+mizMakeWithin(p : (MizWithin, MizTrm) -> MizTrm) -> MizWithin {
+	MizWithin(p, false, 0);
+}
+
+mizWithinTrm(w : MizWithin, t : MizTrm) -> MizTrm {
+	switch (t) {
+		MizVarTrm(sort, __, __): {
+			// callback fires at var-like leaves; Numeral is NOT one of them
+			if (sort == ikTrmNumeral) t else w.p(w, t);
+		}
+		MizBaseTrm(sort): {
+			if (sort == ikTrmIt) w.p(w, t) else t; // ikError untouched
+		}
+		MizFuncTrm(__, __, args, __): {
+			mizWithinTrmList(w, args);
+			t;
+		}
+		MizPrivFuncTrm(__, args, funcExp, __): {
+			mizWithinTrmList(w, args);
+			t2 = mizAsPrivFuncTrm(t);
+			t2.funcExp ::= mizWithinTrm(w, funcExp);
+			t;
+		}
+		MizFraenkelTrm(lambdaArgs, scope, compr, __, __): {
+			iterVector(lambdaArgs, \typ -> {
+				if (w.incBound) w.boundVarNbr ::= w.boundVarNbr + 1;
+				mizWithinTyp(w, typ);
+			});
+			t2 = mizAsFraenkelTrm(t);
+			t2.scope ::= mizWithinTrm(w, scope);
+			mizWithinFrm(w, compr);
+			if (w.incBound) w.boundVarNbr ::= w.boundVarNbr - sizeVector(lambdaArgs);
+			t;
+		}
+		MizChoiceTrm(typ, __): {
+			mizWithinTyp(w, typ);
+			t;
+		}
+		MizQuaTrm(trmProper, qua, __): {
+			t2 = mizAsQuaTrm(t);
+			t2.trmProper ::= mizWithinTrm(w, trmProper);
+			mizWithinTyp(w, qua);
+			t;
+		}
+	}
+}
+
+mizWithinTrmList(w : MizWithin, l : MizTrmList) -> void {
+	switch (l) {
+		MizTrmNil(): {}
+		MizTrmElem(trm, next): {
+			e = mizAsTrmElem(l);
+			e.trm ::= mizWithinTrm(w, trm);
+			mizWithinTrmList(w, next);
+		}
+	}
+}
+
+mizWithinCluster(w : MizWithin, c : MizAttrColl) -> void {
+	iterVector(c.items, \a -> mizWithinTrmList(w, a.args));
+}
+
+mizWithinTyp(w : MizWithin, t : MizTyp) -> void {
+	mizWithinCluster(w, t.lower);
+	mizWithinCluster(w, t.upper);
+	mizWithinTrmList(w, t.modArgs);
+}
+
+mizWithinTypVector(w : MizWithin, v : Vector<MizTyp>) -> void {
+	iterVector(v, \t -> mizWithinTyp(w, t));
+}
+
+mizWithinFrm(w : MizWithin, f : MizFrm) -> void {
+	switch (f) {
+		MizPredFrm(__, __, args, __): mizWithinTrmList(w, args);
+		MizLocPredFrm(__, args, expn, __): {
+			mizWithinTrmList(w, args);
+			mizWithinFrm(w, expn);
+		}
+		MizQualFrm(trm, typ, __): {
+			f2 = mizAsQualFrm(f);
+			f2.trm ::= mizWithinTrm(w, trm);
+			mizWithinTyp(w, typ);
+		}
+		MizNegFrm(arg, __): mizWithinFrm(w, arg);
+		MizBinFrm(__, l, r, __): {
+			mizWithinFrm(w, l);
+			mizWithinFrm(w, r);
+		}
+		MizConjFrm(conjuncts, __): iterVector(conjuncts, \g -> mizWithinFrm(w, g));
+		MizUnivFrm(__, __, quantified, scope, __): {
+			if (w.incBound) w.boundVarNbr ::= w.boundVarNbr + 1;
+			mizWithinTyp(w, quantified);
+			mizWithinFrm(w, scope);
+			if (w.incBound) w.boundVarNbr ::= w.boundVarNbr - 1;
+		}
+		MizUniqFrm(__): {}
+		MizFlexFrm(__, lo, ro, lt, rt, expn, __): {
+			mizWithinFrm(w, lo);
+			mizWithinFrm(w, ro);
+			f.leftTrm ::= mizWithinTrm(w, lt);
+			f.rightTrm ::= mizWithinTrm(w, rt);
+			mizWithinFrm(w, expn);
+		}
+	}
+}
+
+// ---------------- typed downcasts (Pascal pointer casts) ----------------
+// Used where the original casts a sibling pointer after a sort check.
+
+mizAsVarTrm(t : MizTrm) -> MizVarTrm {
+	switch (t) {
+		MizVarTrm(__, __, __): t;
+		default: { mizRunTimeError(2901); MizVarTrm(ikError, 0, 0); }
+	}
+}
+
+mizAsFuncTrm(t : MizTrm) -> MizFuncTrm {
+	switch (t) {
+		MizFuncTrm(__, __, __, __): t;
+		default: { mizRunTimeError(2902); MizFuncTrm(ikError, 0, MizTrmNil(), 0); }
+	}
+}
+
+mizAsPrivFuncTrm(t : MizTrm) -> MizPrivFuncTrm {
+	switch (t) {
+		MizPrivFuncTrm(__, __, __, __): t;
+		default: { mizRunTimeError(2903); MizPrivFuncTrm(0, MizTrmNil(), MizBaseTrm(ikError), 0); }
+	}
+}
+
+mizAsFraenkelTrm(t : MizTrm) -> MizFraenkelTrm {
+	switch (t) {
+		MizFraenkelTrm(__, __, __, __, __): t;
+		default: {
+			mizRunTimeError(2904);
+			MizFraenkelTrm(makeVector(0), MizBaseTrm(ikError), MizUniqFrm(ikError), mizInitIntSeq(0), 0);
+		}
+	}
+}
+
+mizAsQuaTrm(t : MizTrm) -> MizQuaTrm {
+	switch (t) {
+		MizQuaTrm(__, __, __): t;
+		default: { mizRunTimeError(2905); MizQuaTrm(MizBaseTrm(ikError), mizNewIncorTyp(), 0); }
+	}
+}
+
+mizAsChoiceTrm(t : MizTrm) -> MizChoiceTrm {
+	switch (t) {
+		MizChoiceTrm(__, __): t;
+		default: { mizRunTimeError(2906); MizChoiceTrm(mizNewIncorTyp(), 0); }
+	}
+}
+
+mizAsTrmElem(l : MizTrmList) -> MizTrmElem {
+	switch (l) {
+		MizTrmElem(__, __): l;
+		MizTrmNil(): { mizRunTimeError(2907); MizTrmElem(MizBaseTrm(ikError), MizTrmNil()); }
+	}
+}
+
+mizAsPredFrm(f : MizFrm) -> MizPredFrm {
+	switch (f) {
+		MizPredFrm(__, __, __, __): f;
+		default: { mizRunTimeError(2908); MizPredFrm(ikError, 0, MizTrmNil(), 0); }
+	}
+}
+
+mizAsLocPredFrm(f : MizFrm) -> MizLocPredFrm {
+	switch (f) {
+		MizLocPredFrm(__, __, __, __): f;
+		default: { mizRunTimeError(2909); MizLocPredFrm(0, MizTrmNil(), MizUniqFrm(ikError), 0); }
+	}
+}
+
+mizAsQualFrm(f : MizFrm) -> MizQualFrm {
+	switch (f) {
+		MizQualFrm(__, __, __): f;
+		default: { mizRunTimeError(2910); MizQualFrm(MizBaseTrm(ikError), mizNewIncorTyp(), 0); }
+	}
+}
+
+mizAsNegFrm(f : MizFrm) -> MizNegFrm {
+	switch (f) {
+		MizNegFrm(__, __): f;
+		default: { mizRunTimeError(2911); MizNegFrm(MizUniqFrm(ikError), 0); }
+	}
+}
+
+mizAsConjFrm(f : MizFrm) -> MizConjFrm {
+	switch (f) {
+		MizConjFrm(__, __): f;
+		default: { mizRunTimeError(2912); MizConjFrm(makeVector(0), 0); }
+	}
+}
+
+mizAsUnivFrm(f : MizFrm) -> MizUnivFrm {
+	switch (f) {
+		MizUnivFrm(__, __, __, __, __): f;
+		default: { mizRunTimeError(2913); MizUnivFrm(ikError, 0, mizNewIncorTyp(), MizUniqFrm(ikError), 0); }
+	}
+}
+
+mizAsFlexFrm(f : MizFrm) -> MizFlexFrm {
+	switch (f) {
+		MizFlexFrm(__, __, __, __, __, __, __): f;
+		default: {
+			mizRunTimeError(2914);
+			MizFlexFrm(ikError, MizUniqFrm(ikError), MizUniqFrm(ikError),
+				MizBaseTrm(ikError), MizBaseTrm(ikError), MizUniqFrm(ikError), 0);
+		}
+	}
+}
