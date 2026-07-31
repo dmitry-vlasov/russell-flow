@@ -1,0 +1,381 @@
+// Transcription of the definientia machinery: identify.pas (Matches,
+// EqualsExpansion, ExpandTrmIfEqual, InitEssentialsArgs) and the loaders
+// (iocorrel LoadDefinitions/LoadEqualities/LoadExpansions over .dfs/.dfe/
+// .dfx) plus the prechecker's WellMatchedExpansions — the definitional
+// expansion of atomic formulas (definitions enter WITHOUT being cited, but
+// only as expansions of atoms that occur).
+
+import string;
+import loop;
+import ds/vector;
+import ds/tree;
+import fs/filesystem;
+import mizar/original/errhan;
+import mizar/original/mobjects;
+import mizar/original/limits;
+import mizar/original/lexicon;
+import mizar/original/builtin;
+import mizar/original/xml_parser;
+import mizar/original/correl;
+import mizar/original/correl_inst;
+import mizar/original/correl_match;
+import mizar/original/iocorrel;
+import mizar/original/identify;
+import mizar/original/prechecker;
+
+export {
+	MizDefBody ::= MizDefFrm, MizDefTrm;
+	MizDefFrm(f : MizFrm);
+	MizDefTrm(t : MizTrm);
+
+	MizPartDef(body : MizDefBody, guard : MizFrm);
+
+	MizDef(
+		sort : int,                          // 'm' 109 / 'e' 101
+		partials : Vector<MizPartDef>,
+		otherwise : Maybe<MizDefBody>,
+	);
+
+	MizDefiniens(
+		constrKind : int,                    // ik char of the constructor
+		constrNr : int,
+		article : string,
+		defNr : int,
+		primaries : Vector<MizTyp>,
+		essentials : MizIntSeq,
+		assumptions : MizFrm,
+		def : Maybe<MizDef>,
+	);
+
+	MizDefinientia(
+		all : Vector<MizDefiniens>,          // Definientia (.dfs)
+		expansions : Vector<MizDefiniens>,   // ExDefinientia (.dfx)
+		// gEquals: adjusted functor nr -> equals-definitions
+		mutable equalsBy : Tree<int, [MizEqualsDef]>,
+	);
+
+	MizEqualsDef(
+		primaries : Vector<MizTyp>,          // last dropped (the result locus)
+		essentials : MizIntSeq,              // last dropped
+		expansion : MizTrm,
+	);
+
+	mizMakeDefinientia() -> MizDefinientia;
+	// load .dfs/.dfe/.dfx if present; build gEquals; returns counts
+	mizLoadDefinientia(env : MizCorrelEnv, defs : MizDefinientia,
+		mmlDir : string, article : string) -> void;
+
+	// Matches: does the atom's constructor + essential args fit? Fills
+	// env.substTrm on success (caller instantiates through it).
+	mizMatches(env : MizCorrelEnv, kind : int, nr : int, args : MizTrmList,
+		d : MizDefiniens) -> bool;
+
+	// the prechecker hook: expansions of one atomic formula
+	mizAtomicExpansions(env : MizCorrelEnv, defs : MizDefinientia, f : MizFrm) -> [MizFrm];
+
+	// the identify hook: eq-const numbers from equals-expansion of a functor
+	mizEqualsExpandHook(defs : MizDefinientia, idn : MizIdentify,
+		funcNr : int, args : MizTrmList) -> [int];
+
+	// wire both hooks
+	mizWireDefinientia(defs : MizDefinientia, pre : MizPre, idn : MizIdentify) -> void;
+}
+
+mizMakeDefinientia() -> MizDefinientia {
+	MizDefinientia(makeVector(16), makeVector(16), makeTree());
+}
+
+// ---------------- loading ----------------
+
+mizInIntSeqEl(r : MizVrfReader, elName : string) -> MizIntSeq {
+	x = r.x;
+	s = mizInitIntSeq(4);
+	if (x.nState == MizEStart && x.nElName == elName) {
+		mizXmlNextElementState(x);
+		while(\ -> x.nState == MizEStart, \ -> {
+			if (x.nElName == "Int") {
+				__i = mizSeqInsert(s, mizXmlIntAttrDef(x, "x", 0));
+				{}
+			}
+			mizXmlSkipElement(x);
+		});
+		mizXmlNextElementState(x);
+	}
+	s;
+}
+
+mizInDefBody(r : MizVrfReader, srt : int) -> MizDefBody {
+	if (srt == 109) MizDefFrm(mizInFormula(r))   // 'm'
+	else MizDefTrm(mizInTerm(r));                // 'e'
+}
+
+mizInDef(r : MizVrfReader) -> MizDef {
+	x = r.x;
+	kindS = mizXmlAttr(x, "kind");
+	srt = if (strlen(kindS) > 0) getCharCodeAt(kindS, 0) else 109;
+	mizXmlNextElementState(x);
+	partials : Vector<MizPartDef> = makeVector(2);
+	while(\ -> x.nState == MizEStart && x.nElName == "PartialDef", \ -> {
+		mizXmlNextElementState(x);
+		body = mizInDefBody(r, srt);
+		guard = mizInFormula(r);
+		pushVector(partials, MizPartDef(body, guard));
+		mizXmlNextElementState(x); // past </PartialDef>
+	});
+	otherwise = if (x.nState == MizEStart
+		&& (mizIsFrmEl(x.nElName) || mizIsTermEl(x.nElName))) {
+		Some(mizInDefBody(r, srt));
+	} else {
+		None();
+	}
+	mizXmlNextElementState(x); // past the DefMeaning end
+	MizDef(srt, partials, otherwise);
+}
+
+mizInDefiniens(r : MizVrfReader) -> MizDefiniens {
+	x = r.x;
+	mizXmlAssert(x.nElName == "Definiens");
+	kindS = mizXmlAttr(x, "constrkind");
+	kind = if (strlen(kindS) > 0) getCharCodeAt(kindS, 0) else 0;
+	nr = mizXmlIntAttrDef(x, "constrnr", 0);
+	article = mizXmlAttr(x, "aid");
+	defNr = mizXmlIntAttrDef(x, "defnr", 0);
+	mizXmlNextElementState(x);
+	primaries = mizInTypeColl(r);
+	essentials = mizInIntSeqEl(r, "Essentials");
+	assumptions = if (x.nState == MizEStart && mizIsFrmEl(x.nElName)) {
+		mizInFormula(r);
+	} else {
+		mizNewVerum();
+	}
+	def = if (x.nState == MizEStart && x.nElName == "DefMeaning") {
+		Some(mizInDef(r));
+	} else {
+		None();
+	}
+	mizXmlNextElementState(x); // past </Definiens>
+	MizDefiniens(kind, nr, article, defNr, primaries, essentials, assumptions, def);
+}
+
+mizLoadDefsFile(env : MizCorrelEnv, path : string, into : Vector<MizDefiniens>) -> void {
+	if (fileExists(path)) {
+		r = mizMakeVrfReader(mizXmlInitParsing(getFileContent(path)), env);
+		r.mml ::= true;
+		x = r.x;
+		mizXmlNextElementState(x);
+		mizXmlAssert(x.nElName == "Definientia");
+		mizXmlNextElementState(x);
+		while(\ -> x.nState == MizEStart, \ -> {
+			if (x.nElName == "Definiens") {
+				pushVector(into, mizInDefiniens(r));
+			} else {
+				mizXmlSkipElement(x);
+			}
+		});
+	}
+}
+
+// EqualsExpansion: functor definitions of kind 'e' with no assumptions and
+// no partials become directly substitutable equalities
+mizEqualsExpansion(env : MizCorrelEnv, d : MizDefiniens) -> Maybe<MizEqualsDef> {
+	if (d.constrKind != ikTrmFunctor) {
+		None();
+	} else if (mizFrmSort(d.assumptions) != ikFrmVerum) {
+		None();
+	} else {
+		switch (d.def) {
+			None(): None();
+			Some(def): {
+				if (def.sort != 101 || sizeVector(def.partials) > 0) {
+					None();
+				} else {
+					switch (def.otherwise) {
+						None(): None();
+						Some(body): {
+							switch (body) {
+								MizDefTrm(t): {
+									prim = mizCopyTypVector(d.primaries);
+									if (sizeVector(prim) > 0) {
+										removeVector(prim, sizeVector(prim) - 1);
+									}
+									ess = mizCopyIntSeq(d.essentials);
+									if (mizSeqCount(ess) > 0) {
+										mizSeqAtDelete(ess, mizSeqCount(ess) - 1);
+									}
+									Some(MizEqualsDef(prim, ess, mizCopyTrm(t)));
+								}
+								MizDefFrm(__): None();
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+mizLoadDefinientia(env : MizCorrelEnv, defs : MizDefinientia,
+		mmlDir : string, article : string) -> void {
+	mizLoadDefsFile(env, mmlDir + "/" + article + ".dfs", defs.all);
+	mizLoadDefsFile(env, mmlDir + "/" + article + ".dfx", defs.expansions);
+	// gEquals from the equalities file (.dfe) — and from .dfs entries too,
+	// since EqualsExpansion filters to the substitutable ones
+	eqRaw : Vector<MizDefiniens> = makeVector(8);
+	mizLoadDefsFile(env, mmlDir + "/" + article + ".dfe", eqRaw);
+	addEq = \d : MizDefiniens -> {
+		switch (mizEqualsExpansion(env, d)) {
+			Some(ed): {
+				key = d.constrNr;
+				cur = lookupTreeDef(defs.equalsBy, key, []);
+				defs.equalsBy ::= setTree(defs.equalsBy, key, arrayPush(cur, ed));
+			}
+			None(): {}
+		}
+	};
+	iterVector(eqRaw, addEq);
+}
+
+// ---------------- matching ----------------
+
+// InitEssentialsArgs: gSubstTrm[essentials[k]] := args[k]
+mizInitEssentialsArgs(env : MizCorrelEnv, args : MizTrmList, ess : MizIntSeq) -> void {
+	cur = ref args;
+	fori(0, mizSeqCount(ess) - 1, \k -> {
+		switch (^cur) {
+			MizTrmElem(trm, next): {
+				mizSubstTrmSet(env, mizSeqValue(ess, k), Some(trm));
+				cur := next;
+			}
+			MizTrmNil(): {}
+		}
+	});
+}
+
+mizMatches(env : MizCorrelEnv, kind : int, nr : int, args : MizTrmList,
+		d : MizDefiniens) -> bool {
+	mizDisposeSubstTrm(env);
+	if (kind != d.constrKind || nr != d.constrNr) {
+		false;
+	} else if (mizSeqCount(d.essentials) == 0) {
+		true;
+	} else {
+		mizInitEssentialsArgs(env, args, d.essentials);
+		mizCheckLociTypes(env, d.primaries);
+	}
+}
+
+// ---------------- the prechecker hook ----------------
+
+// WellMatchedExpansions + AtomicFormulaExpansions: expandable 'm'
+// definitions with no assumptions and no partials, matched at the atom.
+mizAtomicExpansions(env : MizCorrelEnv, defs : MizDefinientia, f : MizFrm) -> [MizFrm] {
+	p : Maybe<Pair<Pair<int, int>, MizTrmList>> = switch (f) {
+		MizPredFrm(srt, predNr, __, __): {
+			pf : MizPredFrm = f;
+			if (srt == ikFrmPred) {
+				q = mizAdjustFrm(env, pf);
+				Some(Pair(Pair(ikFrmPred, q.first), q.second));
+			} else if (srt == ikFrmAttr) {
+				q = mizAdjustAttrFrm(env, pf);
+				Some(Pair(Pair(ikFrmAttr, q.first), q.second));
+			} else {
+				None();
+			}
+		}
+		default: None();
+	}
+	switch (p) {
+		None(): [];
+		Some(pk): {
+			out : ref [MizFrm] = ref [];
+			iterVector(defs.expansions, \d -> {
+				okShape = switch (d.def) {
+					Some(def): def.sort == 109 && sizeVector(def.partials) == 0
+						&& mizFrmSort(d.assumptions) == ikFrmVerum
+						&& isSome(def.otherwise);
+					None(): false;
+				}
+				if (okShape && mizMatches(env, pk.first.first, pk.first.second, pk.second, d)) {
+					switch (d.def) {
+						Some(def): switch (def.otherwise) {
+							Some(body): switch (body) {
+								MizDefFrm(df): {
+									if (mizFrmSort(df) != ikError) {
+										lFrm1 = mizCopyFrm(df);
+										// ChangeBound: shift bound vars by the
+										// current binder depth
+										w = mizMakeWithin(\__, trm -> {
+											switch (trm) {
+												MizVarTrm(s2, v2, __, __): {
+													if (s2 == ikTrmBound) {
+														vt : MizVarTrm = trm;
+														vt.varNr ::= v2 + env.boundVarNbr;
+													}
+													trm;
+												}
+												default: trm;
+											}
+										});
+										mizWithinFrm(w, lFrm1);
+										out := arrayPush(^out, mizInstSubstFrm(env, lFrm1));
+									}
+								}
+								MizDefTrm(__): {}
+							}
+							None(): {}
+						}
+						None(): {}
+					}
+				} else {
+					mizDisposeSubstTrm(env);
+				}
+			});
+			mizDisposeSubstTrm(env);
+			^out;
+		}
+	}
+}
+
+// ---------------- the identify hook (equals expansion) ----------------
+
+mizEqualsExpandHook(defs : MizDefinientia, idn : MizIdentify,
+		funcNr : int, args : MizTrmList) -> [int] {
+	env = idn.env;
+	// adjust the functor
+	c = mizConstr(env, coFunctor, funcNr);
+	adjNr = if (c.whichConstrNr != 0) c.whichConstrNr else funcNr;
+	adjArgs = if (c.whichConstrNr != 0) mizTrmListDrop(args, c.superfluous) else args;
+	if (idn.equalsExpansionLevel >= 3) {
+		[];
+	} else {
+		eds = lookupTreeDef(defs.equalsBy, adjNr, []);
+		fold(eds, [], \acc, ed -> {
+			mizDisposeSubstTrm(env);
+			mizInitEssentialsArgs(env, adjArgs, ed.essentials);
+			if (mizCheckLociTypes(env, ed.primaries)) {
+				lTrm0 = mizInstSubstTrm(env, ed.expansion);
+				mizDisposeSubstTrm(env);
+				idn.equalsExpansionLevel ::= idn.equalsExpansionLevel + 1;
+				bSaved = env.boundVarNbr;
+				env.boundVarNbr ::= 0;
+				lTrm = mizCollectConstInTrm(idn, lTrm0);
+				env.boundVarNbr ::= bSaved;
+				idn.equalsExpansionLevel ::= idn.equalsExpansionLevel - 1;
+				switch (lTrm) {
+					MizVarTrm(srt, varNr, __, __): {
+						if (srt == ikTrmInfConst) arrayPush(acc, varNr) else acc;
+					}
+					default: acc;
+				}
+			} else {
+				mizDisposeSubstTrm(env);
+				acc;
+			}
+		});
+	}
+}
+
+mizWireDefinientia(defs : MizDefinientia, pre : MizPre, idn : MizIdentify) -> void {
+	pre.atomicExpansions ::= \f -> mizAtomicExpansions(pre.env, defs, f);
+	idn.equalsExpand ::= \idn2, funcNr, args -> mizEqualsExpandHook(defs, idn2, funcNr, args);
+}
