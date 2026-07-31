@@ -83,6 +83,17 @@ export {
 	mizTypRoundUp(env : MizCorrelEnv, cl : MizClusters, typ : MizTyp) -> void;
 
 	mizSwapArguments(l : MizTrmList, first : int, second : int) -> MizTrmList;
+
+	// MAttrCollection.EnlargeBy (correl.pas 2716): merge another cluster in
+	mizAttrCollEnlargeBy(env : MizCorrelEnv, target : MizAttrColl, src : MizAttrColl) -> void;
+
+	// The tail of Load_EnvConstructors (iocorrel.pas 3280-3341): once the
+	// constructors and the registrations are in, round up the registrations'
+	// types and EVERY mode/functor/selector constructor's result type, then
+	// switch the env reader into its `AfterClusters` mode. Without this the
+	// upper cluster of a derived mode's type never inherits the attributes of
+	// the mode's own result type, and no `x is T` derivation works.
+	mizEnvRoundUp(env : MizCorrelEnv, cl : MizClusters) -> void;
 }
 
 mizMakeClusters() -> MizClusters {
@@ -94,6 +105,7 @@ mizMakeClusters() -> MizClusters {
 mizWireRoundcl(env : MizCorrelEnv, cl : MizClusters) -> void {
 	env.roundUpTrmType ::= \e, t -> mizRoundUpTrmType(e, cl, t);
 	env.roundUpCluster ::= \e, c, ty -> mizRoundUpCluster(e, cl, c, ty);
+	env.enlargeBy ::= \e, t, src -> mizAttrCollEnlargeBy(e, t, src);
 }
 
 mizInsertRCluster(cl : MizClusters, r : MizRCluster) -> void {
@@ -483,4 +495,93 @@ mizTypRoundUp(env : MizCorrelEnv, cl : MizClusters, typ : MizTyp) -> void {
 	cluster = mizCopyCluster(typ.upper);
 	mizRoundUpCluster(env, cl, cluster, typ);
 	typ.upper ::= cluster;
+}
+
+// ---------------- the environment round-up (Load_EnvConstructors tail) ----------------
+
+mizAttrCollEnlargeBy(env : MizCorrelEnv, target : MizAttrColl, src : MizAttrColl) -> void {
+	if (target.consistent) {
+		if (!src.consistent) {
+			target.consistent ::= false;
+			clearVector(target.items);
+		} else {
+			iterVector(src.items, \a -> {
+				if (target.consistent) {
+					mizAttrCollInsert(env, target,
+						MizAttr(a.neg, a.attrNr, mizCopyTrmList(a.args), false, a.pattNr));
+				}
+			});
+		}
+	}
+}
+
+// LocArgTyp[1..] := the primaries (the Pascal `move(...)` before every
+// RoundUpWith that may meet a LocusVar)
+mizSetLocArgTyp(env : MizCorrelEnv, prims : Vector<MizTyp>) -> void {
+	while(\ -> sizeVector(env.locArgTyp) <= sizeVector(prims), \ ->
+		pushVector(env.locArgTyp, mizNewIncorTyp()));
+	fori(0, sizeVector(prims) - 1, \i ->
+		setVectorUnsafe(env.locArgTyp, i + 1, getVectorUnsafe(prims, i)));
+}
+
+// ConstrTypObj.RoundUp (correl.pas 1498): the result type's upper cluster is
+// its own lower cluster, PLUS the mode's result-type upper cluster
+// instantiated with the type's arguments, all rounded with the conditional
+// registrations.
+mizConstrTypRoundUp(env : MizCorrelEnv, cl : MizClusters, c : MizConstr) -> void {
+	switch (c.typ) {
+		None(): {}
+		Some(t): {
+			cluster = mizCopyCluster(t.lower);
+			if (t.sort == ikTypMode) {
+				mc = mizConstr(env, coMode, t.modNr);
+				switch (mc.typ) {
+					Some(mt): {
+						inst = mizInstCluster(env, mt.upper, t.modArgs);
+						mizAttrCollEnlargeBy(env, cluster, inst);
+					}
+					None(): {}
+				}
+			}
+			mizSetLocArgTyp(env, c.primaries);
+			mizRoundUpCluster(env, cl, cluster, t);
+			t.upper ::= cluster;
+		}
+	}
+}
+
+mizEnvRoundUp(env : MizCorrelEnv, cl : MizClusters) -> void {
+	// registered clusters: every primary type, then the consequent
+	iterVector(cl.registered, \r -> {
+		iterVector(r.primaries, \ty -> {
+			mizSetLocArgTyp(env, r.primaries);
+			cluster = mizCopyCluster(ty.upper);
+			mizRoundUpCluster(env, cl, cluster, ty);
+			ty.upper ::= cluster;
+			mizClearRoundMemo(cl);
+		});
+		mizSetLocArgTyp(env, r.primaries);
+		mizRoundUpCluster(env, cl, r.consequent.upper, r.clusterType);
+		mizClearRoundMemo(cl);
+	});
+	// functor clusters: the consequent is enlarged by the cluster type's own
+	// upper cluster (the term's rounded type when no type is given)
+	iterVector(cl.functor, \f -> {
+		mizSetLocArgTyp(env, f.primaries);
+		ty = switch (f.clusterType) {
+			Some(t): t;
+			None(): mizRoundUpTrmType(env, cl, f.clusterTerm);
+		};
+		mizAttrCollEnlargeBy(env, f.consequent.upper, ty.upper);
+		mizRoundUpCluster(env, cl, f.consequent.upper, ty);
+		mizClearRoundMemo(cl);
+	});
+	// and every mode / functor / selector constructor's result type
+	iter([coMode, coFunctor, coSelector], \k -> {
+		fori(1, mizConstrCount(env, k), \i -> {
+			mizConstrTypRoundUp(env, cl, mizConstr(env, k, i));
+			mizClearRoundMemo(cl);
+		});
+	});
+	env.afterClusters ::= true;
 }
