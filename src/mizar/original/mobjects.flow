@@ -1,0 +1,525 @@
+// Transcription of ~/dev/system/base/mobjects.pas — the numeric collections the
+// checker computes with. Only the types the verifier path uses are ported:
+//
+//   NatSet   — sorted set of ints, stored as (X, Y) pairs with Y ignored
+//   NatFunc  — finite map int -> int, sorted by X, plus the `nConsistent` flag.
+//              This is the ATOM of the unifier's substitution lattice: Assign
+//              of a conflicting value REFUTES the whole function (consistent
+//              becomes false), exactly as in the original.
+//   IntSequence / IntSet — growable int list / sorted int set.
+//
+// Pascal inheritance NatFunc <- NatSet <- IntRel is flattened: ONE struct
+// MizNatFunc serves both roles (NatSet use ignores `y` and `consistent`).
+// Generic MCollection/MSortedCollection are NOT ported — each Pascal use site
+// gets a typed Vector in its own unit (the virtual-method machinery of
+// MObject exists only to emulate what Flow9 gives us directly).
+//
+// Growth semantics: the original grows by Delta and signals coOverflow when
+// Delta = 0 or a cap is hit; Vector grows freely, and the caps that MATTER
+// (MaxInstNbr in the InstCollection lattice) are enforced at their use sites
+// with explicit checks, as the original does in prechecker.pas.
+
+import ds/vector;
+import loop;
+import math/math;
+import mizar/original/errhan;
+
+export {
+	MizIntPair(x : int, y : int);
+
+	// NatSet / NatFunc. Sorted by x, no duplicate x (unless `duplicates`,
+	// which the verifier path never sets — kept for fidelity).
+	MizNatFunc(
+		items : Vector<MizIntPair>,
+		mutable consistent : bool,
+	);
+
+	mizInitNatFunc(capacity : int) -> MizNatFunc;     // NatFunc.InitNatFunc
+	mizInitNatSet(capacity : int) -> MizNatFunc;      // NatSet.Init
+	mizNatSetWithElement(x : int) -> MizNatFunc;      // NatSet.InitWithElement
+	mizCopyNatFunc(f : MizNatFunc) -> MizNatFunc;     // CopyNatFunc / CopyNatSet
+
+	mizNatCount(f : MizNatFunc) -> int;
+	mizNatItem(f : MizNatFunc, i : int) -> MizIntPair;
+
+	// function SearchPair(X, var Index) — binary search; returns the found flag,
+	// the insertion index is mizNatSearchIndex.
+	mizNatHasInDom(f : MizNatFunc, x : int) -> bool;  // HasInDom / SearchPair
+	mizNatElemNr(f : MizNatFunc, x : int) -> int;     // ElemNr: index or -1
+	mizNatValue(f : MizNatFunc, x : int) -> int;      // Value: aborts if absent
+
+	mizNatInsertPair(f : MizNatFunc, x : int, y : int) -> void; // Insert (keeps first on dup x)
+	mizNatInsertElem(f : MizNatFunc, x : int) -> void;          // InsertElem: (x, 0)
+	mizNatDeleteElem(f : MizNatFunc, x : int) -> void;          // DeleteElem
+	mizNatDeleteAll(f : MizNatFunc) -> void;                    // DeleteAll
+
+	mizNatAssign(f : MizNatFunc, x : int, y : int) -> void;     // Assign: conflict => refuted
+	mizNatUp(f : MizNatFunc, x : int) -> void;                  // Up: increment count
+	mizNatDown(f : MizNatFunc, x : int) -> void;                // Down: decrement, drop at 0
+	mizNatRefuted(f : MizNatFunc) -> void;                      // Refuted: clear + inconsistent
+	mizNatJoin(f : MizNatFunc, g : MizNatFunc) -> void;         // Join: union, conflict => refuted
+	mizNatJoinAtom(f : MizNatFunc, atom : MizNatFunc) -> Maybe<MizNatFunc>; // JoinAtom
+
+	mizNatEnlargeBy(f : MizNatFunc, g : MizNatFunc) -> void;    // NatSet.EnlargeBy (set union)
+	mizNatComplementOf(f : MizNatFunc, g : MizNatFunc) -> void; // remove g's domain
+	mizNatIntersectWith(f : MizNatFunc, g : MizNatFunc) -> void;
+
+	mizNatIsEqualTo(f : MizNatFunc, g : MizNatFunc) -> bool;
+	mizNatIsSubsetOf(f : MizNatFunc, g : MizNatFunc) -> bool;   // pairs, (x,y) both match
+	mizNatMisses(f : MizNatFunc, g : MizNatFunc) -> bool;       // disjoint domains
+	mizNatWeakerThan(f : MizNatFunc, g : MizNatFunc) -> bool;   // f's graph included in g's
+	mizNatCompareWith(f : MizNatFunc, g : MizNatFunc) -> int;   // -1 weaker / 1 stronger / 0
+	mizNatCountAll(f : MizNatFunc) -> int;                      // sum of Y
+	mizNatLCM(f : MizNatFunc, g : MizNatFunc) -> MizNatFunc;    // pointwise max
+
+	// IntSequence / IntSet
+	MizIntSeq(items : Vector<int>);
+
+	mizInitIntSeq(capacity : int) -> MizIntSeq;
+	mizCopyIntSeq(s : MizIntSeq) -> MizIntSeq;
+	mizSeqCount(s : MizIntSeq) -> int;
+	mizSeqValue(s : MizIntSeq, i : int) -> int;                 // Value(aIndex)
+	mizSeqInsert(s : MizIntSeq, v : int) -> int;                // append, returns index
+	mizSeqAtPut(s : MizIntSeq, i : int, v : int) -> void;
+	mizSeqAtDelete(s : MizIntSeq, i : int) -> void;
+	mizSeqIndexOf(s : MizIntSeq, v : int) -> int;               // linear, -1 if absent
+	mizSeqClear(s : MizIntSeq) -> void;
+
+	// IntSet: same struct, kept SORTED via these ops only.
+	mizIntSetInsert(s : MizIntSeq, v : int) -> int;             // sorted insert, no dup; index
+	mizIntSetIsInSet(s : MizIntSeq, v : int) -> bool;           // binary search
+	mizIntSetDelete(s : MizIntSeq, v : int) -> int;             // index deleted or -1
+	mizIntSetIsSubsetOf(s : MizIntSeq, t : MizIntSeq) -> bool;
+	mizIntSetMisses(s : MizIntSeq, t : MizIntSeq) -> bool;
+
+	// Shared low-level helper: insert into a Vector at index (Pascal `move`).
+	mizVectorAtInsert(v : Vector<?>, i : int, val : ?) -> void;
+	mizVectorAtDelete(v : Vector<?>, i : int) -> void;
+}
+
+mizVectorAtInsert(v : Vector<?>, i : int, val : ?) -> void {
+	n = sizeVector(v);
+	if (i >= n) {
+		pushVector(v, val);
+	} else {
+		pushVector(v, getVectorUnsafe(v, n - 1));
+		// shift right: indices n-1 .. i+1 get their left neighbor
+		// (while, not fori: fori recurses and the shift can be long)
+		j = ref n - 1;
+		while(\ -> ^j > i, \ -> {
+			setVectorUnsafe(v, ^j, getVectorUnsafe(v, ^j - 1));
+			j := ^j - 1;
+		});
+		setVectorUnsafe(v, i, val);
+	}
+}
+
+mizVectorAtDelete(v : Vector<?>, i : int) -> void {
+	removeVector(v, i);
+}
+
+// ---------------- NatSet / NatFunc ----------------
+
+mizInitNatFunc(capacity : int) -> MizNatFunc {
+	MizNatFunc(makeVector(max(capacity, 4)), true);
+}
+
+mizInitNatSet(capacity : int) -> MizNatFunc {
+	mizInitNatFunc(capacity);
+}
+
+mizNatSetWithElement(x : int) -> MizNatFunc {
+	f = mizInitNatFunc(4);
+	mizNatInsertElem(f, x);
+	f;
+}
+
+mizCopyNatFunc(f : MizNatFunc) -> MizNatFunc {
+	MizNatFunc(copyVector(f.items), f.consistent);
+}
+
+mizNatCount(f : MizNatFunc) -> int {
+	sizeVector(f.items);
+}
+
+mizNatItem(f : MizNatFunc, i : int) -> MizIntPair {
+	getVectorUnsafe(f.items, i);
+}
+
+// SearchPair: binary search for x. Returns Pair(found, insertion index L).
+mizNatSearchPair(f : MizNatFunc, x : int) -> Pair<bool, int> {
+	found = ref false;
+	l = ref 0;
+	h = ref sizeVector(f.items) - 1;
+	while(\ -> ^l <= ^h, \ -> {
+		i = (^l + ^h) / 2;
+		c = getVectorUnsafe(f.items, i).x - x;
+		if (c < 0) {
+			l := i + 1;
+		} else {
+			h := i - 1;
+			if (c == 0) {
+				found := true;
+				l := i;   // not Duplicates: stop at the leftmost match
+				h := i - 1;
+			}
+		}
+	});
+	Pair(^found, ^l);
+}
+
+mizNatHasInDom(f : MizNatFunc, x : int) -> bool {
+	mizNatSearchPair(f, x).first;
+}
+
+mizNatElemNr(f : MizNatFunc, x : int) -> int {
+	p = mizNatSearchPair(f, x);
+	if (p.first) p.second else -1;
+}
+
+mizNatValue(f : MizNatFunc, x : int) -> int {
+	p = mizNatSearchPair(f, x);
+	if (p.first) {
+		getVectorUnsafe(f.items, p.second).y;
+	} else {
+		mizRunTimeError(2100); // NatSetError(coDuplicate) in the original: absent key
+		0;
+	}
+}
+
+mizNatInsertPair(f : MizNatFunc, x : int, y : int) -> void {
+	p = mizNatSearchPair(f, x);
+	if (!p.first) {
+		mizVectorAtInsert(f.items, p.second, MizIntPair(x, y));
+	}
+}
+
+mizNatInsertElem(f : MizNatFunc, x : int) -> void {
+	mizNatInsertPair(f, x, 0);
+}
+
+mizNatDeleteElem(f : MizNatFunc, x : int) -> void {
+	p = mizNatSearchPair(f, x);
+	if (p.first) {
+		mizVectorAtDelete(f.items, p.second);
+	}
+}
+
+mizNatDeleteAll(f : MizNatFunc) -> void {
+	clearVector(f.items);
+}
+
+mizNatRefuted(f : MizNatFunc) -> void {
+	clearVector(f.items);
+	f.consistent ::= false;
+}
+
+mizNatAssign(f : MizNatFunc, x : int, y : int) -> void {
+	if (f.consistent) {
+		p = mizNatSearchPair(f, x);
+		if (p.first) {
+			if (getVectorUnsafe(f.items, p.second).y != y) {
+				mizNatRefuted(f);
+			}
+			// same value: Insert is a no-op on duplicate x
+		} else {
+			mizVectorAtInsert(f.items, p.second, MizIntPair(x, y));
+		}
+	}
+}
+
+mizNatUp(f : MizNatFunc, x : int) -> void {
+	if (f.consistent) {
+		p = mizNatSearchPair(f, x);
+		if (p.first) {
+			it = getVectorUnsafe(f.items, p.second);
+			setVectorUnsafe(f.items, p.second, MizIntPair(it.x, it.y + 1));
+		} else {
+			mizVectorAtInsert(f.items, p.second, MizIntPair(x, 1));
+		}
+	}
+}
+
+mizNatDown(f : MizNatFunc, x : int) -> void {
+	if (f.consistent) {
+		p = mizNatSearchPair(f, x);
+		if (p.first) {
+			it = getVectorUnsafe(f.items, p.second);
+			if (it.y == 1) {
+				mizVectorAtDelete(f.items, p.second);
+			} else {
+				setVectorUnsafe(f.items, p.second, MizIntPair(it.x, it.y - 1));
+			}
+		} else {
+			mizRunTimeError(2101); // NatSetError(coConsistentError)
+		}
+	}
+}
+
+mizNatJoin(f : MizNatFunc, g : MizNatFunc) -> void {
+	if (f.consistent) {
+		if (!g.consistent) {
+			mizNatRefuted(f);
+		} else {
+			n = sizeVector(g.items);
+			k = ref 0;
+			while(\ -> ^k < n && f.consistent, \ -> {
+				it = getVectorUnsafe(g.items, ^k);
+				p = mizNatSearchPair(f, it.x);
+				if (p.first) {
+					mine = getVectorUnsafe(f.items, p.second);
+					if (mine.y != it.y) {
+						mizNatRefuted(f);
+					}
+				} else {
+					mizVectorAtInsert(f.items, p.second, it);
+				}
+				k := ^k + 1;
+			});
+		}
+	}
+}
+
+mizNatJoinAtom(f : MizNatFunc, atom : MizNatFunc) -> Maybe<MizNatFunc> {
+	eval : MizNatFunc = mizCopyNatFunc(f);
+	mizNatJoin(eval, atom); // EnlargeBy and Join compute the same relation
+	if (eval.consistent) Some(eval) else None();
+}
+
+mizNatEnlargeBy(f : MizNatFunc, g : MizNatFunc) -> void {
+	iterVector(g.items, \it -> mizNatInsertElem(f, it.x));
+}
+
+mizNatComplementOf(f : MizNatFunc, g : MizNatFunc) -> void {
+	iterVector(g.items, \it -> mizNatDeleteElem(f, it.x));
+}
+
+mizNatIntersectWith(f : MizNatFunc, g : MizNatFunc) -> void {
+	k = ref 0;
+	while(\ -> ^k < sizeVector(f.items), \ -> {
+		if (!mizNatHasInDom(g, getVectorUnsafe(f.items, ^k).x)) {
+			mizVectorAtDelete(f.items, ^k);
+		} else {
+			k := ^k + 1;
+		}
+	});
+}
+
+mizNatIsEqualTo(f : MizNatFunc, g : MizNatFunc) -> bool {
+	n = sizeVector(f.items);
+	if (n != sizeVector(g.items)) {
+		false;
+	} else {
+		ok = ref true;
+		fori(0, n - 1, \i -> {
+			a = getVectorUnsafe(f.items, i);
+			b = getVectorUnsafe(g.items, i);
+			if (a.x != b.x || a.y != b.y) ok := false;
+		});
+		^ok;
+	}
+}
+
+mizNatIsSubsetOf(f : MizNatFunc, g : MizNatFunc) -> bool {
+	n = sizeVector(f.items);
+	c = sizeVector(g.items);
+	if (c < n) {
+		false;
+	} else {
+		// merge walk over both sorted lists, exact (x, y) match required
+		res = ref true;
+		j = ref 0;
+		i = ref 0;
+		while(\ -> ^i < n && ^res, \ -> {
+			a = getVectorUnsafe(f.items, ^i);
+			while(\ -> ^j < c && getVectorUnsafe(g.items, ^j).x < a.x, \ -> j := ^j + 1);
+			if (^j == c) {
+				res := false;
+			} else {
+				b = getVectorUnsafe(g.items, ^j);
+				if (a.x != b.x || a.y != b.y) res := false;
+			}
+			i := ^i + 1;
+		});
+		^res;
+	}
+}
+
+mizNatMisses(f : MizNatFunc, g : MizNatFunc) -> bool {
+	small = if (mizNatCount(f) > mizNatCount(g)) g else f;
+	large = if (mizNatCount(f) > mizNatCount(g)) f else g;
+	res = ref true;
+	iterVector(small.items, \it -> {
+		if (mizNatHasInDom(large, it.x)) res := false;
+	});
+	^res;
+}
+
+mizNatWeakerThan(f : MizNatFunc, g : MizNatFunc) -> bool {
+	if (mizNatCount(f) > mizNatCount(g)) {
+		false;
+	} else {
+		res = ref true;
+		iterVector(f.items, \it -> {
+			if (^res) {
+				p = mizNatSearchPair(g, it.x);
+				if (!p.first || getVectorUnsafe(g.items, p.second).y != it.y) {
+					res := false;
+				}
+			}
+		});
+		^res;
+	}
+}
+
+mizNatCompareWith(f : MizNatFunc, g : MizNatFunc) -> int {
+	if (mizNatCount(f) <= mizNatCount(g) && mizNatWeakerThan(f, g)) {
+		-1;
+	} else if (mizNatCount(g) <= mizNatCount(f) && mizNatWeakerThan(g, f)) {
+		1;
+	} else {
+		0;
+	}
+}
+
+mizNatCountAll(f : MizNatFunc) -> int {
+	foldVector(f.items, 0, \acc, it -> acc + it.y);
+}
+
+mizNatLCM(f : MizNatFunc, g : MizNatFunc) -> MizNatFunc {
+	r = mizInitNatFunc(mizNatCount(f) + mizNatCount(g));
+	nf = mizNatCount(f);
+	ng = mizNatCount(g);
+	i = ref 0;
+	j = ref 0;
+	while(\ -> ^i < nf && ^j < ng, \ -> {
+		a = getVectorUnsafe(f.items, ^i);
+		b = getVectorUnsafe(g.items, ^j);
+		if (a.x < b.x) {
+			pushVector(r.items, a);
+			i := ^i + 1;
+		} else if (a.x > b.x) {
+			pushVector(r.items, b);
+			j := ^j + 1;
+		} else {
+			pushVector(r.items, MizIntPair(a.x, max(a.y, b.y)));
+			i := ^i + 1;
+			j := ^j + 1;
+		}
+	});
+	while(\ -> ^i < nf, \ -> {
+		pushVector(r.items, getVectorUnsafe(f.items, ^i));
+		i := ^i + 1;
+	});
+	while(\ -> ^j < ng, \ -> {
+		pushVector(r.items, getVectorUnsafe(g.items, ^j));
+		j := ^j + 1;
+	});
+	r;
+}
+
+// ---------------- IntSequence / IntSet ----------------
+
+mizInitIntSeq(capacity : int) -> MizIntSeq {
+	MizIntSeq(makeVector(max(capacity, 4)));
+}
+
+mizCopyIntSeq(s : MizIntSeq) -> MizIntSeq {
+	MizIntSeq(copyVector(s.items));
+}
+
+mizSeqCount(s : MizIntSeq) -> int {
+	sizeVector(s.items);
+}
+
+mizSeqValue(s : MizIntSeq, i : int) -> int {
+	getVectorUnsafe(s.items, i);
+}
+
+mizSeqInsert(s : MizIntSeq, v : int) -> int {
+	pushVector(s.items, v);
+	sizeVector(s.items) - 1;
+}
+
+mizSeqAtPut(s : MizIntSeq, i : int, v : int) -> void {
+	setVectorUnsafe(s.items, i, v);
+}
+
+mizSeqAtDelete(s : MizIntSeq, i : int) -> void {
+	removeVector(s.items, i);
+}
+
+mizSeqIndexOf(s : MizIntSeq, v : int) -> int {
+	n = sizeVector(s.items);
+	res = ref -1;
+	i = ref 0;
+	while(\ -> ^i < n && ^res < 0, \ -> {
+		if (getVectorUnsafe(s.items, ^i) == v) res := ^i;
+		i := ^i + 1;
+	});
+	^res;
+}
+
+mizSeqClear(s : MizIntSeq) -> void {
+	clearVector(s.items);
+}
+
+// IntSet.Find: binary search. Pair(found, insertion index).
+mizIntSetFind(s : MizIntSeq, v : int) -> Pair<bool, int> {
+	found = ref false;
+	l = ref 0;
+	h = ref sizeVector(s.items) - 1;
+	while(\ -> ^l <= ^h, \ -> {
+		i = (^l + ^h) / 2;
+		c = getVectorUnsafe(s.items, i) - v;
+		if (c < 0) {
+			l := i + 1;
+		} else {
+			h := i - 1;
+			if (c == 0) {
+				found := true;
+				l := i;
+				h := i - 1;
+			}
+		}
+	});
+	Pair(^found, ^l);
+}
+
+mizIntSetInsert(s : MizIntSeq, v : int) -> int {
+	p = mizIntSetFind(s, v);
+	if (!p.first) {
+		mizVectorAtInsert(s.items, p.second, v);
+	}
+	p.second;
+}
+
+mizIntSetIsInSet(s : MizIntSeq, v : int) -> bool {
+	mizIntSetFind(s, v).first;
+}
+
+mizIntSetDelete(s : MizIntSeq, v : int) -> int {
+	p = mizIntSetFind(s, v);
+	if (p.first) {
+		removeVector(s.items, p.second);
+		p.second;
+	} else {
+		-1;
+	}
+}
+
+mizIntSetIsSubsetOf(s : MizIntSeq, t : MizIntSeq) -> bool {
+	res = ref true;
+	iterVector(s.items, \v -> {
+		if (!mizIntSetIsInSet(t, v)) res := false;
+	});
+	^res;
+}
+
+mizIntSetMisses(s : MizIntSeq, t : MizIntSeq) -> bool {
+	res = ref true;
+	iterVector(s.items, \v -> {
+		if (mizIntSetIsInSet(t, v)) res := false;
+	});
+	^res;
+}

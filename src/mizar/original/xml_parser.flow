@@ -1,0 +1,415 @@
+// Transcription of ~/dev/system/base/xml_parser.pas — the streaming XML
+// tokenizer/parser every Mizar pass uses to read `.xml`, `.eno`, `.ecl`, …
+// (analyzer reports run to ~31 MB, so no trees are built: the consumer walks
+// element states exactly as the original does with NextElementState).
+//
+// Object mapping: XMLScannObj/XMLParserObj globals+fields become one struct
+// with `mutable` fields. Pascal 1-based string indexing is kept 1-based via
+// mizCharCode1. The virtual OpenStartTag override (xmlpars.pas resolves the
+// element name to a TXMLElemKind) becomes the `onOpenTag` function field.
+//
+// Error recovery: as in the original — bad XML is a hard RunTimeError
+// (errBadXMLToken 7506), no recovery.
+
+import string;
+import loop;
+import ds/vector;
+import fs/filesystem;
+import mizar/original/errhan;
+
+export {
+	// XMLTokenKind
+	MizXTErr = 0;   // an error symbol
+	MizXTBI = 1;    // <?
+	MizXTEI = 2;    // ?>
+	MizXTDT = 3;    // <!
+	MizXTLT = 4;    // <
+	MizXTGT = 5;    // >
+	MizXTET = 6;    // </
+	MizXTEE = 7;    // />
+	MizXTQT = 8;    // "
+	MizXTEQ = 9;    // =
+	MizXTID = 10;   // Identifier / Name (entities folded in, as the original)
+	MizXTEOTX = 11; // end of text
+
+	// TElementState
+	MizEStart = 0;
+	MizEEnd = 1;
+
+	MizXmlAttr(name : string, value : string);
+
+	MizXmlParser(
+		lines : [string],               // the source, split to lines
+		mutable lineIdx : int,          // 0-based index of nLine in `lines`
+		mutable nLine : string,         // current line + trailing " "
+		mutable nCurCol : int,          // 1-based, as in Pascal
+		mutable nCurTokenKind : int,
+		mutable nSpelling : string,
+		mutable nPos : MizPos,
+		// XMLParserObj:
+		mutable nElName : string,
+		mutable nState : int,           // MizEStart / MizEEnd
+		nAttrVals : Vector<MizXmlAttr>,
+		// xmlpars.pas hook: called by OpenStartTag with the element name
+		mutable onOpenTag : (string) -> void,
+	);
+
+	// InitParsing: opens the text, skips <?xml …?> prolog and processing
+	// instructions. Content is passed in, not read here — the caller decides
+	// the file I/O (tests pass literals, the verifier reads the file).
+	mizXmlInitParsing(content : string) -> MizXmlParser;
+	mizXmlInitParsingFile(path : string) -> MizXmlParser;
+
+	// NextElementState: advance to the next element start/end.
+	// After it: nState, nElName, nAttrVals are valid (attrs only on eStart).
+	mizXmlNextElementState(p : MizXmlParser) -> void;
+
+	// NextTag: like NextElementState but skips attribute values (faster).
+	mizXmlNextTag(p : MizXmlParser) -> void;
+
+	mizXmlAcceptStartState(p : MizXmlParser) -> void; // assert next is eStart
+	mizXmlAcceptEndState(p : MizXmlParser) -> void;   // assert next is eEnd
+
+	// Attribute access on the current element ("" / default if absent).
+	mizXmlAttr(p : MizXmlParser, name : string) -> string;
+	mizXmlAttrDef(p : MizXmlParser, name : string, def : string) -> string;
+	mizXmlIntAttr(p : MizXmlParser, name : string) -> int;      // 7502 if absent
+	mizXmlIntAttrDef(p : MizXmlParser, name : string, def : int) -> int;
+	mizXmlHasAttr(p : MizXmlParser, name : string) -> bool;
+
+	// procedure XMLASSERT — errWrongXMLElement on failure
+	mizXmlAssert(cond : bool) -> void;
+
+	// error numbers (part of observed behavior)
+	errElRedundant = 7500;
+	errElMissing = 7501;
+	errMissingXMLAttribute = 7502;
+	errWrongXMLElement = 7503;
+	errBadXMLToken = 7506;
+
+	// char code at 1-based index (0 past end) — shared 1-based helper
+	mizCharCode1(s : string, i : int) -> int;
+}
+
+mizCharCode1(s : string, i : int) -> int {
+	if (i >= 1 && i <= strlen(s)) getCharCodeAt(s, i - 1) else 0;
+}
+
+// CharKind from GetToken: 1 letter, 2 digit, 3 name-punct (# & - . _), 0 other.
+// ID tokens continue while kind != 0.
+mizXmlCharKind(c : int) -> int {
+	if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90)) 1        // a-z A-Z
+	else if (c >= 48 && c <= 57) 2                              // 0-9
+	else if (c == 35 || c == 38 || c == 45 || c == 46 || c == 95) 3 // # & - . _
+	else 0;
+}
+
+mizXmlIsNameStart(c : int) -> bool {
+	// 'a'..'z','A'..'Z','0'..'9','_','-','&' start an ID in GetToken
+	mizXmlCharKind(c) == 1 || mizXmlCharKind(c) == 2 || c == 95 || c == 45 || c == 38;
+}
+
+mizXmlMakeParser(content : string) -> MizXmlParser {
+	MizXmlParser(
+		strSplit(content, "\n"),
+		-1, "", 1, MizXTErr, "", MizPos(0, 0),
+		"", MizEEnd, makeVector(8), \__ -> {}
+	);
+}
+
+mizXmlInitParsingFile(path : string) -> MizXmlParser {
+	mizXmlInitParsing(getFileContent(path));
+}
+
+mizXmlInitParsing(content : string) -> MizXmlParser {
+	p = mizXmlMakeParser(content);
+	mizXmlGetToken(p);
+	// InitParsing: skip the <?xml?> prolog and further processing instructions
+	if (p.nCurTokenKind == MizXTBI) {
+		mizXmlGetToken(p);
+		if (p.nCurTokenKind == MizXTID && p.nSpelling == "xml") {
+			mizXmlGetToken(p);
+		} else {
+			mizXmlErrorRecovery(10);
+		}
+		while(\ -> p.nCurTokenKind != MizXTEOTX && p.nCurTokenKind != MizXTEI,
+			\ -> mizXmlGetToken(p));
+		if (p.nCurTokenKind == MizXTEI) mizXmlGetToken(p);
+		while(\ -> p.nCurTokenKind == MizXTBI, \ -> {
+			mizXmlGetToken(p);
+			while(\ -> p.nCurTokenKind != MizXTEOTX && p.nCurTokenKind != MizXTEI,
+				\ -> mizXmlGetToken(p));
+			if (p.nCurTokenKind == MizXTEI) mizXmlGetToken(p);
+		});
+	}
+	p;
+}
+
+mizXmlErrorRecovery(err : int) -> void {
+	// "ErrorRecovery is no longer allowed for XML, bad XML is just RTE"
+	mizAssert(errBadXMLToken, false);
+}
+
+mizXmlAssert(cond : bool) -> void {
+	mizAssert(errWrongXMLElement, cond);
+}
+
+// GetToken — the scanner.
+mizXmlGetToken(p : MizXmlParser) -> void {
+	// advance to a non-exhausted line; original: while nCurCol = length(nLine)
+	eotx = ref false;
+	while(\ -> !^eotx && p.nCurCol >= strlen(p.nLine), \ -> {
+		if (p.lineIdx + 1 >= length(p.lines)) {
+			p.nCurTokenKind ::= MizXTEOTX;
+			p.nSpelling ::= "";
+			eotx := true;
+		} else {
+			p.lineIdx ::= p.lineIdx + 1;
+			p.nLine ::= p.lines[p.lineIdx] + " ";
+			p.nPos ::= MizPos(p.lineIdx + 1, p.nPos.col);
+			p.nCurCol ::= 1;
+			// skip leading blanks
+			while(\ -> p.nCurCol < strlen(p.nLine) && mizCharCode1(p.nLine, p.nCurCol) == 32,
+				\ -> p.nCurCol ::= p.nCurCol + 1);
+		}
+	});
+	if (!^eotx) {
+		p.nPos ::= MizPos(p.lineIdx + 1, p.nCurCol);
+		startCol = p.nCurCol;
+		c = mizCharCode1(p.nLine, p.nCurCol);
+		if (mizXmlIsNameStart(c)) {
+			p.nCurTokenKind ::= MizXTID;
+			p.nCurCol ::= p.nCurCol + 1;
+			while(\ -> mizXmlCharKind(mizCharCode1(p.nLine, p.nCurCol)) != 0,
+				\ -> p.nCurCol ::= p.nCurCol + 1);
+		} else if (c == 34) { // "
+			p.nCurTokenKind ::= MizXTQT;
+			p.nCurCol ::= p.nCurCol + 1;
+		} else if (c == 61) { // =
+			p.nCurTokenKind ::= MizXTEQ;
+			p.nCurCol ::= p.nCurCol + 1;
+		} else if (c == 60) { // <
+			p.nCurCol ::= p.nCurCol + 1;
+			c2 = mizCharCode1(p.nLine, p.nCurCol);
+			if (c2 == 47) { // /
+				p.nCurTokenKind ::= MizXTET;
+				p.nCurCol ::= p.nCurCol + 1;
+			} else if (c2 == 63) { // ?
+				p.nCurTokenKind ::= MizXTBI;
+				p.nCurCol ::= p.nCurCol + 1;
+			} else if (c2 == 33) { // !
+				p.nCurTokenKind ::= MizXTDT;
+				p.nCurCol ::= p.nCurCol + 1;
+			} else {
+				p.nCurTokenKind ::= MizXTLT;
+			}
+		} else if (c == 62) { // >
+			p.nCurTokenKind ::= MizXTGT;
+			p.nCurCol ::= p.nCurCol + 1;
+		} else if (c == 47) { // /
+			p.nCurCol ::= p.nCurCol + 1;
+			if (mizCharCode1(p.nLine, p.nCurCol) == 62) { // >
+				p.nCurTokenKind ::= MizXTEE;
+				p.nCurCol ::= p.nCurCol + 1;
+			} else {
+				p.nCurTokenKind ::= MizXTErr;
+			}
+		} else if (c == 63) { // ?
+			p.nCurCol ::= p.nCurCol + 1;
+			if (mizCharCode1(p.nLine, p.nCurCol) == 62) { // >
+				p.nCurTokenKind ::= MizXTEI;
+				p.nCurCol ::= p.nCurCol + 1;
+			} else {
+				p.nCurTokenKind ::= MizXTErr;
+			}
+		} else {
+			p.nCurTokenKind ::= MizXTErr;
+			p.nCurCol ::= p.nCurCol + 1;
+		}
+		p.nSpelling ::= substring(p.nLine, startCol - 1, p.nCurCol - startCol);
+		mizXmlSkipBlanks(p);
+	}
+}
+
+mizXmlSkipBlanks(p : MizXmlParser) -> void {
+	while(\ -> p.nCurCol < strlen(p.nLine)
+			&& {ch = mizCharCode1(p.nLine, p.nCurCol); ch == 32 || ch == 9},
+		\ -> p.nCurCol ::= p.nCurCol + 1);
+}
+
+// GetAttrValue: read up to the closing quote (value may contain spaces).
+mizXmlGetAttrValue(p : MizXmlParser) -> void {
+	lCol = p.nCurCol;
+	while(\ -> p.nCurCol < strlen(p.nLine) && mizCharCode1(p.nLine, p.nCurCol) != 34,
+		\ -> p.nCurCol ::= p.nCurCol + 1);
+	p.nSpelling ::= substring(p.nLine, lCol - 1, p.nCurCol - lCol);
+	if (mizCharCode1(p.nLine, p.nCurCol) == 34) {
+		p.nCurCol ::= p.nCurCol + 1;
+	}
+	mizXmlSkipBlanks(p);
+}
+
+mizXmlOpenStartTag(p : MizXmlParser) -> void {
+	p.nElName ::= p.nSpelling;
+	clearVector(p.nAttrVals);
+	p.onOpenTag(p.nSpelling);
+}
+
+// NextElementState — the high-level parser step.
+mizXmlNextElementState(p : MizXmlParser) -> void {
+	tk = p.nCurTokenKind;
+	if (tk == MizXTEOTX) {
+		p.nState ::= MizEEnd;
+	} else if (tk == MizXTLT) {
+		p.nState ::= MizEStart;
+		mizXmlGetToken(p);
+		if (p.nCurTokenKind == MizXTID) {
+			mizXmlOpenStartTag(p);
+			mizXmlGetToken(p);
+			mizXmlParseAttrs(p, true);
+		} else {
+			mizXmlErrorRecovery(6);
+		}
+	} else if (tk == MizXTEE) {
+		p.nState ::= MizEEnd;
+		mizXmlGetToken(p);
+	} else if (tk == MizXTET) {
+		p.nState ::= MizEEnd;
+		mizXmlGetToken(p);
+		if (p.nCurTokenKind == MizXTID) {
+			// ProcessEndTag is empty in XMLParserObj — the name is not checked
+			mizXmlGetToken(p);
+			if (p.nCurTokenKind == MizXTGT) {
+				mizXmlGetToken(p);
+			} else {
+				mizXmlErrorRecovery(7);
+			}
+		} else {
+			mizXmlErrorRecovery(8);
+		}
+	} else {
+		mizXmlErrorRecovery(9);
+	}
+}
+
+// The attribute loop shared by NextElementState (keep = true) and
+// NextTag (keep = false: values scanned but not stored).
+mizXmlParseAttrs(p : MizXmlParser, keep : bool) -> void {
+	brk = ref false;
+	while(\ -> !^brk && p.nCurTokenKind != MizXTEOTX, \ -> {
+		tk = p.nCurTokenKind;
+		if (tk == MizXTGT) {
+			mizXmlGetToken(p);
+			brk := true; // end of a start-tag; CloseStartTag is empty
+		} else if (tk == MizXTEE) {
+			brk := true; // end of an empty-element tag; token consumed by next step
+		} else if (tk == MizXTID) {
+			attrName = p.nSpelling;
+			mizXmlGetToken(p);
+			if (p.nCurTokenKind == MizXTEQ) {
+				mizXmlGetToken(p);
+				if (p.nCurTokenKind == MizXTQT) {
+					mizXmlGetAttrValue(p);
+					if (keep) {
+						pushVector(p.nAttrVals, MizXmlAttr(attrName, p.nSpelling));
+					}
+					mizXmlGetToken(p);
+				} else {
+					mizXmlErrorRecovery(3);
+				}
+			} else {
+				mizXmlErrorRecovery(4);
+			}
+		} else {
+			mizXmlErrorRecovery(5);
+			brk := true;
+		}
+	});
+}
+
+mizXmlNextTag(p : MizXmlParser) -> void {
+	tk = p.nCurTokenKind;
+	if (tk == MizXTEOTX) {
+		p.nState ::= MizEEnd;
+	} else if (tk == MizXTLT) {
+		p.nState ::= MizEStart;
+		mizXmlGetToken(p);
+		if (p.nCurTokenKind == MizXTID) {
+			mizXmlOpenStartTag(p);
+			mizXmlGetToken(p);
+			mizXmlParseAttrs(p, false);
+		} else {
+			mizXmlErrorRecovery(6);
+		}
+	} else if (tk == MizXTEE) {
+		p.nState ::= MizEEnd;
+		mizXmlGetToken(p);
+	} else if (tk == MizXTET) {
+		p.nState ::= MizEEnd;
+		mizXmlGetToken(p);
+		if (p.nCurTokenKind == MizXTID) {
+			mizXmlOpenStartTag(p);
+			mizXmlGetToken(p);
+			if (p.nCurTokenKind == MizXTGT) {
+				mizXmlGetToken(p);
+			} else {
+				mizXmlErrorRecovery(7);
+			}
+		} else {
+			mizXmlErrorRecovery(8);
+		}
+	} else {
+		mizXmlErrorRecovery(9);
+	}
+}
+
+mizXmlAcceptStartState(p : MizXmlParser) -> void {
+	mizXmlNextElementState(p);
+	mizAssert(errElMissing, p.nState == MizEStart);
+}
+
+mizXmlAcceptEndState(p : MizXmlParser) -> void {
+	mizXmlNextElementState(p);
+	mizAssert(errElRedundant, p.nState == MizEEnd);
+}
+
+mizXmlFindAttr(p : MizXmlParser, name : string) -> Maybe<string> {
+	n = sizeVector(p.nAttrVals);
+	res = ref None();
+	i = ref 0;
+	while(\ -> ^i < n && isNone(^res), \ -> {
+		a : MizXmlAttr = getVectorUnsafe(p.nAttrVals, ^i);
+		if (a.name == name) res := Some(a.value);
+		i := ^i + 1;
+	});
+	^res;
+}
+
+mizXmlHasAttr(p : MizXmlParser, name : string) -> bool {
+	isSome(mizXmlFindAttr(p, name));
+}
+
+mizXmlAttr(p : MizXmlParser, name : string) -> string {
+	mizXmlAttrDef(p, name, "");
+}
+
+mizXmlAttrDef(p : MizXmlParser, name : string, def : string) -> string {
+	either(mizXmlFindAttr(p, name), def);
+}
+
+mizXmlIntAttr(p : MizXmlParser, name : string) -> int {
+	switch (mizXmlFindAttr(p, name)) {
+		Some(v): s2i(v);
+		None(): {
+			mizAssert(errMissingXMLAttribute, false);
+			0;
+		}
+	}
+}
+
+mizXmlIntAttrDef(p : MizXmlParser, name : string, def : int) -> int {
+	switch (mizXmlFindAttr(p, name)) {
+		Some(v): s2i(v);
+		None(): def;
+	}
+}
