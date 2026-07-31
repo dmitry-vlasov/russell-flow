@@ -35,6 +35,8 @@ import mizar/original/equalizer;
 import mizar/original/checker;
 import mizar/original/unifier;
 import mizar/original/definientia;
+import mizar/original/print;
+import net/url_parameter;
 
 export {
 	MizPrepStats(
@@ -49,10 +51,13 @@ export {
 	MizPrep(
 		chk : MizChecker,
 		r : MizVrfReader,
-		labeled : Vector<Maybe<MizFrm>>,   // label nr -> proposition
+		labeled : Vector<Maybe<MizFrm>>,   // label nr -> proposition (block-scoped)
+		permLabeled : Vector<Maybe<MizFrm>>, // article-level labels (Def*/theorems)
 		mutable prev : Maybe<MizFrm>,      // the `then` link
+	mutable lastBlockThesis : Maybe<MizFrm>, // set when a BlockThesis is read
 		mutable theorems : Tree<int, MizFrm>,   // key = kindTag*10^8 + articlenr*10^4 + nr
-		mutable ownArticleNr : int,
+		defs : MizDefinientia,
+	mutable ownArticleNr : int,
 		mutable ownTheoremNr : int,
 		mutable ownDefNr : int,
 		stats : MizPrepStats,
@@ -191,10 +196,10 @@ mizCheckArticle(mmlDir : string, article : string) -> MizPrepStats {
 	stats = MizPrepStats(0, 0, 0, 0, 0, makeVector(8));
 	x = mizXmlInitParsingFile(mmlDir + "/" + article + ".xml");
 	r = mizMakeVrfReader(x, env);
-	p = MizPrep(chk, r, makeVector(64), None(), makeTree(), 2, 0, 0, stats);
+	defs = mizMakeDefinientia();
+	p = MizPrep(chk, r, makeVector(64), makeVector(64), None(), None(), makeTree(), defs, 2, 0, 0, stats);
 	mizLoadTheorems(p, getFileContent(mmlDir + "/" + article + ".eth"));
 	mizLoadClusters(env, cl, getFileContent(mmlDir + "/" + article + ".ecl"));
-	defs = mizMakeDefinientia();
 	mizLoadDefinientia(env, defs, mmlDir, article);
 	chk.atomicExpansions ::= \f -> mizAtomicExpansions(env, defs, f);
 	idn.equalsExpand ::= \idn2, funcNr, args -> mizEqualsExpandHook(defs, idn2, funcNr, args);
@@ -212,7 +217,16 @@ mizSetLabeled(p : MizPrep, nr : int, f : MizFrm) -> void {
 }
 
 mizGetLabeled(p : MizPrep, nr : int) -> Maybe<MizFrm> {
-	getVectorDef(p.labeled, nr, None());
+	switch (getVectorDef(p.labeled, nr, None())) {
+		Some(f): Some(f);
+		None(): getVectorDef(p.permLabeled, nr, None());
+	}
+}
+
+// article-level labels: definition and theorem labels survive block exits
+mizSetPermLabeled(p : MizPrep, nr : int, f : MizFrm) -> void {
+	while(\ -> sizeVector(p.permLabeled) <= nr, \ -> pushVector(p.permLabeled, None()));
+	setVectorUnsafe(p.permLabeled, nr, Some(f));
 }
 
 // read one Proposition element (already ON it); returns (labelNr, formula)
@@ -273,6 +287,11 @@ mizJustify(p : MizPrep, claim : MizFrm, posLine : int) -> void {
 		mizXmlNextElementState(x); // past </By>
 		{ st1 = p.stats; st1.checked ::= st1.checked + 1; }
 		if (^ok) {
+			dbgLine = s2i(getUrlParameterDef("debug-line", "-1"));
+			if (line == dbgLine) {
+				println("=== premises at " + i2s(line) + ":" + i2s(col));
+				iterVector(premises, \pf2 -> println("  " + mizFrm2s(pf2)));
+			}
 			mizInferenceChecker(p.chk, premises);
 			if (mizSeqCount(p.chk.chErrNr) == 0) {
 				{ st2 = p.stats; st2.accepted ::= st2.accepted + 1; }
@@ -348,7 +367,7 @@ mizWalkItems(p : MizPrep) -> void {
 				p.ownTheoremNr ::= p.ownTheoremNr + 1;
 				p.theorems ::= setTree(p.theorems,
 					thKey(kindT, p.ownArticleNr, p.ownTheoremNr), pr.second);
-				if (pr.first > 0) mizSetLabeled(p, pr.first, pr.second);
+				if (pr.first > 0) mizSetPermLabeled(p, pr.first, pr.second);
 			}
 			// consume the rest of the JustifiedTheorem element
 			while(\ -> x.nState == MizEStart, \ -> mizXmlSkipElement(x));
@@ -360,6 +379,7 @@ mizWalkItems(p : MizPrep) -> void {
 				pr = mizReadProposition(p);
 				p.theorems ::= setTree(p.theorems,
 					thKey(kindD, p.ownArticleNr, p.ownDefNr), pr.second);
+				if (pr.first > 0) mizSetPermLabeled(p, pr.first, pr.second);
 			}
 			while(\ -> x.nState == MizEStart, \ -> mizXmlSkipElement(x));
 			mizXmlNextElementState(x);
@@ -417,32 +437,37 @@ mizWalkItems(p : MizPrep) -> void {
 			labelMark = sizeVector(p.labeled);
 			prevMark = p.prev;
 			mizXmlNextElementState(x);
-			thesis : ref Maybe<MizFrm> = ref None();
-			if (x.nState == MizEStart && x.nElName == "BlockThesis") {
-				mizXmlNextElementState(x);
-				if (x.nState == MizEStart) {
-					thesis := Some(mizInFormula(p.r));
-				}
-				// consume to </BlockThesis>
-				while(\ -> x.nState == MizEStart, \ -> mizXmlSkipElement(x));
-				mizXmlNextElementState(x);
-			}
+			p.lastBlockThesis ::= None();
 			mizWalkItems(p);
 			mizXmlNextElementState(x);
 			env2.fixedVarNbr ::= fixedMark;
 			while(\ -> sizeVector(p.labeled) > labelMark,
 				\ -> removeVector(p.labeled, sizeVector(p.labeled) - 1));
 			p.prev ::= prevMark;
-			switch (^thesis) {
+			switch (p.lastBlockThesis) {
 				Some(th): {
 					if (labelNr > 0) mizSetLabeled(p, labelNr, th);
 					p.prev ::= Some(th);
 				}
 				None(): {}
 			}
+			p.lastBlockThesis ::= None();
 		} else if (name == "Proof") {
 			mizWalkBlock(p);
-		} else if (name == "BlockThesis" || name == "Thesis"
+		} else if (name == "BlockThesis") {
+			// a Now's BlockThesis = per-item <Thesis> entries, then the block
+			// formula LAST; a Proof's = the formula directly. Take the final
+			// formula child.
+			mizXmlNextElementState(x);
+			while(\ -> x.nState == MizEStart, \ -> {
+				if (mizIsFrmEl(x.nElName)) {
+					p.lastBlockThesis ::= Some(mizInFormula(p.r));
+				} else {
+					mizXmlSkipElement(x);
+				}
+			});
+			mizXmlNextElementState(x);
+		} else if (name == "Thesis"
 			|| name == "ThesisExpansions" || name == "EndPosition"
 			|| name == "Take" || name == "TakeAsVar" || name == "Reservation"
 			|| name == "Section" || name == "DefPred" || name == "DefFunc"
@@ -462,9 +487,24 @@ mizWalkItems(p : MizPrep) -> void {
 			|| name == "CaseBlock" || name == "SupposeBlock") {
 			// walk inside: these contain items/justifications of the same shape
 			mizWalkBlock(p);
+		} else if (name == "Definiens") {
+			// the article's own definientia arrive inline; equals-definitions
+			// feed the equals-expansion, the rest the atom expansion pool
+			d = mizInDefiniens(p.r);
+			pushVector(p.defs.all, d);
+			pushVector(p.defs.expansions, d);
+			switch (mizEqualsExpansionPub(p.chk.env, d)) {
+				Some(ed): {
+					key = d.constrNr;
+					cur = lookupTreeDef(p.defs.equalsBy, key, []);
+					df = p.defs;
+					df.equalsBy ::= setTree(df.equalsBy, key, arrayPush(cur, ed));
+				}
+				None(): {}
+			}
 		} else if (name == "PerCasesReasoning" || name == "PerCases"
 			|| name == "IterEquality" || name == "SchemeBlock"
-			|| name == "Canceled" || name == "Definiens" || name == "Pattern"
+			|| name == "Canceled" || name == "Pattern"
 			|| name == "Identify" || name == "Reduction") {
 			{ st7 = p.stats; st7.skippedBlocks ::= st7.skippedBlocks + 1; }
 			mizXmlSkipElement(x);
