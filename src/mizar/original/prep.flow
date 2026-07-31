@@ -1,0 +1,472 @@
+// The CheckerOnly pass: walk a Mizar analyzer report (`.xml`) and check every
+// `by` justification — the transcription of the mizprep.pas / prepobj.pas /
+// prephan.pas premise assembly reduced to what the checker consumes:
+//
+//   premises of a `by` = ¬(the justified proposition) + the linked previous
+//   proposition + the cited references (private label / theorem / def).
+//
+// The walker maintains the two per-level facts the checker reads: FixedVar
+// (constants introduced by Let/Consider/Given, with their types) and the
+// label table. Nested Proof/Now blocks save and restore both.
+//
+// Environment: constructors from `.atr`, requirements from `.ere`, theorems
+// and def-theorems from `.eth`, clusters from `.ecl`.
+// STAGED: `from` scheme justifications (schemes.pas) are counted and
+// skipped; PerCases/IterEquality blocks likewise; definientia (.dfs) load
+// with the expansion machinery. Each skip is COUNTED, never silent.
+
+import string;
+import loop;
+import ds/vector;
+import ds/tree;
+import fs/filesystem;
+import mizar/original/errhan;
+import mizar/original/mobjects;
+import mizar/original/lexicon;
+import mizar/original/builtin;
+import mizar/original/xml_parser;
+import mizar/original/correl;
+import mizar/original/correl_inst;
+import mizar/original/iocorrel;
+import mizar/original/roundcl;
+import mizar/original/identify;
+import mizar/original/prechecker;
+import mizar/original/equalizer;
+import mizar/original/checker;
+import mizar/original/unifier;
+
+export {
+	MizPrepStats(
+		mutable checked : int,       // by-inferences run through the checker
+		mutable accepted : int,      // empty error set
+		mutable failed : int,        // nonempty error set
+		mutable skippedFrom : int,   // scheme justifications (staged)
+		mutable skippedBlocks : int, // unrecognized block kinds
+		failures : Vector<string>,   // "line:col errs" for the failed ones
+	);
+
+	MizPrep(
+		chk : MizChecker,
+		r : MizVrfReader,
+		labeled : Vector<Maybe<MizFrm>>,   // label nr -> proposition
+		mutable prev : Maybe<MizFrm>,      // the `then` link
+		mutable theorems : Tree<int, MizFrm>,   // key = kindTag*10^8 + articlenr*10^4 + nr
+		mutable ownArticleNr : int,
+		mutable ownTheoremNr : int,
+		mutable ownDefNr : int,
+		stats : MizPrepStats,
+	);
+
+	// Load the environment and check one article's analyzer report.
+	// mmlDir = …/mml, article = base name. Returns the stats.
+	mizCheckArticle(mmlDir : string, article : string) -> MizPrepStats;
+}
+
+kindT = 1;
+kindD = 2;
+
+thKey(kind : int, articlenr : int, nr : int) -> int {
+	kind * 100000000 + articlenr * 10000 + nr;
+}
+
+// ---------------- environment loading ----------------
+
+mizLoadRequirements(env : MizCorrelEnv, path : string) -> void {
+	content = getFileContent(path);
+	lines = strSplit(content, "\n");
+	fori(0, min(length(lines) - 1, rqLAST), \i -> {
+		v = s2i(trim(lines[i]));
+		mizSetBuiltIn(env.builtIn, i, v);
+	});
+}
+
+mizLoadTheorems(p : MizPrep, content : string) -> void {
+	r2 = mizMakeVrfReaderMML(mizXmlInitParsing(content), p.r.env);
+	x = r2.x;
+	mizXmlNextElementState(x);
+	mizXmlAssert(x.nElName == "Theorems");
+	mizXmlNextElementState(x);
+	maxArt = ref 0;
+	while(\ -> x.nState == MizEStart, \ -> {
+		if (x.nElName == "Theorem") {
+			articlenr = mizXmlIntAttrDef(x, "articlenr", 0);
+			nr = mizXmlIntAttrDef(x, "nr", 0);
+			kindS = mizXmlAttr(x, "kind");
+			kind = if (kindS == "T") kindT else kindD;
+			if (articlenr > ^maxArt) maxArt := articlenr;
+			mizXmlNextElementState(x);
+			f = mizInFormula(r2);
+			// after the formula: at </Theorem>; advance
+			mizXmlNextElementState(x);
+			p.theorems ::= setTree(p.theorems, thKey(kind, articlenr, nr), f);
+		} else {
+			mizXmlSkipElement(x);
+		}
+	});
+	p.ownArticleNr ::= ^maxArt + 1;
+}
+
+// .ecl: <Registrations> with RCluster/CCluster/FCluster
+mizLoadClusters(env : MizCorrelEnv, cl : MizClusters, content : string) -> void {
+	r2 = mizMakeVrfReaderMML(mizXmlInitParsing(content), env);
+	x = r2.x;
+	mizXmlNextElementState(x);
+	mizXmlAssert(x.nElName == "Registrations");
+	mizXmlNextElementState(x);
+	while(\ -> x.nState == MizEStart, \ -> {
+		mizReadOneCluster(env, cl, r2);
+	});
+}
+
+// one RCluster/CCluster/FCluster element (also used for inline ones in .xml)
+mizReadOneCluster(env : MizCorrelEnv, cl : MizClusters, r2 : MizVrfReader) -> void {
+	x = r2.x;
+	name = x.nElName;
+	aid = mizXmlAttr(x, "aid");
+	nr = mizXmlIntAttrDef(x, "nr", 0);
+	if (name == "RCluster") {
+		mizXmlNextElementState(x);
+		prims = mizInArgColl(r2);
+		typ = mizInType(r2);
+		lower = mizInAttrColl(r2);
+		// the DB format may carry a second cluster
+		upper = if (x.nState == MizEStart && x.nElName == "Cluster") mizInAttrColl(r2)
+			else mizCopyCluster(lower);
+		mizInsertRCluster(cl, MizRCluster(aid, nr, prims, MizClusterRec(lower, upper), typ));
+		mizXmlNextElementState(x);
+	} else if (name == "CCluster") {
+		mizXmlNextElementState(x);
+		prims = mizInArgColl(r2);
+		ante = mizInAttrColl(r2);
+		typ = mizInType(r2);
+		lower = mizInAttrColl(r2);
+		upper = if (x.nState == MizEStart && x.nElName == "Cluster") mizInAttrColl(r2)
+			else mizCopyCluster(lower);
+		mizInsertCCluster(env, cl, MizCCluster(aid, nr, prims, ante,
+			MizClusterRec(lower, upper), typ));
+		mizXmlNextElementState(x);
+	} else if (name == "FCluster") {
+		mizXmlNextElementState(x);
+		prims = mizInArgColl(r2);
+		trm = mizInTerm(r2);
+		lower = mizInAttrColl(r2);
+		typ : Maybe<MizTyp> = if (x.nState == MizEStart && x.nElName == "Typ")
+			Some(mizInType(r2)) else None();
+		mizInsertFCluster(env, cl, MizFCluster(aid, nr, prims,
+			MizClusterRec(lower, mizCopyCluster(lower)), trm, typ));
+		mizXmlNextElementState(x);
+	} else {
+		mizXmlSkipElement(x);
+	}
+}
+
+// MML-format reader (one cluster per Typ)
+mizMakeVrfReaderMML(x : MizXmlParser, env : MizCorrelEnv) -> MizVrfReader {
+	r = mizMakeVrfReader(x, env);
+	r.mml ::= true;
+	r;
+}
+
+// ---------------- the walker ----------------
+
+mizCheckArticle(mmlDir : string, article : string) -> MizPrepStats {
+	env = mizMakeCorrelEnv();
+	cl = mizMakeClusters();
+	mizWireRoundcl(env, cl);
+	idn = mizMakeIdentify(env);
+	chk = mizMakeChecker(env, idn, cl);
+	mizWireUnifier(chk);
+
+	// environment
+	r0 = mizMakeVrfReader(mizXmlInitParsing(""), env);
+	mizLoadConstructors(r0, getFileContent(mmlDir + "/" + article + ".atr"));
+	mizLoadRequirements(env, mmlDir + "/" + article + ".ere");
+	env.itTyp ::= mizNewStandardTyp(ikTypMode, mizNewEmptyCluster(),
+		mizNewEmptyCluster(), mizBuiltIn(env.builtIn, rqAny), mizNil);
+	env.nonZeroTyp ::= mizNewStandardTyp(ikTypMode, mizNewEmptyCluster(),
+		mizNewEmptyCluster(), mizBuiltIn(env.builtIn, rqAny), mizNil);
+	mizInitRevReq(idn);
+
+	stats = MizPrepStats(0, 0, 0, 0, 0, makeVector(8));
+	x = mizXmlInitParsingFile(mmlDir + "/" + article + ".xml");
+	r = mizMakeVrfReader(x, env);
+	p = MizPrep(chk, r, makeVector(64), None(), makeTree(), 2, 0, 0, stats);
+	mizLoadTheorems(p, getFileContent(mmlDir + "/" + article + ".eth"));
+	mizLoadClusters(env, cl, getFileContent(mmlDir + "/" + article + ".ecl"));
+
+	mizXmlNextElementState(x);
+	mizXmlAssert(x.nElName == "Article");
+	mizXmlNextElementState(x);
+	mizWalkItems(p);
+	stats;
+}
+
+mizSetLabeled(p : MizPrep, nr : int, f : MizFrm) -> void {
+	while(\ -> sizeVector(p.labeled) <= nr, \ -> pushVector(p.labeled, None()));
+	setVectorUnsafe(p.labeled, nr, Some(f));
+}
+
+mizGetLabeled(p : MizPrep, nr : int) -> Maybe<MizFrm> {
+	getVectorDef(p.labeled, nr, None());
+}
+
+// read one Proposition element (already ON it); returns (labelNr, formula)
+mizReadProposition(p : MizPrep) -> Pair<int, MizFrm> {
+	x = p.r.x;
+	nr = mizXmlIntAttrDef(x, "nr", 0);
+	mizXmlNextElementState(x); // into the formula
+	f = mizInFormula(p.r);
+	// now at </Proposition>; advance
+	mizXmlNextElementState(x);
+	Pair(nr, f);
+}
+
+// a justification follows: By / From / Proof / SkippedProof.
+// `claim` is the proposition being justified.
+mizJustify(p : MizPrep, claim : MizFrm, posLine : int) -> void {
+	env = p.chk.env;
+	x = p.r.x;
+	name = x.nElName;
+	if (x.nState != MizEStart) {
+		// no justification element (shouldn't happen) — nothing to do
+	} else if (name == "By") {
+		linked = mizXmlAttr(x, "linked") == "true";
+		line = mizXmlIntAttrDef(x, "line", posLine);
+		col = mizXmlIntAttrDef(x, "col", 0);
+		premises : Vector<MizFrm> = makeVector(8);
+		pushVector(premises, mizNewNeg(mizCopyFrm(claim)));
+		if (linked) {
+			switch (p.prev) {
+				Some(pf): pushVector(premises, mizCopyFrm(pf));
+				None(): {}
+			}
+		}
+		mizXmlNextElementState(x);
+		ok = ref true;
+		while(\ -> x.nState == MizEStart, \ -> {
+			if (x.nElName == "Ref") {
+				nr = mizXmlIntAttrDef(x, "nr", 0);
+				if (mizXmlHasAttr(x, "articlenr")) {
+					art = mizXmlIntAttr(x, "articlenr");
+					kindS = mizXmlAttr(x, "kind");
+					kind = if (kindS == "T") kindT else kindD;
+					switch (lookupTree(p.theorems, thKey(kind, art, nr))) {
+						Some(f): pushVector(premises, mizCopyFrm(f));
+						None(): ok := false; // unresolvable citation
+					}
+				} else {
+					switch (mizGetLabeled(p, nr)) {
+						Some(f): pushVector(premises, mizCopyFrm(f));
+						None(): ok := false;
+					}
+				}
+				mizXmlSkipElement(x);
+			} else {
+				mizXmlSkipElement(x);
+			}
+		});
+		mizXmlNextElementState(x); // past </By>
+		{ st1 = p.stats; st1.checked ::= st1.checked + 1; }
+		if (^ok) {
+			mizInferenceChecker(p.chk, premises);
+			if (mizSeqCount(p.chk.chErrNr) == 0) {
+				{ st2 = p.stats; st2.accepted ::= st2.accepted + 1; }
+			} else {
+				{ st3 = p.stats; st3.failed ::= st3.failed + 1; }
+				errs = fold(enumFromTo(0, mizSeqCount(p.chk.chErrNr) - 1), "",
+					\acc, i -> acc + " " + i2s(mizSeqValue(p.chk.chErrNr, i)));
+				pushVector(p.stats.failures, i2s(line) + ":" + i2s(col) + errs);
+			}
+		} else {
+			{ st4 = p.stats; st4.failed ::= st4.failed + 1; }
+			pushVector(p.stats.failures, i2s(line) + ":" + i2s(col) + " unresolved-ref");
+		}
+	} else if (name == "From") {
+		{ st5 = p.stats; st5.skippedFrom ::= st5.skippedFrom + 1; }
+		mizXmlSkipElement(x);
+	} else if (name == "Proof") {
+		mizWalkBlock(p);
+	} else if (name == "SkippedProof") {
+		mizXmlSkipElement(x);
+	} else {
+		// unknown justification
+		{ st6 = p.stats; st6.skippedBlocks ::= st6.skippedBlocks + 1; }
+		mizXmlSkipElement(x);
+	}
+}
+
+// walk a Proof/Now/CaseBlock-style block: save scope, process items, restore
+mizWalkBlock(p : MizPrep) -> void {
+	env = p.chk.env;
+	x = p.r.x;
+	fixedMark = env.fixedVarNbr;
+	labelMark = sizeVector(p.labeled);
+	prevMark = p.prev;
+	mizXmlNextElementState(x); // into the block
+	mizWalkItems(p);
+	// at </block>; advance
+	mizXmlNextElementState(x);
+	env.fixedVarNbr ::= fixedMark;
+	while(\ -> sizeVector(p.labeled) > labelMark,
+		\ -> removeVector(p.labeled, sizeVector(p.labeled) - 1));
+	p.prev ::= prevMark;
+}
+
+// push a fixed constant with the given type
+mizPushFixed(p : MizPrep, typ : MizTyp) -> void {
+	env = p.chk.env;
+	env.fixedVarNbr ::= env.fixedVarNbr + 1;
+	while(\ -> sizeVector(env.fixedVar) <= env.fixedVarNbr,
+		\ -> pushVector(env.fixedVar, MizFixedVar(0, mizNewIncorTyp(), false, None(), 0)));
+	fv : MizFixedVar = getVectorUnsafe(env.fixedVar, env.fixedVarNbr);
+	fv.typ ::= typ;
+	fv.def ::= None();
+}
+
+// process the items of the current level until the enclosing end tag
+mizWalkItems(p : MizPrep) -> void {
+	env = p.chk.env;
+	x = p.r.x;
+	while(\ -> x.nState == MizEStart && x.nCurTokenKind != MizXTEOTX, \ -> {
+		name = x.nElName;
+		if (name == "Proposition") {
+			pr = mizReadProposition(p);
+			mizJustify(p, pr.second, 0);
+			if (pr.first > 0) mizSetLabeled(p, pr.first, pr.second);
+			p.prev ::= Some(pr.second);
+		} else if (name == "JustifiedTheorem") {
+			mizXmlNextElementState(x);
+			// Proposition + justification (or SkippedProof)
+			if (x.nState == MizEStart && x.nElName == "Proposition") {
+				pr = mizReadProposition(p);
+				mizJustify(p, pr.second, 0);
+				p.ownTheoremNr ::= p.ownTheoremNr + 1;
+				p.theorems ::= setTree(p.theorems,
+					thKey(kindT, p.ownArticleNr, p.ownTheoremNr), pr.second);
+				if (pr.first > 0) mizSetLabeled(p, pr.first, pr.second);
+			}
+			// consume the rest of the JustifiedTheorem element
+			while(\ -> x.nState == MizEStart, \ -> mizXmlSkipElement(x));
+			mizXmlNextElementState(x);
+		} else if (name == "DefTheorem") {
+			p.ownDefNr ::= p.ownDefNr + 1;
+			mizXmlNextElementState(x);
+			if (x.nState == MizEStart && x.nElName == "Proposition") {
+				pr = mizReadProposition(p);
+				p.theorems ::= setTree(p.theorems,
+					thKey(kindD, p.ownArticleNr, p.ownDefNr), pr.second);
+			}
+			while(\ -> x.nState == MizEStart, \ -> mizXmlSkipElement(x));
+			mizXmlNextElementState(x);
+		} else if (name == "Let") {
+			n = mizXmlIntAttrDef(x, "nr", 1);
+			mizXmlNextElementState(x);
+			while(\ -> x.nState == MizEStart && x.nElName == "Typ", \ -> {
+				typ = mizInType(p.r);
+				mizPushFixed(p, typ);
+			});
+			while(\ -> x.nState == MizEStart, \ -> mizXmlSkipElement(x));
+			mizXmlNextElementState(x);
+		} else if (name == "Assume") {
+			mizXmlNextElementState(x);
+			while(\ -> x.nState == MizEStart, \ -> {
+				if (x.nElName == "Proposition") {
+					pr = mizReadProposition(p);
+					if (pr.first > 0) mizSetLabeled(p, pr.first, pr.second);
+					p.prev ::= Some(pr.second);
+				} else {
+					mizXmlSkipElement(x);
+				}
+			});
+			mizXmlNextElementState(x);
+		} else if (name == "Consider" || name == "Given") {
+			mizXmlNextElementState(x);
+			// existence Proposition + its justification
+			if (x.nState == MizEStart && x.nElName == "Proposition") {
+				pr = mizReadProposition(p);
+				mizJustify(p, pr.second, 0);
+			}
+			// new constants + assumed property propositions
+			while(\ -> x.nState == MizEStart, \ -> {
+				if (x.nElName == "Typ") {
+					typ = mizInType(p.r);
+					mizPushFixed(p, typ);
+				} else if (x.nElName == "Proposition") {
+					pr2 = mizReadProposition(p);
+					if (pr2.first > 0) mizSetLabeled(p, pr2.first, pr2.second);
+					p.prev ::= Some(pr2.second);
+				} else {
+					mizXmlSkipElement(x);
+				}
+			});
+			mizXmlNextElementState(x);
+		} else if (name == "Conclusion") {
+			mizXmlNextElementState(x);
+			mizWalkItems(p);
+			mizXmlNextElementState(x);
+		} else if (name == "Now") {
+			// diffuse block: its BlockThesis becomes the labeled fact
+			labelNr = mizXmlIntAttrDef(x, "nr", 0);
+			env2 = p.chk.env;
+			fixedMark = env2.fixedVarNbr;
+			labelMark = sizeVector(p.labeled);
+			prevMark = p.prev;
+			mizXmlNextElementState(x);
+			thesis : ref Maybe<MizFrm> = ref None();
+			if (x.nState == MizEStart && x.nElName == "BlockThesis") {
+				mizXmlNextElementState(x);
+				if (x.nState == MizEStart) {
+					thesis := Some(mizInFormula(p.r));
+				}
+				// consume to </BlockThesis>
+				while(\ -> x.nState == MizEStart, \ -> mizXmlSkipElement(x));
+				mizXmlNextElementState(x);
+			}
+			mizWalkItems(p);
+			mizXmlNextElementState(x);
+			env2.fixedVarNbr ::= fixedMark;
+			while(\ -> sizeVector(p.labeled) > labelMark,
+				\ -> removeVector(p.labeled, sizeVector(p.labeled) - 1));
+			p.prev ::= prevMark;
+			switch (^thesis) {
+				Some(th): {
+					if (labelNr > 0) mizSetLabeled(p, labelNr, th);
+					p.prev ::= Some(th);
+				}
+				None(): {}
+			}
+		} else if (name == "Proof") {
+			mizWalkBlock(p);
+		} else if (name == "BlockThesis" || name == "Thesis"
+			|| name == "ThesisExpansions" || name == "EndPosition"
+			|| name == "Take" || name == "TakeAsVar" || name == "Reservation"
+			|| name == "Section" || name == "DefPred" || name == "DefFunc"
+			|| name == "SkippedProof") {
+			mizXmlSkipElement(x);
+		} else if (name == "Constructor") {
+			c = mizInConstructor1(p.r);
+			__nr = mizPushConstr(p.chk.env, c);
+			{}
+		} else if (name == "RCluster" || name == "CCluster" || name == "FCluster") {
+			mizReadOneCluster(p.chk.env, p.chk.clusters, p.r);
+		} else if (name == "DefinitionBlock" || name == "RegistrationBlock"
+			|| name == "NotationBlock" || name == "Registration"
+			|| name == "Definition" || name == "JustifiedProperty"
+			|| name == "Coherence" || name == "Existence" || name == "Uniqueness"
+			|| name == "Compatibility" || name == "Correctness"
+			|| name == "CaseBlock" || name == "SupposeBlock") {
+			// walk inside: these contain items/justifications of the same shape
+			mizWalkBlock(p);
+		} else if (name == "PerCasesReasoning" || name == "PerCases"
+			|| name == "IterEquality" || name == "SchemeBlock"
+			|| name == "Canceled" || name == "Definiens" || name == "Pattern"
+			|| name == "Identify" || name == "Reduction") {
+			{ st7 = p.stats; st7.skippedBlocks ::= st7.skippedBlocks + 1; }
+			mizXmlSkipElement(x);
+		} else {
+			// anything unrecognized: skip and count
+			{ st8 = p.stats; st8.skippedBlocks ::= st8.skippedBlocks + 1; }
+			mizXmlSkipElement(x);
+		}
+	});
+}
