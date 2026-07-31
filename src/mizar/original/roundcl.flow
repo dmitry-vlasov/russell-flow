@@ -10,6 +10,8 @@
 // import.
 
 import ds/vector;
+import ds/tree;
+import string;
 import loop;
 import math/math;
 import mizar/original/errhan;
@@ -41,7 +43,23 @@ export {
 		condIndexPos : Vector<MizNatFunc>,    // index = adjusted attr nr
 		condIndexNeg : Vector<MizNatFunc>,
 		initClFire : MizIntSeq,               // antecedent sizes
+		mutable nRoundCluster : int,          // perf counters (debug only)
+		mutable nTryRounding : int,
+		mutable nRoundTrmType : int,
+		// re-entrant scratch pool for RoundUpCluster (the original uses fixed
+		// arrays + move(); allocating per call dominated the profile)
+		scratchFire : Vector<Vector<int>>,
+		scratchStack : Vector<Vector<int>>,
+		scratchIn : Vector<Vector<bool>>,
+		mutable scratchDepth : int,
+		// rounded-type memo, keyed by a structural term key. RoundUpTrmType is
+		// a pure function of (term, cluster registry), and the registry is
+		// fixed within an inference — the original amortizes the same work
+		// through gTermCollection (InsertTermInTTColl). Cleared per inference.
+		mutable roundMemo : Tree<string, MizTyp>,
 	);
+
+	mizClearRoundMemo(cl : MizClusters) -> void;
 
 	mizMakeClusters() -> MizClusters;
 	mizInsertRCluster(cl : MizClusters, r : MizRCluster) -> void;
@@ -66,7 +84,8 @@ export {
 
 mizMakeClusters() -> MizClusters {
 	MizClusters(makeVector(16), makeVector(16), makeVector(16),
-		makeVector(64), makeVector(64), mizInitIntSeq(16));
+		makeVector(64), makeVector(64), mizInitIntSeq(16), 0, 0, 0,
+		makeVector(8), makeVector(8), makeVector(8), 0, makeTree());
 }
 
 mizWireRoundcl(env : MizCorrelEnv, cl : MizClusters) -> void {
@@ -213,11 +232,33 @@ mizTryRounding(env : MizCorrelEnv, cond : MizCCluster, typ : MizTyp,
 // MCondClList.RoundUpCluster — the graph-chasing loop
 mizRoundUpCluster(env : MizCorrelEnv, cl : MizClusters,
 		cluster : MizAttrColl, typ : MizTyp) -> void {
+	cl.nRoundCluster ::= cl.nRoundCluster + 1;
 	nCond = sizeVector(cl.conditional);
 	if (nCond > 0) {
-		clFire : Vector<int> = makeVector(nCond);
-		fori(0, nCond - 1, \j -> pushVector(clFire, mizSeqValue(cl.initClFire, j)));
-		jobs = mizInitNatSet(32);
+		// this recursion level's scratch buffers (grown once, then reused)
+		depth = cl.scratchDepth;
+		cl.scratchDepth ::= depth + 1;
+		while(\ -> sizeVector(cl.scratchFire) <= depth, \ -> {
+			pushVector(cl.scratchFire, makeVector(nCond));
+			pushVector(cl.scratchStack, makeVector(32));
+			pushVector(cl.scratchIn, makeVector(nCond));
+		});
+		clFire : Vector<int> = getVectorUnsafe(cl.scratchFire, depth);
+		jobStack : Vector<int> = getVectorUnsafe(cl.scratchStack, depth);
+		inJobs : Vector<bool> = getVectorUnsafe(cl.scratchIn, depth);
+		clearVector(jobStack);
+		while(\ -> sizeVector(clFire) < nCond, \ -> pushVector(clFire, 0));
+		while(\ -> sizeVector(inJobs) < nCond, \ -> pushVector(inJobs, false));
+		fori(0, nCond - 1, \j -> {
+			setVectorUnsafe(clFire, j, mizSeqValue(cl.initClFire, j));
+			setVectorUnsafe(inJobs, j, false);
+		});
+		pushJob = \nr : int -> {
+			if (!getVectorUnsafe(inJobs, nr)) {
+				setVectorUnsafe(inJobs, nr, true);
+				pushVector(jobStack, nr);
+			}
+		};
 		oldPos = mizInitNatFunc(32);
 		oldNeg = mizInitNatFunc(32);
 
@@ -243,7 +284,7 @@ mizRoundUpCluster(env : MizCorrelEnv, cl : MizClusters,
 							clNr = mizNatItem(idxSet, k).x;
 							setVectorUnsafe(clFire, clNr, getVectorUnsafe(clFire, clNr) - 1);
 							if (getVectorUnsafe(clFire, clNr) <= 0) {
-								mizNatInsertElem(jobs, clNr);
+								pushJob(clNr);
 							}
 						});
 					}
@@ -256,16 +297,18 @@ mizRoundUpCluster(env : MizCorrelEnv, cl : MizClusters,
 
 		// clusters with empty antecedent fire immediately
 		fori(0, nCond - 1, \j -> {
-			if (getVectorUnsafe(clFire, j) == 0) mizNatInsertElem(jobs, j);
+			if (getVectorUnsafe(clFire, j) == 0) pushJob(j);
 		});
 		cur = ref handleUsageAndFire(oldPos, oldNeg);
-		while(\ -> cluster.consistent && mizNatCount(jobs) > 0, \ -> {
-			last = mizNatItem(jobs, mizNatCount(jobs) - 1).x;
-			mizNatDeleteElem(jobs, last);
+		while(\ -> cluster.consistent && sizeVector(jobStack) > 0, \ -> {
+			last = getVectorUnsafe(jobStack, sizeVector(jobStack) - 1);
+			removeVector(jobStack, sizeVector(jobStack) - 1);
+			setVectorUnsafe(inJobs, last, false);
 			if (mizTryRounding(env, getVectorUnsafe(cl.conditional, last), typ, cluster)) {
 				cur := handleUsageAndFire((^cur).first, (^cur).second);
 			}
 		});
+		cl.scratchDepth ::= depth;
 	}
 }
 
@@ -387,9 +430,50 @@ mizRoundUpTrmTypeWithType(env : MizCorrelEnv, cl : MizClusters,
 	typ;
 }
 
+mizClearRoundMemo(cl : MizClusters) -> void {
+	cl.roundMemo ::= makeTree();
+}
+
+// structural key for the rounded-type memo
+mizTrmKey(t : MizTrm) -> string {
+	switch (t) {
+		MizVarTrm(srt, varNr, __, __): "v" + i2s(srt) + ":" + i2s(varNr);
+		MizFuncTrm(srt, funcNr, args, __, __):
+			"f" + i2s(srt) + ":" + i2s(funcNr) + "(" + mizTrmListKey(args) + ")";
+		MizPrivFuncTrm(funcNr, args, __, __, __):
+			"p" + i2s(funcNr) + "(" + mizTrmListKey(args) + ")";
+		default: "?";
+	}
+}
+
+mizTrmListKey(l : MizTrmList) -> string {
+	switch (l) {
+		MizTrmNil(): "";
+		MizTrmElem(trm, next): mizTrmKey(trm) + "," + mizTrmListKey(next);
+	}
+}
+
 mizRoundUpTrmType(env : MizCorrelEnv, cl : MizClusters, t0 : MizTrm) -> MizTyp {
+	cl.nRoundTrmType ::= cl.nRoundTrmType + 1;
 	t = mizSkipPrivFunc(t0);
-	mizRoundUpTrmTypeWithType(env, cl, mizCopyTrmType(env, t), t);
+	srt = mizTrmSort(t);
+	if (srt == ikTrmFunctor || srt == ikTrmSelector || srt == ikTrmAggreg) {
+		key = mizTrmKey(t);
+		if (key == "?" || strContains(key, "?")) {
+			mizRoundUpTrmTypeWithType(env, cl, mizCopyTrmType(env, t), t);
+		} else {
+			switch (lookupTree(cl.roundMemo, key)) {
+				Some(cached): mizCopyTyp(cached);
+				None(): {
+					res = mizRoundUpTrmTypeWithType(env, cl, mizCopyTrmType(env, t), t);
+					cl.roundMemo ::= setTree(cl.roundMemo, key, mizCopyTyp(res));
+					res;
+				}
+			}
+		}
+	} else {
+		mizRoundUpTrmTypeWithType(env, cl, mizCopyTrmType(env, t), t);
+	}
 }
 
 mizTypRoundUp(env : MizCorrelEnv, cl : MizClusters, typ : MizTyp) -> void {
