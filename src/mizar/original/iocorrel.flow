@@ -1,0 +1,505 @@
+// Transcription of ~/dev/system/kernel/iocorrel.pas — the InVRFFileObj input
+// layer: terms, types, attribute collections and formulas from the Mizar
+// XML intermediate files (`.xml` analyzer report, `.eno`, `.ecl`, …).
+//
+// Element dispatch is by tag STRING (the original goes through xmldict's
+// TXMLElemKind; the names here are exactly XMLElemName[]). The reader keeps
+// the same protocol as the original: on entry to each In_* the parser stands
+// ON the element's start state; on exit it stands past the element.
+//
+// The reader carries the MizCorrelEnv because In_UnivFormula/In_FraenkelTerm
+// maintain the BoundVar type stack (used later by type computations), and
+// cluster insertion is sorted through the constructor table.
+
+import string;
+import loop;
+import ds/vector;
+import mizar/original/errhan;
+import mizar/original/mobjects;
+import mizar/original/lexicon;
+import mizar/original/xml_parser;
+import mizar/original/correl;
+
+export {
+	// mml=false: VRF format (.xml analyzer report; Typ carries TWO clusters,
+	// cluster attrs inserted SORTED). mml=true: MML/DB format (.atr, prel;
+	// Typ carries ONE cluster copied to upper, attrs APPENDED) — the original
+	// has InVRFFileObj vs InMMLFileObj for exactly this split.
+	MizVrfReader(
+		x : MizXmlParser,
+		env : MizCorrelEnv,
+		mutable mml : bool,
+	);
+
+	mizMakeVrfReader(x : MizXmlParser, env : MizCorrelEnv) -> MizVrfReader;
+
+	// GetLexemAttrs(atKind, atNr): kind char + nr
+	mizInLexem(r : MizVrfReader) -> Pair<int, int>;
+
+	mizInTerm(r : MizVrfReader) -> MizTrm;
+	mizInTermList(r : MizVrfReader) -> MizTrmList;
+	mizInAttr(r : MizVrfReader) -> MizAttr;
+	mizInAttrColl(r : MizVrfReader) -> MizAttrColl;
+	mizInType(r : MizVrfReader) -> MizTyp;
+	mizInTypeColl(r : MizVrfReader) -> Vector<MizTyp>;
+	mizInFormula(r : MizVrfReader) -> MizFrm;
+
+	// is the current element a term / formula element?
+	mizIsTermEl(name : string) -> bool;
+	mizIsFrmEl(name : string) -> bool;
+
+	// constructors (.atr / prel .dco payload)
+	mizInArgColl(r : MizVrfReader) -> Vector<MizTyp>;
+	mizInConstructor1(r : MizVrfReader) -> MizConstr;
+	mizLoadConstructors(r : MizVrfReader, content : string) -> void;
+}
+
+mizMakeVrfReader(x : MizXmlParser, env : MizCorrelEnv) -> MizVrfReader {
+	MizVrfReader(x, env, false);
+}
+
+// XVarEl2Kind
+mizXVarEl2Kind(name : string) -> int {
+	if (name == "LocusVar") ikTrmLocus
+	else if (name == "Var") ikTrmBound
+	else if (name == "Const") ikTrmConstant
+	else if (name == "InfConst") ikTrmInfConst
+	else if (name == "FreeVar") ikTrmFreeVar
+	else if (name == "LambdaVar") ikTrmLambdaVar
+	else if (name == "Num") ikTrmNumeral
+	else {
+		mizRunTimeError(2038);
+		ikError;
+	}
+}
+
+mizIsVarEl(name : string) -> bool {
+	name == "LocusVar" || name == "Var" || name == "Const" || name == "InfConst"
+	|| name == "FreeVar" || name == "LambdaVar" || name == "Num";
+}
+
+mizIsTermEl(name : string) -> bool {
+	mizIsVarEl(name) || name == "Func" || name == "PrivFunc" || name == "Fraenkel"
+	|| name == "Choice" || name == "It" || name == "ErrorTrm";
+}
+
+mizIsFrmEl(name : string) -> bool {
+	name == "Not" || name == "And" || name == "For" || name == "Pred"
+	|| name == "PrivPred" || name == "Is" || name == "FlexFrm"
+	|| name == "Verum" || name == "ErrorFrm";
+}
+
+// GetLexemAttrs( atKind, atNr): kind is a one-char attribute
+mizInLexem(r : MizVrfReader) -> Pair<int, int> {
+	kindS = mizXmlAttr(r.x, "kind");
+	nr = mizXmlIntAttrDef(r.x, "nr", 0);
+	kind = if (strlen(kindS) >= 1) getCharCodeAt(kindS, 0) else ikError;
+	Pair(kind, nr);
+}
+
+// ---------------- terms ----------------
+
+mizInTerm(r : MizVrfReader) -> MizTrm {
+	name = r.x.nElName;
+	res = if (mizIsVarEl(name)) {
+		mizInVarTerm(r);
+	} else if (name == "Func") {
+		mizInFuncTerm(r);
+	} else if (name == "PrivFunc") {
+		mizInPrivFuncTerm(r);
+	} else if (name == "Fraenkel") {
+		mizInFraenkelTerm(r);
+	} else if (name == "Choice") {
+		mizInChoiceTerm(r);
+	} else if (name == "It" || name == "ErrorTrm") {
+		mizInUniqTerm(r);
+	} else {
+		mizRunTimeError(2038);
+		mizNewIncorTrm();
+	}
+	mizXmlNextElementState(r.x);
+	res;
+}
+
+// ends at the element-end tag or a non-term element (protocol of the original)
+mizInTermList(r : MizVrfReader) -> MizTrmList {
+	head = ref MizTrmNil();
+	tailEl : ref Maybe<MizTrmElem> = ref None();
+	while(\ -> r.x.nState != MizEEnd && mizIsTermEl(r.x.nElName), \ -> {
+		e = MizTrmElem(mizInTerm(r), MizTrmNil());
+		switch (^tailEl) {
+			None(): head := e;
+			Some(prev): prev.next ::= e;
+		}
+		tailEl := Some(e);
+	});
+	^head;
+}
+
+mizInVarTerm(r : MizVrfReader) -> MizTrm {
+	res = mizNewVarTrm(mizXVarEl2Kind(r.x.nElName), mizXmlIntAttr(r.x, "nr"));
+	mizXmlAcceptEndState(r.x);
+	res;
+}
+
+mizInFuncTerm(r : MizVrfReader) -> MizTrm {
+	lx = mizInLexem(r);
+	mizXmlNextElementState(r.x);
+	res = mizNewLocFuncTrm(lx.first, lx.second, mizInTermList(r));
+	mizAssert(errElRedundant, r.x.nState == MizEEnd);
+	res;
+}
+
+mizInPrivFuncTerm(r : MizVrfReader) -> MizTrm {
+	funcNr = mizXmlIntAttr(r.x, "nr");
+	mizXmlNextElementState(r.x);
+	expn = mizInTerm(r);
+	args = mizInTermList(r);
+	res = mizNewPrivFuncTrm(funcNr, args, expn);
+	mizAssert(errElRedundant, r.x.nState == MizEEnd);
+	res;
+}
+
+mizInFraenkelTerm(r : MizVrfReader) -> MizTrm {
+	env = r.env;
+	lBoundVarNbr = env.boundVarNbr;
+	mizXmlNextElementState(r.x);
+	lambdaArgs : Vector<MizTyp> = makeVector(4);
+	while(\ -> r.x.nState != MizEEnd && r.x.nElName == "Typ", \ -> {
+		env.boundVarNbr ::= env.boundVarNbr + 1;
+		typ = mizInType(r);
+		pushVector(lambdaArgs, typ);
+		mizSetBoundVar(env, env.boundVarNbr, typ);
+	});
+	scope = mizInTerm(r);
+	compr = mizInFormula(r);
+	idents = mizInitIntSeq(sizeVector(lambdaArgs));
+	fori(1, sizeVector(lambdaArgs), \__ -> { mizSeqInsert(idents, 0); {} });
+	res = MizFraenkelTrm(lambdaArgs, scope, compr, idents, 0);
+	env.boundVarNbr ::= lBoundVarNbr;
+	mizAssert(errElRedundant, r.x.nState == MizEEnd);
+	res;
+}
+
+mizInChoiceTerm(r : MizVrfReader) -> MizTrm {
+	mizXmlNextElementState(r.x);
+	res = mizNewChoiceTrm(mizInType(r));
+	mizAssert(errElRedundant, r.x.nState == MizEEnd);
+	res;
+}
+
+mizInUniqTerm(r : MizVrfReader) -> MizTrm {
+	res = if (r.x.nElName == "It") mizNewItTrm() else mizNewIncorTrm();
+	mizXmlAcceptEndState(r.x);
+	res;
+}
+
+// ---------------- attributes / clusters / types ----------------
+
+mizInAttr(r : MizVrfReader) -> MizAttr {
+	mizXmlAssert(r.x.nElName == "Adjective");
+	nr = mizXmlIntAttr(r.x, "nr");
+	// value="false" => neg 0; absent => neg 1 (positive)
+	neg = if (mizXmlHasAttr(r.x, "value")) {
+		if (mizXmlAttr(r.x, "value") == "true") 1 else 0;
+	} else {
+		1;
+	}
+	mizXmlNextElementState(r.x);
+	res = MizAttr(neg, nr, mizInTermList(r), false, 0);
+	mizAssert(errElRedundant, r.x.nState == MizEEnd);
+	mizXmlNextElementState(r.x);
+	res;
+}
+
+mizInAttrColl(r : MizVrfReader) -> MizAttrColl {
+	mizXmlAssert(r.x.nElName == "Cluster");
+	coll = mizNewEmptyCluster();
+	mizXmlNextElementState(r.x);
+	while(\ -> r.x.nState != MizEEnd, \ -> {
+		a = mizInAttr(r);
+		if (r.mml) {
+			pushVector(coll.items, a); // InMMLFileObj: AtInsert at end
+		} else {
+			mizAttrCollInsert(r.env, coll, a);
+		}
+	});
+	mizXmlNextElementState(r.x);
+	coll;
+}
+
+mizInType(r : MizVrfReader) -> MizTyp {
+	mizXmlAssert(r.x.nElName == "Typ");
+	lx = mizInLexem(r);
+	kind0 = lx.first;
+	kind = if (kind0 == 76) ikTypStruct else kind0; // 'L' -> ikTypStruct ('G')
+	mizXmlNextElementState(r.x);
+	res = if (kind == ikTypMode || kind == ikTypStruct) {
+		if (r.mml) {
+			// InMMLFileObj.In_Type: ONE cluster, upper is its copy
+			cl = mizInAttrColl(r);
+			args = mizInTermList(r);
+			MizTyp(kind, cl, mizCopyCluster(cl), lx.second, args, 0);
+		} else {
+			lower = mizInAttrColl(r);
+			upper = mizInAttrColl(r);
+			args = mizInTermList(r);
+			MizTyp(kind, lower, upper, lx.second, args, 0);
+		}
+	} else if (kind == 101) { // 'e' errortyp
+		mizNewIncorTyp();
+	} else {
+		mizRunTimeError(2036);
+		mizNewIncorTyp();
+	}
+	mizAssert(errElRedundant, r.x.nState == MizEEnd);
+	mizXmlNextElementState(r.x);
+	res;
+}
+
+mizInTypeColl(r : MizVrfReader) -> Vector<MizTyp> {
+	v : Vector<MizTyp> = makeVector(4);
+	while(\ -> r.x.nState != MizEEnd && r.x.nElName == "Typ", \ -> {
+		pushVector(v, mizInType(r));
+	});
+	v;
+}
+
+// ---------------- formulas ----------------
+
+mizInFormula(r : MizVrfReader) -> MizFrm {
+	name = r.x.nElName;
+	res = if (name == "Not") {
+		mizInNegFormula(r);
+	} else if (name == "And") {
+		mizInConjFormula(r);
+	} else if (name == "For") {
+		mizInUnivFormula(r);
+	} else if (name == "Pred") {
+		mizInPredFormula(r);
+	} else if (name == "PrivPred") {
+		mizInLocPredFormula(r);
+	} else if (name == "Is") {
+		mizInQualFormula(r);
+	} else if (name == "FlexFrm") {
+		mizInFlexFormula(r);
+	} else if (name == "Verum" || name == "ErrorFrm") {
+		mizInUniqFormula(r);
+	} else {
+		mizRunTimeError(2037);
+		mizNewIncorFrm();
+	}
+	mizXmlNextElementState(r.x);
+	res;
+}
+
+mizInQualFormula(r : MizVrfReader) -> MizFrm {
+	mizXmlNextElementState(r.x);
+	trm = mizInTerm(r);
+	mizNewQualFrm(trm, mizInType(r));
+}
+
+mizInUnivFormula(r : MizVrfReader) -> MizFrm {
+	env = r.env;
+	mizXmlNextElementState(r.x);
+	env.boundVarNbr ::= env.boundVarNbr + 1;
+	typ = mizInType(r);
+	mizSetBoundVar(env, env.boundVarNbr, typ);
+	res = mizNewUniv(typ, mizInFormula(r));
+	env.boundVarNbr ::= env.boundVarNbr - 1;
+	res;
+}
+
+mizInFlexFormula(r : MizVrfReader) -> MizFrm {
+	mizXmlNextElementState(r.x);
+	leftOrig = mizInFormula(r);
+	rightOrig = mizInFormula(r);
+	leftTrm = mizInTerm(r);
+	rightTrm = mizInTerm(r);
+	expansion = mizInFormula(r);
+	MizFlexFrm(ikFrmFlexConj, leftOrig, rightOrig, leftTrm, rightTrm, expansion, 0);
+}
+
+mizInConjFormula(r : MizVrfReader) -> MizFrm {
+	mizXmlNextElementState(r.x);
+	conjuncts : Vector<MizFrm> = makeVector(4);
+	while(\ -> r.x.nState != MizEEnd, \ -> {
+		f = mizInFormula(r);
+		srt = mizFrmSort(f);
+		if (srt == ikFrmVerum) {
+			// dropped
+		} else if (srt == ikFrmConj) {
+			switch (f) {
+				MizConjFrm(inner, __): iterVector(inner, \g -> pushVector(conjuncts, g));
+				default: {}
+			}
+		} else {
+			pushVector(conjuncts, f);
+		}
+	});
+	mizNewConjFrm(conjuncts);
+}
+
+mizInNegFormula(r : MizVrfReader) -> MizFrm {
+	mizXmlNextElementState(r.x);
+	mizNewNeg(mizInFormula(r));
+}
+
+mizInPredFormula(r : MizVrfReader) -> MizFrm {
+	lx = mizInLexem(r);
+	mizXmlNextElementState(r.x);
+	mizNewPredFrm(lx.first, lx.second, mizInTermList(r), 0);
+}
+
+mizInLocPredFormula(r : MizVrfReader) -> MizFrm {
+	nr = mizXmlIntAttr(r.x, "nr");
+	mizXmlNextElementState(r.x);
+	args = mizInTermList(r);
+	f = mizInFormula(r);
+	mizNewLocPredFrm(nr, args, f);
+}
+
+mizInUniqFormula(r : MizVrfReader) -> MizFrm {
+	res = if (r.x.nElName == "Verum") mizNewVerum() else mizNewIncorFrm();
+	mizXmlAcceptEndState(r.x);
+	res;
+}
+
+// ---------------- constructors (.atr) ----------------
+
+// XmlElem2Prop
+mizXmlElem2Prop(name : string) -> int {
+	if (name == "Symmetry") sySymmetry
+	else if (name == "Reflexivity") syReflexivity
+	else if (name == "Irreflexivity") syIrreflexivity
+	else if (name == "Associativity") syAssociativity
+	else if (name == "Transitivity") syTransitivity
+	else if (name == "Commutativity") syCommutativity
+	else if (name == "Connectedness") syConnectedness
+	else if (name == "Asymmetry") syAsymmetry
+	else if (name == "Idempotence") syIdempotence
+	else if (name == "Involutiveness") syInvolutiveness
+	else if (name == "Projectivity") syProjectivity
+	else if (name == "Abstractness") syAbstractness
+	else if (name == "Sethood") sySethood
+	else {
+		mizAssert(errWrongXMLElement, false);
+		0;
+	}
+}
+
+// ConstructorKind (enums.pas): kind char -> co*
+mizConstructorKind(kindChar : int) -> int {
+	if (kindChar == 77) coMode              // 'M'
+	else if (kindChar == 76) coStructMode   // 'L'
+	else if (kindChar == 86) coAttribute    // 'V'
+	else if (kindChar == 82) coPredicate    // 'R'
+	else if (kindChar == 75) coFunctor      // 'K'
+	else if (kindChar == 85) coSelector     // 'U'
+	else if (kindChar == 71 || kindChar == 74) coAggregate // 'G','J'
+	else {
+		mizRunTimeError(2211);
+		0;
+	}
+}
+
+mizInArgColl(r : MizVrfReader) -> Vector<MizTyp> {
+	mizXmlAssert(r.x.nElName == "ArgTypes");
+	mizXmlNextElementState(r.x);
+	v = mizInTypeColl(r);
+	mizAssert(errElRedundant, r.x.nState == MizEEnd);
+	mizXmlNextElementState(r.x);
+	v;
+}
+
+// In_Constructor1 — reads one <Constructor>; the parser must stand on it.
+mizInConstructor1(r : MizVrfReader) -> MizConstr {
+	mizXmlAssert(r.x.nElName == "Constructor");
+	kindS = mizXmlAttr(r.x, "kind");
+	kind = mizConstructorKind(getCharCodeAt(kindS, 0));
+	nr = mizXmlIntAttr(r.x, "nr");
+	aid = mizXmlAttr(r.x, "aid");
+	c = mizMakeConstr(kind, aid, nr);
+	c.whichConstrNr ::= mizXmlIntAttrDef(r.x, "redefnr", 0);
+	c.superfluous ::= mizXmlIntAttrDef(r.x, "superfluous", 0);
+	structModeAggrNr = mizXmlIntAttrDef(r.x, "structmodeaggrnr", 0);
+	aggregBase = mizXmlIntAttrDef(r.x, "aggregbase", 0);
+	mizXmlNextElementState(r.x);
+
+	if (r.x.nElName == "Properties" && r.x.nState == MizEStart) {
+		c.firstArg ::= mizXmlIntAttr(r.x, "propertyarg1");
+		c.secondArg ::= mizXmlIntAttr(r.x, "propertyarg2");
+		mizXmlNextElementState(r.x);
+		while(\ -> r.x.nState != MizEEnd, \ -> {
+			c.properties ::= bitOr(c.properties, bitShl(1, mizXmlElem2Prop(r.x.nElName)));
+			mizXmlAcceptEndState(r.x);
+			mizXmlNextElementState(r.x);
+		});
+		mizXmlNextElementState(r.x);
+	}
+	primaries = mizInArgColl(r);
+	iterVector(primaries, \typ -> pushVector(c.primaries, typ));
+
+	// TypedConstrKinds = [coFunctor, coMode, coAttribute, coAggregate, coSelector]
+	if (kind == coFunctor || kind == coMode || kind == coAttribute
+		|| kind == coAggregate || kind == coSelector) {
+		c.typ ::= Some(mizInType(r));
+	}
+
+	if (kind == coStructMode) {
+		c.structModeAggrNr ::= structModeAggrNr;
+		// prefixes (types), then <Fields> of <Field nr=/>
+		while(\ -> r.x.nElName == "Typ" && r.x.nState == MizEStart, \ -> {
+			// fPrefixes — kept but unused by the checker path yet
+			__pref = mizInType(r);
+			{}
+		});
+		mizXmlAssert(r.x.nElName == "Fields");
+		mizXmlNextElementState(r.x);
+		while(\ -> r.x.nState != MizEEnd, \ -> {
+			mizNatInsertElem(c.fields, mizXmlIntAttr(r.x, "nr"));
+			mizXmlAcceptEndState(r.x);
+			mizXmlNextElementState(r.x);
+		});
+		mizXmlNextElementState(r.x);
+	}
+	if (kind == coAggregate) {
+		c.aggregBase ::= aggregBase;
+		mizXmlAssert(r.x.nElName == "Fields");
+		mizXmlNextElementState(r.x);
+		while(\ -> r.x.nState != MizEEnd, \ -> {
+			mizNatInsertElem(c.fields, mizXmlIntAttr(r.x, "nr"));
+			mizXmlAcceptEndState(r.x);
+			mizXmlNextElementState(r.x);
+		});
+		mizXmlNextElementState(r.x);
+	}
+	mizXmlNextElementState(r.x);
+	c;
+}
+
+// Load a <Constructors> file (the article .atr / prel .dco payload) into the
+// environment. Constructors carry relnr= — their slot in the merged table;
+// they arrive in order, so a sequential push must land on relnr exactly.
+mizLoadConstructors(r : MizVrfReader, content : string) -> void {
+	x = r.x;
+	// fresh parse over this content
+	r2 = MizVrfReader(mizXmlInitParsing(content), r.env, true);
+	mizXmlNextElementState(r2.x);
+	mizXmlAssert(r2.x.nElName == "Constructors");
+	mizXmlNextElementState(r2.x);
+	while(\ -> r2.x.nState == MizEStart && r2.x.nElName != "Constructors", \ -> {
+		if (r2.x.nElName == "Signature" || r2.x.nElName == "ArticleID"
+			|| r2.x.nElName == "Vocabularies") {
+			// prel .dco carries a Signature block — skip it wholesale
+			mizXmlSkipElement(r2.x);
+		} else {
+			relnr = mizXmlIntAttrDef(r2.x, "relnr", -1);
+			c = mizInConstructor1(r2);
+			slot = mizPushConstr(r2.env, c);
+			if (relnr >= 0 && relnr != slot) {
+				mizRunTimeError(2803); // constructor table out of order
+			}
+		}
+	});
+}
