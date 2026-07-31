@@ -10,11 +10,12 @@
 //   asymmetry/connectedness closure, requirement rules (LessOrEqual sign
 //   propagation, BelongsTo/Inclusion element-types, the powerset rule),
 //   RenumEqClasses, ContradictionVerify, the negative-basis sweeps.
+// Also here: RoundUpSuperCluster — registration rounding over classes
+//   through the ANInstCollection lattice (bottom of this file).
 // STAGED for slice 2 (explicit no-op stubs below, each marked):
 //   polynomial values (polynom.pas), Identities (gIdentifications +
-//   arithmetic), reductions (gReductions), the complex-number supercluster,
-//   and RoundUpSuperCluster (registration rounding through the
-//   ANInstCollection lattice). Faithful for premises that use none of them;
+//   arithmetic), reductions (gReductions), the complex-number supercluster.
+//   Faithful for premises that use none of them;
 //   missing pieces can only LOSE refutations (error 4), never fabricate one.
 
 import ds/vector;
@@ -62,6 +63,12 @@ export {
 		mutable clash : bool,
 		eqPend : Vector<MizIntPair>,         // lEqPendings
 		settings : Vector<MizIntPair>,       // lSetting
+		// RoundUpSuperCluster state (the AN machinery)
+		allowedC : Vector<Pair<int, MizAttrColl>>, // AllowedCCluster: (cond idx, filtered upper)
+		allowedF : Vector<Pair<int, MizAttrColl>>, // AllowedFCluster: (func idx, filtered upper)
+		anDeps : Vector<Maybe<MizNatFunc>>,  // gDependencies, per class (index-1)
+		anStack : MizNatFunc,                // ANEqStack (NatSet)
+		mutable anInst : MizNatFunc,         // gANInstantiation
 	);
 
 	mizMakeEqualizer(env : MizCorrelEnv, idn : MizIdentify, clusters : MizClusters,
@@ -97,7 +104,9 @@ mizMakeEqualizer(env : MizCorrelEnv, idn : MizIdentify, clusters : MizClusters,
 		MizTrmNil(), makeVector(0), mizNewEmptyCluster()));
 	MizEqualizer(env, idn, clusters, pre, ts, false, 0, 0,
 		makeVector(8), makeVector(8), makeVector(16), fti,
-		makeVector(4), makeVector(4), false, makeVector(8), makeVector(8));
+		makeVector(4), makeVector(4), false, makeVector(8), makeVector(8),
+		makeVector(4), makeVector(4), makeVector(16), mizInitNatSet(16),
+		mizInitNatFunc(1));
 }
 
 mizTrmNbr(eq : MizEqualizer) -> int {
@@ -1254,6 +1263,9 @@ mizEquate(eq0 : MizEqualizer, eval : MizNatFunc) -> void {
 mizEquatePhase2(eq : MizEqualizer) -> void {
 	env = eq.env;
 
+	// registrations restricted to available constants (InitAllowedClusters)
+	mizInitAllowedClusters(eq);
+
 	// asymmetry: a positive asymmetric P(x,y) yields the negative P(y,x)
 	iterVector(copyVector(eq.posBas), \pf -> {
 		switch (pf) {
@@ -1374,7 +1386,8 @@ mizEquatePhase2(eq : MizEqualizer) -> void {
 	if (eq.contr == 0) mizPositiveRequirementRules(eq);
 	if (eq.contr == 0) mizPowersetRule(eq);
 	if (eq.contr == 0) mizNegativeSweep(eq);
-	// RoundUpSuperCluster (registration rounding, ANInstCollection) — slice 2
+	// RoundUpSuperCluster over the dependency stack (the EqStack loop)
+	if (eq.contr == 0) mizSuperClusterRoundLoop(eq);
 	// rqPrime numeric check — slice 2 (polynom.pas exact integers)
 }
 
@@ -1920,4 +1933,610 @@ mizInsertNonEmptyPub(eq : MizEqualizer, i1 : int, i2 : int) -> void {
 
 mizInsertNonZeroPub(eq : MizEqualizer, i1 : int, i2 : int) -> void {
 	mizInsertNonZero(eq, i1, i2);
+}
+
+// ==================== RoundUpSuperCluster (equalizer.pas 1821-2716) ====================
+// Registration rounding over equality classes: every conditional and functor
+// registration whose consequent survives the D-constant filter is matched
+// against each class through the ANInstCollection lattice (loci -> classes),
+// and the located consequent attributes are merged into the class supercluster
+// until a fixpoint (order-independent: the inner `while added` plus the outer
+// dependency stack). Contr codes 8/9 (conditional) and 10/11 (functor).
+
+// ---------------- the AN instantiation lattice ----------------
+// ANInstCollection = PreInstCollection minus the MaxInstNbr cap. We reuse the
+// MizPreInst struct; union/join here are the uncapped AN variants.
+
+mizANUnionWith(p : MizPreInst, q : MizPreInst) -> void {
+	if (p.top) {
+	} else if (q.top) {
+		clearVector(p.evals);
+		p.top ::= true;
+	} else {
+		iterVector(q.evals, \e -> mizPreInstInsertAndAbsorb(p, e));
+	}
+}
+
+mizANJoinWith(p : MizPreInst, q : MizPreInst) -> void {
+	if (q.top) {
+	} else if (p.top) {
+		p.top ::= false;
+		clearVector(p.evals);
+		iterVector(q.evals, \e -> pushVector(p.evals, e));
+	} else if (sizeVector(q.evals) == 0) {
+		clearVector(p.evals);
+	} else if (sizeVector(p.evals) == 0) {
+	} else {
+		tmp : Vector<MizNatFunc> = makeVector(sizeVector(p.evals) * sizeVector(q.evals));
+		iterVector(p.evals, \a ->
+			iterVector(q.evals, \b -> {
+				switch (mizNatJoinAtom(a, b)) {
+					Some(j): pushVector(tmp, j);
+					None(): {}
+				}
+			}));
+		clearVector(p.evals);
+		iterVector(tmp, \e -> pushVector(p.evals, e));
+	}
+}
+
+// ---------------- allowed clusters (CheckForDConsts filter) ----------------
+
+// an attribute is allowed if every InfConst in its arguments is available in
+// this inference (has a DTrm entry)
+mizANAttrHasForeignDConst(eq : MizEqualizer, a : MizAttr) -> bool {
+	found = ref false;
+	w = mizMakeWithin(\__, t -> {
+		switch (t) {
+			MizVarTrm(srt, varNr, __, __): {
+				if (srt == ikTrmInfConst && !^found) {
+					avail = varNr < sizeVector(eq.dTrm) && switch (getVectorUnsafe(eq.dTrm, varNr)) {
+						Some(__): true;
+						None(): false;
+					};
+					if (!avail) found := true;
+				}
+			}
+			default: {}
+		}
+		t;
+	});
+	mizWithinTrmList(w, a.args);
+	^found;
+}
+
+mizANAllowedAttrsIn(eq : MizEqualizer, cluster : MizAttrColl) -> MizAttrColl {
+	r = mizNewEmptyCluster();
+	iterVector(cluster.items, \a ->
+		if (!mizANAttrHasForeignDConst(eq, a)) mizAttrCollInsert(eq.env, r, mizCopyAttr(a)));
+	r;
+}
+
+mizInitAllowedClusters(eq : MizEqualizer) -> void {
+	clearVector(eq.allowedC);
+	clearVector(eq.allowedF);
+	i = ref 0;
+	while(\ -> ^i < sizeVector(eq.clusters.conditional), \ -> {
+		cc : MizCCluster = getVectorUnsafe(eq.clusters.conditional, ^i);
+		lC = mizANAllowedAttrsIn(eq, cc.consequent.upper);
+		if (sizeVector(lC.items) > 0) pushVector(eq.allowedC, Pair(^i, lC));
+		i := ^i + 1;
+	});
+	j = ref 0;
+	while(\ -> ^j < sizeVector(eq.clusters.functor), \ -> {
+		fc : MizFCluster = getVectorUnsafe(eq.clusters.functor, ^j);
+		lF = mizANAllowedAttrsIn(eq, fc.consequent.upper);
+		if (sizeVector(lF.items) > 0) pushVector(eq.allowedF, Pair(^j, lF));
+		j := ^j + 1;
+	});
+}
+
+// ---------------- class dependencies ----------------
+
+// DependsOn(x,y): class y's EqConst occurs inside class x (members, types
+// or supercluster)
+mizANDependsOn(eq : MizEqualizer, x : int, y : int) -> bool {
+	rx = mizTrmSAt(eq, x);
+	ry = mizTrmSAt(eq, y);
+	liveX = switch (rx.eqClass) { MizTrmNil(): false; default: true; };
+	liveY = switch (ry.eqClass) { MizTrmNil(): false; default: true; };
+	if (liveX && liveY) {
+		found = ref false;
+		w = mizMakeWithin(\__, t -> {
+			switch (t) {
+				MizVarTrm(srt, __, __, info): {
+					if (srt == ikTrmEqConst && !^found && mizClassOf(eq, info) == y) {
+						found := true;
+					}
+				}
+				default: {}
+			}
+			t;
+		});
+		cur = ref rx.eqClass;
+		while(\ -> !^found && switch (^cur) { MizTrmNil(): false; default: true; }, \ -> {
+			switch (^cur) {
+				MizTrmElem(trm, next): {
+					mizWithinTrm(w, trm);
+					{}
+					cur := next;
+				}
+				MizTrmNil(): {}
+			}
+		});
+		if (!^found) mizWithinTypVector(w, rx.xTypClass);
+		if (!^found) mizWithinCluster(w, rx.superCluster);
+		^found;
+	} else {
+		false;
+	}
+}
+
+mizANDependentClasses(eq : MizEqualizer, enr : int) -> Maybe<MizNatFunc> {
+	rec = mizTrmSAt(eq, enr);
+	live = switch (rec.eqClass) { MizTrmNil(): false; default: true; };
+	if (live) {
+		r = mizInitNatSet(10);
+		i = ref 1;
+		while(\ -> ^i <= mizTrmNbr(eq), \ -> {
+			if (mizANDependsOn(eq, ^i, enr)) mizNatInsertElem(r, ^i);
+			i := ^i + 1;
+		});
+		Some(r);
+	} else {
+		None();
+	}
+}
+
+// ---------------- matching loci against classes (Instantiate*) ----------------
+
+// FuncNr/args of a functor-like term, adjusted for real functors
+mizANAdjustedArgs(env : MizCorrelEnv, t : MizTrm) -> Pair<int, MizTrmList> {
+	ft : MizFuncTrm = mizEqAsFunc(t);
+	if (ft.sort == ikTrmFunctor) {
+		mizAdjustTrm(env, ft);
+	} else {
+		Pair(ft.funcNr, ft.args);
+	}
+}
+
+// pairwise join of argument instantiations
+mizANJoinArgs(eq : MizEqualizer, prim : Vector<MizTyp>, el0 : MizTrmList,
+		al0 : MizTrmList) -> MizPreInst {
+	r = mizPreInstTop();
+	el = ref el0;
+	al = ref al0;
+	while(\ -> switch (^al) { MizTrmNil(): false; default: true; }, \ -> {
+		switch (^al) {
+			MizTrmElem(at, an) : {
+				switch (^el) {
+					MizTrmElem(et, en): {
+						mizANJoinWith(r, mizANInstTerm(eq, prim, et, at));
+						el := en;
+					}
+					MizTrmNil(): {}
+				}
+				al := an;
+			}
+			MizTrmNil(): {}
+		}
+	});
+	r;
+}
+
+// InstantiateTerm: match the class-side term eTrm against the registration
+// term aTrm (loci as variables to solve for)
+mizANInstTerm(eq : MizEqualizer, prim : Vector<MizTyp>, eTrm : MizTrm,
+		aTrm : MizTrm) -> MizPreInst {
+	env = eq.env;
+	eSort = mizTrmSort(eTrm);
+	if (eSort != ikTrmEqConst) {
+		if (eSort == ikTrmNumeral) {
+			ev : MizVarTrm = mizEqAsVar(eTrm);
+			same = mizTrmSort(aTrm) == ikTrmNumeral && {
+				av : MizVarTrm = mizEqAsVar(aTrm);
+				av.varNr == ev.varNr;
+			};
+			if (same) mizPreInstTop() else mizPreInstBottom();
+		} else if (eSort == mizTrmSort(aTrm)) {
+			ep = mizANAdjustedArgs(env, eTrm);
+			ap = mizANAdjustedArgs(env, aTrm);
+			if (ep.first == ap.first) {
+				mizANJoinArgs(eq, prim, ep.second, ap.second);
+			} else {
+				// same sort, different functor: fall through to the class view
+				mizANInstTermClass(eq, prim, mizClassOf(eq, mizTrmInfoOf(eTrm)), aTrm);
+			}
+		} else {
+			mizPreInstBottom();
+		}
+	} else {
+		mizANInstTermClass(eq, prim, mizClassOf(eq, mizTrmInfoOf(eTrm)), aTrm);
+	}
+}
+
+mizANInstTermClass(eq : MizEqualizer, prim : Vector<MizTyp>, enr : int,
+		aTrm : MizTrm) -> MizPreInst {
+	env = eq.env;
+	aSort = mizTrmSort(aTrm);
+	if (aSort == ikTrmLocus) {
+		av : MizVarTrm = mizEqAsVar(aTrm);
+		t1 : MizTyp = getVectorUnsafe(prim, av.varNr - 1);
+		z = mizANInstType(eq, prim, enr, t1);
+		if (mizPreInstCount(z) == 0) {
+			z;
+		} else {
+			rep : MizVarTrm = mizEqAsVar(mizTrmSAt(eq, enr).term);
+			n = mizInitNatFunc(1);
+			mizNatAssign(n, av.varNr, rep.varNr);
+			mizANJoinWith(z, mizPreInstSingle(n));
+			z;
+		}
+	} else if (aSort == ikTrmNumeral) {
+		av : MizVarTrm = mizEqAsVar(aTrm);
+		rec = mizTrmSAt(eq, enr);
+		if (rec.numDetermined && rec.numValue.re == i2d(av.varNr) && rec.numValue.im == 0.0) {
+			mizPreInstTop();
+		} else {
+			mizPreInstBottom();
+		}
+	} else {
+		// functor / selector / aggregate: match against the class members
+		ap = mizANAdjustedArgs(env, aTrm);
+		r = mizPreInstBottom();
+		cur = ref mizTrmSAt(eq, enr).eqClass;
+		while(\ -> switch (^cur) { MizTrmNil(): false; default: true; }, \ -> {
+			switch (^cur) {
+				MizTrmElem(mem, next): {
+					if (mizTrmSort(mem) == aSort) {
+						mp = mizANAdjustedArgs(env, mem);
+						if (mp.first == ap.first) {
+							z = mizANJoinArgs(eq, prim, mp.second, ap.second);
+							mizANUnionWith(r, z);
+						}
+					}
+					cur := next;
+				}
+				MizTrmNil(): {}
+			}
+		});
+		r;
+	}
+}
+
+mizANInstRadixType(eq : MizEqualizer, prim : Vector<MizTyp>, enr0 : int,
+		atyp : MizTyp) -> MizPreInst {
+	env = eq.env;
+	enr = mizClassOf(eq, enr0);
+	ap = mizAdjustTyp(env, atyp);
+	rec = mizTrmSAt(eq, enr);
+	r = mizPreInstBottom();
+	stop = ref false;
+	i = ref 0;
+	while(\ -> !^stop && ^i < sizeVector(rec.xTypClass), \ -> {
+		xt : MizTyp = getVectorUnsafe(rec.xTypClass, ^i);
+		mp = mizAdjustTyp(env, xt);
+		if (xt.sort == atyp.sort && mp.first == ap.first) {
+			noArgs = switch (ap.second) { MizTrmNil(): true; default: false; };
+			if (noArgs) {
+				// registration type takes no arguments: any match is total
+				r.top ::= true;
+				clearVector(r.evals);
+				stop := true;
+			} else {
+				z = mizANJoinArgs(eq, prim, mp.second, ap.second);
+				mizANUnionWith(r, z);
+			}
+		}
+		i := ^i + 1;
+	});
+	r;
+}
+
+mizANInstAttr(eq : MizEqualizer, prim : Vector<MizTyp>, enr : int,
+		aa : MizAttr) -> MizPreInst {
+	env = eq.env;
+	ap = mizAdjustAttr(env, aa);
+	rec = mizTrmSAt(eq, enr);
+	r = mizPreInstBottom();
+	stop = ref false;
+	i = ref 0;
+	while(\ -> !^stop && ^i < sizeVector(rec.superCluster.items), \ -> {
+		sa : MizAttr = getVectorUnsafe(rec.superCluster.items, ^i);
+		sp = mizAdjustAttr(env, sa);
+		if (sp.first == ap.first && sa.neg == aa.neg) {
+			noArgs = switch (ap.second) { MizTrmNil(): true; default: false; };
+			if (noArgs) {
+				r.top ::= true;
+				clearVector(r.evals);
+				stop := true;
+			} else {
+				v = mizANJoinArgs(eq, prim, sp.second, ap.second);
+				mizANUnionWith(r, v);
+			}
+		}
+		i := ^i + 1;
+	});
+	r;
+}
+
+mizANInstAttrs(eq : MizEqualizer, prim : Vector<MizTyp>, enr : int,
+		alc : MizAttrColl) -> MizPreInst {
+	r = mizPreInstTop();
+	iterVector(alc.items, \a -> mizANJoinWith(r, mizANInstAttr(eq, prim, enr, a)));
+	r;
+}
+
+mizANInstType(eq : MizEqualizer, prim : Vector<MizTyp>, enr : int,
+		atyp : MizTyp) -> MizPreInst {
+	r = mizANInstRadixType(eq, prim, enr, atyp);
+	mizANJoinWith(r, mizANInstAttrs(eq, prim, enr, atyp.lower));
+	r;
+}
+
+mizANInstFCluster(eq : MizEqualizer, fc : MizFCluster, enr : int) -> MizPreInst {
+	r = mizANInstTerm(eq, fc.primaries, mizTrmSAt(eq, enr).term, fc.clusterTerm);
+	switch (fc.clusterType) {
+		Some(ct): mizANJoinWith(r, mizANInstType(eq, fc.primaries, enr, ct));
+		None(): {}
+	}
+	r;
+}
+
+mizANInstCCluster(eq : MizEqualizer, cc : MizCCluster, enr : int) -> MizPreInst {
+	r = mizANInstType(eq, cc.primaries, enr, cc.clusterType);
+	mizANJoinWith(r, mizANInstAttrs(eq, cc.primaries, enr, cc.antecedent));
+	r;
+}
+
+// ---------------- locating registration terms in the class graph ----------------
+
+mizANLocateTermList(eq : MizEqualizer, l0 : MizTrmList) -> Maybe<MizTrmList> {
+	res = ref mizNil;
+	ok = ref true;
+	l = ref l0;
+	while(\ -> ^ok && switch (^l) { MizTrmNil(): false; default: true; }, \ -> {
+		switch (^l) {
+			MizTrmElem(t, next): {
+				switch (mizANLocateTerm(eq, t)) {
+					Some(lt): res := mizAppendTrm(^res, lt);
+					None(): ok := false;
+				}
+				l := next;
+			}
+			MizTrmNil(): {}
+		}
+	});
+	if (^ok) Some(^res) else None();
+}
+
+// LocateTerm: map a registration-side term (under eq.anInst) to the
+// representative of an existing class
+mizANLocateTerm(eq : MizEqualizer, aTrm : MizTrm) -> Maybe<MizTrm> {
+	aSort = mizTrmSort(aTrm);
+	if (aSort == ikTrmLocus) {
+		av : MizVarTrm = mizEqAsVar(aTrm);
+		if (mizNatHasInDom(eq.anInst, av.varNr)) {
+			g = mizNatValue(eq.anInst, av.varNr);
+			found : ref Maybe<MizTrm> = ref None();
+			i = ref 1;
+			while(\ -> ^i <= mizTrmNbr(eq) && ^found == None(), \ -> {
+				rep : MizVarTrm = mizEqAsVar(mizTrmSAt(eq, ^i).term);
+				if (rep.varNr == g) found := Some(mizTrmSAt(eq, ^i).term);
+				i := ^i + 1;
+			});
+			^found;
+		} else {
+			None();
+		}
+	} else if (aSort == ikTrmInfConst) {
+		av : MizVarTrm = mizEqAsVar(aTrm);
+		found : ref Maybe<MizTrm> = ref None();
+		i = ref 1;
+		while(\ -> ^i <= mizTrmNbr(eq) && ^found == None(), \ -> {
+			cur = ref mizTrmSAt(eq, ^i).eqClass;
+			while(\ -> ^found == None() && switch (^cur) { MizTrmNil(): false; default: true; }, \ -> {
+				switch (^cur) {
+					MizTrmElem(mem, next): {
+						hit = switch (mem) {
+							MizVarTrm(srt, varNr, __, __): srt == ikTrmInfConst && varNr == av.varNr;
+							default: false;
+						};
+						if (hit) found := Some(mizTrmSAt(eq, ^i).term);
+						cur := next;
+					}
+					MizTrmNil(): {}
+				}
+			});
+			i := ^i + 1;
+		});
+		^found;
+	} else if (aSort == ikTrmNumeral) {
+		av : MizVarTrm = mizEqAsVar(aTrm);
+		found : ref Maybe<MizTrm> = ref None();
+		i = ref 1;
+		while(\ -> ^i <= mizTrmNbr(eq) && ^found == None(), \ -> {
+			rec = mizTrmSAt(eq, ^i);
+			live = switch (rec.eqClass) { MizTrmNil(): false; default: true; };
+			if (live && rec.numDetermined && rec.numValue.re == i2d(av.varNr)
+					&& rec.numValue.im == 0.0) {
+				found := Some(rec.term);
+			}
+			i := ^i + 1;
+		});
+		^found;
+	} else if (aSort == ikTrmFunctor || aSort == ikTrmSelector || aSort == ikTrmAggreg) {
+		af : MizFuncTrm = mizEqAsFunc(aTrm);
+		found : ref Maybe<MizTrm> = ref None();
+		i = ref 1;
+		while(\ -> ^i <= mizTrmNbr(eq) && ^found == None(), \ -> {
+			rec = mizTrmSAt(eq, ^i);
+			cur = ref rec.eqClass;
+			while(\ -> ^found == None() && switch (^cur) { MizTrmNil(): false; default: true; }, \ -> {
+				switch (^cur) {
+					MizTrmElem(mem, next): {
+						if (mizTrmSort(mem) == aSort) {
+							mf : MizFuncTrm = mizEqAsFunc(mem);
+							if (mf.funcNr == af.funcNr) {
+								noArgs = switch (mf.args) { MizTrmNil(): true; default: false; };
+								if (noArgs) {
+									found := Some(rec.term);
+								} else {
+									switch (mizANLocateTermList(eq, af.args)) {
+										Some(la): {
+											if (mizEqTrmListsE(eq, la, mf.args)) {
+												found := Some(rec.term);
+											}
+										}
+										None(): {}
+									}
+								}
+							}
+						}
+						cur := next;
+					}
+					MizTrmNil(): {}
+				}
+			});
+			i := ^i + 1;
+		});
+		^found;
+	} else {
+		None();
+	}
+}
+
+mizANLocatedAttr(eq : MizEqualizer, a : MizAttr) -> Maybe<MizAttr> {
+	noArgs = switch (a.args) { MizTrmNil(): true; default: false; };
+	if (noArgs) {
+		Some(mizCopyAttr(a));
+	} else {
+		switch (mizANLocateTermList(eq, a.args)) {
+			Some(la): Some(MizAttr(a.neg, a.attrNr, la, a.collected, a.pattNr));
+			None(): None();
+		}
+	}
+}
+
+mizANLocatedCluster(eq : MizEqualizer, aCluster : MizAttrColl) -> MizAttrColl {
+	r = mizNewEmptyCluster();
+	iterVector(aCluster.items, \a -> {
+		switch (mizANLocatedAttr(eq, a)) {
+			Some(la): mizAttrCollInsert(eq.env, r, la);
+			None(): {}
+		}
+	});
+	r;
+}
+
+// ---------------- the rounding itself ----------------
+
+// EnlargeBy into the supercluster; true when it grew
+mizANEnlarge(eq : MizEqualizer, sc : MizAttrColl, lc : MizAttrColl) -> bool {
+	c0 = sizeVector(sc.items);
+	iterVector(lc.items, \a -> mizAttrCollInsert(eq.env, sc, mizCopyAttr(a)));
+	sizeVector(sc.items) != c0;
+}
+
+mizRoundUpSuperCluster(eq : MizEqualizer, enr : int) -> bool {
+	rec = mizTrmSAt(eq, enr);
+	live = switch (rec.eqClass) { MizTrmNil(): false; default: true; };
+	if (!live) {
+		false;
+	} else {
+		r = ref false;
+		stop = ref false;
+		added = ref true;
+		applyOne = \allowed : MizAttrColl, contrTop : int, contrInst : int, inst : MizPreInst -> {
+			if (inst.top) {
+				lC = mizANLocatedCluster(eq, allowed);
+				if (mizANEnlarge(eq, rec.superCluster, lC)) {
+					r := true;
+					added := true;
+				}
+				if (!rec.superCluster.consistent) {
+					mizSetContr(eq, contrTop);
+					r := true;
+					stop := true;
+				}
+			} else {
+				iterVector(inst.evals, \atom -> {
+					if (!^stop) {
+						eq.anInst ::= atom;
+						lC = mizANLocatedCluster(eq, allowed);
+						if (mizANEnlarge(eq, rec.superCluster, lC)) {
+							r := true;
+							added := true;
+						}
+						if (!rec.superCluster.consistent) {
+							mizSetContr(eq, contrInst);
+							r := true;
+							stop := true;
+						}
+					}
+				});
+			}
+		};
+		while(\ -> ^added && !^stop, \ -> {
+			added := false;
+			iterVector(eq.allowedC, \pc -> {
+				if (!^stop) {
+					cc : MizCCluster = getVectorUnsafe(eq.clusters.conditional, pc.first);
+					applyOne(pc.second, 8, 9, mizANInstCCluster(eq, cc, enr));
+				}
+			});
+			iterVector(eq.allowedF, \pf -> {
+				if (!^stop) {
+					fc : MizFCluster = getVectorUnsafe(eq.clusters.functor, pf.first);
+					applyOne(pf.second, 10, 11, mizANInstFCluster(eq, fc, enr));
+				}
+			});
+		});
+		^r;
+	}
+}
+
+// the EqStack loop at the end of Equate: round every class, re-round the
+// dependents of every class whose supercluster changed
+mizSuperClusterRoundLoop(eq : MizEqualizer) -> void {
+	clearVector(eq.anDeps);
+	i = ref 1;
+	while(\ -> ^i <= mizTrmNbr(eq), \ -> {
+		pushVector(eq.anDeps, mizANDependentClasses(eq, ^i));
+		i := ^i + 1;
+	});
+	j = ref 1;
+	while(\ -> ^j <= mizTrmNbr(eq), \ -> {
+		live = switch (mizTrmSAt(eq, ^j).eqClass) { MizTrmNil(): false; default: true; };
+		if (live) mizNatInsertElem(eq.anStack, ^j);
+		j := ^j + 1;
+	});
+	while(\ -> eq.contr == 0 && mizNatCount(eq.anStack) > 0, \ -> {
+		ani = mizNatItem(eq.anStack, 0).x;
+		mizNatDeleteElem(eq.anStack, ani);
+		if (mizRoundUpSuperCluster(eq, ani) && eq.contr == 0) {
+			// refresh the dependency sets with the classes now mentioning ani
+			anj = ref 1;
+			while(\ -> ^anj <= mizTrmNbr(eq), \ -> {
+				if (mizANDependsOn(eq, ani, ^anj)) {
+					switch (getVectorUnsafe(eq.anDeps, ^anj - 1)) {
+						Some(ns): if (!mizNatHasInDom(ns, ani)) mizNatInsertElem(ns, ani);
+						None(): {}
+					}
+				}
+				anj := ^anj + 1;
+			});
+			// re-round everything that depends on ani
+			switch (mizANDependentClasses(eq, ani)) {
+				Some(ns1): {
+					z = ref 0;
+					while(\ -> ^z < mizNatCount(ns1), \ -> {
+						mizNatInsertElem(eq.anStack, mizNatItem(ns1, ^z).x);
+						z := ^z + 1;
+					});
+				}
+				None(): {}
+			}
+		}
+	});
 }
