@@ -41,11 +41,18 @@ export {
 		mutable equalsExpand : (MizIdentify, int, MizTrmList) -> [int],
 		// gReductions (ReductionObj lives in identify.pas)
 		reductions : Vector<MizReduction>,
+		// gIdentifications, functor kind only (nConstrKind = 'K')
+		identifications : Vector<MizFuncIdent>,
 	);
 
 	// ReductionObj: nTerms[0] reduces to nTerms[1] under the primary types
 	MizReduction(article : string, absNr : int, primaries : Vector<MizTyp>,
 		t0 : MizTrm, t1 : MizTrm);
+
+	// IdentifyObj: pattern0 identified with pattern1 under the primary types;
+	// eqArgs (x,y) demand locus y := locus x (with a widening check)
+	MizFuncIdent(article : string, absNr : int, primaries : Vector<MizTyp>,
+		pattern0 : MizTrm, pattern1 : MizTrm, eqArgs : [MizIntPair]);
 
 	mizMakeIdentify(env : MizCorrelEnv) -> MizIdentify;
 	// gRevReq wiring: call after the requirements are loaded
@@ -71,7 +78,7 @@ export {
 mizMakeIdentify(env : MizCorrelEnv) -> MizIdentify {
 	rv : Vector<int> = makeVector(64);
 	MizIdentify(env, makeVector(64), makeVector(64), true, 0, rv,
-		\__, __, __ -> [], makeVector(4));
+		\__, __, __ -> [], makeVector(4), makeVector(4));
 }
 
 mizInitRevReq(idn : MizIdentify) -> void {
@@ -330,6 +337,8 @@ mizCollectConstInTrm(idn : MizIdentify, t : MizTrm) -> MizTrm {
 								cd : MizConstDef = getVectorUnsafe(env.inferConstDef, varNr);
 								eqs = idn.equalsExpand(idn, funcNr, args);
 								iter(eqs, \e -> mizNatInsertElem(cd.eqConst, e));
+								ids = mizIdentifyEqConsts(idn, t);
+								iter(ids, \e -> mizNatInsertElem(cd.eqConst, e));
 							}
 							default: {}
 						}
@@ -488,4 +497,73 @@ mizInferRelease(idn : MizIdentify, mark : int) -> void {
 	});
 	while(\ -> sizeVector(idn.numeric) > mark,
 		\ -> removeVector(idn.numeric, sizeVector(idn.numeric) - 1));
+}
+
+// Identify with equals expansion (identify.pas 758-797): a functor
+// identification whose left pattern Es-matches the term makes the
+// instantiated right pattern an equal constant
+mizIdentifyEqConsts(idn : MizIdentify, t : MizTrm) -> [int] {
+	env = idn.env;
+	if (idn.equalsExpansionLevel >= 3 || sizeVector(idn.identifications) == 0) {
+		[];
+	} else {
+		ft : MizFuncTrm = mizIdAsFunc(t);
+		pa = mizAdjustTrm(env, ft);
+		res = ref [];
+		iterVector(idn.identifications, \idf -> {
+			headOk = switch (idf.pattern0) {
+				MizFuncTrm(s0, __, __, __, __): {
+					if (s0 == ikTrmFunctor) {
+						f0 : MizFuncTrm = mizIdAsFunc(idf.pattern0);
+						p0 = mizAdjustTrm(env, f0);
+						p0.first == pa.first;
+					} else {
+						false;
+					}
+				}
+				default: false;
+			};
+			if (headOk) {
+				k = ref 1;
+				while(\ -> ^k < sizeVector(env.substTrm), \ -> {
+					setVectorUnsafe(env.substTrm, ^k, None());
+					k := ^k + 1;
+				});
+				if (mizEsTrm(env, idf.pattern0, t) && mizCheckLociTypes(env, idf.primaries)) {
+					ok = ref true;
+					iter(idf.eqArgs, \pxy -> {
+						if (^ok) {
+							if (!mizIsWiderThan(env,
+									getVectorUnsafe(idf.primaries, pxy.y - 1),
+									mizCopyTyp(getVectorUnsafe(idf.primaries, pxy.x - 1)))) {
+								ok := false;
+							} else {
+								setVectorUnsafe(env.substTrm, pxy.y,
+									switch (getVectorDef(env.substTrm, pxy.x, None())) {
+										Some(st): Some(mizCopyTrm(st));
+										None(): None();
+									});
+							}
+						}
+					});
+					if (^ok) {
+						lTrm = mizInstSubstTrm(env, idf.pattern1);
+						idn.equalsExpansionLevel ::= idn.equalsExpansionLevel + 1;
+						lB = env.boundVarNbr;
+						env.boundVarNbr ::= 0;
+						ct = mizCollectConstInTrm(idn, lTrm);
+						env.boundVarNbr ::= lB;
+						idn.equalsExpansionLevel ::= idn.equalsExpansionLevel - 1;
+						switch (ct) {
+							MizVarTrm(s4, nr4, __, __): {
+								if (s4 == ikTrmInfConst) res := arrayPush(^res, nr4);
+							}
+							default: {}
+						}
+					}
+				}
+			}
+		});
+		^res;
+	}
 }
