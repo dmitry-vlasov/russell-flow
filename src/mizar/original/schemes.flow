@@ -1,0 +1,749 @@
+// Transcription of ~/dev/system/kernel/schemes.pas — Schematize: checking a
+// `from` justification by SECOND-ORDER MATCHING of the scheme's statement and
+// premises against the actual sentences. Scheme functors instantiate to real
+// functors (gFFuncSubst) or, when 0-ary, to closed terms (gFConstSubst, with
+// a result-type widening check); scheme predicates to real predicates
+// (gFPredSubst). No proof search — a pure match, errors 20..33.
+
+import ds/vector;
+import ds/tree;
+import loop;
+import mizar/original/errhan;
+import mizar/original/mobjects;
+import mizar/original/limits;
+import mizar/original/lexicon;
+import mizar/original/builtin;
+import mizar/original/correl;
+import mizar/original/correl_inst;
+import mizar/original/print;
+import net/url_parameter;
+
+export {
+	// SchRefItem: the scheme functors' RESULT types (by functor nr, 1-based)
+	// and the propositions — statement FIRST, then the premises
+	MizSchemeDef(articleNr : int, nr : int, schTypes : Vector<MizTyp>,
+		schProps : [MizFrm], valid : bool);
+
+	MizSchemes(items : Vector<MizSchemeDef>);
+
+	mizMakeSchemes() -> MizSchemes;
+	mizSchemeFind(s : MizSchemes, articleNr : int, nr : int) -> Maybe<MizSchemeDef>;
+
+	// Schematize: match the scheme against [claim, premise*]; true = accepted
+	mizSchematize(env : MizCorrelEnv, sch : MizSchemeDef,
+		snts : [MizFrm]) -> bool;
+	// same, but returns Pair(error code or 0, failing sentence index or -1)
+	mizSchematizeErr(env : MizCorrelEnv, sch : MizSchemeDef,
+		snts : [MizFrm]) -> Pair<int, int>;
+}
+
+mizMakeSchemes() -> MizSchemes {
+	MizSchemes(makeVector(8));
+}
+
+mizSchemeFind(s : MizSchemes, articleNr : int, nr : int) -> Maybe<MizSchemeDef> {
+	res : ref Maybe<MizSchemeDef> = ref None();
+	iterVector(s.items, \d -> {
+		if (d.articleNr == articleNr && d.nr == nr) res := Some(d);
+	});
+	^res;
+}
+
+// ---------------- the matching state ----------------
+
+MizSchState(
+	env : MizCorrelEnv,
+	schTypes : Vector<MizTyp>,
+	constSubst : Vector<Maybe<MizTrm>>,     // gFConstSubst by scheme functor nr
+	mutable funcSubst : Tree<int, int>,     // (trm sort, sch func nr) -> real nr
+	mutable predSubst : Tree<int, int>,     // (frm sort, sch pred nr) -> real nr
+	mutable thereAreBound : bool,
+	mutable err : int,
+);
+
+skKey(sort : int, nr : int) -> int {
+	sort * 1000000 + nr;
+}
+
+// snapshot / restore for the backtracking points
+MizSchSnap(consts : [Maybe<MizTrm>], funcs : Tree<int, int>, preds : Tree<int, int>);
+
+schSnap(s : MizSchState) -> MizSchSnap {
+	MizSchSnap(vector2array(s.constSubst), s.funcSubst, s.predSubst);
+}
+
+schRestore(s : MizSchState, sn : MizSchSnap) -> void {
+	clearVector(s.constSubst);
+	iter(sn.consts, \c -> pushVector(s.constSubst, c));
+	s.funcSubst ::= sn.funcs;
+	s.predSubst ::= sn.preds;
+}
+
+schConstAt(s : MizSchState, nr : int) -> Maybe<MizTrm> {
+	getVectorDef(s.constSubst, nr, None());
+}
+
+schConstSet(s : MizSchState, nr : int, t : MizTrm) -> void {
+	while(\ -> sizeVector(s.constSubst) <= nr, \ -> pushVector(s.constSubst, None()));
+	setVectorUnsafe(s.constSubst, nr, Some(t));
+}
+
+// ---------------- bound-var helpers ----------------
+
+// SchRenBound: bound vars above the depth re-base down; below = still bound
+mizSchRenBound(s : MizSchState, t : MizTrm) -> void {
+	env = s.env;
+	w = mizMakeWithin(\__, trm -> {
+		switch (trm) {
+			MizVarTrm(srt, v, __, __): {
+				if (srt == ikTrmBound) {
+					if (v > env.boundVarNbr) {
+						vt : MizVarTrm = mizSchAsVar(trm);
+						vt.varNr ::= v - env.boundVarNbr;
+					} else {
+						s.thereAreBound ::= true;
+					}
+				}
+				trm;
+			}
+			default: trm;
+		}
+	});
+	__t = mizWithinTrm(w, t);
+	{}
+}
+
+// SchChkBound: any bound var within the current depth
+mizSchChkBound(s : MizSchState, t : MizTrm) -> void {
+	env = s.env;
+	w = mizMakeWithin(\__, trm -> {
+		switch (trm) {
+			MizVarTrm(srt, v, __, __): {
+				if (srt == ikTrmBound && v <= env.boundVarNbr) {
+					s.thereAreBound ::= true;
+				}
+				trm;
+			}
+			default: trm;
+		}
+	});
+	__t = mizWithinTrm(w, t);
+	{}
+}
+
+// FrRenBound: shift an expanded InfConst definition's bound vars up
+mizSchFrRenBound(s : MizSchState, t : MizTrm) -> void {
+	env = s.env;
+	if (env.boundVarNbr > 0) {
+		w = mizMakeWithin(\__, trm -> {
+			switch (trm) {
+				MizVarTrm(srt, v, __, __): {
+					if (srt == ikTrmBound) {
+						vt : MizVarTrm = mizSchAsVar(trm);
+						vt.varNr ::= v + env.boundVarNbr;
+					}
+					trm;
+				}
+				default: trm;
+			}
+		});
+		__t = mizWithinTrm(w, t);
+		{}
+	}
+}
+
+// GetTrmType through the TTColl: functor-like terms get their type ROUNDED
+// (RoundUpTrmTypeWithType + cluster RoundUpWith), as in InsertTermInTTColl
+mizSchGetTrmType(s : MizSchState, t : MizTrm) -> MizTyp {
+	env = s.env;
+	srt = mizTrmSort(t);
+	if (srt == ikTrmFunctor || srt == ikTrmSelector || srt == ikTrmAggreg) {
+		lTyp = env.roundUpTrmType(env, t);
+		lCl = mizCopyCluster(lTyp.upper);
+		env.roundUpCluster(env, lCl, lTyp);
+		lTyp.upper ::= lCl;
+		lTyp;
+	} else {
+		mizGetTrmType(env, t);
+	}
+}
+
+mizSchAsVar(t : MizTrm) -> MizVarTrm {
+	switch (t) {
+		MizVarTrm(__, __, __, __): t;
+		default: fail0("not a var trm");
+	}
+}
+
+mizSchAsFunc(t : MizTrm) -> MizFuncTrm {
+	switch (t) {
+		MizFuncTrm(__, __, __, __, __): t;
+		default: fail0("not a func trm");
+	}
+}
+
+// ---------------- cluster inclusion with backtracking ----------------
+
+mizSchEqAttr(s : MizSchState, a1 : MizAttr, a2 : MizAttr) -> bool {
+	env = s.env;
+	p1 = mizAdjustAttr(env, a1);
+	p2 = mizAdjustAttr(env, a2);
+	p1.first == p2.first && a1.neg == a2.neg && mizSchEqTrmList(s, p1.second, p2.second);
+}
+
+mizSchIsSubsetOf(s : MizSchState, fClu : MizAttrColl, aClu : MizAttrColl) -> bool {
+	if (sizeVector(aClu.items) < sizeVector(fClu.items)) {
+		false;
+	} else {
+		matched = ref 0;
+		iterVector(fClu.items, \a1 -> {
+			hit = ref false;
+			iterVector(aClu.items, \a2 -> {
+				if (!^hit) {
+					sn = schSnap(s);
+					if (mizSchEqAttr(s, a1, a2)) {
+						hit := true;
+						matched := ^matched + 1;
+					} else {
+						schRestore(s, sn);
+					}
+				}
+			});
+		});
+		^matched == sizeVector(fClu.items);
+	}
+}
+
+mizSchIsSupersetOf(s : MizSchState, fClu : MizAttrColl, aClu : MizAttrColl) -> bool {
+	if (sizeVector(aClu.items) > sizeVector(fClu.items)) {
+		false;
+	} else {
+		matched = ref 0;
+		iterVector(aClu.items, \a2 -> {
+			hit = ref false;
+			iterVector(fClu.items, \a1 -> {
+				if (!^hit) {
+					sn = schSnap(s);
+					if (mizSchEqAttr(s, a1, a2)) {
+						hit := true;
+						matched := ^matched + 1;
+					} else {
+						schRestore(s, sn);
+					}
+				}
+			});
+		});
+		^matched == sizeVector(aClu.items);
+	}
+}
+
+mizSchEqualClusters(s : MizSchState, t1 : MizTyp, t2 : MizTyp) -> bool {
+	mizSchIsSubsetOf(s, t1.lower, t2.upper) && mizSchIsSupersetOf(s, t1.upper, t2.lower);
+}
+
+mizSchCompTyp(s : MizSchState, t1 : MizTyp, t2 : MizTyp) -> bool {
+	env = s.env;
+	if (t1.sort != t2.sort) {
+		false;
+	} else if (t1.sort == ikTypMode) {
+		p1 = mizAdjustTyp(env, t1);
+		p2 = mizAdjustTyp(env, t2);
+		p1.first == p2.first && mizSchEqTrmList(s, p1.second, p2.second);
+	} else if (t1.sort == ikTypStruct) {
+		t1.modNr == t2.modNr && mizSchEqTrmList(s, t1.modArgs, t2.modArgs);
+	} else {
+		t1.sort == ikError;
+	}
+}
+
+mizSchEqTyp(s : MizSchState, t1 : MizTyp, t2 : MizTyp) -> bool {
+	env = s.env;
+	if (t1.sort != t2.sort) {
+		false;
+	} else if (t1.sort == ikTypMode) {
+		if (mizSchEqualClusters(s, t1, t2)) {
+			p1 = mizAdjustTyp(env, t1);
+			p2 = mizAdjustTyp(env, t2);
+			p1.first == p2.first && mizSchEqTrmList(s, p1.second, p2.second);
+		} else {
+			false;
+		}
+	} else if (t1.sort == ikTypStruct) {
+		mizSchEqualClusters(s, t1, t2) && t1.modNr == t2.modNr
+			&& mizSchEqTrmList(s, t1.modArgs, t2.modArgs);
+	} else {
+		t1.sort == ikError;
+	}
+}
+
+// ---------------- SchWidennings ----------------
+
+// can aSource (the term's type) widen to fTarget (the scheme functor's type)?
+mizSchWidennings(s : MizSchState, aSource : MizTyp, fTarget : MizTyp) -> bool {
+	env = s.env;
+	if (!mizSchIsSubsetOf(s, fTarget.lower, aSource.upper)) {
+		false;
+	} else {
+		sn = schSnap(s);
+		if (mizSchCompTyp(s, fTarget, aSource)) {
+			true;
+		} else if (fTarget.sort == aSource.sort && fTarget.modNr == aSource.modNr) {
+			false;
+		} else {
+			schRestore(s, sn);
+			if (fTarget.sort == ikTypMode) {
+				switch (mizWidening(env, aSource)) {
+					None(): false;
+					Some(lTyp0): {
+						switch (mizWideningOf(env, fTarget, lTyp0)) {
+							None(): false;
+							Some(wTyp0): {
+								schRestore(s, sn);
+								if (mizSchCompTyp(s, fTarget, wTyp0)) {
+									true;
+								} else if (mizConstr(env, coMode, fTarget.modNr).whichConstrNr == 0) {
+									// chase the widening chain up to Any
+									res = ref false;
+									stop = ref false;
+									wTyp = ref wTyp0;
+									while(\ -> !^stop, \ -> {
+										isAny = (^wTyp).sort == ikTypMode
+											&& (^wTyp).modNr == mizBuiltIn(env.builtIn, rqAny);
+										if (isAny) {
+											stop := true;
+										} else {
+											switch (mizWidening(env, ^wTyp)) {
+												None(): stop := true;
+												Some(lTyp): {
+													switch (mizWideningOf(env, fTarget, lTyp)) {
+														None(): stop := true;
+														Some(w2): {
+															wTyp := w2;
+															schRestore(s, sn);
+															if (mizSchCompTyp(s, fTarget, w2)) {
+																res := true;
+																stop := true;
+															}
+														}
+													}
+												}
+											}
+										}
+									});
+									^res;
+								} else {
+									false;
+								}
+							}
+						}
+					}
+				}
+			} else if (fTarget.sort == ikTypStruct) {
+				switch (mizWidenToStruct(env, aSource)) {
+					None(): false;
+					Some(lTyp): {
+						if (fTarget.modNr == lTyp.modNr) {
+							mizSchCompTyp(s, fTarget, lTyp);
+						} else {
+							// struct prefix path — staged (ReconAggregTrm family)
+							false;
+						}
+					}
+				}
+			} else {
+				false;
+			}
+		}
+	}
+}
+
+// ---------------- SchEqTrm / SchEqTrmList ----------------
+
+mizSchEqTrmList(s : MizSchState, l1 : MizTrmList, l2 : MizTrmList) -> bool {
+	c1 = ref l1;
+	c2 = ref l2;
+	ok = ref true;
+	go = ref true;
+	while(\ -> ^go, \ -> {
+		switch (^c1) {
+			MizTrmElem(t1, n1): {
+				switch (^c2) {
+					MizTrmElem(t2, n2): {
+						if (mizSchEqTrm(s, t1, t2)) {
+							c1 := n1;
+							c2 := n2;
+						} else {
+							ok := false;
+							go := false;
+						}
+					}
+					MizTrmNil(): {
+						ok := false;
+						go := false;
+					}
+				}
+			}
+			MizTrmNil(): {
+				switch (^c2) {
+					MizTrmElem(__, __): ok := false;
+					MizTrmNil(): {}
+				}
+				go := false;
+			}
+		}
+	});
+	^ok;
+}
+
+mizSchExpandInfConst(s : MizSchState, nr : int) -> MizTrm {
+	env = s.env;
+	cd : MizConstDef = getVectorUnsafe(env.inferConstDef, nr);
+	lTrm = mizCopyTrm(cd.def);
+	mizSchFrRenBound(s, lTrm);
+	lTrm;
+}
+
+mizSchEqTrm(s : MizSchState, t1 : MizTrm, t2 : MizTrm) -> bool {
+	env = s.env;
+	s1 = mizTrmSort(t1);
+	s2 = mizTrmSort(t2);
+	if (s1 == ikTrmSchFunc) {
+		f1 : MizFuncTrm = mizSchAsFunc(t1);
+		noArgs = switch (f1.args) { MizTrmNil(): true; default: false; };
+		if (noArgs) {
+			// 0-ary scheme functor: matches a closed term of a widening type
+			lTrm = mizCopyTrm(t2);
+			s.thereAreBound ::= false;
+			mizSchRenBound(s, lTrm);
+			switch (schConstAt(s, f1.funcNr)) {
+				Some(prev): {
+					if (mizEqTrm(env, prev, lTrm)) {
+						true;
+					} else {
+						s.err ::= 25;
+						false;
+					}
+				}
+				None(): {
+					if (s.thereAreBound) {
+						s.err ::= 27;
+						false;
+					} else {
+						wTyp = mizSchGetTrmType(s, lTrm);
+						if (mizSchWidennings(s, wTyp, getVectorUnsafe(s.schTypes, f1.funcNr - 1))) {
+							schConstSet(s, f1.funcNr, lTrm);
+							true;
+						} else {
+							s.err ::= 26;
+							if (getUrlParameterDef("dbg-sch", "") == "1") {
+								println("SCH26 F" + i2s(f1.funcNr)
+									+ " want=" + mizTyp2s(getVectorUnsafe(s.schTypes, f1.funcNr - 1))
+									+ " got=" + mizTyp2s(wTyp)
+									+ " term=" + mizTrm2s(lTrm));
+							}
+							false;
+						}
+					}
+				}
+			}
+		} else if (s2 == ikTrmInfConst) {
+			v2 : MizVarTrm = mizSchAsVar(t2);
+			mizSchEqTrm(s, t1, mizSchExpandInfConst(s, v2.varNr));
+		} else if (s2 == ikTrmFunctor || s2 == ikTrmPrivFunc || s2 == ikTrmSchFunc) {
+			f2nr = switch (t2) {
+				MizFuncTrm(__, fn, __, __, __): fn;
+				MizPrivFuncTrm(fn, __, __, __, __): fn;
+				default: 0;
+			};
+			f2args = switch (t2) {
+				MizFuncTrm(__, __, aa, __, __): aa;
+				MizPrivFuncTrm(__, aa, __, __, __): aa;
+				default: MizTrmNil();
+			};
+			s.thereAreBound ::= false;
+			mizSchChkBound(s, t2);
+			key = skKey(s2, f1.funcNr);
+			switch (lookupTree(s.funcSubst, key)) {
+				Some(v): {
+					if (v == f2nr) {
+						if (mizSchEqTrmList(s, f1.args, f2args)) {
+							true;
+						} else {
+							s.err ::= 28;
+							false;
+						}
+					} else {
+						s.err ::= 29;
+						false;
+					}
+				}
+				None(): {
+					wTyp = mizSchGetTrmType(s, t2);
+					if (mizSchWidennings(s, wTyp, getVectorUnsafe(s.schTypes, f1.funcNr - 1))) {
+						// a scheme functor maps to ONE kind of functor
+						others = filter([ikTrmFunctor, ikTrmPrivFunc, ikTrmSchFunc],
+							\k -> k != s2);
+						conflict = exists(others, \k ->
+							isSome(lookupTree(s.funcSubst, skKey(k, f1.funcNr))));
+						if (conflict) {
+							s.err ::= 32;
+							false;
+						} else {
+							s.funcSubst ::= setTree(s.funcSubst, key, f2nr);
+							if (mizSchEqTrmList(s, f1.args, f2args)) {
+								true;
+							} else {
+								s.err ::= 28;
+								false;
+							}
+						}
+					} else {
+						s.err ::= 30;
+						false;
+					}
+				}
+			}
+		} else {
+			s.err ::= 21;
+			false;
+		}
+	} else if (s1 == s2) {
+		if (s1 == ikTrmLocus || s1 == ikTrmBound || s1 == ikTrmConstant
+			|| s1 == ikTrmEqConst || s1 == ikTrmFreeVar || s1 == ikTrmLambdaVar
+			|| s1 == ikTrmNumeral) {
+			v1 : MizVarTrm = mizSchAsVar(t1);
+			v2 : MizVarTrm = mizSchAsVar(t2);
+			v1.varNr == v2.varNr;
+		} else if (s1 == ikTrmInfConst) {
+			v1 : MizVarTrm = mizSchAsVar(t1);
+			v2 : MizVarTrm = mizSchAsVar(t2);
+			if (v1.varNr == v2.varNr) {
+				true;
+			} else {
+				cd1 : MizConstDef = getVectorUnsafe(env.inferConstDef, v1.varNr);
+				cd2 : MizConstDef = getVectorUnsafe(env.inferConstDef, v2.varNr);
+				mizSchEqTrm(s, cd1.def, cd2.def);
+			}
+		} else if (s1 == ikTrmFunctor) {
+			ff1 : MizFuncTrm = mizSchAsFunc(t1);
+			ff2 : MizFuncTrm = mizSchAsFunc(t2);
+			p1 = mizAdjustTrm(env, ff1);
+			p2 = mizAdjustTrm(env, ff2);
+			p1.first == p2.first && mizSchEqTrmList(s, p1.second, p2.second);
+		} else if (s1 == ikTrmAggreg || s1 == ikTrmSelector) {
+			ff1 : MizFuncTrm = mizSchAsFunc(t1);
+			ff2 : MizFuncTrm = mizSchAsFunc(t2);
+			ff1.funcNr == ff2.funcNr && mizSchEqTrmList(s, ff1.args, ff2.args);
+		} else if (s1 == ikTrmFraenkel) {
+			k1 = switch (t1) { MizFraenkelTrm(__, __, __, __, __, __): t1; default: fail0("fr"); };
+			k2 = switch (t2) { MizFraenkelTrm(__, __, __, __, __, __): t2; default: fail0("fr"); };
+			if (sizeVector(k1.lambdaArgs) != sizeVector(k2.lambdaArgs)) {
+				false;
+			} else {
+				lB = env.boundVarNbr;
+				ok = ref true;
+				i = ref 0;
+				while(\ -> ^ok && ^i < sizeVector(k1.lambdaArgs), \ -> {
+					env.boundVarNbr ::= env.boundVarNbr + 1;
+					if (!mizSchEqTyp(s, getVectorUnsafe(k1.lambdaArgs, ^i),
+							getVectorUnsafe(k2.lambdaArgs, ^i))) {
+						ok := false;
+					} else {
+						mizSetBoundVar(env, env.boundVarNbr,
+							getVectorUnsafe(k2.lambdaArgs, ^i));
+					}
+					i := ^i + 1;
+				});
+				r = ^ok && mizSchEqTrm(s, k1.scope, k2.scope)
+					&& mizSchEqFrm(s, k1.compr, k2.compr);
+				env.boundVarNbr ::= lB;
+				r;
+			}
+		} else if (s1 == ikTrmChoice) {
+			c1 = switch (t1) { MizChoiceTrm(__, __, __): t1; default: fail0("ch"); };
+			c2 = switch (t2) { MizChoiceTrm(__, __, __): t2; default: fail0("ch"); };
+			mizSchEqTyp(s, c1.choiceTyp, c2.choiceTyp);
+		} else {
+			s1 == ikTrmIt || s1 == ikError;
+		}
+	} else if (s1 == ikTrmInfConst) {
+		v1 : MizVarTrm = mizSchAsVar(t1);
+		mizSchEqTrm(s, mizSchExpandInfConst(s, v1.varNr), t2);
+	} else if (s2 == ikTrmInfConst) {
+		v2 : MizVarTrm = mizSchAsVar(t2);
+		mizSchEqTrm(s, t1, mizSchExpandInfConst(s, v2.varNr));
+	} else {
+		false;
+	}
+}
+
+// ---------------- SchEqFrm ----------------
+
+mizSchEqFrm(s : MizSchState, fFrm10 : MizFrm, fFrm20 : MizFrm) -> bool {
+	env = s.env;
+	// one-sided negation peel: a scheme predicate can match negatively
+	lNeg = (mizFrmSort(fFrm10) == ikFrmNeg && mizFrmSort(fFrm20) != ikFrmNeg)
+		|| (mizFrmSort(fFrm20) == ikFrmNeg && mizFrmSort(fFrm10) != ikFrmNeg);
+	fFrm1 = if (mizFrmSort(fFrm10) == ikFrmNeg && lNeg) {
+		switch (fFrm10) { MizNegFrm(a, __): a; default: fFrm10; };
+	} else fFrm10;
+	fFrm2 = if (mizFrmSort(fFrm20) == ikFrmNeg && lNeg) {
+		switch (fFrm20) { MizNegFrm(a, __): a; default: fFrm20; };
+	} else fFrm20;
+	sf1 = mizFrmSort(fFrm1);
+	sf2 = mizFrmSort(fFrm2);
+	if (sf1 == ikFrmSchPred) {
+		p1 = switch (fFrm1) { MizPredFrm(__, __, __, __): fFrm1; default: fail0("sp"); };
+		if (sf2 == ikFrmPred || sf2 == ikFrmPrivPred || sf2 == ikFrmSchPred) {
+			p2nr = switch (fFrm2) {
+				MizPredFrm(__, nr, __, __): nr;
+				MizLocPredFrm(nr, __, __, __): nr;
+				default: 0;
+			};
+			p2args = switch (fFrm2) {
+				MizPredFrm(__, __, args, __): args;
+				MizLocPredFrm(__, args, __, __): args;
+				default: MizTrmNil();
+			};
+			key = skKey(sf2, p1.predNr);
+			switch (lookupTree(s.predSubst, key)) {
+				Some(v0): {
+					v = if (lNeg) -v0 else v0;
+					if (v == p2nr) {
+						if (mizSchEqTrmList(s, p1.args, p2args)) {
+							true;
+						} else {
+							s.err ::= 23;
+							false;
+						}
+					} else {
+						s.err ::= 24;
+						false;
+					}
+				}
+				None(): {
+					others = filter([ikFrmPred, ikFrmPrivPred, ikFrmSchPred],
+						\k -> k != sf2);
+					conflict = exists(others, \k ->
+						isSome(lookupTree(s.predSubst, skKey(k, p1.predNr))));
+					if (conflict) {
+						s.err ::= 31;
+						false;
+					} else {
+						s.predSubst ::= setTree(s.predSubst, key, p2nr);
+						if (mizSchEqTrmList(s, p1.args, p2args)) {
+							true;
+						} else {
+							s.err ::= 23;
+							false;
+						}
+					}
+				}
+			}
+		} else {
+			s.err ::= 22;
+			false;
+		}
+	} else if (sf1 == sf2 && !lNeg) {
+		if (sf1 == ikFrmVerum || sf1 == ikFrmThesis) {
+			true;
+		} else if (sf1 == ikFrmNeg) {
+			a1 = switch (fFrm1) { MizNegFrm(a, __): a; default: fFrm1; };
+			a2 = switch (fFrm2) { MizNegFrm(a, __): a; default: fFrm2; };
+			mizSchEqFrm(s, a1, a2);
+		} else if (sf1 == ikFrmQual) {
+			q1 = switch (fFrm1) { MizQualFrm(__, __, __): fFrm1; default: fail0("q"); };
+			q2 = switch (fFrm2) { MizQualFrm(__, __, __): fFrm2; default: fail0("q"); };
+			mizSchEqTrm(s, q1.trm, q2.trm) && mizSchEqTyp(s, q1.typ, q2.typ);
+		} else if (sf1 == ikFrmConj) {
+			c1 = switch (fFrm1) { MizConjFrm(__, __): fFrm1; default: fail0("c"); };
+			c2 = switch (fFrm2) { MizConjFrm(__, __): fFrm2; default: fail0("c"); };
+			if (sizeVector(c1.conjuncts) != sizeVector(c2.conjuncts)) {
+				false;
+			} else {
+				ok = ref true;
+				i = ref 0;
+				while(\ -> ^ok && ^i < sizeVector(c1.conjuncts), \ -> {
+					if (!mizSchEqFrm(s, getVectorUnsafe(c1.conjuncts, ^i),
+							getVectorUnsafe(c2.conjuncts, ^i))) {
+						ok := false;
+					}
+					i := ^i + 1;
+				});
+				^ok;
+			}
+		} else if (sf1 == ikFrmAttr) {
+			p1 = switch (fFrm1) { MizPredFrm(__, __, __, __): fFrm1; default: fail0("a"); };
+			p2 = switch (fFrm2) { MizPredFrm(__, __, __, __): fFrm2; default: fail0("a"); };
+			q1 = mizAdjustAttrFrm(env, p1);
+			q2 = mizAdjustAttrFrm(env, p2);
+			q1.first == q2.first && mizSchEqTrmList(s, q1.second, q2.second);
+		} else if (sf1 == ikFrmPred) {
+			p1 = switch (fFrm1) { MizPredFrm(__, __, __, __): fFrm1; default: fail0("p"); };
+			p2 = switch (fFrm2) { MizPredFrm(__, __, __, __): fFrm2; default: fail0("p"); };
+			q1 = mizAdjustFrm(env, p1);
+			q2 = mizAdjustFrm(env, p2);
+			if (q1.first != q2.first) {
+				false;
+			} else if (q1.first == mizBuiltIn(env.builtIn, rqEqualsTo)) {
+				mizSchEqTrm(s, mizTrmListNth(q1.second, 0), mizTrmListNth(q2.second, 0))
+					&& mizSchEqTrm(s, mizTrmListNth(q1.second, 1), mizTrmListNth(q2.second, 1));
+			} else {
+				mizSchEqTrmList(s, q1.second, q2.second);
+			}
+		} else if (sf1 == ikFrmUniv) {
+			u1 = switch (fFrm1) { MizUnivFrm(__, __, __, __, __): fFrm1; default: fail0("u"); };
+			u2 = switch (fFrm2) { MizUnivFrm(__, __, __, __, __): fFrm2; default: fail0("u"); };
+			env.boundVarNbr ::= env.boundVarNbr + 1;
+			r = if (mizSchEqTyp(s, u1.quantified, u2.quantified)) {
+				mizSetBoundVar(env, env.boundVarNbr, u2.quantified);
+				mizSchEqFrm(s, u1.scope, u2.scope);
+			} else {
+				false;
+			}
+			env.boundVarNbr ::= env.boundVarNbr - 1;
+			r;
+		} else if (sf1 == ikFrmFlexConj) {
+			x1 = switch (fFrm1) { MizFlexFrm(__, __, __, __, __, __, __): fFrm1; default: fail0("x"); };
+			x2 = switch (fFrm2) { MizFlexFrm(__, __, __, __, __, __, __): fFrm2; default: fail0("x"); };
+			mizSchEqFrm(s, x1.leftOrig, x2.leftOrig)
+				&& mizSchEqFrm(s, x1.rightOrig, x2.rightOrig);
+		} else {
+			sf1 == ikError;
+		}
+	} else if (sf2 == ikFrmPrivPred) {
+		l2 = switch (fFrm2) { MizLocPredFrm(__, __, __, __): fFrm2; default: fail0("l"); };
+		mizSchEqFrm(s, fFrm10, l2.predExp);
+	} else {
+		false;
+	}
+}
+
+// ---------------- Schematize ----------------
+
+mizSchematize(env : MizCorrelEnv, sch : MizSchemeDef, snts : [MizFrm]) -> bool {
+	mizSchematizeErr(env, sch, snts).first == 0;
+}
+
+mizSchematizeErr(env : MizCorrelEnv, sch : MizSchemeDef, snts : [MizFrm]) -> Pair<int, int> {
+	if (!sch.valid || length(sch.schProps) != length(snts)) {
+		Pair(20, -1);
+	} else {
+		env.boundVarNbr ::= 0;
+		// the original types terms through the TTColl cache, which rounds
+		// subterms recursively; itIsChecker makes CheckLociTypes round the
+		// same way (RoundUpTrmType on the argument substitution)
+		lChk = env.itIsChecker;
+		env.itIsChecker ::= true;
+		s = MizSchState(env, sch.schTypes, makeVector(8), makeTree(), makeTree(),
+			false, 20);
+		bad = ref -1;
+		i = ref 0;
+		while(\ -> ^bad < 0 && ^i < length(sch.schProps), \ -> {
+			if (!mizSchEqFrm(s, sch.schProps[^i], snts[^i])) bad := ^i;
+			i := ^i + 1;
+		});
+		env.itIsChecker ::= lChk;
+		if (^bad < 0) Pair(0, -1) else Pair(s.err, ^bad);
+	}
+}

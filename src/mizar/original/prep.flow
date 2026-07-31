@@ -35,6 +35,7 @@ import mizar/original/equalizer;
 import mizar/original/checker;
 import mizar/original/unifier;
 import mizar/original/definientia;
+import mizar/original/schemes;
 import mizar/original/print;
 import net/url_parameter;
 
@@ -57,6 +58,7 @@ export {
 	mutable lastBlockThesis : Maybe<MizFrm>, // set when a BlockThesis is read
 		mutable theorems : Tree<int, MizFrm>,   // key = kindTag*10^8 + articlenr*10^4 + nr
 		defs : MizDefinientia,
+		schemes : MizSchemes,
 	mutable ownArticleNr : int,
 		mutable ownTheoremNr : int,
 		mutable ownDefNr : int,
@@ -257,6 +259,47 @@ mizLoadReductions(env : MizCorrelEnv, idn : MizIdentify, content : string) -> vo
 	}
 }
 
+// .esh: <Schemes> with <Scheme articlenr nr>: ArgTypes (the scheme functors'
+// result types), then the statement formula followed by the premises
+mizLoadSchemes(p : MizPrep, content : string) -> void {
+	if (content != "") {
+		r2 = mizMakeVrfReaderMML(mizXmlInitParsing(content), p.r.env);
+		x = r2.x;
+		mizXmlNextElementState(x);
+		mizXmlAssert(x.nElName == "Schemes");
+		mizXmlNextElementState(x);
+		while(\ -> x.nState == MizEStart, \ -> {
+			if (x.nElName == "Scheme") {
+				art = mizXmlIntAttrDef(x, "articlenr", 0);
+				nr = mizXmlIntAttrDef(x, "nr", 0);
+				mizXmlNextElementState(x);
+				types = if (x.nState == MizEStart && x.nElName == "ArgTypes") {
+					mizInArgColl(r2);
+				} else {
+					makeVector(0);
+				}
+				props = ref [];
+				bad = ref false;
+				while(\ -> x.nState == MizEStart, \ -> {
+					if (mizIsFrmEl(x.nElName)) {
+						props := arrayPush(^props, mizInFormula(r2));
+					} else {
+						if (x.nElName == "Canceled" || x.nElName == "ErrorScheme") {
+							bad := true;
+						}
+						mizXmlSkipElement(x);
+					}
+				});
+				pushVector(p.schemes.items,
+					MizSchemeDef(art, nr, types, ^props, !^bad));
+				mizXmlNextElementState(x);
+			} else {
+				mizXmlSkipElement(x);
+			}
+		});
+	}
+}
+
 // MML-format reader (one cluster per Typ)
 mizMakeVrfReaderMML(x : MizXmlParser, env : MizCorrelEnv) -> MizVrfReader {
 	r = mizMakeVrfReader(x, env);
@@ -280,19 +323,39 @@ mizCheckArticle(mmlDir : string, article : string) -> MizPrepStats {
 	mizLoadRequirements(env, mmlDir + "/" + article + ".ere");
 	env.itTyp ::= mizNewStandardTyp(ikTypMode, mizNewEmptyCluster(),
 		mizNewEmptyCluster(), mizBuiltIn(env.builtIn, rqAny), mizNil);
-	env.nonZeroTyp ::= mizNewStandardTyp(ikTypMode, mizNewEmptyCluster(),
-		mizNewEmptyCluster(), mizBuiltIn(env.builtIn, rqAny), mizNil);
+	rqElemB = mizBuiltIn(env.builtIn, rqElement);
+	rqOmegaB = mizBuiltIn(env.builtIn, rqOmega);
+	env.nonZeroTyp ::= if (rqElemB != 0 && rqOmegaB != 0) {
+		mizNewStandardTyp(ikTypMode, mizNewEmptyCluster(), mizNewEmptyCluster(),
+			rqElemB, mizNewTrmList(mizNewFuncTrm(rqOmegaB, mizNil), mizNil));
+	} else {
+		mizNewStandardTyp(ikTypMode, mizNewEmptyCluster(), mizNewEmptyCluster(),
+			mizBuiltIn(env.builtIn, rqSetMode), mizNil);
+	}
 	mizInitRevReq(idn);
 
 	stats = MizPrepStats(0, 0, 0, 0, 0, makeVector(8));
 	x = mizXmlInitParsingFile(mmlDir + "/" + article + ".xml");
 	r = mizMakeVrfReader(x, env);
 	defs = mizMakeDefinientia();
-	p = MizPrep(chk, r, makeVector(64), makeVector(64), None(), None(), makeTree(), defs, 2, 0, 0, stats);
+	p = MizPrep(chk, r, makeVector(64), makeVector(64), None(), None(), makeTree(), defs, mizMakeSchemes(), 2, 0, 0, stats);
 	mizLoadTheorems(p, getFileContent(mmlDir + "/" + article + ".eth"));
 	mizLoadClusters(env, cl, getFileContent(mmlDir + "/" + article + ".ecl"));
 	mizLoadReductions(env, idn, getFileContent(mmlDir + "/" + article + ".erd"));
 	mizLoadIdentifications(env, idn, getFileContent(mmlDir + "/" + article + ".eid"));
+	mizLoadSchemes(p, getFileContent(mmlDir + "/" + article + ".esh"));
+	// NonZeroTyp upper cluster: non-zero (+ positive), rounded with the
+	// loaded registrations (iocorrel.pas 3283-3294)
+	nzCl = mizNewEmptyCluster();
+	rqZeroB = mizBuiltIn(env.builtIn, rqZero);
+	if (rqZeroB != 0) mizAttrCollInsert(env, nzCl, MizAttr(0, rqZeroB, mizNil, false, 0));
+	rqPosB = mizBuiltIn(env.builtIn, rqPositive);
+	if (rqElemB > 0 && rqOmegaB > 0 && rqPosB > 0) {
+		mizAttrCollInsert(env, nzCl, MizAttr(1, rqPosB, mizNil, false, 0));
+	}
+	env.roundUpCluster(env, nzCl, env.nonZeroTyp);
+	nzT = env.nonZeroTyp;
+	nzT.upper ::= nzCl;
 	mizLoadDefinientia(env, defs, mmlDir, article);
 	chk.atomicExpansions ::= \f -> mizAtomicExpansions(env, defs, f);
 	idn.equalsExpand ::= \idn2, funcNr, args -> mizEqualsExpandHook(defs, idn2, funcNr, args);
@@ -405,8 +468,57 @@ mizJustify(p : MizPrep, claim : MizFrm, posLine : int) -> void {
 			pushVector(p.stats.failures, i2s(line) + ":" + i2s(col) + " unresolved-ref");
 		}
 	} else if (name == "From") {
-		{ st5 = p.stats; st5.skippedFrom ::= st5.skippedFrom + 1; }
-		mizXmlSkipElement(x);
+		// scheme justification: match [claim, premise*] against the scheme
+		artF = mizXmlIntAttrDef(x, "articlenr", 0);
+		nrF = mizXmlIntAttrDef(x, "nr", 0);
+		lineF = mizXmlIntAttrDef(x, "line", posLine);
+		colF = mizXmlIntAttrDef(x, "col", 0);
+		snts = ref [mizCopyFrm(claim)];
+		okF = ref true;
+		mizXmlNextElementState(x);
+		while(\ -> x.nState == MizEStart, \ -> {
+			if (x.nElName == "Ref") {
+				nr2 = mizXmlIntAttrDef(x, "nr", 0);
+				if (mizXmlHasAttr(x, "articlenr")) {
+					art2 = mizXmlIntAttr(x, "articlenr");
+					kindS2 = mizXmlAttr(x, "kind");
+					kind2 = if (kindS2 == "T") kindT else kindD;
+					switch (lookupTree(p.theorems, thKey(kind2, art2, nr2))) {
+						Some(f): snts := arrayPush(^snts, mizCopyFrm(f));
+						None(): okF := false;
+					}
+				} else {
+					switch (mizGetLabeled(p, nr2)) {
+						Some(f): snts := arrayPush(^snts, mizCopyFrm(f));
+						None(): okF := false;
+					}
+				}
+				mizXmlSkipElement(x);
+			} else {
+				mizXmlSkipElement(x);
+			}
+		});
+		mizXmlNextElementState(x);
+		{ st5 = p.stats; st5.checked ::= st5.checked + 1; }
+		schemeM = mizSchemeFind(p.schemes, artF, nrF);
+		errPair = if (^okF) {
+			switch (schemeM) {
+				Some(sch): mizSchematizeErr(p.chk.env, sch, ^snts);
+				None(): Pair(-1, -1);
+			}
+		} else {
+			Pair(-2, -1);
+		}
+		if (errPair.first == 0) {
+			{ st5a = p.stats; st5a.accepted ::= st5a.accepted + 1; }
+		} else {
+			{ st5f = p.stats; st5f.failed ::= st5f.failed + 1; }
+			why = if (errPair.first == -2) " from-unresolved-ref"
+				else if (errPair.first == -1) " from-missing-scheme"
+				else " from-mismatch err=" + i2s(errPair.first)
+					+ " snt=" + i2s(errPair.second);
+			pushVector(p.stats.failures, i2s(lineF) + ":" + i2s(colF) + why);
+		}
 	} else if (name == "Proof" || name == "PerCasesReasoning") {
 		// PerCasesReasoning as a justification: CaseBlock/SupposeBlock items
 		// and the final PerCases split — all handled by the item walker
@@ -427,10 +539,13 @@ mizWalkBlock(p : MizPrep) -> void {
 	fixedMark = env.fixedVarNbr;
 	labelMark = sizeVector(p.labeled);
 	prevMark = p.prev;
+	locFuncMark = sizeVector(env.locFuncDef);
 	mizXmlNextElementState(x); // into the block
 	mizWalkItems(p);
 	// at </block>; advance
 	mizXmlNextElementState(x);
+	while(\ -> sizeVector(env.locFuncDef) > locFuncMark,
+		\ -> removeVector(env.locFuncDef, sizeVector(env.locFuncDef) - 1));
 	env.fixedVarNbr ::= fixedMark;
 	while(\ -> sizeVector(p.labeled) > labelMark,
 		\ -> removeVector(p.labeled, sizeVector(p.labeled) - 1));
@@ -614,9 +729,23 @@ mizWalkItems(p : MizPrep) -> void {
 		} else if (name == "Thesis"
 			|| name == "ThesisExpansions" || name == "EndPosition"
 			|| name == "Take" || name == "Reservation"
-			|| name == "Section" || name == "DefPred" || name == "DefFunc"
+			|| name == "Section" || name == "DefPred"
 			|| name == "SkippedProof") {
 			mizXmlSkipElement(x);
+		} else if (name == "DefFunc") {
+			// deffunc F(args) = term: a private functor with its result type
+			// (FinishPrivFuncDefinition -> LocFuncDef)
+			mizXmlNextElementState(x);
+			argsD = if (x.nState == MizEStart && x.nElName == "ArgTypes") {
+				mizInArgColl(p.r);
+			} else {
+				makeVector(0);
+			}
+			trmD = mizInTerm(p.r);
+			typD = mizInType(p.r);
+			pushVector(env.locFuncDef, MizFuncDef(0, argsD, trmD, typD));
+			while(\ -> x.nState == MizEStart, \ -> mizXmlSkipElement(x));
+			mizXmlNextElementState(x);
 		} else if (name == "Constructor") {
 			c = mizInConstructor1(p.r);
 			__nr = mizPushConstr(p.chk.env, c);
@@ -720,8 +849,76 @@ mizWalkItems(p : MizPrep) -> void {
 				None(): {}
 			}
 			p.lastBlockThesis ::= None();
-		} else if (name == "SchemeBlock"
-			|| name == "Canceled" || name == "Pattern") {
+		} else if (name == "SchemeBlock") {
+			// the article's own scheme: functor result types, premises, the
+			// statement with its (checked) proof; registered for `from`
+			schemeNr = mizXmlIntAttrDef(x, "schemenr", 0);
+			envS = p.chk.env;
+			fixedMarkS = envS.fixedVarNbr;
+			labelMarkS = sizeVector(p.labeled);
+			prevMarkS = p.prev;
+			schTypes : Vector<MizTyp> = makeVector(4);
+			schPremises = ref [];
+			schStmt : ref Maybe<MizFrm> = ref None();
+			// the scheme functors' types feed GetTrmType inside the block
+			savedSchFuncTyp = copyVector(envS.curSchFuncTyp);
+			clearVector(envS.curSchFuncTyp);
+			mizXmlNextElementState(x);
+			while(\ -> x.nState == MizEStart, \ -> {
+				nm = x.nElName;
+				if (nm == "SchemeFuncDecl") {
+					fnr = mizXmlIntAttrDef(x, "nr", 0);
+					mizXmlNextElementState(x);
+					if (x.nState == MizEStart && x.nElName == "ArgTypes") {
+						__args = mizInArgColl(p.r);
+						{}
+					}
+					resTyp = mizInType(p.r);
+					while(\ -> sizeVector(schTypes) < fnr,
+						\ -> pushVector(schTypes, mizNewIncorTyp()));
+					setVectorUnsafe(schTypes, fnr - 1, resTyp);
+					while(\ -> sizeVector(envS.curSchFuncTyp) < fnr,
+						\ -> pushVector(envS.curSchFuncTyp, mizNewIncorTyp()));
+					setVectorUnsafe(envS.curSchFuncTyp, fnr - 1, resTyp);
+					while(\ -> x.nState == MizEStart, \ -> mizXmlSkipElement(x));
+					mizXmlNextElementState(x);
+				} else if (nm == "SchemePredDecl") {
+					mizXmlSkipElement(x);
+				} else if (nm == "SchemePremises") {
+					mizXmlNextElementState(x);
+					while(\ -> x.nState == MizEStart, \ -> {
+						if (x.nElName == "Proposition") {
+							prP = mizReadProposition(p);
+							if (prP.first > 0) mizSetLabeled(p, prP.first, prP.second);
+							schPremises := arrayPush(^schPremises, prP.second);
+						} else {
+							mizXmlSkipElement(x);
+						}
+					});
+					mizXmlNextElementState(x);
+				} else if (nm == "Proposition") {
+					prS = mizReadProposition(p);
+					schStmt := Some(prS.second);
+					mizJustify(p, prS.second, 0);
+				} else {
+					mizXmlSkipElement(x);
+				}
+			});
+			mizXmlNextElementState(x);
+			envS.fixedVarNbr ::= fixedMarkS;
+			while(\ -> sizeVector(p.labeled) > labelMarkS,
+				\ -> removeVector(p.labeled, sizeVector(p.labeled) - 1));
+			p.prev ::= prevMarkS;
+			clearVector(envS.curSchFuncTyp);
+			iterVector(savedSchFuncTyp, \tS -> pushVector(envS.curSchFuncTyp, tS));
+			switch (^schStmt) {
+				Some(st): {
+					pushVector(p.schemes.items, MizSchemeDef(0, schemeNr,
+						schTypes, concat([st], ^schPremises), true));
+				}
+				None(): {}
+			}
+		} else if (name == "Canceled" || name == "Pattern") {
 			{ st7 = p.stats; st7.skippedBlocks ::= st7.skippedBlocks + 1; }
 			mizXmlSkipElement(x);
 		} else {
