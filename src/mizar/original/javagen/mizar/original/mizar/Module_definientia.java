@@ -11,7 +11,7 @@ final public class Module_definientia {
 		Struct l0_p;
 		Struct l1__tmp = af;
 		switch (l1__tmp.getTypeId()) {
-		case 55/*MizPredFrm*/: {
+		case 56/*MizPredFrm*/: {
 			final Struct_MizPredFrm l2__tmp = (Struct_MizPredFrm)l1__tmp;
 			final int l3_srt = l2__tmp.f_sort;
 			final int l4_predNr = l2__tmp.f_predNr;
@@ -40,10 +40,10 @@ final public class Module_definientia {
 		}
 		Struct l12__tmp = l0_p;
 		switch (l12__tmp.getTypeId()) {
-		case 75/*None*/: {
+		case 80/*None*/: {
 			return SingletonStructs.arr_empty;
 		}
-		case 83/*Some*/: {
+		case 88/*Some*/: {
 			final Struct_Some l13__tmp = (Struct_Some)l12__tmp;
 			final Object l14_pk = l13__tmp.f_value;
 			final Struct_Pair l15_pk = ((Struct_Pair)(l13__tmp).f_value);
@@ -55,14 +55,14 @@ final public class Module_definientia {
 				boolean l22_okShape;
 				Struct l23__tmp = l21_gsymswitch4;
 				switch (l23__tmp.getTypeId()) {
-				case 83/*Some*/: {
+				case 88/*Some*/: {
 					final Struct_Some l24__tmp = (Struct_Some)l23__tmp;
 					final Object l25_def = l24__tmp.f_value;
 					final Struct_MizDef l26_def = ((Struct_MizDef)(l24__tmp).f_value);
 					l22_okShape=(((((l26_def).f_sort==109)&&(Module_vector.f_sizeVector((l26_def).f_partials)==0))&&(Module_correl.f_mizFrmSort((ad).f_assumptions)==Module_lexicon.g_ikFrmVerum))&&Module_maybe.f_isSome((l26_def).f_otherwise));
 					break;
 				}
-				case 75/*None*/: {
+				case 80/*None*/: {
 					l22_okShape=false;
 					break;
 				}
@@ -73,14 +73,14 @@ final public class Module_definientia {
 					final Struct l27_gsymswitch5 = (ad).f_def;
 					Struct l28__tmp = l27_gsymswitch5;
 					switch (l28__tmp.getTypeId()) {
-					case 83/*Some*/: {
+					case 88/*Some*/: {
 						final Struct_Some l29__tmp = (Struct_Some)l28__tmp;
 						final Object l30_def = l29__tmp.f_value;
 						final Struct_MizDef l31_def = ((Struct_MizDef)(l29__tmp).f_value);
 						final Struct l32_gsymswitch6 = (l31_def).f_otherwise;
 						Struct l33__tmp = l32_gsymswitch6;
 						switch (l33__tmp.getTypeId()) {
-						case 83/*Some*/: {
+						case 88/*Some*/: {
 							final Struct_Some l34__tmp = (Struct_Some)l33__tmp;
 							final Object l35_body = l34__tmp.f_value;
 							final Struct l36_body = ((Struct)(l34__tmp).f_value);
@@ -95,7 +95,7 @@ final public class Module_definientia {
 									final Func2<Struct,Struct_MizWithin, Struct> l43_$42 = (Func2<Struct, Struct_MizWithin, Struct>)(Struct_MizWithin al44_0, Struct atrm) -> {
 										Struct l45__tmp = atrm;
 										switch (l45__tmp.getTypeId()) {
-										case 70/*MizVarTrm*/: {
+										case 75/*MizVarTrm*/: {
 											final Struct_MizVarTrm l46__tmp = (Struct_MizVarTrm)l45__tmp;
 											final int l47_s2 = l46__tmp.f_sort;
 											final int l48_v2 = l46__tmp.f_varNr;
@@ -132,14 +132,14 @@ final public class Module_definientia {
 								throw new RuntimeException("Unexpected struct in switch: "+l37__tmp.getTypeName());
 							}
 						}
-						case 75/*None*/: {
+						case 80/*None*/: {
 							return null;
 						}
 						default:
 							throw new RuntimeException("Unexpected struct in switch: "+l33__tmp.getTypeName());
 						}
 					}
-					case 75/*None*/: {
+					case 80/*None*/: {
 						return null;
 					}
 					default:
@@ -193,7 +193,7 @@ final public class Module_definientia {
 					((Field_equalsExpansionLevel)l10_idn).set_equalsExpansionLevel(((l10_idn).f_equalsExpansionLevel-1));
 					Struct l12__tmp = l11_lTrm;
 					switch (l12__tmp.getTypeId()) {
-					case 70/*MizVarTrm*/: {
+					case 75/*MizVarTrm*/: {
 						final Struct_MizVarTrm l13__tmp = (Struct_MizVarTrm)l12__tmp;
 						final int l14_srt = l13__tmp.f_sort;
 						final int l15_varNr = l13__tmp.f_varNr;
@@ -229,10 +229,10 @@ final public class Module_definientia {
 				final Struct l0_gsymswitch0 = (ad).f_def;
 				Struct l1__tmp = l0_gsymswitch0;
 				switch (l1__tmp.getTypeId()) {
-				case 75/*None*/: {
+				case 80/*None*/: {
 					return ((Struct)SingletonStructs.str_None);
 				}
-				case 83/*Some*/: {
+				case 88/*Some*/: {
 					final Struct_Some l2__tmp = (Struct_Some)l1__tmp;
 					final Object l3_def = l2__tmp.f_value;
 					final Struct_MizDef l4_def = ((Struct_MizDef)(l2__tmp).f_value);
@@ -242,10 +242,10 @@ final public class Module_definientia {
 						final Struct l5_gsymswitch1 = (l4_def).f_otherwise;
 						Struct l6__tmp = l5_gsymswitch1;
 						switch (l6__tmp.getTypeId()) {
-						case 75/*None*/: {
+						case 80/*None*/: {
 							return ((Struct)SingletonStructs.str_None);
 						}
-						case 83/*Some*/: {
+						case 88/*Some*/: {
 							final Struct_Some l7__tmp = (Struct_Some)l6__tmp;
 							final Object l8_body = l7__tmp.f_value;
 							final Struct l9_body = ((Struct)(l7__tmp).f_value);
@@ -391,7 +391,7 @@ final public class Module_definientia {
 			final Struct l5_gsymswitch3 = l0_cur.value;
 			Struct l6__tmp = l5_gsymswitch3;
 			switch (l6__tmp.getTypeId()) {
-			case 63/*MizTrmElem*/: {
+			case 68/*MizTrmElem*/: {
 				final Struct_MizTrmElem l7__tmp = (Struct_MizTrmElem)l6__tmp;
 				final Struct l8_trm = l7__tmp.f_trm;
 				final Struct l9_next = l7__tmp.f_next;
@@ -401,7 +401,7 @@ final public class Module_definientia {
 				l0_cur.value = l11_next;
 				return null;
 			}
-			case 64/*MizTrmNil*/: {
+			case 69/*MizTrmNil*/: {
 				return null;
 			}
 			default:
@@ -421,7 +421,7 @@ final public class Module_definientia {
 			final Struct l2_gsymswitch2 = Module_definientia.f_mizEqualsExpansion(l2_env, ad);
 			Struct l3__tmp = l2_gsymswitch2;
 			switch (l3__tmp.getTypeId()) {
-			case 83/*Some*/: {
+			case 88/*Some*/: {
 				final Struct_Some l4__tmp = (Struct_Some)l3__tmp;
 				final Object l5_ed = l4__tmp.f_value;
 				final Struct_MizEqualsDef l6_ed = ((Struct_MizEqualsDef)(l4__tmp).f_value);
@@ -430,7 +430,7 @@ final public class Module_definientia {
 				((Field_equalsBy)l3_defs).set_equalsBy(Module_tree.f_setTree((l3_defs).f_equalsBy, l7_key, Module_array.f_arrayPush(l8_cur, l6_ed)));
 				return null;
 			}
-			case 75/*None*/: {
+			case 80/*None*/: {
 				return null;
 			}
 			default:

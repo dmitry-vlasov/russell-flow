@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785508391392
+// timestamp: 1785512695560
 
 package mizar.original.mizar;
 
@@ -14,7 +14,7 @@ public final class SingletonStructs {
 	static final SingletonStruct str_IllegalStruct = SingletonStruct.make(3,"IllegalStruct");
 	static final SingletonStruct str_JsonFieldIgnoreCase = SingletonStruct.make(7,"JsonFieldIgnoreCase");
 	static final SingletonStruct str_JsonNull = SingletonStruct.make(9,"JsonNull");
-	static final SingletonStruct str_MizTrmNil = SingletonStruct.make(64,"MizTrmNil");
-	static final SingletonStruct str_None = SingletonStruct.make(75,"None");
-	static final SingletonStruct str_TreeEmpty = SingletonStruct.make(84,"TreeEmpty");
+	static final SingletonStruct str_MizTrmNil = SingletonStruct.make(69,"MizTrmNil");
+	static final SingletonStruct str_None = SingletonStruct.make(80,"None");
+	static final SingletonStruct str_TreeEmpty = SingletonStruct.make(89,"TreeEmpty");
 }

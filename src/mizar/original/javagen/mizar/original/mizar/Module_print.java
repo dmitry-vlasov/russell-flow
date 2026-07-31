@@ -10,7 +10,7 @@ final public class Module_print {
 	public static final String f_mizFrm2s(Struct af) {
 		Struct l0__tmp = af;
 		switch (l0__tmp.getTypeId()) {
-		case 55/*MizPredFrm*/: {
+		case 56/*MizPredFrm*/: {
 			final Struct_MizPredFrm l1__tmp = (Struct_MizPredFrm)l0__tmp;
 			final int l2_srt = l1__tmp.f_sort;
 			final int l3_predNr = l1__tmp.f_predNr;
@@ -35,7 +35,7 @@ final public class Module_print {
 			}
 			return ((((l9_k+Module_string.f_i2s(l6_predNr))+"[")+Module_print.f_mizTrmList2s(l7_args))+"]");
 		}
-		case 48/*MizLocPredFrm*/: {
+		case 49/*MizLocPredFrm*/: {
 			final Struct_MizLocPredFrm l1__tmp = (Struct_MizLocPredFrm)l0__tmp;
 			final int l10_predNr = l1__tmp.f_predNr;
 			final Struct l11_args = l1__tmp.f_args;
@@ -45,7 +45,7 @@ final public class Module_print {
 			final int l15___ = (l1__tmp).f_pattNr;
 			return (((("S"+Module_string.f_i2s(l12_predNr))+"[")+Module_print.f_mizTrmList2s(l13_args))+"]");
 		}
-		case 60/*MizQualFrm*/: {
+		case 61/*MizQualFrm*/: {
 			final Struct_MizQualFrm l1__tmp = (Struct_MizQualFrm)l0__tmp;
 			final Struct l16_trm = l1__tmp.f_trm;
 			final Struct_MizTyp l17_typ = l1__tmp.f_typ;
@@ -54,7 +54,7 @@ final public class Module_print {
 			final int l20___ = (l1__tmp).f_pattNr;
 			return ((Module_print.f_mizTrm2s(l18_trm)+" is ")+Module_print.f_mizTyp2s(l19_typ));
 		}
-		case 50/*MizNegFrm*/: {
+		case 51/*MizNegFrm*/: {
 			final Struct_MizNegFrm l1__tmp = (Struct_MizNegFrm)l0__tmp;
 			final Struct l21_arg = l1__tmp.f_arg;
 			final Struct l22_arg = (l1__tmp).f_arg;
@@ -81,7 +81,7 @@ final public class Module_print {
 			};
 			return (("("+((String)Module_vector.f_foldVector(l31_conjuncts, "", ((Func2<Object,Object, Object>)(Func2)l34_$33))))+")");
 		}
-		case 69/*MizUnivFrm*/: {
+		case 74/*MizUnivFrm*/: {
 			final Struct_MizUnivFrm l1__tmp = (Struct_MizUnivFrm)l0__tmp;
 			final Struct_MizTyp l35_quantified = l1__tmp.f_quantified;
 			final Struct l36_scope = l1__tmp.f_scope;
@@ -92,7 +92,7 @@ final public class Module_print {
 			final int l41___ = (l1__tmp).f_pattNr;
 			return ((("\u2200["+Module_print.f_mizTyp2s(l39_quantified))+"]")+Module_print.f_mizFrm2s(l40_scope));
 		}
-		case 68/*MizUniqFrm*/: {
+		case 73/*MizUniqFrm*/: {
 			final Struct_MizUniqFrm l1__tmp = (Struct_MizUniqFrm)l0__tmp;
 			final int l42_srt = l1__tmp.f_sort;
 			final int l43_srt = (l1__tmp).f_sort;
@@ -122,7 +122,7 @@ final public class Module_print {
 	public static final String f_mizTrm2s(Struct at) {
 		Struct l0__tmp = at;
 		switch (l0__tmp.getTypeId()) {
-		case 70/*MizVarTrm*/: {
+		case 75/*MizVarTrm*/: {
 			final Struct_MizVarTrm l1__tmp = (Struct_MizVarTrm)l0__tmp;
 			final int l2_srt = l1__tmp.f_sort;
 			final int l3_varNr = l1__tmp.f_varNr;
@@ -163,7 +163,7 @@ final public class Module_print {
 			}
 			return (l9_pfx+Module_string.f_i2s(l6_varNr));
 		}
-		case 44/*MizFuncTrm*/: {
+		case 45/*MizFuncTrm*/: {
 			final Struct_MizFuncTrm l1__tmp = (Struct_MizFuncTrm)l0__tmp;
 			final int l10_srt = l1__tmp.f_sort;
 			final int l11_funcNr = l1__tmp.f_funcNr;
@@ -189,7 +189,7 @@ final public class Module_print {
 			}
 			return ((((l18_k+Module_string.f_i2s(l14_funcNr))+"(")+Module_print.f_mizTrmList2s(l15_args))+")");
 		}
-		case 58/*MizPrivFuncTrm*/: {
+		case 59/*MizPrivFuncTrm*/: {
 			final Struct_MizPrivFuncTrm l1__tmp = (Struct_MizPrivFuncTrm)l0__tmp;
 			final int l19_funcNr = l1__tmp.f_funcNr;
 			final Struct l20_args = l1__tmp.f_args;
@@ -211,7 +211,7 @@ final public class Module_print {
 			final int l32___ = (l1__tmp).f_trmInfo;
 			return (("{"+Module_print.f_mizTrm2s(l28_scope))+":...}");
 		}
-		case 59/*MizQuaTrm*/: {
+		case 60/*MizQuaTrm*/: {
 			final Struct_MizQuaTrm l1__tmp = (Struct_MizQuaTrm)l0__tmp;
 			final Struct l33_trmProper = l1__tmp.f_trmProper;
 			final Struct l34_trmProper = (l1__tmp).f_trmProper;
@@ -246,10 +246,10 @@ final public class Module_print {
 	public static final String f_mizTrmList2s(Struct al) {
 		Struct l0__tmp = al;
 		switch (l0__tmp.getTypeId()) {
-		case 64/*MizTrmNil*/: {
+		case 69/*MizTrmNil*/: {
 			return "";
 		}
-		case 63/*MizTrmElem*/: {
+		case 68/*MizTrmElem*/: {
 			final Struct_MizTrmElem l1__tmp = (Struct_MizTrmElem)l0__tmp;
 			final Struct l2_trm = l1__tmp.f_trm;
 			final Struct l3_next = l1__tmp.f_next;
@@ -270,7 +270,7 @@ final public class Module_print {
 			String l8_$4;
 			Struct l9__tmp = l7_gsymswitch0;
 			switch (l9__tmp.getTypeId()) {
-			case 64/*MizTrmNil*/: {
+			case 69/*MizTrmNil*/: {
 				l8_$4="";
 				break;
 			}
@@ -297,7 +297,7 @@ final public class Module_print {
 		String l10_$6;
 		Struct l11__tmp = l9_gsymswitch1;
 		switch (l11__tmp.getTypeId()) {
-		case 64/*MizTrmNil*/: {
+		case 69/*MizTrmNil*/: {
 			l10_$6="";
 			break;
 		}

@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785508391390
+// timestamp: 1785512695557
 
 package mizar.original.mizar;
 
@@ -17,7 +17,7 @@ public class Struct_PopResult extends Struct {
 		f_rest = a_rest;
 	}
 
-	public int getTypeId() { return 79; }
+	public int getTypeId() { return 84; }
 	public String getTypeName() { return "PopResult"; }
 
 	private static final String[] field_names = new String[] {
@@ -46,7 +46,7 @@ public class Struct_PopResult extends Struct {
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 79) return 79-tmp;
+		if (tmp != 84) return 84-tmp;
 		Struct_PopResult other = (Struct_PopResult)other_gen;
 		tmp = FlowRuntime.compareByValue(f_k, other.f_k);
 		if (tmp != 0) return tmp;

@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785508391387
+// timestamp: 1785512695551
 
 package mizar.original.mizar;
 
@@ -17,7 +17,7 @@ public class Struct_MizNegFrm extends Struct implements Field_arg<Struct> {
 	public Struct get_arg() { return f_arg; }
 	public void set_arg(Struct value) { f_arg = value; }
 
-	public int getTypeId() { return 50; }
+	public int getTypeId() { return 51; }
 	public String getTypeName() { return "MizNegFrm"; }
 
 	private static final String[] field_names = new String[] {
@@ -45,7 +45,7 @@ public class Struct_MizNegFrm extends Struct implements Field_arg<Struct> {
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 50) return 50-tmp;
+		if (tmp != 51) return 51-tmp;
 		Struct_MizNegFrm other = (Struct_MizNegFrm)other_gen;
 		tmp = f_arg.compareTo(other.f_arg);
 		if (tmp != 0) return tmp;

@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785507609000
+// timestamp: 1785510018000
 
 package mizar.original.mizar;
 
@@ -29,7 +29,7 @@ final public class Module_identify {
 		final Struct_MizCorrelEnv l0_env = (aidn).f_env;
 		Struct l1__tmp = af;
 		switch (l1__tmp.getTypeId()) {
-		case 55/*MizPredFrm*/: {
+		case 56/*MizPredFrm*/: {
 			final Struct_MizPredFrm l2__tmp = (Struct_MizPredFrm)l1__tmp;
 			final Struct l3_args = l2__tmp.f_args;
 			final int l4___ = (l2__tmp).f_sort;
@@ -38,7 +38,7 @@ final public class Module_identify {
 			final int l7___ = (l2__tmp).f_pattNr;
 			return Module_identify.f_mizCollectConstInTrmList(aidn, l6_args);
 		}
-		case 48/*MizLocPredFrm*/: {
+		case 49/*MizLocPredFrm*/: {
 			final Struct_MizLocPredFrm l2__tmp = (Struct_MizLocPredFrm)l1__tmp;
 			final Struct l8_args = l2__tmp.f_args;
 			final Struct l9_expn = l2__tmp.f_predExp;
@@ -53,7 +53,7 @@ final public class Module_identify {
 				continue TAIL_CALL;
 			}
 		}
-		case 60/*MizQualFrm*/: {
+		case 61/*MizQualFrm*/: {
 			final Struct_MizQualFrm l2__tmp = (Struct_MizQualFrm)l1__tmp;
 			final Struct l15_trm = l2__tmp.f_trm;
 			final Struct_MizTyp l16_typ = l2__tmp.f_typ;
@@ -64,7 +64,7 @@ final public class Module_identify {
 			((Field_trm)l20_qf).set_trm(Module_identify.f_mizCollectConstInTrm(aidn, l17_trm));
 			return Module_identify.f_mizCollectConstInTyp(aidn, l18_typ);
 		}
-		case 50/*MizNegFrm*/: {
+		case 51/*MizNegFrm*/: {
 			final Struct_MizNegFrm l2__tmp = (Struct_MizNegFrm)l1__tmp;
 			final Struct l21_arg = l2__tmp.f_arg;
 			final Struct l22_arg = (l2__tmp).f_arg;
@@ -101,7 +101,7 @@ final public class Module_identify {
 			};
 			return Module_vector.f_iterVector(l33_conjuncts, ((Func1<Object,Object>)(Func1)l36_$35));
 		}
-		case 69/*MizUnivFrm*/: {
+		case 74/*MizUnivFrm*/: {
 			final Struct_MizUnivFrm l2__tmp = (Struct_MizUnivFrm)l1__tmp;
 			final Struct_MizTyp l38_quantified = l2__tmp.f_quantified;
 			final Struct l39_scope = l2__tmp.f_scope;
@@ -116,7 +116,7 @@ final public class Module_identify {
 			((Field_boundVarNbr)l0_env).set_boundVarNbr(((l0_env).f_boundVarNbr-1));
 			return null;
 		}
-		case 68/*MizUniqFrm*/: {
+		case 73/*MizUniqFrm*/: {
 			final Struct_MizUniqFrm l2__tmp = (Struct_MizUniqFrm)l1__tmp;
 			final int l45___ = (l2__tmp).f_sort;
 			return null;
@@ -155,7 +155,7 @@ final public class Module_identify {
 		Struct l3_res;
 		Struct l4__tmp = at;
 		switch (l4__tmp.getTypeId()) {
-		case 44/*MizFuncTrm*/: {
+		case 45/*MizFuncTrm*/: {
 			final Struct_MizFuncTrm l5__tmp = (Struct_MizFuncTrm)l4__tmp;
 			final int l6_srt = l5__tmp.f_sort;
 			final int l7_funcNr = l5__tmp.f_funcNr;
@@ -176,7 +176,7 @@ final public class Module_identify {
 						((Field_equalsExpansionLevel)aidn).set_equalsExpansionLevel(l2_lLevel);
 						Struct l16__tmp = l15_it;
 						switch (l16__tmp.getTypeId()) {
-						case 70/*MizVarTrm*/: {
+						case 75/*MizVarTrm*/: {
 							final Struct_MizVarTrm l17__tmp = (Struct_MizVarTrm)l16__tmp;
 							final int l18_varNr = l17__tmp.f_varNr;
 							final int l19___ = (l17__tmp).f_sort;
@@ -189,6 +189,11 @@ final public class Module_identify {
 								return Module_mobjects.f_mizNatInsertElem((l23_cd).f_eqConst, ((int)ae));
 							};
 							Native.iter(l24_eqs, ((Func1<Object,Object>)(Func1)l26_$25));
+							final Object[] l27_ids = Module_identify.f_mizIdentifyEqConsts(aidn, l5__tmp);
+							final Func1<Object,Integer> l29_$28 = (Func1<Object, Integer>)(Integer ae) -> {
+								return Module_mobjects.f_mizNatInsertElem((l23_cd).f_eqConst, ((int)ae));
+							};
+							Native.iter(l27_ids, ((Func1<Object,Object>)(Func1)l29_$28));
 							break;
 						}
 						default: {
@@ -205,94 +210,94 @@ final public class Module_identify {
 			}
 			break;
 		}
-		case 58/*MizPrivFuncTrm*/: {
+		case 59/*MizPrivFuncTrm*/: {
 			final Struct_MizPrivFuncTrm l5__tmp = (Struct_MizPrivFuncTrm)l4__tmp;
-			final Struct l27_args = l5__tmp.f_args;
-			final Struct l28_funcExp = l5__tmp.f_funcExp;
-			final int l29___ = (l5__tmp).f_funcNr;
-			final Struct l30_args = (l5__tmp).f_args;
-			final Struct l31_funcExp = (l5__tmp).f_funcExp;
-			final int l32___ = (l5__tmp).f_pattNr;
-			final int l33___ = (l5__tmp).f_trmInfo;
-			Module_identify.f_mizCollectConstInTrmList(aidn, l30_args);
-			final Struct_MizPrivFuncTrm l34_pt = l5__tmp;
-			((Field_funcExp)l34_pt).set_funcExp(Module_identify.f_mizCollectConstInTrm(aidn, l31_funcExp));
+			final Struct l30_args = l5__tmp.f_args;
+			final Struct l31_funcExp = l5__tmp.f_funcExp;
+			final int l32___ = (l5__tmp).f_funcNr;
+			final Struct l33_args = (l5__tmp).f_args;
+			final Struct l34_funcExp = (l5__tmp).f_funcExp;
+			final int l35___ = (l5__tmp).f_pattNr;
+			final int l36___ = (l5__tmp).f_trmInfo;
+			Module_identify.f_mizCollectConstInTrmList(aidn, l33_args);
+			final Struct_MizPrivFuncTrm l37_pt = l5__tmp;
+			((Field_funcExp)l37_pt).set_funcExp(Module_identify.f_mizCollectConstInTrm(aidn, l34_funcExp));
 			l3_res=l5__tmp;
 			break;
 		}
 		case 42/*MizFraenkelTrm*/: {
 			final Struct_MizFraenkelTrm l5__tmp = (Struct_MizFraenkelTrm)l4__tmp;
-			final Struct_Vector l35_lambdaArgs = l5__tmp.f_lambdaArgs;
-			final Struct l36_scope = l5__tmp.f_scope;
-			final Struct l37_compr = l5__tmp.f_compr;
-			final Struct_Vector l38_lambdaArgs = (l5__tmp).f_lambdaArgs;
-			final Struct l39_scope = (l5__tmp).f_scope;
-			final Struct l40_compr = (l5__tmp).f_compr;
-			final Struct_MizIntSeq l41___ = (l5__tmp).f_idents;
-			final int l42___ = (l5__tmp).f_pattNr;
-			final int l43___ = (l5__tmp).f_trmInfo;
-			final Struct_MizIdentify l46_idn = aidn;
-			final Func1<Object,Struct_MizTyp> l45_$44 = (Func1<Object, Struct_MizTyp>)(Struct_MizTyp atyp) -> {
+			final Struct_Vector l38_lambdaArgs = l5__tmp.f_lambdaArgs;
+			final Struct l39_scope = l5__tmp.f_scope;
+			final Struct l40_compr = l5__tmp.f_compr;
+			final Struct_Vector l41_lambdaArgs = (l5__tmp).f_lambdaArgs;
+			final Struct l42_scope = (l5__tmp).f_scope;
+			final Struct l43_compr = (l5__tmp).f_compr;
+			final Struct_MizIntSeq l44___ = (l5__tmp).f_idents;
+			final int l45___ = (l5__tmp).f_pattNr;
+			final int l46___ = (l5__tmp).f_trmInfo;
+			final Struct_MizIdentify l49_idn = aidn;
+			final Func1<Object,Struct_MizTyp> l48_$47 = (Func1<Object, Struct_MizTyp>)(Struct_MizTyp atyp) -> {
 				((Field_boundVarNbr)l0_env).set_boundVarNbr(((l0_env).f_boundVarNbr+1));
-				return Module_identify.f_mizCollectConstInTyp(l46_idn, atyp);
+				return Module_identify.f_mizCollectConstInTyp(l49_idn, atyp);
 			};
-			Module_vector.f_iterVector(l38_lambdaArgs, ((Func1<Object,Object>)(Func1)l45_$44));
-			final Struct_MizFraenkelTrm l47_ft = l5__tmp;
-			((Field_scope)l47_ft).set_scope(Module_identify.f_mizCollectConstInTrm(aidn, l39_scope));
-			Module_identify.f_mizCollectConstInFrm(aidn, l40_compr);
-			((Field_boundVarNbr)l0_env).set_boundVarNbr(((l0_env).f_boundVarNbr-Module_vector.f_sizeVector(l38_lambdaArgs)));
-			final Reference<Boolean> l48_thereAreBound = ((Reference<Boolean>)(new Reference(false)));
-			final Func2<Struct,Struct_MizWithin, Struct> l50_$49 = (Func2<Struct, Struct_MizWithin, Struct>)(Struct_MizWithin al51_0, Struct atrm) -> {
-				Struct l52__tmp = atrm;
-				switch (l52__tmp.getTypeId()) {
-				case 70/*MizVarTrm*/: {
-					final Struct_MizVarTrm l53__tmp = (Struct_MizVarTrm)l52__tmp;
-					final int l54_s2 = l53__tmp.f_sort;
-					final int l55_v2 = l53__tmp.f_varNr;
-					final int l56_s2 = (l53__tmp).f_sort;
-					final int l57_v2 = (l53__tmp).f_varNr;
-					final int l58___ = (l53__tmp).f_pattNr;
-					final int l59___ = (l53__tmp).f_trmInfo;
-					if (((l56_s2==Module_lexicon.g_ikTrmBound)&&(l57_v2<=(l0_env).f_boundVarNbr))) {
-						l48_thereAreBound.value = ((Boolean)true);
+			Module_vector.f_iterVector(l41_lambdaArgs, ((Func1<Object,Object>)(Func1)l48_$47));
+			final Struct_MizFraenkelTrm l50_ft = l5__tmp;
+			((Field_scope)l50_ft).set_scope(Module_identify.f_mizCollectConstInTrm(aidn, l42_scope));
+			Module_identify.f_mizCollectConstInFrm(aidn, l43_compr);
+			((Field_boundVarNbr)l0_env).set_boundVarNbr(((l0_env).f_boundVarNbr-Module_vector.f_sizeVector(l41_lambdaArgs)));
+			final Reference<Boolean> l51_thereAreBound = ((Reference<Boolean>)(new Reference(false)));
+			final Func2<Struct,Struct_MizWithin, Struct> l53_$52 = (Func2<Struct, Struct_MizWithin, Struct>)(Struct_MizWithin al54_0, Struct atrm) -> {
+				Struct l55__tmp = atrm;
+				switch (l55__tmp.getTypeId()) {
+				case 75/*MizVarTrm*/: {
+					final Struct_MizVarTrm l56__tmp = (Struct_MizVarTrm)l55__tmp;
+					final int l57_s2 = l56__tmp.f_sort;
+					final int l58_v2 = l56__tmp.f_varNr;
+					final int l59_s2 = (l56__tmp).f_sort;
+					final int l60_v2 = (l56__tmp).f_varNr;
+					final int l61___ = (l56__tmp).f_pattNr;
+					final int l62___ = (l56__tmp).f_trmInfo;
+					if (((l59_s2==Module_lexicon.g_ikTrmBound)&&(l60_v2<=(l0_env).f_boundVarNbr))) {
+						l51_thereAreBound.value = ((Boolean)true);
 					} else {
 					}
-					return l53__tmp;
+					return l56__tmp;
 				}
 				default: {
 					return atrm;
 				}
 				}
 			};
-			final Struct_MizWithin l51_w = Module_correl.f_mizMakeWithin(l50_$49);
-			final Struct l52___t2 = Module_correl.f_mizWithinTrm(l51_w, l5__tmp);
-			((Field_onlyConstants)aidn).set_onlyConstants(!((boolean)l48_thereAreBound.value));
+			final Struct_MizWithin l54_w = Module_correl.f_mizMakeWithin(l53_$52);
+			final Struct l55___t2 = Module_correl.f_mizWithinTrm(l54_w, l5__tmp);
+			((Field_onlyConstants)aidn).set_onlyConstants(!((boolean)l51_thereAreBound.value));
 			if ((aidn).f_onlyConstants) {
-				final Func2<Struct,Struct_MizWithin, Struct> l54_$53 = (Func2<Struct, Struct_MizWithin, Struct>)(Struct_MizWithin al55_0, Struct atrm) -> {
-					Struct l56__tmp = atrm;
-					switch (l56__tmp.getTypeId()) {
-					case 70/*MizVarTrm*/: {
-						final Struct_MizVarTrm l57__tmp = (Struct_MizVarTrm)l56__tmp;
-						final int l58_s2 = l57__tmp.f_sort;
-						final int l59_v2 = l57__tmp.f_varNr;
-						final int l60_s2 = (l57__tmp).f_sort;
-						final int l61_v2 = (l57__tmp).f_varNr;
-						final int l62___ = (l57__tmp).f_pattNr;
-						final int l63___ = (l57__tmp).f_trmInfo;
-						if ((l60_s2==Module_lexicon.g_ikTrmBound)) {
-							final Struct_MizVarTrm l64_vt = Module_identify.f_mizIdAsVar(l57__tmp);
-							((Field_varNr)l64_vt).set_varNr((l61_v2+(l0_env).f_boundVarNbr));
+				final Func2<Struct,Struct_MizWithin, Struct> l57_$56 = (Func2<Struct, Struct_MizWithin, Struct>)(Struct_MizWithin al58_0, Struct atrm) -> {
+					Struct l59__tmp = atrm;
+					switch (l59__tmp.getTypeId()) {
+					case 75/*MizVarTrm*/: {
+						final Struct_MizVarTrm l60__tmp = (Struct_MizVarTrm)l59__tmp;
+						final int l61_s2 = l60__tmp.f_sort;
+						final int l62_v2 = l60__tmp.f_varNr;
+						final int l63_s2 = (l60__tmp).f_sort;
+						final int l64_v2 = (l60__tmp).f_varNr;
+						final int l65___ = (l60__tmp).f_pattNr;
+						final int l66___ = (l60__tmp).f_trmInfo;
+						if (((l63_s2==Module_lexicon.g_ikTrmBound)&&(l64_v2>(l0_env).f_boundVarNbr))) {
+							final Struct_MizVarTrm l67_vt = Module_identify.f_mizIdAsVar(l60__tmp);
+							((Field_varNr)l67_vt).set_varNr((l64_v2-(l0_env).f_boundVarNbr));
 						} else {
 						}
-						return l57__tmp;
+						return l60__tmp;
 					}
 					default: {
 						return atrm;
 					}
 					}
 				};
-				final Struct_MizWithin l55_w2 = Module_correl.f_mizMakeWithin(l54_$53);
-				final Struct l56___t3 = Module_correl.f_mizWithinTrm(l55_w2, l5__tmp);
+				final Struct_MizWithin l58_w2 = Module_correl.f_mizMakeWithin(l57_$56);
+				final Struct l59___t3 = Module_correl.f_mizWithinTrm(l58_w2, l5__tmp);
 				l3_res=Module_identify.f_mizCollectInferConst(aidn, l5__tmp);
 			} else {
 				l3_res=l5__tmp;
@@ -301,50 +306,50 @@ final public class Module_identify {
 		}
 		case 21/*MizChoiceTrm*/: {
 			final Struct_MizChoiceTrm l5__tmp = (Struct_MizChoiceTrm)l4__tmp;
-			final Struct_MizTyp l57_typ = l5__tmp.f_choiceTyp;
-			final Struct_MizTyp l58_typ = (l5__tmp).f_choiceTyp;
-			final int l59___ = (l5__tmp).f_pattNr;
-			final int l60___ = (l5__tmp).f_trmInfo;
-			Module_identify.f_mizCollectConstInTyp(aidn, l58_typ);
+			final Struct_MizTyp l60_typ = l5__tmp.f_choiceTyp;
+			final Struct_MizTyp l61_typ = (l5__tmp).f_choiceTyp;
+			final int l62___ = (l5__tmp).f_pattNr;
+			final int l63___ = (l5__tmp).f_trmInfo;
+			Module_identify.f_mizCollectConstInTyp(aidn, l61_typ);
 			l3_res=Module_identify.f_mizCollectInferConst(aidn, l5__tmp);
 			break;
 		}
-		case 70/*MizVarTrm*/: {
+		case 75/*MizVarTrm*/: {
 			final Struct_MizVarTrm l5__tmp = (Struct_MizVarTrm)l4__tmp;
-			final int l61_srt = l5__tmp.f_sort;
-			final int l62_varNr = l5__tmp.f_varNr;
-			final int l63_srt = (l5__tmp).f_sort;
-			final int l64_varNr = (l5__tmp).f_varNr;
-			final int l65___ = (l5__tmp).f_pattNr;
-			final int l66___ = (l5__tmp).f_trmInfo;
-			if ((l63_srt==Module_lexicon.g_ikTrmNumeral)) {
+			final int l64_srt = l5__tmp.f_sort;
+			final int l65_varNr = l5__tmp.f_varNr;
+			final int l66_srt = (l5__tmp).f_sort;
+			final int l67_varNr = (l5__tmp).f_varNr;
+			final int l68___ = (l5__tmp).f_pattNr;
+			final int l69___ = (l5__tmp).f_trmInfo;
+			if ((l66_srt==Module_lexicon.g_ikTrmNumeral)) {
 				l3_res=Module_identify.f_mizCollectInferConst(aidn, l5__tmp);
 			} else {
-				if ((l63_srt==Module_lexicon.g_ikTrmConstant)) {
-					final Struct_MizNatFunc l67_eqSeeds = Module_mobjects.f_mizInitNatSet(4);
-					final Struct_MizFixedVar l68_fv = ((Struct_MizFixedVar)Module_vector.f_getVectorUnsafe((l0_env).f_fixedVar, l64_varNr));
-					final Struct l69_gsymswitch1 = (l68_fv).f_def;
-					Struct l70__tmp = l69_gsymswitch1;
-					switch (l70__tmp.getTypeId()) {
-					case 83/*Some*/: {
-						final Struct_Some l71__tmp = (Struct_Some)l70__tmp;
-						final Object l72_d = l71__tmp.f_value;
-						final Struct l73_d = ((Struct)(l71__tmp).f_value);
-						if ((Module_correl.f_mizTrmSort(l73_d)!=Module_lexicon.g_ikError)) {
-							final Struct l74_lTrm0 = Module_correl_inst.f_mizCopyExpTrm(l73_d);
-							final Struct l75_lTrm = Module_identify.f_mizCollectConstInTrm(aidn, l74_lTrm0);
+				if ((l66_srt==Module_lexicon.g_ikTrmConstant)) {
+					final Struct_MizNatFunc l70_eqSeeds = Module_mobjects.f_mizInitNatSet(4);
+					final Struct_MizFixedVar l71_fv = ((Struct_MizFixedVar)Module_vector.f_getVectorUnsafe((l0_env).f_fixedVar, l67_varNr));
+					final Struct l72_gsymswitch1 = (l71_fv).f_def;
+					Struct l73__tmp = l72_gsymswitch1;
+					switch (l73__tmp.getTypeId()) {
+					case 88/*Some*/: {
+						final Struct_Some l74__tmp = (Struct_Some)l73__tmp;
+						final Object l75_d = l74__tmp.f_value;
+						final Struct l76_d = ((Struct)(l74__tmp).f_value);
+						if ((Module_correl.f_mizTrmSort(l76_d)!=Module_lexicon.g_ikError)) {
+							final Struct l77_lTrm0 = Module_correl_inst.f_mizCopyExpTrm(l76_d);
+							final Struct l78_lTrm = Module_identify.f_mizCollectConstInTrm(aidn, l77_lTrm0);
 							if ((aidn).f_onlyConstants) {
-								Module_errhan.f_mizAssert(4382, (Module_correl.f_mizTrmSort(l75_lTrm)==Module_lexicon.g_ikTrmInfConst));
-								Struct l76__tmp = l75_lTrm;
-								switch (l76__tmp.getTypeId()) {
-								case 70/*MizVarTrm*/: {
-									final Struct_MizVarTrm l77__tmp = (Struct_MizVarTrm)l76__tmp;
-									final int l78_dn = l77__tmp.f_varNr;
-									final int l79___ = (l77__tmp).f_sort;
-									final int l80_dn = (l77__tmp).f_varNr;
-									final int l81___ = (l77__tmp).f_pattNr;
-									final int l82___ = (l77__tmp).f_trmInfo;
-									Module_mobjects.f_mizNatInsertElem(l67_eqSeeds, l80_dn);
+								Module_errhan.f_mizAssert(4382, (Module_correl.f_mizTrmSort(l78_lTrm)==Module_lexicon.g_ikTrmInfConst));
+								Struct l79__tmp = l78_lTrm;
+								switch (l79__tmp.getTypeId()) {
+								case 75/*MizVarTrm*/: {
+									final Struct_MizVarTrm l80__tmp = (Struct_MizVarTrm)l79__tmp;
+									final int l81_dn = l80__tmp.f_varNr;
+									final int l82___ = (l80__tmp).f_sort;
+									final int l83_dn = (l80__tmp).f_varNr;
+									final int l84___ = (l80__tmp).f_pattNr;
+									final int l85___ = (l80__tmp).f_trmInfo;
+									Module_mobjects.f_mizNatInsertElem(l70_eqSeeds, l83_dn);
 									break;
 								}
 								default: {
@@ -358,28 +363,28 @@ final public class Module_identify {
 						}
 						break;
 					}
-					case 75/*None*/: {
+					case 80/*None*/: {
 						break;
 					}
 					default:
-						throw new RuntimeException("Unexpected struct in switch: "+l70__tmp.getTypeName());
+						throw new RuntimeException("Unexpected struct in switch: "+l73__tmp.getTypeName());
 					}
-					final Struct l83_it = Module_identify.f_mizCollectInferConst(aidn, l5__tmp);
-					Struct l84__tmp = l83_it;
-					switch (l84__tmp.getTypeId()) {
-					case 70/*MizVarTrm*/: {
-						final Struct_MizVarTrm l85__tmp = (Struct_MizVarTrm)l84__tmp;
-						final int l86_s3 = l85__tmp.f_sort;
-						final int l87_nr3 = l85__tmp.f_varNr;
-						final int l88_s3 = (l85__tmp).f_sort;
-						final int l89_nr3 = (l85__tmp).f_varNr;
-						final int l90___ = (l85__tmp).f_pattNr;
-						final int l91___ = (l85__tmp).f_trmInfo;
-						if ((l88_s3==Module_lexicon.g_ikTrmInfConst)) {
-							final Struct_MizConstDef l92_cd = ((Struct_MizConstDef)Module_vector.f_getVectorUnsafe((l0_env).f_inferConstDef, l89_nr3));
-							Module_mobjects.f_mizNatEnlargeBy((l92_cd).f_eqConst, l67_eqSeeds);
-							if ((Module_mobjects.f_mizNatCount(l67_eqSeeds)>0)) {
-								((Field_setting)l92_cd).set_setting((Module_mobjects.f_mizNatItem(l67_eqSeeds, 0)).f_x);
+					final Struct l86_it = Module_identify.f_mizCollectInferConst(aidn, l5__tmp);
+					Struct l87__tmp = l86_it;
+					switch (l87__tmp.getTypeId()) {
+					case 75/*MizVarTrm*/: {
+						final Struct_MizVarTrm l88__tmp = (Struct_MizVarTrm)l87__tmp;
+						final int l89_s3 = l88__tmp.f_sort;
+						final int l90_nr3 = l88__tmp.f_varNr;
+						final int l91_s3 = (l88__tmp).f_sort;
+						final int l92_nr3 = (l88__tmp).f_varNr;
+						final int l93___ = (l88__tmp).f_pattNr;
+						final int l94___ = (l88__tmp).f_trmInfo;
+						if ((l91_s3==Module_lexicon.g_ikTrmInfConst)) {
+							final Struct_MizConstDef l95_cd = ((Struct_MizConstDef)Module_vector.f_getVectorUnsafe((l0_env).f_inferConstDef, l92_nr3));
+							Module_mobjects.f_mizNatEnlargeBy((l95_cd).f_eqConst, l70_eqSeeds);
+							if ((Module_mobjects.f_mizNatCount(l70_eqSeeds)>0)) {
+								((Field_setting)l95_cd).set_setting((Module_mobjects.f_mizNatItem(l70_eqSeeds, 0)).f_x);
 							} else {
 							}
 						} else {
@@ -390,9 +395,9 @@ final public class Module_identify {
 						break;
 					}
 					}
-					l3_res=l83_it;
+					l3_res=l86_it;
 				} else {
-					if (((((l63_srt==Module_lexicon.g_ikTrmLocus)||(l63_srt==Module_lexicon.g_ikTrmFreeVar))||(l63_srt==Module_lexicon.g_ikTrmLambdaVar))||(l63_srt==Module_lexicon.g_ikTrmBound))) {
+					if (((((l66_srt==Module_lexicon.g_ikTrmLocus)||(l66_srt==Module_lexicon.g_ikTrmFreeVar))||(l66_srt==Module_lexicon.g_ikTrmLambdaVar))||(l66_srt==Module_lexicon.g_ikTrmBound))) {
 						((Field_onlyConstants)aidn).set_onlyConstants(false);
 						l3_res=l5__tmp;
 					} else {
@@ -402,22 +407,22 @@ final public class Module_identify {
 			}
 			break;
 		}
-		case 59/*MizQuaTrm*/: {
+		case 60/*MizQuaTrm*/: {
 			final Struct_MizQuaTrm l5__tmp = (Struct_MizQuaTrm)l4__tmp;
-			final Struct l93___ = (l5__tmp).f_trmProper;
-			final Struct_MizTyp l94___ = (l5__tmp).f_qua;
-			final int l95___ = (l5__tmp).f_pattNr;
-			final int l96___ = (l5__tmp).f_trmInfo;
+			final Struct l96___ = (l5__tmp).f_trmProper;
+			final Struct_MizTyp l97___ = (l5__tmp).f_qua;
+			final int l98___ = (l5__tmp).f_pattNr;
+			final int l99___ = (l5__tmp).f_trmInfo;
 			Module_errhan.f_mizRunTimeError(2845);
 			l3_res=l5__tmp;
 			break;
 		}
 		case 16/*MizBaseTrm*/: {
 			final Struct_MizBaseTrm l5__tmp = (Struct_MizBaseTrm)l4__tmp;
-			final int l97_srt = l5__tmp.f_sort;
-			final int l98_srt = (l5__tmp).f_sort;
-			final int l99___ = (l5__tmp).f_trmInfo;
-			if ((l98_srt==Module_lexicon.g_ikError)) {
+			final int l100_srt = l5__tmp.f_sort;
+			final int l101_srt = (l5__tmp).f_sort;
+			final int l102___ = (l5__tmp).f_trmInfo;
+			if ((l101_srt==Module_lexicon.g_ikError)) {
 				((Field_onlyConstants)aidn).set_onlyConstants(false);
 				l3_res=l5__tmp;
 			} else {
@@ -437,10 +442,10 @@ final public class Module_identify {
 		TAIL_CALL: for(;;) {
 		Struct l0__tmp = al;
 		switch (l0__tmp.getTypeId()) {
-		case 64/*MizTrmNil*/: {
+		case 69/*MizTrmNil*/: {
 			return null;
 		}
-		case 63/*MizTrmElem*/: {
+		case 68/*MizTrmElem*/: {
 			final Struct_MizTrmElem l1__tmp = (Struct_MizTrmElem)l0__tmp;
 			final Struct l2_trm = l1__tmp.f_trm;
 			final Struct l3_next = l1__tmp.f_next;
@@ -488,7 +493,7 @@ final public class Module_identify {
 				Struct l6_numeric;
 				Struct l7__tmp = at;
 				switch (l7__tmp.getTypeId()) {
-				case 70/*MizVarTrm*/: {
+				case 75/*MizVarTrm*/: {
 					final Struct_MizVarTrm l8__tmp = (Struct_MizVarTrm)l7__tmp;
 					final int l9_srt = l8__tmp.f_sort;
 					final int l10_varNr = l8__tmp.f_varNr;
@@ -503,7 +508,7 @@ final public class Module_identify {
 					}
 					break;
 				}
-				case 44/*MizFuncTrm*/: {
+				case 45/*MizFuncTrm*/: {
 					final Struct_MizFuncTrm l8__tmp = (Struct_MizFuncTrm)l7__tmp;
 					final int l15_srt = l8__tmp.f_sort;
 					final int l16_funcNr0 = l8__tmp.f_funcNr;
@@ -525,20 +530,20 @@ final public class Module_identify {
 								final Struct l27_a2 = Module_identify.f_mizInfNumArg(aidn, Module_correl.f_mizTrmListNth(((Struct)(l24_pa).f_second), 1));
 								Struct l28__tmp = l26_a1;
 								switch (l28__tmp.getTypeId()) {
-								case 83/*Some*/: {
+								case 88/*Some*/: {
 									final Struct_Some l29__tmp = (Struct_Some)l28__tmp;
 									final Object l30_v1 = l29__tmp.f_value;
 									final Struct_MizComplex l31_v1 = ((Struct_MizComplex)(l29__tmp).f_value);
 									Struct l32__tmp = l27_a2;
 									switch (l32__tmp.getTypeId()) {
-									case 83/*Some*/: {
+									case 88/*Some*/: {
 										final Struct_Some l33__tmp = (Struct_Some)l32__tmp;
 										final Object l34_v2 = l33__tmp.f_value;
 										final Struct_MizComplex l35_v2 = ((Struct_MizComplex)(l33__tmp).f_value);
 										l6_numeric=Module_identify.f_mizComplexOp(l25_rq, l31_v1, l35_v2);
 										break;
 									}
-									case 75/*None*/: {
+									case 80/*None*/: {
 										l6_numeric=((Struct)SingletonStructs.str_None);
 										break;
 									}
@@ -547,7 +552,7 @@ final public class Module_identify {
 									}
 									break;
 								}
-								case 75/*None*/: {
+								case 80/*None*/: {
 									l6_numeric=((Struct)SingletonStructs.str_None);
 									break;
 								}
@@ -559,7 +564,7 @@ final public class Module_identify {
 									final Struct l36_gsymswitch0 = Module_identify.f_mizInfNumArg(aidn, Module_correl.f_mizTrmListNth(((Struct)(l24_pa).f_second), 0));
 									Struct l37__tmp = l36_gsymswitch0;
 									switch (l37__tmp.getTypeId()) {
-									case 83/*Some*/: {
+									case 88/*Some*/: {
 										final Struct_Some l38__tmp = (Struct_Some)l37__tmp;
 										final Object l39_v1 = l38__tmp.f_value;
 										final Struct_MizComplex l40_v1 = ((Struct_MizComplex)(l38__tmp).f_value);
@@ -574,7 +579,7 @@ final public class Module_identify {
 										}
 										break;
 									}
-									case 75/*None*/: {
+									case 80/*None*/: {
 										l6_numeric=((Struct)SingletonStructs.str_None);
 										break;
 									}
@@ -637,7 +642,7 @@ final public class Module_identify {
 	public static final Struct_MizFuncTrm f_mizIdAsFunc(Struct at) {
 		Struct l0__tmp = at;
 		switch (l0__tmp.getTypeId()) {
-		case 44/*MizFuncTrm*/: {
+		case 45/*MizFuncTrm*/: {
 			final Struct_MizFuncTrm l1__tmp = (Struct_MizFuncTrm)l0__tmp;
 			final int l2___ = (l1__tmp).f_sort;
 			final int l3___ = (l1__tmp).f_funcNr;
@@ -655,7 +660,7 @@ final public class Module_identify {
 	public static final Struct_MizVarTrm f_mizIdAsVar(Struct at) {
 		Struct l0__tmp = at;
 		switch (l0__tmp.getTypeId()) {
-		case 70/*MizVarTrm*/: {
+		case 75/*MizVarTrm*/: {
 			final Struct_MizVarTrm l1__tmp = (Struct_MizVarTrm)l0__tmp;
 			final int l2___ = (l1__tmp).f_sort;
 			final int l3___ = (l1__tmp).f_varNr;
@@ -669,11 +674,139 @@ final public class Module_identify {
 		}
 		}
 	}
+	public static final Object[] f_mizIdentifyEqConsts(Struct_MizIdentify aidn, Struct at) {
+		final Struct_MizCorrelEnv l0_env = (aidn).f_env;
+		if ((((aidn).f_equalsExpansionLevel>=3)||(Module_vector.f_sizeVector((aidn).f_identifications)==0))) {
+			return SingletonStructs.arr_empty;
+		} else {
+			final Struct_MizFuncTrm l1_ft = Module_identify.f_mizIdAsFunc(at);
+			final Struct_Pair l2_pa = Module_correl.f_mizAdjustTrm(l0_env, l1_ft);
+			final Reference<Object[]> l3_res = ((Reference<Object[]>)(new Reference(SingletonStructs.arr_empty)));
+			final Struct_Vector l6_$5 = (aidn).f_identifications;
+			final Struct l8_t = at;
+			final Struct_MizIdentify l9_idn = aidn;
+			final Func1<Object,Struct_MizFuncIdent> l7_$4 = (Func1<Object, Struct_MizFuncIdent>)(Struct_MizFuncIdent aidf) -> {
+				final Struct l8_gsymswitch2 = (aidf).f_pattern0;
+				boolean l9_headOk;
+				Struct l10__tmp = l8_gsymswitch2;
+				switch (l10__tmp.getTypeId()) {
+				case 45/*MizFuncTrm*/: {
+					final Struct_MizFuncTrm l11__tmp = (Struct_MizFuncTrm)l10__tmp;
+					final int l12_s0 = l11__tmp.f_sort;
+					final int l13_s0 = (l11__tmp).f_sort;
+					final int l14___ = (l11__tmp).f_funcNr;
+					final Struct l15___ = (l11__tmp).f_args;
+					final int l16___ = (l11__tmp).f_pattNr;
+					final int l17___ = (l11__tmp).f_trmInfo;
+					if ((l13_s0==Module_lexicon.g_ikTrmFunctor)) {
+						final Struct_MizFuncTrm l18_f0 = Module_identify.f_mizIdAsFunc((aidf).f_pattern0);
+						final Struct_Pair l19_p0 = Module_correl.f_mizAdjustTrm(l0_env, l18_f0);
+						l9_headOk=(((int)(l19_p0).f_first)==((int)(l2_pa).f_first));
+					} else {
+						l9_headOk=false;
+					}
+					break;
+				}
+				default: {
+					l9_headOk=false;
+					break;
+				}
+				}
+				if (l9_headOk) {
+					final Reference<Integer> l20_k = ((Reference<Integer>)(new Reference(1)));
+					final Func0<Boolean> l23_$21 = (Func0<Boolean>)() -> {
+						return (((int)l20_k.value)<Module_vector.f_sizeVector((l0_env).f_substTrm));
+					};
+					final Func0<Object> l24_$22 = (Func0<Object>)() -> {
+						Module_vector.f_setVectorUnsafe((l0_env).f_substTrm, ((int)l20_k.value), SingletonStructs.str_None);
+						l20_k.value = ((Integer)(((int)l20_k.value)+1));
+						return null;
+					};
+					Module_loop.f_while(l23_$21, l24_$22);
+					if ((Module_correl_match.f_mizEsTrm(l0_env, (aidf).f_pattern0, l8_t)&&Module_correl_match.f_mizCheckLociTypes(l0_env, (aidf).f_primaries))) {
+						final Reference<Boolean> l25_ok = ((Reference<Boolean>)(new Reference(true)));
+						final Object[] l28_$27 = (aidf).f_eqArgs;
+						final Func1<Object,Struct_MizIntPair> l29_$26 = (Func1<Object, Struct_MizIntPair>)(Struct_MizIntPair apxy) -> {
+							if (((boolean)l25_ok.value)) {
+								if (!Module_correl_inst.f_mizIsWiderThan(l0_env, ((Struct_MizTyp)Module_vector.f_getVectorUnsafe((aidf).f_primaries, ((apxy).f_y-1))), Wrappers.w_mizCopyTyp.invoke(((Struct_MizTyp)Module_vector.f_getVectorUnsafe((aidf).f_primaries, ((apxy).f_x-1)))))) {
+									l25_ok.value = ((Boolean)false);
+									return null;
+								} else {
+									final Struct_Vector l33_$31 = (l0_env).f_substTrm;
+									final int l34_$32 = (apxy).f_y;
+									final Struct l35_gsymswitch3 = ((Struct)Module_vector.f_getVectorDef((l0_env).f_substTrm, (apxy).f_x, SingletonStructs.str_None));
+									Struct l36_$30;
+									Struct l37__tmp = l35_gsymswitch3;
+									switch (l37__tmp.getTypeId()) {
+									case 88/*Some*/: {
+										final Struct_Some l38__tmp = (Struct_Some)l37__tmp;
+										final Object l39_st = l38__tmp.f_value;
+										final Struct l40_st = ((Struct)(l38__tmp).f_value);
+										l36_$30=(new Struct_Some(Module_correl.f_mizCopyTrm(l40_st)));
+										break;
+									}
+									case 80/*None*/: {
+										l36_$30=((Struct)SingletonStructs.str_None);
+										break;
+									}
+									default:
+										throw new RuntimeException("Unexpected struct in switch: "+l37__tmp.getTypeName());
+									}
+									return Module_vector.f_setVectorUnsafe(l33_$31, l34_$32, l36_$30);
+								}
+							} else {
+								return null;
+							}
+						};
+						Native.iter(l28_$27, ((Func1<Object,Object>)(Func1)l29_$26));
+						if (((boolean)l25_ok.value)) {
+							final Struct l30_lTrm = Module_correl_match.f_mizInstSubstTrm(l0_env, (aidf).f_pattern1);
+							((Field_equalsExpansionLevel)l9_idn).set_equalsExpansionLevel(((l9_idn).f_equalsExpansionLevel+1));
+							final int l31_lB = (l0_env).f_boundVarNbr;
+							((Field_boundVarNbr)l0_env).set_boundVarNbr(0);
+							final Struct l32_ct = Module_identify.f_mizCollectConstInTrm(l9_idn, l30_lTrm);
+							((Field_boundVarNbr)l0_env).set_boundVarNbr(l31_lB);
+							((Field_equalsExpansionLevel)l9_idn).set_equalsExpansionLevel(((l9_idn).f_equalsExpansionLevel-1));
+							Struct l33__tmp = l32_ct;
+							switch (l33__tmp.getTypeId()) {
+							case 75/*MizVarTrm*/: {
+								final Struct_MizVarTrm l34__tmp = (Struct_MizVarTrm)l33__tmp;
+								final int l35_s4 = l34__tmp.f_sort;
+								final int l36_nr4 = l34__tmp.f_varNr;
+								final int l37_s4 = (l34__tmp).f_sort;
+								final int l38_nr4 = (l34__tmp).f_varNr;
+								final int l39___ = (l34__tmp).f_pattNr;
+								final int l40___ = (l34__tmp).f_trmInfo;
+								if ((l37_s4==Module_lexicon.g_ikTrmInfConst)) {
+									l3_res.value = Module_array.f_arrayPush(l3_res.value, l38_nr4);
+									return null;
+								} else {
+									return null;
+								}
+							}
+							default: {
+								return null;
+							}
+							}
+						} else {
+							return null;
+						}
+					} else {
+						return null;
+					}
+				} else {
+					return null;
+				}
+			};
+			Module_vector.f_iterVector(l6_$5, ((Func1<Object,Object>)(Func1)l7_$4));
+			return l3_res.value;
+		}
+	}
 	public static final Struct f_mizInfNumArg(Struct_MizIdentify aidn, Struct at0) {
 		final Struct l0_t = Module_correl.f_mizSkipPrivFunc(at0);
 		Struct l1__tmp = l0_t;
 		switch (l1__tmp.getTypeId()) {
-		case 70/*MizVarTrm*/: {
+		case 75/*MizVarTrm*/: {
 			final Struct_MizVarTrm l2__tmp = (Struct_MizVarTrm)l1__tmp;
 			final int l3_srt = l2__tmp.f_sort;
 			final int l4_varNr = l2__tmp.f_varNr;
@@ -788,7 +921,7 @@ final public class Module_identify {
 		final Func3<Object[],Struct_MizIdentify, Integer, Struct> l6_$1 = (Func3<Object[], Struct_MizIdentify, Integer, Struct>)(Struct_MizIdentify al7_0, Integer al8_1, Struct al9_2) -> {
 			return SingletonStructs.arr_empty;
 		};
-		return (new Struct_MizIdentify(aenv, l4_$2, l5_$3, true, 0, l0_rv, l6_$1, Module_vector.f_makeVector(4)));
+		return (new Struct_MizIdentify(aenv, l4_$2, l5_$3, true, 0, l0_rv, l6_$1, Module_vector.f_makeVector(4), Module_vector.f_makeVector(4)));
 	}
 	public static final Struct f_mizNumericValue(Struct_MizIdentify aidn, int anr) {
 		return ((Struct)Module_vector.f_getVectorDef((aidn).f_numeric, anr, SingletonStructs.str_None));

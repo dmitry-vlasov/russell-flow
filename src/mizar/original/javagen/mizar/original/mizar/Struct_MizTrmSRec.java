@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785508391389
+// timestamp: 1785512695555
 
 package mizar.original.mizar;
 
@@ -31,7 +31,7 @@ public class Struct_MizTrmSRec extends Struct implements Field_numDetermined<Boo
 	public Struct_MizAttrColl get_superCluster() { return f_superCluster; }
 	public void set_superCluster(Struct_MizAttrColl value) { f_superCluster = value; }
 
-	public int getTypeId() { return 65; }
+	public int getTypeId() { return 70; }
 	public String getTypeName() { return "MizTrmSRec"; }
 
 	private static final String[] field_names = new String[] {
@@ -63,7 +63,7 @@ public class Struct_MizTrmSRec extends Struct implements Field_numDetermined<Boo
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 65) return 65-tmp;
+		if (tmp != 70) return 70-tmp;
 		Struct_MizTrmSRec other = (Struct_MizTrmSRec)other_gen;
 		tmp = f_term.compareTo(other.f_term);
 		if (tmp != 0) return tmp;

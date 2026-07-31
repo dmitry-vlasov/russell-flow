@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785508391386
+// timestamp: 1785512695550
 
 package mizar.original.mizar;
 
@@ -25,7 +25,7 @@ public class Struct_MizFuncTrm extends Struct implements Field_sort<Integer>, Fi
 	public Integer get_trmInfo() { return f_trmInfo; }
 	public void set_trmInfo(Integer value) { f_trmInfo = value; }
 
-	public int getTypeId() { return 44; }
+	public int getTypeId() { return 45; }
 	public String getTypeName() { return "MizFuncTrm"; }
 
 	private static final String[] field_names = new String[] {
@@ -56,7 +56,7 @@ public class Struct_MizFuncTrm extends Struct implements Field_sort<Integer>, Fi
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 44) return 44-tmp;
+		if (tmp != 45) return 45-tmp;
 		Struct_MizFuncTrm other = (Struct_MizFuncTrm)other_gen;
 		if (f_sort != other.f_sort)
 			return (f_sort > other.f_sort) ? 1 : -1;

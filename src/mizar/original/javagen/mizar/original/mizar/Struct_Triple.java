@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785508391391
+// timestamp: 1785512695558
 
 package mizar.original.mizar;
 
@@ -17,7 +17,7 @@ public class Struct_Triple extends Struct {
 		f_third = a_third;
 	}
 
-	public int getTypeId() { return 86; }
+	public int getTypeId() { return 91; }
 	public String getTypeName() { return "Triple"; }
 
 	private static final String[] field_names = new String[] {
@@ -46,7 +46,7 @@ public class Struct_Triple extends Struct {
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 86) return 86-tmp;
+		if (tmp != 91) return 91-tmp;
 		Struct_Triple other = (Struct_Triple)other_gen;
 		tmp = FlowRuntime.compareByValue(f_first, other.f_first);
 		if (tmp != 0) return tmp;

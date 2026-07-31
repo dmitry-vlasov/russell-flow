@@ -17,7 +17,7 @@ final public class Module_checker {
 		final Func1<Object,Struct> l8_$5 = (Func1<Object, Struct>)(Struct anf) -> {
 			Struct l9__tmp = anf;
 			switch (l9__tmp.getTypeId()) {
-			case 55/*MizPredFrm*/: {
+			case 56/*MizPredFrm*/: {
 				final Struct_MizPredFrm l10__tmp = (Struct_MizPredFrm)l9__tmp;
 				final int l11_srt = l10__tmp.f_sort;
 				final int l12_predNr = l10__tmp.f_predNr;
@@ -66,7 +66,7 @@ final public class Module_checker {
 	public static final Struct f_mizChkArgs(Struct at) {
 		Struct l0__tmp = at;
 		switch (l0__tmp.getTypeId()) {
-		case 44/*MizFuncTrm*/: {
+		case 45/*MizFuncTrm*/: {
 			final Struct_MizFuncTrm l1__tmp = (Struct_MizFuncTrm)l0__tmp;
 			final Struct l2_args = l1__tmp.f_args;
 			final int l3___ = (l1__tmp).f_sort;
@@ -76,7 +76,7 @@ final public class Module_checker {
 			final int l7___ = (l1__tmp).f_trmInfo;
 			return l5_args;
 		}
-		case 58/*MizPrivFuncTrm*/: {
+		case 59/*MizPrivFuncTrm*/: {
 			final Struct_MizPrivFuncTrm l1__tmp = (Struct_MizPrivFuncTrm)l0__tmp;
 			final Struct l8_args = l1__tmp.f_args;
 			final int l9___ = (l1__tmp).f_funcNr;
@@ -94,7 +94,7 @@ final public class Module_checker {
 	public static final Struct_MizPredFrm f_mizChkAsPred(Struct af) {
 		Struct l0__tmp = af;
 		switch (l0__tmp.getTypeId()) {
-		case 55/*MizPredFrm*/: {
+		case 56/*MizPredFrm*/: {
 			final Struct_MizPredFrm l1__tmp = (Struct_MizPredFrm)l0__tmp;
 			final int l2___ = (l1__tmp).f_sort;
 			final int l3___ = (l1__tmp).f_predNr;
@@ -111,7 +111,7 @@ final public class Module_checker {
 	public static final int f_mizChkFuncNr(Struct at) {
 		Struct l0__tmp = at;
 		switch (l0__tmp.getTypeId()) {
-		case 44/*MizFuncTrm*/: {
+		case 45/*MizFuncTrm*/: {
 			final Struct_MizFuncTrm l1__tmp = (Struct_MizFuncTrm)l0__tmp;
 			final int l2_funcNr = l1__tmp.f_funcNr;
 			final int l3___ = (l1__tmp).f_sort;
@@ -121,7 +121,7 @@ final public class Module_checker {
 			final int l7___ = (l1__tmp).f_trmInfo;
 			return l4_funcNr;
 		}
-		case 58/*MizPrivFuncTrm*/: {
+		case 59/*MizPrivFuncTrm*/: {
 			final Struct_MizPrivFuncTrm l1__tmp = (Struct_MizPrivFuncTrm)l0__tmp;
 			final int l8_funcNr = l1__tmp.f_funcNr;
 			final int l9_funcNr = (l1__tmp).f_funcNr;
@@ -264,7 +264,7 @@ final public class Module_checker {
 				final Struct l10_gsymswitch0 = l2_a.value;
 				Struct l11__tmp = l10_gsymswitch0;
 				switch (l11__tmp.getTypeId()) {
-				case 64/*MizTrmNil*/: {
+				case 69/*MizTrmNil*/: {
 					l9_$8=false;
 					break;
 				}
@@ -282,7 +282,7 @@ final public class Module_checker {
 			final Struct l8_gsymswitch1 = l2_a.value;
 			Struct l9__tmp = l8_gsymswitch1;
 			switch (l9__tmp.getTypeId()) {
-			case 63/*MizTrmElem*/: {
+			case 68/*MizTrmElem*/: {
 				final Struct_MizTrmElem l10__tmp = (Struct_MizTrmElem)l9__tmp;
 				final Struct l11_ta = l10__tmp.f_trm;
 				final Struct l12_na = l10__tmp.f_next;
@@ -291,7 +291,7 @@ final public class Module_checker {
 				final Struct l15_gsymswitch2 = l3_b.value;
 				Struct l16__tmp = l15_gsymswitch2;
 				switch (l16__tmp.getTypeId()) {
-				case 63/*MizTrmElem*/: {
+				case 68/*MizTrmElem*/: {
 					final Struct_MizTrmElem l17__tmp = (Struct_MizTrmElem)l16__tmp;
 					final Struct l18_tb = l17__tmp.f_trm;
 					final Struct l19_nb = l17__tmp.f_next;
@@ -301,13 +301,13 @@ final public class Module_checker {
 						final Struct l22_gsymswitch3 = l0_diff.value;
 						Struct l23__tmp = l22_gsymswitch3;
 						switch (l23__tmp.getTypeId()) {
-						case 83/*Some*/: {
+						case 88/*Some*/: {
 							final Struct_Some l24__tmp = (Struct_Some)l23__tmp;
 							final Struct_Pair l25___ = ((Struct_Pair)(l24__tmp).f_value);
 							l1_multi.value = ((Boolean)true);
 							break;
 						}
-						case 75/*None*/: {
+						case 80/*None*/: {
 							((Reference<Struct_Some>)(Reference)l0_diff).value = (new Struct_Some((new Struct_Pair(l13_ta, l20_tb))));
 							break;
 						}
@@ -320,7 +320,7 @@ final public class Module_checker {
 					l3_b.value = l21_nb;
 					return null;
 				}
-				case 64/*MizTrmNil*/: {
+				case 69/*MizTrmNil*/: {
 					l1_multi.value = ((Boolean)true);
 					return null;
 				}
@@ -328,7 +328,7 @@ final public class Module_checker {
 					throw new RuntimeException("Unexpected struct in switch: "+l16__tmp.getTypeName());
 				}
 			}
-			case 64/*MizTrmNil*/: {
+			case 69/*MizTrmNil*/: {
 				return null;
 			}
 			default:
@@ -352,7 +352,7 @@ final public class Module_checker {
 			if (((l6_eq_0).f_contr==0)) {
 				Struct l6__tmp = apf;
 				switch (l6__tmp.getTypeId()) {
-				case 55/*MizPredFrm*/: {
+				case 56/*MizPredFrm*/: {
 					final Struct_MizPredFrm l7__tmp = (Struct_MizPredFrm)l6__tmp;
 					final int l8_srt = l7__tmp.f_sort;
 					final int l9_predNr = l7__tmp.f_predNr;
@@ -396,7 +396,7 @@ final public class Module_checker {
 				if (((l12_eq_0).f_contr==0)) {
 					Struct l12__tmp = anf;
 					switch (l12__tmp.getTypeId()) {
-					case 55/*MizPredFrm*/: {
+					case 56/*MizPredFrm*/: {
 						final Struct_MizPredFrm l13__tmp = (Struct_MizPredFrm)l12__tmp;
 						final int l14_srt = l13__tmp.f_sort;
 						final int l15_predNr = l13__tmp.f_predNr;
@@ -445,7 +445,7 @@ final public class Module_checker {
 					boolean l19_liveI;
 					Struct l20__tmp = l18_gsymswitch4;
 					switch (l20__tmp.getTypeId()) {
-					case 64/*MizTrmNil*/: {
+					case 69/*MizTrmNil*/: {
 						l19_liveI=false;
 						break;
 					}
@@ -463,7 +463,7 @@ final public class Module_checker {
 								boolean l28_liveJ;
 								Struct l29__tmp = l27_gsymswitch5;
 								switch (l29__tmp.getTypeId()) {
-								case 64/*MizTrmNil*/: {
+								case 69/*MizTrmNil*/: {
 									l28_liveJ=false;
 									break;
 								}
@@ -504,7 +504,7 @@ final public class Module_checker {
 				final Struct l25_nf = ((Struct)Module_vector.f_getVectorUnsafe((l25_eq_0).f_negBas, ((int)l19_ii.value)));
 				Struct l26__tmp = l25_nf;
 				switch (l26__tmp.getTypeId()) {
-				case 55/*MizPredFrm*/: {
+				case 56/*MizPredFrm*/: {
 					final Struct_MizPredFrm l27__tmp = (Struct_MizPredFrm)l26__tmp;
 					final int l28_srt = l27__tmp.f_sort;
 					final int l29_predNr = l27__tmp.f_predNr;
@@ -525,7 +525,7 @@ final public class Module_checker {
 								final Struct l44_gsymswitch7 = l40_curL.value;
 								Struct l45__tmp = l44_gsymswitch7;
 								switch (l45__tmp.getTypeId()) {
-								case 64/*MizTrmNil*/: {
+								case 69/*MizTrmNil*/: {
 									return ((Boolean)false);
 								}
 								default: {
@@ -537,7 +537,7 @@ final public class Module_checker {
 								final Struct l45_gsymswitch8 = l40_curL.value;
 								Struct l46__tmp = l45_gsymswitch8;
 								switch (l46__tmp.getTypeId()) {
-								case 63/*MizTrmElem*/: {
+								case 68/*MizTrmElem*/: {
 									final Struct_MizTrmElem l47__tmp = (Struct_MizTrmElem)l46__tmp;
 									final Struct l48_tl = l47__tmp.f_trm;
 									final Struct l49_nl = l47__tmp.f_next;
@@ -550,7 +550,7 @@ final public class Module_checker {
 											final Struct l57_gsymswitch9 = l53_curR.value;
 											Struct l58__tmp = l57_gsymswitch9;
 											switch (l58__tmp.getTypeId()) {
-											case 64/*MizTrmNil*/: {
+											case 69/*MizTrmNil*/: {
 												return ((Boolean)false);
 											}
 											default: {
@@ -562,7 +562,7 @@ final public class Module_checker {
 											final Struct l58_gsymswitch10 = l53_curR.value;
 											Struct l59__tmp = l58_gsymswitch10;
 											switch (l59__tmp.getTypeId()) {
-											case 63/*MizTrmElem*/: {
+											case 68/*MizTrmElem*/: {
 												final Struct_MizTrmElem l60__tmp = (Struct_MizTrmElem)l59__tmp;
 												final Struct l61_tr = l60__tmp.f_trm;
 												final Struct l62_nr = l60__tmp.f_next;
@@ -572,14 +572,14 @@ final public class Module_checker {
 													final Struct l65_gsymswitch11 = Module_checker.f_mizOneDiffInTrmLists(Module_checker.f_mizChkArgs(l50_tl), Module_checker.f_mizChkArgs(l63_tr));
 													Struct l66__tmp = l65_gsymswitch11;
 													switch (l66__tmp.getTypeId()) {
-													case 83/*Some*/: {
+													case 88/*Some*/: {
 														final Struct_Some l67__tmp = (Struct_Some)l66__tmp;
 														final Object l68_p = l67__tmp.f_value;
 														final Struct_Pair l69_p = ((Struct_Pair)(l67__tmp).f_value);
 														Module_checker.f_mizAllocInequality(l26_chk, l25_eq_0, ((Struct)(l69_p).f_first), ((Struct)(l69_p).f_second));
 														break;
 													}
-													case 75/*None*/: {
+													case 80/*None*/: {
 														break;
 													}
 													default:
@@ -590,7 +590,7 @@ final public class Module_checker {
 												l53_curR.value = l64_nr;
 												return null;
 											}
-											case 64/*MizTrmNil*/: {
+											case 69/*MizTrmNil*/: {
 												return null;
 											}
 											default:
@@ -603,7 +603,7 @@ final public class Module_checker {
 									l40_curL.value = l51_nl;
 									return null;
 								}
-								case 64/*MizTrmNil*/: {
+								case 69/*MizTrmNil*/: {
 									return null;
 								}
 								default:
@@ -618,7 +618,7 @@ final public class Module_checker {
 							final Func1<Object,Struct> l48_$45 = (Func1<Object, Struct>)(Struct apf) -> {
 								Struct l49__tmp = apf;
 								switch (l49__tmp.getTypeId()) {
-								case 55/*MizPredFrm*/: {
+								case 56/*MizPredFrm*/: {
 									final Struct_MizPredFrm l50__tmp = (Struct_MizPredFrm)l49__tmp;
 									final int l51_s2 = l50__tmp.f_sort;
 									final int l52_s2 = (l50__tmp).f_sort;
@@ -632,13 +632,13 @@ final public class Module_checker {
 											final Struct l58_gsymswitch12 = Module_checker.f_mizOneDiffInTrmLists(((Struct)(l57_pb).f_second), ((Struct)(l36_pa).f_second));
 											Struct l59__tmp = l58_gsymswitch12;
 											switch (l59__tmp.getTypeId()) {
-											case 83/*Some*/: {
+											case 88/*Some*/: {
 												final Struct_Some l60__tmp = (Struct_Some)l59__tmp;
 												final Object l61_p = l60__tmp.f_value;
 												final Struct_Pair l62_p = ((Struct_Pair)(l60__tmp).f_value);
 												return Module_checker.f_mizAllocInequality(l26_chk, l25_eq_0, ((Struct)(l62_p).f_first), ((Struct)(l62_p).f_second));
 											}
-											case 75/*None*/: {
+											case 80/*None*/: {
 												return null;
 											}
 											default:
@@ -664,7 +664,7 @@ final public class Module_checker {
 						final Func1<Object,Struct> l52_$49 = (Func1<Object, Struct>)(Struct apf) -> {
 							Struct l53__tmp = apf;
 							switch (l53__tmp.getTypeId()) {
-							case 55/*MizPredFrm*/: {
+							case 56/*MizPredFrm*/: {
 								final Struct_MizPredFrm l54__tmp = (Struct_MizPredFrm)l53__tmp;
 								final int l55_s2 = l54__tmp.f_sort;
 								final int l56_p2 = l54__tmp.f_predNr;
@@ -677,13 +677,13 @@ final public class Module_checker {
 									final Struct l62_gsymswitch6 = Module_checker.f_mizOneDiffInTrmLists(l60_args2, l33_args);
 									Struct l63__tmp = l62_gsymswitch6;
 									switch (l63__tmp.getTypeId()) {
-									case 83/*Some*/: {
+									case 88/*Some*/: {
 										final Struct_Some l64__tmp = (Struct_Some)l63__tmp;
 										final Object l65_p = l64__tmp.f_value;
 										final Struct_Pair l66_p = ((Struct_Pair)(l64__tmp).f_value);
 										return Module_checker.f_mizAllocInequality(l26_chk, l25_eq_0, ((Struct)(l66_p).f_first), ((Struct)(l66_p).f_second));
 									}
-									case 75/*None*/: {
+									case 80/*None*/: {
 										return null;
 									}
 									default:
@@ -702,7 +702,7 @@ final public class Module_checker {
 					}
 					break;
 				}
-				case 60/*MizQualFrm*/: {
+				case 61/*MizQualFrm*/: {
 					final Struct_MizQualFrm l27__tmp = (Struct_MizQualFrm)l26__tmp;
 					final Struct l53_trm = l27__tmp.f_trm;
 					final Struct_MizTyp l54_typ = l27__tmp.f_typ;
@@ -730,13 +730,13 @@ final public class Module_checker {
 								final Struct l76_gsymswitch13 = Module_checker.f_mizOneDiffInTrmLists(((Struct)(l74_p1).f_second), ((Struct)(l75_p2).f_second));
 								Struct l77__tmp = l76_gsymswitch13;
 								switch (l77__tmp.getTypeId()) {
-								case 83/*Some*/: {
+								case 88/*Some*/: {
 									final Struct_Some l78__tmp = (Struct_Some)l77__tmp;
 									final Object l79_p = l78__tmp.f_value;
 									final Struct_Pair l80_p = ((Struct_Pair)(l78__tmp).f_value);
 									return Module_checker.f_mizAllocInequality(l26_chk, l25_eq_0, ((Struct)(l80_p).f_first), ((Struct)(l80_p).f_second));
 								}
-								case 75/*None*/: {
+								case 80/*None*/: {
 									return null;
 								}
 								default:
@@ -758,7 +758,7 @@ final public class Module_checker {
 							boolean l69_liveJ;
 							Struct l70__tmp = l68_gsymswitch14;
 							switch (l70__tmp.getTypeId()) {
-							case 64/*MizTrmNil*/: {
+							case 69/*MizTrmNil*/: {
 								l69_liveJ=false;
 								break;
 							}

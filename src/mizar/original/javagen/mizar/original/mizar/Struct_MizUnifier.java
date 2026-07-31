@@ -1,11 +1,11 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785508391389
+// timestamp: 1785512695555
 
 package mizar.original.mizar;
 
 import com.area9innovation.flow.*;
 
-public class Struct_MizUnifier extends Struct implements Field_eqClassNbr<Integer>, Field_freeVarBase<Integer>, Field_unifBase<Integer>, Field_freeVarUnifs<Struct> {
+public class Struct_MizUnifier extends Struct implements Field_eqClassNbr<Integer>, Field_freeVarBase<Integer>, Field_unifBase<Integer>, Field_freeVarUnifs<Struct>, Field_debug<Boolean> {
 	public Struct_MizCorrelEnv f_env;
 	public Struct_MizIdentify f_idn;
 	public Struct_MizEqualizer f_eq;
@@ -21,9 +21,10 @@ public class Struct_MizUnifier extends Struct implements Field_eqClassNbr<Intege
 	public int f_unifBase;
 	public Struct f_freeVarUnifs;
 	public Struct_MizPre f_pre;
+	public boolean f_debug;
 
 	public Struct_MizUnifier() {}
-	public Struct_MizUnifier(Struct_MizCorrelEnv a_env, Struct_MizIdentify a_idn, Struct_MizEqualizer a_eq, int a_eqClassNbr, Struct_Vector a_eqList, Struct_MizNatFunc a_dConstEqClass, Struct_Vector a_eqClassVal, Struct_Vector a_eqClassType, Struct_Vector a_eqClassSuper, Struct_Vector a_eTrm, Struct_Vector a_freeVarType, int a_freeVarBase, int a_unifBase, Struct a_freeVarUnifs, Struct_MizPre a_pre) {
+	public Struct_MizUnifier(Struct_MizCorrelEnv a_env, Struct_MizIdentify a_idn, Struct_MizEqualizer a_eq, int a_eqClassNbr, Struct_Vector a_eqList, Struct_MizNatFunc a_dConstEqClass, Struct_Vector a_eqClassVal, Struct_Vector a_eqClassType, Struct_Vector a_eqClassSuper, Struct_Vector a_eTrm, Struct_Vector a_freeVarType, int a_freeVarBase, int a_unifBase, Struct a_freeVarUnifs, Struct_MizPre a_pre, boolean a_debug) {
 		f_env = a_env;
 		f_idn = a_idn;
 		f_eq = a_eq;
@@ -39,6 +40,7 @@ public class Struct_MizUnifier extends Struct implements Field_eqClassNbr<Intege
 		f_unifBase = a_unifBase;
 		f_freeVarUnifs = a_freeVarUnifs;
 		f_pre = a_pre;
+		f_debug = a_debug;
 	}
 	public Integer get_eqClassNbr() { return f_eqClassNbr; }
 	public void set_eqClassNbr(Integer value) { f_eqClassNbr = value; }
@@ -48,27 +50,29 @@ public class Struct_MizUnifier extends Struct implements Field_eqClassNbr<Intege
 	public void set_unifBase(Integer value) { f_unifBase = value; }
 	public Struct get_freeVarUnifs() { return f_freeVarUnifs; }
 	public void set_freeVarUnifs(Struct value) { f_freeVarUnifs = value; }
+	public Boolean get_debug() { return f_debug; }
+	public void set_debug(Boolean value) { f_debug = value; }
 
-	public int getTypeId() { return 67; }
+	public int getTypeId() { return 72; }
 	public String getTypeName() { return "MizUnifier"; }
 
 	private static final String[] field_names = new String[] {
-		"env", "idn", "eq", "eqClassNbr", "eqList", "dConstEqClass", "eqClassVal", "eqClassType", "eqClassSuper", "eTrm", "freeVarType", "freeVarBase", "unifBase", "freeVarUnifs", "pre"
+		"env", "idn", "eq", "eqClassNbr", "eqList", "dConstEqClass", "eqClassVal", "eqClassType", "eqClassSuper", "eTrm", "freeVarType", "freeVarBase", "unifBase", "freeVarUnifs", "pre", "debug"
 	};
 	private static final RuntimeType[] field_types = new RuntimeType[] {
-		RuntimeType.STRUCT, RuntimeType.STRUCT, RuntimeType.STRUCT, RuntimeType.INT, RuntimeType.STRUCT, RuntimeType.STRUCT, RuntimeType.STRUCT, RuntimeType.STRUCT, RuntimeType.STRUCT, RuntimeType.STRUCT, RuntimeType.STRUCT, RuntimeType.INT, RuntimeType.INT, RuntimeType.STRUCT, RuntimeType.STRUCT
+		RuntimeType.STRUCT, RuntimeType.STRUCT, RuntimeType.STRUCT, RuntimeType.INT, RuntimeType.STRUCT, RuntimeType.STRUCT, RuntimeType.STRUCT, RuntimeType.STRUCT, RuntimeType.STRUCT, RuntimeType.STRUCT, RuntimeType.STRUCT, RuntimeType.INT, RuntimeType.INT, RuntimeType.STRUCT, RuntimeType.STRUCT, RuntimeType.BOOL
 	};
 	public String[] getFieldNames() { return field_names; }
 	public RuntimeType[] getFieldTypes() { return field_types; }
 
 	public Object[] getFields() {
 		return new Object[] {
-			f_env, f_idn, f_eq, f_eqClassNbr, f_eqList, f_dConstEqClass, f_eqClassVal, f_eqClassType, f_eqClassSuper, f_eTrm, f_freeVarType, f_freeVarBase, f_unifBase, f_freeVarUnifs, f_pre
+			f_env, f_idn, f_eq, f_eqClassNbr, f_eqList, f_dConstEqClass, f_eqClassVal, f_eqClassType, f_eqClassSuper, f_eTrm, f_freeVarType, f_freeVarBase, f_unifBase, f_freeVarUnifs, f_pre, f_debug
 		};
 	}
 	@SuppressWarnings("unchecked")
 	public void setFields(Object[] values) {
-		if (values.length != 15)
+		if (values.length != 16)
 			throw new IndexOutOfBoundsException("Invalid field count in MizUnifier");
 		f_env = (Struct_MizCorrelEnv)values[0];
 		f_idn = (Struct_MizIdentify)values[1];
@@ -85,12 +89,13 @@ public class Struct_MizUnifier extends Struct implements Field_eqClassNbr<Intege
 		f_unifBase = (Integer)values[12];
 		f_freeVarUnifs = (Struct)values[13];
 		f_pre = (Struct_MizPre)values[14];
+		f_debug = (Boolean)values[15];
 	}
 
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 67) return 67-tmp;
+		if (tmp != 72) return 72-tmp;
 		Struct_MizUnifier other = (Struct_MizUnifier)other_gen;
 		tmp = f_env.compareTo(other.f_env);
 		if (tmp != 0) return tmp;
@@ -121,6 +126,9 @@ public class Struct_MizUnifier extends Struct implements Field_eqClassNbr<Intege
 		tmp = f_freeVarUnifs.compareTo(other.f_freeVarUnifs);
 		if (tmp != 0) return tmp;
 		tmp = f_pre.compareTo(other.f_pre);
-		return tmp;
+		if (tmp != 0) return tmp;
+		if (f_debug != other.f_debug)
+			return f_debug ? 1 : -1;
+		return 0;
 	}
 }

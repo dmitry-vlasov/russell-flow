@@ -133,4 +133,11 @@ final public class Module_vector {
 		final Object[] l0_dummy = SingletonStructs.arr_empty;
 		return Native.sizeVector((avector).f_vect, l0_dummy);
 	}
+	public static final Object[] f_vector2array(Struct_Vector avector) {
+		return Native.vector2array((avector).f_vect);
+	}
+	// The wrapper to a native: Native.vector2array
+	public static final Object[] f_vector2arrayNative(Object avector) {
+		return Native.vector2array(avector);
+	}
 }

@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785508391386
+// timestamp: 1785512695550
 
 package mizar.original.mizar;
 
@@ -15,7 +15,7 @@ public class Struct_MizIntPair extends Struct {
 		f_y = a_y;
 	}
 
-	public int getTypeId() { return 46; }
+	public int getTypeId() { return 47; }
 	public String getTypeName() { return "MizIntPair"; }
 
 	private static final String[] field_names = new String[] {
@@ -43,7 +43,7 @@ public class Struct_MizIntPair extends Struct {
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 46) return 46-tmp;
+		if (tmp != 47) return 47-tmp;
 		Struct_MizIntPair other = (Struct_MizIntPair)other_gen;
 		if (f_x != other.f_x)
 			return (f_x > other.f_x) ? 1 : -1;

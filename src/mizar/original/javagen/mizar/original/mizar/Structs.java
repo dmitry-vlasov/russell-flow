@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785508391393
+// timestamp: 1785512695561
 
 package mizar.original.mizar;
 
@@ -56,6 +56,7 @@ public final class Structs {
 		new Struct_MizFlexFrm(),
 		new Struct_MizFraenkelTrm(),
 		new Struct_MizFuncDef(),
+		new Struct_MizFuncIdent(),
 		new Struct_MizFuncTrm(),
 		new Struct_MizIdentify(),
 		new Struct_MizIntPair(),
@@ -75,6 +76,10 @@ public final class Structs {
 		new Struct_MizQualFrm(),
 		new Struct_MizRCluster(),
 		new Struct_MizReduction(),
+		new Struct_MizSchSnap(),
+		new Struct_MizSchState(),
+		new Struct_MizSchemeDef(),
+		new Struct_MizSchemes(),
 		new Struct_MizTrmElem(),
 		SingletonStructs.str_MizTrmNil,
 		new Struct_MizTrmSRec(),

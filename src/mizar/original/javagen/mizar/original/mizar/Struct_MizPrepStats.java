@@ -1,11 +1,11 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785508391388
+// timestamp: 1785512695552
 
 package mizar.original.mizar;
 
 import com.area9innovation.flow.*;
 
-public class Struct_MizPrepStats extends Struct implements Field_checked<Integer>, Field_accepted<Integer>, Field_failed<Integer>, Field_skippedFrom<Integer>, Field_skippedBlocks<Integer> {
+public class Struct_MizPrepStats extends Struct implements Field_checked<Integer>, Field_accepted<Integer>, Field_failed<Integer>, Field_skippedBlocks<Integer> {
 	public int f_checked;
 	public int f_accepted;
 	public int f_failed;
@@ -28,12 +28,10 @@ public class Struct_MizPrepStats extends Struct implements Field_checked<Integer
 	public void set_accepted(Integer value) { f_accepted = value; }
 	public Integer get_failed() { return f_failed; }
 	public void set_failed(Integer value) { f_failed = value; }
-	public Integer get_skippedFrom() { return f_skippedFrom; }
-	public void set_skippedFrom(Integer value) { f_skippedFrom = value; }
 	public Integer get_skippedBlocks() { return f_skippedBlocks; }
 	public void set_skippedBlocks(Integer value) { f_skippedBlocks = value; }
 
-	public int getTypeId() { return 57; }
+	public int getTypeId() { return 58; }
 	public String getTypeName() { return "MizPrepStats"; }
 
 	private static final String[] field_names = new String[] {
@@ -65,7 +63,7 @@ public class Struct_MizPrepStats extends Struct implements Field_checked<Integer
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 57) return 57-tmp;
+		if (tmp != 58) return 58-tmp;
 		Struct_MizPrepStats other = (Struct_MizPrepStats)other_gen;
 		if (f_checked != other.f_checked)
 			return (f_checked > other.f_checked) ? 1 : -1;

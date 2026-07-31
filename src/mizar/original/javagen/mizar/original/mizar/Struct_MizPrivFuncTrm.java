@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785508391388
+// timestamp: 1785512695552
 
 package mizar.original.mizar;
 
@@ -25,7 +25,7 @@ public class Struct_MizPrivFuncTrm extends Struct implements Field_funcExp<Struc
 	public Integer get_trmInfo() { return f_trmInfo; }
 	public void set_trmInfo(Integer value) { f_trmInfo = value; }
 
-	public int getTypeId() { return 58; }
+	public int getTypeId() { return 59; }
 	public String getTypeName() { return "MizPrivFuncTrm"; }
 
 	private static final String[] field_names = new String[] {
@@ -56,7 +56,7 @@ public class Struct_MizPrivFuncTrm extends Struct implements Field_funcExp<Struc
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 58) return 58-tmp;
+		if (tmp != 59) return 59-tmp;
 		Struct_MizPrivFuncTrm other = (Struct_MizPrivFuncTrm)other_gen;
 		if (f_funcNr != other.f_funcNr)
 			return (f_funcNr > other.f_funcNr) ? 1 : -1;

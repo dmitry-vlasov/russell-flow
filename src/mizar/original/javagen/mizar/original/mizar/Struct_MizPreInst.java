@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785508391387
+// timestamp: 1785512695551
 
 package mizar.original.mizar;
 
@@ -21,7 +21,7 @@ public class Struct_MizPreInst extends Struct implements Field_top<Boolean>, Fie
 	public Boolean get_overflow() { return f_overflow; }
 	public void set_overflow(Boolean value) { f_overflow = value; }
 
-	public int getTypeId() { return 54; }
+	public int getTypeId() { return 55; }
 	public String getTypeName() { return "MizPreInst"; }
 
 	private static final String[] field_names = new String[] {
@@ -50,7 +50,7 @@ public class Struct_MizPreInst extends Struct implements Field_top<Boolean>, Fie
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 54) return 54-tmp;
+		if (tmp != 55) return 55-tmp;
 		Struct_MizPreInst other = (Struct_MizPreInst)other_gen;
 		tmp = f_evals.compareTo(other.f_evals);
 		if (tmp != 0) return tmp;

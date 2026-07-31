@@ -24,6 +24,10 @@ final public class Module_array {
 	public static final int f_elemIndex(Object[] aa, Object aelem, int aillegal) {
 		return Native.elemIndex(aa, aelem, aillegal);
 	}
+	// The wrapper to a native: Native.exists
+	public static final boolean f_exists(Object[] aa, Func1<Boolean,Object> afn) {
+		return Native.exists(aa, afn);
+	}
 	public static final boolean f_existsIndex(Object[] aa, int ai) {
 		return ((ai>=0)&&(ai<Native.length(aa)));
 	}
