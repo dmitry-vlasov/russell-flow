@@ -701,6 +701,7 @@ mizAccomTheorems(acc : MizAccom, evl : MizEvl) -> Pair<Tree<int, MizFrm>, int> {
 					curNr = if (kind == kindD) { defNr := ^defNr + 1; ^defNr }
 						else { thNr := ^thNr + 1; ^thNr };
 					if (mizAccFrm(acc.env, f)) {
+						mizEnvifyFrm(acc.env, f);
 						out := setTree(^out, mizThKey(kind, artNr, curNr), f);
 					}
 				} else {
@@ -764,12 +765,15 @@ mizAccomSchemes(acc : MizAccom, evl : MizEvl) -> MizSchemes {
 					schNr := ^schNr + 1;
 					iterVector(types, \ty -> mizAccomRenumberTyp(tr, ty));
 					iter(^props, \f -> mizAccomRenumberFrm(tr, f));
-					clearVector(acc.env.curSchFuncTyp);
 					if (mizAccTypColl(acc.env, types)
 						&& forall(^props, \f -> mizAccFrm(acc.env, f))) {
+						// still inside the scheme's functor-type scope
+						iterVector(types, \ty -> mizEnvifyTyp(acc.env, ty));
+						iter(^props, \f -> mizEnvifyFrm(acc.env, f));
 						pushVector(out.items,
 							MizSchemeDef(artNr, ^schNr, types, ^props, !^bad));
 					}
+					clearVector(acc.env.curSchFuncTyp);
 				} else {
 					mizXmlSkipElement(x);
 				}
@@ -866,7 +870,10 @@ mizAccomDefinientia(acc : MizAccom, evl : MizEvl, directive : string)
 				if (x.nElName == "Definiens") {
 					d = mizInDefiniens(r);
 					mizAccomRenumberDefiniens(tr, d);
-					if (mizAccDefiniens(acc.env, d)) pushVector(out, d);
+					if (mizAccDefiniens(acc.env, d)) {
+						mizEnvifyDefiniens(acc.env, d);
+						pushVector(out, d);
+					}
 				} else {
 					mizXmlSkipElement(x);
 				}
@@ -927,6 +934,9 @@ mizAccomIdentifications(acc : MizAccom, evl : MizEvl, idn : MizIdentify) -> void
 			if (mizAccTypColl(acc.env, it.primaries)
 				&& mizAccTrm(acc.env, it.pattern0)
 				&& mizAccTrm(acc.env, it.pattern1)) {
+				iterVector(it.primaries, \ty -> mizEnvifyTyp(acc.env, ty));
+				mizEnvifyTrm(acc.env, it.pattern0);
+				mizEnvifyTrm(acc.env, it.pattern1);
 				pushVector(idn.identifications, it);
 			}
 		}));
@@ -945,6 +955,9 @@ mizAccomReductions(acc : MizAccom, evl : MizEvl, idn : MizIdentify) -> void {
 			// AccesibleReduction
 			if (mizAccTypColl(acc.env, rd.primaries)
 				&& mizAccTrm(acc.env, rd.t0) && mizAccTrm(acc.env, rd.t1)) {
+				iterVector(rd.primaries, \ty -> mizEnvifyTyp(acc.env, ty));
+				mizEnvifyTrm(acc.env, rd.t0);
+				mizEnvifyTrm(acc.env, rd.t1);
 				pushVector(idn.reductions, rd);
 			}
 		}));
@@ -992,6 +1005,119 @@ mizAccomRequirements(acc : MizAccom, evl : MizEvl) -> void {
 	});
 }
 
+// ---------------- the env-format post-processing ----------------
+//
+// In the original the accommodator is a separate program, so AfterClusters is
+// always false while `prel/` is read, and the CHECKER later re-reads the flat
+// files with AfterClusters on. Accommodating in-process we must do both: read
+// (and translate) with the flag off, then apply exactly what
+// InEnvFileObj.In_Type would have applied — bottom-up, since In_Type sees the
+// nested types first.
+
+mizEnvifyTyp(env : MizCorrelEnv, t : MizTyp) -> void {
+	mizEnvifyCluster(env, t.lower);
+	mizEnvifyCluster(env, t.upper);
+	mizEnvifyTrmList(env, t.modArgs);
+	upper = mizCopyCluster(t.lower);
+	if (t.sort == ikTypMode) {
+		mc = mizConstr(env, coMode, t.modNr);
+		switch (mc.typ) {
+			Some(mt): mizAttrCollEnlargeBy(env, upper, mizInstCluster(env, mt.upper, t.modArgs));
+			None(): {}
+		}
+	}
+	env.roundUpCluster(env, upper, t);
+	t.upper ::= upper;
+}
+
+mizEnvifyCluster(env : MizCorrelEnv, c : MizAttrColl) -> void {
+	iterVector(c.items, \a -> mizEnvifyTrmList(env, a.args));
+}
+
+mizEnvifyTrmList(env : MizCorrelEnv, l : MizTrmList) -> void {
+	switch (l) {
+		MizTrmNil(): {}
+		MizTrmElem(trm, next): {
+			mizEnvifyTrm(env, trm);
+			mizEnvifyTrmList(env, next);
+		}
+	}
+}
+
+mizEnvifyTrm(env : MizCorrelEnv, t : MizTrm) -> void {
+	switch (t) {
+		MizFuncTrm(__, __, args, __, __): mizEnvifyTrmList(env, args);
+		MizPrivFuncTrm(__, args, expn, __, __): {
+			mizEnvifyTrm(env, expn);
+			mizEnvifyTrmList(env, args);
+		}
+		MizFraenkelTrm(lambdaArgs, scope, compr, __, __, __): {
+			iterVector(lambdaArgs, \ty -> mizEnvifyTyp(env, ty));
+			mizEnvifyTrm(env, scope);
+			mizEnvifyFrm(env, compr);
+		}
+		MizQuaTrm(trmProper, typ, __, __): {
+			mizEnvifyTrm(env, trmProper);
+			mizEnvifyTyp(env, typ);
+		}
+		MizChoiceTrm(typ, __, __): mizEnvifyTyp(env, typ);
+		default: {}
+	}
+}
+
+mizEnvifyFrm(env : MizCorrelEnv, f : MizFrm) -> void {
+	switch (f) {
+		MizPredFrm(__, __, args, __): mizEnvifyTrmList(env, args);
+		MizLocPredFrm(__, args, expn, __): {
+			mizEnvifyFrm(env, expn);
+			mizEnvifyTrmList(env, args);
+		}
+		MizQualFrm(trm, typ, __): {
+			mizEnvifyTrm(env, trm);
+			mizEnvifyTyp(env, typ);
+		}
+		MizNegFrm(arg, __): mizEnvifyFrm(env, arg);
+		MizConjFrm(conjuncts, __): iterVector(conjuncts, \g -> mizEnvifyFrm(env, g));
+		MizUnivFrm(__, __, quantified, scope, __): {
+			mizEnvifyTyp(env, quantified);
+			mizEnvifyFrm(env, scope);
+		}
+		MizFlexFrm(__, lo, ro, lt, rt, expansion, __): {
+			mizEnvifyFrm(env, lo);
+			mizEnvifyFrm(env, ro);
+			mizEnvifyFrm(env, expansion);
+			mizEnvifyTrm(env, lt);
+			mizEnvifyTrm(env, rt);
+		}
+		default: {}
+	}
+}
+
+mizEnvifyDefiniens(env : MizCorrelEnv, d : MizDefiniens) -> void {
+	iterVector(d.primaries, \t -> mizEnvifyTyp(env, t));
+	mizEnvifyFrm(env, d.assumptions);
+	switch (d.def) {
+		None(): {}
+		Some(def): {
+			switch (def.otherwise) {
+				Some(b): mizEnvifyDefBody(env, b);
+				None(): {}
+			}
+			iterVector(def.partials, \pd -> {
+				mizEnvifyDefBody(env, pd.body);
+				mizEnvifyFrm(env, pd.guard);
+			});
+		}
+	}
+}
+
+mizEnvifyDefBody(env : MizCorrelEnv, b : MizDefBody) -> void {
+	switch (b) {
+		MizDefFrm(f): mizEnvifyFrm(env, f);
+		MizDefTrm(t): mizEnvifyTrm(env, t);
+	}
+}
+
 // ---------------- the whole accommodation ----------------
 
 mizAccomEnvLoader(mmlDir : string, article : string) -> MizEnvLoader {
@@ -1015,6 +1141,10 @@ mizAccomEnvLoader(mmlDir : string, article : string) -> MizEnvLoader {
 			switch (^accRef) {
 				None(): mizRunTimeError(2805);
 				Some(acc): {
+					// the accommodator reads prel/ in the SOURCE frames, so the
+					// AfterClusters treatment must wait until each item has
+					// been translated — mizEnvify* applies it afterwards
+					env.afterClusters ::= false;
 					th = mizAccomTheorems(acc, evl);
 					p.theorems ::= th.first;
 					p.ownArticleNr ::= th.second;
@@ -1028,6 +1158,7 @@ mizAccomEnvLoader(mmlDir : string, article : string) -> MizEnvLoader {
 						\d -> pushVector(defs.expansions, d));
 					iterVector(mizAccomDefinientia(acc, evl, "equalities"),
 						\d -> mizAddEqualsDef(env, defs, d));
+					env.afterClusters ::= true;
 				}
 			}
 		});
