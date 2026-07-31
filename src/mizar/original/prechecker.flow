@@ -1,0 +1,742 @@
+// Transcription of ~/dev/system/kernel/prechecker.pas — PreCheck: turn the
+// premise array into a set of ground literal sets (the DNF disjuncts), i.e.
+// the PreInstCollection normal form over the Basic atom collection.
+//
+// PreInstCollection here: Vector<MizNatFunc> + top flag. Top is the neutral
+// element of JoinWith (one empty substitution); Bottom = empty vector is the
+// neutral of UnionWith. The Generator/ReNew status machinery of the original
+// is memory management for shared items — a GC'd runtime does not need it.
+// Overflow keeps the original law: a JoinWith product past MaxInstNbr sets
+// nOverflow and LatOvfl and the collection empties (graceful give-up).
+//
+// Two PreCheck phases arrive with later units and are HOOKS for now:
+//  - definitional expansion (ExpandAtomicAsTrue) consults ExDefinientia via
+//    identify.Matches — pre.atomicExpansions, default none (correct when the
+//    environment carries no expandable definitions);
+//  - constant collection (CollectConstInFrm, identify.pas) — pre.collectConst,
+//    default identity. // TODO(M1): fill with the identify.pas port.
+//  - ellipsis expansion (ExpandFlexAsTrue, ellipses.pas). // TODO(M1)
+
+import ds/vector;
+import loop;
+import math/math;
+import mizar/original/errhan;
+import mizar/original/mobjects;
+import mizar/original/limits;
+import mizar/original/lexicon;
+import mizar/original/builtin;
+import mizar/original/correl;
+import mizar/original/correl_inst;
+
+export {
+	MizPreInst(
+		evals : Vector<MizNatFunc>,
+		mutable top : bool,
+		mutable overflow : bool,
+	);
+
+	// prechecker unit state (ConstBase, Basic, flags, hooks)
+	MizPre(
+		env : MizCorrelEnv,
+		basic : Vector<MizFrm>,               // Basic
+		mutable constBase : int,
+		mutable constOvfl : bool,
+		mutable latOvfl : bool,
+		mutable trivialError : bool,
+		// SetVarInTrm hook: rewrites a variable-like leaf while normalizing
+		mutable setVarInTrm : (MizTrm) -> MizTrm,
+		// NewVariable hook: introduce a fresh constant/variable for a binder
+		mutable newVariable : (MizPre, MizTyp) -> void,
+		// definitional expansion of one atomic formula (sign-aware): the
+		// expansions to conjoin/disjoin. Default: none.
+		mutable atomicExpansions : (MizFrm) -> [MizFrm],
+		// CollectConstInFrm hook. Default: identity.
+		mutable collectConst : (MizFrm) -> void,
+	);
+
+	mizMakePre(env : MizCorrelEnv) -> MizPre;
+
+	mizPreInstTop() -> MizPreInst;
+	mizPreInstBottom() -> MizPreInst;
+	mizPreInstSingle(atom : MizNatFunc) -> MizPreInst;
+	mizPreInstCount(p : MizPreInst) -> int;
+
+	mizPreInstInsertAndAbsorb(p : MizPreInst, elem : MizNatFunc) -> void;
+	mizPreInstUnionWith(pre : MizPre, p : MizPreInst, q : MizPreInst) -> void;
+	mizPreInstJoinWith(pre : MizPre, p : MizPreInst, q : MizPreInst) -> void;
+	mizPreInstJoinWithAtom(elem : MizNatFunc, coll : MizPreInst) -> MizPreInst;
+	// JoinInstList: fold a list of collections (largest first) into one
+	mizPreInstJoinList(pre : MizPre, colls : Vector<MizPreInst>) -> MizPreInst;
+
+	// Basic collection
+	mizBasicFrmNr(pre : MizPre, f : MizFrm) -> int;         // -1 if absent
+	mizNewBasic(pre : MizPre, f : MizFrm) -> int;
+
+	mizNormalizeAsTrue(pre : MizPre, f : MizFrm) -> MizPreInst;
+	mizNormalizeAsFalse(pre : MizPre, f : MizFrm) -> MizPreInst;
+
+	mizDistributeQuantifiers(pre : MizPre, f : MizFrm) -> MizFrm;
+	mizRemoveIntQuantifier(pre : MizPre, f : MizFrm) -> MizFrm;
+	mizRemoveExtQuantifier(pre : MizPre, f : MizFrm) -> MizFrm;
+
+	mizExpandAtomicAsTrue(pre : MizPre, f : MizFrm) -> MizFrm;
+	mizExpandAtomicAsFalse(pre : MizPre, f : MizFrm) -> MizFrm;
+
+	// NewConst — the default newVariable hook of the checker: fresh constant
+	// with the binder's type (SetConstInTrm renumbering applied by the caller)
+	mizNewConst(pre : MizPre, typ : MizTyp) -> void;
+
+	// PreCheck itself: premises -> normal form (list of disjuncts over Basic)
+	mizPreCheck(pre : MizPre, inference : Vector<MizFrm>) -> MizPreInst;
+}
+
+mizMakePre(env : MizCorrelEnv) -> MizPre {
+	MizPre(env, makeVector(16), 0, false, false, false,
+		\t -> t,
+		\p, typ -> mizNewConst(p, typ),
+		\__ -> [],
+		\__ -> {});
+}
+
+// ---------------- PreInstCollection ----------------
+
+mizPreInstTop() -> MizPreInst {
+	MizPreInst(makeVector(1), true, false);
+}
+
+mizPreInstBottom() -> MizPreInst {
+	MizPreInst(makeVector(4), false, false);
+}
+
+mizPreInstSingle(atom : MizNatFunc) -> MizPreInst {
+	v : Vector<MizNatFunc> = makeVector(1);
+	pushVector(v, atom);
+	MizPreInst(v, false, false);
+}
+
+mizPreInstCount(p : MizPreInst) -> int {
+	if (p.top) 1 else sizeVector(p.evals);
+}
+
+// InsertAndAbsorb: keep only the WEAKEST (most general) substitutions.
+mizPreInstInsertAndAbsorb(p : MizPreInst, elem : MizNatFunc) -> void {
+	i = ref 0;
+	redundant = ref false;
+	replaced = ref false;
+	while(\ -> !^redundant && !^replaced && ^i < sizeVector(p.evals), \ -> {
+		lAtom : MizNatFunc = getVectorUnsafe(p.evals, ^i);
+		c = mizNatCompareWith(lAtom, elem);
+		if (c == 0) {
+			i := ^i + 1;
+		} else if (c == -1) {
+			redundant := true; // an existing atom is weaker — elem adds nothing
+		} else {
+			replaced := true;  // elem is weaker — it replaces and sweeps
+		}
+	});
+	if (^redundant) {
+		// drop elem
+	} else if (^replaced) {
+		setVectorUnsafe(p.evals, ^i, elem);
+		i := ^i + 1;
+		while(\ -> ^i < sizeVector(p.evals), \ -> {
+			lAtom : MizNatFunc = getVectorUnsafe(p.evals, ^i);
+			if (mizNatWeakerThan(elem, lAtom)) {
+				removeVector(p.evals, ^i);
+			} else {
+				i := ^i + 1;
+			}
+		});
+	} else {
+		pushVector(p.evals, elem);
+	}
+}
+
+// UnionWith: p := p ∪ q (disjunction of eval lists).
+mizPreInstUnionWith(pre : MizPre, p : MizPreInst, q : MizPreInst) -> void {
+	if (p.overflow) {
+		// stays overflowed
+	} else if (q.overflow) {
+		clearVector(p.evals);
+		p.top ::= false;
+		p.overflow ::= true;
+	} else if (!p.top && sizeVector(p.evals) == 0) {
+		// p empty: take q wholesale
+		p.top ::= q.top;
+		iterVector(q.evals, \e -> pushVector(p.evals, e));
+	} else if (p.top) {
+		// Top absorbs
+	} else if (!q.top && sizeVector(q.evals) == 0) {
+		// q empty: nothing
+	} else if (q.top) {
+		clearVector(p.evals);
+		p.top ::= true;
+	} else {
+		iterVector(q.evals, \e -> {
+			if (!p.overflow) {
+				mizPreInstInsertAndAbsorb(p, e);
+			}
+		});
+	}
+}
+
+// JoinWith: p := p ⨯ q (conjunction; pairwise JoinAtom), capped at MaxInstNbr.
+mizPreInstJoinWith(pre : MizPre, p : MizPreInst, q : MizPreInst) -> void {
+	if (p.top) {
+		p.top ::= q.top;
+		clearVector(p.evals);
+		iterVector(q.evals, \e -> pushVector(p.evals, e));
+		p.overflow ::= q.overflow;
+	} else if (q.top) {
+		// neutral
+	} else if (sizeVector(q.evals) == 0) {
+		clearVector(p.evals);
+		p.top ::= false;
+	} else if (sizeVector(p.evals) == 0) {
+		// bottom absorbs
+	} else {
+		newSize0 = sizeVector(p.evals) * sizeVector(q.evals);
+		newSize = min(newSize0, MaxInstNbr);
+		old : Vector<MizNatFunc> = copyVector(p.evals);
+		clearVector(p.evals);
+		iterVector(q.evals, \e -> {
+			iterVector(old, \a -> {
+				if (!p.overflow) {
+					switch (mizNatJoinAtom(a, e)) {
+						Some(j): {
+							if (sizeVector(p.evals) >= newSize) {
+								// past the lattice cap: graceful give-up
+								clearVector(p.evals);
+								p.overflow ::= true;
+								pre.latOvfl ::= true;
+							} else {
+								mizPreInstInsertAndAbsorb(p, j);
+							}
+						}
+						None(): {}
+					}
+				}
+			});
+		});
+	}
+}
+
+mizPreInstJoinWithAtom(elem : MizNatFunc, coll : MizPreInst) -> MizPreInst {
+	res = mizPreInstBottom();
+	iterVector(coll.evals, \a -> {
+		switch (mizNatJoinAtom(a, elem)) {
+			Some(j): pushVector(res.evals, j);
+			None(): {}
+		}
+	});
+	res;
+}
+
+// JoinInstList: fold collections, always combining the two SMALLEST last —
+// the original keeps a ULCollection sorted so the largest sits first and
+// repeatedly takes from the END (smallest). Singleton collections join by
+// JoinWithAtom against every remaining collection.
+mizPreInstJoinList(pre : MizPre, colls : Vector<MizPreInst>) -> MizPreInst {
+	if (sizeVector(colls) == 0) {
+		mizPreInstTop();
+	} else {
+		// sort descending by count (ULCollection order)
+		work : Vector<MizPreInst> = copyVector(colls);
+		n = sizeVector(work);
+		// simple insertion sort, n is small
+		fori(1, n - 1, \i -> {
+			j = ref i;
+			while(\ -> ^j > 0 && mizPreInstCount(getVectorUnsafe(work, ^j - 1))
+					< mizPreInstCount(getVectorUnsafe(work, ^j)), \ -> {
+				tmp : MizPreInst = getVectorUnsafe(work, ^j);
+				setVectorUnsafe(work, ^j, getVectorUnsafe(work, ^j - 1));
+				setVectorUnsafe(work, ^j - 1, tmp);
+				j := ^j - 1;
+			});
+		});
+		res : ref Maybe<MizPreInst> = ref None();
+		while(\ -> sizeVector(work) > 1 && isNone(^res), \ -> {
+			lInsts : MizPreInst = getVectorUnsafe(work, sizeVector(work) - 1);
+			removeVector(work, sizeVector(work) - 1);
+			if (mizPreInstCount(lInsts) == 1 && !lInsts.top) {
+				lObj : MizNatFunc = getVectorUnsafe(lInsts.evals, 0);
+				fori(0, sizeVector(work) - 1, \z -> {
+					setVectorUnsafe(work, z,
+						mizPreInstJoinWithAtom(lObj, getVectorUnsafe(work, z)));
+				});
+			} else {
+				lInsts1 : MizPreInst = getVectorUnsafe(work, sizeVector(work) - 1);
+				removeVector(work, sizeVector(work) - 1);
+				mizPreInstJoinWith(pre, lInsts1, lInsts);
+				if (lInsts1.overflow) {
+					bot = mizPreInstBottom();
+					bot.overflow ::= true;
+					res := Some(bot);
+				} else {
+					// keep the sort order: reinsert by count
+					pos = ref sizeVector(work);
+					while(\ -> ^pos > 0 && mizPreInstCount(getVectorUnsafe(work, ^pos - 1))
+							< mizPreInstCount(lInsts1), \ -> pos := ^pos - 1);
+					v2 : Vector<MizPreInst> = makeVector(sizeVector(work) + 1);
+					fori(0, ^pos - 1, \k -> pushVector(v2, getVectorUnsafe(work, k)));
+					pushVector(v2, lInsts1);
+					fori(^pos, sizeVector(work) - 1, \k -> pushVector(v2, getVectorUnsafe(work, k)));
+					clearVector(work);
+					iterVector(v2, \c -> pushVector(work, c));
+				}
+			}
+		});
+		switch (^res) {
+			Some(r): r;
+			None(): getVectorUnsafe(work, 0);
+		}
+	}
+}
+
+// ---------------- Basic ----------------
+
+mizBasicFrmNr(pre : MizPre, f : MizFrm) -> int {
+	n = sizeVector(pre.basic);
+	res = ref -1;
+	i = ref 0;
+	while(\ -> ^i < n && ^res < 0, \ -> {
+		if (mizEqFrm(pre.env, f, getVectorUnsafe(pre.basic, ^i))) res := ^i;
+		i := ^i + 1;
+	});
+	^res;
+}
+
+mizNewBasic(pre : MizPre, f : MizFrm) -> int {
+	i = mizBasicFrmNr(pre, f);
+	if (i >= 0) {
+		i;
+	} else {
+		pushVector(pre.basic, f);
+		sizeVector(pre.basic) - 1;
+	}
+}
+
+// ---------------- normalization ----------------
+
+// apply the setVarInTrm hook over a copied formula
+mizApplySetVar(pre : MizPre, f : MizFrm) -> MizFrm {
+	w = mizMakeWithin(\__, trm -> pre.setVarInTrm(trm));
+	mizWithinFrm(w, f);
+	f;
+}
+
+mizNormalizeAsTrue(pre : MizPre, f : MizFrm) -> MizPreInst {
+	srt = mizFrmSort(f);
+	if (srt == ikFrmNeg) {
+		nf = mizAsNegArg(f);
+		mizNormalizeAsFalse(pre, nf);
+	} else if (srt == ikFrmConj) {
+		res = mizPreInstTop();
+		conj = mizAsConjuncts(f);
+		iterVector(conj, \g -> {
+			l = mizNormalizeAsTrue(pre, g);
+			mizPreInstJoinWith(pre, res, l);
+		});
+		res;
+	} else if (srt == ikFrmVerum) {
+		mizPreInstTop();
+	} else {
+		lsnt = mizApplySetVar(pre, mizCopyFrm(f));
+		atom = mizInitNatFunc(2);
+		mizNatAssign(atom, mizNewBasic(pre, lsnt), 1);
+		mizPreInstSingle(atom);
+	}
+}
+
+mizNormalizeAsFalse(pre : MizPre, f : MizFrm) -> MizPreInst {
+	srt = mizFrmSort(f);
+	if (srt == ikFrmNeg) {
+		nf = mizAsNegArg(f);
+		mizNormalizeAsTrue(pre, nf);
+	} else if (srt == ikFrmConj) {
+		res = mizPreInstBottom();
+		conj = mizAsConjuncts(f);
+		iterVector(conj, \g -> {
+			l = mizNormalizeAsFalse(pre, g);
+			mizPreInstUnionWith(pre, res, l);
+		});
+		res;
+	} else if (srt == ikFrmVerum) {
+		mizPreInstBottom();
+	} else {
+		lsnt = mizApplySetVar(pre, mizCopyFrm(f));
+		atom = mizInitNatFunc(2);
+		mizNatAssign(atom, mizNewBasic(pre, lsnt), 0);
+		mizPreInstSingle(atom);
+	}
+}
+
+mizAsNegArg(f : MizFrm) -> MizFrm {
+	switch (f) {
+		MizNegFrm(arg, __): arg;
+		default: { mizRunTimeError(2911); f; }
+	}
+}
+
+mizAsConjuncts(f : MizFrm) -> Vector<MizFrm> {
+	switch (f) {
+		MizConjFrm(conjuncts, __): conjuncts;
+		default: { mizRunTimeError(2912); makeVector(0); }
+	}
+}
+
+// ---------------- quantifier handling ----------------
+
+mizDistributeQuantifiers(pre : MizPre, f : MizFrm) -> MizFrm {
+	env = pre.env;
+	switch (f) {
+		MizNegFrm(arg, __): mizNewNeg(mizDistributeQuantifiers(pre, arg));
+		MizConjFrm(conjuncts, __): {
+			res = ref mizNewVerum();
+			iterVector(conjuncts, \g ->
+				res := mizNewConj(^res, mizDistributeQuantifiers(pre, g)));
+			^res;
+		}
+		MizUnivFrm(__, __, quantified, scope, __): {
+			env.boundVarNbr ::= env.boundVarNbr + 1;
+			l = mizDistributeQuantifiers(pre, scope);
+			res = switch (l) {
+				MizConjFrm(lc, __): {
+					fori(0, sizeVector(lc) - 1, \i -> {
+						g : MizFrm = getVectorUnsafe(lc, i);
+						nonFict = ref false;
+						wc = mizMakeWithin(\__, trm -> {
+							switch (trm) {
+								MizVarTrm(s2, v2, __): {
+									if (s2 == ikTrmBound && v2 == env.boundVarNbr) {
+										nonFict := true;
+									}
+									trm;
+								}
+								default: trm;
+							}
+						});
+						mizWithinFrm(wc, g);
+						if (^nonFict) {
+							setVectorUnsafe(lc, i,
+								mizNewUniv(mizCopyExpTyp(quantified), g));
+						} else {
+							wr = mizMakeWithin(\__, trm -> {
+								switch (trm) {
+									MizVarTrm(s2, v2, __): {
+										if (s2 == ikTrmBound && v2 > env.boundVarNbr) {
+											vt = mizAsVarTrmB(trm);
+											vt.varNr ::= v2 - 1;
+										}
+										trm;
+									}
+									default: trm;
+								}
+							});
+							mizWithinFrm(wr, g);
+						}
+					});
+					l;
+				}
+				default: mizNewUniv(mizCopyExpTyp(quantified), l);
+			}
+			env.boundVarNbr ::= env.boundVarNbr - 1;
+			res;
+		}
+		MizLocPredFrm(__, __, expn, __): {
+			if (mizFrmSort(expn) != ikError) {
+				mizDistributeQuantifiers(pre, expn);
+			} else {
+				mizCopyExpFrm(f);
+			}
+		}
+		default: mizCopyExpFrm(f);
+	}
+}
+
+mizAsVarTrmB(t : MizTrm) -> MizVarTrm {
+	switch (t) {
+		MizVarTrm(__, __, __): t;
+		default: { mizRunTimeError(2901); MizVarTrm(ikError, 0, 0); }
+	}
+}
+
+// SetConstInTrm — the default setVarInTrm during PreCheck: a bound var still
+// under a binder renumbers down; one freed by RemoveExtQuantifier becomes the
+// fresh CONSTANT ConstBase + n.
+mizSetConstInTrm(pre : MizPre, t : MizTrm) -> MizTrm {
+	env = pre.env;
+	switch (t) {
+		MizVarTrm(srt, varNr, __): {
+			if (srt == ikTrmBound) {
+				vt = mizAsVarTrmB(t);
+				if (varNr > env.boundVarNbr) {
+					vt.varNr ::= varNr - env.boundVarNbr;
+				} else {
+					vt.sort ::= ikTrmConstant;
+					vt.varNr ::= varNr + pre.constBase;
+				}
+			}
+			t;
+		}
+		default: t;
+	}
+}
+
+// NewConst: introduce a fresh constant for one stripped binder
+mizNewConst(pre : MizPre, typ : MizTyp) -> void {
+	env = pre.env;
+	if (env.fixedVarNbr >= MaxVarNbr) {
+		pre.constOvfl ::= true;
+	} else {
+		lTyp = mizCopyTyp(typ);
+		// WithinType(SetConstInTrm)
+		w = mizMakeWithin(\__, trm -> mizSetConstInTrm(pre, trm));
+		mizWithinTyp(w, lTyp);
+		env.fixedVarNbr ::= env.fixedVarNbr + 1;
+		// CollectConstInTyp(lTyp) — via the hook when identify lands
+		while(\ -> sizeVector(env.fixedVar) <= env.fixedVarNbr,
+			\ -> pushVector(env.fixedVar,
+				MizFixedVar(0, mizNewIncorTyp(), false, None(), 0)));
+		fv : MizFixedVar = getVectorUnsafe(env.fixedVar, env.fixedVarNbr);
+		fv.typ ::= lTyp;
+		fv.def ::= None();
+	}
+}
+
+mizRemoveExtQuantifier(pre : MizPre, f0 : MizFrm) -> MizFrm {
+	env = pre.env;
+	switch (f0) {
+		MizNegFrm(arg, __): {
+			na = mizRemoveIntQuantifier(pre, arg);
+			f1 : MizNegFrm = f0;
+			f1.arg ::= na;
+			switch (na) {
+				MizNegFrm(inner, __): inner; // strip double negation
+				default: f0;
+			}
+		}
+		MizUnivFrm(__, __, __, __, __): {
+			// strip the whole ∀-prefix, one fresh constant per binder
+			pre.constBase ::= env.fixedVarNbr; // InitVarBase = InitConstBase
+			env.boundVarNbr ::= 0;
+			cur = ref f0;
+			cont = ref true;
+			while(\ -> ^cont, \ -> {
+				switch (^cur) {
+					MizUnivFrm(__, __, q, s, __): {
+						env.boundVarNbr ::= env.boundVarNbr + 1;
+						pre.newVariable(pre, mizCopyTyp(q));
+						cur := s;
+					}
+					default: cont := false;
+				}
+			});
+			body = mizApplySetVar(pre, ^cur);
+			mizRemoveExtQuantifier(pre, body);
+		}
+		MizConjFrm(conjuncts, __): {
+			out : Vector<MizFrm> = makeVector(sizeVector(conjuncts));
+			iterVector(conjuncts, \g0 -> {
+				g = mizRemoveExtQuantifier(pre, g0);
+				switch (g) {
+					MizConjFrm(inner, __): iterVector(inner, \h -> pushVector(out, h));
+					default: pushVector(out, g);
+				}
+			});
+			MizConjFrm(out, 0);
+		}
+		default: f0;
+	}
+}
+
+mizRemoveIntQuantifier(pre : MizPre, f0 : MizFrm) -> MizFrm {
+	switch (f0) {
+		MizNegFrm(arg, __): {
+			na = mizRemoveExtQuantifier(pre, arg);
+			f1 : MizNegFrm = f0;
+			f1.arg ::= na;
+			switch (na) {
+				MizNegFrm(inner, __): inner;
+				default: f0;
+			}
+		}
+		MizConjFrm(conjuncts, __): {
+			out : Vector<MizFrm> = makeVector(sizeVector(conjuncts));
+			iterVector(conjuncts, \g0 -> {
+				g = mizRemoveIntQuantifier(pre, g0);
+				switch (g) {
+					MizConjFrm(inner, __): iterVector(inner, \h -> pushVector(out, h));
+					default: pushVector(out, g);
+				}
+			});
+			MizConjFrm(out, 0);
+		}
+		default: f0;
+	}
+}
+
+// ---------------- definitional expansion (hooks) ----------------
+
+mizExpandAtomicAsTrue(pre : MizPre, f : MizFrm) -> MizFrm {
+	switch (f) {
+		MizNegFrm(arg, __): mizNewNeg(mizExpandAtomicAsFalse(pre, arg));
+		MizConjFrm(conjuncts, __): {
+			res = ref mizNewVerum();
+			iterVector(conjuncts, \g ->
+				res := mizNewConj(^res, mizExpandAtomicAsTrue(pre, g)));
+			^res;
+		}
+		MizPredFrm(srt, __, __, __): {
+			if (srt == ikFrmPred || srt == ikFrmAttr) {
+				res = ref mizCopyExpFrm(f);
+				exps = pre.atomicExpansions(f);
+				iter(exps, \e -> res := mizNewConj(^res, e));
+				^res;
+			} else {
+				mizCopyExpFrm(f);
+			}
+		}
+		default: mizCopyExpFrm(f);
+	}
+}
+
+mizExpandAtomicAsFalse(pre : MizPre, f : MizFrm) -> MizFrm {
+	env = pre.env;
+	switch (f) {
+		MizNegFrm(arg, __): mizNewNeg(mizExpandAtomicAsTrue(pre, arg));
+		MizConjFrm(conjuncts, __): {
+			res = ref mizNewVerum();
+			iterVector(conjuncts, \g ->
+				res := mizNewConj(^res, mizExpandAtomicAsFalse(pre, g)));
+			^res;
+		}
+		MizPredFrm(srt, __, __, __): {
+			if (srt == ikFrmPred || srt == ikFrmAttr) {
+				res = ref mizCopyExpFrm(f);
+				exps = pre.atomicExpansions(f);
+				iter(exps, \e -> res := mizNewDisj(^res, e));
+				^res;
+			} else {
+				mizCopyExpFrm(f);
+			}
+		}
+		MizUnivFrm(__, __, quantified, scope, __): {
+			env.boundVarNbr ::= env.boundVarNbr + 1;
+			mizSetBoundVar(env, env.boundVarNbr, quantified);
+			res = mizNewUniv(mizCopyExpTyp(quantified), mizExpandAtomicAsFalse(pre, scope));
+			env.boundVarNbr ::= env.boundVarNbr - 1;
+			res;
+		}
+		default: mizCopyExpFrm(f);
+	}
+}
+
+// ---------------- CreateInference ----------------
+// Negative Qual literals ¬(x is T-with-attrs) split into: ¬(x is T-bare) OR
+// one positive counter-attribute qualification per lower-cluster attribute.
+// The struct-type branch (aggregate field mismatch) needs ReconSelectTrm and
+// arrives with the equalizer support. // TODO(M1): struct Qual split.
+mizCreateInference(pre : MizPre, normalForm : MizPreInst) -> void {
+	env = pre.env;
+	z = ref 0;
+	zCount = ref sizeVector(normalForm.evals);
+	while(\ -> ^z < ^zCount, \ -> {
+		this : MizNatFunc = getVectorUnsafe(normalForm.evals, ^z);
+		lQual : Vector<MizFrm> = makeVector(4);
+		lEval = mizCopyNatFunc(this);
+		fori(0, sizeVector(pre.basic) - 1, \i -> {
+			if (mizNatHasInDom(this, i) && mizNatValue(this, i) == 0
+				&& mizFrmSort(getVectorUnsafe(pre.basic, i)) == ikFrmQual) {
+				mizNatDeleteElem(lEval, i);
+				pushVector(lQual, getVectorUnsafe(pre.basic, i));
+			}
+		});
+		if (sizeVector(lQual) > 0) {
+			lNormalForm = mizPreInstSingle(mizCopyNatFunc(lEval));
+			iterVector(lQual, \lFrm -> {
+				qf = mizAsQualFrmP(lFrm);
+				lSubject = mizCopyTrm(qf.trm);
+				lQualification = mizCopyTyp(qf.typ);
+				lQualification.lower ::= mizNewEmptyCluster();
+				lQualification.upper ::= mizNewEmptyCluster();
+				lQualified = mizNewBasic(pre,
+					mizNewQualFrm(mizCopyTrm(lSubject), mizCopyTyp(lQualification)));
+				lEvalList = mizPreInstBottom();
+				iterVector(qf.typ.lower.items, \attr -> {
+					lQualTyp = mizCopyTyp(lQualification);
+					ca = mizConstr(env, coAttribute, attr.attrNr);
+					lClusterPtr = switch (ca.typ) {
+						Some(ct): mizInstCluster(env, ct.upper, attr.args);
+						None(): mizNewEmptyCluster();
+					}
+					counterNeg = if (attr.neg == 0) 1 else 0;
+					mizAttrCollInsert(env, lClusterPtr,
+						MizAttr(counterNeg, attr.attrNr, mizCopyTrmList(attr.args), false, 0));
+					// CollectConstInCluster — identify hook pending
+					lQualTyp.lower ::= lClusterPtr;
+					lQualTyp.upper ::= mizCopyCluster(lClusterPtr);
+					llEval = mizInitNatFunc(2);
+					mizNatAssign(llEval,
+						mizNewBasic(pre, mizNewQualFrm(mizCopyTrm(lSubject), lQualTyp)), 1);
+					mizPreInstInsertAndAbsorb(lEvalList, llEval);
+				});
+				lNegBas = mizInitNatFunc(2);
+				mizNatAssign(lNegBas, lQualified, 0);
+				lEvalList1 = mizPreInstSingle(lNegBas);
+				// TODO(M1): struct-type aggregate split (ReconSelectTrm)
+				mizPreInstUnionWith(pre, lEvalList, lEvalList1);
+				mizPreInstJoinWith(pre, lNormalForm, lEvalList);
+			});
+			removeVector(normalForm.evals, ^z);
+			zCount := ^zCount - 1;
+			iterVector(lNormalForm.evals, \e -> pushVector(normalForm.evals, e));
+		} else {
+			z := ^z + 1;
+		}
+	});
+}
+
+mizAsQualFrmP(f : MizFrm) -> MizQualFrm {
+	switch (f) {
+		MizQualFrm(__, __, __): f;
+		default: { mizRunTimeError(2910); MizQualFrm(MizBaseTrm(ikError), mizNewIncorTyp(), 0); }
+	}
+}
+
+// ---------------- PreCheck ----------------
+
+mizPreCheck(pre : MizPre, inference : Vector<MizFrm>) -> MizPreInst {
+	env = pre.env;
+	pre.constBase ::= env.fixedVarNbr;
+
+	// definitional expansions (hook), then ellipsis expansion (TODO(M1))
+	env.boundVarNbr ::= 0;
+	lInference = mapVector(inference, \g -> mizExpandAtomicAsTrue(pre, g));
+
+	lChkFrm = ref mizNewVerum();
+	iterVector(lInference, \g ->
+		lChkFrm := mizNewConj(^lChkFrm, mizDistributeQuantifiers(pre, g)));
+
+	// hooks for skolemization by constants
+	pre.setVarInTrm ::= \t -> mizSetConstInTrm(pre, t);
+	pre.newVariable ::= \p, typ -> mizNewConst(p, typ);
+
+	body = mizRemoveIntQuantifier(pre, ^lChkFrm);
+
+	env.boundVarNbr ::= 0;
+	pre.collectConst(body);
+
+	pre.constBase ::= env.fixedVarNbr;
+	clearVector(pre.basic);
+	pre.trivialError ::= false;
+
+	normalForm = mizNormalizeAsTrue(pre, body);
+	if (normalForm.top) {
+		pre.trivialError ::= true; // a disjunct with no literals: nothing to refute
+		normalForm;
+	} else {
+		mizCreateInference(pre, normalForm);
+		normalForm;
+	}
+}
