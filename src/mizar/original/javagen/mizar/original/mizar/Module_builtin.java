@@ -9,7 +9,9 @@ import com.area9innovation.flow.*;
 final public class Module_builtin {
 	public static int g_rqAny;
 	public static int g_rqBelongsTo;
+	public static int g_rqComplex;
 	public static int g_rqDiv;
+	public static int g_rqDivides;
 	public static int g_rqElement;
 	public static int g_rqEmpty;
 	public static int g_rqEmptySet;
@@ -43,7 +45,9 @@ final public class Module_builtin {
 	public static void init() {
 		g_rqAny=1;
 		g_rqBelongsTo=4;
+		g_rqComplex=31;
 		g_rqDiv=35;
+		g_rqDivides=37;
 		g_rqElement=7;
 		g_rqEmpty=5;
 		g_rqEmptySet=6;

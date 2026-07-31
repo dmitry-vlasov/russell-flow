@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785512695556
+// timestamp: 1785524849111
 
 package mizar.original.mizar;
 
@@ -19,7 +19,7 @@ public class Struct_MizWithin extends Struct implements Field_boundVarNbr<Intege
 	public Integer get_boundVarNbr() { return f_boundVarNbr; }
 	public void set_boundVarNbr(Integer value) { f_boundVarNbr = value; }
 
-	public int getTypeId() { return 77; }
+	public int getTypeId() { return 79; }
 	public String getTypeName() { return "MizWithin"; }
 
 	private static final String[] field_names = new String[] {
@@ -48,7 +48,7 @@ public class Struct_MizWithin extends Struct implements Field_boundVarNbr<Intege
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 77) return 77-tmp;
+		if (tmp != 79) return 79-tmp;
 		Struct_MizWithin other = (Struct_MizWithin)other_gen;
 		tmp = FlowRuntime.compareByValue(f_p, other.f_p);
 		if (tmp != 0) return tmp;

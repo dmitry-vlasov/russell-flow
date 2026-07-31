@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785512695557
+// timestamp: 1785524849111
 
 package mizar.original.mizar;
 
@@ -19,7 +19,7 @@ public class Struct_Quadruple extends Struct {
 		f_fourth = a_fourth;
 	}
 
-	public int getTypeId() { return 86; }
+	public int getTypeId() { return 88; }
 	public String getTypeName() { return "Quadruple"; }
 
 	private static final String[] field_names = new String[] {
@@ -49,7 +49,7 @@ public class Struct_Quadruple extends Struct {
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 86) return 86-tmp;
+		if (tmp != 88) return 88-tmp;
 		Struct_Quadruple other = (Struct_Quadruple)other_gen;
 		tmp = FlowRuntime.compareByValue(f_first, other.f_first);
 		if (tmp != 0) return tmp;

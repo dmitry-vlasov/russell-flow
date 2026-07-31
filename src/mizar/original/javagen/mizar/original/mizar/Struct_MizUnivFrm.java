@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785512695556
+// timestamp: 1785524849110
 
 package mizar.original.mizar;
 
@@ -25,7 +25,7 @@ public class Struct_MizUnivFrm extends Struct implements Field_sort<Integer>, Fi
 	public Struct get_scope() { return f_scope; }
 	public void set_scope(Struct value) { f_scope = value; }
 
-	public int getTypeId() { return 74; }
+	public int getTypeId() { return 76; }
 	public String getTypeName() { return "MizUnivFrm"; }
 
 	private static final String[] field_names = new String[] {
@@ -56,7 +56,7 @@ public class Struct_MizUnivFrm extends Struct implements Field_sort<Integer>, Fi
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 74) return 74-tmp;
+		if (tmp != 76) return 76-tmp;
 		Struct_MizUnivFrm other = (Struct_MizUnivFrm)other_gen;
 		if (f_sort != other.f_sort)
 			return (f_sort > other.f_sort) ? 1 : -1;

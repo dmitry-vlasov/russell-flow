@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785512695558
+// timestamp: 1785524849112
 
 package mizar.original.mizar;
 
@@ -13,7 +13,7 @@ public class Struct_VerboseOutput extends Struct {
 		f_fn = a_fn;
 	}
 
-	public int getTypeId() { return 93; }
+	public int getTypeId() { return 95; }
 	public String getTypeName() { return "VerboseOutput"; }
 
 	private static final String[] field_names = new String[] {
@@ -40,7 +40,7 @@ public class Struct_VerboseOutput extends Struct {
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 93) return 93-tmp;
+		if (tmp != 95) return 95-tmp;
 		Struct_VerboseOutput other = (Struct_VerboseOutput)other_gen;
 		tmp = FlowRuntime.compareByValue(f_fn, other.f_fn);
 		return tmp;

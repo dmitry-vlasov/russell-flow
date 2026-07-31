@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785511906000
+// timestamp: 1785514251000
 
 package mizar.original.mizar;
 
@@ -71,13 +71,13 @@ final public class Module_prep {
 		final Struct l0_gsymswitch0 = ((Struct)Module_vector.f_getVectorDef((ap).f_labeled, anr, SingletonStructs.str_None));
 		Struct l1__tmp = l0_gsymswitch0;
 		switch (l1__tmp.getTypeId()) {
-		case 88/*Some*/: {
+		case 90/*Some*/: {
 			final Struct_Some l2__tmp = (Struct_Some)l1__tmp;
 			final Object l3_f = l2__tmp.f_value;
 			final Struct l4_f = ((Struct)(l2__tmp).f_value);
 			return (new Struct_Some(l4_f));
 		}
-		case 80/*None*/: {
+		case 82/*None*/: {
 			return ((Struct)Module_vector.f_getVectorDef((ap).f_permLabeled, anr, SingletonStructs.str_None));
 		}
 		default:
@@ -101,14 +101,14 @@ final public class Module_prep {
 					final Struct l7_gsymswitch3 = (ap).f_prev;
 					Struct l8__tmp = l7_gsymswitch3;
 					switch (l8__tmp.getTypeId()) {
-					case 88/*Some*/: {
+					case 90/*Some*/: {
 						final Struct_Some l9__tmp = (Struct_Some)l8__tmp;
 						final Object l10_pf = l9__tmp.f_value;
 						final Struct l11_pf = ((Struct)(l9__tmp).f_value);
 						Module_vector.f_pushVector(l6_premises, Wrappers.w_mizCopyFrm.invoke(l11_pf));
 						break;
 					}
-					case 80/*None*/: {
+					case 82/*None*/: {
 						break;
 					}
 					default:
@@ -137,14 +137,14 @@ final public class Module_prep {
 							final Struct l21_gsymswitch5 = Module_tree.f_lookupTree((l17_p).f_theorems, Module_prep.f_thKey(l20_kind, l18_art, l17_nr));
 							Struct l22__tmp = l21_gsymswitch5;
 							switch (l22__tmp.getTypeId()) {
-							case 88/*Some*/: {
+							case 90/*Some*/: {
 								final Struct_Some l23__tmp = (Struct_Some)l22__tmp;
 								final Object l24_f = l23__tmp.f_value;
 								final Struct l25_f = ((Struct)(l23__tmp).f_value);
 								Module_vector.f_pushVector(l6_premises, Wrappers.w_mizCopyFrm.invoke(l25_f));
 								break;
 							}
-							case 80/*None*/: {
+							case 82/*None*/: {
 								l12_ok.value = ((Boolean)false);
 								break;
 							}
@@ -155,14 +155,14 @@ final public class Module_prep {
 							final Struct l26_gsymswitch4 = Module_prep.f_mizGetLabeled(l17_p, l17_nr);
 							Struct l27__tmp = l26_gsymswitch4;
 							switch (l27__tmp.getTypeId()) {
-							case 88/*Some*/: {
+							case 90/*Some*/: {
 								final Struct_Some l28__tmp = (Struct_Some)l27__tmp;
 								final Object l29_f = l28__tmp.f_value;
 								final Struct l30_f = ((Struct)(l28__tmp).f_value);
 								Module_vector.f_pushVector(l6_premises, Wrappers.w_mizCopyFrm.invoke(l30_f));
 								break;
 							}
-							case 80/*None*/: {
+							case 82/*None*/: {
 								l12_ok.value = ((Boolean)false);
 								break;
 							}
@@ -195,87 +195,93 @@ final public class Module_prep {
 						Module_vector.f_iterVector(l6_premises, ((Func1<Object,Object>)(Func1)l22_$21));
 					} else {
 					}
+					final double l23_t0chk = Native.timestamp();
 					Module_checker.f_mizInferenceChecker((ap).f_chk, l6_premises);
+					final double l24_dtchk = (Native.timestamp()-l23_t0chk);
+					if (((l24_dtchk>200.0)&&(Module_url_parameter.f_getUrlParameterDef("trace", "")).equals("2"))) {
+						Module_runtime.f_println((((((("SLOW "+Module_string.f_i2s(l4_line))+":")+Module_string.f_i2s(l5_col))+" ")+Module_string.f_d2s(l24_dtchk))+"ms"));
+					} else {
+					}
 					((Field_debug)l20_ck).set_debug(false);
 					if ((Module_mobjects.f_mizSeqCount(((ap).f_chk).f_chErrNr)==0)) {
-						final Struct_MizPrepStats l23_st2 = (ap).f_stats;
-						((Field_accepted)l23_st2).set_accepted(((l23_st2).f_accepted+1));
+						final Struct_MizPrepStats l25_st2 = (ap).f_stats;
+						((Field_accepted)l25_st2).set_accepted(((l25_st2).f_accepted+1));
 						return null;
 					} else {
-						final Struct_MizPrepStats l24_st3 = (ap).f_stats;
-						((Field_failed)l24_st3).set_failed(((l24_st3).f_failed+1));
-						final Object[] l27_$26 = Native.enumFromTo(0, (Module_mobjects.f_mizSeqCount(((ap).f_chk).f_chErrNr)-1));
-						final Struct_MizPrep l29_p = ap;
-						final Func2<String,String, Integer> l28_$25 = (Func2<String, String, Integer>)(String aacc, Integer ai) -> {
-							return ((aacc+" ")+Module_string.f_i2s(Module_mobjects.f_mizSeqValue(((l29_p).f_chk).f_chErrNr, ((int)ai))));
+						final Struct_MizPrepStats l26_st3 = (ap).f_stats;
+						((Field_failed)l26_st3).set_failed(((l26_st3).f_failed+1));
+						final Object[] l29_$28 = Native.enumFromTo(0, (Module_mobjects.f_mizSeqCount(((ap).f_chk).f_chErrNr)-1));
+						final Struct_MizPrep l31_p = ap;
+						final Func2<String,String, Integer> l30_$27 = (Func2<String, String, Integer>)(String aacc, Integer ai) -> {
+							return ((aacc+" ")+Module_string.f_i2s(Module_mobjects.f_mizSeqValue(((l31_p).f_chk).f_chErrNr, ((int)ai))));
 						};
-						final String l30_errs = ((String)Native.fold(l27_$26, "", ((Func2<Object,Object, Object>)(Func2)l28_$25)));
-						return Module_vector.f_pushVector(((ap).f_stats).f_failures, (((Module_string.f_i2s(l4_line)+":")+Module_string.f_i2s(l5_col))+l30_errs));
+						final String l32_errs = ((String)Native.fold(l29_$28, "", ((Func2<Object,Object, Object>)(Func2)l30_$27)));
+						return Module_vector.f_pushVector(((ap).f_stats).f_failures, (((Module_string.f_i2s(l4_line)+":")+Module_string.f_i2s(l5_col))+l32_errs));
 					}
 				} else {
-					final Struct_MizPrepStats l31_st4 = (ap).f_stats;
-					((Field_failed)l31_st4).set_failed(((l31_st4).f_failed+1));
+					final Struct_MizPrepStats l33_st4 = (ap).f_stats;
+					((Field_failed)l33_st4).set_failed(((l33_st4).f_failed+1));
 					return Module_vector.f_pushVector(((ap).f_stats).f_failures, (((Module_string.f_i2s(l4_line)+":")+Module_string.f_i2s(l5_col))+" unresolved-ref"));
 				}
 			} else {
 				if ((l2_name).equals("From")) {
-					final int l32_artF = Module_xml_parser.f_mizXmlIntAttrDef(l1_x, "articlenr", 0);
-					final int l33_nrF = Module_xml_parser.f_mizXmlIntAttrDef(l1_x, "nr", 0);
-					final int l34_lineF = Module_xml_parser.f_mizXmlIntAttrDef(l1_x, "line", aposLine);
-					final int l35_colF = Module_xml_parser.f_mizXmlIntAttrDef(l1_x, "col", 0);
-					final Reference<Object[]> l36_snts = ((Reference<Object[]>)(new Reference((new Object[] { Wrappers.w_mizCopyFrm.invoke(aclaim) }))));
-					final Reference<Boolean> l37_okF = ((Reference<Boolean>)(new Reference(true)));
+					final int l34_artF = Module_xml_parser.f_mizXmlIntAttrDef(l1_x, "articlenr", 0);
+					final int l35_nrF = Module_xml_parser.f_mizXmlIntAttrDef(l1_x, "nr", 0);
+					final int l36_lineF = Module_xml_parser.f_mizXmlIntAttrDef(l1_x, "line", aposLine);
+					final int l37_colF = Module_xml_parser.f_mizXmlIntAttrDef(l1_x, "col", 0);
+					final Reference<Object[]> l38_snts = ((Reference<Object[]>)(new Reference((new Object[] { Wrappers.w_mizCopyFrm.invoke(aclaim) }))));
+					final Reference<Boolean> l39_okF = ((Reference<Boolean>)(new Reference(true)));
 					Module_xml_parser.f_mizXmlNextElementState(l1_x);
-					final Func0<Boolean> l40_$38 = (Func0<Boolean>)() -> {
+					final Func0<Boolean> l42_$40 = (Func0<Boolean>)() -> {
 						return ((l1_x).f_nState==Module_xml_parser.g_MizEStart);
 					};
-					final Struct_MizPrep l42_p = ap;
-					final Func0<Object> l41_$39 = (Func0<Object>)() -> {
+					final Struct_MizPrep l44_p = ap;
+					final Func0<Object> l43_$41 = (Func0<Object>)() -> {
 						if (((l1_x).f_nElName).equals("Ref")) {
-							final int l42_nr2 = Module_xml_parser.f_mizXmlIntAttrDef(l1_x, "nr", 0);
+							final int l44_nr2 = Module_xml_parser.f_mizXmlIntAttrDef(l1_x, "nr", 0);
 							if (Module_xml_parser.f_mizXmlHasAttr(l1_x, "articlenr")) {
-								final int l43_art2 = Module_xml_parser.f_mizXmlIntAttr(l1_x, "articlenr");
-								final String l44_kindS2 = Module_xml_parser.f_mizXmlAttr(l1_x, "kind");
-								int l45_kind2;
-								if ((l44_kindS2).equals("T")) {
-									l45_kind2=Module_prep.g_kindT;
+								final int l45_art2 = Module_xml_parser.f_mizXmlIntAttr(l1_x, "articlenr");
+								final String l46_kindS2 = Module_xml_parser.f_mizXmlAttr(l1_x, "kind");
+								int l47_kind2;
+								if ((l46_kindS2).equals("T")) {
+									l47_kind2=Module_prep.g_kindT;
 								} else {
-									l45_kind2=Module_prep.g_kindD;
+									l47_kind2=Module_prep.g_kindD;
 								}
-								final Struct l46_gsymswitch2 = Module_tree.f_lookupTree((l42_p).f_theorems, Module_prep.f_thKey(l45_kind2, l43_art2, l42_nr2));
-								Struct l47__tmp = l46_gsymswitch2;
-								switch (l47__tmp.getTypeId()) {
-								case 88/*Some*/: {
-									final Struct_Some l48__tmp = (Struct_Some)l47__tmp;
-									final Object l49_f = l48__tmp.f_value;
-									final Struct l50_f = ((Struct)(l48__tmp).f_value);
-									l36_snts.value = Module_array.f_arrayPush(l36_snts.value, Wrappers.w_mizCopyFrm.invoke(l50_f));
+								final Struct l48_gsymswitch2 = Module_tree.f_lookupTree((l44_p).f_theorems, Module_prep.f_thKey(l47_kind2, l45_art2, l44_nr2));
+								Struct l49__tmp = l48_gsymswitch2;
+								switch (l49__tmp.getTypeId()) {
+								case 90/*Some*/: {
+									final Struct_Some l50__tmp = (Struct_Some)l49__tmp;
+									final Object l51_f = l50__tmp.f_value;
+									final Struct l52_f = ((Struct)(l50__tmp).f_value);
+									l38_snts.value = Module_array.f_arrayPush(l38_snts.value, Wrappers.w_mizCopyFrm.invoke(l52_f));
 									break;
 								}
-								case 80/*None*/: {
-									l37_okF.value = ((Boolean)false);
+								case 82/*None*/: {
+									l39_okF.value = ((Boolean)false);
 									break;
 								}
 								default:
-									throw new RuntimeException("Unexpected struct in switch: "+l47__tmp.getTypeName());
+									throw new RuntimeException("Unexpected struct in switch: "+l49__tmp.getTypeName());
 								}
 							} else {
-								final Struct l51_gsymswitch1 = Module_prep.f_mizGetLabeled(l42_p, l42_nr2);
-								Struct l52__tmp = l51_gsymswitch1;
-								switch (l52__tmp.getTypeId()) {
-								case 88/*Some*/: {
-									final Struct_Some l53__tmp = (Struct_Some)l52__tmp;
-									final Object l54_f = l53__tmp.f_value;
-									final Struct l55_f = ((Struct)(l53__tmp).f_value);
-									l36_snts.value = Module_array.f_arrayPush(l36_snts.value, Wrappers.w_mizCopyFrm.invoke(l55_f));
+								final Struct l53_gsymswitch1 = Module_prep.f_mizGetLabeled(l44_p, l44_nr2);
+								Struct l54__tmp = l53_gsymswitch1;
+								switch (l54__tmp.getTypeId()) {
+								case 90/*Some*/: {
+									final Struct_Some l55__tmp = (Struct_Some)l54__tmp;
+									final Object l56_f = l55__tmp.f_value;
+									final Struct l57_f = ((Struct)(l55__tmp).f_value);
+									l38_snts.value = Module_array.f_arrayPush(l38_snts.value, Wrappers.w_mizCopyFrm.invoke(l57_f));
 									break;
 								}
-								case 80/*None*/: {
-									l37_okF.value = ((Boolean)false);
+								case 82/*None*/: {
+									l39_okF.value = ((Boolean)false);
 									break;
 								}
 								default:
-									throw new RuntimeException("Unexpected struct in switch: "+l52__tmp.getTypeName());
+									throw new RuntimeException("Unexpected struct in switch: "+l54__tmp.getTypeName());
 								}
 							}
 							return Module_xml_parser.f_mizXmlSkipElement(l1_x);
@@ -283,50 +289,50 @@ final public class Module_prep {
 							return Module_xml_parser.f_mizXmlSkipElement(l1_x);
 						}
 					};
-					Module_loop.f_while(l40_$38, l41_$39);
+					Module_loop.f_while(l42_$40, l43_$41);
 					Module_xml_parser.f_mizXmlNextElementState(l1_x);
-					final Struct_MizPrepStats l43_st5 = (ap).f_stats;
-					((Field_checked)l43_st5).set_checked(((l43_st5).f_checked+1));
-					final Struct l44_schemeM = Module_schemes.f_mizSchemeFind((ap).f_schemes, l32_artF, l33_nrF);
-					Struct_Pair l45_errPair;
-					if (((boolean)l37_okF.value)) {
-						Struct l46__tmp = l44_schemeM;
-						switch (l46__tmp.getTypeId()) {
-						case 88/*Some*/: {
-							final Struct_Some l47__tmp = (Struct_Some)l46__tmp;
-							final Object l48_sch = l47__tmp.f_value;
-							final Struct_MizSchemeDef l49_sch = ((Struct_MizSchemeDef)(l47__tmp).f_value);
-							l45_errPair=Module_schemes.f_mizSchematizeErr(((ap).f_chk).f_env, l49_sch, l36_snts.value);
+					final Struct_MizPrepStats l45_st5 = (ap).f_stats;
+					((Field_checked)l45_st5).set_checked(((l45_st5).f_checked+1));
+					final Struct l46_schemeM = Module_schemes.f_mizSchemeFind((ap).f_schemes, l34_artF, l35_nrF);
+					Struct_Pair l47_errPair;
+					if (((boolean)l39_okF.value)) {
+						Struct l48__tmp = l46_schemeM;
+						switch (l48__tmp.getTypeId()) {
+						case 90/*Some*/: {
+							final Struct_Some l49__tmp = (Struct_Some)l48__tmp;
+							final Object l50_sch = l49__tmp.f_value;
+							final Struct_MizSchemeDef l51_sch = ((Struct_MizSchemeDef)(l49__tmp).f_value);
+							l47_errPair=Module_schemes.f_mizSchematizeErr(((ap).f_chk).f_env, l51_sch, l38_snts.value);
 							break;
 						}
-						case 80/*None*/: {
-							l45_errPair=(new Struct_Pair((-1), (-1)));
+						case 82/*None*/: {
+							l47_errPair=(new Struct_Pair((-1), (-1)));
 							break;
 						}
 						default:
-							throw new RuntimeException("Unexpected struct in switch: "+l46__tmp.getTypeName());
+							throw new RuntimeException("Unexpected struct in switch: "+l48__tmp.getTypeName());
 						}
 					} else {
-						l45_errPair=(new Struct_Pair((-2), (-1)));
+						l47_errPair=(new Struct_Pair((-2), (-1)));
 					}
-					if ((((int)(l45_errPair).f_first)==0)) {
-						final Struct_MizPrepStats l50_st5a = (ap).f_stats;
-						((Field_accepted)l50_st5a).set_accepted(((l50_st5a).f_accepted+1));
+					if ((((int)(l47_errPair).f_first)==0)) {
+						final Struct_MizPrepStats l52_st5a = (ap).f_stats;
+						((Field_accepted)l52_st5a).set_accepted(((l52_st5a).f_accepted+1));
 						return null;
 					} else {
-						final Struct_MizPrepStats l51_st5f = (ap).f_stats;
-						((Field_failed)l51_st5f).set_failed(((l51_st5f).f_failed+1));
-						String l52_why;
-						if ((((int)(l45_errPair).f_first)==(-2))) {
-							l52_why=" from-unresolved-ref";
+						final Struct_MizPrepStats l53_st5f = (ap).f_stats;
+						((Field_failed)l53_st5f).set_failed(((l53_st5f).f_failed+1));
+						String l54_why;
+						if ((((int)(l47_errPair).f_first)==(-2))) {
+							l54_why=" from-unresolved-ref";
 						} else {
-							if ((((int)(l45_errPair).f_first)==(-1))) {
-								l52_why=" from-missing-scheme";
+							if ((((int)(l47_errPair).f_first)==(-1))) {
+								l54_why=" from-missing-scheme";
 							} else {
-								l52_why=(((" from-mismatch err="+Module_string.f_i2s(((int)(l45_errPair).f_first)))+" snt=")+Module_string.f_i2s(((int)(l45_errPair).f_second)));
+								l54_why=(((" from-mismatch err="+Module_string.f_i2s(((int)(l47_errPair).f_first)))+" snt=")+Module_string.f_i2s(((int)(l47_errPair).f_second)));
 							}
 						}
-						return Module_vector.f_pushVector(((ap).f_stats).f_failures, (((Module_string.f_i2s(l34_lineF)+":")+Module_string.f_i2s(l35_colF))+l52_why));
+						return Module_vector.f_pushVector(((ap).f_stats).f_failures, (((Module_string.f_i2s(l36_lineF)+":")+Module_string.f_i2s(l37_colF))+l54_why));
 					}
 				} else {
 					if (((l2_name).equals("Proof")||(l2_name).equals("PerCasesReasoning"))) {
@@ -335,8 +341,8 @@ final public class Module_prep {
 						if ((l2_name).equals("SkippedProof")) {
 							return Module_xml_parser.f_mizXmlSkipElement(l1_x);
 						} else {
-							final Struct_MizPrepStats l53_st6 = (ap).f_stats;
-							((Field_skippedBlocks)l53_st6).set_skippedBlocks(((l53_st6).f_skippedBlocks+1));
+							final Struct_MizPrepStats l55_st6 = (ap).f_stats;
+							((Field_skippedBlocks)l55_st6).set_skippedBlocks(((l55_st6).f_skippedBlocks+1));
 							return Module_xml_parser.f_mizXmlSkipElement(l1_x);
 						}
 					}
@@ -977,7 +983,7 @@ final public class Module_prep {
 														final Struct l68_gsymswitch9 = (l6_p).f_lastBlockThesis;
 														Struct l69__tmp = l68_gsymswitch9;
 														switch (l69__tmp.getTypeId()) {
-														case 88/*Some*/: {
+														case 90/*Some*/: {
 															final Struct_Some l70__tmp = (Struct_Some)l69__tmp;
 															final Object l71_th = l70__tmp.f_value;
 															final Struct l72_th = ((Struct)(l70__tmp).f_value);
@@ -988,7 +994,7 @@ final public class Module_prep {
 															((Field_prev)l6_p).set_prev((new Struct_Some(l72_th)));
 															break;
 														}
-														case 80/*None*/: {
+														case 82/*None*/: {
 															break;
 														}
 														default:
@@ -1063,7 +1069,7 @@ final public class Module_prep {
 																								final Struct l87_gsymswitch8 = Module_definientia.f_mizEqualsExpansionPub(((l6_p).f_chk).f_env, l86_d);
 																								Struct l88__tmp = l87_gsymswitch8;
 																								switch (l88__tmp.getTypeId()) {
-																								case 88/*Some*/: {
+																								case 90/*Some*/: {
 																									final Struct_Some l89__tmp = (Struct_Some)l88__tmp;
 																									final Object l90_ed = l89__tmp.f_value;
 																									final Struct_MizEqualsDef l91_ed = ((Struct_MizEqualsDef)(l89__tmp).f_value);
@@ -1073,7 +1079,7 @@ final public class Module_prep {
 																									((Field_equalsBy)l94_df).set_equalsBy(Module_tree.f_setTree((l94_df).f_equalsBy, l92_key, Module_array.f_arrayPush(l93_cur, l91_ed)));
 																									return null;
 																								}
-																								case 80/*None*/: {
+																								case 82/*None*/: {
 																									return null;
 																								}
 																								default:
@@ -1179,7 +1185,7 @@ final public class Module_prep {
 																												final Struct l125_gsymswitch7 = (l6_p).f_lastBlockThesis;
 																												Struct l126__tmp = l125_gsymswitch7;
 																												switch (l126__tmp.getTypeId()) {
-																												case 88/*Some*/: {
+																												case 90/*Some*/: {
 																													final Struct_Some l127__tmp = (Struct_Some)l126__tmp;
 																													final Object l128_thP = l127__tmp.f_value;
 																													final Struct l129_thP = ((Struct)(l127__tmp).f_value);
@@ -1190,7 +1196,7 @@ final public class Module_prep {
 																													((Field_prev)l6_p).set_prev((new Struct_Some(l129_thP)));
 																													break;
 																												}
-																												case 80/*None*/: {
+																												case 82/*None*/: {
 																													break;
 																												}
 																												default:
@@ -1303,13 +1309,13 @@ final public class Module_prep {
 																													final Struct l149_gsymswitch6 = l137_schStmt.value;
 																													Struct l150__tmp = l149_gsymswitch6;
 																													switch (l150__tmp.getTypeId()) {
-																													case 88/*Some*/: {
+																													case 90/*Some*/: {
 																														final Struct_Some l151__tmp = (Struct_Some)l150__tmp;
 																														final Object l152_st = l151__tmp.f_value;
 																														final Struct l153_st = ((Struct)(l151__tmp).f_value);
 																														return Module_vector.f_pushVector(((l6_p).f_schemes).f_items, (new Struct_MizSchemeDef(0, l130_schemeNr, l135_schTypes, Native.concat((new Object[] { l153_st }), l136_schPremises.value), true)));
 																													}
-																													case 80/*None*/: {
+																													case 82/*None*/: {
 																														return null;
 																													}
 																													default:

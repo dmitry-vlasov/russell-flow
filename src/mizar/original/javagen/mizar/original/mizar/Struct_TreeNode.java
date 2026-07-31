@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785512695557
+// timestamp: 1785524849112
 
 package mizar.original.mizar;
 
@@ -21,7 +21,7 @@ public class Struct_TreeNode extends Struct {
 		f_depth = a_depth;
 	}
 
-	public int getTypeId() { return 90; }
+	public int getTypeId() { return 92; }
 	public String getTypeName() { return "TreeNode"; }
 
 	private static final String[] field_names = new String[] {
@@ -52,7 +52,7 @@ public class Struct_TreeNode extends Struct {
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 90) return 90-tmp;
+		if (tmp != 92) return 92-tmp;
 		Struct_TreeNode other = (Struct_TreeNode)other_gen;
 		tmp = FlowRuntime.compareByValue(f_key, other.f_key);
 		if (tmp != 0) return tmp;

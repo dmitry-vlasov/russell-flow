@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785512695551
+// timestamp: 1785524849107
 
 package mizar.original.mizar;
 
@@ -47,7 +47,7 @@ public class Struct_MizPre extends Struct implements Field_constBase<Integer>, F
 	public Func1<Object,Struct> get_collectConst() { return f_collectConst; }
 	public void set_collectConst(Func1<Object,Struct> value) { f_collectConst = value; }
 
-	public int getTypeId() { return 54; }
+	public int getTypeId() { return 56; }
 	public String getTypeName() { return "MizPre"; }
 
 	private static final String[] field_names = new String[] {
@@ -83,7 +83,7 @@ public class Struct_MizPre extends Struct implements Field_constBase<Integer>, F
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 54) return 54-tmp;
+		if (tmp != 56) return 56-tmp;
 		Struct_MizPre other = (Struct_MizPre)other_gen;
 		tmp = f_env.compareTo(other.f_env);
 		if (tmp != 0) return tmp;

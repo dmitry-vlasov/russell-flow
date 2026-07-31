@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785512695555
+// timestamp: 1785524849110
 
 package mizar.original.mizar;
 
@@ -53,7 +53,7 @@ public class Struct_MizUnifier extends Struct implements Field_eqClassNbr<Intege
 	public Boolean get_debug() { return f_debug; }
 	public void set_debug(Boolean value) { f_debug = value; }
 
-	public int getTypeId() { return 72; }
+	public int getTypeId() { return 74; }
 	public String getTypeName() { return "MizUnifier"; }
 
 	private static final String[] field_names = new String[] {
@@ -95,7 +95,7 @@ public class Struct_MizUnifier extends Struct implements Field_eqClassNbr<Intege
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 72) return 72-tmp;
+		if (tmp != 74) return 74-tmp;
 		Struct_MizUnifier other = (Struct_MizUnifier)other_gen;
 		tmp = f_env.compareTo(other.f_env);
 		if (tmp != 0) return tmp;

@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785512692000
+// timestamp: 1785524846000
 
 package mizar.original.mizar;
 
@@ -47,7 +47,7 @@ final public class Module_equalizer {
 		final Func2<Struct,Struct_MizWithin, Struct> l2_$1 = (Func2<Struct, Struct_MizWithin, Struct>)(Struct_MizWithin al3_0, Struct at) -> {
 			Struct l4__tmp = at;
 			switch (l4__tmp.getTypeId()) {
-			case 75/*MizVarTrm*/: {
+			case 77/*MizVarTrm*/: {
 				final Struct_MizVarTrm l5__tmp = (Struct_MizVarTrm)l4__tmp;
 				final int l6_srt = l5__tmp.f_sort;
 				final int l7_varNr = l5__tmp.f_varNr;
@@ -61,13 +61,13 @@ final public class Module_equalizer {
 						final Struct l15_gsymswitch37 = ((Struct)Module_vector.f_getVectorUnsafe((l3_eq_0).f_dTrm, l9_varNr));
 						Struct l16__tmp = l15_gsymswitch37;
 						switch (l16__tmp.getTypeId()) {
-						case 88/*Some*/: {
+						case 90/*Some*/: {
 							final Struct_Some l17__tmp = (Struct_Some)l16__tmp;
 							final Struct l18___ = ((Struct)(l17__tmp).f_value);
 							l14_$13=true;
 							break;
 						}
-						case 80/*None*/: {
+						case 82/*None*/: {
 							l14_$13=false;
 							break;
 						}
@@ -102,7 +102,7 @@ final public class Module_equalizer {
 		boolean l2_live;
 		Struct l3__tmp = l1_gsymswitch42;
 		switch (l3__tmp.getTypeId()) {
-		case 69/*MizTrmNil*/: {
+		case 71/*MizTrmNil*/: {
 			l2_live=false;
 			break;
 		}
@@ -141,7 +141,7 @@ final public class Module_equalizer {
 		boolean l3_liveX;
 		Struct l4__tmp = l2_gsymswitch38;
 		switch (l4__tmp.getTypeId()) {
-		case 69/*MizTrmNil*/: {
+		case 71/*MizTrmNil*/: {
 			l3_liveX=false;
 			break;
 		}
@@ -154,7 +154,7 @@ final public class Module_equalizer {
 		boolean l7_liveY;
 		Struct l8__tmp = l6_gsymswitch39;
 		switch (l8__tmp.getTypeId()) {
-		case 69/*MizTrmNil*/: {
+		case 71/*MizTrmNil*/: {
 			l7_liveY=false;
 			break;
 		}
@@ -170,7 +170,7 @@ final public class Module_equalizer {
 			final Func2<Struct,Struct_MizWithin, Struct> l12_$11 = (Func2<Struct, Struct_MizWithin, Struct>)(Struct_MizWithin al13_0, Struct at) -> {
 				Struct l14__tmp = at;
 				switch (l14__tmp.getTypeId()) {
-				case 75/*MizVarTrm*/: {
+				case 77/*MizVarTrm*/: {
 					final Struct_MizVarTrm l15__tmp = (Struct_MizVarTrm)l14__tmp;
 					final int l16_srt = l15__tmp.f_sort;
 					final int l17_info = l15__tmp.f_trmInfo;
@@ -198,7 +198,7 @@ final public class Module_equalizer {
 					final Struct l23_gsymswitch40 = l16_cur.value;
 					Struct l24__tmp = l23_gsymswitch40;
 					switch (l24__tmp.getTypeId()) {
-					case 69/*MizTrmNil*/: {
+					case 71/*MizTrmNil*/: {
 						l22_$21=false;
 						break;
 					}
@@ -216,7 +216,7 @@ final public class Module_equalizer {
 				final Struct l21_gsymswitch41 = l16_cur.value;
 				Struct l22__tmp = l21_gsymswitch41;
 				switch (l22__tmp.getTypeId()) {
-				case 68/*MizTrmElem*/: {
+				case 70/*MizTrmElem*/: {
 					final Struct_MizTrmElem l23__tmp = (Struct_MizTrmElem)l22__tmp;
 					final Struct l24_trm = l23__tmp.f_trm;
 					final Struct l25_next = l23__tmp.f_next;
@@ -226,7 +226,7 @@ final public class Module_equalizer {
 					l16_cur.value = l27_next;
 					return null;
 				}
-				case 69/*MizTrmNil*/: {
+				case 71/*MizTrmNil*/: {
 					return null;
 				}
 				default:
@@ -275,11 +275,11 @@ final public class Module_equalizer {
 			final Struct_MizAttr l10_sa = ((Struct_MizAttr)Module_vector.f_getVectorUnsafe(((l2_rec).f_superCluster).f_items, ((int)l5_i.value)));
 			final Struct_Pair l11_sp = Module_correl.f_mizAdjustAttr(l0_env, l10_sa);
 			if (((((int)(l11_sp).f_first)==((int)(l1_ap).f_first))&&((l10_sa).f_neg==(l10_aa).f_neg))) {
-				final Struct l12_gsymswitch49 = ((Struct)(l1_ap).f_second);
+				final Struct l12_gsymswitch51 = ((Struct)(l1_ap).f_second);
 				boolean l13_noArgs;
-				Struct l14__tmp = l12_gsymswitch49;
+				Struct l14__tmp = l12_gsymswitch51;
 				switch (l14__tmp.getTypeId()) {
-				case 69/*MizTrmNil*/: {
+				case 71/*MizTrmNil*/: {
 					l13_noArgs=true;
 					break;
 				}
@@ -333,17 +333,17 @@ final public class Module_equalizer {
 	}
 	public static final Struct_MizPreInst f_mizANInstFCluster(Struct_MizEqualizer aeq_0, Struct_MizFCluster afc, int aenr) {
 		final Struct_MizPreInst l0_r = Module_equalizer.f_mizANInstTerm(aeq_0, (afc).f_primaries, (Module_equalizer.f_mizTrmSAt(aeq_0, aenr)).f_term, (afc).f_clusterTerm);
-		final Struct l1_gsymswitch50 = (afc).f_clusterType;
-		Struct l2__tmp = l1_gsymswitch50;
+		final Struct l1_gsymswitch52 = (afc).f_clusterType;
+		Struct l2__tmp = l1_gsymswitch52;
 		switch (l2__tmp.getTypeId()) {
-		case 88/*Some*/: {
+		case 90/*Some*/: {
 			final Struct_Some l3__tmp = (Struct_Some)l2__tmp;
 			final Object l4_ct = l3__tmp.f_value;
 			final Struct_MizTyp l5_ct = ((Struct_MizTyp)(l3__tmp).f_value);
 			Module_equalizer.f_mizANJoinWith(l0_r, Module_equalizer.f_mizANInstType(aeq_0, (afc).f_primaries, aenr, l5_ct));
 			break;
 		}
-		case 80/*None*/: {
+		case 82/*None*/: {
 			break;
 		}
 		default:
@@ -357,49 +357,58 @@ final public class Module_equalizer {
 		final Struct_Pair l2_ap = Module_correl.f_mizAdjustTyp(l0_env, aatyp);
 		final Struct_MizTrmSRec l3_rec = Module_equalizer.f_mizTrmSAt(aeq_0, l1_enr);
 		final Struct_MizPreInst l4_r = Module_prechecker.f_mizPreInstBottom();
-		final Reference<Boolean> l5_stop = ((Reference<Boolean>)(new Reference(false)));
-		final Reference<Integer> l6_i = ((Reference<Integer>)(new Reference(0)));
-		final Func0<Boolean> l9_$7 = (Func0<Boolean>)() -> {
-			return ((Boolean)(!((boolean)l5_stop.value)&&(((int)l6_i.value)<Module_vector.f_sizeVector((l3_rec).f_xTypClass))));
+		final boolean l5_dbgR = (Module_url_parameter.f_getUrlParameterDef("dbg-rus2", "")).equals(Module_string.f_i2s(aenr0));
+		final Reference<Boolean> l6_stop = ((Reference<Boolean>)(new Reference(false)));
+		final Reference<Integer> l7_i = ((Reference<Integer>)(new Reference(0)));
+		final Func0<Boolean> l10_$8 = (Func0<Boolean>)() -> {
+			return ((Boolean)(!((boolean)l6_stop.value)&&(((int)l7_i.value)<Module_vector.f_sizeVector((l3_rec).f_xTypClass))));
 		};
-		final Struct_MizTyp l11_atyp = aatyp;
-		final Struct_MizEqualizer l12_eq_0 = aeq_0;
-		final Struct_Vector l13_prim = aprim;
-		final Func0<Object> l10_$8 = (Func0<Object>)() -> {
-			final Struct_MizTyp l11_xt = ((Struct_MizTyp)Module_vector.f_getVectorUnsafe((l3_rec).f_xTypClass, ((int)l6_i.value)));
-			final Struct_Pair l12_mp = Module_correl.f_mizAdjustTyp(l0_env, l11_xt);
-			if ((((l11_xt).f_sort==(l11_atyp).f_sort)&&(((int)(l12_mp).f_first)==((int)(l2_ap).f_first)))) {
-				final Struct l13_gsymswitch48 = ((Struct)(l2_ap).f_second);
-				boolean l14_noArgs;
-				Struct l15__tmp = l13_gsymswitch48;
-				switch (l15__tmp.getTypeId()) {
-				case 69/*MizTrmNil*/: {
-					l14_noArgs=true;
+		final Struct_MizTyp l12_atyp = aatyp;
+		final Struct_MizEqualizer l13_eq_0 = aeq_0;
+		final Struct_Vector l14_prim = aprim;
+		final Func0<Object> l11_$9 = (Func0<Object>)() -> {
+			final Struct_MizTyp l12_xt = ((Struct_MizTyp)Module_vector.f_getVectorUnsafe((l3_rec).f_xTypClass, ((int)l7_i.value)));
+			final Struct_Pair l13_mp = Module_correl.f_mizAdjustTyp(l0_env, l12_xt);
+			if (l5_dbgR) {
+				Module_runtime.f_println(((((((("    IRT xt.sort="+Module_string.f_i2s((l12_xt).f_sort))+"/")+Module_string.f_i2s((l12_atyp).f_sort))+" nr=")+Module_string.f_i2s(((int)(l13_mp).f_first)))+"/")+Module_string.f_i2s(((int)(l2_ap).f_first))));
+			} else {
+			}
+			if ((((l12_xt).f_sort==(l12_atyp).f_sort)&&(((int)(l13_mp).f_first)==((int)(l2_ap).f_first)))) {
+				final Struct l14_gsymswitch50 = ((Struct)(l2_ap).f_second);
+				boolean l15_noArgs;
+				Struct l16__tmp = l14_gsymswitch50;
+				switch (l16__tmp.getTypeId()) {
+				case 71/*MizTrmNil*/: {
+					l15_noArgs=true;
 					break;
 				}
 				default: {
-					l14_noArgs=false;
+					l15_noArgs=false;
 					break;
 				}
 				}
-				if (l14_noArgs) {
+				if (l15_noArgs) {
 					((Field_top)l4_r).set_top(true);
 					Module_vector.f_clearVector((l4_r).f_evals);
-					l5_stop.value = ((Boolean)true);
+					l6_stop.value = ((Boolean)true);
 				} else {
-					final Struct_MizPreInst l17_z = Module_equalizer.f_mizANJoinArgs(l12_eq_0, l13_prim, ((Struct)(l12_mp).f_second), ((Struct)(l2_ap).f_second));
-					Module_equalizer.f_mizANUnionWith(l4_r, l17_z);
+					final Struct_MizPreInst l18_z = Module_equalizer.f_mizANJoinArgs(l13_eq_0, l14_prim, ((Struct)(l13_mp).f_second), ((Struct)(l2_ap).f_second));
+					Module_equalizer.f_mizANUnionWith(l4_r, l18_z);
 				}
 			} else {
 			}
-			l6_i.value = ((Integer)(((int)l6_i.value)+1));
+			l7_i.value = ((Integer)(((int)l7_i.value)+1));
 			return null;
 		};
-		Module_loop.f_while(l9_$7, l10_$8);
+		Module_loop.f_while(l10_$8, l11_$9);
 		return l4_r;
 	}
 	public static final Struct_MizPreInst f_mizANInstTerm(Struct_MizEqualizer aeq_0, Struct_Vector aprim, Struct aeTrm, Struct aaTrm) {
 		final Struct_MizCorrelEnv l0_env = (aeq_0).f_env;
+		if ((Module_url_parameter.f_getUrlParameterDef("dbg-rus3", "")).equals("2")) {
+			Module_runtime.f_println(((((("       AIT e="+Module_string.f_i2s(Module_correl.f_mizTrmSort(aeTrm)))+"/")+Module_string.f_i2s(Module_equalizer.f_mizTrmInfoOf(aeTrm)))+" a=")+Module_string.f_i2s(Module_correl.f_mizTrmSort(aaTrm))));
+		} else {
+		}
 		final int l1_eSort = Module_correl.f_mizTrmSort(aeTrm);
 		if ((l1_eSort!=Module_lexicon.g_ikTrmEqConst)) {
 			if ((l1_eSort==Module_lexicon.g_ikTrmNumeral)) {
@@ -462,12 +471,82 @@ final public class Module_equalizer {
 			} else {
 				final Struct_Pair l9_ap = Module_equalizer.f_mizANAdjustedArgs(l0_env, aaTrm);
 				final Struct_MizPreInst l10_r = Module_prechecker.f_mizPreInstBottom();
-				final Reference<Struct> l11_cur = ((Reference<Struct>)(new Reference((Module_equalizer.f_mizTrmSAt(aeq_0, aenr)).f_eqClass)));
-				final Func0<Boolean> l14_$12 = (Func0<Boolean>)() -> {
-					final Struct l15_gsymswitch46 = l11_cur.value;
-					Struct l16__tmp = l15_gsymswitch46;
-					switch (l16__tmp.getTypeId()) {
-					case 69/*MizTrmNil*/: {
+				if ((!(Module_url_parameter.f_getUrlParameterDef("dbg-rus3", "")).equals(""))) {
+					final Reference<String> l11_mems3 = ((Reference<String>)(new Reference("")));
+					final Reference<Struct> l12_cur3 = ((Reference<Struct>)(new Reference((Module_equalizer.f_mizTrmSAt(aeq_0, aenr)).f_eqClass)));
+					final Func0<Boolean> l15_$13 = (Func0<Boolean>)() -> {
+						final Struct l16_gsymswitch46 = l12_cur3.value;
+						Struct l17__tmp = l16_gsymswitch46;
+						switch (l17__tmp.getTypeId()) {
+						case 71/*MizTrmNil*/: {
+							return ((Boolean)false);
+						}
+						default: {
+							return ((Boolean)true);
+						}
+						}
+					};
+					final Func0<Object> l16_$14 = (Func0<Object>)() -> {
+						final Struct l17_gsymswitch47 = l12_cur3.value;
+						Struct l18__tmp = l17_gsymswitch47;
+						switch (l18__tmp.getTypeId()) {
+						case 70/*MizTrmElem*/: {
+							final Struct_MizTrmElem l19__tmp = (Struct_MizTrmElem)l18__tmp;
+							final Struct l20_m3 = l19__tmp.f_trm;
+							final Struct l21_n3 = l19__tmp.f_next;
+							final Struct l22_m3 = (l19__tmp).f_trm;
+							final Struct l23_n3 = (l19__tmp).f_next;
+							final String l26_$25 = ((l11_mems3.value+" ")+Module_string.f_i2s(Module_correl.f_mizTrmSort(l22_m3)));
+							String l27_$24;
+							Struct l28__tmp = l22_m3;
+							switch (l28__tmp.getTypeId()) {
+							case 45/*MizFuncTrm*/: {
+								final Struct_MizFuncTrm l29__tmp = (Struct_MizFuncTrm)l28__tmp;
+								final int l30_fn3 = l29__tmp.f_funcNr;
+								final int l31___ = (l29__tmp).f_sort;
+								final int l32_fn3 = (l29__tmp).f_funcNr;
+								final Struct l33___ = (l29__tmp).f_args;
+								final int l34___ = (l29__tmp).f_pattNr;
+								final int l35___ = (l29__tmp).f_trmInfo;
+								l27_$24=(":"+Module_string.f_i2s(l32_fn3));
+								break;
+							}
+							case 77/*MizVarTrm*/: {
+								final Struct_MizVarTrm l29__tmp = (Struct_MizVarTrm)l28__tmp;
+								final int l36_vn3 = l29__tmp.f_varNr;
+								final int l37___ = (l29__tmp).f_sort;
+								final int l38_vn3 = (l29__tmp).f_varNr;
+								final int l39___ = (l29__tmp).f_pattNr;
+								final int l40___ = (l29__tmp).f_trmInfo;
+								l27_$24=("#"+Module_string.f_i2s(l38_vn3));
+								break;
+							}
+							default: {
+								l27_$24="";
+								break;
+							}
+							}
+							l11_mems3.value = (l26_$25+l27_$24);
+							l12_cur3.value = l23_n3;
+							return null;
+						}
+						case 71/*MizTrmNil*/: {
+							return null;
+						}
+						default:
+							throw new RuntimeException("Unexpected struct in switch: "+l18__tmp.getTypeName());
+						}
+					};
+					Module_loop.f_while(l15_$13, l16_$14);
+					Module_runtime.f_println(((((((("      ITC enr="+Module_string.f_i2s(aenr))+" aSort=")+Module_string.f_i2s(l1_aSort))+" aNr=")+Module_string.f_i2s(((int)(l9_ap).f_first)))+" mems:")+l11_mems3.value));
+				} else {
+				}
+				final Reference<Struct> l17_cur = ((Reference<Struct>)(new Reference((Module_equalizer.f_mizTrmSAt(aeq_0, aenr)).f_eqClass)));
+				final Func0<Boolean> l20_$18 = (Func0<Boolean>)() -> {
+					final Struct l21_gsymswitch48 = l17_cur.value;
+					Struct l22__tmp = l21_gsymswitch48;
+					switch (l22__tmp.getTypeId()) {
+					case 71/*MizTrmNil*/: {
 						return ((Boolean)false);
 					}
 					default: {
@@ -475,44 +554,48 @@ final public class Module_equalizer {
 					}
 					}
 				};
-				final Struct_MizEqualizer l16_eq_0 = aeq_0;
-				final Struct_Vector l17_prim = aprim;
-				final Func0<Object> l15_$13 = (Func0<Object>)() -> {
-					final Struct l16_gsymswitch47 = l11_cur.value;
-					Struct l17__tmp = l16_gsymswitch47;
-					switch (l17__tmp.getTypeId()) {
-					case 68/*MizTrmElem*/: {
-						final Struct_MizTrmElem l18__tmp = (Struct_MizTrmElem)l17__tmp;
-						final Struct l19_mem = l18__tmp.f_trm;
-						final Struct l20_next = l18__tmp.f_next;
-						final Struct l21_mem = (l18__tmp).f_trm;
-						final Struct l22_next = (l18__tmp).f_next;
-						if ((Module_correl.f_mizTrmSort(l21_mem)==l1_aSort)) {
-							final Struct_Pair l23_mp = Module_equalizer.f_mizANAdjustedArgs(l0_env, l21_mem);
-							if ((((int)(l23_mp).f_first)==((int)(l9_ap).f_first))) {
-								final Struct_MizPreInst l24_z = Module_equalizer.f_mizANJoinArgs(l16_eq_0, l17_prim, ((Struct)(l23_mp).f_second), ((Struct)(l9_ap).f_second));
-								Module_equalizer.f_mizANUnionWith(l10_r, l24_z);
+				final Struct_MizEqualizer l22_eq_0 = aeq_0;
+				final Struct_Vector l23_prim = aprim;
+				final Func0<Object> l21_$19 = (Func0<Object>)() -> {
+					final Struct l22_gsymswitch49 = l17_cur.value;
+					Struct l23__tmp = l22_gsymswitch49;
+					switch (l23__tmp.getTypeId()) {
+					case 70/*MizTrmElem*/: {
+						final Struct_MizTrmElem l24__tmp = (Struct_MizTrmElem)l23__tmp;
+						final Struct l25_mem = l24__tmp.f_trm;
+						final Struct l26_next = l24__tmp.f_next;
+						final Struct l27_mem = (l24__tmp).f_trm;
+						final Struct l28_next = (l24__tmp).f_next;
+						if ((Module_correl.f_mizTrmSort(l27_mem)==l1_aSort)) {
+							final Struct_Pair l29_mp = Module_equalizer.f_mizANAdjustedArgs(l0_env, l27_mem);
+							if ((((int)(l29_mp).f_first)==((int)(l9_ap).f_first))) {
+								final Struct_MizPreInst l30_z = Module_equalizer.f_mizANJoinArgs(l22_eq_0, l23_prim, ((Struct)(l29_mp).f_second), ((Struct)(l9_ap).f_second));
+								Module_equalizer.f_mizANUnionWith(l10_r, l30_z);
 							} else {
 							}
 						} else {
 						}
-						l11_cur.value = l22_next;
+						l17_cur.value = l28_next;
 						return null;
 					}
-					case 69/*MizTrmNil*/: {
+					case 71/*MizTrmNil*/: {
 						return null;
 					}
 					default:
-						throw new RuntimeException("Unexpected struct in switch: "+l17__tmp.getTypeName());
+						throw new RuntimeException("Unexpected struct in switch: "+l23__tmp.getTypeName());
 					}
 				};
-				Module_loop.f_while(l14_$12, l15_$13);
+				Module_loop.f_while(l20_$18, l21_$19);
 				return l10_r;
 			}
 		}
 	}
 	public static final Struct_MizPreInst f_mizANInstType(Struct_MizEqualizer aeq_0, Struct_Vector aprim, int aenr, Struct_MizTyp aatyp) {
 		final Struct_MizPreInst l0_r = Module_equalizer.f_mizANInstRadixType(aeq_0, aprim, aenr, aatyp);
+		if ((Module_url_parameter.f_getUrlParameterDef("dbg-rus2", "")).equals(Module_string.f_i2s(aenr))) {
+			Module_runtime.f_println(((("     ITY radix -> "+((l0_r).f_top?"top":Module_string.f_i2s(Module_prechecker.f_mizPreInstCount(l0_r))))+" lowerN=")+Module_string.f_i2s(Module_vector.f_sizeVector(((aatyp).f_lower).f_items))));
+		} else {
+		}
 		Module_equalizer.f_mizANJoinWith(l0_r, Module_equalizer.f_mizANInstAttrs(aeq_0, aprim, aenr, (aatyp).f_lower));
 		return l0_r;
 	}
@@ -524,7 +607,7 @@ final public class Module_equalizer {
 			final Struct l6_gsymswitch43 = l2_al.value;
 			Struct l7__tmp = l6_gsymswitch43;
 			switch (l7__tmp.getTypeId()) {
-			case 69/*MizTrmNil*/: {
+			case 71/*MizTrmNil*/: {
 				return ((Boolean)false);
 			}
 			default: {
@@ -538,7 +621,7 @@ final public class Module_equalizer {
 			final Struct l7_gsymswitch44 = l2_al.value;
 			Struct l8__tmp = l7_gsymswitch44;
 			switch (l8__tmp.getTypeId()) {
-			case 68/*MizTrmElem*/: {
+			case 70/*MizTrmElem*/: {
 				final Struct_MizTrmElem l9__tmp = (Struct_MizTrmElem)l8__tmp;
 				final Struct l10_at = l9__tmp.f_trm;
 				final Struct l11_an = l9__tmp.f_next;
@@ -547,7 +630,7 @@ final public class Module_equalizer {
 				final Struct l14_gsymswitch45 = l1_el.value;
 				Struct l15__tmp = l14_gsymswitch45;
 				switch (l15__tmp.getTypeId()) {
-				case 68/*MizTrmElem*/: {
+				case 70/*MizTrmElem*/: {
 					final Struct_MizTrmElem l16__tmp = (Struct_MizTrmElem)l15__tmp;
 					final Struct l17_et = l16__tmp.f_trm;
 					final Struct l18_en = l16__tmp.f_next;
@@ -557,7 +640,7 @@ final public class Module_equalizer {
 					l1_el.value = l20_en;
 					break;
 				}
-				case 69/*MizTrmNil*/: {
+				case 71/*MizTrmNil*/: {
 					break;
 				}
 				default:
@@ -566,7 +649,7 @@ final public class Module_equalizer {
 				l2_al.value = l13_an;
 				return null;
 			}
-			case 69/*MizTrmNil*/: {
+			case 71/*MizTrmNil*/: {
 				return null;
 			}
 			default:
@@ -605,13 +688,13 @@ final public class Module_equalizer {
 								final Struct l14_gsymswitch36 = Module_mobjects.f_mizNatJoinAtom(aa, ab);
 								Struct l15__tmp = l14_gsymswitch36;
 								switch (l15__tmp.getTypeId()) {
-								case 88/*Some*/: {
+								case 90/*Some*/: {
 									final Struct_Some l16__tmp = (Struct_Some)l15__tmp;
 									final Object l17_j = l16__tmp.f_value;
 									final Struct_MizNatFunc l18_j = ((Struct_MizNatFunc)(l16__tmp).f_value);
 									return Module_vector.f_pushVector(l5_tmp, l18_j);
 								}
-								case 80/*None*/: {
+								case 82/*None*/: {
 									return null;
 								}
 								default:
@@ -642,7 +725,7 @@ final public class Module_equalizer {
 				final Reference<Integer> l4_i = ((Reference<Integer>)(new Reference(1)));
 				final Struct_MizEqualizer l8_eq_0 = aeq_0;
 				final Func0<Boolean> l7_$5 = (Func0<Boolean>)() -> {
-					return ((Boolean)((((int)l4_i.value)<=Module_equalizer.f_mizTrmNbr(l8_eq_0))&&((Struct)l3_found.value).getTypeId() == 80));
+					return ((Boolean)((((int)l4_i.value)<=Module_equalizer.f_mizTrmNbr(l8_eq_0))&&((Struct)l3_found.value).getTypeId() == 82));
 				};
 				final Struct_MizEqualizer l10_eq_0 = aeq_0;
 				final Func0<Object> l9_$6 = (Func0<Object>)() -> {
@@ -666,18 +749,18 @@ final public class Module_equalizer {
 				final Reference<Integer> l13_i = ((Reference<Integer>)(new Reference(1)));
 				final Struct_MizEqualizer l17_eq_0 = aeq_0;
 				final Func0<Boolean> l16_$14 = (Func0<Boolean>)() -> {
-					return ((Boolean)((((int)l13_i.value)<=Module_equalizer.f_mizTrmNbr(l17_eq_0))&&((Struct)l12_found.value).getTypeId() == 80));
+					return ((Boolean)((((int)l13_i.value)<=Module_equalizer.f_mizTrmNbr(l17_eq_0))&&((Struct)l12_found.value).getTypeId() == 82));
 				};
 				final Struct_MizEqualizer l19_eq_0 = aeq_0;
 				final Func0<Object> l18_$15 = (Func0<Object>)() -> {
 					final Reference<Struct> l19_cur = ((Reference<Struct>)(new Reference((Module_equalizer.f_mizTrmSAt(l19_eq_0, ((int)l13_i.value))).f_eqClass)));
 					final Func0<Boolean> l22_$20 = (Func0<Boolean>)() -> {
 						boolean l25_$24;
-						if (((Struct)l12_found.value).getTypeId() == 80) {
-							final Struct l26_gsymswitch59 = l19_cur.value;
-							Struct l27__tmp = l26_gsymswitch59;
+						if (((Struct)l12_found.value).getTypeId() == 82) {
+							final Struct l26_gsymswitch61 = l19_cur.value;
+							Struct l27__tmp = l26_gsymswitch61;
 							switch (l27__tmp.getTypeId()) {
-							case 69/*MizTrmNil*/: {
+							case 71/*MizTrmNil*/: {
 								l25_$24=false;
 								break;
 							}
@@ -692,10 +775,10 @@ final public class Module_equalizer {
 						return ((Boolean)l25_$24);
 					};
 					final Func0<Object> l23_$21 = (Func0<Object>)() -> {
-						final Struct l24_gsymswitch60 = l19_cur.value;
-						Struct l25__tmp = l24_gsymswitch60;
+						final Struct l24_gsymswitch62 = l19_cur.value;
+						Struct l25__tmp = l24_gsymswitch62;
 						switch (l25__tmp.getTypeId()) {
-						case 68/*MizTrmElem*/: {
+						case 70/*MizTrmElem*/: {
 							final Struct_MizTrmElem l26__tmp = (Struct_MizTrmElem)l25__tmp;
 							final Struct l27_mem = l26__tmp.f_trm;
 							final Struct l28_next = l26__tmp.f_next;
@@ -704,7 +787,7 @@ final public class Module_equalizer {
 							boolean l31_hit;
 							Struct l32__tmp = l29_mem;
 							switch (l32__tmp.getTypeId()) {
-							case 75/*MizVarTrm*/: {
+							case 77/*MizVarTrm*/: {
 								final Struct_MizVarTrm l33__tmp = (Struct_MizVarTrm)l32__tmp;
 								final int l34_srt = l33__tmp.f_sort;
 								final int l35_varNr = l33__tmp.f_varNr;
@@ -727,7 +810,7 @@ final public class Module_equalizer {
 							l19_cur.value = l30_next;
 							return null;
 						}
-						case 69/*MizTrmNil*/: {
+						case 71/*MizTrmNil*/: {
 							return null;
 						}
 						default:
@@ -747,16 +830,16 @@ final public class Module_equalizer {
 					final Reference<Integer> l22_i = ((Reference<Integer>)(new Reference(1)));
 					final Struct_MizEqualizer l26_eq_0 = aeq_0;
 					final Func0<Boolean> l25_$23 = (Func0<Boolean>)() -> {
-						return ((Boolean)((((int)l22_i.value)<=Module_equalizer.f_mizTrmNbr(l26_eq_0))&&((Struct)l21_found.value).getTypeId() == 80));
+						return ((Boolean)((((int)l22_i.value)<=Module_equalizer.f_mizTrmNbr(l26_eq_0))&&((Struct)l21_found.value).getTypeId() == 82));
 					};
 					final Struct_MizEqualizer l28_eq_0 = aeq_0;
 					final Func0<Object> l27_$24 = (Func0<Object>)() -> {
 						final Struct_MizTrmSRec l28_rec = Module_equalizer.f_mizTrmSAt(l28_eq_0, ((int)l22_i.value));
-						final Struct l29_gsymswitch58 = (l28_rec).f_eqClass;
+						final Struct l29_gsymswitch60 = (l28_rec).f_eqClass;
 						boolean l30_live;
-						Struct l31__tmp = l29_gsymswitch58;
+						Struct l31__tmp = l29_gsymswitch60;
 						switch (l31__tmp.getTypeId()) {
-						case 69/*MizTrmNil*/: {
+						case 71/*MizTrmNil*/: {
 							l30_live=false;
 							break;
 						}
@@ -781,7 +864,7 @@ final public class Module_equalizer {
 						final Reference<Integer> l31_i = ((Reference<Integer>)(new Reference(1)));
 						final Struct_MizEqualizer l35_eq_0 = aeq_0;
 						final Func0<Boolean> l34_$32 = (Func0<Boolean>)() -> {
-							return ((Boolean)((((int)l31_i.value)<=Module_equalizer.f_mizTrmNbr(l35_eq_0))&&((Struct)l30_found.value).getTypeId() == 80));
+							return ((Boolean)((((int)l31_i.value)<=Module_equalizer.f_mizTrmNbr(l35_eq_0))&&((Struct)l30_found.value).getTypeId() == 82));
 						};
 						final Struct_MizEqualizer l37_eq_0 = aeq_0;
 						final Func0<Object> l36_$33 = (Func0<Object>)() -> {
@@ -789,11 +872,11 @@ final public class Module_equalizer {
 							final Reference<Struct> l38_cur = ((Reference<Struct>)(new Reference((l37_rec).f_eqClass)));
 							final Func0<Boolean> l41_$39 = (Func0<Boolean>)() -> {
 								boolean l44_$43;
-								if (((Struct)l30_found.value).getTypeId() == 80) {
-									final Struct l45_gsymswitch54 = l38_cur.value;
-									Struct l46__tmp = l45_gsymswitch54;
+								if (((Struct)l30_found.value).getTypeId() == 82) {
+									final Struct l45_gsymswitch56 = l38_cur.value;
+									Struct l46__tmp = l45_gsymswitch56;
 									switch (l46__tmp.getTypeId()) {
-									case 69/*MizTrmNil*/: {
+									case 71/*MizTrmNil*/: {
 										l44_$43=false;
 										break;
 									}
@@ -808,10 +891,10 @@ final public class Module_equalizer {
 								return ((Boolean)l44_$43);
 							};
 							final Func0<Object> l42_$40 = (Func0<Object>)() -> {
-								final Struct l43_gsymswitch55 = l38_cur.value;
-								Struct l44__tmp = l43_gsymswitch55;
+								final Struct l43_gsymswitch57 = l38_cur.value;
+								Struct l44__tmp = l43_gsymswitch57;
 								switch (l44__tmp.getTypeId()) {
-								case 68/*MizTrmElem*/: {
+								case 70/*MizTrmElem*/: {
 									final Struct_MizTrmElem l45__tmp = (Struct_MizTrmElem)l44__tmp;
 									final Struct l46_mem = l45__tmp.f_trm;
 									final Struct l47_next = l45__tmp.f_next;
@@ -820,11 +903,11 @@ final public class Module_equalizer {
 									if ((Module_correl.f_mizTrmSort(l48_mem)==l0_aSort)) {
 										final Struct_MizFuncTrm l50_mf = Module_equalizer.f_mizEqAsFunc(l48_mem);
 										if (((l50_mf).f_funcNr==(l29_af).f_funcNr)) {
-											final Struct l51_gsymswitch56 = (l50_mf).f_args;
+											final Struct l51_gsymswitch58 = (l50_mf).f_args;
 											boolean l52_noArgs;
-											Struct l53__tmp = l51_gsymswitch56;
+											Struct l53__tmp = l51_gsymswitch58;
 											switch (l53__tmp.getTypeId()) {
-											case 69/*MizTrmNil*/: {
+											case 71/*MizTrmNil*/: {
 												l52_noArgs=true;
 												break;
 											}
@@ -836,10 +919,10 @@ final public class Module_equalizer {
 											if (l52_noArgs) {
 												((Reference<Struct_Some>)(Reference)l30_found).value = (new Struct_Some((l37_rec).f_term));
 											} else {
-												final Struct l55_gsymswitch57 = Module_equalizer.f_mizANLocateTermList(l37_eq_0, (l29_af).f_args);
-												Struct l56__tmp = l55_gsymswitch57;
+												final Struct l55_gsymswitch59 = Module_equalizer.f_mizANLocateTermList(l37_eq_0, (l29_af).f_args);
+												Struct l56__tmp = l55_gsymswitch59;
 												switch (l56__tmp.getTypeId()) {
-												case 88/*Some*/: {
+												case 90/*Some*/: {
 													final Struct_Some l57__tmp = (Struct_Some)l56__tmp;
 													final Object l58_la = l57__tmp.f_value;
 													final Struct l59_la = ((Struct)(l57__tmp).f_value);
@@ -849,7 +932,7 @@ final public class Module_equalizer {
 													}
 													break;
 												}
-												case 80/*None*/: {
+												case 82/*None*/: {
 													break;
 												}
 												default:
@@ -863,7 +946,7 @@ final public class Module_equalizer {
 									l38_cur.value = l49_next;
 									return null;
 								}
-								case 69/*MizTrmNil*/: {
+								case 71/*MizTrmNil*/: {
 									return null;
 								}
 								default:
@@ -890,10 +973,10 @@ final public class Module_equalizer {
 		final Func0<Boolean> l5_$3 = (Func0<Boolean>)() -> {
 			boolean l8_$7;
 			if (((boolean)l1_ok.value)) {
-				final Struct l9_gsymswitch51 = l2_l.value;
-				Struct l10__tmp = l9_gsymswitch51;
+				final Struct l9_gsymswitch53 = l2_l.value;
+				Struct l10__tmp = l9_gsymswitch53;
 				switch (l10__tmp.getTypeId()) {
-				case 69/*MizTrmNil*/: {
+				case 71/*MizTrmNil*/: {
 					l8_$7=false;
 					break;
 				}
@@ -909,26 +992,26 @@ final public class Module_equalizer {
 		};
 		final Struct_MizEqualizer l7_eq_0 = aeq_0;
 		final Func0<Object> l6_$4 = (Func0<Object>)() -> {
-			final Struct l7_gsymswitch52 = l2_l.value;
-			Struct l8__tmp = l7_gsymswitch52;
+			final Struct l7_gsymswitch54 = l2_l.value;
+			Struct l8__tmp = l7_gsymswitch54;
 			switch (l8__tmp.getTypeId()) {
-			case 68/*MizTrmElem*/: {
+			case 70/*MizTrmElem*/: {
 				final Struct_MizTrmElem l9__tmp = (Struct_MizTrmElem)l8__tmp;
 				final Struct l10_t = l9__tmp.f_trm;
 				final Struct l11_next = l9__tmp.f_next;
 				final Struct l12_t = (l9__tmp).f_trm;
 				final Struct l13_next = (l9__tmp).f_next;
-				final Struct l14_gsymswitch53 = Module_equalizer.f_mizANLocateTerm(l7_eq_0, l12_t);
-				Struct l15__tmp = l14_gsymswitch53;
+				final Struct l14_gsymswitch55 = Module_equalizer.f_mizANLocateTerm(l7_eq_0, l12_t);
+				Struct l15__tmp = l14_gsymswitch55;
 				switch (l15__tmp.getTypeId()) {
-				case 88/*Some*/: {
+				case 90/*Some*/: {
 					final Struct_Some l16__tmp = (Struct_Some)l15__tmp;
 					final Object l17_lt = l16__tmp.f_value;
 					final Struct l18_lt = ((Struct)(l16__tmp).f_value);
 					l0_res.value = Module_equalizer.f_mizAppendTrm(l0_res.value, l18_lt);
 					break;
 				}
-				case 80/*None*/: {
+				case 82/*None*/: {
 					l1_ok.value = ((Boolean)false);
 					break;
 				}
@@ -938,7 +1021,7 @@ final public class Module_equalizer {
 				l2_l.value = l13_next;
 				return null;
 			}
-			case 69/*MizTrmNil*/: {
+			case 71/*MizTrmNil*/: {
 				return null;
 			}
 			default:
@@ -953,11 +1036,11 @@ final public class Module_equalizer {
 		}
 	}
 	public static final Struct f_mizANLocatedAttr(Struct_MizEqualizer aeq_0, Struct_MizAttr aa) {
-		final Struct l0_gsymswitch61 = (aa).f_args;
+		final Struct l0_gsymswitch63 = (aa).f_args;
 		boolean l1_noArgs;
-		Struct l2__tmp = l0_gsymswitch61;
+		Struct l2__tmp = l0_gsymswitch63;
 		switch (l2__tmp.getTypeId()) {
-		case 69/*MizTrmNil*/: {
+		case 71/*MizTrmNil*/: {
 			l1_noArgs=true;
 			break;
 		}
@@ -969,16 +1052,16 @@ final public class Module_equalizer {
 		if (l1_noArgs) {
 			return (new Struct_Some(Wrappers.w_mizCopyAttr.invoke(aa)));
 		} else {
-			final Struct l4_gsymswitch62 = Module_equalizer.f_mizANLocateTermList(aeq_0, (aa).f_args);
-			Struct l5__tmp = l4_gsymswitch62;
+			final Struct l4_gsymswitch64 = Module_equalizer.f_mizANLocateTermList(aeq_0, (aa).f_args);
+			Struct l5__tmp = l4_gsymswitch64;
 			switch (l5__tmp.getTypeId()) {
-			case 88/*Some*/: {
+			case 90/*Some*/: {
 				final Struct_Some l6__tmp = (Struct_Some)l5__tmp;
 				final Object l7_la = l6__tmp.f_value;
 				final Struct l8_la = ((Struct)(l6__tmp).f_value);
 				return (new Struct_Some((new Struct_MizAttr((aa).f_neg, (aa).f_attrNr, l8_la, (aa).f_collected, (aa).f_pattNr))));
 			}
-			case 80/*None*/: {
+			case 82/*None*/: {
 				return ((Struct)SingletonStructs.str_None);
 			}
 			default:
@@ -991,16 +1074,16 @@ final public class Module_equalizer {
 		final Struct_Vector l3_$2 = (aaCluster).f_items;
 		final Struct_MizEqualizer l5_eq_0 = aeq_0;
 		final Func1<Object,Struct_MizAttr> l4_$1 = (Func1<Object, Struct_MizAttr>)(Struct_MizAttr aa) -> {
-			final Struct l5_gsymswitch63 = Module_equalizer.f_mizANLocatedAttr(l5_eq_0, aa);
-			Struct l6__tmp = l5_gsymswitch63;
+			final Struct l5_gsymswitch65 = Module_equalizer.f_mizANLocatedAttr(l5_eq_0, aa);
+			Struct l6__tmp = l5_gsymswitch65;
 			switch (l6__tmp.getTypeId()) {
-			case 88/*Some*/: {
+			case 90/*Some*/: {
 				final Struct_Some l7__tmp = (Struct_Some)l6__tmp;
 				final Object l8_la = l7__tmp.f_value;
 				final Struct_MizAttr l9_la = ((Struct_MizAttr)(l7__tmp).f_value);
 				return Module_correl.f_mizAttrCollInsert((l5_eq_0).f_env, l0_r, l9_la);
 			}
-			case 80/*None*/: {
+			case 82/*None*/: {
 				return null;
 			}
 			default:
@@ -1086,10 +1169,10 @@ final public class Module_equalizer {
 	public static final Struct f_mizAllButLast(Struct al) {
 		Struct l0__tmp = al;
 		switch (l0__tmp.getTypeId()) {
-		case 69/*MizTrmNil*/: {
+		case 71/*MizTrmNil*/: {
 			return al;
 		}
-		case 68/*MizTrmElem*/: {
+		case 70/*MizTrmElem*/: {
 			final Struct_MizTrmElem l1__tmp = (Struct_MizTrmElem)l0__tmp;
 			final Struct l2_trm = l1__tmp.f_trm;
 			final Struct l3_next = l1__tmp.f_next;
@@ -1097,10 +1180,10 @@ final public class Module_equalizer {
 			final Struct l5_next = (l1__tmp).f_next;
 			Struct l6__tmp = l5_next;
 			switch (l6__tmp.getTypeId()) {
-			case 69/*MizTrmNil*/: {
+			case 71/*MizTrmNil*/: {
 				return ((Struct)SingletonStructs.str_MizTrmNil);
 			}
-			case 68/*MizTrmElem*/: {
+			case 70/*MizTrmElem*/: {
 				final Struct_MizTrmElem l7__tmp = (Struct_MizTrmElem)l6__tmp;
 				final Struct l8___ = (l7__tmp).f_trm;
 				final Struct l9___ = (l7__tmp).f_next;
@@ -1127,7 +1210,7 @@ final public class Module_equalizer {
 			final int l7___ = (l1__tmp).f_trmInfo;
 			return Module_equalizer.f_mizFuncIdxAlloc(aeq_0, akind, l4_funcNr, l1__tmp);
 		}
-		case 59/*MizPrivFuncTrm*/: {
+		case 61/*MizPrivFuncTrm*/: {
 			final Struct_MizPrivFuncTrm l1__tmp = (Struct_MizPrivFuncTrm)l0__tmp;
 			final int l8_funcNr = l1__tmp.f_funcNr;
 			final int l9_funcNr = (l1__tmp).f_funcNr;
@@ -1145,10 +1228,10 @@ final public class Module_equalizer {
 	public static final Struct f_mizAppendTrm(Struct al, Struct at) {
 		Struct l0__tmp = al;
 		switch (l0__tmp.getTypeId()) {
-		case 69/*MizTrmNil*/: {
+		case 71/*MizTrmNil*/: {
 			return (new Struct_MizTrmElem(at, ((Struct)SingletonStructs.str_MizTrmNil)));
 		}
-		case 68/*MizTrmElem*/: {
+		case 70/*MizTrmElem*/: {
 			final Struct_MizTrmElem l1__tmp = (Struct_MizTrmElem)l0__tmp;
 			final Struct l2___ = (l1__tmp).f_trm;
 			final Struct l3___ = (l1__tmp).f_next;
@@ -1173,7 +1256,7 @@ final public class Module_equalizer {
 			final int l7___ = (l1__tmp).f_trmInfo;
 			return l5_args;
 		}
-		case 59/*MizPrivFuncTrm*/: {
+		case 61/*MizPrivFuncTrm*/: {
 			final Struct_MizPrivFuncTrm l1__tmp = (Struct_MizPrivFuncTrm)l0__tmp;
 			final Struct l8_args = l1__tmp.f_args;
 			final int l9___ = (l1__tmp).f_funcNr;
@@ -1188,13 +1271,20 @@ final public class Module_equalizer {
 		}
 		}
 	}
+	public static final Struct_MizComplex f_mizCInvE(Struct_MizComplex aa) {
+		final double l0_d = (((aa).f_re*(aa).f_re)+((aa).f_im*(aa).f_im));
+		return (new Struct_MizComplex(((aa).f_re/l0_d), ((-(aa).f_im)/l0_d)));
+	}
+	public static final Struct_MizComplex f_mizCMul(Struct_MizComplex aa, Struct_MizComplex ab) {
+		return (new Struct_MizComplex((((aa).f_re*(ab).f_re)-((aa).f_im*(ab).f_im)), (((aa).f_re*(ab).f_im)+((aa).f_im*(ab).f_re))));
+	}
 	public static final Object f_mizChChangeBoundE(Struct_MizEqualizer aeq_0, Struct at) {
 		final Struct_MizCorrelEnv l0_env = (aeq_0).f_env;
 		if (((l0_env).f_boundVarNbr>0)) {
 			final Func2<Struct,Struct_MizWithin, Struct> l2_$1 = (Func2<Struct, Struct_MizWithin, Struct>)(Struct_MizWithin al3_0, Struct atrm) -> {
 				Struct l4__tmp = atrm;
 				switch (l4__tmp.getTypeId()) {
-				case 75/*MizVarTrm*/: {
+				case 77/*MizVarTrm*/: {
 					final Struct_MizVarTrm l5__tmp = (Struct_MizVarTrm)l4__tmp;
 					final int l6_s2 = l5__tmp.f_sort;
 					final int l7_v2 = l5__tmp.f_varNr;
@@ -1224,6 +1314,25 @@ final public class Module_equalizer {
 	public static final int f_mizClassOf(Struct_MizEqualizer aeq_0, int ai) {
 		return Module_equalizer.f_mizTrmInfoOf((Module_equalizer.f_mizTrmSAt(aeq_0, ai)).f_term);
 	}
+	public static final Object f_mizClearPolynomialValues(Struct_MizEqualizer aeq_0) {
+		final Reference<Integer> l0_t = ((Reference<Integer>)(new Reference(1)));
+		final Struct_MizEqualizer l4_eq_0 = aeq_0;
+		final Func0<Boolean> l3_$1 = (Func0<Boolean>)() -> {
+			return (((int)l0_t.value)<=Module_equalizer.f_mizTrmNbr(l4_eq_0));
+		};
+		final Struct_MizEqualizer l6_eq_0 = aeq_0;
+		final Func0<Object> l5_$2 = (Func0<Object>)() -> {
+			final Struct_MizTrmSRec l6_rec = Module_equalizer.f_mizTrmSAt(l6_eq_0, ((int)l0_t.value));
+			final int l7_repNr = Module_equalizer.f_mizClassOf(l6_eq_0, ((int)l0_t.value));
+			if (((l7_repNr!=((int)l0_t.value))&&(Module_vector.f_sizeVector((Module_equalizer.f_mizTrmSAt(l6_eq_0, l7_repNr)).f_polynomialValues)>0))) {
+				Module_equalizer.f_mizSubstVarP(l6_eq_0, ((int)l0_t.value), l7_repNr);
+			} else {
+			}
+			l0_t.value = ((Integer)(((int)l0_t.value)+1));
+			return null;
+		};
+		return Module_loop.f_while(l3_$1, l5_$2);
+	}
 	public static final int f_mizCompRdTrmsPub(Struct_MizCorrelEnv aenv, Struct aa, Struct ab) {
 		final boolean l0_saved = (aenv).f_strictCompare;
 		((Field_strictCompare)aenv).set_strictCompare(false);
@@ -1234,10 +1343,10 @@ final public class Module_equalizer {
 	public static final Struct f_mizConcatTrmLists(Struct aa, Struct ab) {
 		Struct l0__tmp = aa;
 		switch (l0__tmp.getTypeId()) {
-		case 69/*MizTrmNil*/: {
+		case 71/*MizTrmNil*/: {
 			return ab;
 		}
-		case 68/*MizTrmElem*/: {
+		case 70/*MizTrmElem*/: {
 			final Struct_MizTrmElem l1__tmp = (Struct_MizTrmElem)l0__tmp;
 			final Struct l2___ = (l1__tmp).f_trm;
 			final Struct l3___ = (l1__tmp).f_next;
@@ -1261,7 +1370,7 @@ final public class Module_equalizer {
 			final Struct l7_nf = ((Struct)Module_vector.f_getVectorUnsafe((l7_eq_0).f_negBas, ((int)l1_i.value)));
 			Struct l8__tmp = l7_nf;
 			switch (l8__tmp.getTypeId()) {
-			case 56/*MizPredFrm*/: {
+			case 58/*MizPredFrm*/: {
 				final Struct_MizPredFrm l9__tmp = (Struct_MizPredFrm)l8__tmp;
 				final int l10_srt = l9__tmp.f_sort;
 				final int l11_predNr = l9__tmp.f_predNr;
@@ -1274,7 +1383,7 @@ final public class Module_equalizer {
 					final Struct l17_la = Module_equalizer.f_mizGetAttr(l7_eq_0, (Module_equalizer.f_mizTrmSAt(l7_eq_0, Module_equalizer.f_mizTrmInfoOf(Module_equalizer.f_mizLastArgE(l15_args)))).f_superCluster, l14_predNr, Module_equalizer.f_mizAllButLast(l15_args));
 					Struct l18__tmp = l17_la;
 					switch (l18__tmp.getTypeId()) {
-					case 88/*Some*/: {
+					case 90/*Some*/: {
 						final Struct_Some l19__tmp = (Struct_Some)l18__tmp;
 						final Object l20_at = l19__tmp.f_value;
 						final Struct_MizAttr l21_at = ((Struct_MizAttr)(l19__tmp).f_value);
@@ -1284,7 +1393,7 @@ final public class Module_equalizer {
 						}
 						break;
 					}
-					case 80/*None*/: {
+					case 82/*None*/: {
 						break;
 					}
 					default:
@@ -1318,7 +1427,7 @@ final public class Module_equalizer {
 				}
 				break;
 			}
-			case 61/*MizQualFrm*/: {
+			case 63/*MizQualFrm*/: {
 				final Struct_MizQualFrm l9__tmp = (Struct_MizQualFrm)l8__tmp;
 				final Struct l28_trm = l9__tmp.f_trm;
 				final Struct_MizTyp l29_typ = l9__tmp.f_typ;
@@ -1434,7 +1543,7 @@ final public class Module_equalizer {
 	public static final Struct_MizNegFrm f_mizEqAsNeg(Struct af) {
 		Struct l0__tmp = af;
 		switch (l0__tmp.getTypeId()) {
-		case 51/*MizNegFrm*/: {
+		case 52/*MizNegFrm*/: {
 			final Struct_MizNegFrm l1__tmp = (Struct_MizNegFrm)l0__tmp;
 			final Struct l2___ = (l1__tmp).f_arg;
 			final int l3___ = (l1__tmp).f_pattNr;
@@ -1449,7 +1558,7 @@ final public class Module_equalizer {
 	public static final Struct_MizPredFrm f_mizEqAsPred(Struct af) {
 		Struct l0__tmp = af;
 		switch (l0__tmp.getTypeId()) {
-		case 56/*MizPredFrm*/: {
+		case 58/*MizPredFrm*/: {
 			final Struct_MizPredFrm l1__tmp = (Struct_MizPredFrm)l0__tmp;
 			final int l2___ = (l1__tmp).f_sort;
 			final int l3___ = (l1__tmp).f_predNr;
@@ -1466,7 +1575,7 @@ final public class Module_equalizer {
 	public static final Struct_MizPrivFuncTrm f_mizEqAsPriv(Struct at) {
 		Struct l0__tmp = at;
 		switch (l0__tmp.getTypeId()) {
-		case 59/*MizPrivFuncTrm*/: {
+		case 61/*MizPrivFuncTrm*/: {
 			final Struct_MizPrivFuncTrm l1__tmp = (Struct_MizPrivFuncTrm)l0__tmp;
 			final int l2___ = (l1__tmp).f_funcNr;
 			final Struct l3___ = (l1__tmp).f_args;
@@ -1484,7 +1593,7 @@ final public class Module_equalizer {
 	public static final Struct_MizQualFrm f_mizEqAsQual(Struct af) {
 		Struct l0__tmp = af;
 		switch (l0__tmp.getTypeId()) {
-		case 61/*MizQualFrm*/: {
+		case 63/*MizQualFrm*/: {
 			final Struct_MizQualFrm l1__tmp = (Struct_MizQualFrm)l0__tmp;
 			final Struct l2___ = (l1__tmp).f_trm;
 			final Struct_MizTyp l3___ = (l1__tmp).f_typ;
@@ -1500,7 +1609,7 @@ final public class Module_equalizer {
 	public static final Struct_MizUnivFrm f_mizEqAsUniv(Struct af) {
 		Struct l0__tmp = af;
 		switch (l0__tmp.getTypeId()) {
-		case 74/*MizUnivFrm*/: {
+		case 76/*MizUnivFrm*/: {
 			final Struct_MizUnivFrm l1__tmp = (Struct_MizUnivFrm)l0__tmp;
 			final int l2___ = (l1__tmp).f_sort;
 			final int l3___ = (l1__tmp).f_varId;
@@ -1518,7 +1627,7 @@ final public class Module_equalizer {
 	public static final Struct_MizVarTrm f_mizEqAsVar(Struct at) {
 		Struct l0__tmp = at;
 		switch (l0__tmp.getTypeId()) {
-		case 75/*MizVarTrm*/: {
+		case 77/*MizVarTrm*/: {
 			final Struct_MizVarTrm l1__tmp = (Struct_MizVarTrm)l0__tmp;
 			final int l2___ = (l1__tmp).f_sort;
 			final int l3___ = (l1__tmp).f_varNr;
@@ -1540,10 +1649,10 @@ final public class Module_equalizer {
 	public static final boolean f_mizEqButLast(Struct_MizEqualizer aeq_0, Struct aa0, Struct ab0) {
 		Struct l0__tmp = aa0;
 		switch (l0__tmp.getTypeId()) {
-		case 69/*MizTrmNil*/: {
+		case 71/*MizTrmNil*/: {
 			return false;
 		}
-		case 68/*MizTrmElem*/: {
+		case 70/*MizTrmElem*/: {
 			final Struct_MizTrmElem l1__tmp = (Struct_MizTrmElem)l0__tmp;
 			final Struct l2_ta = l1__tmp.f_trm;
 			final Struct l3_na = l1__tmp.f_next;
@@ -1551,10 +1660,10 @@ final public class Module_equalizer {
 			final Struct l5_na = (l1__tmp).f_next;
 			Struct l6__tmp = ab0;
 			switch (l6__tmp.getTypeId()) {
-			case 69/*MizTrmNil*/: {
+			case 71/*MizTrmNil*/: {
 				return false;
 			}
-			case 68/*MizTrmElem*/: {
+			case 70/*MizTrmElem*/: {
 				final Struct_MizTrmElem l7__tmp = (Struct_MizTrmElem)l6__tmp;
 				final Struct l8_tb = l7__tmp.f_trm;
 				final Struct l9_nb = l7__tmp.f_next;
@@ -1563,7 +1672,7 @@ final public class Module_equalizer {
 				boolean l12_lastA;
 				Struct l13__tmp = l5_na;
 				switch (l13__tmp.getTypeId()) {
-				case 69/*MizTrmNil*/: {
+				case 71/*MizTrmNil*/: {
 					l12_lastA=true;
 					break;
 				}
@@ -1575,7 +1684,7 @@ final public class Module_equalizer {
 				boolean l15_lastB;
 				Struct l16__tmp = l11_nb;
 				switch (l16__tmp.getTypeId()) {
-				case 69/*MizTrmNil*/: {
+				case 71/*MizTrmNil*/: {
 					l15_lastB=true;
 					break;
 				}
@@ -1610,7 +1719,7 @@ final public class Module_equalizer {
 			} else {
 				Struct l2__tmp = aa;
 				switch (l2__tmp.getTypeId()) {
-				case 51/*MizNegFrm*/: {
+				case 52/*MizNegFrm*/: {
 					final Struct_MizNegFrm l3__tmp = (Struct_MizNegFrm)l2__tmp;
 					final Struct l4_arg = l3__tmp.f_arg;
 					final Struct l5_arg = (l3__tmp).f_arg;
@@ -1624,7 +1733,7 @@ final public class Module_equalizer {
 						continue TAIL_CALL;
 					}
 				}
-				case 61/*MizQualFrm*/: {
+				case 63/*MizQualFrm*/: {
 					final Struct_MizQualFrm l3__tmp = (Struct_MizQualFrm)l2__tmp;
 					final Struct l10_trm = l3__tmp.f_trm;
 					final Struct_MizTyp l11_typ = l3__tmp.f_typ;
@@ -1661,7 +1770,7 @@ final public class Module_equalizer {
 						return ((boolean)l20_ok.value);
 					}
 				}
-				case 56/*MizPredFrm*/: {
+				case 58/*MizPredFrm*/: {
 					final Struct_MizPredFrm l3__tmp = (Struct_MizPredFrm)l2__tmp;
 					final int l27_srt = l3__tmp.f_sort;
 					final int l28_predNr = l3__tmp.f_predNr;
@@ -1720,7 +1829,7 @@ final public class Module_equalizer {
 					final Struct_MizLocPredFrm l53_lb = Module_equalizer.f_mizEqAsLocPred(ab);
 					return ((l49_predNr==(l53_lb).f_predNr)&&Module_equalizer.f_mizEqTrmListsE(aeq_0, l50_args, (l53_lb).f_args));
 				}
-				case 74/*MizUnivFrm*/: {
+				case 76/*MizUnivFrm*/: {
 					final Struct_MizUnivFrm l3__tmp = (Struct_MizUnivFrm)l2__tmp;
 					final Struct_MizTyp l54_quantified = l3__tmp.f_quantified;
 					final Struct l55_scope = l3__tmp.f_scope;
@@ -1744,13 +1853,13 @@ final public class Module_equalizer {
 	public static final boolean f_mizEqTrmListsE(Struct_MizEqualizer aeq_0, Struct aa, Struct ab) {
 		Struct l0__tmp = aa;
 		switch (l0__tmp.getTypeId()) {
-		case 69/*MizTrmNil*/: {
+		case 71/*MizTrmNil*/: {
 			Struct l2__tmp = ab;
 			switch (l2__tmp.getTypeId()) {
-			case 69/*MizTrmNil*/: {
+			case 71/*MizTrmNil*/: {
 				return true;
 			}
-			case 68/*MizTrmElem*/: {
+			case 70/*MizTrmElem*/: {
 				final Struct_MizTrmElem l3__tmp = (Struct_MizTrmElem)l2__tmp;
 				final Struct l4___ = (l3__tmp).f_trm;
 				final Struct l5___ = (l3__tmp).f_next;
@@ -1760,7 +1869,7 @@ final public class Module_equalizer {
 				throw new RuntimeException("Unexpected struct in switch: "+l2__tmp.getTypeName());
 			}
 		}
-		case 68/*MizTrmElem*/: {
+		case 70/*MizTrmElem*/: {
 			final Struct_MizTrmElem l1__tmp = (Struct_MizTrmElem)l0__tmp;
 			final Struct l6_ta = l1__tmp.f_trm;
 			final Struct l7_na = l1__tmp.f_next;
@@ -1768,10 +1877,10 @@ final public class Module_equalizer {
 			final Struct l9_na = (l1__tmp).f_next;
 			Struct l10__tmp = ab;
 			switch (l10__tmp.getTypeId()) {
-			case 69/*MizTrmNil*/: {
+			case 71/*MizTrmNil*/: {
 				return false;
 			}
-			case 68/*MizTrmElem*/: {
+			case 70/*MizTrmElem*/: {
 				final Struct_MizTrmElem l11__tmp = (Struct_MizTrmElem)l10__tmp;
 				final Struct l12_tb = l11__tmp.f_trm;
 				final Struct l13_nb = l11__tmp.f_next;
@@ -1797,7 +1906,7 @@ final public class Module_equalizer {
 			} else {
 				Struct l1__tmp = aa;
 				switch (l1__tmp.getTypeId()) {
-				case 75/*MizVarTrm*/: {
+				case 77/*MizVarTrm*/: {
 					final Struct_MizVarTrm l2__tmp = (Struct_MizVarTrm)l1__tmp;
 					final int l3_varNr = l2__tmp.f_varNr;
 					final int l4___ = (l2__tmp).f_sort;
@@ -1827,7 +1936,7 @@ final public class Module_equalizer {
 						return ((l13_funcNr==(l17_fb).f_funcNr)&&Module_equalizer.f_mizEqTrmListsE(aeq_0, l14_args, (l17_fb).f_args));
 					}
 				}
-				case 59/*MizPrivFuncTrm*/: {
+				case 61/*MizPrivFuncTrm*/: {
 					final Struct_MizPrivFuncTrm l2__tmp = (Struct_MizPrivFuncTrm)l1__tmp;
 					final int l21_funcNr = l2__tmp.f_funcNr;
 					final Struct l22_args = l2__tmp.f_args;
@@ -1888,7 +1997,7 @@ final public class Module_equalizer {
 					final int l53___ = (l2__tmp).f_trmInfo;
 					return (l52_srt==Module_lexicon.g_ikError);
 				}
-				case 60/*MizQuaTrm*/: {
+				case 62/*MizQuaTrm*/: {
 					final Struct_MizQuaTrm l2__tmp = (Struct_MizQuaTrm)l1__tmp;
 					final Struct l54___ = (l2__tmp).f_trmProper;
 					final Struct_MizTyp l55___ = (l2__tmp).f_qua;
@@ -1956,7 +2065,7 @@ final public class Module_equalizer {
 				final Struct l10_bf = ((Struct)Module_vector.f_getVectorUnsafe(l3_basic, l9_j));
 				Struct l11__tmp = l10_bf;
 				switch (l11__tmp.getTypeId()) {
-				case 61/*MizQualFrm*/: {
+				case 63/*MizQualFrm*/: {
 					final Struct_MizQualFrm l12__tmp = (Struct_MizQualFrm)l11__tmp;
 					final Struct l13_trm = l12__tmp.f_trm;
 					final Struct_MizTyp l14_typ = l12__tmp.f_typ;
@@ -1974,7 +2083,7 @@ final public class Module_equalizer {
 					Module_equalizer.f_mizInsertType(l0_eq_0, l18_xType, Module_equalizer.f_mizTrmInfoOf(l20_xTerm2));
 					break;
 				}
-				case 56/*MizPredFrm*/: {
+				case 58/*MizPredFrm*/: {
 					final Struct_MizPredFrm l12__tmp = (Struct_MizPredFrm)l11__tmp;
 					final int l21_srt = l12__tmp.f_sort;
 					final int l22_predNr = l12__tmp.f_predNr;
@@ -2044,7 +2153,7 @@ final public class Module_equalizer {
 					boolean l17_isNegAttr;
 					Struct l18__tmp = l16_bf;
 					switch (l18__tmp.getTypeId()) {
-					case 56/*MizPredFrm*/: {
+					case 58/*MizPredFrm*/: {
 						final Struct_MizPredFrm l19__tmp = (Struct_MizPredFrm)l18__tmp;
 						final int l20_srt = l19__tmp.f_sort;
 						final int l21_srt = (l19__tmp).f_sort;
@@ -2114,7 +2223,7 @@ final public class Module_equalizer {
 				boolean l10_live;
 				Struct l11__tmp = l9_gsymswitch35;
 				switch (l11__tmp.getTypeId()) {
-				case 69/*MizTrmNil*/: {
+				case 71/*MizTrmNil*/: {
 					l10_live=false;
 					break;
 				}
@@ -2150,7 +2259,7 @@ final public class Module_equalizer {
 		final Func1<Object,Struct> l4_$1 = (Func1<Object, Struct>)(Struct apf) -> {
 			Struct l5__tmp = apf;
 			switch (l5__tmp.getTypeId()) {
-			case 56/*MizPredFrm*/: {
+			case 58/*MizPredFrm*/: {
 				final Struct_MizPredFrm l6__tmp = (Struct_MizPredFrm)l5__tmp;
 				final int l7_srt = l6__tmp.f_sort;
 				final int l8_predNr = l6__tmp.f_predNr;
@@ -2196,7 +2305,7 @@ final public class Module_equalizer {
 		final Func1<Object,Struct> l9_$6 = (Func1<Object, Struct>)(Struct anf) -> {
 			Struct l10__tmp = anf;
 			switch (l10__tmp.getTypeId()) {
-			case 56/*MizPredFrm*/: {
+			case 58/*MizPredFrm*/: {
 				final Struct_MizPredFrm l11__tmp = (Struct_MizPredFrm)l10__tmp;
 				final int l12_srt = l11__tmp.f_sort;
 				final int l13_predNr = l11__tmp.f_predNr;
@@ -2250,7 +2359,7 @@ final public class Module_equalizer {
 				final Struct l22_gsymswitch21 = l18_cur.value;
 				Struct l23__tmp = l22_gsymswitch21;
 				switch (l23__tmp.getTypeId()) {
-				case 69/*MizTrmNil*/: {
+				case 71/*MizTrmNil*/: {
 					return ((Boolean)false);
 				}
 				default: {
@@ -2262,7 +2371,7 @@ final public class Module_equalizer {
 				final Struct l23_gsymswitch22 = l18_cur.value;
 				Struct l24__tmp = l23_gsymswitch22;
 				switch (l24__tmp.getTypeId()) {
-				case 68/*MizTrmElem*/: {
+				case 70/*MizTrmElem*/: {
 					final Struct_MizTrmElem l25__tmp = (Struct_MizTrmElem)l24__tmp;
 					final Struct l26_trm = l25__tmp.f_trm;
 					final Struct l27_next = l25__tmp.f_next;
@@ -2270,7 +2379,7 @@ final public class Module_equalizer {
 					final Struct l29_next = (l25__tmp).f_next;
 					Struct l30__tmp = l28_trm;
 					switch (l30__tmp.getTypeId()) {
-					case 75/*MizVarTrm*/: {
+					case 77/*MizVarTrm*/: {
 						final Struct_MizVarTrm l31__tmp = (Struct_MizVarTrm)l30__tmp;
 						final int l32_srt = l31__tmp.f_sort;
 						final int l33_varNr = l31__tmp.f_varNr;
@@ -2308,7 +2417,7 @@ final public class Module_equalizer {
 					l18_cur.value = l29_next;
 					return null;
 				}
-				case 69/*MizTrmNil*/: {
+				case 71/*MizTrmNil*/: {
 					return null;
 				}
 				default:
@@ -2333,6 +2442,38 @@ final public class Module_equalizer {
 		} else {
 		}
 		if (((aeq_0).f_contr==0)) {
+			Module_equalizer.f_mizInitSuperClusterForComplex(aeq_0);
+		} else {
+		}
+		if (((aeq_0).f_contr==0)) {
+			Module_equalizer.f_mizUnionEqualsForNonComplex(aeq_0);
+		} else {
+		}
+		if (((aeq_0).f_contr==0)) {
+			Module_equalizer.f_mizInitPolynomialValues(aeq_0);
+		} else {
+		}
+		if (((aeq_0).f_contr==0)) {
+			Module_equalizer.f_mizSubstituteSettings(aeq_0);
+		} else {
+		}
+		if (((aeq_0).f_contr==0)) {
+			Module_equalizer.f_mizClearPolynomialValues(aeq_0);
+		} else {
+		}
+		if (((aeq_0).f_contr==0)) {
+			Module_equalizer.f_mizEquatePolynomialValues(aeq_0);
+		} else {
+		}
+		if (((aeq_0).f_contr==0)) {
+			Module_equalizer.f_mizEquatePolynomials(aeq_0);
+		} else {
+		}
+		if (((aeq_0).f_contr==0)) {
+			Module_equalizer.f_mizClearPolynomialValues(aeq_0);
+		} else {
+		}
+		if (((aeq_0).f_contr==0)) {
 			final Struct_Vector l20_$19 = (aeq_0).f_eqPend;
 			final Struct_MizEqualizer l22_eq_0 = aeq_0;
 			final Func1<Object,Struct_MizIntPair> l21_$18 = (Func1<Object, Struct_MizIntPair>)(Struct_MizIntPair ap) -> {
@@ -2347,23 +2488,34 @@ final public class Module_equalizer {
 		} else {
 		}
 		if (((aeq_0).f_contr==0)) {
-			final Struct_Vector l25_$24 = (aeq_0).f_settings;
-			final Struct_MizEqualizer l27_eq_0 = aeq_0;
-			final Func1<Object,Struct_MizIntPair> l26_$23 = (Func1<Object, Struct_MizIntPair>)(Struct_MizIntPair ap) -> {
-				if (((l27_eq_0).f_contr==0)) {
-					return Module_equalizer.f_mizUnionTrms(l27_eq_0, (ap).f_x, (ap).f_y);
-				} else {
-					return null;
-				}
-			};
-			Module_vector.f_iterVector(l25_$24, ((Func1<Object,Object>)(Func1)l26_$23));
-			Module_vector.f_clearVector((aeq_0).f_settings);
+			Module_equalizer.f_mizEquatePolynomials(aeq_0);
 		} else {
 		}
-		if (((aeq_0).f_contr==0)) {
-			Module_equalizer.f_mizIdentities(aeq_0);
-		} else {
-		}
+		final Reference<Boolean> l23_outerCl = ((Reference<Boolean>)(new Reference(true)));
+		final Struct_MizEqualizer l27_eq_0 = aeq_0;
+		final Func0<Boolean> l26_$24 = (Func0<Boolean>)() -> {
+			return ((Boolean)(((l27_eq_0).f_contr==0)&&((boolean)l23_outerCl.value)));
+		};
+		final Struct_MizEqualizer l29_eq_0 = aeq_0;
+		final Func0<Object> l28_$25 = (Func0<Object>)() -> {
+			Module_equalizer.f_mizClearPolynomialValues(l29_eq_0);
+			if (((l29_eq_0).f_contr==0)) {
+				Module_equalizer.f_mizIdentities(l29_eq_0);
+			} else {
+			}
+			if (((l29_eq_0).f_contr==0)) {
+				final boolean l29_savedClash = (l29_eq_0).f_clash;
+				((Field_clash)l29_eq_0).set_clash(false);
+				Module_equalizer.f_mizEquatePolynomials(l29_eq_0);
+				l23_outerCl.value = ((Boolean)(l29_eq_0).f_clash);
+				((Field_clash)l29_eq_0).set_clash(l29_savedClash);
+				return null;
+			} else {
+				l23_outerCl.value = ((Boolean)false);
+				return null;
+			}
+		};
+		Module_loop.f_while(l26_$24, l28_$25);
 		if (((aeq_0).f_contr==0)) {
 			Module_equalizer.f_mizRenumEqClasses(aeq_0);
 		} else {
@@ -2373,31 +2525,31 @@ final public class Module_equalizer {
 		} else {
 		}
 		if (((aeq_0).f_contr==0)) {
-			final Struct_Vector l30_$29 = (aeq_0).f_negBas;
-			final Struct_MizEqualizer l32_eq_0 = aeq_0;
-			final Func1<Object,Struct> l31_$28 = (Func1<Object, Struct>)(Struct anf) -> {
-				if (((l32_eq_0).f_contr==0)) {
-					Struct l32__tmp = anf;
-					switch (l32__tmp.getTypeId()) {
-					case 56/*MizPredFrm*/: {
-						final Struct_MizPredFrm l33__tmp = (Struct_MizPredFrm)l32__tmp;
-						final int l34_srt = l33__tmp.f_sort;
-						final int l35_predNr = l33__tmp.f_predNr;
-						final Struct l36_args = l33__tmp.f_args;
-						final int l37_srt = (l33__tmp).f_sort;
-						final int l38_predNr = (l33__tmp).f_predNr;
-						final Struct l39_args = (l33__tmp).f_args;
-						final int l40___ = (l33__tmp).f_pattNr;
-						if ((l37_srt==Module_lexicon.g_ikFrmPred)) {
-							final Struct_MizConstr l41_c = Module_correl.f_mizConstr(l0_env, Module_correl.g_coPredicate, l38_predNr);
-							if (Module_correl.f_mizHasProperty(l41_c, Module_correl.g_syReflexivity)) {
-								final Struct_Pair l42_p2 = Module_equalizer.f_mizGetArgs2(l39_args, (l41_c).f_firstArg, (l41_c).f_secondArg);
-								final int l43_i1 = Module_equalizer.f_mizTrmInfoOf(((Struct)(l42_p2).f_first));
-								final int l44_i2 = Module_equalizer.f_mizTrmInfoOf(((Struct)(l42_p2).f_second));
-								Module_equalizer.f_mizInsertNonEmpty(l32_eq_0, l43_i1, l44_i2);
-								Module_equalizer.f_mizInsertNonEmpty(l32_eq_0, l44_i2, l43_i1);
-								Module_equalizer.f_mizInsertNonZero(l32_eq_0, l43_i1, l44_i2);
-								return Module_equalizer.f_mizInsertNonZero(l32_eq_0, l44_i2, l43_i1);
+			final Struct_Vector l32_$31 = (aeq_0).f_negBas;
+			final Struct_MizEqualizer l34_eq_0 = aeq_0;
+			final Func1<Object,Struct> l33_$30 = (Func1<Object, Struct>)(Struct anf) -> {
+				if (((l34_eq_0).f_contr==0)) {
+					Struct l34__tmp = anf;
+					switch (l34__tmp.getTypeId()) {
+					case 58/*MizPredFrm*/: {
+						final Struct_MizPredFrm l35__tmp = (Struct_MizPredFrm)l34__tmp;
+						final int l36_srt = l35__tmp.f_sort;
+						final int l37_predNr = l35__tmp.f_predNr;
+						final Struct l38_args = l35__tmp.f_args;
+						final int l39_srt = (l35__tmp).f_sort;
+						final int l40_predNr = (l35__tmp).f_predNr;
+						final Struct l41_args = (l35__tmp).f_args;
+						final int l42___ = (l35__tmp).f_pattNr;
+						if ((l39_srt==Module_lexicon.g_ikFrmPred)) {
+							final Struct_MizConstr l43_c = Module_correl.f_mizConstr(l0_env, Module_correl.g_coPredicate, l40_predNr);
+							if (Module_correl.f_mizHasProperty(l43_c, Module_correl.g_syReflexivity)) {
+								final Struct_Pair l44_p2 = Module_equalizer.f_mizGetArgs2(l41_args, (l43_c).f_firstArg, (l43_c).f_secondArg);
+								final int l45_i1 = Module_equalizer.f_mizTrmInfoOf(((Struct)(l44_p2).f_first));
+								final int l46_i2 = Module_equalizer.f_mizTrmInfoOf(((Struct)(l44_p2).f_second));
+								Module_equalizer.f_mizInsertNonEmpty(l34_eq_0, l45_i1, l46_i2);
+								Module_equalizer.f_mizInsertNonEmpty(l34_eq_0, l46_i2, l45_i1);
+								Module_equalizer.f_mizInsertNonZero(l34_eq_0, l45_i1, l46_i2);
+								return Module_equalizer.f_mizInsertNonZero(l34_eq_0, l46_i2, l45_i1);
 							} else {
 								return null;
 							}
@@ -2413,7 +2565,7 @@ final public class Module_equalizer {
 					return null;
 				}
 			};
-			Module_vector.f_iterVector(l30_$29, ((Func1<Object,Object>)(Func1)l31_$28));
+			Module_vector.f_iterVector(l32_$31, ((Func1<Object,Object>)(Func1)l33_$30));
 		} else {
 		}
 		if (((aeq_0).f_contr==0)) {
@@ -2434,6 +2586,476 @@ final public class Module_equalizer {
 			return null;
 		}
 	}
+	public static final Object f_mizEquatePolynomialValues(Struct_MizEqualizer aeq_0) {
+		if ((Module_builtin.f_mizBuiltIn(((aeq_0).f_env).f_builtIn, Module_builtin.g_rqComplex)!=0)) {
+			final Struct_MizNatFunc l0_pend = Module_mobjects.f_mizInitNatSet(8);
+			final Reference<Boolean> l1_loop1 = ((Reference<Boolean>)(new Reference(true)));
+			final Struct_MizEqualizer l5_eq_0 = aeq_0;
+			final Func0<Boolean> l4_$2 = (Func0<Boolean>)() -> {
+				return ((Boolean)(((l5_eq_0).f_contr==0)&&((boolean)l1_loop1.value)));
+			};
+			final Struct_MizEqualizer l7_eq_0 = aeq_0;
+			final Func0<Object> l6_$3 = (Func0<Object>)() -> {
+				final Reference<Integer> l7_t = ((Reference<Integer>)(new Reference(1)));
+				final Func0<Boolean> l10_$8 = (Func0<Boolean>)() -> {
+					return ((Boolean)(((l7_eq_0).f_contr==0)&&(((int)l7_t.value)<=Module_equalizer.f_mizTrmNbr(l7_eq_0))));
+				};
+				final Func0<Object> l11_$9 = (Func0<Object>)() -> {
+					final Struct_MizTrmSRec l12_rec = Module_equalizer.f_mizTrmSAt(l7_eq_0, ((int)l7_t.value));
+					final Struct l13_gsymswitch92 = (l12_rec).f_eqClass;
+					boolean l14_live;
+					Struct l15__tmp = l13_gsymswitch92;
+					switch (l15__tmp.getTypeId()) {
+					case 71/*MizTrmNil*/: {
+						l14_live=false;
+						break;
+					}
+					default: {
+						l14_live=true;
+						break;
+					}
+					}
+					if ((l14_live&&(Module_vector.f_sizeVector((l12_rec).f_polynomialValues)>0))) {
+						final int l17_iV = Module_polynom.f_mizPolyIsVariable(((Struct_MizPolynomial)Module_vector.f_getVectorUnsafe((l12_rec).f_polynomialValues, 0)));
+						if (((l17_iV>0)&&(l17_iV!=((int)l7_t.value)))) {
+							final Struct_MizTrmSRec l18_ri = Module_equalizer.f_mizTrmSAt(l7_eq_0, Module_equalizer.f_mizClassOf(l7_eq_0, l17_iV));
+							if ((Module_vector.f_sizeVector((l18_ri).f_polynomialValues)>0)) {
+								final int l19_jV = Module_polynom.f_mizPolyIsVariable(((Struct_MizPolynomial)Module_vector.f_getVectorUnsafe((l18_ri).f_polynomialValues, 0)));
+								if ((l19_jV==l17_iV)) {
+									if ((((int)l7_t.value)>l17_iV)) {
+										final boolean l20___s1 = Module_equalizer.f_mizSubstituteVariableP(l7_eq_0, ((int)l7_t.value), ((Struct_MizPolynomial)Module_vector.f_getVectorUnsafe((l18_ri).f_polynomialValues, 0)), l0_pend);
+									} else {
+										final Struct_MizPolynomial l21_lp = Module_polynom.f_mizPolyWithMonomial((new Struct_MizComplex(1.0, 0.0)), ((int)l7_t.value));
+										final boolean l22___s2 = Module_equalizer.f_mizSubstituteVariableP(l7_eq_0, l17_iV, l21_lp, l0_pend);
+									}
+									Module_equalizer.f_mizUnionTrms(l7_eq_0, ((int)l7_t.value), l17_iV);
+								} else {
+								}
+							} else {
+							}
+						} else {
+						}
+					} else {
+					}
+					l7_t.value = ((Integer)(((int)l7_t.value)+1));
+					return null;
+				};
+				Module_loop.f_while(l10_$8, l11_$9);
+				Module_equalizer.f_mizSubstitutePendingVars(l7_eq_0, l0_pend);
+				final Reference<Integer> l12_i = ((Reference<Integer>)(new Reference(0)));
+				final Func0<Boolean> l15_$13 = (Func0<Boolean>)() -> {
+					return ((Boolean)(((l7_eq_0).f_contr==0)&&(((int)l12_i.value)<Module_vector.f_sizeVector((l7_eq_0).f_eqPend))));
+				};
+				final Func0<Object> l16_$14 = (Func0<Object>)() -> {
+					final Struct_MizIntPair l17_p = ((Struct_MizIntPair)Module_vector.f_getVectorUnsafe((l7_eq_0).f_eqPend, ((int)l12_i.value)));
+					final Struct_MizTrmSRec l18_rx = Module_equalizer.f_mizTrmSAt(l7_eq_0, Module_equalizer.f_mizClassOf(l7_eq_0, (l17_p).f_x));
+					final Struct_MizTrmSRec l19_ry = Module_equalizer.f_mizTrmSAt(l7_eq_0, Module_equalizer.f_mizClassOf(l7_eq_0, (l17_p).f_y));
+					final Reference<Boolean> l20_matched = ((Reference<Boolean>)(new Reference(false)));
+					if (((Module_vector.f_sizeVector((l18_rx).f_polynomialValues)>0)&&(Module_vector.f_sizeVector((l19_ry).f_polynomialValues)>0))) {
+						final Struct_Vector l23_$22 = (l18_rx).f_polynomialValues;
+						final Func1<Object,Struct_MizPolynomial> l24_$21 = (Func1<Object, Struct_MizPolynomial>)(Struct_MizPolynomial ap1) -> {
+							final Struct_Vector l27_$26 = (l19_ry).f_polynomialValues;
+							final Func1<Object,Struct_MizPolynomial> l28_$25 = (Func1<Object, Struct_MizPolynomial>)(Struct_MizPolynomial ap2) -> {
+								if ((!((boolean)l20_matched.value)&&(Module_polynom.f_mizComparePolynomials(ap1, ap2)==0))) {
+									l20_matched.value = ((Boolean)true);
+									return null;
+								} else {
+									return null;
+								}
+							};
+							return Module_vector.f_iterVector(l27_$26, ((Func1<Object,Object>)(Func1)l28_$25));
+						};
+						Module_vector.f_iterVector(l23_$22, ((Func1<Object,Object>)(Func1)l24_$21));
+						if (((boolean)l20_matched.value)) {
+							Module_equalizer.f_mizUnionTrms(l7_eq_0, (l17_p).f_x, (l17_p).f_y);
+							Module_vector.f_removeVector((l7_eq_0).f_eqPend, ((int)l12_i.value));
+						} else {
+							final int l25_lVar1 = Module_polynom.f_mizPolyIsUniVariantVariable(((Struct_MizPolynomial)Module_vector.f_getVectorUnsafe((l18_rx).f_polynomialValues, 0)));
+							final int l26_lVar2 = Module_polynom.f_mizPolyIsUniVariantVariable(((Struct_MizPolynomial)Module_vector.f_getVectorUnsafe((l19_ry).f_polynomialValues, 0)));
+							if ((l25_lVar1==Module_equalizer.f_mizClassOf(l7_eq_0, (l17_p).f_x))) {
+								if ((l26_lVar2==Module_equalizer.f_mizClassOf(l7_eq_0, (l17_p).f_y))) {
+									Module_equalizer.f_mizUnionTrms(l7_eq_0, (l17_p).f_x, (l17_p).f_y);
+									Module_vector.f_removeVector((l7_eq_0).f_eqPend, ((int)l12_i.value));
+									l20_matched.value = ((Boolean)true);
+								} else {
+									if (((l19_ry).f_numDetermined&&(Module_vector.f_sizeVector((l19_ry).f_polynomialValues)==1))) {
+										final boolean l27___s3 = Module_equalizer.f_mizSubstituteVariableP(l7_eq_0, (l17_p).f_x, ((Struct_MizPolynomial)Module_vector.f_getVectorUnsafe((l19_ry).f_polynomialValues, 0)), l0_pend);
+										Module_equalizer.f_mizUnionTrms(l7_eq_0, (l17_p).f_x, (l17_p).f_y);
+										Module_vector.f_removeVector((l7_eq_0).f_eqPend, ((int)l12_i.value));
+										l20_matched.value = ((Boolean)true);
+									} else {
+									}
+								}
+							} else {
+								if (((l18_rx).f_numDetermined&&(Module_vector.f_sizeVector((l18_rx).f_polynomialValues)==1))) {
+									if ((l26_lVar2==Module_equalizer.f_mizClassOf(l7_eq_0, (l17_p).f_y))) {
+										final boolean l28___s4 = Module_equalizer.f_mizSubstituteVariableP(l7_eq_0, (l17_p).f_y, ((Struct_MizPolynomial)Module_vector.f_getVectorUnsafe((l18_rx).f_polynomialValues, 0)), l0_pend);
+										Module_equalizer.f_mizUnionTrms(l7_eq_0, (l17_p).f_x, (l17_p).f_y);
+										Module_vector.f_removeVector((l7_eq_0).f_eqPend, ((int)l12_i.value));
+										l20_matched.value = ((Boolean)true);
+									} else {
+										if (Module_polynom.f_mizPolyIsNumeric(((Struct_MizPolynomial)Module_vector.f_getVectorUnsafe((l19_ry).f_polynomialValues, 0)))) {
+											Module_equalizer.f_mizSetContr(l7_eq_0, 16);
+										} else {
+										}
+									}
+								} else {
+								}
+							}
+						}
+					} else {
+					}
+					if (!((boolean)l20_matched.value)) {
+						l12_i.value = ((Integer)(((int)l12_i.value)+1));
+						return null;
+					} else {
+						return null;
+					}
+				};
+				Module_loop.f_while(l15_$13, l16_$14);
+				l1_loop1.value = (Module_mobjects.f_mizNatCount(l0_pend)!=0);
+				return null;
+			};
+			return Module_loop.f_while(l4_$2, l6_$3);
+		} else {
+			return null;
+		}
+	}
+	public static final Object f_mizEquatePolynomials(Struct_MizEqualizer aeq_0) {
+		final Reference<Integer> l0_i1 = ((Reference<Integer>)(new Reference(1)));
+		final Struct_MizEqualizer l4_eq_0 = aeq_0;
+		final Func0<Boolean> l3_$1 = (Func0<Boolean>)() -> {
+			return ((Boolean)(((l4_eq_0).f_contr==0)&&(((int)l0_i1.value)<=Module_equalizer.f_mizTrmNbr(l4_eq_0))));
+		};
+		final Struct_MizEqualizer l6_eq_0 = aeq_0;
+		final Func0<Object> l5_$2 = (Func0<Object>)() -> {
+			final Struct_MizTrmSRec l6_r1 = Module_equalizer.f_mizTrmSAt(l6_eq_0, ((int)l0_i1.value));
+			final Struct l7_gsymswitch93 = (l6_r1).f_eqClass;
+			boolean l8_live1;
+			Struct l9__tmp = l7_gsymswitch93;
+			switch (l9__tmp.getTypeId()) {
+			case 71/*MizTrmNil*/: {
+				l8_live1=false;
+				break;
+			}
+			default: {
+				l8_live1=true;
+				break;
+			}
+			}
+			if ((l8_live1&&(Module_vector.f_sizeVector((l6_r1).f_polynomialValues)>0))) {
+				final Reference<Integer> l11_i2 = ((Reference<Integer>)(new Reference((((int)l0_i1.value)+1))));
+				final Func0<Boolean> l14_$12 = (Func0<Boolean>)() -> {
+					return ((Boolean)(((l6_eq_0).f_contr==0)&&(((int)l11_i2.value)<=Module_equalizer.f_mizTrmNbr(l6_eq_0))));
+				};
+				final Func0<Object> l15_$13 = (Func0<Object>)() -> {
+					final Struct_MizTrmSRec l16_r2 = Module_equalizer.f_mizTrmSAt(l6_eq_0, ((int)l11_i2.value));
+					final Struct l17_gsymswitch94 = (l16_r2).f_eqClass;
+					boolean l18_live2;
+					Struct l19__tmp = l17_gsymswitch94;
+					switch (l19__tmp.getTypeId()) {
+					case 71/*MizTrmNil*/: {
+						l18_live2=false;
+						break;
+					}
+					default: {
+						l18_live2=true;
+						break;
+					}
+					}
+					if ((l18_live2&&(Module_vector.f_sizeVector((l16_r2).f_polynomialValues)>0))) {
+						final Reference<Boolean> l21_hit = ((Reference<Boolean>)(new Reference(false)));
+						final Struct_Vector l24_$23 = (l6_r1).f_polynomialValues;
+						final Func1<Object,Struct_MizPolynomial> l25_$22 = (Func1<Object, Struct_MizPolynomial>)(Struct_MizPolynomial ap1) -> {
+							final Struct_Vector l28_$27 = (l16_r2).f_polynomialValues;
+							final Func1<Object,Struct_MizPolynomial> l29_$26 = (Func1<Object, Struct_MizPolynomial>)(Struct_MizPolynomial ap2) -> {
+								if ((!((boolean)l21_hit.value)&&(Module_polynom.f_mizComparePolynomials(ap1, ap2)==0))) {
+									l21_hit.value = ((Boolean)true);
+									return null;
+								} else {
+									return null;
+								}
+							};
+							return Module_vector.f_iterVector(l28_$27, ((Func1<Object,Object>)(Func1)l29_$26));
+						};
+						Module_vector.f_iterVector(l24_$23, ((Func1<Object,Object>)(Func1)l25_$22));
+						if (((boolean)l21_hit.value)) {
+							Module_equalizer.f_mizUnionTrms(l6_eq_0, ((int)l0_i1.value), ((int)l11_i2.value));
+						} else {
+						}
+					} else {
+					}
+					l11_i2.value = ((Integer)(((int)l11_i2.value)+1));
+					return null;
+				};
+				Module_loop.f_while(l14_$12, l15_$13);
+			} else {
+			}
+			l0_i1.value = ((Integer)(((int)l0_i1.value)+1));
+			return null;
+		};
+		return Module_loop.f_while(l3_$1, l5_$2);
+	}
+	public static final Object f_mizEvalComplexReq(Struct_MizEqualizer aeq_0, int arq, Struct at) {
+		final Struct l0_args = Module_equalizer.f_mizArgsOfE(at);
+		final int l1_ti = Module_equalizer.f_mizTrmInfoOf(at);
+		final int l2_lTrmInfo = Module_equalizer.f_mizClassOf(aeq_0, l1_ti);
+		final Struct_MizEqualizer l4_eq_0 = aeq_0;
+		final Func1<Struct,Struct> l3_valOf = (Func1<Struct, Struct>)(Struct aa) -> {
+			final Struct_MizTrmSRec l4_ra = Module_equalizer.f_mizTrmSAt(l4_eq_0, Module_equalizer.f_mizClassOf(l4_eq_0, Module_equalizer.f_mizTrmInfoOf(aa)));
+			if ((l4_ra).f_numDetermined) {
+				return (new Struct_Some((l4_ra).f_numValue));
+			} else {
+				return ((Struct)SingletonStructs.str_None);
+			}
+		};
+		final Func2<Boolean,Struct_MizComplex, Integer> l5_isInt = (Func2<Boolean, Struct_MizComplex, Integer>)(Struct_MizComplex av, Integer an) -> {
+			return ((Boolean)(((av).f_im==0.0)&&((av).f_re==Module_math.f_i2d(((int)an)))));
+		};
+		if ((arq==Module_builtin.g_rqRealAdd)) {
+			final Struct l6_lt1 = Module_correl.f_mizTrmListNth(l0_args, 0);
+			final Struct l7_lt2 = Module_correl.f_mizTrmListNth(l0_args, 1);
+			final Struct l8_gsymswitch81 = l3_valOf.invoke(l6_lt1);
+			Struct l9__tmp = l8_gsymswitch81;
+			switch (l9__tmp.getTypeId()) {
+			case 90/*Some*/: {
+				final Struct_Some l10__tmp = (Struct_Some)l9__tmp;
+				final Object l11_v1 = l10__tmp.f_value;
+				final Struct_MizComplex l12_v1 = ((Struct_MizComplex)(l10__tmp).f_value);
+				if (((boolean)l5_isInt.invoke(l12_v1, ((Integer)0)))) {
+					Module_equalizer.f_mizUnionTrms(aeq_0, l2_lTrmInfo, Module_equalizer.f_mizTrmInfoOf(l7_lt2));
+				} else {
+				}
+				if (((aeq_0).f_contr==0)) {
+					final Struct l13_gsymswitch82 = l3_valOf.invoke(l7_lt2);
+					Struct l14__tmp = l13_gsymswitch82;
+					switch (l14__tmp.getTypeId()) {
+					case 90/*Some*/: {
+						final Struct_Some l15__tmp = (Struct_Some)l14__tmp;
+						final Object l16_v2 = l15__tmp.f_value;
+						final Struct_MizComplex l17_v2 = ((Struct_MizComplex)(l15__tmp).f_value);
+						return Module_equalizer.f_mizEquateComplexValue(aeq_0, Module_equalizer.f_mizClassOf(aeq_0, l1_ti), (new Struct_MizComplex(((l12_v1).f_re+(l17_v2).f_re), ((l12_v1).f_im+(l17_v2).f_im))));
+					}
+					case 82/*None*/: {
+						return null;
+					}
+					default:
+						throw new RuntimeException("Unexpected struct in switch: "+l14__tmp.getTypeName());
+					}
+				} else {
+					return null;
+				}
+			}
+			case 82/*None*/: {
+				return null;
+			}
+			default:
+				throw new RuntimeException("Unexpected struct in switch: "+l9__tmp.getTypeName());
+			}
+		} else {
+			if ((arq==Module_builtin.g_rqRealMult)) {
+				final Struct l18_lt1 = Module_correl.f_mizTrmListNth(l0_args, 0);
+				final Struct l19_lt2 = Module_correl.f_mizTrmListNth(l0_args, 1);
+				final Struct l20_gsymswitch79 = l3_valOf.invoke(l18_lt1);
+				Struct l21__tmp = l20_gsymswitch79;
+				switch (l21__tmp.getTypeId()) {
+				case 90/*Some*/: {
+					final Struct_Some l22__tmp = (Struct_Some)l21__tmp;
+					final Object l23_v1 = l22__tmp.f_value;
+					final Struct_MizComplex l24_v1 = ((Struct_MizComplex)(l22__tmp).f_value);
+					if (((boolean)l5_isInt.invoke(l24_v1, ((Integer)0)))) {
+						Module_equalizer.f_mizUnionTrms(aeq_0, l1_ti, Module_equalizer.f_mizTrmInfoOf(l18_lt1));
+					} else {
+						if (((boolean)l5_isInt.invoke(l24_v1, ((Integer)1)))) {
+							Module_equalizer.f_mizUnionTrms(aeq_0, l1_ti, Module_equalizer.f_mizTrmInfoOf(l19_lt2));
+						} else {
+						}
+					}
+					if (((aeq_0).f_contr==0)) {
+						final Struct l25_gsymswitch80 = l3_valOf.invoke(l19_lt2);
+						Struct l26__tmp = l25_gsymswitch80;
+						switch (l26__tmp.getTypeId()) {
+						case 90/*Some*/: {
+							final Struct_Some l27__tmp = (Struct_Some)l26__tmp;
+							final Object l28_v2 = l27__tmp.f_value;
+							final Struct_MizComplex l29_v2 = ((Struct_MizComplex)(l27__tmp).f_value);
+							return Module_equalizer.f_mizEquateComplexValue(aeq_0, Module_equalizer.f_mizClassOf(aeq_0, l1_ti), Module_equalizer.f_mizCMul(l24_v1, l29_v2));
+						}
+						case 82/*None*/: {
+							return null;
+						}
+						default:
+							throw new RuntimeException("Unexpected struct in switch: "+l26__tmp.getTypeName());
+						}
+					} else {
+						return null;
+					}
+				}
+				case 82/*None*/: {
+					return null;
+				}
+				default:
+					throw new RuntimeException("Unexpected struct in switch: "+l21__tmp.getTypeName());
+				}
+			} else {
+				if ((arq==Module_builtin.g_rqRealNeg)) {
+					final Struct l30_lt1 = Module_correl.f_mizTrmListNth(l0_args, 0);
+					final Struct l31_gsymswitch78 = l3_valOf.invoke(l30_lt1);
+					Struct l32__tmp = l31_gsymswitch78;
+					switch (l32__tmp.getTypeId()) {
+					case 90/*Some*/: {
+						final Struct_Some l33__tmp = (Struct_Some)l32__tmp;
+						final Object l34_v1 = l33__tmp.f_value;
+						final Struct_MizComplex l35_v1 = ((Struct_MizComplex)(l33__tmp).f_value);
+						return Module_equalizer.f_mizEquateComplexValue(aeq_0, l2_lTrmInfo, (new Struct_MizComplex((-(l35_v1).f_re), (-(l35_v1).f_im))));
+					}
+					case 82/*None*/: {
+						return null;
+					}
+					default:
+						throw new RuntimeException("Unexpected struct in switch: "+l32__tmp.getTypeName());
+					}
+				} else {
+					if ((arq==Module_builtin.g_rqRealInv)) {
+						final Struct l36_lt1 = Module_correl.f_mizTrmListNth(l0_args, 0);
+						final Struct l37_gsymswitch77 = l3_valOf.invoke(l36_lt1);
+						Struct l38__tmp = l37_gsymswitch77;
+						switch (l38__tmp.getTypeId()) {
+						case 90/*Some*/: {
+							final Struct_Some l39__tmp = (Struct_Some)l38__tmp;
+							final Object l40_v1 = l39__tmp.f_value;
+							final Struct_MizComplex l41_v1 = ((Struct_MizComplex)(l39__tmp).f_value);
+							if ((((l41_v1).f_re!=0.0)||((l41_v1).f_im!=0.0))) {
+								return Module_equalizer.f_mizEquateComplexValue(aeq_0, l2_lTrmInfo, Module_equalizer.f_mizCInvE(l41_v1));
+							} else {
+								return null;
+							}
+						}
+						case 82/*None*/: {
+							return null;
+						}
+						default:
+							throw new RuntimeException("Unexpected struct in switch: "+l38__tmp.getTypeName());
+						}
+					} else {
+						if ((arq==Module_builtin.g_rqRealDiff)) {
+							final Struct l42_lt1 = Module_correl.f_mizTrmListNth(l0_args, 0);
+							final Struct l43_lt2 = Module_correl.f_mizTrmListNth(l0_args, 1);
+							final Struct l44_gsymswitch75 = l3_valOf.invoke(l43_lt2);
+							Struct l45__tmp = l44_gsymswitch75;
+							switch (l45__tmp.getTypeId()) {
+							case 90/*Some*/: {
+								final Struct_Some l46__tmp = (Struct_Some)l45__tmp;
+								final Object l47_v2 = l46__tmp.f_value;
+								final Struct_MizComplex l48_v2 = ((Struct_MizComplex)(l46__tmp).f_value);
+								if (((boolean)l5_isInt.invoke(l48_v2, ((Integer)0)))) {
+									Module_equalizer.f_mizUnionTrms(aeq_0, l2_lTrmInfo, Module_equalizer.f_mizTrmInfoOf(l42_lt1));
+								} else {
+								}
+								if (((aeq_0).f_contr==0)) {
+									final Struct l49_gsymswitch76 = l3_valOf.invoke(l42_lt1);
+									Struct l50__tmp = l49_gsymswitch76;
+									switch (l50__tmp.getTypeId()) {
+									case 90/*Some*/: {
+										final Struct_Some l51__tmp = (Struct_Some)l50__tmp;
+										final Object l52_v1 = l51__tmp.f_value;
+										final Struct_MizComplex l53_v1 = ((Struct_MizComplex)(l51__tmp).f_value);
+										return Module_equalizer.f_mizEquateComplexValue(aeq_0, Module_equalizer.f_mizClassOf(aeq_0, l1_ti), (new Struct_MizComplex(((l53_v1).f_re-(l48_v2).f_re), ((l53_v1).f_im-(l48_v2).f_im))));
+									}
+									case 82/*None*/: {
+										return null;
+									}
+									default:
+										throw new RuntimeException("Unexpected struct in switch: "+l50__tmp.getTypeName());
+									}
+								} else {
+									return null;
+								}
+							}
+							case 82/*None*/: {
+								return null;
+							}
+							default:
+								throw new RuntimeException("Unexpected struct in switch: "+l45__tmp.getTypeName());
+							}
+						} else {
+							if ((arq==Module_builtin.g_rqRealDiv)) {
+								final Struct l54_lt1 = Module_correl.f_mizTrmListNth(l0_args, 0);
+								final Struct l55_lt2 = Module_correl.f_mizTrmListNth(l0_args, 1);
+								final Struct l56_gsymswitch72 = l3_valOf.invoke(l54_lt1);
+								Struct l57__tmp = l56_gsymswitch72;
+								switch (l57__tmp.getTypeId()) {
+								case 90/*Some*/: {
+									final Struct_Some l58__tmp = (Struct_Some)l57__tmp;
+									final Object l59_v1 = l58__tmp.f_value;
+									final Struct_MizComplex l60_v1 = ((Struct_MizComplex)(l58__tmp).f_value);
+									if (((boolean)l5_isInt.invoke(l60_v1, ((Integer)0)))) {
+										Module_equalizer.f_mizUnionTrms(aeq_0, l1_ti, Module_equalizer.f_mizTrmInfoOf(l54_lt1));
+									} else {
+									}
+									break;
+								}
+								case 82/*None*/: {
+									break;
+								}
+								default:
+									throw new RuntimeException("Unexpected struct in switch: "+l57__tmp.getTypeName());
+								}
+								if (((aeq_0).f_contr==0)) {
+									final Struct l61_gsymswitch73 = l3_valOf.invoke(l55_lt2);
+									Struct l62__tmp = l61_gsymswitch73;
+									switch (l62__tmp.getTypeId()) {
+									case 90/*Some*/: {
+										final Struct_Some l63__tmp = (Struct_Some)l62__tmp;
+										final Object l64_v2 = l63__tmp.f_value;
+										final Struct_MizComplex l65_v2 = ((Struct_MizComplex)(l63__tmp).f_value);
+										if ((((l65_v2).f_re!=0.0)||((l65_v2).f_im!=0.0))) {
+											final Struct_MizComplex l66_inv = Module_equalizer.f_mizCInvE(l65_v2);
+											if (((boolean)l5_isInt.invoke(l66_inv, ((Integer)1)))) {
+												Module_equalizer.f_mizUnionTrms(aeq_0, l1_ti, Module_equalizer.f_mizTrmInfoOf(l54_lt1));
+											} else {
+											}
+											if (((aeq_0).f_contr==0)) {
+												final Struct l67_gsymswitch74 = l3_valOf.invoke(l54_lt1);
+												Struct l68__tmp = l67_gsymswitch74;
+												switch (l68__tmp.getTypeId()) {
+												case 90/*Some*/: {
+													final Struct_Some l69__tmp = (Struct_Some)l68__tmp;
+													final Object l70_v1 = l69__tmp.f_value;
+													final Struct_MizComplex l71_v1 = ((Struct_MizComplex)(l69__tmp).f_value);
+													return Module_equalizer.f_mizEquateComplexValue(aeq_0, Module_equalizer.f_mizClassOf(aeq_0, l1_ti), Module_equalizer.f_mizCMul(l71_v1, l66_inv));
+												}
+												case 82/*None*/: {
+													return null;
+												}
+												default:
+													throw new RuntimeException("Unexpected struct in switch: "+l68__tmp.getTypeName());
+												}
+											} else {
+												return null;
+											}
+										} else {
+											return null;
+										}
+									}
+									case 82/*None*/: {
+										return null;
+									}
+									default:
+										throw new RuntimeException("Unexpected struct in switch: "+l62__tmp.getTypeName());
+									}
+								} else {
+									return null;
+								}
+							} else {
+								return null;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 	public static final Object f_mizExecuteReduction(Struct_MizEqualizer aeq_0, int aenr, Struct_MizReduction ared) {
 		final Struct l0_t1 = (ared).f_t1;
 		Struct l1_target;
@@ -2446,13 +3068,13 @@ final public class Module_equalizer {
 		}
 		Struct l4__tmp = l1_target;
 		switch (l4__tmp.getTypeId()) {
-		case 88/*Some*/: {
+		case 90/*Some*/: {
 			final Struct_Some l5__tmp = (Struct_Some)l4__tmp;
 			final Object l6_t = l5__tmp.f_value;
 			final Struct l7_t = ((Struct)(l5__tmp).f_value);
 			return Module_equalizer.f_mizUnionTrms(aeq_0, aenr, Module_equalizer.f_mizTrmInfoOf(l7_t));
 		}
-		case 80/*None*/: {
+		case 82/*None*/: {
 			return null;
 		}
 		default:
@@ -2463,10 +3085,10 @@ final public class Module_equalizer {
 		final Struct l0_gsymswitch4 = Module_equalizer.f_mizFuncIdxFind(aeq_0, akind, afuncNr);
 		Struct l1__tmp = l0_gsymswitch4;
 		switch (l1__tmp.getTypeId()) {
-		case 80/*None*/: {
+		case 82/*None*/: {
 			return ((Struct)SingletonStructs.str_None);
 		}
-		case 88/*Some*/: {
+		case 90/*Some*/: {
 			final Struct_Some l2__tmp = (Struct_Some)l1__tmp;
 			final Object l3_v = l2__tmp.f_value;
 			final Struct_Vector l4_v = ((Struct_Vector)(l2__tmp).f_value);
@@ -2499,13 +3121,13 @@ final public class Module_equalizer {
 		final Struct l1_gsymswitch3 = Module_equalizer.f_mizFuncIdxFind(aeq_0, akind, afuncNr);
 		Struct l2__tmp = l1_gsymswitch3;
 		switch (l2__tmp.getTypeId()) {
-		case 88/*Some*/: {
+		case 90/*Some*/: {
 			final Struct_Some l3__tmp = (Struct_Some)l2__tmp;
 			final Object l4_v = l3__tmp.f_value;
 			final Struct_Vector l5_v = ((Struct_Vector)(l3__tmp).f_value);
 			return Module_vector.f_pushVector(l5_v, at);
 		}
-		case 80/*None*/: {
+		case 82/*None*/: {
 			final Struct_Vector l6_v = Module_vector.f_makeVector(4);
 			Module_vector.f_pushVector(l6_v, at);
 			return Module_vector.f_pushVector(l0_idx, (new Struct_Pair(afuncNr, l6_v)));
@@ -2545,7 +3167,7 @@ final public class Module_equalizer {
 			final int l7___ = (l1__tmp).f_trmInfo;
 			return l4_funcNr;
 		}
-		case 59/*MizPrivFuncTrm*/: {
+		case 61/*MizPrivFuncTrm*/: {
 			final Struct_MizPrivFuncTrm l1__tmp = (Struct_MizPrivFuncTrm)l0__tmp;
 			final int l8_funcNr = l1__tmp.f_funcNr;
 			final int l9_funcNr = (l1__tmp).f_funcNr;
@@ -2578,7 +3200,7 @@ final public class Module_equalizer {
 		final Func2<Struct,Struct_MizWithin, Struct> l3_$2 = (Func2<Struct, Struct_MizWithin, Struct>)(Struct_MizWithin al4_0, Struct atrm) -> {
 			Struct l5__tmp = atrm;
 			switch (l5__tmp.getTypeId()) {
-			case 75/*MizVarTrm*/: {
+			case 77/*MizVarTrm*/: {
 				final Struct_MizVarTrm l6__tmp = (Struct_MizVarTrm)l5__tmp;
 				final int l7_s2 = l6__tmp.f_sort;
 				final int l8_v2 = l6__tmp.f_varNr;
@@ -2815,7 +3437,7 @@ final public class Module_equalizer {
 											final Struct l32_gsymswitch33 = l25_cur.value;
 											Struct l33__tmp = l32_gsymswitch33;
 											switch (l33__tmp.getTypeId()) {
-											case 69/*MizTrmNil*/: {
+											case 71/*MizTrmNil*/: {
 												l31_$30=false;
 												break;
 											}
@@ -2833,7 +3455,7 @@ final public class Module_equalizer {
 										final Struct l30_gsymswitch34 = l25_cur.value;
 										Struct l31__tmp = l30_gsymswitch34;
 										switch (l31__tmp.getTypeId()) {
-										case 68/*MizTrmElem*/: {
+										case 70/*MizTrmElem*/: {
 											final Struct_MizTrmElem l32__tmp = (Struct_MizTrmElem)l31__tmp;
 											final Struct l33_member = l32__tmp.f_trm;
 											final Struct l34_next = l32__tmp.f_next;
@@ -2871,7 +3493,7 @@ final public class Module_equalizer {
 											l25_cur.value = l36_next;
 											return null;
 										}
-										case 69/*MizTrmNil*/: {
+										case 71/*MizTrmNil*/: {
 											return null;
 										}
 										default:
@@ -2957,7 +3579,18 @@ final public class Module_equalizer {
 									return null;
 								}
 							};
-							return Module_vector.f_iterVector(l17_terms, ((Func1<Object,Object>)(Func1)l25_$24));
+							Module_vector.f_iterVector(l17_terms, ((Func1<Object,Object>)(Func1)l25_$24));
+						} else {
+						}
+						if ((((l7_eq_0).f_contr==0)&&((((((l21_rq==Module_builtin.g_rqRealAdd)||(l21_rq==Module_builtin.g_rqRealMult))||(l21_rq==Module_builtin.g_rqRealNeg))||(l21_rq==Module_builtin.g_rqRealInv))||(l21_rq==Module_builtin.g_rqRealDiff))||(l21_rq==Module_builtin.g_rqRealDiv)))) {
+							final Func1<Object,Struct> l27_$26 = (Func1<Object, Struct>)(Struct at) -> {
+								if (((l7_eq_0).f_contr==0)) {
+									return Module_equalizer.f_mizEvalComplexReq(l7_eq_0, l21_rq, at);
+								} else {
+									return null;
+								}
+							};
+							return Module_vector.f_iterVector(l17_terms, ((Func1<Object,Object>)(Func1)l27_$26));
 						} else {
 							return null;
 						}
@@ -3037,7 +3670,7 @@ final public class Module_equalizer {
 					boolean l11_live;
 					Struct l12__tmp = l10_gsymswitch23;
 					switch (l12__tmp.getTypeId()) {
-					case 69/*MizTrmNil*/: {
+					case 71/*MizTrmNil*/: {
 						l11_live=false;
 						break;
 					}
@@ -3050,7 +3683,7 @@ final public class Module_equalizer {
 						final Struct l14_gsymswitch24 = Module_equalizer.f_mizGetAttr(l2_eq_0, (l9_rec).f_superCluster, l3_aRq, ((Struct)SingletonStructs.str_MizTrmNil));
 						Struct l15__tmp = l14_gsymswitch24;
 						switch (l15__tmp.getTypeId()) {
-						case 88/*Some*/: {
+						case 90/*Some*/: {
 							final Struct_Some l16__tmp = (Struct_Some)l15__tmp;
 							final Object l17_a = l16__tmp.f_value;
 							final Struct_MizAttr l18_a = ((Struct_MizAttr)(l16__tmp).f_value);
@@ -3064,7 +3697,7 @@ final public class Module_equalizer {
 							}
 							break;
 						}
-						case 80/*None*/: {
+						case 82/*None*/: {
 							break;
 						}
 						default:
@@ -3083,6 +3716,200 @@ final public class Module_equalizer {
 		l1_doOne.invoke(((Integer)Module_builtin.g_rqEmpty), ((Integer)Module_builtin.g_rqEmptySet));
 		return l1_doOne.invoke(((Integer)Module_builtin.g_rqZero), ((Integer)Module_builtin.g_rqZeroNumber));
 	}
+	public static final Object f_mizInitPolynomialValues(Struct_MizEqualizer aeq_0) {
+		final Struct_MizCorrelEnv l0_env = (aeq_0).f_env;
+		if ((Module_builtin.f_mizBuiltIn((l0_env).f_builtIn, Module_builtin.g_rqComplex)!=0)) {
+			final Struct_MizNatFunc l1_pend = Module_mobjects.f_mizInitNatSet(8);
+			final Struct_MizComplex l2_cOne = (new Struct_MizComplex(1.0, 0.0));
+			final Reference<Integer> l3_t = ((Reference<Integer>)(new Reference(1)));
+			final Struct_MizEqualizer l7_eq_0 = aeq_0;
+			final Func0<Boolean> l6_$4 = (Func0<Boolean>)() -> {
+				return (((int)l3_t.value)<=Module_equalizer.f_mizTrmNbr(l7_eq_0));
+			};
+			final Struct_MizEqualizer l9_eq_0 = aeq_0;
+			final Func0<Object> l8_$5 = (Func0<Object>)() -> {
+				final Struct_MizTrmSRec l9_rec = Module_equalizer.f_mizTrmSAt(l9_eq_0, ((int)l3_t.value));
+				final Struct l10_gsymswitch89 = (l9_rec).f_eqClass;
+				boolean l11_live;
+				Struct l12__tmp = l10_gsymswitch89;
+				switch (l12__tmp.getTypeId()) {
+				case 71/*MizTrmNil*/: {
+					l11_live=false;
+					break;
+				}
+				default: {
+					l11_live=true;
+					break;
+				}
+				}
+				if (l11_live) {
+					final int l14_tt = ((int)l3_t.value);
+					final Reference<Struct> l15_cur = ((Reference<Struct>)(new Reference((l9_rec).f_eqClass)));
+					final Func0<Boolean> l18_$16 = (Func0<Boolean>)() -> {
+						final Struct l19_gsymswitch90 = l15_cur.value;
+						Struct l20__tmp = l19_gsymswitch90;
+						switch (l20__tmp.getTypeId()) {
+						case 71/*MizTrmNil*/: {
+							return ((Boolean)false);
+						}
+						default: {
+							return ((Boolean)true);
+						}
+						}
+					};
+					final Func0<Object> l19_$17 = (Func0<Object>)() -> {
+						final Struct l20_gsymswitch91 = l15_cur.value;
+						Struct l21__tmp = l20_gsymswitch91;
+						switch (l21__tmp.getTypeId()) {
+						case 70/*MizTrmElem*/: {
+							final Struct_MizTrmElem l22__tmp = (Struct_MizTrmElem)l21__tmp;
+							final Struct l23_trm = l22__tmp.f_trm;
+							final Struct l24_next = l22__tmp.f_next;
+							final Struct l25_trm = (l22__tmp).f_trm;
+							final Struct l26_next = (l22__tmp).f_next;
+							final int l27_srt = Module_correl.f_mizTrmSort(l25_trm);
+							if (((((((l27_srt==Module_lexicon.g_ikTrmSchFunc)||(l27_srt==Module_lexicon.g_ikTrmPrivFunc))||(l27_srt==Module_lexicon.g_ikTrmAggreg))||(l27_srt==Module_lexicon.g_ikTrmSelector))||(l27_srt==Module_lexicon.g_ikTrmFraenkel))||(l27_srt==Module_lexicon.g_ikTrmEqConst))) {
+								if (Module_equalizer.f_mizIsComplexNumberE(l9_eq_0, (l9_rec).f_superCluster)) {
+									Module_equalizer.f_mizPolyValInsert((l9_rec).f_polynomialValues, Module_polynom.f_mizPolyWithMonomial(l2_cOne, l14_tt));
+								} else {
+								}
+							} else {
+								if ((l27_srt==Module_lexicon.g_ikTrmInfConst)) {
+									if ((l9_rec).f_numDetermined) {
+										Module_equalizer.f_mizPolyValInsert((l9_rec).f_polynomialValues, Module_polynom.f_mizPolyWithNumeric((l9_rec).f_numValue));
+										Module_mobjects.f_mizNatInsertElem(l1_pend, l14_tt);
+									} else {
+										if (Module_equalizer.f_mizIsComplexNumberE(l9_eq_0, (l9_rec).f_superCluster)) {
+											if ((Module_vector.f_sizeVector((l9_rec).f_polynomialValues)==0)) {
+												Module_equalizer.f_mizPolyValInsert((l9_rec).f_polynomialValues, Module_polynom.f_mizPolyWithMonomial(l2_cOne, l14_tt));
+											} else {
+											}
+										} else {
+										}
+									}
+								} else {
+									if ((l27_srt==Module_lexicon.g_ikTrmFunctor)) {
+										final Struct_MizFuncTrm l28_ft = Module_equalizer.f_mizEqAsFunc(l25_trm);
+										final int l29_rq = Module_equalizer.f_mizRevReqPub((l9_eq_0).f_idn, (l28_ft).f_funcNr);
+										if ((l29_rq==Module_builtin.g_rqImaginaryUnit)) {
+											Module_equalizer.f_mizPolyValInsert((l9_rec).f_polynomialValues, Module_polynom.f_mizPolyWithNumeric((new Struct_MizComplex(0.0, 1.0))));
+											Module_mobjects.f_mizNatInsertElem(l1_pend, l14_tt);
+										} else {
+											if ((((l29_rq==Module_builtin.g_rqRealAdd)||(l29_rq==Module_builtin.g_rqRealMult))||(l29_rq==Module_builtin.g_rqRealDiff))) {
+												final int l30_a1 = Module_equalizer.f_mizClassOf(l9_eq_0, Module_equalizer.f_mizTrmInfoOf(Module_correl.f_mizTrmListNth((l28_ft).f_args, 0)));
+												final int l31_a2 = Module_equalizer.f_mizClassOf(l9_eq_0, Module_equalizer.f_mizTrmInfoOf(Module_correl.f_mizTrmListNth((l28_ft).f_args, 1)));
+												final Struct_MizPolynomial l32_p1 = Module_polynom.f_mizPolyWithMonomial(l2_cOne, l30_a1);
+												final Struct_MizPolynomial l33_p2 = Module_polynom.f_mizPolyWithMonomial(l2_cOne, l31_a2);
+												Struct_MizPolynomial l34_pv;
+												if ((l29_rq==Module_builtin.g_rqRealAdd)) {
+													l34_pv=Module_polynom.f_mizAddPolynomials(l32_p1, l33_p2);
+												} else {
+													if ((l29_rq==Module_builtin.g_rqRealMult)) {
+														l34_pv=Module_polynom.f_mizMultPolynomials(l32_p1, l33_p2);
+													} else {
+														l34_pv=Module_polynom.f_mizDiffPolynomials(l32_p1, l33_p2);
+													}
+												}
+												Module_equalizer.f_mizPolyValInsert((l9_rec).f_polynomialValues, l34_pv);
+												Module_mobjects.f_mizNatInsertElem(l1_pend, l14_tt);
+											} else {
+												if ((l29_rq==Module_builtin.g_rqRealNeg)) {
+													final int l35_a1 = Module_equalizer.f_mizClassOf(l9_eq_0, Module_equalizer.f_mizTrmInfoOf(Module_correl.f_mizTrmListNth((l28_ft).f_args, 0)));
+													final Struct_MizPolynomial l36_p1 = Module_polynom.f_mizPolyWithMonomial(l2_cOne, l35_a1);
+													Module_equalizer.f_mizPolyValInsert((l9_rec).f_polynomialValues, Module_polynom.f_mizNMultPolynomial((new Struct_MizComplex((-1.0), 0.0)), l36_p1));
+													Module_mobjects.f_mizNatInsertElem(l1_pend, l14_tt);
+												} else {
+													if ((l29_rq==Module_builtin.g_rqRealInv)) {
+														Module_equalizer.f_mizPolyValInsert((l9_rec).f_polynomialValues, Module_polynom.f_mizPolyWithMonomial(l2_cOne, l14_tt));
+													} else {
+														if ((l29_rq==Module_builtin.g_rqRealDiv)) {
+															final int l37_a1 = Module_equalizer.f_mizClassOf(l9_eq_0, Module_equalizer.f_mizTrmInfoOf(Module_correl.f_mizTrmListNth((l28_ft).f_args, 0)));
+															final Struct_MizTrmSRec l38_a2r = Module_equalizer.f_mizTrmSAt(l9_eq_0, Module_equalizer.f_mizClassOf(l9_eq_0, Module_equalizer.f_mizTrmInfoOf(Module_correl.f_mizTrmListNth((l28_ft).f_args, 1))));
+															Struct l39_inv;
+															if (((l38_a2r).f_numDetermined&&!((((l38_a2r).f_numValue).f_re==0.0)&&(((l38_a2r).f_numValue).f_im==0.0)))) {
+																final double l40_d = ((((l38_a2r).f_numValue).f_re*((l38_a2r).f_numValue).f_re)+(((l38_a2r).f_numValue).f_im*((l38_a2r).f_numValue).f_im));
+																l39_inv=(new Struct_Some((new Struct_MizComplex((((l38_a2r).f_numValue).f_re/l40_d), ((-((l38_a2r).f_numValue).f_im)/l40_d)))));
+															} else {
+																l39_inv=((Struct)SingletonStructs.str_None);
+															}
+															Struct l41__tmp = l39_inv;
+															switch (l41__tmp.getTypeId()) {
+															case 90/*Some*/: {
+																final Struct_Some l42__tmp = (Struct_Some)l41__tmp;
+																final Object l43_iv = l42__tmp.f_value;
+																final Struct_MizComplex l44_iv = ((Struct_MizComplex)(l42__tmp).f_value);
+																final Struct_MizPolynomial l45_p1 = Module_polynom.f_mizPolyWithMonomial(l2_cOne, l37_a1);
+																Module_equalizer.f_mizPolyValInsert((l9_rec).f_polynomialValues, Module_polynom.f_mizNMultPolynomial(l44_iv, l45_p1));
+																Module_mobjects.f_mizNatInsertElem(l1_pend, l14_tt);
+																break;
+															}
+															case 82/*None*/: {
+																Module_equalizer.f_mizPolyValInsert((l9_rec).f_polynomialValues, Module_polynom.f_mizPolyWithMonomial(l2_cOne, l14_tt));
+																break;
+															}
+															default:
+																throw new RuntimeException("Unexpected struct in switch: "+l41__tmp.getTypeName());
+															}
+														} else {
+															if ((l9_rec).f_numDetermined) {
+																Module_equalizer.f_mizPolyValInsert((l9_rec).f_polynomialValues, Module_polynom.f_mizPolyWithNumeric((l9_rec).f_numValue));
+																Module_mobjects.f_mizNatInsertElem(l1_pend, l14_tt);
+															} else {
+																if (Module_equalizer.f_mizIsComplexNumberE(l9_eq_0, (l9_rec).f_superCluster)) {
+																	Module_equalizer.f_mizPolyValInsert((l9_rec).f_polynomialValues, Module_polynom.f_mizPolyWithMonomial(l2_cOne, l14_tt));
+																} else {
+																}
+															}
+														}
+													}
+												}
+											}
+										}
+									} else {
+									}
+								}
+							}
+							l15_cur.value = l26_next;
+							return null;
+						}
+						case 71/*MizTrmNil*/: {
+							return null;
+						}
+						default:
+							throw new RuntimeException("Unexpected struct in switch: "+l21__tmp.getTypeName());
+						}
+					};
+					Module_loop.f_while(l18_$16, l19_$17);
+					if ((Module_vector.f_sizeVector((l9_rec).f_polynomialValues)>1)) {
+						final Reference<Integer> l20_k = ((Reference<Integer>)(new Reference(0)));
+						final Reference<Boolean> l21_done1 = ((Reference<Boolean>)(new Reference(false)));
+						final Func0<Boolean> l24_$22 = (Func0<Boolean>)() -> {
+							return ((Boolean)(!((boolean)l21_done1.value)&&(((int)l20_k.value)<Module_vector.f_sizeVector((l9_rec).f_polynomialValues))));
+						};
+						final Func0<Object> l25_$23 = (Func0<Object>)() -> {
+							if ((Module_polynom.f_mizPolyIsVariable(((Struct_MizPolynomial)Module_vector.f_getVectorUnsafe((l9_rec).f_polynomialValues, ((int)l20_k.value))))==l14_tt)) {
+								Module_vector.f_removeVector((l9_rec).f_polynomialValues, ((int)l20_k.value));
+								l21_done1.value = ((Boolean)true);
+								return null;
+							} else {
+								l20_k.value = ((Integer)(((int)l20_k.value)+1));
+								return null;
+							}
+						};
+						Module_loop.f_while(l24_$22, l25_$23);
+					} else {
+					}
+				} else {
+				}
+				l3_t.value = ((Integer)(((int)l3_t.value)+1));
+				return null;
+			};
+			Module_loop.f_while(l6_$4, l8_$5);
+			return Module_equalizer.f_mizSubstitutePendingVars(aeq_0, l1_pend);
+		} else {
+			return null;
+		}
+	}
 	public static final Object f_mizInitStructuresInEqClass(Struct_MizEqualizer aeq_0) {
 		final Struct_MizCorrelEnv l0_env = (aeq_0).f_env;
 		final Reference<Integer> l1_ii = ((Reference<Integer>)(new Reference(1)));
@@ -3097,7 +3924,7 @@ final public class Module_equalizer {
 			boolean l9_live;
 			Struct l10__tmp = l8_gsymswitch25;
 			switch (l10__tmp.getTypeId()) {
-			case 69/*MizTrmNil*/: {
+			case 71/*MizTrmNil*/: {
 				l9_live=false;
 				break;
 			}
@@ -3116,7 +3943,7 @@ final public class Module_equalizer {
 						final Struct l19_gsymswitch26 = (l17_ca).f_typ;
 						Struct l20__tmp = l19_gsymswitch26;
 						switch (l20__tmp.getTypeId()) {
-						case 88/*Some*/: {
+						case 90/*Some*/: {
 							final Struct_Some l21__tmp = (Struct_Some)l20__tmp;
 							final Object l22_ct = l21__tmp.f_value;
 							final Struct_MizTyp l23_ct = ((Struct_MizTyp)(l21__tmp).f_value);
@@ -3131,7 +3958,7 @@ final public class Module_equalizer {
 								}
 							}
 						}
-						case 80/*None*/: {
+						case 82/*None*/: {
 							return null;
 						}
 						default:
@@ -3149,8 +3976,142 @@ final public class Module_equalizer {
 		};
 		return Module_loop.f_while(l4_$2, l6_$3);
 	}
+	public static final Object f_mizInitSuperClusterForComplex(Struct_MizEqualizer aeq_0) {
+		final Struct_MizCorrelEnv l0_env = (aeq_0).f_env;
+		if ((Module_builtin.f_mizBuiltIn((l0_env).f_builtIn, Module_builtin.g_rqComplex)!=0)) {
+			final Reference<Integer> l1_ii = ((Reference<Integer>)(new Reference(1)));
+			final Struct_MizEqualizer l5_eq_0 = aeq_0;
+			final Func0<Boolean> l4_$2 = (Func0<Boolean>)() -> {
+				return ((Boolean)(((l5_eq_0).f_contr==0)&&(((int)l1_ii.value)<=Module_equalizer.f_mizTrmNbr(l5_eq_0))));
+			};
+			final Struct_MizEqualizer l7_eq_0 = aeq_0;
+			final Func0<Object> l6_$3 = (Func0<Object>)() -> {
+				final Struct_MizTrmSRec l7_rec = Module_equalizer.f_mizTrmSAt(l7_eq_0, ((int)l1_ii.value));
+				final Reference<Struct> l8_cur = ((Reference<Struct>)(new Reference((l7_rec).f_eqClass)));
+				final Func0<Boolean> l11_$9 = (Func0<Boolean>)() -> {
+					boolean l14_$13;
+					if (((l7_eq_0).f_contr==0)) {
+						final Struct l15_gsymswitch84 = l8_cur.value;
+						Struct l16__tmp = l15_gsymswitch84;
+						switch (l16__tmp.getTypeId()) {
+						case 71/*MizTrmNil*/: {
+							l14_$13=false;
+							break;
+						}
+						default: {
+							l14_$13=true;
+							break;
+						}
+						}
+					} else {
+						l14_$13=false;
+					}
+					return ((Boolean)l14_$13);
+				};
+				final Func0<Object> l12_$10 = (Func0<Object>)() -> {
+					final Struct l13_gsymswitch85 = l8_cur.value;
+					Struct l14__tmp = l13_gsymswitch85;
+					switch (l14__tmp.getTypeId()) {
+					case 70/*MizTrmElem*/: {
+						final Struct_MizTrmElem l15__tmp = (Struct_MizTrmElem)l14__tmp;
+						final Struct l16_trm = l15__tmp.f_trm;
+						final Struct l17_next = l15__tmp.f_next;
+						final Struct l18_trm = (l15__tmp).f_trm;
+						final Struct l19_next = (l15__tmp).f_next;
+						Struct l20__tmp = l18_trm;
+						switch (l20__tmp.getTypeId()) {
+						case 77/*MizVarTrm*/: {
+							final Struct_MizVarTrm l21__tmp = (Struct_MizVarTrm)l20__tmp;
+							final int l22_srt = l21__tmp.f_sort;
+							final int l23_srt = (l21__tmp).f_sort;
+							final int l24___ = (l21__tmp).f_varNr;
+							final int l25___ = (l21__tmp).f_pattNr;
+							final int l26___ = (l21__tmp).f_trmInfo;
+							if (((l23_srt==Module_lexicon.g_ikTrmInfConst)&&(l7_rec).f_numDetermined)) {
+								Module_equalizer.f_mizInsertComplexE(l7_eq_0, ((int)l1_ii.value));
+							} else {
+							}
+							break;
+						}
+						case 45/*MizFuncTrm*/: {
+							final Struct_MizFuncTrm l21__tmp = (Struct_MizFuncTrm)l20__tmp;
+							final int l27_srt = l21__tmp.f_sort;
+							final int l28_funcNr = l21__tmp.f_funcNr;
+							final Struct l29_args = l21__tmp.f_args;
+							final int l30_srt = (l21__tmp).f_sort;
+							final int l31_funcNr = (l21__tmp).f_funcNr;
+							final Struct l32_args = (l21__tmp).f_args;
+							final int l33___ = (l21__tmp).f_pattNr;
+							final int l34___ = (l21__tmp).f_trmInfo;
+							if ((l30_srt==Module_lexicon.g_ikTrmFunctor)) {
+								final int l35_rq = Module_equalizer.f_mizRevReqPub((l7_eq_0).f_idn, l31_funcNr);
+								if ((l35_rq==Module_builtin.g_rqImaginaryUnit)) {
+									Module_equalizer.f_mizInsertComplexE(l7_eq_0, ((int)l1_ii.value));
+								} else {
+									if (((((l35_rq==Module_builtin.g_rqRealAdd)||(l35_rq==Module_builtin.g_rqRealMult))||(l35_rq==Module_builtin.g_rqRealDiff))||(l35_rq==Module_builtin.g_rqRealDiv))) {
+										Module_equalizer.f_mizInsertComplexE(l7_eq_0, Module_equalizer.f_mizClassOf(l7_eq_0, Module_equalizer.f_mizTrmInfoOf(Module_correl.f_mizTrmListNth(l32_args, 0))));
+										if (((l7_eq_0).f_contr==0)) {
+											Module_equalizer.f_mizInsertComplexE(l7_eq_0, Module_equalizer.f_mizClassOf(l7_eq_0, Module_equalizer.f_mizTrmInfoOf(Module_correl.f_mizTrmListNth(l32_args, 1))));
+										} else {
+										}
+										if (((l7_eq_0).f_contr==0)) {
+											Module_equalizer.f_mizInsertComplexE(l7_eq_0, ((int)l1_ii.value));
+										} else {
+										}
+									} else {
+										if (((l35_rq==Module_builtin.g_rqRealNeg)||(l35_rq==Module_builtin.g_rqRealInv))) {
+											Module_equalizer.f_mizInsertComplexE(l7_eq_0, Module_equalizer.f_mizClassOf(l7_eq_0, Module_equalizer.f_mizTrmInfoOf(Module_correl.f_mizTrmListNth(l32_args, 0))));
+											if (((l7_eq_0).f_contr==0)) {
+												Module_equalizer.f_mizInsertComplexE(l7_eq_0, ((int)l1_ii.value));
+											} else {
+											}
+										} else {
+										}
+									}
+								}
+							} else {
+							}
+							break;
+						}
+						default: {
+							break;
+						}
+						}
+						l8_cur.value = l19_next;
+						return null;
+					}
+					case 71/*MizTrmNil*/: {
+						return null;
+					}
+					default:
+						throw new RuntimeException("Unexpected struct in switch: "+l14__tmp.getTypeName());
+					}
+				};
+				Module_loop.f_while(l11_$9, l12_$10);
+				l1_ii.value = ((Integer)(((int)l1_ii.value)+1));
+				return null;
+			};
+			return Module_loop.f_while(l4_$2, l6_$3);
+		} else {
+			return null;
+		}
+	}
 	public static final Object f_mizInsertAttrE(Struct_MizEqualizer aeq_0, Struct_MizAttrColl ac, int aattrNr, int aneg, Struct aargs) {
 		return Module_correl.f_mizAttrCollInsert((aeq_0).f_env, ac, (new Struct_MizAttr(aneg, aattrNr, aargs, false, 0)));
+	}
+	public static final Object f_mizInsertComplexE(Struct_MizEqualizer aeq_0, int anr) {
+		final int l0_rqC = Module_builtin.f_mizBuiltIn(((aeq_0).f_env).f_builtIn, Module_builtin.g_rqComplex);
+		final Struct_MizTrmSRec l1_rec = Module_equalizer.f_mizTrmSAt(aeq_0, Module_equalizer.f_mizClassOf(aeq_0, anr));
+		if (!Module_equalizer.f_mizIsComplexNumberE(aeq_0, (l1_rec).f_superCluster)) {
+			Module_equalizer.f_mizInsertAttrE(aeq_0, (l1_rec).f_superCluster, l0_rqC, 1, ((Struct)SingletonStructs.str_MizTrmNil));
+			if (!((l1_rec).f_superCluster).f_consistent) {
+				return Module_equalizer.f_mizSetContr(aeq_0, 13);
+			} else {
+				return null;
+			}
+		} else {
+			return null;
+		}
 	}
 	public static final Object f_mizInsertNonEmpty(Struct_MizEqualizer aeq_0, int ai1, int ai2) {
 		final Struct_MizCorrelEnv l0_env = (aeq_0).f_env;
@@ -3159,7 +4120,7 @@ final public class Module_equalizer {
 			final Struct l2_gsymswitch19 = Module_equalizer.f_mizGetAttr(aeq_0, (Module_equalizer.f_mizTrmSAt(aeq_0, ai1)).f_superCluster, l1_rqE, ((Struct)SingletonStructs.str_MizTrmNil));
 			Struct l3__tmp = l2_gsymswitch19;
 			switch (l3__tmp.getTypeId()) {
-			case 88/*Some*/: {
+			case 90/*Some*/: {
 				final Struct_Some l4__tmp = (Struct_Some)l3__tmp;
 				final Object l5_a = l4__tmp.f_value;
 				final Struct_MizAttr l6_a = ((Struct_MizAttr)(l4__tmp).f_value);
@@ -3174,7 +4135,7 @@ final public class Module_equalizer {
 					return null;
 				}
 			}
-			case 80/*None*/: {
+			case 82/*None*/: {
 				return null;
 			}
 			default:
@@ -3194,7 +4155,7 @@ final public class Module_equalizer {
 			final Struct l2_gsymswitch20 = Module_equalizer.f_mizGetAttr(aeq_0, (Module_equalizer.f_mizTrmSAt(aeq_0, ai1)).f_superCluster, l1_rqZ, ((Struct)SingletonStructs.str_MizTrmNil));
 			Struct l3__tmp = l2_gsymswitch20;
 			switch (l3__tmp.getTypeId()) {
-			case 88/*Some*/: {
+			case 90/*Some*/: {
 				final Struct_Some l4__tmp = (Struct_Some)l3__tmp;
 				final Object l5_a = l4__tmp.f_value;
 				final Struct_MizAttr l6_a = ((Struct_MizAttr)(l4__tmp).f_value);
@@ -3209,7 +4170,7 @@ final public class Module_equalizer {
 					return null;
 				}
 			}
-			case 80/*None*/: {
+			case 82/*None*/: {
 				return null;
 			}
 			default:
@@ -3283,14 +4244,14 @@ final public class Module_equalizer {
 					final Struct l17_gsymswitch0 = Module_correl_inst.f_mizWidening(l0_env, l2_fTyp.value);
 					Struct l18__tmp = l17_gsymswitch0;
 					switch (l18__tmp.getTypeId()) {
-					case 88/*Some*/: {
+					case 90/*Some*/: {
 						final Struct_Some l19__tmp = (Struct_Some)l18__tmp;
 						final Object l20_w = l19__tmp.f_value;
 						final Struct_MizTyp l21_w = ((Struct_MizTyp)(l19__tmp).f_value);
 						l2_fTyp.value = l21_w;
 						return null;
 					}
-					case 80/*None*/: {
+					case 82/*None*/: {
 						l3_stop.value = ((Boolean)true);
 						return null;
 					}
@@ -3343,6 +4304,24 @@ final public class Module_equalizer {
 		};
 		return Module_loop.f_while(l14_$12, l15_$13);
 	}
+	public static final boolean f_mizIsComplexNumberE(Struct_MizEqualizer aeq_0, Struct_MizAttrColl asc) {
+		final int l0_rqC = Module_builtin.f_mizBuiltIn(((aeq_0).f_env).f_builtIn, Module_builtin.g_rqComplex);
+		final Struct l1_gsymswitch83 = Module_equalizer.f_mizGetAttr(aeq_0, asc, l0_rqC, ((Struct)SingletonStructs.str_MizTrmNil));
+		Struct l2__tmp = l1_gsymswitch83;
+		switch (l2__tmp.getTypeId()) {
+		case 90/*Some*/: {
+			final Struct_Some l3__tmp = (Struct_Some)l2__tmp;
+			final Object l4_a = l3__tmp.f_value;
+			final Struct_MizAttr l5_a = ((Struct_MizAttr)(l3__tmp).f_value);
+			return ((l5_a).f_neg==1);
+		}
+		case 82/*None*/: {
+			return false;
+		}
+		default:
+			throw new RuntimeException("Unexpected struct in switch: "+l2__tmp.getTypeName());
+		}
+	}
 	public static final boolean f_mizIsItEmptySet(Struct_MizEqualizer aeq_0, Struct acls) {
 		final Struct_MizCorrelEnv l0_env = (aeq_0).f_env;
 		final int l1_rqES = Module_builtin.f_mizBuiltIn((l0_env).f_builtIn, Module_builtin.g_rqEmptySet);
@@ -3354,7 +4333,7 @@ final public class Module_equalizer {
 				final Struct l10_gsymswitch31 = l3_cur.value;
 				Struct l11__tmp = l10_gsymswitch31;
 				switch (l11__tmp.getTypeId()) {
-				case 69/*MizTrmNil*/: {
+				case 71/*MizTrmNil*/: {
 					l9_$8=false;
 					break;
 				}
@@ -3372,7 +4351,7 @@ final public class Module_equalizer {
 			final Struct l8_gsymswitch32 = l3_cur.value;
 			Struct l9__tmp = l8_gsymswitch32;
 			switch (l9__tmp.getTypeId()) {
-			case 68/*MizTrmElem*/: {
+			case 70/*MizTrmElem*/: {
 				final Struct_MizTrmElem l10__tmp = (Struct_MizTrmElem)l9__tmp;
 				final Struct l11_trm = l10__tmp.f_trm;
 				final Struct l12_next = l10__tmp.f_next;
@@ -3402,7 +4381,7 @@ final public class Module_equalizer {
 				l3_cur.value = l14_next;
 				return null;
 			}
-			case 69/*MizTrmNil*/: {
+			case 71/*MizTrmNil*/: {
 				return null;
 			}
 			default:
@@ -3428,13 +4407,13 @@ final public class Module_equalizer {
 			final Func1<Integer,Struct> l9_negOf = (Func1<Integer, Struct>)(Struct am) -> {
 				Struct l10__tmp = am;
 				switch (l10__tmp.getTypeId()) {
-				case 88/*Some*/: {
+				case 90/*Some*/: {
 					final Struct_Some l11__tmp = (Struct_Some)l10__tmp;
 					final Object l12_a = l11__tmp.f_value;
 					final Struct_MizAttr l13_a = ((Struct_MizAttr)(l11__tmp).f_value);
 					return ((Integer)(l13_a).f_neg);
 				}
-				case 80/*None*/: {
+				case 82/*None*/: {
 					return ((Integer)(-1));
 				}
 				default:
@@ -3469,9 +4448,8 @@ final public class Module_equalizer {
 				} else {
 				}
 				if ((((aeq_0).f_contr==0)&&(((int)l9_negOf.invoke(l7_att.invoke(l6_scR, ((Integer)l1_rqPos))))==0))) {
-					return l10_ins.invoke(l5_scL, ((Integer)l1_rqPos), ((Integer)0), ((Integer)29));
+					l10_ins.invoke(l5_scL, ((Integer)l1_rqPos), ((Integer)0), ((Integer)29));
 				} else {
-					return null;
 				}
 			} else {
 				if ((((int)l9_negOf.invoke(l7_att.invoke(l5_scL, ((Integer)l1_rqPos))))==0)) {
@@ -3479,10 +4457,33 @@ final public class Module_equalizer {
 				} else {
 				}
 				if ((((aeq_0).f_contr==0)&&(((int)l9_negOf.invoke(l7_att.invoke(l6_scR, ((Integer)l2_rqNeg))))==0))) {
-					return l10_ins.invoke(l5_scL, ((Integer)l1_rqPos), ((Integer)1), ((Integer)38));
+					l10_ins.invoke(l5_scL, ((Integer)l1_rqPos), ((Integer)1), ((Integer)38));
 				} else {
-					return null;
 				}
+			}
+		} else {
+		}
+		if (((aeq_0).f_contr==0)) {
+			final Struct l13_lLeft2 = Module_correl.f_mizTrmListNth(aargs, 0);
+			final Struct l14_lRight2 = Module_correl.f_mizTrmListNth(aargs, 1);
+			final Struct_MizTrmSRec l15_rl = Module_equalizer.f_mizTrmSAt(aeq_0, Module_equalizer.f_mizClassOf(aeq_0, Module_equalizer.f_mizTrmInfoOf(l13_lLeft2)));
+			final Struct_MizTrmSRec l16_rr = Module_equalizer.f_mizTrmSAt(aeq_0, Module_equalizer.f_mizClassOf(aeq_0, Module_equalizer.f_mizTrmInfoOf(l14_lRight2)));
+			if (((((l15_rl).f_numDetermined&&(l16_rr).f_numDetermined)&&(((l15_rl).f_numValue).f_im==0.0))&&(((l16_rr).f_numValue).f_im==0.0))) {
+				if (apositive) {
+					if ((((l15_rl).f_numValue).f_re>((l16_rr).f_numValue).f_re)) {
+						return Module_equalizer.f_mizSetContr(aeq_0, 32);
+					} else {
+						return null;
+					}
+				} else {
+					if ((((l15_rl).f_numValue).f_re<=((l16_rr).f_numValue).f_re)) {
+						return Module_equalizer.f_mizSetContr(aeq_0, 39);
+					} else {
+						return null;
+					}
+				}
+			} else {
+				return null;
 			}
 		} else {
 			return null;
@@ -3498,7 +4499,7 @@ final public class Module_equalizer {
 		};
 		Module_runtime.f_fori(0, 4, l2_$1);
 		final Struct_Vector l3_ts = Module_vector.f_makeVector(64);
-		Module_vector.f_pushVector(l3_ts, (new Struct_MizTrmSRec(Module_correl.f_mizNewIncorTrm(), false, (new Struct_MizComplex(0.0, 0.0)), ((Struct)SingletonStructs.str_MizTrmNil), Module_vector.f_makeVector(0), Module_correl.f_mizNewEmptyCluster())));
+		Module_vector.f_pushVector(l3_ts, (new Struct_MizTrmSRec(Module_correl.f_mizNewIncorTrm(), false, (new Struct_MizComplex(0.0, 0.0)), ((Struct)SingletonStructs.str_MizTrmNil), Module_vector.f_makeVector(0), Module_correl.f_mizNewEmptyCluster(), Module_vector.f_makeVector(2))));
 		return (new Struct_MizEqualizer(aenv, aidn, aclusters, apre, l3_ts, false, 0, 0, Module_vector.f_makeVector(8), Module_vector.f_makeVector(8), Module_vector.f_makeVector(16), l0_fti, Module_vector.f_makeVector(4), Module_vector.f_makeVector(4), false, Module_vector.f_makeVector(8), Module_vector.f_makeVector(8), Module_vector.f_makeVector(4), Module_vector.f_makeVector(4), Module_vector.f_makeVector(16), Module_mobjects.f_mizInitNatSet(16), Module_mobjects.f_mizInitNatFunc(1)));
 	}
 	public static final Object f_mizNegPairSweep(Struct_MizEqualizer aeq_0, Struct anf, int acode) {
@@ -3539,7 +4540,7 @@ final public class Module_equalizer {
 				final Struct l18_nf = ((Struct)Module_vector.f_getVectorUnsafe((l13_eq_0).f_negBas, ((int)l13_ii.value)));
 				Struct l19__tmp = l18_nf;
 				switch (l19__tmp.getTypeId()) {
-				case 56/*MizPredFrm*/: {
+				case 58/*MizPredFrm*/: {
 					final Struct_MizPredFrm l20__tmp = (Struct_MizPredFrm)l19__tmp;
 					final int l21_srt = l20__tmp.f_sort;
 					final int l22_predNr = l20__tmp.f_predNr;
@@ -3552,7 +4553,7 @@ final public class Module_equalizer {
 						final Struct l28_la = Module_equalizer.f_mizGetAttr(l13_eq_0, (Module_equalizer.f_mizTrmSAt(l13_eq_0, Module_equalizer.f_mizTrmInfoOf(Module_equalizer.f_mizLastArgE(l26_args)))).f_superCluster, l25_predNr, Module_equalizer.f_mizAllButLast(l26_args));
 						Struct l29__tmp = l28_la;
 						switch (l29__tmp.getTypeId()) {
-						case 88/*Some*/: {
+						case 90/*Some*/: {
 							final Struct_Some l30__tmp = (Struct_Some)l29__tmp;
 							final Object l31_at = l30__tmp.f_value;
 							final Struct_MizAttr l32_at = ((Struct_MizAttr)(l30__tmp).f_value);
@@ -3562,7 +4563,7 @@ final public class Module_equalizer {
 							}
 							break;
 						}
-						case 80/*None*/: {
+						case 82/*None*/: {
 							break;
 						}
 						default:
@@ -3592,14 +4593,14 @@ final public class Module_equalizer {
 											String l42_$38;
 											Struct l43__tmp = l41_gsymswitch29;
 											switch (l43__tmp.getTypeId()) {
-											case 88/*Some*/: {
+											case 90/*Some*/: {
 												final Struct_Some l44__tmp = (Struct_Some)l43__tmp;
 												final Object l45_a0 = l44__tmp.f_value;
 												final Struct_MizAttr l46_a0 = ((Struct_MizAttr)(l44__tmp).f_value);
 												l42_$38=Module_string.f_i2s((l46_a0).f_neg);
 												break;
 											}
-											case 80/*None*/: {
+											case 82/*None*/: {
 												l42_$38="none";
 												break;
 											}
@@ -3612,7 +4613,7 @@ final public class Module_equalizer {
 										final Struct l47_gsymswitch30 = Module_equalizer.f_mizGetAttr(l13_eq_0, (Module_equalizer.f_mizTrmSAt(l13_eq_0, Module_equalizer.f_mizTrmInfoOf(l37_lRight))).f_superCluster, l6_rqEmp, ((Struct)SingletonStructs.str_MizTrmNil));
 										Struct l48__tmp = l47_gsymswitch30;
 										switch (l48__tmp.getTypeId()) {
-										case 88/*Some*/: {
+										case 90/*Some*/: {
 											final Struct_Some l49__tmp = (Struct_Some)l48__tmp;
 											final Object l50_a = l49__tmp.f_value;
 											final Struct_MizAttr l51_a = ((Struct_MizAttr)(l49__tmp).f_value);
@@ -3640,7 +4641,7 @@ final public class Module_equalizer {
 											}
 											break;
 										}
-										case 80/*None*/: {
+										case 82/*None*/: {
 											break;
 										}
 										default:
@@ -3684,7 +4685,7 @@ final public class Module_equalizer {
 					}
 					break;
 				}
-				case 61/*MizQualFrm*/: {
+				case 63/*MizQualFrm*/: {
 					final Struct_MizQualFrm l20__tmp = (Struct_MizQualFrm)l19__tmp;
 					final Struct l65_trm = l20__tmp.f_trm;
 					final Struct_MizTyp l66_typ = l20__tmp.f_typ;
@@ -3714,6 +4715,51 @@ final public class Module_equalizer {
 		};
 		return Module_loop.f_while(l10_$8, l12_$9);
 	}
+	public static final Object f_mizPolyValInsert(Struct_Vector av, Struct_MizPolynomial ap) {
+		final int l0_n = Module_vector.f_sizeVector(av);
+		final Reference<Integer> l1_pos = ((Reference<Integer>)(new Reference(0)));
+		final Reference<Boolean> l2_dup = ((Reference<Boolean>)(new Reference(false)));
+		final Reference<Boolean> l3_brk = ((Reference<Boolean>)(new Reference(false)));
+		final Func0<Boolean> l6_$4 = (Func0<Boolean>)() -> {
+			return ((Boolean)(!((boolean)l3_brk.value)&&(((int)l1_pos.value)<l0_n)));
+		};
+		final Struct_Vector l8_v = av;
+		final Struct_MizPolynomial l9_p = ap;
+		final Func0<Object> l7_$5 = (Func0<Object>)() -> {
+			final int l8_c = Module_polynom.f_mizStdComparePolynomials(((Struct_MizPolynomial)Module_vector.f_getVectorUnsafe(l8_v, ((int)l1_pos.value))), l9_p);
+			if ((l8_c==0)) {
+				l2_dup.value = ((Boolean)true);
+				l3_brk.value = ((Boolean)true);
+				return null;
+			} else {
+				if ((l8_c>0)) {
+					l3_brk.value = ((Boolean)true);
+					return null;
+				} else {
+					l1_pos.value = ((Integer)(((int)l1_pos.value)+1));
+					return null;
+				}
+			}
+		};
+		Module_loop.f_while(l6_$4, l7_$5);
+		if (!((boolean)l2_dup.value)) {
+			Module_vector.f_pushVector(av, ap);
+			final Reference<Integer> l10_i = ((Reference<Integer>)(new Reference((Module_vector.f_sizeVector(av)-1))));
+			final Func0<Boolean> l13_$11 = (Func0<Boolean>)() -> {
+				return (((int)l10_i.value)>((int)l1_pos.value));
+			};
+			final Struct_Vector l15_v = av;
+			final Func0<Object> l14_$12 = (Func0<Object>)() -> {
+				Module_vector.f_setVectorUnsafe(l15_v, ((int)l10_i.value), Module_vector.f_getVectorUnsafe(l15_v, (((int)l10_i.value)-1)));
+				l10_i.value = ((Integer)(((int)l10_i.value)-1));
+				return null;
+			};
+			Module_loop.f_while(l13_$11, l14_$12);
+			return Module_vector.f_setVectorUnsafe(av, ((int)l1_pos.value), ap);
+		} else {
+			return null;
+		}
+	}
 	public static final Object f_mizPositiveRequirementRules(Struct_MizEqualizer aeq_0) {
 		final Struct_MizCorrelEnv l0_env = (aeq_0).f_env;
 		final int l1_rqLE = Module_builtin.f_mizBuiltIn((l0_env).f_builtIn, Module_builtin.g_rqLessOrEqual);
@@ -3735,7 +4781,7 @@ final public class Module_equalizer {
 				if (((l13_eq_0).f_contr==0)) {
 					Struct l17__tmp = apf;
 					switch (l17__tmp.getTypeId()) {
-					case 56/*MizPredFrm*/: {
+					case 58/*MizPredFrm*/: {
 						final Struct_MizPredFrm l18__tmp = (Struct_MizPredFrm)l17__tmp;
 						final int l19_srt = l18__tmp.f_sort;
 						final int l20_srt = (l18__tmp).f_sort;
@@ -3814,7 +4860,7 @@ final public class Module_equalizer {
 					if (((l11_eq_0).f_contr==0)) {
 						Struct l15__tmp = apf;
 						switch (l15__tmp.getTypeId()) {
-						case 56/*MizPredFrm*/: {
+						case 58/*MizPredFrm*/: {
 							final Struct_MizPredFrm l16__tmp = (Struct_MizPredFrm)l15__tmp;
 							final int l17_srt = l16__tmp.f_sort;
 							final int l18_srt = (l16__tmp).f_sort;
@@ -3838,7 +4884,7 @@ final public class Module_equalizer {
 												final Struct l37_gsymswitch27 = l33_cur.value;
 												Struct l38__tmp = l37_gsymswitch27;
 												switch (l38__tmp.getTypeId()) {
-												case 69/*MizTrmNil*/: {
+												case 71/*MizTrmNil*/: {
 													return ((Boolean)false);
 												}
 												default: {
@@ -3850,7 +4896,7 @@ final public class Module_equalizer {
 												final Struct l38_gsymswitch28 = l33_cur.value;
 												Struct l39__tmp = l38_gsymswitch28;
 												switch (l39__tmp.getTypeId()) {
-												case 68/*MizTrmElem*/: {
+												case 70/*MizTrmElem*/: {
 													final Struct_MizTrmElem l40__tmp = (Struct_MizTrmElem)l39__tmp;
 													final Struct l41_trm = l40__tmp.f_trm;
 													final Struct l42_next = l40__tmp.f_next;
@@ -3894,7 +4940,7 @@ final public class Module_equalizer {
 													l33_cur.value = l44_next;
 													return null;
 												}
-												case 69/*MizTrmNil*/: {
+												case 71/*MizTrmNil*/: {
 													return null;
 												}
 												default:
@@ -3946,17 +4992,17 @@ final public class Module_equalizer {
 			};
 			final Struct_MizEqualizer l6_eq_0 = aeq_0;
 			final Func0<Object> l5_$2 = (Func0<Object>)() -> {
-				final Struct l6_gsymswitch69 = ((Struct)Module_vector.f_getVectorUnsafe((l6_eq_0).f_dTrm, ((int)l0_k.value)));
-				Struct l7__tmp = l6_gsymswitch69;
+				final Struct l6_gsymswitch71 = ((Struct)Module_vector.f_getVectorUnsafe((l6_eq_0).f_dTrm, ((int)l0_k.value)));
+				Struct l7__tmp = l6_gsymswitch71;
 				switch (l7__tmp.getTypeId()) {
-				case 88/*Some*/: {
+				case 90/*Some*/: {
 					final Struct_Some l8__tmp = (Struct_Some)l7__tmp;
 					final Object l9_t = l8__tmp.f_value;
 					final Struct l10_t = ((Struct)(l8__tmp).f_value);
 					Module_equalizer.f_mizProcessReductionsAN(l6_eq_0, Module_equalizer.f_mizTrmInfoOf(l10_t));
 					break;
 				}
-				case 80/*None*/: {
+				case 82/*None*/: {
 					break;
 				}
 				default:
@@ -3972,11 +5018,11 @@ final public class Module_equalizer {
 	}
 	public static final Object f_mizProcessReductionsAN(Struct_MizEqualizer aeq_0, int aenr) {
 		final Struct_MizTrmSRec l0_rec = Module_equalizer.f_mizTrmSAt(aeq_0, aenr);
-		final Struct l1_gsymswitch68 = (l0_rec).f_eqClass;
+		final Struct l1_gsymswitch70 = (l0_rec).f_eqClass;
 		boolean l2_live;
-		Struct l3__tmp = l1_gsymswitch68;
+		Struct l3__tmp = l1_gsymswitch70;
 		switch (l3__tmp.getTypeId()) {
-		case 69/*MizTrmNil*/: {
+		case 71/*MizTrmNil*/: {
 			l2_live=false;
 			break;
 		}
@@ -4022,7 +5068,7 @@ final public class Module_equalizer {
 			boolean l7_live;
 			Struct l8__tmp = l6_gsymswitch17;
 			switch (l8__tmp.getTypeId()) {
-			case 69/*MizTrmNil*/: {
+			case 71/*MizTrmNil*/: {
 				l7_live=false;
 				break;
 			}
@@ -4064,7 +5110,7 @@ final public class Module_equalizer {
 			boolean l17_live;
 			Struct l18__tmp = l16_gsymswitch18;
 			switch (l18__tmp.getTypeId()) {
-			case 69/*MizTrmNil*/: {
+			case 71/*MizTrmNil*/: {
 				l17_live=false;
 				break;
 			}
@@ -4101,11 +5147,11 @@ final public class Module_equalizer {
 	}
 	public static final boolean f_mizRoundUpSuperCluster(Struct_MizEqualizer aeq_0, int aenr) {
 		final Struct_MizTrmSRec l0_rec = Module_equalizer.f_mizTrmSAt(aeq_0, aenr);
-		final Struct l1_gsymswitch64 = (l0_rec).f_eqClass;
+		final Struct l1_gsymswitch66 = (l0_rec).f_eqClass;
 		boolean l2_live;
-		Struct l3__tmp = l1_gsymswitch64;
+		Struct l3__tmp = l1_gsymswitch66;
 		switch (l3__tmp.getTypeId()) {
-		case 69/*MizTrmNil*/: {
+		case 71/*MizTrmNil*/: {
 			l2_live=false;
 			break;
 		}
@@ -4207,7 +5253,7 @@ final public class Module_equalizer {
 	public static final Object f_mizSetTrmInfo(Struct at, int av) {
 		Struct l0__tmp = at;
 		switch (l0__tmp.getTypeId()) {
-		case 75/*MizVarTrm*/: {
+		case 77/*MizVarTrm*/: {
 			final Struct_MizVarTrm l1__tmp = (Struct_MizVarTrm)l0__tmp;
 			final int l2___ = (l1__tmp).f_sort;
 			final int l3___ = (l1__tmp).f_varNr;
@@ -4228,7 +5274,7 @@ final public class Module_equalizer {
 			((Field_trmInfo)l12_x).set_trmInfo(av);
 			return null;
 		}
-		case 59/*MizPrivFuncTrm*/: {
+		case 61/*MizPrivFuncTrm*/: {
 			final Struct_MizPrivFuncTrm l1__tmp = (Struct_MizPrivFuncTrm)l0__tmp;
 			final int l13___ = (l1__tmp).f_funcNr;
 			final Struct l14___ = (l1__tmp).f_args;
@@ -4251,7 +5297,7 @@ final public class Module_equalizer {
 			((Field_trmInfo)l25_x).set_trmInfo(av);
 			return null;
 		}
-		case 60/*MizQuaTrm*/: {
+		case 62/*MizQuaTrm*/: {
 			final Struct_MizQuaTrm l1__tmp = (Struct_MizQuaTrm)l0__tmp;
 			final Struct l26___ = (l1__tmp).f_trmProper;
 			final Struct_MizTyp l27___ = (l1__tmp).f_qua;
@@ -4304,6 +5350,245 @@ final public class Module_equalizer {
 		Module_loop.f_while(l4_$2, l6_$3);
 		return l0_res.value;
 	}
+	public static final Object f_mizSubstVarP(Struct_MizEqualizer aeq_0, int alVar, int asVar) {
+		final Struct_MizPolynomial l0_lPoly = Module_polynom.f_mizPolyWithMonomial((new Struct_MizComplex(1.0, 0.0)), asVar);
+		final Reference<Integer> l1_t = ((Reference<Integer>)(new Reference(1)));
+		final Struct_MizEqualizer l5_eq_0 = aeq_0;
+		final Func0<Boolean> l4_$2 = (Func0<Boolean>)() -> {
+			return (((int)l1_t.value)<=Module_equalizer.f_mizTrmNbr(l5_eq_0));
+		};
+		final Struct_MizEqualizer l7_eq_0 = aeq_0;
+		final int l8_lVar = alVar;
+		final Func0<Object> l6_$3 = (Func0<Object>)() -> {
+			final Struct_MizTrmSRec l7_rec = Module_equalizer.f_mizTrmSAt(l7_eq_0, ((int)l1_t.value));
+			final Struct l8_gsymswitch87 = (l7_rec).f_eqClass;
+			boolean l9_live;
+			Struct l10__tmp = l8_gsymswitch87;
+			switch (l10__tmp.getTypeId()) {
+			case 71/*MizTrmNil*/: {
+				l9_live=false;
+				break;
+			}
+			default: {
+				l9_live=true;
+				break;
+			}
+			}
+			if (((((int)l1_t.value)!=l8_lVar)&&l9_live)) {
+				final Struct_Vector l12_changed = Module_vector.f_makeVector(2);
+				final Reference<Integer> l13_i = ((Reference<Integer>)(new Reference(0)));
+				final Func0<Boolean> l16_$14 = (Func0<Boolean>)() -> {
+					return (((int)l13_i.value)<Module_vector.f_sizeVector((l7_rec).f_polynomialValues));
+				};
+				final Func0<Object> l17_$15 = (Func0<Object>)() -> {
+					final Struct_MizPolynomial l18_pv = ((Struct_MizPolynomial)Module_vector.f_getVectorUnsafe((l7_rec).f_polynomialValues, ((int)l13_i.value)));
+					if (Module_polynom.f_mizPolyHasTheVariable(l18_pv, l8_lVar)) {
+						Module_polynom.f_mizPolyInsertValue(l18_pv, l8_lVar, l0_lPoly);
+						if (Module_polynom.f_mizPolyIsNumeric(l18_pv)) {
+							if (!(l7_rec).f_numDetermined) {
+								((Field_numDetermined)l7_rec).set_numDetermined(true);
+								((Field_numValue)l7_rec).set_numValue(Module_polynom.f_mizPolyGetNumeric(l18_pv));
+							} else {
+								if (!Module_polynom.f_mizPolyIsNumericEqualWith(l18_pv, (l7_rec).f_numValue)) {
+									Module_equalizer.f_mizSetContr(l7_eq_0, 15);
+								} else {
+								}
+							}
+						} else {
+						}
+						Module_vector.f_pushVector(l12_changed, l18_pv);
+						return Module_vector.f_removeVector((l7_rec).f_polynomialValues, ((int)l13_i.value));
+					} else {
+						l13_i.value = ((Integer)(((int)l13_i.value)+1));
+						return null;
+					}
+				};
+				Module_loop.f_while(l16_$14, l17_$15);
+				final Func1<Object,Struct_MizPolynomial> l19_$18 = (Func1<Object, Struct_MizPolynomial>)(Struct_MizPolynomial apv) -> {
+					return Module_equalizer.f_mizPolyValInsert((l7_rec).f_polynomialValues, apv);
+				};
+				Module_vector.f_iterVector(l12_changed, ((Func1<Object,Object>)(Func1)l19_$18));
+			} else {
+			}
+			l1_t.value = ((Integer)(((int)l1_t.value)+1));
+			return null;
+		};
+		return Module_loop.f_while(l4_$2, l6_$3);
+	}
+	public static final Object f_mizSubstitutePendingVars(Struct_MizEqualizer aeq_0, Struct_MizNatFunc apend) {
+		final Struct_MizNatFunc l3_pend = apend;
+		final Func0<Boolean> l2_$0 = (Func0<Boolean>)() -> {
+			return (Module_mobjects.f_mizNatCount(l3_pend)>0);
+		};
+		final Struct_MizEqualizer l5_eq_0 = aeq_0;
+		final Struct_MizNatFunc l6_pend = apend;
+		final Func0<Object> l4_$1 = (Func0<Object>)() -> {
+			final int l5_k = Module_equalizer.f_mizClassOf(l5_eq_0, (Module_mobjects.f_mizNatItem(l6_pend, 0)).f_x);
+			Module_mobjects.f_mizNatDeleteElem(l6_pend, (Module_mobjects.f_mizNatItem(l6_pend, 0)).f_x);
+			final Struct_MizTrmSRec l6_rec = Module_equalizer.f_mizTrmSAt(l5_eq_0, l5_k);
+			if ((Module_vector.f_sizeVector((l6_rec).f_polynomialValues)==1)) {
+				final boolean l7___s = Module_equalizer.f_mizSubstituteVariableP(l5_eq_0, l5_k, ((Struct_MizPolynomial)Module_vector.f_getVectorUnsafe((l6_rec).f_polynomialValues, 0)), l6_pend);
+				return null;
+			} else {
+				return null;
+			}
+		};
+		Module_loop.f_while(l2_$0, l4_$1);
+		final Reference<Boolean> l7_go = ((Reference<Boolean>)(new Reference(true)));
+		final Func0<Boolean> l10_$8 = (Func0<Boolean>)() -> {
+			return l7_go.value;
+		};
+		final Struct_MizEqualizer l12_eq_0 = aeq_0;
+		final Struct_MizNatFunc l13_pend = apend;
+		final Func0<Object> l11_$9 = (Func0<Object>)() -> {
+			final Reference<Integer> l12_t = ((Reference<Integer>)(new Reference(1)));
+			final Func0<Boolean> l15_$13 = (Func0<Boolean>)() -> {
+				return (((int)l12_t.value)<=Module_equalizer.f_mizTrmNbr(l12_eq_0));
+			};
+			final Func0<Object> l16_$14 = (Func0<Object>)() -> {
+				final Struct_MizTrmSRec l17_rec = Module_equalizer.f_mizTrmSAt(l12_eq_0, ((int)l12_t.value));
+				final Struct l18_gsymswitch88 = (l17_rec).f_eqClass;
+				boolean l19_live;
+				Struct l20__tmp = l18_gsymswitch88;
+				switch (l20__tmp.getTypeId()) {
+				case 71/*MizTrmNil*/: {
+					l19_live=false;
+					break;
+				}
+				default: {
+					l19_live=true;
+					break;
+				}
+				}
+				if (((l19_live&&(l17_rec).f_numDetermined)&&(Module_vector.f_sizeVector((l17_rec).f_polynomialValues)==1))) {
+					Module_mobjects.f_mizNatInsertElem(l13_pend, ((int)l12_t.value));
+				} else {
+				}
+				l12_t.value = ((Integer)(((int)l12_t.value)+1));
+				return null;
+			};
+			Module_loop.f_while(l15_$13, l16_$14);
+			final Reference<Boolean> l17_subst = ((Reference<Boolean>)(new Reference(false)));
+			final Func0<Boolean> l20_$18 = (Func0<Boolean>)() -> {
+				return (Module_mobjects.f_mizNatCount(l13_pend)>0);
+			};
+			final Func0<Object> l21_$19 = (Func0<Object>)() -> {
+				final int l22_k = Module_equalizer.f_mizClassOf(l12_eq_0, (Module_mobjects.f_mizNatItem(l13_pend, 0)).f_x);
+				Module_mobjects.f_mizNatDeleteElem(l13_pend, (Module_mobjects.f_mizNatItem(l13_pend, 0)).f_x);
+				final Struct_MizTrmSRec l23_rec = Module_equalizer.f_mizTrmSAt(l12_eq_0, l22_k);
+				if ((Module_vector.f_sizeVector((l23_rec).f_polynomialValues)==1)) {
+					if (Module_equalizer.f_mizSubstituteVariableP(l12_eq_0, l22_k, ((Struct_MizPolynomial)Module_vector.f_getVectorUnsafe((l23_rec).f_polynomialValues, 0)), l13_pend)) {
+						l17_subst.value = ((Boolean)true);
+						return null;
+					} else {
+						return null;
+					}
+				} else {
+					return null;
+				}
+			};
+			Module_loop.f_while(l20_$18, l21_$19);
+			l7_go.value = l17_subst.value;
+			return null;
+		};
+		return Module_loop.f_while(l10_$8, l11_$9);
+	}
+	public static final Object f_mizSubstituteSettings(Struct_MizEqualizer aeq_0) {
+		final Struct_MizNatFunc l0_pend = Module_mobjects.f_mizInitNatSet(8);
+		final Struct_Vector l3_$2 = (aeq_0).f_settings;
+		final Struct_MizEqualizer l5_eq_0 = aeq_0;
+		final Func1<Object,Struct_MizIntPair> l4_$1 = (Func1<Object, Struct_MizIntPair>)(Struct_MizIntPair ap) -> {
+			if (((l5_eq_0).f_contr==0)) {
+				final Struct_MizTrmSRec l5_rx = Module_equalizer.f_mizTrmSAt(l5_eq_0, Module_equalizer.f_mizClassOf(l5_eq_0, (ap).f_x));
+				final Struct_MizTrmSRec l6_ry = Module_equalizer.f_mizTrmSAt(l5_eq_0, Module_equalizer.f_mizClassOf(l5_eq_0, (ap).f_y));
+				if (((Module_vector.f_sizeVector((l5_rx).f_polynomialValues)>0)&&(Module_vector.f_sizeVector((l6_ry).f_polynomialValues)>0))) {
+					final boolean l7___s = Module_equalizer.f_mizSubstituteVariableP(l5_eq_0, (ap).f_x, ((Struct_MizPolynomial)Module_vector.f_getVectorUnsafe((l6_ry).f_polynomialValues, 0)), l0_pend);
+				} else {
+				}
+				return Module_equalizer.f_mizUnionTrms(l5_eq_0, (ap).f_x, (ap).f_y);
+			} else {
+				return null;
+			}
+		};
+		Module_vector.f_iterVector(l3_$2, ((Func1<Object,Object>)(Func1)l4_$1));
+		Module_vector.f_clearVector((aeq_0).f_settings);
+		return Module_equalizer.f_mizSubstitutePendingVars(aeq_0, l0_pend);
+	}
+	public static final boolean f_mizSubstituteVariableP(Struct_MizEqualizer aeq_0, int aaVar, Struct_MizPolynomial aaTerm, Struct_MizNatFunc apend) {
+		final Reference<Boolean> l0_res = ((Reference<Boolean>)(new Reference(false)));
+		if (!Module_polynom.f_mizPolyHasTheVariable(aaTerm, aaVar)) {
+			final int l1_lVar = Module_equalizer.f_mizClassOf(aeq_0, aaVar);
+			final Reference<Integer> l2_t = ((Reference<Integer>)(new Reference(1)));
+			final Struct_MizEqualizer l6_eq_0 = aeq_0;
+			final Func0<Boolean> l5_$3 = (Func0<Boolean>)() -> {
+				return (((int)l2_t.value)<=Module_equalizer.f_mizTrmNbr(l6_eq_0));
+			};
+			final Struct_MizEqualizer l8_eq_0 = aeq_0;
+			final int l9_aVar = aaVar;
+			final Struct_MizPolynomial l10_aTerm = aaTerm;
+			final Struct_MizNatFunc l11_pend = apend;
+			final Func0<Object> l7_$4 = (Func0<Object>)() -> {
+				final Struct_MizTrmSRec l8_rec = Module_equalizer.f_mizTrmSAt(l8_eq_0, ((int)l2_t.value));
+				final Struct l9_gsymswitch86 = (l8_rec).f_eqClass;
+				boolean l10_live;
+				Struct l11__tmp = l9_gsymswitch86;
+				switch (l11__tmp.getTypeId()) {
+				case 71/*MizTrmNil*/: {
+					l10_live=false;
+					break;
+				}
+				default: {
+					l10_live=true;
+					break;
+				}
+				}
+				if (((((int)l2_t.value)!=l1_lVar)&&l10_live)) {
+					final Struct_Vector l13_changed = Module_vector.f_makeVector(2);
+					final Reference<Integer> l14_i = ((Reference<Integer>)(new Reference(0)));
+					final Func0<Boolean> l17_$15 = (Func0<Boolean>)() -> {
+						return (((int)l14_i.value)<Module_vector.f_sizeVector((l8_rec).f_polynomialValues));
+					};
+					final Func0<Object> l18_$16 = (Func0<Object>)() -> {
+						final Struct_MizPolynomial l19_pv = ((Struct_MizPolynomial)Module_vector.f_getVectorUnsafe((l8_rec).f_polynomialValues, ((int)l14_i.value)));
+						if (Module_polynom.f_mizPolyHasTheVariable(l19_pv, l9_aVar)) {
+							Module_polynom.f_mizPolyInsertValue(l19_pv, l9_aVar, l10_aTerm);
+							if (Module_polynom.f_mizPolyIsNumeric(l19_pv)) {
+								if (!(l8_rec).f_numDetermined) {
+									Module_mobjects.f_mizNatInsertElem(l11_pend, ((int)l2_t.value));
+									((Field_numDetermined)l8_rec).set_numDetermined(true);
+									((Field_numValue)l8_rec).set_numValue(Module_polynom.f_mizPolyGetNumeric(l19_pv));
+								} else {
+									if (!Module_polynom.f_mizPolyIsNumericEqualWith(l19_pv, (l8_rec).f_numValue)) {
+										Module_equalizer.f_mizSetContr(l8_eq_0, 4);
+									} else {
+									}
+								}
+							} else {
+							}
+							Module_vector.f_pushVector(l13_changed, l19_pv);
+							Module_vector.f_removeVector((l8_rec).f_polynomialValues, ((int)l14_i.value));
+							l0_res.value = ((Boolean)true);
+							return null;
+						} else {
+							l14_i.value = ((Integer)(((int)l14_i.value)+1));
+							return null;
+						}
+					};
+					Module_loop.f_while(l17_$15, l18_$16);
+					final Func1<Object,Struct_MizPolynomial> l20_$19 = (Func1<Object, Struct_MizPolynomial>)(Struct_MizPolynomial apv) -> {
+						return Module_equalizer.f_mizPolyValInsert((l8_rec).f_polynomialValues, apv);
+					};
+					Module_vector.f_iterVector(l13_changed, ((Func1<Object,Object>)(Func1)l20_$19));
+				} else {
+				}
+				l2_t.value = ((Integer)(((int)l2_t.value)+1));
+				return null;
+			};
+			Module_loop.f_while(l5_$3, l7_$4);
+		} else {
+		}
+		return ((boolean)l0_res.value);
+	}
 	public static final Object f_mizSuperClusterRoundLoop(Struct_MizEqualizer aeq_0) {
 		Module_vector.f_clearVector((aeq_0).f_anDeps);
 		final Reference<Integer> l0_i = ((Reference<Integer>)(new Reference(1)));
@@ -4325,11 +5610,11 @@ final public class Module_equalizer {
 		};
 		final Struct_MizEqualizer l13_eq_0 = aeq_0;
 		final Func0<Object> l12_$9 = (Func0<Object>)() -> {
-			final Struct l13_gsymswitch65 = (Module_equalizer.f_mizTrmSAt(l13_eq_0, ((int)l7_j.value))).f_eqClass;
+			final Struct l13_gsymswitch67 = (Module_equalizer.f_mizTrmSAt(l13_eq_0, ((int)l7_j.value))).f_eqClass;
 			boolean l14_live;
-			Struct l15__tmp = l13_gsymswitch65;
+			Struct l15__tmp = l13_gsymswitch67;
 			switch (l15__tmp.getTypeId()) {
-			case 69/*MizTrmNil*/: {
+			case 71/*MizTrmNil*/: {
 				l14_live=false;
 				break;
 			}
@@ -4361,10 +5646,10 @@ final public class Module_equalizer {
 				};
 				final Func0<Object> l24_$22 = (Func0<Object>)() -> {
 					if (Module_equalizer.f_mizANDependsOn(l19_eq_0, l19_ani, ((int)l20_anj.value))) {
-						final Struct l25_gsymswitch66 = ((Struct)Module_vector.f_getVectorUnsafe((l19_eq_0).f_anDeps, (((int)l20_anj.value)-1)));
-						Struct l26__tmp = l25_gsymswitch66;
+						final Struct l25_gsymswitch68 = ((Struct)Module_vector.f_getVectorUnsafe((l19_eq_0).f_anDeps, (((int)l20_anj.value)-1)));
+						Struct l26__tmp = l25_gsymswitch68;
 						switch (l26__tmp.getTypeId()) {
-						case 88/*Some*/: {
+						case 90/*Some*/: {
 							final Struct_Some l27__tmp = (Struct_Some)l26__tmp;
 							final Object l28_ns = l27__tmp.f_value;
 							final Struct_MizNatFunc l29_ns = ((Struct_MizNatFunc)(l27__tmp).f_value);
@@ -4374,7 +5659,7 @@ final public class Module_equalizer {
 							}
 							break;
 						}
-						case 80/*None*/: {
+						case 82/*None*/: {
 							break;
 						}
 						default:
@@ -4386,10 +5671,10 @@ final public class Module_equalizer {
 					return null;
 				};
 				Module_loop.f_while(l23_$21, l24_$22);
-				final Struct l25_gsymswitch67 = Module_equalizer.f_mizANDependentClasses(l19_eq_0, l19_ani);
-				Struct l26__tmp = l25_gsymswitch67;
+				final Struct l25_gsymswitch69 = Module_equalizer.f_mizANDependentClasses(l19_eq_0, l19_ani);
+				Struct l26__tmp = l25_gsymswitch69;
 				switch (l26__tmp.getTypeId()) {
-				case 88/*Some*/: {
+				case 90/*Some*/: {
 					final Struct_Some l27__tmp = (Struct_Some)l26__tmp;
 					final Object l28_ns1 = l27__tmp.f_value;
 					final Struct_MizNatFunc l29_ns1 = ((Struct_MizNatFunc)(l27__tmp).f_value);
@@ -4404,7 +5689,7 @@ final public class Module_equalizer {
 					};
 					return Module_loop.f_while(l33_$31, l34_$32);
 				}
-				case 80/*None*/: {
+				case 82/*None*/: {
 					return null;
 				}
 				default:
@@ -4419,7 +5704,7 @@ final public class Module_equalizer {
 	public static final int f_mizTrmInfoOf(Struct at) {
 		Struct l0__tmp = at;
 		switch (l0__tmp.getTypeId()) {
-		case 75/*MizVarTrm*/: {
+		case 77/*MizVarTrm*/: {
 			final Struct_MizVarTrm l1__tmp = (Struct_MizVarTrm)l0__tmp;
 			final int l2_trmInfo = l1__tmp.f_trmInfo;
 			final int l3___ = (l1__tmp).f_sort;
@@ -4438,7 +5723,7 @@ final public class Module_equalizer {
 			final int l12_trmInfo = (l1__tmp).f_trmInfo;
 			return l12_trmInfo;
 		}
-		case 59/*MizPrivFuncTrm*/: {
+		case 61/*MizPrivFuncTrm*/: {
 			final Struct_MizPrivFuncTrm l1__tmp = (Struct_MizPrivFuncTrm)l0__tmp;
 			final int l13_trmInfo = l1__tmp.f_trmInfo;
 			final int l14___ = (l1__tmp).f_funcNr;
@@ -4459,7 +5744,7 @@ final public class Module_equalizer {
 			final int l25_trmInfo = (l1__tmp).f_trmInfo;
 			return l25_trmInfo;
 		}
-		case 60/*MizQuaTrm*/: {
+		case 62/*MizQuaTrm*/: {
 			final Struct_MizQuaTrm l1__tmp = (Struct_MizQuaTrm)l0__tmp;
 			final int l26_trmInfo = l1__tmp.f_trmInfo;
 			final Struct l27___ = (l1__tmp).f_trmProper;
@@ -4493,6 +5778,37 @@ final public class Module_equalizer {
 	public static final Struct_MizTrmSRec f_mizTrmSAt(Struct_MizEqualizer aeq_0, int ai) {
 		return ((Struct_MizTrmSRec)Module_vector.f_getVectorUnsafe((aeq_0).f_trmS, ai));
 	}
+	public static final Object f_mizUnionEqualsForNonComplex(Struct_MizEqualizer aeq_0) {
+		final int l0_before = Module_vector.f_sizeVector((aeq_0).f_eqPend);
+		final Reference<Integer> l1_i = ((Reference<Integer>)(new Reference(0)));
+		final Struct_MizEqualizer l5_eq_0 = aeq_0;
+		final Func0<Boolean> l4_$2 = (Func0<Boolean>)() -> {
+			return ((Boolean)(((l5_eq_0).f_contr==0)&&(((int)l1_i.value)<Module_vector.f_sizeVector((l5_eq_0).f_eqPend))));
+		};
+		final Struct_MizEqualizer l7_eq_0 = aeq_0;
+		final Func0<Object> l6_$3 = (Func0<Object>)() -> {
+			final Struct_MizIntPair l7_p = ((Struct_MizIntPair)Module_vector.f_getVectorUnsafe((l7_eq_0).f_eqPend, ((int)l1_i.value)));
+			final boolean l8_cx = (Module_equalizer.f_mizIsComplexNumberE(l7_eq_0, (Module_equalizer.f_mizTrmSAt(l7_eq_0, Module_equalizer.f_mizClassOf(l7_eq_0, (l7_p).f_x))).f_superCluster)||Module_equalizer.f_mizIsComplexNumberE(l7_eq_0, (Module_equalizer.f_mizTrmSAt(l7_eq_0, Module_equalizer.f_mizClassOf(l7_eq_0, (l7_p).f_y))).f_superCluster));
+			if (l8_cx) {
+				Module_equalizer.f_mizInsertComplexE(l7_eq_0, (l7_p).f_x);
+				if (((l7_eq_0).f_contr==0)) {
+					Module_equalizer.f_mizInsertComplexE(l7_eq_0, (l7_p).f_y);
+				} else {
+				}
+				l1_i.value = ((Integer)(((int)l1_i.value)+1));
+				return null;
+			} else {
+				Module_equalizer.f_mizUnionTrms(l7_eq_0, (l7_p).f_x, (l7_p).f_y);
+				return Module_vector.f_removeVector((l7_eq_0).f_eqPend, ((int)l1_i.value));
+			}
+		};
+		Module_loop.f_while(l4_$2, l6_$3);
+		if ((((aeq_0).f_contr==0)&&(l0_before!=Module_vector.f_sizeVector((aeq_0).f_eqPend)))) {
+			return Module_equalizer.f_mizIdentities(aeq_0);
+		} else {
+			return null;
+		}
+	}
 	public static final Object f_mizUnionTrms(Struct_MizEqualizer aeq_0, int ae1, int ae2) {
 		final Struct_MizCorrelEnv l0_env = (aeq_0).f_env;
 		final int l1_a0 = Module_equalizer.f_mizClassOf(aeq_0, ae1);
@@ -4521,7 +5837,7 @@ final public class Module_equalizer {
 					final Struct l11_gsymswitch15 = l7_cur.value;
 					Struct l12__tmp = l11_gsymswitch15;
 					switch (l12__tmp.getTypeId()) {
-					case 69/*MizTrmNil*/: {
+					case 71/*MizTrmNil*/: {
 						return ((Boolean)false);
 					}
 					default: {
@@ -4534,7 +5850,7 @@ final public class Module_equalizer {
 					final Struct l12_gsymswitch16 = l7_cur.value;
 					Struct l13__tmp = l12_gsymswitch16;
 					switch (l13__tmp.getTypeId()) {
-					case 68/*MizTrmElem*/: {
+					case 70/*MizTrmElem*/: {
 						final Struct_MizTrmElem l14__tmp = (Struct_MizTrmElem)l13__tmp;
 						final Struct l15_trm = l14__tmp.f_trm;
 						final Struct l16_next = l14__tmp.f_next;
@@ -4544,7 +5860,7 @@ final public class Module_equalizer {
 						l7_cur.value = l18_next;
 						return null;
 					}
-					case 69/*MizTrmNil*/: {
+					case 71/*MizTrmNil*/: {
 						return null;
 					}
 					default:
@@ -4577,7 +5893,36 @@ final public class Module_equalizer {
 					return Module_equalizer.f_mizInsertType(l26_eq_0, atyp, l4_b);
 				};
 				Module_vector.f_iterVector(l24_$23, ((Func1<Object,Object>)(Func1)l25_$22));
-				return Module_vector.f_clearVector((l5_ra).f_xTypClass);
+				Module_vector.f_clearVector((l5_ra).f_xTypClass);
+				final Struct_Vector l29_$28 = (l5_ra).f_polynomialValues;
+				final Func1<Object,Struct_MizPolynomial> l30_$27 = (Func1<Object, Struct_MizPolynomial>)(Struct_MizPolynomial apv) -> {
+					return Module_equalizer.f_mizPolyValInsert((l6_rb).f_polynomialValues, apv);
+				};
+				Module_vector.f_iterVector(l29_$28, ((Func1<Object,Object>)(Func1)l30_$27));
+				Module_vector.f_clearVector((l5_ra).f_polynomialValues);
+				if ((Module_vector.f_sizeVector((l6_rb).f_polynomialValues)==2)) {
+					final Struct_MizNatFunc l31_pend = Module_mobjects.f_mizInitNatSet(8);
+					final int l32_iP = Module_polynom.f_mizPolyIsVariable(((Struct_MizPolynomial)Module_vector.f_getVectorUnsafe((l6_rb).f_polynomialValues, 0)));
+					final int l33_jP = Module_polynom.f_mizPolyIsVariable(((Struct_MizPolynomial)Module_vector.f_getVectorUnsafe((l6_rb).f_polynomialValues, 1)));
+					if ((l32_iP>0)) {
+						if (((l33_jP>0)&&(l32_iP<l33_jP))) {
+							Module_vector.f_removeVector((l6_rb).f_polynomialValues, 1);
+							final boolean l34___sv1 = Module_equalizer.f_mizSubstituteVariableP(aeq_0, l33_jP, ((Struct_MizPolynomial)Module_vector.f_getVectorUnsafe((l6_rb).f_polynomialValues, 0)), l31_pend);
+						} else {
+							Module_vector.f_removeVector((l6_rb).f_polynomialValues, 0);
+							final boolean l35___sv2 = Module_equalizer.f_mizSubstituteVariableP(aeq_0, l32_iP, ((Struct_MizPolynomial)Module_vector.f_getVectorUnsafe((l6_rb).f_polynomialValues, 0)), l31_pend);
+						}
+					} else {
+						if ((l33_jP>0)) {
+							Module_vector.f_removeVector((l6_rb).f_polynomialValues, 1);
+							final boolean l36___sv3 = Module_equalizer.f_mizSubstituteVariableP(aeq_0, l33_jP, ((Struct_MizPolynomial)Module_vector.f_getVectorUnsafe((l6_rb).f_polynomialValues, 0)), l31_pend);
+						} else {
+						}
+					}
+					return Module_equalizer.f_mizSubstitutePendingVars(aeq_0, l31_pend);
+				} else {
+					return null;
+				}
 			} else {
 				return null;
 			}
@@ -4593,7 +5938,7 @@ final public class Module_equalizer {
 			final Struct l5_gsymswitch1 = l1_cur.value;
 			Struct l6__tmp = l5_gsymswitch1;
 			switch (l6__tmp.getTypeId()) {
-			case 69/*MizTrmNil*/: {
+			case 71/*MizTrmNil*/: {
 				return ((Boolean)false);
 			}
 			default: {
@@ -4605,7 +5950,7 @@ final public class Module_equalizer {
 			final Struct l6_gsymswitch2 = l1_cur.value;
 			Struct l7__tmp = l6_gsymswitch2;
 			switch (l7__tmp.getTypeId()) {
-			case 68/*MizTrmElem*/: {
+			case 70/*MizTrmElem*/: {
 				final Struct_MizTrmElem l8__tmp = (Struct_MizTrmElem)l7__tmp;
 				final Struct l9_trm = l8__tmp.f_trm;
 				final Struct l10_next = l8__tmp.f_next;
@@ -4618,7 +5963,7 @@ final public class Module_equalizer {
 				l1_cur.value = l12_next;
 				return null;
 			}
-			case 69/*MizTrmNil*/: {
+			case 71/*MizTrmNil*/: {
 				return null;
 			}
 			default:
@@ -4648,7 +5993,7 @@ final public class Module_equalizer {
 			Module_equalizer.f_mizSetTrmInfo(l1_rep, l0_nr);
 			final Struct_Vector l2_xt = Module_vector.f_makeVector(4);
 			Module_vector.f_pushVector(l2_xt, Module_correl.f_mizNewStandardTyp(Module_lexicon.g_ikTypMode, Module_correl.f_mizNewEmptyCluster(), Module_correl.f_mizNewEmptyCluster(), Module_builtin.f_mizBuiltIn(((aeq_0).f_env).f_builtIn, Module_builtin.g_rqAny), ((Struct)SingletonStructs.str_MizTrmNil)));
-			return Module_vector.f_pushVector((aeq_0).f_trmS, (new Struct_MizTrmSRec(l1_rep, false, (new Struct_MizComplex(0.0, 0.0)), (new Struct_MizTrmElem(at, ((Struct)SingletonStructs.str_MizTrmNil))), l2_xt, Module_correl.f_mizNewEmptyCluster())));
+			return Module_vector.f_pushVector((aeq_0).f_trmS, (new Struct_MizTrmSRec(l1_rep, false, (new Struct_MizComplex(0.0, 0.0)), (new Struct_MizTrmElem(at, ((Struct)SingletonStructs.str_MizTrmNil))), l2_xt, Module_correl.f_mizNewEmptyCluster(), Module_vector.f_makeVector(2))));
 		}
 	}
 	public static final Object f_mizYFormula(Struct_MizEqualizer aeq_0, Struct af) {
@@ -4656,7 +6001,7 @@ final public class Module_equalizer {
 		final Struct_MizCorrelEnv l0_env = (aeq_0).f_env;
 		Struct l1__tmp = af;
 		switch (l1__tmp.getTypeId()) {
-		case 51/*MizNegFrm*/: {
+		case 52/*MizNegFrm*/: {
 			final Struct_MizNegFrm l2__tmp = (Struct_MizNegFrm)l1__tmp;
 			final Struct l3_arg = l2__tmp.f_arg;
 			final Struct l4_arg = (l2__tmp).f_arg;
@@ -4678,7 +6023,7 @@ final public class Module_equalizer {
 			};
 			return Module_vector.f_iterVector(l8_conjuncts, ((Func1<Object,Object>)(Func1)l11_$10));
 		}
-		case 74/*MizUnivFrm*/: {
+		case 76/*MizUnivFrm*/: {
 			final Struct_MizUnivFrm l2__tmp = (Struct_MizUnivFrm)l1__tmp;
 			final Struct_MizTyp l13_quantified = l2__tmp.f_quantified;
 			final Struct l14_scope = l2__tmp.f_scope;
@@ -4693,7 +6038,7 @@ final public class Module_equalizer {
 			((Field_boundVarNbr)l0_env).set_boundVarNbr(((l0_env).f_boundVarNbr-1));
 			return null;
 		}
-		case 56/*MizPredFrm*/: {
+		case 58/*MizPredFrm*/: {
 			final Struct_MizPredFrm l2__tmp = (Struct_MizPredFrm)l1__tmp;
 			final Struct l20_args = l2__tmp.f_args;
 			final int l21___ = (l2__tmp).f_sort;
@@ -4711,7 +6056,7 @@ final public class Module_equalizer {
 			final int l29___ = (l2__tmp).f_pattNr;
 			return Module_equalizer.f_mizYTermList(aeq_0, l27_args);
 		}
-		case 61/*MizQualFrm*/: {
+		case 63/*MizQualFrm*/: {
 			final Struct_MizQualFrm l2__tmp = (Struct_MizQualFrm)l1__tmp;
 			final Struct l30_trm = l2__tmp.f_trm;
 			final Struct_MizTyp l31_typ = l2__tmp.f_typ;
@@ -4741,7 +6086,7 @@ final public class Module_equalizer {
 				continue TAIL_CALL;
 			}
 		}
-		case 73/*MizUniqFrm*/: {
+		case 75/*MizUniqFrm*/: {
 			final Struct_MizUniqFrm l2__tmp = (Struct_MizUniqFrm)l1__tmp;
 			final int l46___ = (l2__tmp).f_sort;
 			return null;
@@ -4770,13 +6115,13 @@ final public class Module_equalizer {
 				final Struct l3_cached = ((Struct)Module_vector.f_getVectorDef((aeq_0).f_dTrm, (l2_vt).f_varNr, SingletonStructs.str_None));
 				Struct l4__tmp = l3_cached;
 				switch (l4__tmp.getTypeId()) {
-				case 88/*Some*/: {
+				case 90/*Some*/: {
 					final Struct_Some l5__tmp = (Struct_Some)l4__tmp;
 					final Object l6_c = l5__tmp.f_value;
 					final Struct l7_c = ((Struct)(l5__tmp).f_value);
 					return l7_c;
 				}
-				case 80/*None*/: {
+				case 82/*None*/: {
 					Module_equalizer.f_mizYEqClass(aeq_0, at0);
 					final int l8_info = Module_equalizer.f_mizTrmInfoOf(at0);
 					final Struct l9_rep = (Module_equalizer.f_mizTrmSAt(aeq_0, l8_info)).f_term;
@@ -4794,7 +6139,7 @@ final public class Module_equalizer {
 					final Struct l17_gsymswitch7 = Module_identify.f_mizNumericValue((aeq_0).f_idn, (l2_vt).f_varNr);
 					Struct l18__tmp = l17_gsymswitch7;
 					switch (l18__tmp.getTypeId()) {
-					case 88/*Some*/: {
+					case 90/*Some*/: {
 						final Struct_Some l19__tmp = (Struct_Some)l18__tmp;
 						final Object l20_v = l19__tmp.f_value;
 						final Struct_MizComplex l21_v = ((Struct_MizComplex)(l19__tmp).f_value);
@@ -4803,7 +6148,7 @@ final public class Module_equalizer {
 						((Field_numValue)l22_rec).set_numValue(l21_v);
 						break;
 					}
-					case 80/*None*/: {
+					case 82/*None*/: {
 						break;
 					}
 					default:
@@ -4845,13 +6190,13 @@ final public class Module_equalizer {
 						final Struct l34_gsymswitch6 = Module_equalizer.f_mizFindEqArgsTerm(aeq_0, Module_equalizer.g_expFunctor, ((int)(l33_pa).f_first), ((Struct)(l33_pa).f_second));
 						Struct l35__tmp = l34_gsymswitch6;
 						switch (l35__tmp.getTypeId()) {
-						case 88/*Some*/: {
+						case 90/*Some*/: {
 							final Struct_Some l36__tmp = (Struct_Some)l35__tmp;
 							final Object l37_existing = l36__tmp.f_value;
 							final Struct l38_existing = ((Struct)(l36__tmp).f_value);
 							return (Module_equalizer.f_mizTrmSAt(aeq_0, Module_equalizer.f_mizTrmInfoOf(l38_existing))).f_term;
 						}
-						case 80/*None*/: {
+						case 82/*None*/: {
 							final Struct l39_nt = Module_correl.f_mizNewFuncTrm(((int)(l33_pa).f_first), Module_correl.f_mizCopyTrmList(((Struct)(l33_pa).f_second)));
 							Module_equalizer.f_mizYEqClass(aeq_0, l39_nt);
 							final int l40_info = Module_equalizer.f_mizTrmInfoOf(l39_nt);
@@ -4911,13 +6256,13 @@ final public class Module_equalizer {
 							}
 							Struct l52__tmp = l51_hit;
 							switch (l52__tmp.getTypeId()) {
-							case 88/*Some*/: {
+							case 90/*Some*/: {
 								final Struct_Some l53__tmp = (Struct_Some)l52__tmp;
 								final Object l54_existing = l53__tmp.f_value;
 								final Struct l55_existing = ((Struct)(l53__tmp).f_value);
 								return (Module_equalizer.f_mizTrmSAt(aeq_0, Module_equalizer.f_mizTrmInfoOf(l55_existing))).f_term;
 							}
-							case 80/*None*/: {
+							case 82/*None*/: {
 								Module_equalizer.f_mizYEqClass(aeq_0, at0);
 								final int l56_info2 = Module_equalizer.f_mizTrmInfoOf(at0);
 								if ((l1_srt!=Module_lexicon.g_ikTrmSchFunc)) {
@@ -4959,13 +6304,13 @@ final public class Module_equalizer {
 									final Struct l67_gsymswitch5 = Module_equalizer.f_mizSortedFind(aeq_0, (aeq_0).f_choiceTerm, at0);
 									Struct l68__tmp = l67_gsymswitch5;
 									switch (l68__tmp.getTypeId()) {
-									case 88/*Some*/: {
+									case 90/*Some*/: {
 										final Struct_Some l69__tmp = (Struct_Some)l68__tmp;
 										final Object l70_existing = l69__tmp.f_value;
 										final Struct l71_existing = ((Struct)(l69__tmp).f_value);
 										return (Module_equalizer.f_mizTrmSAt(aeq_0, Module_equalizer.f_mizTrmInfoOf(l71_existing))).f_term;
 									}
-									case 80/*None*/: {
+									case 82/*None*/: {
 										Module_equalizer.f_mizYEqClass(aeq_0, at0);
 										final int l72_info3 = Module_equalizer.f_mizTrmInfoOf(at0);
 										Module_vector.f_pushVector((aeq_0).f_choiceTerm, at0);
@@ -4992,10 +6337,10 @@ final public class Module_equalizer {
 		TAIL_CALL: for(;;) {
 		Struct l0__tmp = al;
 		switch (l0__tmp.getTypeId()) {
-		case 69/*MizTrmNil*/: {
+		case 71/*MizTrmNil*/: {
 			return null;
 		}
-		case 68/*MizTrmElem*/: {
+		case 70/*MizTrmElem*/: {
 			final Struct_MizTrmElem l1__tmp = (Struct_MizTrmElem)l0__tmp;
 			final Struct l2_trm = l1__tmp.f_trm;
 			final Struct l3_next = l1__tmp.f_next;
@@ -5038,7 +6383,7 @@ final public class Module_equalizer {
 				boolean l13_isNil;
 				Struct l14__tmp = l12_gsymswitch14;
 				switch (l14__tmp.getTypeId()) {
-				case 69/*MizTrmNil*/: {
+				case 71/*MizTrmNil*/: {
 					l13_isNil=true;
 					break;
 				}
@@ -5064,7 +6409,7 @@ final public class Module_equalizer {
 				final Struct l14_gsymswitch12 = Module_equalizer.f_mizFindEqArgsTerm(aeq_0, Module_equalizer.g_expFunctor, ((int)(l13_pa).f_first), ((Struct)(l13_pa).f_second));
 				Struct l15__tmp = l14_gsymswitch12;
 				switch (l15__tmp.getTypeId()) {
-				case 88/*Some*/: {
+				case 90/*Some*/: {
 					final Struct_Some l16__tmp = (Struct_Some)l15__tmp;
 					final Object l17_existing = l16__tmp.f_value;
 					final Struct l18_existing = ((Struct)(l16__tmp).f_value);
@@ -5072,7 +6417,7 @@ final public class Module_equalizer {
 					l3_handled.value = ((Boolean)true);
 					break;
 				}
-				case 80/*None*/: {
+				case 82/*None*/: {
 					final Struct_MizConstr l19_c = Module_correl.f_mizConstr(l0_env, Module_correl.g_coFunctor, (l12_ft).f_funcNr);
 					if (Module_correl.f_mizHasProperty(l19_c, Module_correl.g_syCommutativity)) {
 						final Struct l20_lCommTrm = Module_correl.f_mizNewFuncTrm((l12_ft).f_funcNr, Module_roundcl.f_mizSwapArguments((l12_ft).f_args, (l19_c).f_firstArg, (l19_c).f_secondArg));
@@ -5081,7 +6426,7 @@ final public class Module_equalizer {
 						final Struct l23_gsymswitch13 = Module_equalizer.f_mizFindEqArgsTerm(aeq_0, Module_equalizer.g_expFunctor, ((int)(l22_pw).f_first), ((Struct)(l22_pw).f_second));
 						Struct l24__tmp = l23_gsymswitch13;
 						switch (l24__tmp.getTypeId()) {
-						case 88/*Some*/: {
+						case 90/*Some*/: {
 							final Struct_Some l25__tmp = (Struct_Some)l24__tmp;
 							final Object l26_existing2 = l25__tmp.f_value;
 							final Struct l27_existing2 = ((Struct)(l25__tmp).f_value);
@@ -5089,7 +6434,7 @@ final public class Module_equalizer {
 							l3_handled.value = ((Boolean)true);
 							break;
 						}
-						case 80/*None*/: {
+						case 82/*None*/: {
 							break;
 						}
 						default:
@@ -5119,7 +6464,7 @@ final public class Module_equalizer {
 					final Struct l30_gsymswitch11 = Module_equalizer.f_mizFindEqArgsTerm(aeq_0, l29_kind, Module_equalizer.f_mizFuncNrOfE(at0), l28_args);
 					Struct l31__tmp = l30_gsymswitch11;
 					switch (l31__tmp.getTypeId()) {
-					case 88/*Some*/: {
+					case 90/*Some*/: {
 						final Struct_Some l32__tmp = (Struct_Some)l31__tmp;
 						final Object l33_existing = l32__tmp.f_value;
 						final Struct l34_existing = ((Struct)(l32__tmp).f_value);
@@ -5127,7 +6472,7 @@ final public class Module_equalizer {
 						l3_handled.value = ((Boolean)true);
 						break;
 					}
-					case 80/*None*/: {
+					case 82/*None*/: {
 						break;
 					}
 					default:
@@ -5142,7 +6487,7 @@ final public class Module_equalizer {
 						final Struct l38_gsymswitch10 = Module_equalizer.f_mizFuncIdxFind(aeq_0, Module_equalizer.g_expAggreg, (l35_ft2).f_funcNr);
 						Struct l39__tmp = l38_gsymswitch10;
 						switch (l39__tmp.getTypeId()) {
-						case 88/*Some*/: {
+						case 90/*Some*/: {
 							final Struct_Some l40__tmp = (Struct_Some)l39__tmp;
 							final Object l41_v = l40__tmp.f_value;
 							final Struct_Vector l42_v = ((Struct_Vector)(l40__tmp).f_value);
@@ -5164,7 +6509,7 @@ final public class Module_equalizer {
 							Module_loop.f_while(l46_$44, l47_$45);
 							break;
 						}
-						case 80/*None*/: {
+						case 82/*None*/: {
 							break;
 						}
 						default:
@@ -5190,7 +6535,7 @@ final public class Module_equalizer {
 								final Struct l55_gsymswitch9 = Module_equalizer.f_mizSortedFind(aeq_0, (aeq_0).f_frOper, at0);
 								Struct l56__tmp = l55_gsymswitch9;
 								switch (l56__tmp.getTypeId()) {
-								case 88/*Some*/: {
+								case 90/*Some*/: {
 									final Struct_Some l57__tmp = (Struct_Some)l56__tmp;
 									final Object l58_existing = l57__tmp.f_value;
 									final Struct l59_existing = ((Struct)(l57__tmp).f_value);
@@ -5198,7 +6543,7 @@ final public class Module_equalizer {
 									l3_handled.value = ((Boolean)true);
 									break;
 								}
-								case 80/*None*/: {
+								case 82/*None*/: {
 									break;
 								}
 								default:
@@ -5212,7 +6557,7 @@ final public class Module_equalizer {
 								final Struct l61_gsymswitch8 = Module_equalizer.f_mizSortedFind(aeq_0, (aeq_0).f_choiceTerm, at0);
 								Struct l62__tmp = l61_gsymswitch8;
 								switch (l62__tmp.getTypeId()) {
-								case 88/*Some*/: {
+								case 90/*Some*/: {
 									final Struct_Some l63__tmp = (Struct_Some)l62__tmp;
 									final Object l64_existing = l63__tmp.f_value;
 									final Struct l65_existing = ((Struct)(l63__tmp).f_value);
@@ -5220,7 +6565,7 @@ final public class Module_equalizer {
 									l3_handled.value = ((Boolean)true);
 									break;
 								}
-								case 80/*None*/: {
+								case 82/*None*/: {
 									break;
 								}
 								default:

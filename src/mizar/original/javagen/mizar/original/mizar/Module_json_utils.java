@@ -48,20 +48,20 @@ final public class Module_json_utils {
 				final Struct l6_gsymswitch0 = l6_fnValue.invoke(av);
 				Struct l7__tmp = l6_gsymswitch0;
 				switch (l7__tmp.getTypeId()) {
-				case 80/*None*/: {
+				case 82/*None*/: {
 					return l0_err;
 				}
-				case 88/*Some*/: {
+				case 90/*Some*/: {
 					final Struct_Some l8__tmp = (Struct_Some)l7__tmp;
 					final Object l9_v2 = l8__tmp.f_value;
 					final Object l10_v2 = (l8__tmp).f_value;
 					final Struct l11_gsymswitch1 = l7_fnKey.invoke(ak);
 					Struct l12__tmp = l11_gsymswitch1;
 					switch (l12__tmp.getTypeId()) {
-					case 80/*None*/: {
+					case 82/*None*/: {
 						return l0_err;
 					}
-					case 88/*Some*/: {
+					case 90/*Some*/: {
 						final Struct_Some l13__tmp = (Struct_Some)l12__tmp;
 						final Object l14_k2 = l13__tmp.f_value;
 						final Object l15_k2 = (l13__tmp).f_value;
@@ -153,10 +153,10 @@ final public class Module_json_utils {
 					final Struct l8_gsymswitch2 = l8_fnValue.invoke(((Struct)(aa).f_second));
 					Struct l9__tmp = l8_gsymswitch2;
 					switch (l9__tmp.getTypeId()) {
-					case 80/*None*/: {
+					case 82/*None*/: {
 						return (new Struct_Pair(false, Module_list.f_makeList()));
 					}
-					case 88/*Some*/: {
+					case 90/*Some*/: {
 						final Struct_Some l10__tmp = (Struct_Some)l9__tmp;
 						final Object l11_v = l10__tmp.f_value;
 						final Object l12_v = (l10__tmp).f_value;

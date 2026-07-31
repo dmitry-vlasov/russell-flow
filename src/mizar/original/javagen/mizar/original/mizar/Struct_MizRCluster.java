@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785512695553
+// timestamp: 1785524849108
 
 package mizar.original.mizar;
 
@@ -21,7 +21,7 @@ public class Struct_MizRCluster extends Struct {
 		f_clusterType = a_clusterType;
 	}
 
-	public int getTypeId() { return 62; }
+	public int getTypeId() { return 64; }
 	public String getTypeName() { return "MizRCluster"; }
 
 	private static final String[] field_names = new String[] {
@@ -52,7 +52,7 @@ public class Struct_MizRCluster extends Struct {
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 62) return 62-tmp;
+		if (tmp != 64) return 64-tmp;
 		Struct_MizRCluster other = (Struct_MizRCluster)other_gen;
 		tmp = f_article.compareTo(other.f_article);
 		if (tmp != 0) return tmp;

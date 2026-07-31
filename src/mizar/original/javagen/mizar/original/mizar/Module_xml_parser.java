@@ -289,13 +289,13 @@ final public class Module_xml_parser {
 		final Struct l0_gsymswitch0 = Module_xml_parser.f_mizXmlFindAttr(ap, aname);
 		Struct l1__tmp = l0_gsymswitch0;
 		switch (l1__tmp.getTypeId()) {
-		case 88/*Some*/: {
+		case 90/*Some*/: {
 			final Struct_Some l2__tmp = (Struct_Some)l1__tmp;
 			final Object l3_v = l2__tmp.f_value;
 			final String l4_v = ((String)(l2__tmp).f_value);
 			return Module_math.f_s2i(l4_v);
 		}
-		case 80/*None*/: {
+		case 82/*None*/: {
 			Module_errhan.f_mizAssert(Module_xml_parser.g_errMissingXMLAttribute, false);
 			return 0;
 		}
@@ -307,13 +307,13 @@ final public class Module_xml_parser {
 		final Struct l0_gsymswitch1 = Module_xml_parser.f_mizXmlFindAttr(ap, aname);
 		Struct l1__tmp = l0_gsymswitch1;
 		switch (l1__tmp.getTypeId()) {
-		case 88/*Some*/: {
+		case 90/*Some*/: {
 			final Struct_Some l2__tmp = (Struct_Some)l1__tmp;
 			final Object l3_v = l2__tmp.f_value;
 			final String l4_v = ((String)(l2__tmp).f_value);
 			return Module_math.f_s2i(l4_v);
 		}
-		case 80/*None*/: {
+		case 82/*None*/: {
 			return adef;
 		}
 		default:

@@ -1,0 +1,378 @@
+// Transcription of ~/dev/system/kernel/polynom.pas — the polynomial values:
+// monomials (coefficient x power product over class variables) and sorted
+// polynomial collections with Add/Mult/Diff/NthPower/NMult, the comparisons,
+// and variable substitution (InsertValue). Coefficients are DOUBLES here —
+// the recorded deviation from the original's exact rational complex numbers
+// (numbers.pas RComplex). Groebner-basis machinery stays staged; only what
+// the equalizer pipeline consumes is here.
+
+import ds/vector;
+import loop;
+import math/math;
+import mizar/original/errhan;
+import mizar/original/mobjects;
+import mizar/original/identify;
+
+export {
+	MizMonomial(
+		mutable coeff : MizComplex,
+		powers : MizNatFunc,                 // var -> exponent, sorted
+	);
+
+	// sorted by CompareMonomials (lex)
+	MizPolynomial(monos : Vector<MizMonomial>);
+
+	mizPolyWithNumeric(v : MizComplex) -> MizPolynomial;
+	mizPolyWithMonomial(c : MizComplex, varNr : int) -> MizPolynomial;
+	mizCopyPoly(p : MizPolynomial) -> MizPolynomial;
+
+	mizPolyIsNumeric(p : MizPolynomial) -> bool;
+	mizPolyIsNumericEqualWith(p : MizPolynomial, v : MizComplex) -> bool;
+	mizPolyGetNumeric(p : MizPolynomial) -> MizComplex;
+	mizPolyIsVariable(p : MizPolynomial) -> int;          // var nr or 0
+	mizPolyIsUniVariantVariable(p : MizPolynomial) -> int;
+	mizPolyHasTheVariable(p : MizPolynomial, varNr : int) -> bool;
+
+	mizCompareMonomials(a : MizMonomial, b : MizMonomial) -> int;
+	mizStdComparePolynomials(a : MizPolynomial, b : MizPolynomial) -> int;
+	mizComparePolynomials(a : MizPolynomial, b : MizPolynomial) -> int;
+
+	mizAddPolynomials(a : MizPolynomial, b : MizPolynomial) -> MizPolynomial;
+	mizMultPolynomials(a : MizPolynomial, b : MizPolynomial) -> MizPolynomial;
+	mizDiffPolynomials(a : MizPolynomial, b : MizPolynomial) -> MizPolynomial;
+	mizNMultPolynomial(v : MizComplex, p : MizPolynomial) -> MizPolynomial;
+
+	// substitute varNr := q in place
+	mizPolyInsertValue(p : MizPolynomial, varNr : int, q : MizPolynomial) -> void;
+}
+
+mizCZeroP = MizComplex(0.0, 0.0);
+mizCOneP = MizComplex(1.0, 0.0);
+
+cEq0(v : MizComplex) -> bool { v.re == 0.0 && v.im == 0.0 }
+cEq1(v : MizComplex) -> bool { v.re == 1.0 && v.im == 0.0 }
+cAdd(a : MizComplex, b : MizComplex) -> MizComplex { MizComplex(a.re + b.re, a.im + b.im) }
+cSub(a : MizComplex, b : MizComplex) -> MizComplex { MizComplex(a.re - b.re, a.im - b.im) }
+cMul(a : MizComplex, b : MizComplex) -> MizComplex {
+	MizComplex(a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re);
+}
+cNeg(a : MizComplex) -> MizComplex { MizComplex(-a.re, -a.im) }
+cCmp(a : MizComplex, b : MizComplex) -> int {
+	if (a.re < b.re) -1 else if (a.re > b.re) 1
+	else if (a.im < b.im) -1 else if (a.im > b.im) 1 else 0;
+}
+
+mizNewMonomial(c : MizComplex) -> MizMonomial {
+	MizMonomial(c, mizInitNatFunc(4));
+}
+
+mizCopyMonomial(m : MizMonomial) -> MizMonomial {
+	MizMonomial(m.coeff, mizCopyNatFunc(m.powers));
+}
+
+mizPolyWithNumeric(v : MizComplex) -> MizPolynomial {
+	p = MizPolynomial(makeVector(2));
+	pushVector(p.monos, mizNewMonomial(v));
+	p;
+}
+
+mizPolyWithMonomial(c : MizComplex, varNr : int) -> MizPolynomial {
+	m = mizNewMonomial(c);
+	mizNatAssign(m.powers, varNr, 1);
+	p = MizPolynomial(makeVector(2));
+	pushVector(p.monos, m);
+	p;
+}
+
+mizCopyPoly(p : MizPolynomial) -> MizPolynomial {
+	r = MizPolynomial(makeVector(sizeVector(p.monos)));
+	iterVector(p.monos, \m -> pushVector(r.monos, mizCopyMonomial(m)));
+	r;
+}
+
+mizPolyIsNumeric(p : MizPolynomial) -> bool {
+	sizeVector(p.monos) == 1 && mizNatCount(getVectorUnsafe(p.monos, 0).powers) == 0;
+}
+
+mizPolyIsNumericEqualWith(p : MizPolynomial, v : MizComplex) -> bool {
+	mizPolyIsNumeric(p) && cCmp(getVectorUnsafe(p.monos, 0).coeff, v) == 0;
+}
+
+mizPolyGetNumeric(p : MizPolynomial) -> MizComplex {
+	getVectorUnsafe(p.monos, 0).coeff;
+}
+
+mizMonoIsVariable(m : MizMonomial) -> int {
+	if (mizNatCount(m.powers) == 1 && mizNatItem(m.powers, 0).y == 1
+		&& cEq1(m.coeff)) {
+		mizNatItem(m.powers, 0).x;
+	} else {
+		0;
+	}
+}
+
+mizPolyIsVariable(p : MizPolynomial) -> int {
+	if (sizeVector(p.monos) == 1) mizMonoIsVariable(getVectorUnsafe(p.monos, 0))
+	else 0;
+}
+
+mizPolyIsUniVariantVariable(p : MizPolynomial) -> int {
+	// the head monomial as a plain variable (used for x = polynomial checks)
+	if (sizeVector(p.monos) == 1) mizMonoIsVariable(getVectorUnsafe(p.monos, 0))
+	else 0;
+}
+
+mizPolyHasTheVariable(p : MizPolynomial, varNr : int) -> bool {
+	r = ref false;
+	iterVector(p.monos, \m -> if (mizNatHasInDom(m.powers, varNr)) r := true);
+	^r;
+}
+
+// LexCompareMonomials
+mizCompareMonomials(a : MizMonomial, b : MizMonomial) -> int {
+	na = mizNatCount(a.powers);
+	nb = mizNatCount(b.powers);
+	res = ref 0;
+	i = ref 0;
+	while(\ -> ^res == 0 && ^i < na, \ -> {
+		if (^i >= nb) {
+			res := -1;
+		} else {
+			pa = mizNatItem(a.powers, ^i);
+			pb = mizNatItem(b.powers, ^i);
+			c1 = if (pa.x < pb.x) -1 else if (pa.x > pb.x) 1 else 0;
+			if (c1 != 0) {
+				res := c1;
+			} else {
+				c2 = if (pa.y < pb.y) 1 else if (pa.y > pb.y) -1 else 0;
+				if (c2 != 0) res := c2;
+			}
+		}
+		i := ^i + 1;
+	});
+	if (^res != 0) ^res
+	else if (na < nb) 1 else if (na > nb) -1 else 0;
+}
+
+mizStdCompareMonomials(a : MizMonomial, b : MizMonomial) -> int {
+	ca = mizNatCountAll(a.powers);
+	cb = mizNatCountAll(b.powers);
+	if (ca != cb) {
+		if (ca < cb) -1 else 1;
+	} else {
+		mizNatCompareGraph(a.powers, b.powers);
+	}
+}
+
+mizNatCompareGraph(f : MizNatFunc, g : MizNatFunc) -> int {
+	nf = mizNatCount(f);
+	ng = mizNatCount(g);
+	res = ref 0;
+	i = ref 0;
+	while(\ -> ^res == 0 && ^i < nf && ^i < ng, \ -> {
+		pf = mizNatItem(f, ^i);
+		pg = mizNatItem(g, ^i);
+		if (pf.x != pg.x) res := if (pf.x < pg.x) -1 else 1
+		else if (pf.y != pg.y) res := if (pf.y < pg.y) -1 else 1;
+		i := ^i + 1;
+	});
+	if (^res != 0) ^res
+	else if (nf < ng) -1 else if (nf > ng) 1 else 0;
+}
+
+mizStdComparePolynomials(a : MizPolynomial, b : MizPolynomial) -> int {
+	na = sizeVector(a.monos);
+	nb = sizeVector(b.monos);
+	if (na != nb) {
+		if (na < nb) -1 else 1;
+	} else {
+		res = ref 0;
+		i = ref 0;
+		while(\ -> ^res == 0 && ^i < na, \ -> {
+			ma = getVectorUnsafe(a.monos, ^i);
+			mb = getVectorUnsafe(b.monos, ^i);
+			c1 = mizStdCompareMonomials(ma, mb);
+			if (c1 != 0) res := c1
+			else {
+				c2 = cCmp(ma.coeff, mb.coeff);
+				if (c2 != 0) res := c2;
+			}
+			i := ^i + 1;
+		});
+		^res;
+	}
+}
+
+mizComparePolynomials(a : MizPolynomial, b : MizPolynomial) -> int {
+	na = sizeVector(a.monos);
+	nb = sizeVector(b.monos);
+	if (nb == 0) 1
+	else if (na == 0) -1
+	else {
+		res = ref 0;
+		i = ref 0;
+		while(\ -> ^res == 0 && ^i < na && ^i < nb, \ -> {
+			ma = getVectorUnsafe(a.monos, ^i);
+			mb = getVectorUnsafe(b.monos, ^i);
+			c1 = mizCompareMonomials(ma, mb);
+			if (c1 != 0) res := c1
+			else {
+				c2 = cCmp(ma.coeff, mb.coeff);
+				if (c2 != 0) res := c2;
+			}
+			i := ^i + 1;
+		});
+		if (^res != 0) ^res
+		else if (na < nb) -1 else if (na > nb) 1 else 0;
+	}
+}
+
+// Polynomial.Insert: sorted insert merging equal power products
+mizPolyInsert(p : MizPolynomial, m : MizMonomial) -> void {
+	n = sizeVector(p.monos);
+	pos = ref 0;
+	found = ref false;
+	brk = ref false;
+	while(\ -> !^brk && ^pos < n, \ -> {
+		c = mizCompareMonomials(getVectorUnsafe(p.monos, ^pos), m);
+		if (c == 0) {
+			found := true;
+			brk := true;
+		} else if (c > 0) {
+			brk := true;
+		} else {
+			pos := ^pos + 1;
+		}
+	});
+	if (^found) {
+		e = getVectorUnsafe(p.monos, ^pos);
+		v = cAdd(m.coeff, e.coeff);
+		if (cEq0(v)) {
+			if (sizeVector(p.monos) > 1) {
+				removeVector(p.monos, ^pos);
+			} else {
+				mizNatDeleteAll(e.powers);
+				e.coeff ::= v;
+			}
+		} else {
+			e.coeff ::= v;
+		}
+	} else {
+		if (cEq0(m.coeff) && sizeVector(p.monos) > 0) {
+			// drop a zero monomial when something is already present
+		} else {
+			if (sizeVector(p.monos) > 0
+				&& cEq0(getVectorUnsafe(p.monos, 0).coeff)) {
+				removeVector(p.monos, 0);
+				pos := max(0, ^pos - 1);
+			}
+			mizVectorAtInsertM(p.monos, ^pos, m);
+		}
+	}
+}
+
+mizVectorAtInsertM(v : Vector<MizMonomial>, pos : int, m : MizMonomial) -> void {
+	pushVector(v, m);
+	i = ref sizeVector(v) - 1;
+	while(\ -> ^i > pos, \ -> {
+		setVectorUnsafe(v, ^i, getVectorUnsafe(v, ^i - 1));
+		i := ^i - 1;
+	});
+	setVectorUnsafe(v, pos, m);
+}
+
+mizAddPolynomials(a : MizPolynomial, b : MizPolynomial) -> MizPolynomial {
+	r = MizPolynomial(makeVector(sizeVector(a.monos) + sizeVector(b.monos)));
+	iterVector(a.monos, \m -> mizPolyInsert(r, mizCopyMonomial(m)));
+	iterVector(b.monos, \m -> mizPolyInsert(r, mizCopyMonomial(m)));
+	if (sizeVector(r.monos) == 0) mizPolyWithNumeric(mizCZeroP) else r;
+}
+
+mizDiffPolynomials(a : MizPolynomial, b : MizPolynomial) -> MizPolynomial {
+	r = MizPolynomial(makeVector(sizeVector(a.monos) + sizeVector(b.monos)));
+	iterVector(a.monos, \m -> mizPolyInsert(r, mizCopyMonomial(m)));
+	iterVector(b.monos, \m -> {
+		nm = mizCopyMonomial(m);
+		nm.coeff ::= cNeg(m.coeff);
+		mizPolyInsert(r, nm);
+	});
+	if (sizeVector(r.monos) == 0) mizPolyWithNumeric(mizCZeroP) else r;
+}
+
+mizMultPolynomials(a : MizPolynomial, b : MizPolynomial) -> MizPolynomial {
+	if (mizPolyIsNumericEqualWith(a, mizCZeroP)
+		|| mizPolyIsNumericEqualWith(b, mizCZeroP)) {
+		mizPolyWithNumeric(mizCZeroP);
+	} else {
+		r = MizPolynomial(makeVector(sizeVector(a.monos) * sizeVector(b.monos)));
+		iterVector(a.monos, \ma -> {
+			iterVector(b.monos, \mb -> {
+				nm = MizMonomial(cMul(ma.coeff, mb.coeff), mizCopyNatFunc(ma.powers));
+				mizNatAddPointwise(nm.powers, mb.powers);
+				mizPolyInsert(r, nm);
+			});
+		});
+		if (sizeVector(r.monos) == 0) mizPolyWithNumeric(mizCZeroP) else r;
+	}
+}
+
+mizNatAddPointwise(f : MizNatFunc, g : MizNatFunc) -> void {
+	fori(0, mizNatCount(g) - 1, \i -> {
+		it = mizNatItem(g, i);
+		fori(1, it.y, \__ -> mizNatUp(f, it.x));
+	});
+}
+
+mizNMultPolynomial(v : MizComplex, p : MizPolynomial) -> MizPolynomial {
+	if (cEq0(v)) {
+		mizPolyWithNumeric(v);
+	} else {
+		r = mizCopyPoly(p);
+		if (!cEq1(v)) {
+			iterVector(r.monos, \m -> m.coeff ::= cMul(v, m.coeff));
+		}
+		r;
+	}
+}
+
+mizNthPower(p : MizPolynomial, n : int) -> MizPolynomial {
+	if (n == 0) {
+		mizPolyWithNumeric(mizCOneP);
+	} else {
+		r = ref mizCopyPoly(p);
+		fori(2, n, \__ -> r := mizMultPolynomials(^r, p));
+		^r;
+	}
+}
+
+mizMMultPolynomial(m : MizMonomial, p : MizPolynomial) -> MizPolynomial {
+	r = MizPolynomial(makeVector(sizeVector(p.monos)));
+	iterVector(p.monos, \pm -> {
+		nm = MizMonomial(cMul(m.coeff, pm.coeff), mizCopyNatFunc(m.powers));
+		mizNatAddPointwise(nm.powers, pm.powers);
+		mizPolyInsert(r, nm);
+	});
+	if (sizeVector(r.monos) == 0) mizPolyWithNumeric(mizCZeroP) else r;
+}
+
+// InsertValue: substitute varNr := q in place
+mizPolyInsertValue(p : MizPolynomial, varNr : int, q : MizPolynomial) -> void {
+	old : Vector<MizMonomial> = copyVector(p.monos);
+	clearVector(p.monos);
+	iterVector(old, \m -> {
+		if (mizNatHasInDom(m.powers, varNr)) {
+			if (!mizPolyIsNumericEqualWith(q, mizCZeroP)) {
+				power = mizNatValue(m.powers, varNr);
+				mizNatDeleteElem(m.powers, varNr);
+				qp = mizNthPower(q, power);
+				mp = mizMMultPolynomial(m, qp);
+				iterVector(mp.monos, \nm -> mizPolyInsert(p, nm));
+			}
+		} else {
+			mizPolyInsert(p, m);
+		}
+	});
+	if (sizeVector(p.monos) == 0) {
+		pushVector(p.monos, mizNewMonomial(mizCZeroP));
+	}
+}

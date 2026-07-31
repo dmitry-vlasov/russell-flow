@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785512695556
+// timestamp: 1785524849111
 
 package mizar.original.mizar;
 
@@ -49,7 +49,7 @@ public class Struct_MizXmlParser extends Struct implements Field_lineIdx<Integer
 	public Integer get_nState() { return f_nState; }
 	public void set_nState(Integer value) { f_nState = value; }
 
-	public int getTypeId() { return 79; }
+	public int getTypeId() { return 81; }
 	public String getTypeName() { return "MizXmlParser"; }
 
 	private static final String[] field_names = new String[] {
@@ -86,7 +86,7 @@ public class Struct_MizXmlParser extends Struct implements Field_lineIdx<Integer
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 79) return 79-tmp;
+		if (tmp != 81) return 81-tmp;
 		Struct_MizXmlParser other = (Struct_MizXmlParser)other_gen;
 		tmp = FlowRuntime.compareByValue(f_lines, other.f_lines);
 		if (tmp != 0) return tmp;

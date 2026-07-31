@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785512695552
+// timestamp: 1785524849108
 
 package mizar.original.mizar;
 
@@ -23,7 +23,7 @@ public class Struct_MizQuaTrm extends Struct implements Field_trmProper<Struct>,
 	public Integer get_trmInfo() { return f_trmInfo; }
 	public void set_trmInfo(Integer value) { f_trmInfo = value; }
 
-	public int getTypeId() { return 60; }
+	public int getTypeId() { return 62; }
 	public String getTypeName() { return "MizQuaTrm"; }
 
 	private static final String[] field_names = new String[] {
@@ -53,7 +53,7 @@ public class Struct_MizQuaTrm extends Struct implements Field_trmProper<Struct>,
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 60) return 60-tmp;
+		if (tmp != 62) return 62-tmp;
 		Struct_MizQuaTrm other = (Struct_MizQuaTrm)other_gen;
 		tmp = f_trmProper.compareTo(other.f_trmProper);
 		if (tmp != 0) return tmp;

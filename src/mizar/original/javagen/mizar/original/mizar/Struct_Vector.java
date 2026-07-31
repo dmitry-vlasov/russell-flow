@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785512695558
+// timestamp: 1785524849112
 
 package mizar.original.mizar;
 
@@ -15,7 +15,7 @@ public class Struct_Vector extends Struct {
 		f_defVal = a_defVal;
 	}
 
-	public int getTypeId() { return 92; }
+	public int getTypeId() { return 94; }
 	public String getTypeName() { return "Vector"; }
 
 	private static final String[] field_names = new String[] {
@@ -43,7 +43,7 @@ public class Struct_Vector extends Struct {
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 92) return 92-tmp;
+		if (tmp != 94) return 94-tmp;
 		Struct_Vector other = (Struct_Vector)other_gen;
 		tmp = FlowRuntime.compareByValue(f_vect, other.f_vect);
 		if (tmp != 0) return tmp;

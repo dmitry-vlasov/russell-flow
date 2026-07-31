@@ -11,7 +11,7 @@ final public class Module_tree {
 		TAIL_CALL: for(;;) {
 		Struct l0__tmp = aset;
 		switch (l0__tmp.getTypeId()) {
-		case 90/*TreeNode*/: {
+		case 92/*TreeNode*/: {
 			final Struct_TreeNode l1__tmp = (Struct_TreeNode)l0__tmp;
 			final Object l2_k = l1__tmp.f_key;
 			final Object l3_v = l1__tmp.f_value;
@@ -42,7 +42,7 @@ final public class Module_tree {
 				}
 			}
 		}
-		case 89/*TreeEmpty*/: {
+		case 91/*TreeEmpty*/: {
 			return ((Struct)SingletonStructs.str_None);
 		}
 		default:
@@ -77,10 +77,10 @@ final public class Module_tree {
 			if ((l2_balance<0)) {
 				Struct l4__tmp = aright;
 				switch (l4__tmp.getTypeId()) {
-				case 89/*TreeEmpty*/: {
+				case 91/*TreeEmpty*/: {
 					return l3_composed;
 				}
-				case 90/*TreeNode*/: {
+				case 92/*TreeNode*/: {
 					final Struct_TreeNode l5__tmp = (Struct_TreeNode)l4__tmp;
 					final Object l6_rk = l5__tmp.f_key;
 					final Object l7_rv = l5__tmp.f_value;
@@ -100,10 +100,10 @@ final public class Module_tree {
 			} else {
 				Struct l16__tmp = aleft;
 				switch (l16__tmp.getTypeId()) {
-				case 89/*TreeEmpty*/: {
+				case 91/*TreeEmpty*/: {
 					return l3_composed;
 				}
-				case 90/*TreeNode*/: {
+				case 92/*TreeNode*/: {
 					final Struct_TreeNode l17__tmp = (Struct_TreeNode)l16__tmp;
 					final Object l18_lk = l17__tmp.f_key;
 					final Object l19_lv = l17__tmp.f_value;
@@ -126,7 +126,7 @@ final public class Module_tree {
 	public static final Struct f_setTree(Struct aset, Object akey, Object avalue) {
 		Struct l0__tmp = aset;
 		switch (l0__tmp.getTypeId()) {
-		case 90/*TreeNode*/: {
+		case 92/*TreeNode*/: {
 			final Struct_TreeNode l1__tmp = (Struct_TreeNode)l0__tmp;
 			final Object l2_k = l1__tmp.f_key;
 			final Object l3_v = l1__tmp.f_value;
@@ -149,7 +149,7 @@ final public class Module_tree {
 				}
 			}
 		}
-		case 89/*TreeEmpty*/: {
+		case 91/*TreeEmpty*/: {
 			return (new Struct_TreeNode(akey, avalue, ((Struct)SingletonStructs.str_TreeEmpty), ((Struct)SingletonStructs.str_TreeEmpty), 1));
 		}
 		default:
@@ -159,10 +159,10 @@ final public class Module_tree {
 	public static final int f_treeDepth(Struct atree) {
 		Struct l0__tmp = atree;
 		switch (l0__tmp.getTypeId()) {
-		case 89/*TreeEmpty*/: {
+		case 91/*TreeEmpty*/: {
 			return 0;
 		}
-		case 90/*TreeNode*/: {
+		case 92/*TreeNode*/: {
 			final Struct_TreeNode l1__tmp = (Struct_TreeNode)l0__tmp;
 			final int l2_depth = l1__tmp.f_depth;
 			final Object l3___ = (l1__tmp).f_key;
@@ -179,10 +179,10 @@ final public class Module_tree {
 	public static final Struct f_treeLeftRotation(Struct atree) {
 		Struct l0__tmp = atree;
 		switch (l0__tmp.getTypeId()) {
-		case 89/*TreeEmpty*/: {
+		case 91/*TreeEmpty*/: {
 			return atree;
 		}
-		case 90/*TreeNode*/: {
+		case 92/*TreeNode*/: {
 			final Struct_TreeNode l1__tmp = (Struct_TreeNode)l0__tmp;
 			final Object l2_k = l1__tmp.f_key;
 			final Object l3_v = l1__tmp.f_value;
@@ -196,10 +196,10 @@ final public class Module_tree {
 			final int l11_depth = (l1__tmp).f_depth;
 			Struct l12__tmp = l10_right;
 			switch (l12__tmp.getTypeId()) {
-			case 89/*TreeEmpty*/: {
+			case 91/*TreeEmpty*/: {
 				return l1__tmp;
 			}
-			case 90/*TreeNode*/: {
+			case 92/*TreeNode*/: {
 				final Struct_TreeNode l13__tmp = (Struct_TreeNode)l12__tmp;
 				final Object l14_ck = l13__tmp.f_key;
 				final Object l15_cv = l13__tmp.f_value;
@@ -224,10 +224,10 @@ final public class Module_tree {
 	public static final Struct f_treeRightRotation(Struct atree) {
 		Struct l0__tmp = atree;
 		switch (l0__tmp.getTypeId()) {
-		case 89/*TreeEmpty*/: {
+		case 91/*TreeEmpty*/: {
 			return atree;
 		}
-		case 90/*TreeNode*/: {
+		case 92/*TreeNode*/: {
 			final Struct_TreeNode l1__tmp = (Struct_TreeNode)l0__tmp;
 			final Object l2_k = l1__tmp.f_key;
 			final Object l3_v = l1__tmp.f_value;
@@ -241,10 +241,10 @@ final public class Module_tree {
 			final int l11_depth = (l1__tmp).f_depth;
 			Struct l12__tmp = l9_left;
 			switch (l12__tmp.getTypeId()) {
-			case 89/*TreeEmpty*/: {
+			case 91/*TreeEmpty*/: {
 				return l1__tmp;
 			}
-			case 90/*TreeNode*/: {
+			case 92/*TreeNode*/: {
 				final Struct_TreeNode l13__tmp = (Struct_TreeNode)l12__tmp;
 				final Object l14_ck = l13__tmp.f_key;
 				final Object l15_cv = l13__tmp.f_value;

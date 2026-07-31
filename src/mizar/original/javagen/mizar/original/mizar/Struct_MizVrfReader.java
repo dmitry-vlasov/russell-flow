@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785512695556
+// timestamp: 1785524849110
 
 package mizar.original.mizar;
 
@@ -19,7 +19,7 @@ public class Struct_MizVrfReader extends Struct implements Field_mml<Boolean> {
 	public Boolean get_mml() { return f_mml; }
 	public void set_mml(Boolean value) { f_mml = value; }
 
-	public int getTypeId() { return 76; }
+	public int getTypeId() { return 78; }
 	public String getTypeName() { return "MizVrfReader"; }
 
 	private static final String[] field_names = new String[] {
@@ -48,7 +48,7 @@ public class Struct_MizVrfReader extends Struct implements Field_mml<Boolean> {
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 76) return 76-tmp;
+		if (tmp != 78) return 78-tmp;
 		Struct_MizVrfReader other = (Struct_MizVrfReader)other_gen;
 		tmp = f_x.compareTo(other.f_x);
 		if (tmp != 0) return tmp;

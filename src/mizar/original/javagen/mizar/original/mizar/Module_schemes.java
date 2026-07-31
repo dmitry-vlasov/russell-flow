@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785511364000
+// timestamp: 1785514111000
 
 package mizar.original.mizar;
 
@@ -30,7 +30,7 @@ final public class Module_schemes {
 	public static final Struct_MizVarTrm f_mizSchAsVar(Struct at) {
 		Struct l0__tmp = at;
 		switch (l0__tmp.getTypeId()) {
-		case 75/*MizVarTrm*/: {
+		case 77/*MizVarTrm*/: {
 			final Struct_MizVarTrm l1__tmp = (Struct_MizVarTrm)l0__tmp;
 			final int l2___ = (l1__tmp).f_sort;
 			final int l3___ = (l1__tmp).f_varNr;
@@ -49,7 +49,7 @@ final public class Module_schemes {
 		final Func2<Struct,Struct_MizWithin, Struct> l2_$1 = (Func2<Struct, Struct_MizWithin, Struct>)(Struct_MizWithin al3_0, Struct atrm) -> {
 			Struct l4__tmp = atrm;
 			switch (l4__tmp.getTypeId()) {
-			case 75/*MizVarTrm*/: {
+			case 77/*MizVarTrm*/: {
 				final Struct_MizVarTrm l5__tmp = (Struct_MizVarTrm)l4__tmp;
 				final int l6_srt = l5__tmp.f_sort;
 				final int l7_v = l5__tmp.f_varNr;
@@ -104,7 +104,7 @@ final public class Module_schemes {
 		if (((Module_correl.f_mizFrmSort(afFrm10)==Module_lexicon.g_ikFrmNeg)&&l1_lNeg)) {
 			Struct l3__tmp = afFrm10;
 			switch (l3__tmp.getTypeId()) {
-			case 51/*MizNegFrm*/: {
+			case 52/*MizNegFrm*/: {
 				final Struct_MizNegFrm l4__tmp = (Struct_MizNegFrm)l3__tmp;
 				final Struct l5_a = l4__tmp.f_arg;
 				final Struct l6_a = (l4__tmp).f_arg;
@@ -124,7 +124,7 @@ final public class Module_schemes {
 		if (((Module_correl.f_mizFrmSort(afFrm20)==Module_lexicon.g_ikFrmNeg)&&l1_lNeg)) {
 			Struct l9__tmp = afFrm20;
 			switch (l9__tmp.getTypeId()) {
-			case 51/*MizNegFrm*/: {
+			case 52/*MizNegFrm*/: {
 				final Struct_MizNegFrm l10__tmp = (Struct_MizNegFrm)l9__tmp;
 				final Struct l11_a = l10__tmp.f_arg;
 				final Struct l12_a = (l10__tmp).f_arg;
@@ -146,7 +146,7 @@ final public class Module_schemes {
 			Struct_MizPredFrm l16_p1;
 			Struct l17__tmp = l2_fFrm1;
 			switch (l17__tmp.getTypeId()) {
-			case 56/*MizPredFrm*/: {
+			case 58/*MizPredFrm*/: {
 				final Struct_MizPredFrm l18__tmp = (Struct_MizPredFrm)l17__tmp;
 				final int l19___ = (l18__tmp).f_sort;
 				final int l20___ = (l18__tmp).f_predNr;
@@ -164,7 +164,7 @@ final public class Module_schemes {
 				int l23_p2nr;
 				Struct l24__tmp = l8_fFrm2;
 				switch (l24__tmp.getTypeId()) {
-				case 56/*MizPredFrm*/: {
+				case 58/*MizPredFrm*/: {
 					final Struct_MizPredFrm l25__tmp = (Struct_MizPredFrm)l24__tmp;
 					final int l26_nr = l25__tmp.f_predNr;
 					final int l27___ = (l25__tmp).f_sort;
@@ -192,7 +192,7 @@ final public class Module_schemes {
 				Struct l36_p2args;
 				Struct l37__tmp = l8_fFrm2;
 				switch (l37__tmp.getTypeId()) {
-				case 56/*MizPredFrm*/: {
+				case 58/*MizPredFrm*/: {
 					final Struct_MizPredFrm l38__tmp = (Struct_MizPredFrm)l37__tmp;
 					final Struct l39_args = l38__tmp.f_args;
 					final int l40___ = (l38__tmp).f_sort;
@@ -221,7 +221,7 @@ final public class Module_schemes {
 				final Struct l50_gsymswitch11 = Module_tree.f_lookupTree((as).f_predSubst, l49_key);
 				Struct l51__tmp = l50_gsymswitch11;
 				switch (l51__tmp.getTypeId()) {
-				case 88/*Some*/: {
+				case 90/*Some*/: {
 					final Struct_Some l52__tmp = (Struct_Some)l51__tmp;
 					final Object l53_v0 = l52__tmp.f_value;
 					final int l54_v0 = ((int)(l52__tmp).f_value);
@@ -243,7 +243,7 @@ final public class Module_schemes {
 						return false;
 					}
 				}
-				case 80/*None*/: {
+				case 82/*None*/: {
 					final Object[] l58_$57 = (new Object[] { Module_lexicon.g_ikFrmPred, Module_lexicon.g_ikFrmPrivPred, Module_lexicon.g_ikFrmSchPred });
 					final Func1<Boolean,Integer> l59_$56 = (Func1<Boolean, Integer>)(Integer ak) -> {
 						return (((int)ak)!=l15_sf2);
@@ -284,7 +284,7 @@ final public class Module_schemes {
 						Struct l66_a1;
 						Struct l67__tmp = l2_fFrm1;
 						switch (l67__tmp.getTypeId()) {
-						case 51/*MizNegFrm*/: {
+						case 52/*MizNegFrm*/: {
 							final Struct_MizNegFrm l68__tmp = (Struct_MizNegFrm)l67__tmp;
 							final Struct l69_a = l68__tmp.f_arg;
 							final Struct l70_a = (l68__tmp).f_arg;
@@ -300,7 +300,7 @@ final public class Module_schemes {
 						Struct l72_a2;
 						Struct l73__tmp = l8_fFrm2;
 						switch (l73__tmp.getTypeId()) {
-						case 51/*MizNegFrm*/: {
+						case 52/*MizNegFrm*/: {
 							final Struct_MizNegFrm l74__tmp = (Struct_MizNegFrm)l73__tmp;
 							final Struct l75_a = l74__tmp.f_arg;
 							final Struct l76_a = (l74__tmp).f_arg;
@@ -325,7 +325,7 @@ final public class Module_schemes {
 							Struct_MizQualFrm l80_q1;
 							Struct l81__tmp = l2_fFrm1;
 							switch (l81__tmp.getTypeId()) {
-							case 61/*MizQualFrm*/: {
+							case 63/*MizQualFrm*/: {
 								final Struct_MizQualFrm l82__tmp = (Struct_MizQualFrm)l81__tmp;
 								final Struct l83___ = (l82__tmp).f_trm;
 								final Struct_MizTyp l84___ = (l82__tmp).f_typ;
@@ -341,7 +341,7 @@ final public class Module_schemes {
 							Struct_MizQualFrm l86_q2;
 							Struct l87__tmp = l8_fFrm2;
 							switch (l87__tmp.getTypeId()) {
-							case 61/*MizQualFrm*/: {
+							case 63/*MizQualFrm*/: {
 								final Struct_MizQualFrm l88__tmp = (Struct_MizQualFrm)l87__tmp;
 								final Struct l89___ = (l88__tmp).f_trm;
 								final Struct_MizTyp l90___ = (l88__tmp).f_typ;
@@ -415,7 +415,7 @@ final public class Module_schemes {
 									Struct_MizPredFrm l112_p1;
 									Struct l113__tmp = l2_fFrm1;
 									switch (l113__tmp.getTypeId()) {
-									case 56/*MizPredFrm*/: {
+									case 58/*MizPredFrm*/: {
 										final Struct_MizPredFrm l114__tmp = (Struct_MizPredFrm)l113__tmp;
 										final int l115___ = (l114__tmp).f_sort;
 										final int l116___ = (l114__tmp).f_predNr;
@@ -432,7 +432,7 @@ final public class Module_schemes {
 									Struct_MizPredFrm l119_p2;
 									Struct l120__tmp = l8_fFrm2;
 									switch (l120__tmp.getTypeId()) {
-									case 56/*MizPredFrm*/: {
+									case 58/*MizPredFrm*/: {
 										final Struct_MizPredFrm l121__tmp = (Struct_MizPredFrm)l120__tmp;
 										final int l122___ = (l121__tmp).f_sort;
 										final int l123___ = (l121__tmp).f_predNr;
@@ -454,7 +454,7 @@ final public class Module_schemes {
 										Struct_MizPredFrm l128_p1;
 										Struct l129__tmp = l2_fFrm1;
 										switch (l129__tmp.getTypeId()) {
-										case 56/*MizPredFrm*/: {
+										case 58/*MizPredFrm*/: {
 											final Struct_MizPredFrm l130__tmp = (Struct_MizPredFrm)l129__tmp;
 											final int l131___ = (l130__tmp).f_sort;
 											final int l132___ = (l130__tmp).f_predNr;
@@ -471,7 +471,7 @@ final public class Module_schemes {
 										Struct_MizPredFrm l135_p2;
 										Struct l136__tmp = l8_fFrm2;
 										switch (l136__tmp.getTypeId()) {
-										case 56/*MizPredFrm*/: {
+										case 58/*MizPredFrm*/: {
 											final Struct_MizPredFrm l137__tmp = (Struct_MizPredFrm)l136__tmp;
 											final int l138___ = (l137__tmp).f_sort;
 											final int l139___ = (l137__tmp).f_predNr;
@@ -501,7 +501,7 @@ final public class Module_schemes {
 											Struct_MizUnivFrm l144_u1;
 											Struct l145__tmp = l2_fFrm1;
 											switch (l145__tmp.getTypeId()) {
-											case 74/*MizUnivFrm*/: {
+											case 76/*MizUnivFrm*/: {
 												final Struct_MizUnivFrm l146__tmp = (Struct_MizUnivFrm)l145__tmp;
 												final int l147___ = (l146__tmp).f_sort;
 												final int l148___ = (l146__tmp).f_varId;
@@ -519,7 +519,7 @@ final public class Module_schemes {
 											Struct_MizUnivFrm l152_u2;
 											Struct l153__tmp = l8_fFrm2;
 											switch (l153__tmp.getTypeId()) {
-											case 74/*MizUnivFrm*/: {
+											case 76/*MizUnivFrm*/: {
 												final Struct_MizUnivFrm l154__tmp = (Struct_MizUnivFrm)l153__tmp;
 												final int l155___ = (l154__tmp).f_sort;
 												final int l156___ = (l154__tmp).f_varId;
@@ -639,7 +639,7 @@ final public class Module_schemes {
 			boolean l5_noArgs;
 			Struct l6__tmp = l4_gsymswitch8;
 			switch (l6__tmp.getTypeId()) {
-			case 69/*MizTrmNil*/: {
+			case 71/*MizTrmNil*/: {
 				l5_noArgs=true;
 				break;
 			}
@@ -655,7 +655,7 @@ final public class Module_schemes {
 				final Struct l9_gsymswitch10 = Module_schemes.f_schConstAt(as, (l3_f1).f_funcNr);
 				Struct l10__tmp = l9_gsymswitch10;
 				switch (l10__tmp.getTypeId()) {
-				case 88/*Some*/: {
+				case 90/*Some*/: {
 					final Struct_Some l11__tmp = (Struct_Some)l10__tmp;
 					final Object l12_prev = l11__tmp.f_value;
 					final Struct l13_prev = ((Struct)(l11__tmp).f_value);
@@ -666,7 +666,7 @@ final public class Module_schemes {
 						return false;
 					}
 				}
-				case 80/*None*/: {
+				case 82/*None*/: {
 					if ((as).f_thereAreBound) {
 						((Field_err)as).set_err(27);
 						return false;
@@ -712,7 +712,7 @@ final public class Module_schemes {
 							l17_f2nr=l22_fn;
 							break;
 						}
-						case 59/*MizPrivFuncTrm*/: {
+						case 61/*MizPrivFuncTrm*/: {
 							final Struct_MizPrivFuncTrm l19__tmp = (Struct_MizPrivFuncTrm)l18__tmp;
 							final int l26_fn = l19__tmp.f_funcNr;
 							final int l27_fn = (l19__tmp).f_funcNr;
@@ -742,7 +742,7 @@ final public class Module_schemes {
 							l32_f2args=l38_aa;
 							break;
 						}
-						case 59/*MizPrivFuncTrm*/: {
+						case 61/*MizPrivFuncTrm*/: {
 							final Struct_MizPrivFuncTrm l34__tmp = (Struct_MizPrivFuncTrm)l33__tmp;
 							final Struct l41_aa = l34__tmp.f_args;
 							final int l42___ = (l34__tmp).f_funcNr;
@@ -764,7 +764,7 @@ final public class Module_schemes {
 						final Struct l48_gsymswitch9 = Module_tree.f_lookupTree((as).f_funcSubst, l47_key);
 						Struct l49__tmp = l48_gsymswitch9;
 						switch (l49__tmp.getTypeId()) {
-						case 88/*Some*/: {
+						case 90/*Some*/: {
 							final Struct_Some l50__tmp = (Struct_Some)l49__tmp;
 							final Object l51_v = l50__tmp.f_value;
 							final int l52_v = ((int)(l50__tmp).f_value);
@@ -780,7 +780,7 @@ final public class Module_schemes {
 								return false;
 							}
 						}
-						case 80/*None*/: {
+						case 82/*None*/: {
 							final Struct_MizTyp l53_wTyp = Module_schemes.f_mizSchGetTrmType(as, at2);
 							if (Module_schemes.f_mizSchWidennings(as, l53_wTyp, ((Struct_MizTyp)Module_vector.f_getVectorUnsafe((as).f_schTypes, ((l3_f1).f_funcNr-1))))) {
 								final Object[] l56_$55 = (new Object[] { Module_lexicon.g_ikTrmFunctor, Module_lexicon.g_ikTrmPrivFunc, Module_lexicon.g_ikTrmSchFunc });
@@ -1002,7 +1002,7 @@ final public class Module_schemes {
 			final Struct l8_gsymswitch5 = l0_c1.value;
 			Struct l9__tmp = l8_gsymswitch5;
 			switch (l9__tmp.getTypeId()) {
-			case 68/*MizTrmElem*/: {
+			case 70/*MizTrmElem*/: {
 				final Struct_MizTrmElem l10__tmp = (Struct_MizTrmElem)l9__tmp;
 				final Struct l11_t1 = l10__tmp.f_trm;
 				final Struct l12_n1 = l10__tmp.f_next;
@@ -1011,7 +1011,7 @@ final public class Module_schemes {
 				final Struct l15_gsymswitch6 = l1_c2.value;
 				Struct l16__tmp = l15_gsymswitch6;
 				switch (l16__tmp.getTypeId()) {
-				case 68/*MizTrmElem*/: {
+				case 70/*MizTrmElem*/: {
 					final Struct_MizTrmElem l17__tmp = (Struct_MizTrmElem)l16__tmp;
 					final Struct l18_t2 = l17__tmp.f_trm;
 					final Struct l19_n2 = l17__tmp.f_next;
@@ -1027,7 +1027,7 @@ final public class Module_schemes {
 						return null;
 					}
 				}
-				case 69/*MizTrmNil*/: {
+				case 71/*MizTrmNil*/: {
 					l2_ok.value = ((Boolean)false);
 					l3_go.value = ((Boolean)false);
 					return null;
@@ -1036,18 +1036,18 @@ final public class Module_schemes {
 					throw new RuntimeException("Unexpected struct in switch: "+l16__tmp.getTypeName());
 				}
 			}
-			case 69/*MizTrmNil*/: {
+			case 71/*MizTrmNil*/: {
 				final Struct l22_gsymswitch7 = l1_c2.value;
 				Struct l23__tmp = l22_gsymswitch7;
 				switch (l23__tmp.getTypeId()) {
-				case 68/*MizTrmElem*/: {
+				case 70/*MizTrmElem*/: {
 					final Struct_MizTrmElem l24__tmp = (Struct_MizTrmElem)l23__tmp;
 					final Struct l25___ = (l24__tmp).f_trm;
 					final Struct l26___ = (l24__tmp).f_next;
 					l2_ok.value = ((Boolean)false);
 					break;
 				}
-				case 69/*MizTrmNil*/: {
+				case 71/*MizTrmNil*/: {
 					break;
 				}
 				default:
@@ -1101,7 +1101,7 @@ final public class Module_schemes {
 			final Func2<Struct,Struct_MizWithin, Struct> l2_$1 = (Func2<Struct, Struct_MizWithin, Struct>)(Struct_MizWithin al3_0, Struct atrm) -> {
 				Struct l4__tmp = atrm;
 				switch (l4__tmp.getTypeId()) {
-				case 75/*MizVarTrm*/: {
+				case 77/*MizVarTrm*/: {
 					final Struct_MizVarTrm l5__tmp = (Struct_MizVarTrm)l4__tmp;
 					final int l6_srt = l5__tmp.f_sort;
 					final int l7_v = l5__tmp.f_varNr;
@@ -1209,7 +1209,7 @@ final public class Module_schemes {
 		final Func2<Struct,Struct_MizWithin, Struct> l2_$1 = (Func2<Struct, Struct_MizWithin, Struct>)(Struct_MizWithin al3_0, Struct atrm) -> {
 			Struct l4__tmp = atrm;
 			switch (l4__tmp.getTypeId()) {
-			case 75/*MizVarTrm*/: {
+			case 77/*MizVarTrm*/: {
 				final Struct_MizVarTrm l5__tmp = (Struct_MizVarTrm)l4__tmp;
 				final int l6_srt = l5__tmp.f_sort;
 				final int l7_v = l5__tmp.f_varNr;
@@ -1254,20 +1254,20 @@ final public class Module_schemes {
 						final Struct l2_gsymswitch1 = Module_correl_inst.f_mizWidening(l0_env, aaSource);
 						Struct l3__tmp = l2_gsymswitch1;
 						switch (l3__tmp.getTypeId()) {
-						case 80/*None*/: {
+						case 82/*None*/: {
 							return false;
 						}
-						case 88/*Some*/: {
+						case 90/*Some*/: {
 							final Struct_Some l4__tmp = (Struct_Some)l3__tmp;
 							final Object l5_lTyp0 = l4__tmp.f_value;
 							final Struct_MizTyp l6_lTyp0 = ((Struct_MizTyp)(l4__tmp).f_value);
 							final Struct l7_gsymswitch2 = Module_correl_inst.f_mizWideningOf(l0_env, afTarget, l6_lTyp0);
 							Struct l8__tmp = l7_gsymswitch2;
 							switch (l8__tmp.getTypeId()) {
-							case 80/*None*/: {
+							case 82/*None*/: {
 								return false;
 							}
-							case 88/*Some*/: {
+							case 90/*Some*/: {
 								final Struct_Some l9__tmp = (Struct_Some)l8__tmp;
 								final Object l10_wTyp0 = l9__tmp.f_value;
 								final Struct_MizTyp l11_wTyp0 = ((Struct_MizTyp)(l9__tmp).f_value);
@@ -1293,22 +1293,22 @@ final public class Module_schemes {
 												final Struct l20_gsymswitch3 = Module_correl_inst.f_mizWidening(l0_env, l14_wTyp.value);
 												Struct l21__tmp = l20_gsymswitch3;
 												switch (l21__tmp.getTypeId()) {
-												case 80/*None*/: {
+												case 82/*None*/: {
 													l13_stop.value = ((Boolean)true);
 													return null;
 												}
-												case 88/*Some*/: {
+												case 90/*Some*/: {
 													final Struct_Some l22__tmp = (Struct_Some)l21__tmp;
 													final Object l23_lTyp = l22__tmp.f_value;
 													final Struct_MizTyp l24_lTyp = ((Struct_MizTyp)(l22__tmp).f_value);
 													final Struct l25_gsymswitch4 = Module_correl_inst.f_mizWideningOf(l0_env, l19_fTarget, l24_lTyp);
 													Struct l26__tmp = l25_gsymswitch4;
 													switch (l26__tmp.getTypeId()) {
-													case 80/*None*/: {
+													case 82/*None*/: {
 														l13_stop.value = ((Boolean)true);
 														return null;
 													}
-													case 88/*Some*/: {
+													case 90/*Some*/: {
 														final Struct_Some l27__tmp = (Struct_Some)l26__tmp;
 														final Object l28_w2 = l27__tmp.f_value;
 														final Struct_MizTyp l29_w2 = ((Struct_MizTyp)(l27__tmp).f_value);
@@ -1350,10 +1350,10 @@ final public class Module_schemes {
 							final Struct l21_gsymswitch0 = Module_correl_inst.f_mizWidenToStruct(l0_env, aaSource);
 							Struct l22__tmp = l21_gsymswitch0;
 							switch (l22__tmp.getTypeId()) {
-							case 80/*None*/: {
+							case 82/*None*/: {
 								return false;
 							}
-							case 88/*Some*/: {
+							case 90/*Some*/: {
 								final Struct_Some l23__tmp = (Struct_Some)l22__tmp;
 								final Object l24_lTyp = l23__tmp.f_value;
 								final Struct_MizTyp l25_lTyp = ((Struct_MizTyp)(l23__tmp).f_value);
@@ -1380,7 +1380,7 @@ final public class Module_schemes {
 		} else {
 			((Field_boundVarNbr)aenv).set_boundVarNbr(0);
 			final boolean l0_lChk = (aenv).f_itIsChecker;
-			((Field_itIsChecker)aenv).set_itIsChecker(true);
+			((Field_itIsChecker)aenv).set_itIsChecker((Module_url_parameter.f_getUrlParameterDef("sch-round", "1")).equals("1"));
 			final Struct_MizSchState l1_s = (new Struct_MizSchState(aenv, (asch).f_schTypes, Module_vector.f_makeVector(8), Module_tree.f_makeTree(), Module_tree.f_makeTree(), false, 20));
 			final Reference<Integer> l2_bad = ((Reference<Integer>)(new Reference((-1))));
 			final Reference<Integer> l3_i = ((Reference<Integer>)(new Reference(0)));

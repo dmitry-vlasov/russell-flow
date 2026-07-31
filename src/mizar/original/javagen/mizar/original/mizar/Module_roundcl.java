@@ -177,14 +177,14 @@ final public class Module_roundcl {
 			boolean l19_typOk;
 			Struct l20__tmp = l18_gsymswitch2;
 			switch (l20__tmp.getTypeId()) {
-			case 88/*Some*/: {
+			case 90/*Some*/: {
 				final Struct_Some l21__tmp = (Struct_Some)l20__tmp;
 				final Object l22_ct = l21__tmp.f_value;
 				final Struct_MizTyp l23_ct = ((Struct_MizTyp)(l21__tmp).f_value);
 				final Struct l24_gsymswitch3 = Module_correl_inst.f_mizWideningOf(aenv, l23_ct, Wrappers.w_mizCopyTyp.invoke(atyp));
 				Struct l25__tmp = l24_gsymswitch3;
 				switch (l25__tmp.getTypeId()) {
-				case 88/*Some*/: {
+				case 90/*Some*/: {
 					final Struct_Some l26__tmp = (Struct_Some)l25__tmp;
 					final Object l27_lTyp = l26__tmp.f_value;
 					final Struct_MizTyp l28_lTyp = ((Struct_MizTyp)(l26__tmp).f_value);
@@ -203,7 +203,7 @@ final public class Module_roundcl {
 					l19_typOk=(l33_$32&&Module_correl_match.f_mizCheckLociTypes(aenv, (afc).f_primaries));
 					break;
 				}
-				case 80/*None*/: {
+				case 82/*None*/: {
 					l19_typOk=false;
 					break;
 				}
@@ -212,7 +212,7 @@ final public class Module_roundcl {
 				}
 				break;
 			}
-			case 80/*None*/: {
+			case 82/*None*/: {
 				l19_typOk=true;
 				break;
 			}
@@ -284,14 +284,14 @@ final public class Module_roundcl {
 			final Struct l7_gsymswitch0 = Module_correl_match.f_mizSubstTrmGet(l7_env, ((int)l1_k.value));
 			Struct l8__tmp = l7_gsymswitch0;
 			switch (l8__tmp.getTypeId()) {
-			case 88/*Some*/: {
+			case 90/*Some*/: {
 				final Struct_Some l9__tmp = (Struct_Some)l8__tmp;
 				final Object l10_t = l9__tmp.f_value;
 				final Struct l11_t = ((Struct)(l9__tmp).f_value);
 				Module_vector.f_pushVector((l7_env).f_instantiation, l11_t);
 				break;
 			}
-			case 80/*None*/: {
+			case 82/*None*/: {
 				l0_brk.value = ((Boolean)true);
 				break;
 			}
@@ -431,10 +431,10 @@ final public class Module_roundcl {
 			final Struct l2_gsymswitch4 = Module_roundcl.f_mizFClusterInterval(aenv, acl, at);
 			Struct l3__tmp = l2_gsymswitch4;
 			switch (l3__tmp.getTypeId()) {
-			case 80/*None*/: {
+			case 82/*None*/: {
 				break;
 			}
-			case 88/*Some*/: {
+			case 90/*Some*/: {
 				final Struct_Some l4__tmp = (Struct_Some)l3__tmp;
 				final Object l5_iv = l4__tmp.f_value;
 				final Struct_Pair l6_iv = ((Struct_Pair)(l4__tmp).f_value);
@@ -530,7 +530,7 @@ final public class Module_roundcl {
 				final Struct l16_gsymswitch1 = Module_correl_inst.f_mizWideningOf(aenv, (acond).f_clusterType, Wrappers.w_mizCopyTyp.invoke(atyp));
 				Struct l17__tmp = l16_gsymswitch1;
 				switch (l17__tmp.getTypeId()) {
-				case 88/*Some*/: {
+				case 90/*Some*/: {
 					final Struct_Some l18__tmp = (Struct_Some)l17__tmp;
 					final Object l19_lTyp = l18__tmp.f_value;
 					final Struct_MizTyp l20_lTyp = ((Struct_MizTyp)(l18__tmp).f_value);
@@ -554,7 +554,7 @@ final public class Module_roundcl {
 					}
 					break;
 				}
-				case 80/*None*/: {
+				case 82/*None*/: {
 					l15_res=false;
 					break;
 				}

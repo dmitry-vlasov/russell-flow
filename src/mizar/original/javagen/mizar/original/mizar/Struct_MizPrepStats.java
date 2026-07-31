@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785512695552
+// timestamp: 1785524849108
 
 package mizar.original.mizar;
 
@@ -31,7 +31,7 @@ public class Struct_MizPrepStats extends Struct implements Field_checked<Integer
 	public Integer get_skippedBlocks() { return f_skippedBlocks; }
 	public void set_skippedBlocks(Integer value) { f_skippedBlocks = value; }
 
-	public int getTypeId() { return 58; }
+	public int getTypeId() { return 60; }
 	public String getTypeName() { return "MizPrepStats"; }
 
 	private static final String[] field_names = new String[] {
@@ -63,7 +63,7 @@ public class Struct_MizPrepStats extends Struct implements Field_checked<Integer
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 58) return 58-tmp;
+		if (tmp != 60) return 60-tmp;
 		Struct_MizPrepStats other = (Struct_MizPrepStats)other_gen;
 		if (f_checked != other.f_checked)
 			return (f_checked > other.f_checked) ? 1 : -1;

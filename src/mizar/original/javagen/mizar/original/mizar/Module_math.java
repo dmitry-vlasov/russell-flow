@@ -166,6 +166,9 @@ final public class Module_math {
 			}
 		}
 	}
+	public static final int f_round(double ad) {
+		return Module_math.f_floor((ad+0.5));
+	}
 	public static final double f_s2d(String as) {
 		final int l0_n = Native.strlen(as);
 		if ((l0_n==0)) {

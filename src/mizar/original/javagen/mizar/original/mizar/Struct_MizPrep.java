@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785512695552
+// timestamp: 1785524849108
 
 package mizar.original.mizar;
 
@@ -49,7 +49,7 @@ public class Struct_MizPrep extends Struct implements Field_prev<Struct>, Field_
 	public Integer get_ownDefNr() { return f_ownDefNr; }
 	public void set_ownDefNr(Integer value) { f_ownDefNr = value; }
 
-	public int getTypeId() { return 57; }
+	public int getTypeId() { return 59; }
 	public String getTypeName() { return "MizPrep"; }
 
 	private static final String[] field_names = new String[] {
@@ -88,7 +88,7 @@ public class Struct_MizPrep extends Struct implements Field_prev<Struct>, Field_
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 57) return 57-tmp;
+		if (tmp != 59) return 59-tmp;
 		Struct_MizPrep other = (Struct_MizPrep)other_gen;
 		tmp = f_chk.compareTo(other.f_chk);
 		if (tmp != 0) return tmp;

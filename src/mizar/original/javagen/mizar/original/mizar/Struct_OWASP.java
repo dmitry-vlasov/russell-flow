@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785512695556
+// timestamp: 1785524849111
 
 package mizar.original.mizar;
 
@@ -13,7 +13,7 @@ public class Struct_OWASP extends Struct {
 		f_level = a_level;
 	}
 
-	public int getTypeId() { return 81; }
+	public int getTypeId() { return 83; }
 	public String getTypeName() { return "OWASP"; }
 
 	private static final String[] field_names = new String[] {
@@ -40,7 +40,7 @@ public class Struct_OWASP extends Struct {
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 81) return 81-tmp;
+		if (tmp != 83) return 83-tmp;
 		Struct_OWASP other = (Struct_OWASP)other_gen;
 		if (f_level != other.f_level)
 			return (f_level > other.f_level) ? 1 : -1;

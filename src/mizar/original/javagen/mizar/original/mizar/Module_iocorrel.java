@@ -392,11 +392,11 @@ final public class Module_iocorrel {
 			final Struct l8_gsymswitch0 = l1_tailEl.value;
 			Struct l9__tmp = l8_gsymswitch0;
 			switch (l9__tmp.getTypeId()) {
-			case 80/*None*/: {
+			case 82/*None*/: {
 				((Reference<Struct_MizTrmElem>)(Reference)l0_head).value = l7_e;
 				break;
 			}
-			case 88/*Some*/: {
+			case 90/*Some*/: {
 				final Struct_Some l10__tmp = (Struct_Some)l9__tmp;
 				final Object l11_prev = l10__tmp.f_value;
 				final Struct_MizTrmElem l12_prev = ((Struct_MizTrmElem)(l10__tmp).f_value);

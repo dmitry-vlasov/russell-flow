@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785512695559
+// timestamp: 1785524849113
 
 package mizar.original.mizar;
 
@@ -14,7 +14,7 @@ public final class mizar extends FlowRuntime {
 		FlowRuntime.registerNativeHost(Native.class);
 	}
 
-	// Init modules: 16
+	// Init modules: 17
 	private static final void init_modules() {
 		Module_lexicon.init();
 		Module_limits.init();
@@ -27,10 +27,11 @@ public final class mizar extends FlowRuntime {
 		Module_correl.init();
 		Module_url_parameter.init();
 		Module_devmode.init();
-		Module_equalizer.init();
+		Module_polynom.init();
 		Module_target.init();
-		Module_unifier.init();
+		Module_equalizer.init();
 		Module_xml_parser.init();
+		Module_unifier.init();
 		Module_prep.init();
 	}
 	private static final void init() {

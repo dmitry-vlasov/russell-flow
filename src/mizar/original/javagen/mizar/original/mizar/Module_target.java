@@ -69,11 +69,11 @@ final public class Module_target {
 		final Struct l2_gsymswitch0 = Module_array.f_find(Module_target.g_allTargets, ((Func1<Boolean,Object>)(Func1)l1_$0));
 		Struct l3__tmp = l2_gsymswitch0;
 		switch (l3__tmp.getTypeId()) {
-		case 80/*None*/: {
+		case 82/*None*/: {
 			g_screenDPI=90;
 			break;
 		}
-		case 88/*Some*/: {
+		case 90/*Some*/: {
 			final Struct_Some l4__tmp = (Struct_Some)l3__tmp;
 			final Object l5_v = l4__tmp.f_value;
 			final String l6_v = ((String)(l4__tmp).f_value);
@@ -89,11 +89,11 @@ final public class Module_target {
 		final Struct l9_gsymswitch1 = Module_array.f_find(Module_target.g_allTargets, ((Func1<Boolean,Object>)(Func1)l8_$7));
 		Struct l10__tmp = l9_gsymswitch1;
 		switch (l10__tmp.getTypeId()) {
-		case 80/*None*/: {
+		case 82/*None*/: {
 			g_screenDensity=1.0;
 			break;
 		}
-		case 88/*Some*/: {
+		case 90/*Some*/: {
 			final Struct_Some l11__tmp = (Struct_Some)l10__tmp;
 			final Object l12_v = l11__tmp.f_value;
 			final String l13_v = ((String)(l11__tmp).f_value);

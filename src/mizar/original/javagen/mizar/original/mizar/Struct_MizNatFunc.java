@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785512695551
+// timestamp: 1785524849107
 
 package mizar.original.mizar;
 
@@ -17,7 +17,7 @@ public class Struct_MizNatFunc extends Struct implements Field_consistent<Boolea
 	public Boolean get_consistent() { return f_consistent; }
 	public void set_consistent(Boolean value) { f_consistent = value; }
 
-	public int getTypeId() { return 50; }
+	public int getTypeId() { return 51; }
 	public String getTypeName() { return "MizNatFunc"; }
 
 	private static final String[] field_names = new String[] {
@@ -45,7 +45,7 @@ public class Struct_MizNatFunc extends Struct implements Field_consistent<Boolea
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 50) return 50-tmp;
+		if (tmp != 51) return 51-tmp;
 		Struct_MizNatFunc other = (Struct_MizNatFunc)other_gen;
 		tmp = f_items.compareTo(other.f_items);
 		if (tmp != 0) return tmp;

@@ -93,6 +93,16 @@ final public class Module_mobjects {
 	public static final int f_mizNatCount(Struct_MizNatFunc af) {
 		return Module_vector.f_sizeVector((af).f_items);
 	}
+	public static final int f_mizNatCountAll(Struct_MizNatFunc af) {
+		final Struct_Vector l2_$1 = (af).f_items;
+		final Func2<Integer,Integer, Struct_MizIntPair> l3_$0 = (Func2<Integer, Integer, Struct_MizIntPair>)(Integer aacc, Struct_MizIntPair ait) -> {
+			return ((Integer)(((int)aacc)+(ait).f_y));
+		};
+		return ((int)Module_vector.f_foldVector(l2_$1, 0, ((Func2<Object,Object, Object>)(Func2)l3_$0)));
+	}
+	public static final Object f_mizNatDeleteAll(Struct_MizNatFunc af) {
+		return Module_vector.f_clearVector((af).f_items);
+	}
 	public static final Object f_mizNatDeleteElem(Struct_MizNatFunc af, int ax) {
 		final Struct_Pair l0_p = Module_mobjects.f_mizNatSearchPair(af, ax);
 		if (((boolean)(l0_p).f_first)) {

@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785512695554
+// timestamp: 1785524849109
 
 package mizar.original.mizar;
 
@@ -33,7 +33,7 @@ public class Struct_MizSchState extends Struct implements Field_funcSubst<Struct
 	public Integer get_err() { return f_err; }
 	public void set_err(Integer value) { f_err = value; }
 
-	public int getTypeId() { return 65; }
+	public int getTypeId() { return 67; }
 	public String getTypeName() { return "MizSchState"; }
 
 	private static final String[] field_names = new String[] {
@@ -66,7 +66,7 @@ public class Struct_MizSchState extends Struct implements Field_funcSubst<Struct
 	public int compareTo(Struct other_gen) {
 		if (other_gen == this) return 0;
 		int tmp = other_gen.getTypeId();
-		if (tmp != 65) return 65-tmp;
+		if (tmp != 67) return 67-tmp;
 		Struct_MizSchState other = (Struct_MizSchState)other_gen;
 		tmp = f_env.compareTo(other.f_env);
 		if (tmp != 0) return tmp;

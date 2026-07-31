@@ -1,5 +1,5 @@
 // HASH COLLISIONS: YES
-// timestamp: 1785496853000
+// timestamp: 1785514954000
 
 package mizar.original.mizar;
 
@@ -35,7 +35,7 @@ final public class Module_prechecker {
 	public static final Struct f_mizAsNegArg(Struct af) {
 		Struct l0__tmp = af;
 		switch (l0__tmp.getTypeId()) {
-		case 51/*MizNegFrm*/: {
+		case 52/*MizNegFrm*/: {
 			final Struct_MizNegFrm l1__tmp = (Struct_MizNegFrm)l0__tmp;
 			final Struct l2_arg = l1__tmp.f_arg;
 			final Struct l3_arg = (l1__tmp).f_arg;
@@ -51,7 +51,7 @@ final public class Module_prechecker {
 	public static final Struct_MizQualFrm f_mizAsQualFrmP(Struct af) {
 		Struct l0__tmp = af;
 		switch (l0__tmp.getTypeId()) {
-		case 61/*MizQualFrm*/: {
+		case 63/*MizQualFrm*/: {
 			final Struct_MizQualFrm l1__tmp = (Struct_MizQualFrm)l0__tmp;
 			final Struct l2___ = (l1__tmp).f_trm;
 			final Struct_MizTyp l3___ = (l1__tmp).f_typ;
@@ -67,7 +67,7 @@ final public class Module_prechecker {
 	public static final Struct_MizVarTrm f_mizAsVarTrmB(Struct at) {
 		Struct l0__tmp = at;
 		switch (l0__tmp.getTypeId()) {
-		case 75/*MizVarTrm*/: {
+		case 77/*MizVarTrm*/: {
 			final Struct_MizVarTrm l1__tmp = (Struct_MizVarTrm)l0__tmp;
 			final int l2___ = (l1__tmp).f_sort;
 			final int l3___ = (l1__tmp).f_varNr;
@@ -142,14 +142,14 @@ final public class Module_prechecker {
 						Struct_MizAttrColl l29_lClusterPtr;
 						Struct l30__tmp = l28_gsymswitch4;
 						switch (l30__tmp.getTypeId()) {
-						case 88/*Some*/: {
+						case 90/*Some*/: {
 							final Struct_Some l31__tmp = (Struct_Some)l30__tmp;
 							final Object l32_ct = l31__tmp.f_value;
 							final Struct_MizTyp l33_ct = ((Struct_MizTyp)(l31__tmp).f_value);
 							l29_lClusterPtr=Module_correl_inst.f_mizInstCluster(l0_env, (l33_ct).f_upper, (aattr).f_args);
 							break;
 						}
-						case 80/*None*/: {
+						case 82/*None*/: {
 							l29_lClusterPtr=Module_correl.f_mizNewEmptyCluster();
 							break;
 						}
@@ -196,7 +196,7 @@ final public class Module_prechecker {
 		final Struct_MizCorrelEnv l0_env = (apre).f_env;
 		Struct l1__tmp = af;
 		switch (l1__tmp.getTypeId()) {
-		case 51/*MizNegFrm*/: {
+		case 52/*MizNegFrm*/: {
 			final Struct_MizNegFrm l2__tmp = (Struct_MizNegFrm)l1__tmp;
 			final Struct l3_arg = l2__tmp.f_arg;
 			final Struct l4_arg = (l2__tmp).f_arg;
@@ -217,7 +217,7 @@ final public class Module_prechecker {
 			Module_vector.f_iterVector(l7_conjuncts, ((Func1<Object,Object>)(Func1)l11_$10));
 			return l9_res.value;
 		}
-		case 74/*MizUnivFrm*/: {
+		case 76/*MizUnivFrm*/: {
 			final Struct_MizUnivFrm l2__tmp = (Struct_MizUnivFrm)l1__tmp;
 			final Struct_MizTyp l13_quantified = l2__tmp.f_quantified;
 			final Struct l14_scope = l2__tmp.f_scope;
@@ -243,7 +243,7 @@ final public class Module_prechecker {
 					final Func2<Struct,Struct_MizWithin, Struct> l34_$33 = (Func2<Struct, Struct_MizWithin, Struct>)(Struct_MizWithin al35_0, Struct atrm) -> {
 						Struct l36__tmp = atrm;
 						switch (l36__tmp.getTypeId()) {
-						case 75/*MizVarTrm*/: {
+						case 77/*MizVarTrm*/: {
 							final Struct_MizVarTrm l37__tmp = (Struct_MizVarTrm)l36__tmp;
 							final int l38_s2 = l37__tmp.f_sort;
 							final int l39_v2 = l37__tmp.f_varNr;
@@ -270,7 +270,7 @@ final public class Module_prechecker {
 						final Func2<Struct,Struct_MizWithin, Struct> l37_$36 = (Func2<Struct, Struct_MizWithin, Struct>)(Struct_MizWithin al38_0, Struct atrm) -> {
 							Struct l39__tmp = atrm;
 							switch (l39__tmp.getTypeId()) {
-							case 75/*MizVarTrm*/: {
+							case 77/*MizVarTrm*/: {
 								final Struct_MizVarTrm l40__tmp = (Struct_MizVarTrm)l39__tmp;
 								final int l41_s2 = l40__tmp.f_sort;
 								final int l42_v2 = l40__tmp.f_varNr;
@@ -333,7 +333,7 @@ final public class Module_prechecker {
 		final Struct_MizCorrelEnv l0_env = (apre).f_env;
 		Struct l1__tmp = af;
 		switch (l1__tmp.getTypeId()) {
-		case 51/*MizNegFrm*/: {
+		case 52/*MizNegFrm*/: {
 			final Struct_MizNegFrm l2__tmp = (Struct_MizNegFrm)l1__tmp;
 			final Struct l3_arg = l2__tmp.f_arg;
 			final Struct l4_arg = (l2__tmp).f_arg;
@@ -354,7 +354,7 @@ final public class Module_prechecker {
 			Module_vector.f_iterVector(l7_conjuncts, ((Func1<Object,Object>)(Func1)l11_$10));
 			return l9_res.value;
 		}
-		case 56/*MizPredFrm*/: {
+		case 58/*MizPredFrm*/: {
 			final Struct_MizPredFrm l2__tmp = (Struct_MizPredFrm)l1__tmp;
 			final int l13_srt = l2__tmp.f_sort;
 			final int l14_srt = (l2__tmp).f_sort;
@@ -374,7 +374,7 @@ final public class Module_prechecker {
 				return Module_correl_inst.f_mizCopyExpFrm(l2__tmp);
 			}
 		}
-		case 74/*MizUnivFrm*/: {
+		case 76/*MizUnivFrm*/: {
 			final Struct_MizUnivFrm l2__tmp = (Struct_MizUnivFrm)l1__tmp;
 			final Struct_MizTyp l22_quantified = l2__tmp.f_quantified;
 			final Struct l23_scope = l2__tmp.f_scope;
@@ -397,7 +397,7 @@ final public class Module_prechecker {
 	public static final Struct f_mizExpandAtomicAsTrue(Struct_MizPre apre, Struct af) {
 		Struct l0__tmp = af;
 		switch (l0__tmp.getTypeId()) {
-		case 51/*MizNegFrm*/: {
+		case 52/*MizNegFrm*/: {
 			final Struct_MizNegFrm l1__tmp = (Struct_MizNegFrm)l0__tmp;
 			final Struct l2_arg = l1__tmp.f_arg;
 			final Struct l3_arg = (l1__tmp).f_arg;
@@ -418,7 +418,7 @@ final public class Module_prechecker {
 			Module_vector.f_iterVector(l6_conjuncts, ((Func1<Object,Object>)(Func1)l10_$9));
 			return l8_res.value;
 		}
-		case 56/*MizPredFrm*/: {
+		case 58/*MizPredFrm*/: {
 			final Struct_MizPredFrm l1__tmp = (Struct_MizPredFrm)l0__tmp;
 			final int l12_srt = l1__tmp.f_sort;
 			final int l13_srt = (l1__tmp).f_sort;
@@ -556,39 +556,44 @@ final public class Module_prechecker {
 		((Field_constBase)apre).set_constBase((l0_env).f_fixedVarNbr);
 		((Field_boundVarNbr)l0_env).set_boundVarNbr(0);
 		final Struct_MizPre l3_pre = apre;
-		final Func1<Struct,Struct> l2_$1 = (Func1<Struct, Struct>)(Struct ag) -> {
-			return Module_prechecker.f_mizExpandAtomicAsTrue(l3_pre, ag);
+		final Func1<Object,Struct> l2_$1 = (Func1<Object, Struct>)(Struct ag) -> {
+			return (l3_pre).f_collectConst.invoke(ag);
 		};
-		final Struct_Vector l4_lInference = Module_vector.f_mapVector(ainference, ((Func1<Object,Object>)(Func1)l2_$1));
-		final Reference<Struct> l5_lChkFrm = ((Reference<Struct>)(new Reference(Module_correl.f_mizNewVerum())));
-		final Struct_MizPre l8_pre = apre;
-		final Func1<Object,Struct> l7_$6 = (Func1<Object, Struct>)(Struct ag) -> {
-			l5_lChkFrm.value = Module_correl.f_mizNewConj(l5_lChkFrm.value, Module_prechecker.f_mizDistributeQuantifiers(l8_pre, ag));
+		Module_vector.f_iterVector(ainference, ((Func1<Object,Object>)(Func1)l2_$1));
+		final Struct_MizPre l6_pre = apre;
+		final Func1<Struct,Struct> l5_$4 = (Func1<Struct, Struct>)(Struct ag) -> {
+			return Module_prechecker.f_mizExpandAtomicAsTrue(l6_pre, ag);
+		};
+		final Struct_Vector l7_lInference = Module_vector.f_mapVector(ainference, ((Func1<Object,Object>)(Func1)l5_$4));
+		final Reference<Struct> l8_lChkFrm = ((Reference<Struct>)(new Reference(Module_correl.f_mizNewVerum())));
+		final Struct_MizPre l11_pre = apre;
+		final Func1<Object,Struct> l10_$9 = (Func1<Object, Struct>)(Struct ag) -> {
+			l8_lChkFrm.value = Module_correl.f_mizNewConj(l8_lChkFrm.value, Module_prechecker.f_mizDistributeQuantifiers(l11_pre, ag));
 			return null;
 		};
-		Module_vector.f_iterVector(l4_lInference, ((Func1<Object,Object>)(Func1)l7_$6));
-		final Struct_MizPre l11_pre = apre;
-		final Func1<Struct,Struct> l10_$9 = (Func1<Struct, Struct>)(Struct at) -> {
-			return Module_prechecker.f_mizSetConstInTrm(l11_pre, at);
+		Module_vector.f_iterVector(l7_lInference, ((Func1<Object,Object>)(Func1)l10_$9));
+		final Struct_MizPre l14_pre = apre;
+		final Func1<Struct,Struct> l13_$12 = (Func1<Struct, Struct>)(Struct at) -> {
+			return Module_prechecker.f_mizSetConstInTrm(l14_pre, at);
 		};
-		((Field_setVarInTrm)apre).set_setVarInTrm(l10_$9);
-		final Func2<Object,Struct_MizPre, Struct_MizTyp> l13_$12 = (Func2<Object, Struct_MizPre, Struct_MizTyp>)(Struct_MizPre ap, Struct_MizTyp atyp) -> {
+		((Field_setVarInTrm)apre).set_setVarInTrm(l13_$12);
+		final Func2<Object,Struct_MizPre, Struct_MizTyp> l16_$15 = (Func2<Object, Struct_MizPre, Struct_MizTyp>)(Struct_MizPre ap, Struct_MizTyp atyp) -> {
 			return Module_prechecker.f_mizNewConst(ap, atyp);
 		};
-		((Field_newVariable)apre).set_newVariable(l13_$12);
-		final Struct l14_body = Module_prechecker.f_mizRemoveIntQuantifier(apre, l5_lChkFrm.value);
+		((Field_newVariable)apre).set_newVariable(l16_$15);
+		final Struct l17_body = Module_prechecker.f_mizRemoveIntQuantifier(apre, l8_lChkFrm.value);
 		((Field_boundVarNbr)l0_env).set_boundVarNbr(0);
-		(apre).f_collectConst.invoke(l14_body);
+		(apre).f_collectConst.invoke(l17_body);
 		((Field_constBase)apre).set_constBase((l0_env).f_fixedVarNbr);
 		Module_vector.f_clearVector((apre).f_basic);
 		((Field_trivialError)apre).set_trivialError(false);
-		final Struct_MizPreInst l15_normalForm = Module_prechecker.f_mizNormalizeAsTrue(apre, l14_body);
-		if ((l15_normalForm).f_top) {
+		final Struct_MizPreInst l18_normalForm = Module_prechecker.f_mizNormalizeAsTrue(apre, l17_body);
+		if ((l18_normalForm).f_top) {
 			((Field_trivialError)apre).set_trivialError(true);
-			return l15_normalForm;
+			return l18_normalForm;
 		} else {
-			Module_prechecker.f_mizCreateInference(apre, l15_normalForm);
-			return l15_normalForm;
+			Module_prechecker.f_mizCreateInference(apre, l18_normalForm);
+			return l18_normalForm;
 		}
 	}
 	public static final Struct_MizPreInst f_mizPreInstBottom() {
@@ -736,13 +741,13 @@ final public class Module_prechecker {
 			final Struct l12_gsymswitch2 = l6_res.value;
 			Struct l13__tmp = l12_gsymswitch2;
 			switch (l13__tmp.getTypeId()) {
-			case 88/*Some*/: {
+			case 90/*Some*/: {
 				final Struct_Some l14__tmp = (Struct_Some)l13__tmp;
 				final Object l15_r = l14__tmp.f_value;
 				final Struct_MizPreInst l16_r = ((Struct_MizPreInst)(l14__tmp).f_value);
 				return l16_r;
 			}
-			case 80/*None*/: {
+			case 82/*None*/: {
 				return ((Struct_MizPreInst)Module_vector.f_getVectorUnsafe(l0_work, 0));
 			}
 			default:
@@ -787,7 +792,7 @@ final public class Module_prechecker {
 									final Struct l14_gsymswitch0 = Module_mobjects.f_mizNatJoinAtom(aa, ae);
 									Struct l15__tmp = l14_gsymswitch0;
 									switch (l15__tmp.getTypeId()) {
-									case 88/*Some*/: {
+									case 90/*Some*/: {
 										final Struct_Some l16__tmp = (Struct_Some)l15__tmp;
 										final Object l17_j = l16__tmp.f_value;
 										final Struct_MizNatFunc l18_j = ((Struct_MizNatFunc)(l16__tmp).f_value);
@@ -800,7 +805,7 @@ final public class Module_prechecker {
 											return Module_prechecker.f_mizPreInstInsertAndAbsorb(l12_p, l18_j);
 										}
 									}
-									case 80/*None*/: {
+									case 82/*None*/: {
 										return null;
 									}
 									default:
@@ -826,13 +831,13 @@ final public class Module_prechecker {
 			final Struct l5_gsymswitch1 = Module_mobjects.f_mizNatJoinAtom(aa, l5_elem);
 			Struct l6__tmp = l5_gsymswitch1;
 			switch (l6__tmp.getTypeId()) {
-			case 88/*Some*/: {
+			case 90/*Some*/: {
 				final Struct_Some l7__tmp = (Struct_Some)l6__tmp;
 				final Object l8_j = l7__tmp.f_value;
 				final Struct_MizNatFunc l9_j = ((Struct_MizNatFunc)(l7__tmp).f_value);
 				return Module_vector.f_pushVector((l0_res).f_evals, l9_j);
 			}
-			case 80/*None*/: {
+			case 82/*None*/: {
 				return null;
 			}
 			default:
@@ -902,7 +907,7 @@ final public class Module_prechecker {
 		final Struct_MizCorrelEnv l0_env = (apre).f_env;
 		Struct l1__tmp = af0;
 		switch (l1__tmp.getTypeId()) {
-		case 51/*MizNegFrm*/: {
+		case 52/*MizNegFrm*/: {
 			final Struct_MizNegFrm l2__tmp = (Struct_MizNegFrm)l1__tmp;
 			final Struct l3_arg = l2__tmp.f_arg;
 			final Struct l4_arg = (l2__tmp).f_arg;
@@ -912,7 +917,7 @@ final public class Module_prechecker {
 			((Field_arg)l7_f1).set_arg(l6_na);
 			Struct l8__tmp = l6_na;
 			switch (l8__tmp.getTypeId()) {
-			case 51/*MizNegFrm*/: {
+			case 52/*MizNegFrm*/: {
 				final Struct_MizNegFrm l9__tmp = (Struct_MizNegFrm)l8__tmp;
 				final Struct l10_inner = l9__tmp.f_arg;
 				final Struct l11_inner = (l9__tmp).f_arg;
@@ -924,7 +929,7 @@ final public class Module_prechecker {
 			}
 			}
 		}
-		case 74/*MizUnivFrm*/: {
+		case 76/*MizUnivFrm*/: {
 			final Struct_MizUnivFrm l2__tmp = (Struct_MizUnivFrm)l1__tmp;
 			final int l13___ = (l2__tmp).f_sort;
 			final int l14___ = (l2__tmp).f_varId;
@@ -943,7 +948,7 @@ final public class Module_prechecker {
 				final Struct l24_gsymswitch3 = l18_cur.value;
 				Struct l25__tmp = l24_gsymswitch3;
 				switch (l25__tmp.getTypeId()) {
-				case 74/*MizUnivFrm*/: {
+				case 76/*MizUnivFrm*/: {
 					final Struct_MizUnivFrm l26__tmp = (Struct_MizUnivFrm)l25__tmp;
 					final Struct_MizTyp l27_q = l26__tmp.f_quantified;
 					final Struct l28_s = l26__tmp.f_scope;
@@ -1009,7 +1014,7 @@ final public class Module_prechecker {
 	public static final Struct f_mizRemoveIntQuantifier(Struct_MizPre apre, Struct af0) {
 		Struct l0__tmp = af0;
 		switch (l0__tmp.getTypeId()) {
-		case 51/*MizNegFrm*/: {
+		case 52/*MizNegFrm*/: {
 			final Struct_MizNegFrm l1__tmp = (Struct_MizNegFrm)l0__tmp;
 			final Struct l2_arg = l1__tmp.f_arg;
 			final Struct l3_arg = (l1__tmp).f_arg;
@@ -1019,7 +1024,7 @@ final public class Module_prechecker {
 			((Field_arg)l6_f1).set_arg(l5_na);
 			Struct l7__tmp = l5_na;
 			switch (l7__tmp.getTypeId()) {
-			case 51/*MizNegFrm*/: {
+			case 52/*MizNegFrm*/: {
 				final Struct_MizNegFrm l8__tmp = (Struct_MizNegFrm)l7__tmp;
 				final Struct l9_inner = l8__tmp.f_arg;
 				final Struct l10_inner = (l8__tmp).f_arg;
@@ -1069,7 +1074,7 @@ final public class Module_prechecker {
 		final Struct_MizCorrelEnv l0_env = (apre).f_env;
 		Struct l1__tmp = at;
 		switch (l1__tmp.getTypeId()) {
-		case 75/*MizVarTrm*/: {
+		case 77/*MizVarTrm*/: {
 			final Struct_MizVarTrm l2__tmp = (Struct_MizVarTrm)l1__tmp;
 			final int l3_srt = l2__tmp.f_sort;
 			final int l4_varNr = l2__tmp.f_varNr;
