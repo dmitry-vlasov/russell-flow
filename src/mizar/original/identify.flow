@@ -1,0 +1,461 @@
+// Transcription of ~/dev/system/kernel/identify.pas (the constant-collection
+// part): CollectConstInTrm/Frm/Typ/Cluster and CollectInferConst — the
+// hash-consing of closed terms into InfConst numbers with rounded-up types,
+// equality-class seeds (fEqConst) and numeric values.
+//
+// InferConstDef is env.inferConstDef (insertion order — InfConst numbers) plus
+// a sorted view here (sortedIdx, ordered by CompRdTrms over the definitions,
+// i.e. CompTrms with strictCompare=false).
+//
+// Numeric values use double-precision complex arithmetic. // DEVIATION:
+// the original uses extended precision; exact rational arithmetic arrives
+// with polynom.pas. Recorded, revisit with the arithmetic requirements.
+//
+// Equals-expansion (CollectEqualsComst via gEquals/EqDefinientia) is behind
+// the equalsExpand hook until the definientia loading lands. // TODO(M1)
+
+import ds/vector;
+import loop;
+import math/math;
+import mizar/original/errhan;
+import mizar/original/mobjects;
+import mizar/original/limits;
+import mizar/original/lexicon;
+import mizar/original/builtin;
+import mizar/original/correl;
+import mizar/original/correl_inst;
+import mizar/original/correl_match;
+
+export {
+	MizComplex(re : double, im : double);
+
+	// the identify unit state, per article
+	MizIdentify(
+		env : MizCorrelEnv,
+		sortedIdx : Vector<int>,             // InfConst nrs sorted by CompRdTrms(def)
+		numeric : Vector<Maybe<MizComplex>>, // fNumericValue by InfConst nr
+		mutable onlyConstants : bool,        // gOnlyConstants
+		mutable equalsExpansionLevel : int,  // gEqualsExpansionLevel
+		revReq : Vector<int>,                // gRevReq: functor nr -> rq*
+		// equals-expansion hook: eq-const numbers for a functor definition
+		mutable equalsExpand : (MizIdentify, int, MizTrmList) -> [int],
+	);
+
+	mizMakeIdentify(env : MizCorrelEnv) -> MizIdentify;
+	// gRevReq wiring: call after the requirements are loaded
+	mizInitRevReq(idn : MizIdentify) -> void;
+
+	// find a collected constant whose definition equals the term (CompRdTrms)
+	mizInferConstFind(idn : MizIdentify, t : MizTrm) -> Maybe<int>;
+
+	// CollectConstInTrm: returns the (possibly replaced) term
+	mizCollectConstInTrm(idn : MizIdentify, t : MizTrm) -> MizTrm;
+	mizCollectConstInTrmList(idn : MizIdentify, l : MizTrmList) -> void;
+	mizCollectConstInFrm(idn : MizIdentify, f : MizFrm) -> void;
+	mizCollectConstInTyp(idn : MizIdentify, typ : MizTyp) -> void;
+	mizCollectConstInCluster(idn : MizIdentify, c : MizAttrColl) -> MizAttrColl;
+
+	mizNumericValue(idn : MizIdentify, nr : int) -> Maybe<MizComplex>;
+}
+
+mizMakeIdentify(env : MizCorrelEnv) -> MizIdentify {
+	rv : Vector<int> = makeVector(64);
+	MizIdentify(env, makeVector(64), makeVector(64), true, 0, rv,
+		\__, __, __ -> []);
+}
+
+mizInitRevReq(idn : MizIdentify) -> void {
+	clearVector(idn.revReq);
+	// FunctorRequirement members mapped back: gRevReq[gBuiltIn[r]] := r
+	n = mizConstrCount(idn.env, coFunctor);
+	fori(0, n, \__ -> pushVector(idn.revReq, rqNone));
+	frqs = [rqEmptySet, rqRealAdd, rqRealMult, rqSucc, rqUnion, rqIntersection,
+		rqSubtraction, rqSymmetricDifference, rqRealNeg, rqRealInv, rqRealDiff,
+		rqRealDiv, rqImaginaryUnit, rqOmega, rqZeroNumber, rqPowerSet,
+		rqDiv, rqMod, rqLCM, rqGCD];
+	iter(frqs, \r -> {
+		nr = mizBuiltIn(idn.env.builtIn, r);
+		if (nr > 0 && nr < sizeVector(idn.revReq)) {
+			setVectorUnsafe(idn.revReq, nr, r);
+		}
+	});
+}
+
+mizRevReq(idn : MizIdentify, funcNr : int) -> int {
+	getVectorDef(idn.revReq, funcNr, rqNone);
+}
+
+mizNumericValue(idn : MizIdentify, nr : int) -> Maybe<MizComplex> {
+	getVectorDef(idn.numeric, nr, None());
+}
+
+mizSetNumeric(idn : MizIdentify, nr : int, v : Maybe<MizComplex>) -> void {
+	while(\ -> sizeVector(idn.numeric) <= nr, \ -> pushVector(idn.numeric, None()));
+	setVectorUnsafe(idn.numeric, nr, v);
+}
+
+// CompRdTrms
+mizCompRdTrms(env : MizCorrelEnv, a : MizTrm, b : MizTrm) -> int {
+	saved = env.strictCompare;
+	env.strictCompare ::= false;
+	c = mizCompTrms(env, a, b);
+	env.strictCompare ::= saved;
+	c;
+}
+
+// binary search in the sorted view; Pair(found insertion-nr or -1, position)
+mizInferSearch(idn : MizIdentify, t : MizTrm) -> Pair<int, int> {
+	env = idn.env;
+	l = ref 0;
+	h = ref sizeVector(idn.sortedIdx) - 1;
+	found = ref -1;
+	while(\ -> ^l <= ^h && ^found < 0, \ -> {
+		m = (^l + ^h) / 2;
+		nr = getVectorUnsafe(idn.sortedIdx, m);
+		cd : MizConstDef = getVectorUnsafe(env.inferConstDef, nr);
+		c = mizCompRdTrms(env, cd.def, t);
+		if (c < 0) l := m + 1
+		else if (c > 0) h := m - 1
+		else found := nr;
+	});
+	Pair(^found, ^l);
+}
+
+mizInferConstFind(idn : MizIdentify, t : MizTrm) -> Maybe<int> {
+	p = mizInferSearch(idn, t);
+	if (p.first >= 0) Some(p.first) else None();
+}
+
+// CollectInferConst: intern a closed term; returns its InfConst term.
+mizCollectInferConst(idn : MizIdentify, t : MizTrm) -> MizTrm {
+	env = idn.env;
+	if (!idn.onlyConstants) {
+		t;
+	} else {
+		p = mizInferSearch(idn, t);
+		if (p.first >= 0) {
+			mizNewVarTrm(ikTrmInfConst, p.first);
+		} else {
+			lTyp = env.roundUpTrmType(env, t);
+			nr = sizeVector(env.inferConstDef);
+			// round the type's cluster once more against itself
+			lClusterPtr = mizCopyCluster(lTyp.upper);
+			env.roundUpCluster(env, lClusterPtr, lTyp);
+			lTyp.upper ::= lClusterPtr;
+			cd = MizConstDef(t, mizInitNatSet(4), -1, lTyp, false);
+			pushVector(env.inferConstDef, cd);
+			mizVectorAtInsert(idn.sortedIdx, p.second, nr);
+			// numeric value
+			numeric : Maybe<MizComplex> = switch (t) {
+				MizVarTrm(srt, varNr, __): {
+					if (srt == ikTrmNumeral) Some(MizComplex(i2d(varNr), 0.0))
+					else None();
+				}
+				MizFuncTrm(srt, funcNr0, args0, __): {
+					if (srt == ikTrmFunctor) {
+						ft : MizFuncTrm = mizIdAsFunc(t);
+						pa = mizAdjustTrm(env, ft);
+						rq = mizRevReq(idn, pa.first);
+						if (rq == rqImaginaryUnit) {
+							Some(MizComplex(0.0, 1.0));
+						} else if (rq == rqRealAdd || rq == rqRealMult
+							|| rq == rqRealDiff || rq == rqRealDiv) {
+							a1 = mizInfNumArg(idn, mizTrmListNth(pa.second, 0));
+							a2 = mizInfNumArg(idn, mizTrmListNth(pa.second, 1));
+							switch (a1) {
+								Some(v1): switch (a2) {
+									Some(v2): mizComplexOp(rq, v1, v2);
+									None(): None();
+								}
+								None(): None();
+							}
+						} else if (rq == rqRealNeg || rq == rqRealInv) {
+							switch (mizInfNumArg(idn, mizTrmListNth(pa.second, 0))) {
+								Some(v1): {
+									if (rq == rqRealNeg) Some(MizComplex(-v1.re, -v1.im))
+									else if (v1.re != 0.0 || v1.im != 0.0) Some(mizCInv(v1))
+									else None();
+								}
+								None(): None();
+							}
+						} else {
+							None();
+						}
+					} else {
+						None();
+					}
+				}
+				default: None();
+			}
+			cd.determined ::= isSome(numeric);
+			mizSetNumeric(idn, nr, numeric);
+			mizCollectConstInTyp(idn, cd.typ);
+			mizNewVarTrm(ikTrmInfConst, nr);
+		}
+	}
+}
+
+mizInfNumArg(idn : MizIdentify, t0 : MizTrm) -> Maybe<MizComplex> {
+	t = mizSkipPrivFunc(t0);
+	switch (t) {
+		MizVarTrm(srt, varNr, __): {
+			if (srt == ikTrmInfConst) mizNumericValue(idn, varNr) else None();
+		}
+		default: None();
+	}
+}
+
+mizComplexOp(rq : int, a : MizComplex, b : MizComplex) -> Maybe<MizComplex> {
+	if (rq == rqRealAdd) {
+		Some(MizComplex(a.re + b.re, a.im + b.im));
+	} else if (rq == rqRealMult) {
+		Some(MizComplex(a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re));
+	} else if (rq == rqRealDiff) {
+		Some(MizComplex(a.re - b.re, a.im - b.im));
+	} else if (rq == rqRealDiv) {
+		if (b.re == 0.0 && b.im == 0.0) {
+			None();
+		} else {
+			d = b.re * b.re + b.im * b.im;
+			Some(MizComplex((a.re * b.re + a.im * b.im) / d,
+				(a.im * b.re - a.re * b.im) / d));
+		}
+	} else {
+		None();
+	}
+}
+
+mizCInv(v : MizComplex) -> MizComplex {
+	d = v.re * v.re + v.im * v.im;
+	MizComplex(v.re / d, -v.im / d);
+}
+
+// ---------------- the walkers ----------------
+
+mizCollectConstInTrmList(idn : MizIdentify, l : MizTrmList) -> void {
+	switch (l) {
+		MizTrmNil(): {}
+		MizTrmElem(trm, next): {
+			e : MizTrmElem = l;
+			e.trm ::= mizCollectConstInTrm(idn, trm);
+			mizCollectConstInTrmList(idn, next);
+		}
+	}
+}
+
+mizCollectConstInCluster(idn : MizIdentify, c : MizAttrColl) -> MizAttrColl {
+	// rebuilt with sorted insertion (the arg terms change, so may the order)
+	res = mizNewEmptyCluster();
+	iterVector(c.items, \a -> {
+		na = MizAttr(a.neg, a.attrNr, mizCopyTrmList(a.args), false, a.pattNr);
+		mizCollectConstInTrmList(idn, na.args);
+		mizAttrCollInsert(idn.env, res, na);
+	});
+	res.consistent ::= res.consistent && c.consistent;
+	res;
+}
+
+mizCollectConstInTyp(idn : MizIdentify, typ : MizTyp) -> void {
+	if (typ.sort != ikError) {
+		typ.lower ::= mizCollectConstInCluster(idn, typ.lower);
+		typ.upper ::= mizCollectConstInCluster(idn, typ.upper);
+		mizCollectConstInTrmList(idn, typ.modArgs);
+	}
+}
+
+mizCollectConstInFrm(idn : MizIdentify, f : MizFrm) -> void {
+	env = idn.env;
+	switch (f) {
+		MizPredFrm(__, __, args, __): mizCollectConstInTrmList(idn, args);
+		MizLocPredFrm(__, args, expn, __): {
+			mizCollectConstInTrmList(idn, args);
+			mizCollectConstInFrm(idn, expn);
+		}
+		MizQualFrm(trm, typ, __): {
+			qf : MizQualFrm = f;
+			qf.trm ::= mizCollectConstInTrm(idn, trm);
+			mizCollectConstInTyp(idn, typ);
+		}
+		MizNegFrm(arg, __): mizCollectConstInFrm(idn, arg);
+		MizBinFrm(__, l, r, __): {
+			mizCollectConstInFrm(idn, l);
+			mizCollectConstInFrm(idn, r);
+		}
+		MizConjFrm(conjuncts, __): iterVector(conjuncts, \g -> mizCollectConstInFrm(idn, g));
+		MizUnivFrm(__, __, quantified, scope, __): {
+			env.boundVarNbr ::= env.boundVarNbr + 1;
+			mizCollectConstInTyp(idn, quantified);
+			mizCollectConstInFrm(idn, scope);
+			env.boundVarNbr ::= env.boundVarNbr - 1;
+		}
+		MizUniqFrm(__): {}
+		MizFlexFrm(__, lo, ro, __, __, expn, __): {
+			mizCollectConstInFrm(idn, lo);
+			mizCollectConstInFrm(idn, ro);
+			mizCollectConstInFrm(idn, expn);
+		}
+	}
+}
+
+mizCollectConstInTrm(idn : MizIdentify, t : MizTrm) -> MizTrm {
+	env = idn.env;
+	lOnly = idn.onlyConstants;
+	idn.onlyConstants ::= true;
+	lLevel = idn.equalsExpansionLevel;
+	idn.equalsExpansionLevel ::= 0;
+	res = switch (t) {
+		MizFuncTrm(srt, funcNr, args, __): {
+			mizCollectConstInTrmList(idn, args);
+			if (srt == ikTrmFunctor) {
+				if (idn.onlyConstants) {
+					p = mizInferSearch(idn, t);
+					if (p.first >= 0) {
+						mizNewVarTrm(ikTrmInfConst, p.first);
+					} else {
+						it = mizCollectInferConst(idn, t);
+						// equals-expansion seeds the eq-const set
+						idn.equalsExpansionLevel ::= lLevel;
+						switch (it) {
+							MizVarTrm(__, varNr, __): {
+								cd : MizConstDef = getVectorUnsafe(env.inferConstDef, varNr);
+								eqs = idn.equalsExpand(idn, funcNr, args);
+								iter(eqs, \e -> mizNatInsertElem(cd.eqConst, e));
+							}
+							default: {}
+						}
+						it;
+					}
+				} else {
+					t;
+				}
+			} else {
+				// Selector/Aggreg/SchFunc
+				mizCollectInferConst(idn, t);
+			}
+		}
+		MizPrivFuncTrm(__, args, funcExp, __): {
+			mizCollectConstInTrmList(idn, args);
+			pt : MizPrivFuncTrm = t;
+			pt.funcExp ::= mizCollectConstInTrm(idn, funcExp);
+			t;
+		}
+		MizFraenkelTrm(lambdaArgs, scope, compr, __, __): {
+			iterVector(lambdaArgs, \typ -> {
+				env.boundVarNbr ::= env.boundVarNbr + 1;
+				mizCollectConstInTyp(idn, typ);
+			});
+			ft : MizFraenkelTrm = t;
+			ft.scope ::= mizCollectConstInTrm(idn, scope);
+			mizCollectConstInFrm(idn, compr);
+			env.boundVarNbr ::= env.boundVarNbr - sizeVector(lambdaArgs);
+			// closed Fraenkel terms get collected too
+			thereAreBound = ref false;
+			w = mizMakeWithin(\__, trm -> {
+				switch (trm) {
+					MizVarTrm(s2, v2, __): {
+						if (s2 == ikTrmBound && v2 <= env.boundVarNbr) {
+							thereAreBound := true;
+						}
+						trm;
+					}
+					default: trm;
+				}
+			});
+			__t2 = mizWithinTrm(w, t);
+			idn.onlyConstants ::= !^thereAreBound;
+			if (idn.onlyConstants) {
+				// ChChangeBound: shift the remaining bound vars by gBoundBase
+				w2 = mizMakeWithin(\__, trm -> {
+					switch (trm) {
+						MizVarTrm(s2, v2, __): {
+							if (s2 == ikTrmBound) {
+								vt : MizVarTrm = mizIdAsVar(trm);
+								vt.varNr ::= v2 + env.boundVarNbr;
+							}
+							trm;
+						}
+						default: trm;
+					}
+				});
+				__t3 = mizWithinTrm(w2, t);
+				mizCollectInferConst(idn, t);
+			} else {
+				t;
+			}
+		}
+		MizChoiceTrm(typ, __): {
+			mizCollectConstInTyp(idn, typ);
+			mizCollectInferConst(idn, t);
+		}
+		MizVarTrm(srt, varNr, __): {
+			if (srt == ikTrmNumeral) {
+				mizCollectInferConst(idn, t);
+			} else if (srt == ikTrmConstant) {
+				// a constant with an expandable definition seeds eq-consts
+				eqSeeds = mizInitNatSet(4);
+				fv : MizFixedVar = getVectorUnsafe(env.fixedVar, varNr);
+				switch (fv.def) {
+					Some(d): {
+						if (mizTrmSort(d) != ikError) {
+							lTrm0 = mizCopyExpTrm(d);
+							lTrm = mizCollectConstInTrm(idn, lTrm0);
+							if (idn.onlyConstants) {
+								mizAssert(4382, mizTrmSort(lTrm) == ikTrmInfConst);
+								switch (lTrm) {
+									MizVarTrm(__, dn, __): mizNatInsertElem(eqSeeds, dn);
+									default: {}
+								}
+							}
+							idn.onlyConstants ::= true;
+						}
+					}
+					None(): {}
+				}
+				it = mizCollectInferConst(idn, t);
+				switch (it) {
+					MizVarTrm(s3, nr3, __): {
+						if (s3 == ikTrmInfConst) {
+							cd : MizConstDef = getVectorUnsafe(env.inferConstDef, nr3);
+							mizNatEnlargeBy(cd.eqConst, eqSeeds);
+							if (mizNatCount(eqSeeds) > 0) {
+								cd.setting ::= mizNatItem(eqSeeds, 0).x;
+							}
+						}
+					}
+					default: {}
+				}
+				it;
+			} else if (srt == ikTrmLocus || srt == ikTrmFreeVar
+				|| srt == ikTrmLambdaVar || srt == ikTrmBound) {
+				idn.onlyConstants ::= false;
+				t;
+			} else {
+				// InfConst: already collected
+				t;
+			}
+		}
+		MizQuaTrm(__, __, __): {
+			mizRunTimeError(2845);
+			t;
+		}
+		MizBaseTrm(srt): {
+			if (srt == ikError) {
+				idn.onlyConstants ::= false;
+				t;
+			} else {
+				mizRunTimeError(2845);
+				t;
+			}
+		}
+	}
+	idn.onlyConstants ::= lOnly && idn.onlyConstants;
+	idn.equalsExpansionLevel ::= lLevel;
+	res;
+}
+
+mizIdAsFunc(t : MizTrm) -> MizFuncTrm {
+	switch (t) { MizFuncTrm(__, __, __, __): t; default: { mizRunTimeError(2902); MizFuncTrm(ikError, 0, MizTrmNil(), 0); } }
+}
+mizIdAsVar(t : MizTrm) -> MizVarTrm {
+	switch (t) { MizVarTrm(__, __, __): t; default: { mizRunTimeError(2901); MizVarTrm(ikError, 0, 0); } }
+}
