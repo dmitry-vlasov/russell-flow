@@ -1,0 +1,123 @@
+// Component test for mizar/original/correl_inst.flow — instantiation, term
+// typing, widening. Builds a tiny mode hierarchy:
+//   M1 "Any" (rqAny), M2 "set" widens to M1, M3 "special set" widens to M2;
+//   functor K1 : (set) -> M3; attribute V1 on set.
+
+import mizar/original/correl;
+import mizar/original/correl_inst;
+import mizar/original/lexicon;
+import mizar/original/builtin;
+import mizar/original/mobjects;
+import mizar/original/test/test_utils;
+import ds/vector;
+
+export {
+	runCorrelInstTests(t : MizTest) -> void;
+}
+
+mkModeTyp(nr : int) -> MizTyp {
+	mizNewStandardTyp(ikTypMode, mizNewEmptyCluster(), mizNewEmptyCluster(), nr, mizNil);
+}
+
+runCorrelInstTests(t : MizTest) -> void {
+	env = mizMakeCorrelEnv();
+	// M1 Any
+	m1 = mizMakeConstr(coMode, "H", 1);
+	m1.typ ::= Some(mkModeTyp(0)); // Any has no widening (guarded by rqAny)
+	m1nr = mizPushConstr(env, m1);
+	mizSetBuiltIn(env.builtIn, rqAny, m1nr);
+	// M2 set -> M1
+	m2 = mizMakeConstr(coMode, "H", 2);
+	m2.typ ::= Some(mkModeTyp(m1nr));
+	m2nr = mizPushConstr(env, m2);
+	mizSetBuiltIn(env.builtIn, rqSetMode, m2nr);
+	// M3 -> M2
+	m3 = mizMakeConstr(coMode, "T", 1);
+	m3.typ ::= Some(mkModeTyp(m2nr));
+	m3nr = mizPushConstr(env, m3);
+	// K1 : (M2) -> M3, result type mentions locus 1 in an attr arg? keep simple
+	k1 = mizMakeConstr(coFunctor, "T", 1);
+	pushVector(k1.primaries, mkModeTyp(m2nr));
+	k1.typ ::= Some(mkModeTyp(m3nr));
+	k1nr = mizPushConstr(env, k1);
+
+	// --- instantiation: type with a locus argument ---
+	// mode M4(x1) with arg list (locus 1); instantiate with constant c5
+	m4 = mizMakeConstr(coMode, "T", 2);
+	pushVector(m4.primaries, mkModeTyp(m2nr));
+	m4.typ ::= Some(mkModeTyp(m2nr));
+	m4nr = mizPushConstr(env, m4);
+	tyLocus = MizTyp(ikTypMode, mizNewEmptyCluster(), mizNewEmptyCluster(), m4nr,
+		mizNewTrmList(mizNewVarTrm(ikTrmLocus, 1), mizNil), 0);
+	c5 = mizNewVarTrm(ikTrmConstant, 5);
+	tyInst = mizInstTyp(env, tyLocus, mizNewTrmList(c5, mizNil));
+	arg0 = mizTrmListNth(tyInst.modArgs, 0);
+	mizCheck(t, "inst.typ.locus",
+		mizTrmSort(arg0) == ikTrmConstant);
+	// the original type is untouched
+	mizCheck(t, "inst.typ.source.intact",
+		mizTrmSort(mizTrmListNth(tyLocus.modArgs, 0)) == ikTrmLocus);
+
+	// --- bound renumbering: instantiation term with a bound var, copied
+	// under a binder (boundVarNbr > boundBase) shifts it ---
+	env.boundVarNbr ::= 0;
+	bTrm = mizNewVarTrm(ikTrmBound, 1);
+	frm = mizNewPredFrm(ikFrmPred, 1, mizNewTrmList(mizNewVarTrm(ikTrmLocus, 1), mizNil), 0);
+	// wrap in a Univ so copying the scope raises boundVarNbr by 1
+	m2typ = mkModeTyp(m2nr);
+	uf = MizUnivFrm(ikFrmUniv, 0, m2typ, frm, 0);
+	instUf = mizInstFrm(env, uf, mizNewTrmList(bTrm, mizNil));
+	switch (instUf) {
+		MizUnivFrm(__, __, __, scope, __): {
+			switch (scope) {
+				MizPredFrm(__, __, args, __): {
+					a = mizTrmListNth(args, 0);
+					switch (a) {
+						MizVarTrm(srt, varNr, __):
+							mizCheck(t, "inst.renbound",
+								srt == ikTrmBound && varNr == 2);
+						default: mizCheck(t, "inst.renbound", false);
+					}
+				}
+				default: mizCheck(t, "inst.renbound", false);
+			}
+		}
+		default: mizCheck(t, "inst.renbound", false);
+	}
+
+	// --- CopyTrmType: K1(c) has type M3; bound var typed from BoundVar ---
+	kTrm = mizNewFuncTrm(k1nr, mizNewTrmList(mizNewVarTrm(ikTrmConstant, 1), mizNil));
+	tyK = mizCopyTrmType(env, kTrm);
+	mizCheck(t, "typ.functor", tyK.sort == ikTypMode && tyK.modNr == m3nr);
+	mizSetBoundVar(env, 1, mkModeTyp(m2nr));
+	tyB = mizCopyTrmType(env, mizNewVarTrm(ikTrmBound, 1));
+	mizCheckEqI(t, "typ.bound", tyB.modNr, m2nr);
+
+	// --- widening: M3 -> M2 -> M1; stops at Any ---
+	ty3 = mkModeTyp(m3nr);
+	switch (mizWidening(env, ty3)) {
+		Some(w): mizCheckEqI(t, "widen.step", w.modNr, m2nr);
+		None(): mizCheck(t, "widen.step", false);
+	}
+	ty1 = mkModeTyp(m1nr);
+	mizCheck(t, "widen.any.stops", isNone(mizWidening(env, ty1)));
+
+	// IsWiderThan: M2 is wider than M3, not vice versa; Any widest
+	mizCheck(t, "wider.m2.m3", mizIsWiderThan(env, mkModeTyp(m2nr), mkModeTyp(m3nr)));
+	mizCheck(t, "wider.m3.m2.not", !mizIsWiderThan(env, mkModeTyp(m3nr), mkModeTyp(m2nr)));
+	mizCheck(t, "wider.any.m3", mizIsWiderThan(env, mkModeTyp(m1nr), mkModeTyp(m3nr)));
+
+	// TypReachable mirrors that (cheap pretest)
+	mizCheck(t, "reach.m2.m3", mizTypReachable(env, mkModeTyp(m2nr), mkModeTyp(m3nr)));
+	mizCheck(t, "reach.any", mizTypReachable(env, mkModeTyp(m1nr), mkModeTyp(m3nr)));
+
+	// WideningOf: target M2 from source M3 lands on M2
+	switch (mizWideningOf(env, mkModeTyp(m2nr), mkModeTyp(m3nr))) {
+		Some(w): mizCheckEqI(t, "widenof.mode", w.modNr, m2nr);
+		None(): mizCheck(t, "widenof.mode", false);
+	}
+
+	// EqRadices through adjustment
+	mizCheck(t, "eqradices", mizEqRadices(env, mkModeTyp(m3nr), mkModeTyp(m3nr)));
+	mizCheck(t, "eqradices.not", !mizEqRadices(env, mkModeTyp(m3nr), mkModeTyp(m2nr)));
+}

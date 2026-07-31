@@ -1,0 +1,604 @@
+// Transcription of ~/dev/system/kernel/correl.pas (part 2): instantiation,
+// term typing, and type widening.
+//
+// The original threads instantiation through CopyTerm via the globals
+// Instantiated / Instantiation[] / BoundBase: while Instantiated, copying a
+// LOCUS k yields a copy of Instantiation[k] with bound variables above
+// BoundBase renumbered by (BoundVarNbr - BoundBase) — RenBound. Here that
+// state lives in MizCorrelEnv and the env-aware copy family mizInstCopy*
+// implements exactly the same protocol (including EqConst node SHARING:
+// CopyTerm returns the same node for ikTrmEqConst — the equalizer relies on
+// this identity).
+//
+// GetTrmType's gTermCollection cache is a pure memoization in the original
+// (TTPairObj stores CopyTrmType output); it is omitted here until profiling
+// asks for it — semantics are CopyTrmType's. // DEVIATION: perf-only.
+
+import ds/vector;
+import loop;
+import mizar/original/errhan;
+import mizar/original/mobjects;
+import mizar/original/lexicon;
+import mizar/original/builtin;
+import mizar/original/correl;
+
+export {
+	// InstTyp/InstTrm/InstFrm/InstCluster: substitute the argument list for
+	// loci 1..n and copy. InstTrmInTyp: single-term substitution for locus 1.
+	mizInstTyp(env : MizCorrelEnv, typ : MizTyp, args : MizTrmList) -> MizTyp;
+	mizInstTrm(env : MizCorrelEnv, trm : MizTrm, args : MizTrmList) -> MizTrm;
+	mizInstFrm(env : MizCorrelEnv, frm : MizFrm, args : MizTrmList) -> MizFrm;
+	mizInstCluster(env : MizCorrelEnv, clu : MizAttrColl, args : MizTrmList) -> MizAttrColl;
+	mizInstTrmInTyp(env : MizCorrelEnv, typ : MizTyp, trm : MizTrm) -> MizTyp;
+	mizInstQual(env : MizCorrelEnv, frm : MizFrm, args : MizTrmList, trm : MizTrm) -> MizFrm;
+
+	// the env-aware copy family (CopyTerm/CopyType/CopyFormula/CopyCluster
+	// under the instantiation protocol; plain deep copy when not instantiated)
+	mizInstCopyTrm(env : MizCorrelEnv, t : MizTrm) -> MizTrm;
+	mizInstCopyTrmList(env : MizCorrelEnv, l : MizTrmList) -> MizTrmList;
+	mizInstCopyTyp(env : MizCorrelEnv, t : MizTyp) -> MizTyp;
+	mizInstCopyCluster(env : MizCorrelEnv, c : MizAttrColl) -> MizAttrColl;
+	mizInstCopyFrm(env : MizCorrelEnv, f : MizFrm) -> MizFrm;
+
+	// CopyTrmType / GetTrmType: the type of a term
+	mizCopyTrmType(env : MizCorrelEnv, t : MizTrm) -> MizTyp;
+	mizGetTrmType(env : MizCorrelEnv, t : MizTrm) -> MizTyp;
+
+	// widening family
+	mizEqRadices(env : MizCorrelEnv, a : MizTyp, b : MizTyp) -> bool;
+	mizDecreasingAttrs(env : MizCorrelEnv, source : MizTyp, target : MizTyp,
+		eqAttr : (MizAttr, MizAttr) -> bool) -> bool;
+	mizAttrCollIsSubsetOf(env : MizCorrelEnv, c : MizAttrColl, other : MizAttrColl,
+		eqAttr : (MizAttr, MizAttr) -> bool) -> bool;
+	mizTypReachable(env : MizCorrelEnv, wider : MizTyp, narrower : MizTyp) -> bool;
+	mizWidening(env : MizCorrelEnv, t : MizTyp) -> Maybe<MizTyp>;
+	mizWidenToStruct(env : MizCorrelEnv, t : MizTyp) -> Maybe<MizTyp>;
+	mizWideningOf(env : MizCorrelEnv, target : MizTyp, source : MizTyp) -> Maybe<MizTyp>;
+	mizIsWiderThan(env : MizCorrelEnv, wider : MizTyp, narrower : MizTyp) -> bool;
+	mizCopyAllowed(env : MizCorrelEnv, typ : MizTyp, origin : MizAttrColl) -> MizAttrColl;
+	mizAdjustedAttrNrOf(env : MizCorrelEnv, a : MizAttr) -> int;
+}
+
+// RenBound over a freshly copied instantiation term
+mizRenBound(env : MizCorrelEnv, t : MizTrm) -> MizTrm {
+	w = mizMakeWithin(\__, trm -> {
+		switch (trm) {
+			MizVarTrm(srt, varNr, __): {
+				if (srt == ikTrmBound && varNr > env.boundBase) {
+					vt = mizAsVarTrmL(trm);
+					vt.varNr ::= varNr + (env.boundVarNbr - env.boundBase);
+				}
+				trm;
+			}
+			default: trm;
+		}
+	});
+	mizWithinTrm(w, t);
+}
+
+mizAsVarTrmL(t : MizTrm) -> MizVarTrm {
+	switch (t) {
+		MizVarTrm(__, __, __): t;
+		default: { mizRunTimeError(2901); MizVarTrm(ikError, 0, 0); }
+	}
+}
+
+// CopyTerm under the instantiation protocol.
+mizInstCopyTrm(env : MizCorrelEnv, t : MizTrm) -> MizTrm {
+	srt0 = mizTrmSort(t);
+	if (srt0 == ikTrmEqConst) {
+		t; // SHARED, not copied — identity matters in the equalizer
+	} else if (env.instantiated && srt0 == ikTrmLocus) {
+		vt = mizAsVarTrmL(t);
+		env.instantiated ::= false;
+		lTrm = mizInstCopyTrm(env, getVectorUnsafe(env.instantiation, vt.varNr));
+		env.instantiated ::= true;
+		mizRenBound(env, lTrm);
+	} else {
+		switch (t) {
+			MizVarTrm(srt, varNr, pattNr): MizVarTrm(srt, varNr, pattNr);
+			MizFuncTrm(srt, funcNr, args, pattNr):
+				MizFuncTrm(srt, funcNr, mizInstCopyTrmList(env, args), pattNr);
+			MizPrivFuncTrm(funcNr, args, funcExp, pattNr):
+				MizPrivFuncTrm(funcNr, mizInstCopyTrmList(env, args),
+					mizInstCopyTrm(env, funcExp), pattNr);
+			MizFraenkelTrm(lambdaArgs, scope, compr, idents, pattNr): {
+				i0 = env.boundVarNbr;
+				la : Vector<MizTyp> = makeVector(sizeVector(lambdaArgs));
+				iterVector(lambdaArgs, \typ -> {
+					env.boundVarNbr ::= env.boundVarNbr + 1;
+					pushVector(la, mizInstCopyTyp(env, typ));
+				});
+				sc = mizInstCopyTrm(env, scope);
+				cp = mizInstCopyFrm(env, compr);
+				env.boundVarNbr ::= i0;
+				MizFraenkelTrm(la, sc, cp, mizCopyIntSeq(idents), pattNr);
+			}
+			MizChoiceTrm(typ, pattNr): MizChoiceTrm(mizInstCopyTyp(env, typ), pattNr);
+			MizQuaTrm(trmProper, qua, pattNr):
+				MizQuaTrm(mizInstCopyTrm(env, trmProper), mizInstCopyTyp(env, qua), pattNr);
+			MizBaseTrm(srt): MizBaseTrm(srt);
+		}
+	}
+}
+
+mizInstCopyTrmList(env : MizCorrelEnv, l : MizTrmList) -> MizTrmList {
+	switch (l) {
+		MizTrmNil(): l;
+		MizTrmElem(trm, next):
+			MizTrmElem(mizInstCopyTrm(env, trm), mizInstCopyTrmList(env, next));
+	}
+}
+
+mizInstCopyAttr(env : MizCorrelEnv, a : MizAttr) -> MizAttr {
+	MizAttr(a.neg, a.attrNr, mizInstCopyTrmList(env, a.args), false, a.pattNr);
+}
+
+mizInstCopyCluster(env : MizCorrelEnv, c : MizAttrColl) -> MizAttrColl {
+	MizAttrColl(mapVector(c.items, \a -> mizInstCopyAttr(env, a)), c.consistent);
+}
+
+mizInstCopyTyp(env : MizCorrelEnv, t : MizTyp) -> MizTyp {
+	MizTyp(t.sort, mizInstCopyCluster(env, t.lower), mizInstCopyCluster(env, t.upper),
+		t.modNr, mizInstCopyTrmList(env, t.modArgs), t.pattNr);
+}
+
+mizInstCopyFrm(env : MizCorrelEnv, f : MizFrm) -> MizFrm {
+	switch (f) {
+		MizPredFrm(srt, predNr, args, pattNr):
+			MizPredFrm(srt, predNr, mizInstCopyTrmList(env, args), pattNr);
+		MizLocPredFrm(predNr, args, expn, pattNr):
+			MizLocPredFrm(predNr, mizInstCopyTrmList(env, args),
+				mizInstCopyFrm(env, expn), pattNr);
+		MizQualFrm(trm, typ, pattNr):
+			MizQualFrm(mizInstCopyTrm(env, trm), mizInstCopyTyp(env, typ), pattNr);
+		MizNegFrm(arg, pattNr): MizNegFrm(mizInstCopyFrm(env, arg), pattNr);
+		MizBinFrm(srt, l, r, pattNr):
+			MizBinFrm(srt, mizInstCopyFrm(env, l), mizInstCopyFrm(env, r), pattNr);
+		MizConjFrm(conjuncts, pattNr):
+			MizConjFrm(mapVector(conjuncts, \g -> mizInstCopyFrm(env, g)), pattNr);
+		MizUnivFrm(srt, varId, quantified, scope, pattNr): {
+			// UnivFrmObj.CopyFormula bumps BoundVarNbr while copying the scope
+			q = mizInstCopyTyp(env, quantified);
+			env.boundVarNbr ::= env.boundVarNbr + 1;
+			s = mizInstCopyFrm(env, scope);
+			env.boundVarNbr ::= env.boundVarNbr - 1;
+			MizUnivFrm(srt, varId, q, s, pattNr);
+		}
+		MizUniqFrm(srt): MizUniqFrm(srt);
+		MizFlexFrm(srt, lo, ro, lt, rt, expn, pattNr):
+			MizFlexFrm(srt, mizInstCopyFrm(env, lo), mizInstCopyFrm(env, ro),
+				mizInstCopyTrm(env, lt), mizInstCopyTrm(env, rt),
+				mizInstCopyFrm(env, expn), pattNr);
+	}
+}
+
+// fill Instantiation[1..] from a TrmList (InitInstList pattern)
+mizSetInstantiation(env : MizCorrelEnv, args : MizTrmList) -> void {
+	clearVector(env.instantiation);
+	pushVector(env.instantiation, mizNewIncorTrm()); // dummy slot 0
+	cur = ref args;
+	while(\ -> switch (^cur) { MizTrmNil(): false; default: true; }, \ -> {
+		switch (^cur) {
+			MizTrmElem(trm, next): {
+				pushVector(env.instantiation, trm);
+				cur := next;
+			}
+			MizTrmNil(): {}
+		}
+	});
+	env.instantiated ::= true;
+	env.boundBase ::= env.boundVarNbr;
+}
+
+mizStopInst(env : MizCorrelEnv) -> void {
+	env.instantiated ::= false;
+}
+
+mizInstTyp(env : MizCorrelEnv, typ : MizTyp, args : MizTrmList) -> MizTyp {
+	mizSetInstantiation(env, args);
+	res = mizInstCopyTyp(env, typ);
+	mizStopInst(env);
+	res;
+}
+
+mizInstTrm(env : MizCorrelEnv, trm : MizTrm, args : MizTrmList) -> MizTrm {
+	mizSetInstantiation(env, args);
+	res = mizInstCopyTrm(env, trm);
+	mizStopInst(env);
+	res;
+}
+
+mizInstFrm(env : MizCorrelEnv, frm : MizFrm, args : MizTrmList) -> MizFrm {
+	mizSetInstantiation(env, args);
+	res = mizInstCopyFrm(env, frm);
+	mizStopInst(env);
+	res;
+}
+
+mizInstCluster(env : MizCorrelEnv, clu : MizAttrColl, args : MizTrmList) -> MizAttrColl {
+	mizSetInstantiation(env, args);
+	res = mizInstCopyCluster(env, clu);
+	mizStopInst(env);
+	res;
+}
+
+mizInstTrmInTyp(env : MizCorrelEnv, typ : MizTyp, trm : MizTrm) -> MizTyp {
+	clearVector(env.instantiation);
+	pushVector(env.instantiation, mizNewIncorTrm());
+	pushVector(env.instantiation, trm);
+	env.instantiated ::= true;
+	env.boundBase ::= env.boundVarNbr;
+	res = mizInstCopyTyp(env, typ);
+	mizStopInst(env);
+	res;
+}
+
+mizInstQual(env : MizCorrelEnv, frm : MizFrm, args : MizTrmList, trm : MizTrm) -> MizFrm {
+	mizSetInstantiation(env, args);
+	pushVector(env.instantiation, trm); // Instantiation[k] := fTrm after the list
+	res = mizInstCopyFrm(env, frm);
+	mizStopInst(env);
+	res;
+}
+
+// ---------------- term typing ----------------
+
+mizCopyTrmType(env : MizCorrelEnv, t : MizTrm) -> MizTyp {
+	switch (t) {
+		MizVarTrm(srt, varNr, __): {
+			if (srt == ikTrmBound) {
+				mizCopyTyp(mizBoundVar(env, varNr));
+			} else if (srt == ikTrmConstant) {
+				fv : MizFixedVar = getVectorUnsafe(env.fixedVar, varNr);
+				typ = mizCopyTyp(fv.typ);
+				// WithinType(ChangeBound): bound vars shift by gBoundBase —
+				// in the checker gBoundBase tracks the current binder depth
+				w = mizMakeWithin(\__, trm -> {
+					switch (trm) {
+						MizVarTrm(s2, v2, __): {
+							if (s2 == ikTrmBound) {
+								vt = mizAsVarTrmL(trm);
+								vt.varNr ::= v2 + env.boundVarNbr;
+							}
+							trm;
+						}
+						default: trm;
+					}
+				});
+				mizWithinTyp(w, typ);
+				typ;
+			} else if (srt == ikTrmInfConst) {
+				cd : MizConstDef = getVectorUnsafe(env.inferConstDef, varNr);
+				mizCopyTyp(cd.typ);
+			} else if (srt == ikTrmNumeral) {
+				mizCopyTyp(env.nonZeroTyp);
+			} else if (srt == ikTrmLocus) {
+				mizCopyTyp(getVectorUnsafe(env.locArgTyp, varNr));
+			} else {
+				mizRunTimeError(2054);
+				mizNewIncorTyp();
+			}
+		}
+		MizFuncTrm(srt, funcNr, args, __): {
+			if (srt == ikTrmSchFunc) {
+				mizCopyTyp(getVectorUnsafe(env.curSchFuncTyp, funcNr - 1));
+			} else {
+				// Functor/Selector/Aggreg: instantiate the constructor's type
+				kind = if (srt == ikTrmFunctor) coFunctor
+					else if (srt == ikTrmSelector) coSelector
+					else coAggregate;
+				c = mizConstr(env, kind, funcNr);
+				switch (c.typ) {
+					Some(ct): mizInstTyp(env, ct, args);
+					None(): {
+						mizRunTimeError(2054);
+						mizNewIncorTyp();
+					}
+				}
+			}
+		}
+		MizPrivFuncTrm(funcNr, args, __, __): {
+			fd : MizFuncDef = getVectorUnsafe(env.locFuncDef, funcNr - 1);
+			mizInstTyp(env, fd.funcTyp, args);
+		}
+		MizFraenkelTrm(__, __, __, __, __):
+			mizNewStandardTyp(ikTypMode, mizNewEmptyCluster(), mizNewEmptyCluster(),
+				mizBuiltIn(env.builtIn, rqSetMode), MizTrmNil());
+		MizChoiceTrm(typ, __): mizCopyTyp(typ);
+		MizQuaTrm(__, qua, __): mizCopyTyp(qua);
+		MizBaseTrm(srt): {
+			if (srt == ikTrmIt) mizCopyTyp(env.itTyp)
+			else mizNewIncorTyp(); // ikError
+		}
+	}
+}
+
+mizGetTrmType(env : MizCorrelEnv, t : MizTrm) -> MizTyp {
+	// gTermCollection memoization omitted (perf-only) — see file header
+	mizCopyTrmType(env, t);
+}
+
+// ---------------- widening ----------------
+
+mizEqRadices(env : MizCorrelEnv, a : MizTyp, b : MizTyp) -> bool {
+	if (a.sort != b.sort) {
+		false;
+	} else if (a.sort == ikTypMode) {
+		pa = mizAdjustTyp(env, a);
+		pb = mizAdjustTyp(env, b);
+		pa.first == pb.first && mizEqTrmList(env, pa.second, pb.second);
+	} else if (a.sort == ikTypStruct) {
+		a.modNr == b.modNr && mizEqTrmList(env, a.modArgs, b.modArgs);
+	} else {
+		mizRunTimeError(2051);
+		false;
+	}
+}
+
+mizAdjustedAttrNrOf(env : MizCorrelEnv, a : MizAttr) -> int {
+	mizAdjustedAttrNr(env, a);
+}
+
+mizAttrCollIsSubsetOf(env : MizCorrelEnv, c : MizAttrColl, other : MizAttrColl,
+		eqAttr : (MizAttr, MizAttr) -> bool) -> bool {
+	n = sizeVector(c.items);
+	m = sizeVector(other.items);
+	if (m < n) {
+		false;
+	} else {
+		res = ref true;
+		j = ref 0;
+		i = ref 0;
+		while(\ -> ^i < n && ^res, \ -> {
+			a : MizAttr = getVectorUnsafe(c.items, ^i);
+			lAttrNr = mizAdjustedAttrNr(env, a);
+			while(\ -> ^j < m
+					&& mizAdjustedAttrNr(env, getVectorUnsafe(other.items, ^j)) < lAttrNr,
+				\ -> j := ^j + 1);
+			if (^j == m || !eqAttr(getVectorUnsafe(other.items, ^j), a)) {
+				res := false;
+			}
+			i := ^i + 1;
+		});
+		^res;
+	}
+}
+
+mizDecreasingAttrs(env : MizCorrelEnv, source : MizTyp, target : MizTyp,
+		eqAttr : (MizAttr, MizAttr) -> bool) -> bool {
+	// TypObj.DecreasingAttrs: called as narrower.DecreasingAttrs(self) with
+	// self = the WIDER type; target's lower attrs must sit in source's upper
+	if (sizeVector(target.lower.items) == 0) {
+		true;
+	} else {
+		mizAttrCollIsSubsetOf(env, target.lower, source.upper, eqAttr);
+	}
+}
+
+mizTypReachable(env : MizCorrelEnv, wider : MizTyp, narrower : MizTyp) -> bool {
+	if (wider.sort != ikTypMode || narrower.sort != ikTypMode) {
+		true;
+	} else if (wider.modNr == mizBuiltIn(env.builtIn, rqAny)) {
+		true;
+	} else {
+		lModNr0 = wider.modNr;
+		cw = mizConstr(env, coMode, lModNr0);
+		lModNr = if (cw.whichConstrNr != 0) cw.whichConstrNr else lModNr0;
+		cur = ref narrower;
+		res = ref false;
+		brk = ref false;
+		while(\ -> !^brk && (^cur).sort == ikTypMode && (^cur).modNr >= lModNr, \ -> {
+			cn = mizConstr(env, coMode, (^cur).modNr);
+			orig = cn.whichConstrNr;
+			if ((^cur).modNr == lModNr || orig == lModNr) {
+				res := true;
+				brk := true;
+			} else {
+				switch (cn.typ) {
+					Some(ct): cur := ct;
+					None(): brk := true;
+				}
+			}
+		});
+		^res;
+	}
+}
+
+mizCopyAllowed(env : MizCorrelEnv, typ : MizTyp, origin : MizAttrColl) -> MizAttrColl {
+	res = mizNewEmptyCluster();
+	mizAssert(2599, typ.sort == ikTypMode);
+	pm = mizAdjustTyp(env, typ);
+	lModNr = pm.first;
+	iterVector(origin.items, \a -> {
+		lAttrNr = mizAdjustedAttrNr(env, a);
+		ca = mizConstr(env, coAttribute, lAttrNr);
+		switch (ca.typ) {
+			Some(ct): {
+				if (ct.sort == ikTypMode) {
+					if (lModNr != ct.modNr) {
+						mizAttrCollInsert(env, res, mizCopyAttr(a));
+					}
+				} else if (ct.sort == ikTypStruct) {
+					mizAttrCollInsert(env, res, mizCopyAttr(a));
+				}
+			}
+			None(): {}
+		}
+	});
+	res;
+}
+
+mizWidening(env : MizCorrelEnv, t : MizTyp) -> Maybe<MizTyp> {
+	if (t.sort == ikTypMode) {
+		if (t.modNr == mizBuiltIn(env.builtIn, rqAny)) {
+			None();
+		} else {
+			c = mizConstr(env, coMode, t.modNr);
+			switch (c.typ) {
+				Some(ct): {
+					lTyp = mizInstTyp(env, ct, t.modArgs);
+					lTyp.upper ::= mizCopyAllowed(env, t, t.upper);
+					Some(lTyp);
+				}
+				None(): None();
+			}
+		}
+	} else if (t.sort == ikTypStruct) {
+		Some(mizNewStandardTyp(ikTypMode, mizNewEmptyCluster(), mizNewEmptyCluster(),
+			mizBuiltIn(env.builtIn, rqSetMode), MizTrmNil()));
+	} else {
+		mizRunTimeError(2223);
+		None();
+	}
+}
+
+mizWidenToStruct(env : MizCorrelEnv, t : MizTyp) -> Maybe<MizTyp> {
+	cur = ref mizCopyTyp(t);
+	res : ref Maybe<MizTyp> = ref None();
+	brk = ref false;
+	while(\ -> !^brk, \ -> {
+		if ((^cur).sort == ikTypMode) {
+			switch (mizWidening(env, ^cur)) {
+				Some(w): cur := w;
+				None(): brk := true; // ran out — result stays None
+			}
+		} else {
+			res := Some(^cur);
+			brk := true;
+		}
+	});
+	^res;
+}
+
+mizWideningOf(env : MizCorrelEnv, target : MizTyp, source : MizTyp) -> Maybe<MizTyp> {
+	if (target.sort == ikTypMode) {
+		pt = mizAdjustTyp(env, target);
+		lModNr = pt.first;
+		cur = ref source;
+		res : ref Maybe<MizTyp> = ref None();
+		brk = ref false;
+		while(\ -> !^brk && (^cur).sort == ikTypMode && (^cur).modNr >= lModNr, \ -> {
+			cm = mizConstr(env, coMode, (^cur).modNr);
+			if ((^cur).modNr == lModNr || cm.whichConstrNr == lModNr) {
+				res := Some(^cur);
+				brk := true;
+			} else {
+				switch (mizWidening(env, ^cur)) {
+					Some(w): cur := w;
+					None(): brk := true;
+				}
+			}
+		});
+		if (isNone(^res) && (^cur).sort == ikTypStruct) {
+			if (lModNr == mizBuiltIn(env.builtIn, rqSetMode)) {
+				res := Some(MizTyp(ikTypMode, mizNewEmptyCluster(), mizNewEmptyCluster(),
+					mizBuiltIn(env.builtIn, rqSetMode), MizTrmNil(), 0));
+			} else if (lModNr == mizBuiltIn(env.builtIn, rqAny)) {
+				res := Some(MizTyp(ikTypMode, mizNewEmptyCluster(), mizNewEmptyCluster(),
+					mizBuiltIn(env.builtIn, rqAny), MizTrmNil(), 0));
+			}
+		}
+		^res;
+	} else if (target.sort == ikTypStruct) {
+		switch (mizWidenToStruct(env, source)) {
+			None(): None();
+			Some(st0): {
+				if (target.modNr == st0.modNr) {
+					Some(st0);
+				} else {
+					cs = mizConstr(env, coStructMode, target.modNr);
+					co = mizConstr(env, coStructMode, st0.modNr);
+					if (mizNatCount(cs.fields) == 0
+						|| !mizNatIsSubsetOf(cs.fields, co.fields)) {
+						None();
+					} else {
+						// WidenningPath: DFS through prefixes to target.modNr
+						path : Vector<MizTyp> = makeVector(4);
+						found = mizWidenningPath(env, st0.modNr, target.modNr, path);
+						if (found) {
+							cur2 = ref st0;
+							// prefixes were pushed root-first along the found path
+							iterVector(path, \pref : MizTyp -> {
+								cur2 := mizInstTyp(env, pref, (^cur2).modArgs);
+							});
+							Some(^cur2);
+						} else {
+							None();
+						}
+					}
+				}
+			}
+		}
+	} else {
+		None(); // ikError
+	}
+}
+
+// WidenningPath: DFS over struct prefixes from struct nr `from` to `target`,
+// collecting the prefix types along the successful path (in visit order).
+mizWidenningPath(env : MizCorrelEnv, from : int, target : int,
+		path : Vector<MizTyp>) -> bool {
+	cs = mizConstr(env, coStructMode, from);
+	found = ref false;
+	i = ref 0;
+	// prefixes of a struct are its fPrefixes; stored in c.primaries? NO —
+	// StructConstrObj.fPrefixes is separate; kept in MizConstr.prefixes below
+	prefs = mizConstrPrefixes(env, from);
+	n = sizeVector(prefs);
+	while(\ -> !^found && ^i < n, \ -> {
+		p : MizTyp = getVectorUnsafe(prefs, ^i);
+		if (p.modNr == target) {
+			pushVector(path, p);
+			found := true;
+		} else {
+			if (mizWidenningPath(env, p.modNr, target, path)) {
+				// insert this prefix BEFORE the deeper ones (original AtPut
+				// at the reserved slot): emulate by inserting at position 0
+				mizVectorAtInsert(path, 0, p);
+				found := true;
+			}
+		}
+		i := ^i + 1;
+	});
+	^found;
+}
+
+mizIsWiderThan(env : MizCorrelEnv, wider : MizTyp, narrower0 : MizTyp) -> bool {
+	// TypObj.IsWiderThan: self = wider; the argument is consumed by widening.
+	// Gate: wider's lower attrs must sit in narrower's upper (DecreasingAttrs).
+	if (!mizDecreasingAttrs(env, narrower0, wider, \x, y -> mizEqAttr(env, x, y))) {
+		false;
+	} else if (wider.sort == ikTypMode) {
+		pw = mizAdjustTyp(env, wider);
+		lModNr = pw.first;
+		cur = ref narrower0;
+		res = ref false;
+		brk = ref false;
+		while(\ -> !^brk && (^cur).sort == ikTypMode && (^cur).modNr >= lModNr, \ -> {
+			if (mizEqRadices(env, wider, ^cur)) {
+				res := true;
+				brk := true;
+			} else {
+				switch (mizWidening(env, ^cur)) {
+					Some(w): cur := w;
+					None(): brk := true;
+				}
+			}
+		});
+		if (!^res && (^cur).sort == ikTypStruct) {
+			if (lModNr == mizBuiltIn(env.builtIn, rqSetMode)
+				|| lModNr == mizBuiltIn(env.builtIn, rqAny)) {
+				res := true;
+			}
+		}
+		^res;
+	} else if (wider.sort == ikTypStruct) {
+		switch (mizWideningOf(env, wider, narrower0)) {
+			None(): false;
+			Some(w): mizEqRadices(env, wider, w);
+		}
+	} else {
+		false;
+	}
+}
