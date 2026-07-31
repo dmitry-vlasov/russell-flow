@@ -25,6 +25,8 @@ import mizar/original/lexicon;
 import mizar/original/xml_parser;
 import mizar/original/correl;
 import mizar/original/iocorrel;
+import mizar/original/roundcl;
+import mizar/original/prep;
 
 export {
 	// the parsed .evl: directive name -> article ids, in file order
@@ -36,9 +38,31 @@ export {
 	// prel/<initial>/<article><ext>
 	mizPrelPath(mmlDir : string, article : string, ext : string) -> string;
 
+	// the accommodation in progress: the merged constructor frame plus the
+	// per-article bases every later pass translates against
+	// per-article .dco header: its <Signature> frame and its own <ConstrCounts>
+	MizDcoInfo(signature : [string], ownCounts : Tree<int, int>);
+
+	// running merged totals by kind, and the per-article bases
+	MizAccomState(
+		mutable merged : Tree<int, int>,                 // kind -> count so far
+		mutable info : Tree<string, MizDcoInfo>,         // article -> its .dco header
+		// article -> kind -> merged count at the moment that article starts:
+		// translations are ARITHMETIC (base + own index), so a constructor may
+		// refer forward to one of its own article's later constructors
+		mutable baseOf : Tree<string, Tree<int, int>>,
+	);
+
+	MizAccom(env : MizCorrelEnv, mmlDir : string, st : MizAccomState);
+	mizMakeAccom(env : MizCorrelEnv, mmlDir : string) -> MizAccom;
+
 	// build the merged constructor table into env, exactly as the .atr would
 	// have it. Returns the article order actually loaded.
-	mizAccomConstructors(env : MizCorrelEnv, mmlDir : string, evl : MizEvl) -> [string];
+	mizAccomConstructors(acc : MizAccom, evl : MizEvl) -> [string];
+
+	// build the registration table, exactly as the .ecl would have it
+	// (acc_han.pas ProcessClusters). Must run after mizAccomConstructors.
+	mizAccomClusters(acc : MizAccom, cl : MizClusters, evl : MizEvl) -> void;
 }
 
 mizEvlDirective(evl : MizEvl, name : string) -> [string] {
@@ -84,26 +108,36 @@ mizLoadEvl(path : string) -> MizEvl {
 
 // ---------------- the merged constructor table ----------------
 
-// per-article own counts by constructor kind
-MizDcoInfo(signature : [string], ownCounts : Tree<int, int>);
-
-// running merged totals by kind, and (article,kind,ownIndex) -> merged nr
-MizAccomState(
-	mutable merged : Tree<int, int>,                 // kind -> count so far
-	mutable slotOf : Tree<string, int>,              // "article|kind|ownIdx" -> merged nr
-	mutable info : Tree<string, MizDcoInfo>,         // article -> its .dco header
-	// article -> kind -> merged count at the moment that article starts:
-	// translations are ARITHMETIC (base + own index), so a constructor may
-	// refer forward to one of its own article's later constructors
-	mutable baseOf : Tree<string, Tree<int, int>>,
-);
+mizMakeAccom(env : MizCorrelEnv, mmlDir : string) -> MizAccom {
+	MizAccom(env, mmlDir, MizAccomState(makeTree(), makeTree(), makeTree()));
+}
 
 mizAccomBase(st : MizAccomState, article : string, kind : int) -> int {
 	lookupTreeDef(lookupTreeDef(st.baseOf, article, makeTree()), kind, 0);
 }
 
-accKey(article : string, kind : int, ownIdx : int) -> string {
-	article + "|" + i2s(kind) + "|" + i2s(ownIdx);
+mizAccomOwn(st : MizAccomState, article : string, kind : int) -> int {
+	switch (lookupTree(st.info, article)) {
+		Some(inf): lookupTreeDef(inf.ownCounts, kind, 0);
+		None(): 0;
+	}
+}
+
+mizAccomMerged(st : MizAccomState, kind : int) -> int {
+	lookupTreeDef(st.merged, kind, 0);
+}
+
+// record the frame an article occupies in the merged table: its base is the
+// current total, and its own count is added to that total (inlibr ReadConstructors
+// / ReadDCOBases both do exactly this — the second without loading anything)
+mizAccomOpenFrame(st : MizAccomState, article : string, inf : MizDcoInfo) -> void {
+	st.info ::= setTree(st.info, article, inf);
+	bases = ref makeTree();
+	fori(0, coLAST, \k -> bases := setTree(^bases, k, mizAccomMerged(st, k)));
+	st.baseOf ::= setTree(st.baseOf, article, ^bases);
+	fori(0, coLAST, \k ->
+		st.merged ::= setTree(st.merged, k,
+			mizAccomMerged(st, k) + lookupTreeDef(inf.ownCounts, k, 0)));
 }
 
 // read a .dco header: <Signature> article ids and <ConstrCounts>
@@ -133,32 +167,37 @@ mizReadDcoHeader(x : MizXmlParser) -> MizDcoInfo {
 	MizDcoInfo(^sig, ^counts);
 }
 
-// translate a LOCAL (kind, nr) of `article`'s frame into the merged nr
+// Translate a LOCAL (kind, nr) of a file's own numbering frame into the merged
+// frame. The frame is the ordered article list the file numbers against — for a
+// `.dco` that is its <Signature> followed by the article itself, for a `.dcl`
+// its <Signature> already ends with the article. This is inlibr's gTrans built
+// by AssignSTables, expressed arithmetically.
+mizAccomTranslateIn(st : MizAccomState, frame : [string], kind : int, nr : int) -> int {
+	if (nr == 0) 0 else {
+		rest = ref nr;
+		res = ref 0;
+		i = ref 0;
+		while(\ -> ^res == 0 && ^i < length(frame), \ -> {
+			a = frame[^i];
+			own = mizAccomOwn(st, a, kind);
+			if (^rest <= own) {
+				res := mizAccomBase(st, a, kind) + ^rest;
+			} else {
+				rest := ^rest - own;
+			}
+			i := ^i + 1;
+		});
+		// out of frame: an unresolved reference keeps its number (the original
+		// would have reported connection fault 825 while reading the header)
+		if (^res != 0) ^res else nr;
+	}
+}
+
+// the .dco frame of `article`
 mizAccomTranslate(st : MizAccomState, article : string, kind : int, nr : int) -> int {
 	switch (lookupTree(st.info, article)) {
 		None(): nr;
-		Some(inf): {
-			// walk the signature prefix: each article contributes its own count
-			rest = ref nr;
-			res = ref 0;
-			i = ref 0;
-			sig = inf.signature;
-			while(\ -> ^res == 0 && ^i < length(sig), \ -> {
-				a = sig[^i];
-				own = switch (lookupTree(st.info, a)) {
-					Some(ai): lookupTreeDef(ai.ownCounts, kind, 0);
-					None(): 0;
-				};
-				if (^rest <= own) {
-					res := mizAccomBase(st, a, kind) + ^rest;
-				} else {
-					rest := ^rest - own;
-				}
-				i := ^i + 1;
-			});
-			if (^res != 0) ^res
-			else mizAccomBase(st, article, kind) + ^rest;
-		}
+		Some(inf): mizAccomTranslateIn(st, arrayPush(inf.signature, article), kind, nr);
 	}
 }
 
@@ -166,35 +205,35 @@ mizAccomTranslate(st : MizAccomState, article : string, kind : int, nr : int) ->
 
 // Every reference inside a constructor's types/terms/attributes carries the
 // SOURCE article's numbering; rewrite each to the merged frame.
-mizAccomRenumberTyp(st : MizAccomState, article : string, t : MizTyp) -> void {
+mizAccomRenumberTyp(tr : (int, int) -> int, t : MizTyp) -> void {
 	if (t.sort == ikTypMode) {
-		t.modNr ::= mizAccomTranslate(st, article, coMode, t.modNr);
+		t.modNr ::= tr(coMode, t.modNr);
 	} else if (t.sort == ikTypStruct) {
-		t.modNr ::= mizAccomTranslate(st, article, coStructMode, t.modNr);
+		t.modNr ::= tr(coStructMode, t.modNr);
 	}
-	mizAccomRenumberCluster(st, article, t.lower);
-	mizAccomRenumberCluster(st, article, t.upper);
-	mizAccomRenumberTrmList(st, article, t.modArgs);
+	mizAccomRenumberCluster(tr, t.lower);
+	mizAccomRenumberCluster(tr, t.upper);
+	mizAccomRenumberTrmList(tr, t.modArgs);
 }
 
-mizAccomRenumberCluster(st : MizAccomState, article : string, c : MizAttrColl) -> void {
+mizAccomRenumberCluster(tr : (int, int) -> int, c : MizAttrColl) -> void {
 	iterVector(c.items, \a -> {
-		a.attrNr ::= mizAccomTranslate(st, article, coAttribute, a.attrNr);
-		mizAccomRenumberTrmList(st, article, a.args);
+		a.attrNr ::= tr(coAttribute, a.attrNr);
+		mizAccomRenumberTrmList(tr, a.args);
 	});
 }
 
-mizAccomRenumberTrmList(st : MizAccomState, article : string, l : MizTrmList) -> void {
+mizAccomRenumberTrmList(tr : (int, int) -> int, l : MizTrmList) -> void {
 	switch (l) {
 		MizTrmNil(): {}
 		MizTrmElem(trm, next): {
-			mizAccomRenumberTrm(st, article, trm);
-			mizAccomRenumberTrmList(st, article, next);
+			mizAccomRenumberTrm(tr, trm);
+			mizAccomRenumberTrmList(tr, next);
 		}
 	}
 }
 
-mizAccomRenumberTrm(st : MizAccomState, article : string, t : MizTrm) -> void {
+mizAccomRenumberTrm(tr : (int, int) -> int, t : MizTrm) -> void {
 	switch (t) {
 		MizFuncTrm(srt, funcNr, args, __, __): {
 			ft : MizFuncTrm = t;
@@ -203,88 +242,89 @@ mizAccomRenumberTrm(st : MizAccomState, article : string, t : MizTrm) -> void {
 				else if (srt == ikTrmAggreg || srt == ikTrmSubAgreg) coAggregate
 				else -1;
 			if (kind >= 0) {
-				ft.funcNr ::= mizAccomTranslate(st, article, kind, funcNr);
+				ft.funcNr ::= tr(kind, funcNr);
 			}
-			mizAccomRenumberTrmList(st, article, args);
+			mizAccomRenumberTrmList(tr, args);
 		}
 		MizPrivFuncTrm(__, args, expn, __, __): {
-			mizAccomRenumberTrm(st, article, expn);
-			mizAccomRenumberTrmList(st, article, args);
+			mizAccomRenumberTrm(tr, expn);
+			mizAccomRenumberTrmList(tr, args);
 		}
 		MizFraenkelTrm(lambdaArgs, scope, compr, __, __, __): {
-			iterVector(lambdaArgs, \ty -> mizAccomRenumberTyp(st, article, ty));
-			mizAccomRenumberTrm(st, article, scope);
-			mizAccomRenumberFrm(st, article, compr);
+			iterVector(lambdaArgs, \ty -> mizAccomRenumberTyp(tr, ty));
+			mizAccomRenumberTrm(tr, scope);
+			mizAccomRenumberFrm(tr, compr);
 		}
 		MizQuaTrm(trmProper, typ, __, __): {
-			mizAccomRenumberTrm(st, article, trmProper);
-			mizAccomRenumberTyp(st, article, typ);
+			mizAccomRenumberTrm(tr, trmProper);
+			mizAccomRenumberTyp(tr, typ);
 		}
-		MizChoiceTrm(typ, __, __): mizAccomRenumberTyp(st, article, typ);
+		MizChoiceTrm(typ, __, __): mizAccomRenumberTyp(tr, typ);
 		default: {}
 	}
 }
 
-mizAccomRenumberFrm(st : MizAccomState, article : string, f : MizFrm) -> void {
+mizAccomRenumberFrm(tr : (int, int) -> int, f : MizFrm) -> void {
 	switch (f) {
 		MizPredFrm(srt, predNr, args, __): {
 			pf : MizPredFrm = f;
 			kind = if (srt == ikFrmAttr) coAttribute else coPredicate;
-			pf.predNr ::= mizAccomTranslate(st, article, kind, predNr);
-			mizAccomRenumberTrmList(st, article, args);
+			pf.predNr ::= tr(kind, predNr);
+			mizAccomRenumberTrmList(tr, args);
 		}
 		MizLocPredFrm(__, args, expn, __): {
-			mizAccomRenumberFrm(st, article, expn);
-			mizAccomRenumberTrmList(st, article, args);
+			mizAccomRenumberFrm(tr, expn);
+			mizAccomRenumberTrmList(tr, args);
 		}
 		MizQualFrm(trm, typ, __): {
-			mizAccomRenumberTrm(st, article, trm);
-			mizAccomRenumberTyp(st, article, typ);
+			mizAccomRenumberTrm(tr, trm);
+			mizAccomRenumberTyp(tr, typ);
 		}
-		MizNegFrm(arg, __): mizAccomRenumberFrm(st, article, arg);
-		MizConjFrm(conjuncts, __): iterVector(conjuncts, \g -> mizAccomRenumberFrm(st, article, g));
+		MizNegFrm(arg, __): mizAccomRenumberFrm(tr, arg);
+		MizConjFrm(conjuncts, __): iterVector(conjuncts, \g -> mizAccomRenumberFrm(tr, g));
 		MizUnivFrm(__, __, quantified, scope, __): {
-			mizAccomRenumberTyp(st, article, quantified);
-			mizAccomRenumberFrm(st, article, scope);
+			mizAccomRenumberTyp(tr, quantified);
+			mizAccomRenumberFrm(tr, scope);
 		}
 		MizFlexFrm(__, lo, ro, lt, rt, expansion, __): {
-			mizAccomRenumberFrm(st, article, lo);
-			mizAccomRenumberFrm(st, article, ro);
-			mizAccomRenumberFrm(st, article, expansion);
-			mizAccomRenumberTrm(st, article, lt);
-			mizAccomRenumberTrm(st, article, rt);
+			mizAccomRenumberFrm(tr, lo);
+			mizAccomRenumberFrm(tr, ro);
+			mizAccomRenumberFrm(tr, expansion);
+			mizAccomRenumberTrm(tr, lt);
+			mizAccomRenumberTrm(tr, rt);
 		}
 		default: {}
 	}
 }
 
-mizAccomRenumberConstr(st : MizAccomState, article : string, c : MizConstr) -> void {
-	iterVector(c.primaries, \t -> mizAccomRenumberTyp(st, article, t));
+mizAccomRenumberConstr(tr : (int, int) -> int, c : MizConstr) -> void {
+	iterVector(c.primaries, \t -> mizAccomRenumberTyp(tr, t));
 	switch (c.typ) {
-		Some(t): mizAccomRenumberTyp(st, article, t);
+		Some(t): mizAccomRenumberTyp(tr, t);
 		None(): {}
 	}
-	iterVector(c.prefixes, \t -> mizAccomRenumberTyp(st, article, t));
+	iterVector(c.prefixes, \t -> mizAccomRenumberTyp(tr, t));
 	if (c.structModeAggrNr != 0) {
-		c.structModeAggrNr ::= mizAccomTranslate(st, article, coAggregate, c.structModeAggrNr);
+		c.structModeAggrNr ::= tr(coAggregate, c.structModeAggrNr);
 	}
 	// field / aggregate selector lists are selector numbers
 	newFields = mizInitNatSet(mizNatCount(c.fields));
 	fori(0, mizNatCount(c.fields) - 1, \i ->
-		mizNatInsertElem(newFields, mizAccomTranslate(st, article, coSelector,
-			mizNatItem(c.fields, i).x)));
+		mizNatInsertElem(newFields, tr(coSelector, mizNatItem(c.fields, i).x)));
 	mizNatDeleteAll(c.fields);
 	fori(0, mizNatCount(newFields) - 1, \i ->
 		mizNatInsertElem(c.fields, mizNatItem(newFields, i).x));
 	fori(0, mizSeqCount(c.aggrFields) - 1, \i ->
 		mizSeqAtPut(c.aggrFields, i,
-			mizAccomTranslate(st, article, coSelector, mizSeqValue(c.aggrFields, i))));
+			tr(coSelector, mizSeqValue(c.aggrFields, i))));
 }
 
 // ---------------- the constructor pass ----------------
 
-mizAccomConstructors(env : MizCorrelEnv, mmlDir : string, evl : MizEvl) -> [string] {
-	st = MizAccomState(makeTree(), makeTree(), makeTree(), makeTree());
+mizAccomConstructors(acc : MizAccom, evl : MizEvl) -> [string] {
+	env = acc.env;
+	mmlDir = acc.mmlDir;
+	st = acc.st;
 	articles = mizEvlDirective(evl, "constructors");
 	loaded = ref [];
 	// An article's own numbering assumes its <Signature> articles come first,
@@ -352,26 +392,17 @@ mizAccomOneDco(env : MizCorrelEnv, st : MizAccomState, mmlDir : string,
 			mizXmlAssert(x.nElName == "Constructors");
 			mizXmlNextElementState(x);
 			inf = mizReadDcoHeader(x);
-			st.info ::= setTree(st.info, a, inf);
-			bases = ref makeTree();
-			fori(0, coLAST, \k -> bases := setTree(^bases, k, mizConstrCount(env, k)));
-			st.baseOf ::= setTree(st.baseOf, a, ^bases);
-			// the article's own constructors, in file order
-			ownIdx : Tree<int, int> = makeTree();
-			idx = ref ownIdx;
+			// the frame is opened BEFORE the constructors are read: a
+			// constructor may refer to ITSELF or to a later one of its own
+			// article (HIDDEN's root mode does), and the original resolves
+			// those against the slots being created
+			mizAccomOpenFrame(st, a, inf);
+			tr = \k, nr -> mizAccomTranslate(st, a, k, nr);
 			while(\ -> x.nState == MizEStart, \ -> {
 				if (x.nElName == "Constructor") {
 					c = mizInConstructor1(r);
-					// register the slot BEFORE renumbering: a constructor may
-					// refer to ITSELF (HIDDEN's root mode does), and the
-					// original resolves that against the slot being created
-					n = lookupTreeDef(^idx, c.kind, 0) + 1;
-					idx := setTree(^idx, c.kind, n);
 					slot = mizConstrCount(env, c.kind) + 1;
-					st.slotOf ::= setTree(st.slotOf, accKey(a, c.kind, n), slot);
-					st.merged ::= setTree(st.merged, c.kind,
-						lookupTreeDef(st.merged, c.kind, 0) + 1);
-					mizAccomRenumberConstr(st, a, c);
+					mizAccomRenumberConstr(tr, c);
 					pushed = mizPushConstr(env, c);
 					if (pushed != slot) mizRunTimeError(2804);
 				} else {
@@ -381,4 +412,204 @@ mizAccomOneDco(env : MizCorrelEnv, st : MizAccomState, mmlDir : string,
 			loaded := arrayPush(^loaded, a);
 		}
 	}
+}
+
+// ---------------- the registration pass (.ecl) ----------------
+
+// Make sure every article of a `.dcl`'s <Signature> occupies a frame in the
+// merged table. Articles outside the constructors closure get a frame WITHOUT
+// their constructors — inlibr InitDCOBases/ReadDCOBases call them "the cutting
+// off constructors": only their counts shift the numbering, and RestoreDCOBases
+// drops the frames again once the file is processed.
+mizAccomEnsureBases(acc : MizAccom, sig : [string]) -> [string] {
+	st = acc.st;
+	added = ref [];
+	iter(sig, \a -> {
+		if (!containsKeyTree(st.info, a)) {
+			path = mizPrelPath(acc.mmlDir, a, ".dco");
+			inf = if (fileExists(path)) {
+				r = mizMakeVrfReader(mizXmlInitParsing(getFileContent(path)), acc.env);
+				r.mml ::= true;
+				mizXmlNextElementState(r.x);
+				mizXmlNextElementState(r.x);
+				mizReadDcoHeader(r.x);
+			} else {
+				MizDcoInfo([], makeTree());
+			};
+			mizAccomOpenFrame(st, a, inf);
+			added := arrayPush(^added, a);
+		}
+	});
+	^added;
+}
+
+// ---------------- accessibility (inlibr Accessible*) ----------------
+//
+// gChosen[kind] is the identity over 1..gConstrNbr — the count reached by the
+// CONSTRUCTOR pass (ChooseConstrutors runs once, before ProcessClusters). So a
+// reference is accessible exactly when it lands inside the merged table: a
+// registration mentioning a cut-off article's constructor is DROPPED.
+
+// no forallVector in ds/vector
+mizAccForall(v : Vector<?>, f : (?) -> bool) -> bool {
+	foldVector(v, true, \acc, x -> acc && f(x));
+}
+
+mizAccChosen(env : MizCorrelEnv, kind : int, nr : int) -> bool {
+	nr >= 1 && nr <= mizConstrCount(env, kind);
+}
+
+mizAccTrmList(env : MizCorrelEnv, l : MizTrmList) -> bool {
+	switch (l) {
+		MizTrmNil(): true;
+		MizTrmElem(trm, next): mizAccTrm(env, trm) && mizAccTrmList(env, next);
+	}
+}
+
+mizAccTrm(env : MizCorrelEnv, t : MizTrm) -> bool {
+	switch (t) {
+		MizFuncTrm(srt, funcNr, args, __, __): {
+			kind = if (srt == ikTrmFunctor) coFunctor
+				else if (srt == ikTrmSelector) coSelector
+				else if (srt == ikTrmAggreg || srt == ikTrmSubAgreg) coAggregate
+				else -1;
+			(kind < 0 || mizAccChosen(env, kind, funcNr)) && mizAccTrmList(env, args);
+		}
+		MizPrivFuncTrm(__, args, __, __, __): mizAccTrmList(env, args);
+		MizFraenkelTrm(lambdaArgs, scope, compr, __, __, __):
+			mizAccForall(lambdaArgs, \ty -> mizAccTyp(env, ty))
+			&& mizAccTrm(env, scope) && mizAccFrm(env, compr);
+		MizQuaTrm(trmProper, typ, __, __): mizAccTrm(env, trmProper) && mizAccTyp(env, typ);
+		MizChoiceTrm(typ, __, __): mizAccTyp(env, typ);
+		default: true;
+	}
+}
+
+mizAccCluster(env : MizCorrelEnv, c : MizAttrColl) -> bool {
+	mizAccForall(c.items, \a -> mizAccChosen(env, coAttribute, a.attrNr)
+		&& mizAccTrmList(env, a.args));
+}
+
+mizAccTyp(env : MizCorrelEnv, t : MizTyp) -> bool {
+	mizAccCluster(env, t.lower)
+	&& mizAccChosen(env, if (t.sort == ikTypStruct) coStructMode else coMode, t.modNr)
+	&& mizAccTrmList(env, t.modArgs);
+}
+
+mizAccFrm(env : MizCorrelEnv, f : MizFrm) -> bool {
+	switch (f) {
+		MizPredFrm(srt, predNr, args, __): {
+			ok = if (srt == ikFrmAttr) mizAccChosen(env, coAttribute, predNr)
+				else if (srt == ikFrmPred) mizAccChosen(env, coPredicate, predNr)
+				else true;   // ikFrmSchPred: arguments only
+			ok && mizAccTrmList(env, args);
+		}
+		MizLocPredFrm(__, args, __, __): mizAccTrmList(env, args);
+		MizQualFrm(trm, typ, __): mizAccTrm(env, trm) && mizAccTyp(env, typ);
+		MizNegFrm(arg, __): mizAccFrm(env, arg);
+		MizConjFrm(conjuncts, __): mizAccForall(conjuncts, \g -> mizAccFrm(env, g));
+		MizUnivFrm(__, __, quantified, scope, __):
+			mizAccTyp(env, quantified) && mizAccFrm(env, scope);
+		MizFlexFrm(__, lo, ro, __, __, __, __): mizAccFrm(env, lo) && mizAccFrm(env, ro);
+		default: true;
+	}
+}
+
+mizAccTypColl(env : MizCorrelEnv, v : Vector<MizTyp>) -> bool {
+	mizAccForall(v, \t -> mizAccTyp(env, t));
+}
+
+// the per-kind accessibility test of ProcessClusters
+mizAccCluster1(env : MizCorrelEnv, c : MizAnyCluster) -> bool {
+	switch (c) {
+		MizRCluster(__, __, prims, cons, typ):
+			mizAccTypColl(env, prims) && mizAccTyp(env, typ)
+			&& mizAccCluster(env, cons.lower);
+		MizFCluster(__, __, prims, cons, trm, typ):
+			mizAccTypColl(env, prims) && mizAccTrm(env, trm)
+			&& (switch (typ) { Some(t): mizAccTyp(env, t); None(): true; })
+			&& mizAccCluster(env, cons.lower);
+		MizCCluster(__, __, prims, ante, cons, typ):
+			mizAccTypColl(env, prims) && mizAccTyp(env, typ)
+			&& mizAccCluster(env, ante) && mizAccCluster(env, cons.lower);
+	}
+}
+
+mizAccomRenumberCl(tr : (int, int) -> int, c : MizClusterRec) -> void {
+	mizAccomRenumberCluster(tr, c.lower);
+	mizAccomRenumberCluster(tr, c.upper);
+}
+
+mizAccomClusters(acc : MizAccom, cl : MizClusters, evl : MizEvl) -> void {
+	st = acc.st;
+	iter(mizEvlDirective(evl, "registrations"), \art -> {
+		path = mizPrelPath(acc.mmlDir, art, ".dcl");
+		if (fileExists(path)) {
+			r = mizMakeVrfReaderMML(mizXmlInitParsing(getFileContent(path)), acc.env);
+			x = r.x;
+			mizXmlNextElementState(x);
+			mizXmlAssert(x.nElName == "Registrations");
+			mizXmlNextElementState(x);
+			// a .dcl numbers against its <Signature>, which already ENDS with
+			// the article itself (unlike a .dco's)
+			sig = mizReadDcoHeader(x).signature;
+			savedMerged = st.merged;
+			added = mizAccomEnsureBases(acc, sig);
+			tr = \k, nr -> mizAccomTranslateIn(st, sig, k, nr);
+			// the original renumbers the registration WITHIN the file's frame,
+			// then renumbers it once more: `nr` becomes its index among the
+			// article's registrations of that kind. lRegNr counts EVERY cluster
+			// (acc_han.pas 887), lFunNr and lCondNr only their own kind.
+			regNr = ref 0;
+			funNr = ref 0;
+			condNr = ref 0;
+			while(\ -> x.nState == MizEStart, \ -> {
+				switch (mizReadClusterVal(r)) {
+					None(): {}
+					Some(c): {
+						regNr := ^regNr + 1;
+						renumbered : MizAnyCluster = switch (c) {
+							MizRCluster(__, __, prims, cons, typ): {
+								mizAccomRenumberCl(tr, cons);
+								iterVector(prims, \t -> mizAccomRenumberTyp(tr, t));
+								mizAccomRenumberTyp(tr, typ);
+								MizRCluster(art, ^regNr, prims, cons, typ);
+							}
+							MizFCluster(__, __, prims, cons, trm, typ): {
+								mizAccomRenumberCl(tr, cons);
+								iterVector(prims, \t -> mizAccomRenumberTyp(tr, t));
+								mizAccomRenumberTrm(tr, trm);
+								switch (typ) {
+									Some(t): mizAccomRenumberTyp(tr, t);
+									None(): {}
+								}
+								funNr := ^funNr + 1;
+								MizFCluster(art, ^funNr, prims, cons, trm, typ);
+							}
+							MizCCluster(__, __, prims, ante, cons, typ): {
+								mizAccomRenumberCluster(tr, ante);
+								iterVector(prims, \t -> mizAccomRenumberTyp(tr, t));
+								mizAccomRenumberTyp(tr, typ);
+								mizAccomRenumberCl(tr, cons);
+								condNr := ^condNr + 1;
+								MizCCluster(art, ^condNr, prims, ante, cons, typ);
+							}
+						};
+						// a registration reaching a CUT-OFF article's
+						// constructor is inaccessible and dropped — but it
+						// has still consumed its number
+						if (mizAccCluster1(acc.env, renumbered)) {
+							mizInsertAnyCluster(acc.env, cl, renumbered);
+						}
+					}
+				}
+			});
+			// RestoreDCOBases
+			st.merged ::= savedMerged;
+			iter(added, \a -> {
+				st.info ::= removeFromTree(st.info, a);
+				st.baseOf ::= removeFromTree(st.baseOf, a);
+			});
+		}
+	});
 }
