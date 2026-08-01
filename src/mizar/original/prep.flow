@@ -201,6 +201,138 @@ mizInsertAnyCluster(env : MizCorrelEnv, cl : MizClusters, c : MizAnyCluster) -> 
 	}
 }
 
+// the article's OWN registration, met while walking: insert it and then run
+// the Finish*Cluster re-rounding of the already-collected constants
+mizDeclareCluster(env : MizCorrelEnv, cl : MizClusters, idn : MizIdentify,
+		c : MizAnyCluster) -> void {
+	mizInsertAnyCluster(env, cl, c);
+	switch (c) {
+		MizRCluster(__, __, __, __, __): {}  // FinishExistentialCluster: insert only
+		MizCCluster(__, __, __, __, __, __): mizFinishCCluster(env, cl, idn, c);
+		MizFCluster(__, __, __, __, __, __): mizFinishFCluster(env, cl, idn, c);
+	}
+}
+
+// ---------------- re-rounding on a newly declared registration ----------------
+// stdprep.pas FinishConditionalCluster (1035) / FinishFunctorCluster (1084) /
+// FinishExistentialCluster (969) + RoundUpFurther (991).
+//
+// A constant is collected with the type the registrations known AT THAT MOMENT
+// give it, and that type is then frozen in InferConstDef. When the article
+// later DECLARES a registration of its own, the original walks the whole
+// collected table and re-rounds every entry the new cluster reaches, then
+// propagates to the entries that mention those constants as arguments.
+// Without this pass a constant interned before a registration keeps a stale,
+// weaker type for the rest of the article. (An EXISTENTIAL/registered cluster
+// triggers no re-rounding — the original's FinishExistentialCluster only
+// inserts, and the authors' own ##TODO above RoundUpFurther lists exactly
+// which cases they left out; transcribed as-is, omissions included.)
+//
+// RoundUpFurther (991): from the first entry that changed to the end of the
+// table, an entry whose definition is a functor/selector/aggregate/scheme-functor
+// term with an argument among the changed constants is re-rounded from scratch;
+// a NUMERAL entry has its upper cluster re-rounded unconditionally.
+mizRoundUpFurther(env : MizCorrelEnv, cl : MizClusters, idn : MizIdentify,
+		firstRoundedUp : int, roundedUp : MizNatFunc) -> void {
+	reRoundUpper = \cd : MizConstDef -> {
+		ty = cd.typ;
+		lCl = mizCopyCluster(ty.upper);
+		mizRoundUpCluster(env, cl, lCl, ty);
+		ty.upper ::= mizCollectConstInCluster(idn, lCl);
+	};
+	fori(firstRoundedUp, sizeVector(env.inferConstDef) - 1, \i -> {
+		cd : MizConstDef = getVectorUnsafe(env.inferConstDef, i);
+		srt = mizTrmSort(cd.def);
+		if (srt == ikTrmFunctor || srt == ikTrmSelector || srt == ikTrmAggreg
+			|| srt == ikTrmSchFunc) {
+			args = switch (cd.def) {
+				MizFuncTrm(__, __, a, __, __): a;
+				default: mizNil;
+			};
+			touched = ref false;
+			l = ref args;
+			while(\ -> !^touched && switch (^l) { MizTrmNil(): false; default: true; }, \ -> {
+				switch (^l) {
+					MizTrmElem(t, next): {
+						switch (t) {
+							MizVarTrm(vs, vnr, __, __):
+								if (vs == ikTrmInfConst && mizNatHasInDom(roundedUp, vnr)) {
+									touched := true;
+								}
+							default: {}
+						}
+						l := next;
+					}
+					MizTrmNil(): {}
+				}
+			});
+			if (^touched) {
+				cd.typ ::= mizRoundUpTrmType(env, cl, cd.def);
+				reRoundUpper(cd);
+			}
+		} else if (srt == ikTrmNumeral) {
+			reRoundUpper(cd);
+		}
+	});
+}
+
+// the shared tail of both Finish*Cluster procedures
+mizFinishClusterRound(env : MizCorrelEnv, cl : MizClusters, idn : MizIdentify,
+		roundOne : (MizConstDef) -> bool) -> void {
+	firstRoundedUp = ref -1;
+	roundedUp = mizInitNatSet(8);
+	fori(0, sizeVector(env.inferConstDef) - 1, \i -> {
+		cd : MizConstDef = getVectorUnsafe(env.inferConstDef, i);
+		if (roundOne(cd)) {
+			if (^firstRoundedUp < 0) firstRoundedUp := i;
+			mizNatInsertElem(roundedUp, i);
+		}
+	});
+	if (^firstRoundedUp >= 0) {
+		mizRoundUpFurther(env, cl, idn, ^firstRoundedUp, roundedUp);
+	}
+}
+
+// FinishConditionalCluster (stdprep.pas 1035): the new conditional cluster is
+// TryRounding'd against every collected constant's type, and NonZeroTyp is
+// rounded again at the end.
+mizFinishCCluster(env : MizCorrelEnv, cl : MizClusters, idn : MizIdentify,
+		cc : MizCCluster) -> void {
+	mizFinishClusterRound(env, cl, idn, \cd -> {
+		ty = cd.typ;
+		lCl = mizCopyCluster(ty.upper);
+		if (mizTryRounding(env, cc, ty, lCl)) {
+			mizRoundUpCluster(env, cl, lCl, ty);
+			ty.upper ::= mizCollectConstInCluster(idn, lCl);
+			true;
+		} else {
+			false;
+		}
+	});
+	mizTypRoundUp(env, cl, env.nonZeroTyp);
+}
+
+// FinishFunctorCluster (stdprep.pas 1084): the new functor cluster is applied
+// to every collected constant whose definition IS that cluster's term.
+mizFinishFCluster(env : MizCorrelEnv, cl : MizClusters, idn : MizIdentify,
+		fc : MizFCluster) -> void {
+	mizFinishClusterRound(env, cl, idn, \cd -> {
+		if (mizCmpFuncTrm(env, fc.clusterTerm, cd.def) != 0) {
+			false;
+		} else {
+			ty = cd.typ;
+			lCl = mizCopyCluster(ty.upper);
+			if (mizFClusterRoundUpWith(env, fc, cd.def, ty, lCl)) {
+				mizRoundUpCluster(env, cl, lCl, ty);
+				ty.upper ::= mizCollectConstInCluster(idn, lCl);
+				true;
+			} else {
+				false;
+			}
+		}
+	});
+}
+
 mizReadClusterVal(r2 : MizVrfReader) -> Maybe<MizAnyCluster> {
 	x = r2.x;
 	name = x.nElName;
@@ -441,7 +573,17 @@ mizCheckArticleWith(mmlDir : string, article : string,
 	loader.late(env, cl, idn, defs, p);
 	chk.atomicExpansions ::= \f -> mizAtomicExpansions(env, defs, f);
 	idn.equalsExpand ::= \idn2, funcNr, args -> mizEqualsExpandHook(defs, idn2, funcNr, args);
+	if (getUrlParameterDef("dbg-nzt", "") == "1") {
+		println("NZT before collect " + mizFullTyp2s(env.nonZeroTyp));
+	}
 	mizCollectConstInEnvConstructors(env, idn, cl);
+	if (getUrlParameterDef("dbg-nzt", "") == "1") {
+		println("NZT after  collect " + mizFullTyp2s(env.nonZeroTyp));
+		println("ENV constants interned: " + i2s(sizeVector(env.inferConstDef)));
+		iteriVector(env.inferConstDef, \i, cd ->
+			println("  ENVICD[" + i2s(i) + "] " + mizTrm2s(cd.def)
+				+ " : " + mizFullTyp2s(cd.typ)));
+	}
 
 	mizXmlNextElementState(x);
 	mizXmlAssert(x.nElName == "Article");
@@ -471,10 +613,13 @@ mizCollectConstInEnvCluster(idn : MizIdentify, c : MizAttrColl) -> void {
 mizCollectConstInEnvConstructors(env : MizCorrelEnv, idn : MizIdentify,
 		cl : MizClusters) -> void {
 	// The first half (stdprep.pas 1119-1133): NonZeroTyp, every mode/functor/
-	// aggregate/selector result type, and the struct prefixes. Measured as a
-	// REGRESSION on fdiff_10/fcont_1/sin_cos, so it is behind `collect-types=1`
-	// until the .inf trace diff explains that; do not enable it blind.
-	if (getUrlParameterDef("collect-types", "") == "1") {
+	// aggregate/selector result type, and the struct prefixes.
+	// `collect-types=0` turns it off for A/B runs; it is on by default because
+	// the original always does it. It used to regress fdiff_10/fcont_1/sin_cos
+	// (the InferConstDef strict-key bug) and then surrealn (the missing
+	// Finish*Cluster re-rounding) — both fixed, and the stride is now
+	// byte-identical with it on and off.
+	if (getUrlParameterDef("collect-types", "") != "0") {
 		mizCollectConstInTyp(idn, env.nonZeroTyp);
 		iter([coFunctor, coMode, coAggregate, coSelector], \k ->
 			iteriVector(env.constrs[k], \i, c ->
@@ -930,7 +1075,12 @@ mizWalkItems(p : MizPrep) -> void {
 			__nr = mizPushConstr(p.chk.env, c);
 			{}
 		} else if (name == "RCluster" || name == "CCluster" || name == "FCluster") {
-			mizReadOneCluster(p.chk.env, p.chk.clusters, p.r);
+			// the article's own registration: Finish*Cluster re-rounds the
+			// constants collected before this point (stdprep.pas 969/1035/1084)
+			switch (mizReadClusterVal(p.r)) {
+				Some(c): mizDeclareCluster(p.chk.env, p.chk.clusters, p.chk.idn, c);
+				None(): {}
+			}
 		} else if (name == "Reduction") {
 			mizReadOneReduction(p.chk.idn, p.r);
 		} else if (name == "Identify") {
