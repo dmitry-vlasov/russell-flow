@@ -10,9 +10,9 @@
 // CopyTerm returns the same node for ikTrmEqConst — the equalizer relies on
 // this identity).
 //
-// GetTrmType's gTermCollection cache is a pure memoization in the original
-// (TTPairObj stores CopyTrmType output); it is omitted here until profiling
-// asks for it — semantics are CopyTrmType's. // DEVIATION: perf-only.
+// GetTrmType's gTermCollection is NOT a pure memoization: InsertTermInTTColl
+// stores the ROUNDED type, so GetTrmType of a functor term is stronger than
+// CopyTrmType of it. See mizGetTrmType below.
 
 import ds/vector;
 import loop;
@@ -43,6 +43,9 @@ export {
 	// CopyTrmType / GetTrmType: the type of a term
 	mizCopyTrmType(env : MizCorrelEnv, t : MizTrm) -> MizTyp;
 	mizGetTrmType(env : MizCorrelEnv, t : MizTrm) -> MizTyp;
+	// gTermCollection scoping (MarkTermsInTTColl / RemoveTermsFromTTColl)
+	mizTTCollMark(env : MizCorrelEnv) -> int;
+	mizTTCollRelease(env : MizCorrelEnv, mark : int) -> void;
 
 	// widening family
 	mizEqRadices(env : MizCorrelEnv, a : MizTyp, b : MizTyp) -> bool;
@@ -334,9 +337,61 @@ mizCopyTrmType(env : MizCorrelEnv, t : MizTrm) -> MizTyp {
 	}
 }
 
+// gTermCollection lookup: the sorted position of a term, and whether it is
+// already there (correl.pas 1175 InsertTermInTTColl / GetTrmType 1157)
+mizTTCollSearch(env : MizCorrelEnv, t : MizTrm) -> Pair<bool, int> {
+	l = ref 0;
+	h = ref sizeVector(env.ttColl) - 1;
+	found = ref false;
+	while(\ -> ^l <= ^h && !^found, \ -> {
+		m = (^l + ^h) / 2;
+		c = mizCompTrms(env, getVectorUnsafe(env.ttColl, m).trm, t);
+		if (c < 0) l := m + 1
+		else if (c > 0) h := m - 1
+		else { found := true; l := m; }
+	});
+	Pair(^found, ^l);
+}
+
+// GetTrmType (correl.pas 1157). For a functor/selector/aggregate term this is
+// NOT CopyTrmType: the original routes it through gTermCollection, and
+// InsertTermInTTColl stores the type ROUNDED (RoundUpTrmTypeWithType plus one
+// RoundUpWith of the resulting upper cluster). Returning the raw type here
+// gave a weaker type on every non-checker path — CheckLociTypes outside an
+// inference, and the scheme instantiations.
+// The entry is inserted with its RAW type BEFORE the rounding runs, exactly as
+// the original does: that is what stops a rounding which asks for the same
+// term's type again from recursing forever.
 mizGetTrmType(env : MizCorrelEnv, t : MizTrm) -> MizTyp {
-	// gTermCollection memoization omitted (perf-only) — see file header
-	mizCopyTrmType(env, t);
+	srt = mizTrmSort(t);
+	if (srt == ikTrmFunctor || srt == ikTrmSelector || srt == ikTrmAggreg) {
+		p = mizTTCollSearch(env, t);
+		if (p.first) {
+			mizCopyTyp(getVectorUnsafe(env.ttColl, p.second).typ);
+		} else {
+			entry = MizTTPair(mizCopyTrm(t), mizCopyTrmType(env, t));
+			mizVectorAtInsert(env.ttColl, p.second, entry);
+			rounded = env.roundUpTrmType(env, t);
+			cl = mizCopyCluster(rounded.upper);
+			env.roundUpCluster(env, cl, rounded);
+			rounded.upper ::= cl;
+			entry.typ ::= rounded;
+			mizCopyTyp(rounded);
+		}
+	} else {
+		mizCopyTrmType(env, t);
+	}
+}
+
+// MarkTermsInTTColl / RemoveTermsFromTTColl (checker.pas 335 / 434): the
+// collection is scoped to one inference.
+mizTTCollMark(env : MizCorrelEnv) -> int {
+	sizeVector(env.ttColl);
+}
+
+mizTTCollRelease(env : MizCorrelEnv, mark : int) -> void {
+	while(\ -> sizeVector(env.ttColl) > mark,
+		\ -> removeVector(env.ttColl, sizeVector(env.ttColl) - 1));
 }
 
 // ---------------- widening ----------------

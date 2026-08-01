@@ -7,6 +7,7 @@
 #   ./fullrun.sh jobs=12 timeout=300  — more workers, longer cap
 #   ./fullrun.sh out=/tmp/run2.txt    — another output file
 #   ./fullrun.sh list=slow.txt        — a subset of articles, same MML
+#   ./fullrun.sh args=collect-types=1 — extra flags passed to every mizarj run
 #   ./fullrun.sh tally                — just re-tally an existing output file
 #
 # RESUMABLE: articles already present in the output file are skipped, so the
@@ -25,13 +26,13 @@ BASE_DIR=$( cd "$SCRIPT_DIR/../../.." && pwd -P )   # repository root
 # ---- internal worker: check ONE article, append one line under a lock -------
 # (handled before the option parsing — its arguments are positional)
 if [ "$1" = "--one" ]; then
-	article="$2"; out="$3"; timeout_s="$4"; mem="$5"; mml="$6"
+	article="$2"; out="$3"; timeout_s="$4"; mem="$5"; mml="$6"; extra="$7"
 	# Keep the exit code: 124 is the cap, anything else is a crash or an
 	# operator kill. Recording those alike once turned a killed run into nine
 	# false timeouts.
 	rc=0
 	o=$( timeout "$timeout_s" "$BASE_DIR/bin/mizarj" "mem=$mem" "mml=$mml" \
-		"article=$article" 2>&1 ) || rc=$?
+		"article=$article" $extra 2>&1 ) || rc=$?
 	r=$( printf '%s' "$o" | grep -o 'checked=[0-9]* accepted=[0-9]*' ) || true
 	if [ -n "$r" ]; then
 		line="$article $r"
@@ -50,6 +51,7 @@ TIMEOUT=300
 MEM=4g
 OUT="$BASE_DIR/fullrun_out.txt"
 LIST=""            # article list; defaults to $MML/mml.lar
+EXTRA=""           # extra mizarj flags, appended to every run
 TALLY_ONLY=0
 
 for i in "$@"; do
@@ -60,6 +62,7 @@ case $i in
 	mml=*)     MML="${i#*=}" ;;
 	out=*)     OUT="${i#*=}" ;;
 	list=*)    LIST="${i#*=}" ;;
+	args=*)    EXTRA="$EXTRA ${i#*=}" ;;
 	tally)     TALLY_ONLY=1 ;;
 	*)
 		echo "unknown argument: $i" >&2
@@ -119,10 +122,11 @@ echo "MML       $MML"
 echo "list      $LIST"
 echo "output    $OUT"
 echo "articles  $count to run ($JOBS workers, ${TIMEOUT}s cap, $MEM per worker)"
+[ -n "$EXTRA" ] && echo "extra    $EXTRA"
 if [ "$count" -eq 0 ]; then tally "$OUT"; exit 0; fi
 
 xargs -a "$TODO" -P "$JOBS" -I{} \
-	"$0" --one {} "$OUT" "$TIMEOUT" "$MEM" "$MML"
+	"$0" --one {} "$OUT" "$TIMEOUT" "$MEM" "$MML" "$EXTRA"
 
 printf '%s\n' "DONE" >> "$OUT"
 echo
