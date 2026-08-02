@@ -88,10 +88,103 @@ export {
 	// read one .dfs/.dfe/.dfx (or prel .def) payload into a pool
 	mizLoadDefsFile(env : MizCorrelEnv, path : string, into : Vector<MizDefiniens>) -> void;
 	mizEqualsExpansionPub(env : MizCorrelEnv, d : MizDefiniens) -> Maybe<MizEqualsDef>;
+
+	// StdItemObj.FinishDefiniens (stdprep.pas 861), the two things it does
+	// BESIDES registering the definiens in gEquals:
+	//   * the SELF-REFERENCE guard — an expansion that mentions the defined
+	//     functor is not registered at all (CollectFuncInTrm, 877-879);
+	//   * the RETROACTIVE pass — every constant ALREADY collected for that
+	//     functor is expanded now and the new constant joins its fEqConst
+	//     (882-900). Without it a term interned before its own `equals`
+	//     definition is read never gets the expansion, and the definition is
+	//     dead for the rest of the article.
+	mizEqualsDefSelfRef(env : MizCorrelEnv, constrNr : int, ed : MizEqualsDef) -> bool;
+	mizEqualsDefRetrofit(idn : MizIdentify, constrNr : int, ed : MizEqualsDef) -> void;
 }
 
 mizEqualsExpansionPub(env : MizCorrelEnv, d : MizDefiniens) -> Maybe<MizEqualsDef> {
 	mizEqualsExpansion(env, d);
+}
+
+// CollectFuncInTrm (stdprep.pas 814): the functor numbers a term mentions,
+// RAW and ADJUSTED. A Fraenkel term contributes NOTHING — the original's body
+// for that case is commented out (835-844), and so is the Choice one.
+mizCollectFuncInTrmSet(env : MizCorrelEnv, t : MizTrm, acc : Vector<int>) -> void {
+	switch (t) {
+		MizFuncTrm(srt, funcNr, args, __, __): {
+			if (srt == ikTrmFunctor) {
+				mizCollectFuncInTrmListSet(env, args, acc);
+				ft : MizFuncTrm = t;
+				pushVector(acc, funcNr);
+				pushVector(acc, mizAdjustTrm(env, ft).first);
+			} else {
+				// SchFunc / Aggreg / Selector: arguments only
+				mizCollectFuncInTrmListSet(env, args, acc);
+			}
+		}
+		MizPrivFuncTrm(__, args, funcExp, __, __): {
+			mizCollectFuncInTrmListSet(env, args, acc);
+			mizCollectFuncInTrmSet(env, funcExp, acc);
+		}
+		default: {}   // vars, numerals, Fraenkel, Choice, It, error
+	}
+}
+
+mizCollectFuncInTrmListSet(env : MizCorrelEnv, l : MizTrmList, acc : Vector<int>) -> void {
+	switch (l) {
+		MizTrmNil(): {}
+		MizTrmElem(t, next): {
+			mizCollectFuncInTrmSet(env, t, acc);
+			mizCollectFuncInTrmListSet(env, next, acc);
+		}
+	}
+}
+
+mizEqualsDefSelfRef(env : MizCorrelEnv, constrNr : int, ed : MizEqualsDef) -> bool {
+	acc : Vector<int> = makeVector(8);
+	mizCollectFuncInTrmSet(env, ed.expansion, acc);
+	exists(vector2array(acc), \n -> n == constrNr);
+}
+
+mizEqualsDefRetrofit(idn : MizIdentify, constrNr : int, ed : MizEqualsDef) -> void {
+	env = idn.env;
+	// the Pascal `for i:=0 to InferConstDef.Count-1` fixes the bound once
+	n = sizeVector(env.inferConstDef);
+	i = ref 0;
+	while(\ -> ^i < n, \ -> {
+		cd : MizConstDef = getVectorUnsafe(env.inferConstDef, ^i);
+		switch (cd.def) {
+			MizFuncTrm(srt, __, __, __, __): {
+				if (srt == ikTrmFunctor) {
+					ft : MizFuncTrm = cd.def;
+					pa = mizAdjustTrm(env, ft);
+					if (pa.first == constrNr) {
+						// ExpandTrmIfEqual (identify.pas 642) + CollectConstInTrm
+						mizDisposeSubstTrm(env);
+						mizInitEssentialsArgs(env, pa.second, ed.essentials);
+						if (mizCheckLociTypesN(env, ed.primaries)) {
+							lTrm0 = mizInstSubstTrm(env, ed.expansion);
+							mizDisposeSubstTrm(env);
+							bSaved = env.boundVarNbr;
+							env.boundVarNbr ::= 0;
+							lTrm = mizCollectConstInTrm(idn, lTrm0);
+							env.boundVarNbr ::= bSaved;
+							switch (lTrm) {
+								MizVarTrm(s2, varNr, __, __): {
+									if (s2 == ikTrmInfConst) mizNatInsertElem(cd.eqConst, varNr);
+								}
+								default: {}
+							}
+						} else {
+							mizDisposeSubstTrm(env);
+						}
+					}
+				}
+			}
+			default: {}
+		}
+		i := ^i + 1;
+	});
 }
 
 mizMakeDefinientia() -> MizDefinientia {
