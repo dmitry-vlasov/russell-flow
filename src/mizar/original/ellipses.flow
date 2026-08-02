@@ -1,0 +1,208 @@
+// Transcription of the "for CHECKER" part of ~/dev/system/kernel/ellipses.pas
+// (lines 654-766): the expansion of a flexary conjunction (`P(a) & ... & P(b)`,
+// FrmSort ikFrmFlexConj) before the premises are normalised.
+//
+// A flex formula carries three things the checker uses: the two ORIGINAL
+// formulas (the first and the last conjunct, nLeftOrigFrm/nRightOrigFrm), the
+// two guard TERMS (the lower and upper bound, nLeftTrm/nRightTrm) and a
+// generated UNIVERSAL nExpansion of the shape
+//     for x st a <= x & x <= b holds P(x)
+// which the analyzer built and wrote into the .xml.
+//
+// ExpandFlexAsTrue/AsFalse walk a premise and, at every flex node, replace it
+// by the CONJUNCTION (resp. DISJUNCTION) of
+//   * the flex formula itself,
+//   * its universal expansion, and
+//   * ExpandFlex: the explicit finite list of instances, but ONLY when both
+//     bounds are concrete — the lower one a numeral or the `0` functor, the
+//     upper one a numeral — and no more than 100 apart.
+// The instance list is what lets the checker close `P(0) & ... & P(3)` goals
+// by ground reasoning instead of by instantiating the universal.
+//
+// The rest of ellipses.pas (ProcessEllipses and the Ellipses* comparisons) is
+// ANALYZER-side and is not part of the checker closure.
+
+import ds/vector;
+import mizar/original/lexicon;
+import mizar/original/builtin;
+import mizar/original/correl;
+import mizar/original/correl_inst;
+
+export {
+	// ExpandFlexAsTrue (ellipses.pas 711)
+	mizExpandFlexAsTrue(env : MizCorrelEnv, f : MizFrm) -> MizFrm;
+}
+
+mizElAsVar(t : MizTrm) -> MizVarTrm {
+	switch (t) {
+		MizVarTrm(__, __, __, __): t;
+		default: { mizRunTimeError(2502); MizVarTrm(ikError, 0, 0, 0); }
+	}
+}
+
+// ReplacePlaceHolderByConjunctNumber (ellipses.pas 657): inside the expansion's
+// scope the running index is bound variable 1. Replace it by the numeral of the
+// conjunct being generated — or, when that number is 0, by the `0` functor the
+// lower guard came from — and shift every other bound variable down by one,
+// since the expansion's own quantifier is being dropped.
+mizReplacePlaceHolder(conjunctNr : int, zeroFunctor : Maybe<MizTrm>,
+		w : MizWithin, t : MizTrm) -> MizTrm {
+	switch (t) {
+		MizVarTrm(srt, varNr, __, __): {
+			if (srt != ikTrmBound) {
+				t;
+			} else if (varNr == 1) {
+				if (conjunctNr != 0) {
+					vt = mizElAsVar(t);
+					vt.sort ::= ikTrmNumeral;
+					vt.varNr ::= conjunctNr;
+					t;
+				} else {
+					switch (zeroFunctor) {
+						Some(z): mizCopyTrm(z);
+						None(): t;
+					}
+				}
+			} else {
+				vt = mizElAsVar(t);
+				vt.varNr ::= varNr - 1;
+				t;
+			}
+		}
+		default: t;
+	}
+}
+
+// local typed downcast (each unit defines its own, as elsewhere in the port)
+mizElAsFunc(t : MizTrm) -> MizFuncTrm {
+	switch (t) {
+		MizFuncTrm(__, __, __, __, __): t;
+		default: { mizRunTimeError(2500); MizFuncTrm(ikError, 0, MizTrmNil(), 0, 0); }
+	}
+}
+
+mizElAsNeg(f : MizFrm) -> MizNegFrm {
+	switch (f) {
+		MizNegFrm(__, __): f;
+		default: { mizRunTimeError(2501); MizNegFrm(MizUniqFrm(ikError), 0); }
+	}
+}
+
+// ExpandFlex (ellipses.pas 673)
+mizExpandFlex(env : MizCorrelEnv, f : MizFrm) -> MizFrm {
+	mizAssert(2500, mizFrmSort(f) == ikFrmFlexConj);
+	res = ref mizNewVerum();
+	switch (f) {
+		MizFlexFrm(__, __, __, leftTrm, rightTrm, expansion, __): {
+			lowerP = switch (leftTrm) {
+				MizVarTrm(srt, varNr, __, __):
+					if (srt == ikTrmNumeral) Pair(varNr, None()) else Pair(-1, None());
+				MizFuncTrm(__, __, __, __, __): {
+					zf = mizCopyTrm(leftTrm);
+					pa = mizAdjustTrm(env, mizElAsFunc(zf));
+					if (pa.first == mizBuiltIn(env.builtIn, rqZeroNumber)) {
+						Pair(0, Some(zf));
+					} else {
+						Pair(-1, Some(zf));
+					}
+				}
+				default: Pair(-1, None());
+			};
+			lower = lowerP.first;
+			upper = switch (rightTrm) {
+				MizVarTrm(srt, varNr, __, __): if (srt == ikTrmNumeral) varNr else -1;
+				default: -1;
+			};
+			isNumeralUpper = switch (rightTrm) {
+				MizVarTrm(srt, __, __, __): srt == ikTrmNumeral;
+				default: false;
+			};
+			if (lower >= 0 && isNumeralUpper && upper - lower <= 100) {
+				// the expansion is `for x st <guard1> & <guard2> holds P(x)`,
+				// stored as Univ(¬Conj(guard1, guard2, body...)); the two
+				// guards are conjuncts 0 and 1 and are dropped (the Pascal
+				// loop starts at 2)
+				fori(0, upper - lower, \z -> {
+					conjunctNr = lower + z;
+					scope = ref mizNewVerum();
+					switch (expansion) {
+						MizUnivFrm(__, __, __, uScope, __): {
+							switch (uScope) {
+								MizNegFrm(negArg, __): {
+									switch (negArg) {
+										MizConjFrm(conjuncts, __): {
+											iteriVector(conjuncts, \i, g -> {
+												if (i >= 2) {
+													scope := mizNewConj(^scope, mizCopyFrm(g));
+												}
+											});
+										}
+										default: {}
+									}
+								}
+								default: {}
+							}
+						}
+						default: {}
+					}
+					w = mizMakeWithin(\ww, t ->
+						mizReplacePlaceHolder(conjunctNr, lowerP.second, ww, t));
+					mizWithinFrm(w, ^scope);
+					res := mizNewConj(^res, mizNewNeg(^scope));
+				});
+			}
+		}
+		default: {}
+	}
+	^res;
+}
+
+mizExpandFlexAsTrue(env : MizCorrelEnv, f : MizFrm) -> MizFrm {
+	srt = mizFrmSort(f);
+	if (srt == ikFrmNeg) {
+		mizNewNeg(mizExpandFlexAsFalse(env, mizElAsNeg(f).arg));
+	} else if (srt == ikFrmConj) {
+		res = ref mizNewVerum();
+		switch (f) {
+			MizConjFrm(conjuncts, __):
+				iterVector(conjuncts, \g -> res := mizNewConj(^res, mizExpandFlexAsTrue(env, g)));
+			default: {}
+		}
+		^res;
+	} else if (srt == ikFrmFlexConj) {
+		lConj = mizExpandFlex(env, f);
+		expn = switch (f) { MizFlexFrm(__, __, __, __, __, e, __): e; default: mizNewVerum(); };
+		if (mizFrmSort(lConj) == ikFrmVerum) {
+			mizNewConj(mizCopyExpFrm(f), mizCopyExpFrm(expn));
+		} else {
+			mizNewConj(mizCopyExpFrm(f), mizNewConj(mizCopyExpFrm(expn), lConj));
+		}
+	} else {
+		mizCopyExpFrm(f);
+	}
+}
+
+mizExpandFlexAsFalse(env : MizCorrelEnv, f : MizFrm) -> MizFrm {
+	srt = mizFrmSort(f);
+	if (srt == ikFrmNeg) {
+		mizNewNeg(mizExpandFlexAsTrue(env, mizElAsNeg(f).arg));
+	} else if (srt == ikFrmConj) {
+		res = ref mizNewVerum();
+		switch (f) {
+			MizConjFrm(conjuncts, __):
+				iterVector(conjuncts, \g -> res := mizNewConj(^res, mizExpandFlexAsFalse(env, g)));
+			default: {}
+		}
+		^res;
+	} else if (srt == ikFrmFlexConj) {
+		lConj = mizExpandFlex(env, f);
+		expn = switch (f) { MizFlexFrm(__, __, __, __, __, e, __): e; default: mizNewVerum(); };
+		if (mizFrmSort(lConj) == ikFrmVerum) {
+			mizNewDisj(mizCopyExpFrm(f), mizCopyExpFrm(expn));
+		} else {
+			mizNewDisj(mizCopyExpFrm(f), mizNewDisj(mizCopyExpFrm(expn), lConj));
+		}
+	} else {
+		mizCopyExpFrm(f);
+	}
+}
