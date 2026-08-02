@@ -18,6 +18,7 @@ import mizar/original/builtin;
 import mizar/original/correl;
 import net/url_parameter;
 import mizar/original/correl_inst;
+import mizar/original/print;
 
 export {
 	mizSubstTrmGet(env : MizCorrelEnv, k : int) -> Maybe<MizTrm>;
@@ -38,6 +39,7 @@ export {
 	mizAttrEquals(env : MizCorrelEnv, a : MizAttr, b : MizAttr) -> bool;
 
 	mizCheckLociTypes(env : MizCorrelEnv, list : Vector<MizTyp>) -> bool;
+	mizCheckLociTypesN(env : MizCorrelEnv, list : Vector<MizTyp>) -> bool;
 }
 
 mizSubstTrmGet(env : MizCorrelEnv, k : int) -> Maybe<MizTrm> {
@@ -311,6 +313,9 @@ mizCompEsTyp(env : MizCorrelEnv, f : MizTyp, a : MizTyp, exactly : bool) -> bool
 		mizEsTrmList(env, f.modArgs, a.modArgs);
 	} else if (f.sort == ikTypMode && !exactly) {
 		pa = mizAdjustTyp(env, a);
+		if (mizDbgCltn()) println("  CET adjust a=" + mizFullTyp2s(a)
+			+ " -> mod=" + i2s(pa.first) + " args=(" + mizTrmList2s(pa.second) + ")"
+			+ " vs f mod=" + i2s(f.modNr) + " args=(" + mizTrmList2s(f.modArgs) + ")");
 		f.modNr == pa.first && mizEsTrmList(env, f.modArgs, pa.second);
 	} else {
 		false;
@@ -389,14 +394,21 @@ mizCheckLociTypes(env : MizCorrelEnv, list : Vector<MizTyp>) -> bool {
 					} else {
 						// undo bindings made during the failed arg match
 						mizResetNewerSubst(env, getVectorUnsafe(snaps, ^locusNr));
-						mode := 2;
+						// A FAILED CompEsTyp is NOT a backtrack: the original
+						// falls out of the `if` into the common tail, which
+						// widens THIS level's recorded type one more step and
+						// returns to Again. Only DecreasingAttrs and a nil
+						// WideningOf enter the level search (mode 2).
+						mode := 3;
 					}
 				}
 				None(): mode := 2;
 			}
-		} else {
+		} else if (^mode == 2) {
 			// BackTrack: move up to a previous level whose reached type can
-			// widen further (a non-redefined mode locus)
+			// widen further (a non-redefined mode locus). The original's
+			// `repeat ... until` — the loci type of the level found must be a
+			// plain (non-redefined) mode.
 			setVectorUnsafe(substTyp, ^locusNr, None());
 			found = ref false;
 			while(\ -> !^found && !^finished, \ -> {
@@ -413,7 +425,7 @@ mizCheckLociTypes(env : MizCorrelEnv, list : Vector<MizTyp>) -> bool {
 					target2 : MizTyp = getVectorUnsafe(list, ^locusNr);
 					c2 = mizConstr(env, coMode, target2.modNr);
 					okLevel = switch (st) {
-						Some(stt): (stt.sort == ikTypMode || stt.modNr != mizBuiltIn(env.builtIn, rqAny))
+						Some(stt): (stt.sort == ikTypMode || stt.modNr != 1)
 							&& target2.sort == ikTypMode
 							&& c2.whichConstrNr == 0;
 						None(): false;
@@ -422,22 +434,158 @@ mizCheckLociTypes(env : MizCorrelEnv, list : Vector<MizTyp>) -> bool {
 					else setVectorUnsafe(substTyp, ^locusNr, None());
 				}
 			});
-			if (!^finished) {
-				st2 = getVectorUnsafe(substTyp, ^locusNr);
-				setVectorUnsafe(substTyp, ^locusNr, None());
-				switch (st2) {
-					Some(stt2): {
-						switch (mizWidening(env, stt2)) {
-							Some(w2): {
-								mizResetNewerSubst(env, getVectorUnsafe(snaps, ^locusNr));
-								pending := Some(w2);
-								mode := 1;
-							}
-							None(): {} // stay in backtrack
+			if (!^finished) mode := 3;
+		} else {
+			// the common tail: widen THIS level's recorded type one more step
+			// and return to Again; a nil widening enters the level search
+			st2 = getVectorUnsafe(substTyp, ^locusNr);
+			setVectorUnsafe(substTyp, ^locusNr, None());
+			switch (st2) {
+				Some(stt2): {
+					switch (mizWidening(env, stt2)) {
+						Some(w2): {
+							mizResetNewerSubst(env, getVectorUnsafe(snaps, ^locusNr));
+							pending := Some(w2);
+							mode := 1;
 						}
+						None(): mode := 2;
 					}
-					None(): {}
 				}
+				None(): mode := 2;
+			}
+		}
+	});
+	^result;
+}
+
+// CheckLociTypesN (correl.pas 2908) — the SECOND loci check, used ONLY where
+// every locus is bound because InitEssentialsArgs has just filled them all:
+// Matches (identify.pas 370, definiens matching) and ExpandTrmIfEqual
+// (identify.pas 642, the `equals` expansion). It differs from CheckLociTypes
+// in three ways, all of them live:
+//   * no skipping of unbound loci, at the start or after a CompEsTyp success;
+//   * backtracking steps up ONE locus at a time and stops at Count, instead of
+//     jumping to the next BOUND locus;
+//   * the substitution is RE-SAVED after DecreasingAttrs, so the loci that
+//     EsAttrRev bound while comparing attributes survive into the next level.
+// The port used to call the CheckLociTypes variant at both sites, which
+// rejected `equals` expansions the original accepts.
+gMizDbgCltn : ref int = ref -1;
+mizDbgCltn() -> bool {
+	if (^gMizDbgCltn < 0) {
+		gMizDbgCltn := if (getUrlParameterDef("dbg-cltn", "") == "1") 1 else 0;
+	}
+	^gMizDbgCltn == 1;
+}
+
+mizCheckLociTypesN(env : MizCorrelEnv, list : Vector<MizTyp>) -> bool {
+	n = sizeVector(list);
+	if (mizDbgCltn()) println("CLTN start count=" + i2s(n));
+	snaps : Vector<Vector<bool>> = makeVector(n + 1);
+	fori(0, n, \__ -> pushVector(snaps, makeVector(0)));
+	substTyp : Vector<Maybe<MizTyp>> = makeVector(n + 1);
+	fori(0, n, \__ -> pushVector(substTyp, None()));
+	valSnaps : Vector<Vector<Maybe<MizTrm>>> = makeVector(n + 1);
+	fori(0, n, \__ -> pushVector(valSnaps, makeVector(0)));
+
+	locusNr = ref n;                     // 1-based; 0 = done. NO nil-skipping.
+	result = ref true;
+	finished = ref false;
+	pending : ref Maybe<MizTyp> = ref None();
+	mode = ref 0; // 0 = descend, 1 = again (widen pending), 2 = backtrack
+
+	while(\ -> !^finished, \ -> {
+		if (^mode == 0) {
+			if (^locusNr == 0) {
+				finished := true;
+			} else {
+				setVectorUnsafe(snaps, ^locusNr - 1, mizSnapshotSubst(env));
+				setVectorUnsafe(valSnaps, ^locusNr - 1, copyVector(env.substTrm));
+				trm = either(mizSubstTrmGet(env, ^locusNr), mizNewIncorTrm());
+				wTyp = if (env.itIsChecker) env.roundUpTrmType(env, trm)
+					else mizGetTrmType(env, trm);
+				if (mizDbgCltn()) println("CLTN locus=" + i2s(^locusNr)
+					+ " trm=" + mizTrm2s(trm) + " got=" + mizFullTyp2s(wTyp)
+					+ " want=" + mizFullTyp2s(getVectorUnsafe(list, ^locusNr - 1))
+					+ " checker=" + b2s(env.itIsChecker));
+				locusNr := ^locusNr - 1;
+				mizRestoreSubst(env, getVectorUnsafe(valSnaps, ^locusNr));
+				target : MizTyp = getVectorUnsafe(list, ^locusNr);
+				if (!mizDecreasingAttrs(env, wTyp, target, \x, y -> mizEsAttrRev(env, x, y))) {
+					if (mizDbgCltn()) println("CLTN decreasingAttrs FAILED at " + i2s(^locusNr));
+					mode := 2;
+				} else {
+					// lSubstTrm[lLocusNr] := gSubstTrm — keep what EsAttrRev bound
+					setVectorUnsafe(valSnaps, ^locusNr, copyVector(env.substTrm));
+					setVectorUnsafe(snaps, ^locusNr, mizSnapshotSubst(env));
+					pending := Some(wTyp);
+					mode := 1;
+				}
+			}
+		} else if (^mode == 1) {
+			target : MizTyp = getVectorUnsafe(list, ^locusNr);
+			w = mizWideningOf(env, target, either(^pending, mizNewIncorTyp()));
+			switch (w) {
+				Some(wt): {
+					setVectorUnsafe(substTyp, ^locusNr, Some(wt));
+					ce = mizCompEsTyp(env, target, wt, false);
+					if (mizDbgCltn()) println("CLTN again locus=" + i2s(^locusNr)
+						+ " widened=" + mizFullTyp2s(wt) + " compEs=" + b2s(ce));
+					if (ce) {
+						mode := 0;               // plain `continue`, no skipping
+					} else {
+						mizResetNewerSubst(env, getVectorUnsafe(snaps, ^locusNr));
+						mode := 3;               // widen-in-place tail, not backtrack
+					}
+				}
+				None(): {
+					if (mizDbgCltn()) println("CLTN again locus=" + i2s(^locusNr)
+						+ " widening FAILED, want=" + mizFullTyp2s(target)
+						+ " got=" + mizFullTyp2s(either(^pending, mizNewIncorTyp())));
+					mode := 2;
+				}
+			}
+		} else if (^mode == 2) {
+			found = ref false;
+			while(\ -> !^found && !^finished, \ -> {
+				setVectorUnsafe(substTyp, ^locusNr, None());
+				locusNr := ^locusNr + 1;
+				if (^locusNr == n) {
+					mizDisposeSubstTrm(env);
+					if (mizDbgCltn()) println("CLTN -> FALSE");
+					result := false;
+					finished := true;
+				} else {
+					st = getVectorUnsafe(substTyp, ^locusNr);
+					target2 : MizTyp = getVectorUnsafe(list, ^locusNr);
+					c2 = mizConstr(env, coMode, target2.modNr);
+					okLevel = switch (st) {
+						Some(stt): (stt.sort == ikTypMode
+								|| stt.modNr != mizBuiltIn(env.builtIn, rqAny))
+							&& target2.sort == ikTypMode
+							&& c2.whichConstrNr == 0;
+						None(): false;
+					}
+					if (okLevel) found := true;
+				}
+			});
+			if (!^finished) mode := 3;
+		} else {
+			// the common tail (see CheckLociTypes)
+			st2 = getVectorUnsafe(substTyp, ^locusNr);
+			setVectorUnsafe(substTyp, ^locusNr, None());
+			switch (st2) {
+				Some(stt2): {
+					switch (mizWidening(env, stt2)) {
+						Some(w2): {
+							mizResetNewerSubst(env, getVectorUnsafe(snaps, ^locusNr));
+							pending := Some(w2);
+							mode := 1;
+						}
+						None(): mode := 2;
+					}
+				}
+				None(): mode := 2;
 			}
 		}
 	});
