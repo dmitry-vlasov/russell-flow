@@ -898,7 +898,7 @@ mizJustify(p : MizPrep, claim : MizFrm, posLine : int) -> void {
 	} else if (name == "Proof" || name == "PerCasesReasoning") {
 		// PerCasesReasoning as a justification: CaseBlock/SupposeBlock items
 		// and the final PerCases split — all handled by the item walker
-		mizWalkBlock(p);
+		mizWalkBlock(p, if (name == "Proof") relTruncate else relFreeConst);
 	} else if (name == "SkippedProof") {
 		mizXmlSkipElement(x);
 	} else {
@@ -908,24 +908,253 @@ mizJustify(p : MizPrep, claim : MizFrm, posLine : int) -> void {
 	}
 }
 
+// The block-exit release of InferConstDef (stdprep.pas 497-570). A block marks
+// the collection on entry (StdBlockObj.Init 228) and releases on exit, and the
+// release is BLOCK-KIND SPECIFIC:
+//   relNone      — not a block of the original at all, keep everything
+//   relTruncate  — FinishMain/Notation/Case/Suppose/CaseList/Proof: plain
+//                  FreeItemsFrom(mark)
+//   relFreeConst — FinishDefinition/Registration/Diffuse: FreeConstDef, which
+//                  KEEPS every constant at or above the mark whose definition
+//                  and type do NOT mention a variable local to the block
+//                  (transitively — the scan restarts whenever a new
+//                  local-dependent constant is found), disposes the rest,
+//                  RENUMBERS the survivors and rewrites every reference.
+relNone = 0;
+relTruncate = 1;
+relFreeConst = 2;
+
+// FreeConstDef (stdprep.pas 415-480)
+mizFreeConstDef(p : MizPrep, varNbrBase : int, mark : int) -> void {
+	env = p.chk.env;
+	idn = p.chk.idn;
+	n = sizeVector(env.inferConstDef);
+	if (mark >= n) {
+		mizInferRelease(idn, mark);
+	} else {
+		// 1. which of the constants from `mark` on are LOCAL to the block?
+		local : ref [bool] = ref map(enumFromTo(0, n - 1), \__ -> false);
+		occ = ref false;
+		checkW = mizMakeWithin(\__, t -> {
+			switch (t) {
+				MizVarTrm(srt, varNr, __, __): {
+					if (srt == ikTrmConstant) {
+						if (varNr > varNbrBase) occ := true;
+					} else if (srt == ikTrmInfConst) {
+						if (varNr >= 0 && varNr < n && ^local[varNr]) occ := true;
+					}
+					t;
+				}
+				default: t;
+			}
+		});
+		i = ref mark;
+		while(\ -> ^i < n, \ -> {
+			if (^local[^i]) {
+				i := ^i + 1;
+			} else {
+				cd : MizConstDef = getVectorUnsafe(env.inferConstDef, ^i);
+				occ := false;
+				__c1 = mizWithinTrm(checkW, cd.def);
+				if (!^occ) mizWithinTyp(checkW, cd.typ);
+				if (^occ) {
+					local := replace(^local, ^i, true);
+					i := mark;          // the original restarts the scan
+				} else {
+					i := ^i + 1;
+				}
+			}
+		});
+		// 2. keep the survivors in order, recording old -> new
+		renum = ref makeTree();
+		survivors : Vector<MizConstDef> = makeVector(n - mark);
+		numerics : Vector<Maybe<MizCplx>> = makeVector(n - mark);
+		fori(mark, n - 1, \k -> {
+			if (!^local[k]) {
+				renum := setTree(^renum, k, mark + sizeVector(survivors));
+				pushVector(survivors, getVectorUnsafe(env.inferConstDef, k));
+				pushVector(numerics, mizNumericValue(idn, k));
+			}
+		});
+		renumW = mizMakeWithin(\__, t -> {
+			switch (t) {
+				MizVarTrm(srt, varNr, __, __): {
+					if (srt == ikTrmInfConst) {
+						switch (lookupTree(^renum, varNr)) {
+							Some(nn): { vt = mizPrepAsVar(t); vt.varNr ::= nn; }
+							None(): {}
+						}
+					}
+					t;
+				}
+				default: t;
+			}
+		});
+		// 3. renumber the survivors' own definitions and types FIRST — the
+		// definition is the search key, so it must be final before the entry
+		// goes back into the sorted index
+		iterVector(survivors, \cd -> {
+			__c2 = mizWithinTrm(renumW, cd.def);
+			mizWithinTyp(renumW, cd.typ);
+		});
+		mizInferRelease(idn, mark);
+		// re-add each survivor THROUGH THE INDEX. Dropping this is what makes
+		// the same fixed variable collect twice: the entry is in
+		// inferConstDef but invisible to mizInferSearch, so the next
+		// occurrence allocates a fresh constant and nothing matches any more.
+		iteriVector(survivors, \si, cd -> {
+			nr = sizeVector(env.inferConstDef);
+			ps = mizInferSearch(idn, cd.def);
+			pushVector(env.inferConstDef, cd);
+			mizVectorAtInsert(idn.sortedIdx, ps.second, nr);
+			mizSetNumeric(idn, nr, getVectorUnsafe(numerics, si));
+		});
+		// 4. the equal-constant lists, over the WHOLE table
+		cnt = sizeVector(env.inferConstDef);
+		fori(0, cnt - 1, \k -> {
+			cd : MizConstDef = getVectorUnsafe(env.inferConstDef, k);
+			changed = ref false;
+			fori(0, mizNatCount(cd.eqConst) - 1, \j -> {
+				if (containsKeyTree(^renum, mizNatItem(cd.eqConst, j).x)) changed := true;
+			});
+			if (^changed) {
+				fresh = mizInitNatSet(4);
+				fori(0, mizNatCount(cd.eqConst) - 1, \j -> {
+					v = mizNatItem(cd.eqConst, j).x;
+					switch (lookupTree(^renum, v)) {
+						Some(nn): mizNatInsertElem(fresh, nn);
+						None(): if (v < cnt) mizNatInsertElem(fresh, v);
+					}
+				});
+				mizNatDeleteAll(cd.eqConst);
+				mizNatEnlargeBy(cd.eqConst, fresh);
+			}
+		});
+		// 5. the block's own output: the diffuse thesis (FinishDiffuse 566).
+		// The defined constructors and registered clusters (FinishDefinition
+		// 507-523, FinishRegistration 532-533) are already installed in the
+		// environment by the loader and carry no inference constants here.
+		switch (p.lastBlockThesis) {
+			Some(th): mizWithinFrm(renumW, th);
+			None(): {}
+		}
+	}
+}
+
+// ExpandInferConsts (correl.pas 4288), the inverse of the collection: replace
+// every inference constant by a COPY of its definition, shifting the copied
+// term's bound variables by the current binder depth (FrRenBound). The
+// original applies it to a PUBLIC SCHEME's stored types and formulas at
+// FinishPublicScheme (stdprep.pas 674-680) — with IncBounVarNbr on — and only
+// then frees the block's constants. Without it the scheme keeps references to
+// constants that the release has just dropped.
+mizExpandInferConstsW(env : MizCorrelEnv) -> MizWithin {
+	w = MizWithin(\ww, t -> {
+		switch (t) {
+			MizVarTrm(srt, varNr, __, __): {
+				if (srt == ikTrmInfConst && varNr < sizeVector(env.inferConstDef)) {
+					cd : MizConstDef = getVectorUnsafe(env.inferConstDef, varNr);
+					lTrm = mizCopyTrm(cd.def);
+					base = ww.boundVarNbr;
+					if (base != 0) {
+						shift = mizMakeWithin(\__, t2 -> {
+							switch (t2) {
+								MizVarTrm(s2, v2, __, __): {
+									if (s2 == ikTrmBound) {
+										vt = mizPrepAsVar(t2);
+										vt.varNr ::= v2 + base;
+									}
+									t2;
+								}
+								default: t2;
+							}
+						});
+						__sh = mizWithinTrm(shift, lTrm);
+						{}
+					}
+					// the definition may itself mention inference constants
+					mizWithinTrm(ww, lTrm);
+				} else {
+					t;
+				}
+			}
+			default: t;
+		}
+	}, true, 0);   // IncBounVarNbr := true
+	w;
+}
+
+mizPrepAsVar(t : MizTrm) -> MizVarTrm {
+	switch (t) { MizVarTrm(__, __, __, __): t; default: { mizRunTimeError(2901); MizVarTrm(ikError, 0, 0, 0); } }
+}
+
+mizReleaseBlock(p : MizPrep, kind : int, varMark : int, infMark : int) -> void {
+	if (kind == relTruncate) {
+		mizInferRelease(p.chk.idn, infMark);
+	} else if (kind == relFreeConst) {
+		mizFreeConstDef(p, varMark, infMark);
+	}
+}
+
 // walk a Proof/Now/CaseBlock-style block: save scope, process items, restore
-mizWalkBlock(p : MizPrep) -> void {
+mizWalkBlock(p : MizPrep, relKind : int) -> void {
 	env = p.chk.env;
 	x = p.r.x;
 	fixedMark = env.fixedVarNbr;
 	labelMark = sizeVector(p.labeled);
 	prevMark = p.prev;
 	locFuncMark = sizeVector(env.locFuncDef);
+	infMark = sizeVector(env.inferConstDef);
 	mizXmlNextElementState(x); // into the block
 	mizWalkItems(p);
 	// at </block>; advance
 	mizXmlNextElementState(x);
 	while(\ -> sizeVector(env.locFuncDef) > locFuncMark,
 		\ -> removeVector(env.locFuncDef, sizeVector(env.locFuncDef) - 1));
+	mizReleaseBlock(p, relKind, fixedMark, infMark);
 	env.fixedVarNbr ::= fixedMark;
 	while(\ -> sizeVector(p.labeled) > labelMark,
 		\ -> removeVector(p.labeled, sizeVector(p.labeled) - 1));
 	p.prev ::= prevMark;
+}
+
+// ---------------- the walk-time collection (stdprep.pas 256-288) ----------
+// StdBlockObj gives the parser six hooks — ProcessProposition, ProcessFormula,
+// ProcessTerm, ProcessType, ProcessTypeList, ProcessIterSteps — and each one
+// collects the inference constants of the element that was just read
+// (prephan.pas 363/372/379/386/395/414). Two consequences, and the SECOND is
+// the one that matters:
+//   * the constants accumulate across the article, so a later inference meets
+//     terms that are already hash-consed together;
+//   * the collection REWRITES THE ELEMENT IN PLACE. A fixed variable's stored
+//     definition therefore loses its raw sub-terms — a Fraenkel inside it
+//     becomes an interned constant — and only then does the closed-ness test
+//     (`VarNr <= BoundVarNbr`) see it as closed at a nested depth.
+// The original resets BoundVarNbr to 0 before each collection: these are
+// top-level elements, nothing is bound around them.
+mizPrepCollectFrm(p : MizPrep, f : MizFrm) -> void {
+	env = p.chk.env;
+	saved = env.boundVarNbr;
+	env.boundVarNbr ::= 0;
+	mizCollectConstInFrm(p.chk.idn, f);
+	env.boundVarNbr ::= saved;
+}
+
+mizPrepCollectTrm(p : MizPrep, t : MizTrm) -> MizTrm {
+	env = p.chk.env;
+	saved = env.boundVarNbr;
+	env.boundVarNbr ::= 0;
+	res = mizCollectConstInTrm(p.chk.idn, t);
+	env.boundVarNbr ::= saved;
+	res;
+}
+
+mizPrepCollectTyp(p : MizPrep, typ : MizTyp) -> void {
+	env = p.chk.env;
+	saved = env.boundVarNbr;
+	env.boundVarNbr ::= 0;
+	mizCollectConstInTyp(p.chk.idn, typ);
+	env.boundVarNbr ::= saved;
 }
 
 // push a fixed constant with the given type
@@ -947,6 +1176,7 @@ mizWalkItems(p : MizPrep) -> void {
 		name = x.nElName;
 		if (name == "Proposition") {
 			pr = mizReadProposition(p);
+			mizPrepCollectFrm(p, pr.second);   // ProcessProposition
 			mizJustify(p, pr.second, 0);
 			if (pr.first > 0) mizSetLabeled(p, pr.first, pr.second);
 			p.prev ::= Some(pr.second);
@@ -955,6 +1185,8 @@ mizWalkItems(p : MizPrep) -> void {
 			// Proposition + justification (or SkippedProof)
 			if (x.nState == MizEStart && x.nElName == "Proposition") {
 				pr = mizReadProposition(p);
+				mizPrepCollectFrm(p, pr.second);   // ProcessProposition
+			mizPrepCollectFrm(p, pr.second);   // ProcessProposition
 				mizJustify(p, pr.second, 0);
 				p.ownTheoremNr ::= p.ownTheoremNr + 1;
 				p.theorems ::= setTree(p.theorems,
@@ -969,6 +1201,8 @@ mizWalkItems(p : MizPrep) -> void {
 			mizXmlNextElementState(x);
 			if (x.nState == MizEStart && x.nElName == "Proposition") {
 				pr = mizReadProposition(p);
+				mizPrepCollectFrm(p, pr.second);   // ProcessProposition
+			mizPrepCollectFrm(p, pr.second);   // ProcessProposition
 				p.theorems ::= setTree(p.theorems,
 					mizThKey(kindD, p.ownArticleNr, p.ownDefNr), pr.second);
 				if (pr.first > 0) mizSetPermLabeled(p, pr.first, pr.second);
@@ -980,6 +1214,7 @@ mizWalkItems(p : MizPrep) -> void {
 			mizXmlNextElementState(x);
 			while(\ -> x.nState == MizEStart && x.nElName == "Typ", \ -> {
 				typ = mizInType(p.r);
+				mizPrepCollectTyp(p, typ);   // ProcessType
 				mizPushFixed(p, typ);
 			});
 			while(\ -> x.nState == MizEStart, \ -> mizXmlSkipElement(x));
@@ -989,6 +1224,9 @@ mizWalkItems(p : MizPrep) -> void {
 			while(\ -> x.nState == MizEStart, \ -> {
 				if (x.nElName == "Proposition") {
 					pr = mizReadProposition(p);
+					mizPrepCollectFrm(p, pr.second);   // ProcessProposition
+				mizPrepCollectFrm(p, pr.second);   // ProcessProposition
+			mizPrepCollectFrm(p, pr.second);   // ProcessProposition
 					if (pr.first > 0) mizSetLabeled(p, pr.first, pr.second);
 					p.prev ::= Some(pr.second);
 				} else {
@@ -1004,15 +1242,19 @@ mizWalkItems(p : MizPrep) -> void {
 			mizXmlNextElementState(x);
 			if (x.nState == MizEStart && x.nElName == "Proposition") {
 				pr = mizReadProposition(p);
+				mizPrepCollectFrm(p, pr.second);   // ProcessProposition
+			mizPrepCollectFrm(p, pr.second);   // ProcessProposition
 				if (justified) mizJustify(p, pr.second, 0);
 			}
 			// new constants + assumed property propositions
 			while(\ -> x.nState == MizEStart, \ -> {
 				if (x.nElName == "Typ") {
 					typ = mizInType(p.r);
+					mizPrepCollectTyp(p, typ);   // ProcessType
 					mizPushFixed(p, typ);
 				} else if (x.nElName == "Proposition") {
 					pr2 = mizReadProposition(p);
+					mizPrepCollectFrm(p, pr2.second);   // ProcessProposition
 					if (pr2.first > 0) mizSetLabeled(p, pr2.first, pr2.second);
 					p.prev ::= Some(pr2.second);
 				} else {
@@ -1028,13 +1270,16 @@ mizWalkItems(p : MizPrep) -> void {
 			mizXmlNextElementState(x);
 			while(\ -> x.nState == MizEStart && x.nElName == "Typ", \ -> {
 				typ = mizInType(p.r);
+				mizPrepCollectTyp(p, typ);   // ProcessType
 				mizPushFixed(p, typ);
-				trm = mizInTerm(p.r);
+				trm = mizPrepCollectTrm(p, mizInTerm(p.r));   // ProcessTerm
 				fv : MizFixedVar = getVectorUnsafe(env.fixedVar, env.fixedVarNbr);
 				fv.def ::= Some(trm);
 			});
 			if (x.nState == MizEStart && x.nElName == "Proposition") {
 				pr = mizReadProposition(p);
+				mizPrepCollectFrm(p, pr.second);   // ProcessProposition
+			mizPrepCollectFrm(p, pr.second);   // ProcessProposition
 				mizJustify(p, pr.second, 0);
 			}
 			while(\ -> x.nState == MizEStart, \ -> mizXmlSkipElement(x));
@@ -1044,8 +1289,9 @@ mizWalkItems(p : MizPrep) -> void {
 			// term as its definition (Start/FinishExemplifyingTerm)
 			mizXmlNextElementState(x);
 			typ3 = mizInType(p.r);
+			mizPrepCollectTyp(p, typ3);   // ProcessType
 			mizPushFixed(p, typ3);
-			trm3 = mizInTerm(p.r);
+			trm3 = mizPrepCollectTrm(p, mizInTerm(p.r));   // ProcessTerm
 			fv3 : MizFixedVar = getVectorUnsafe(env.fixedVar, env.fixedVarNbr);
 			fv3.def ::= Some(trm3);
 			while(\ -> x.nState == MizEStart, \ -> mizXmlSkipElement(x));
@@ -1055,8 +1301,9 @@ mizWalkItems(p : MizPrep) -> void {
 			// already expanded by the analyzer (FinishConstantDefinition:
 			// "the term is ignored", nDef stays nil)
 			mizXmlNextElementState(x);
-			__trm = mizInTerm(p.r);
+			__trm = mizPrepCollectTrm(p, mizInTerm(p.r));   // ProcessTerm
 			typ2 = mizInType(p.r);
+			mizPrepCollectTyp(p, typ2);   // ProcessType
 			mizPushFixed(p, typ2);
 			while(\ -> x.nState == MizEStart, \ -> mizXmlSkipElement(x));
 			mizXmlNextElementState(x);
@@ -1071,10 +1318,14 @@ mizWalkItems(p : MizPrep) -> void {
 			fixedMark = env2.fixedVarNbr;
 			labelMark = sizeVector(p.labeled);
 			prevMark = p.prev;
+			infMark2 = sizeVector(env2.inferConstDef);
 			mizXmlNextElementState(x);
 			p.lastBlockThesis ::= None();
 			mizWalkItems(p);
 			mizXmlNextElementState(x);
+			// FinishDiffuse (stdprep.pas 564): FreeConstDef, then the block's
+			// THESIS is rewritten with the new constant numbers
+			mizReleaseBlock(p, relFreeConst, fixedMark, infMark2);
 			env2.fixedVarNbr ::= fixedMark;
 			while(\ -> sizeVector(p.labeled) > labelMark,
 				\ -> removeVector(p.labeled, sizeVector(p.labeled) - 1));
@@ -1088,7 +1339,7 @@ mizWalkItems(p : MizPrep) -> void {
 			}
 			p.lastBlockThesis ::= None();
 		} else if (name == "Proof") {
-			mizWalkBlock(p);
+			mizWalkBlock(p, relTruncate);   // FinishProof
 		} else if (name == "BlockThesis") {
 			// a Now's BlockThesis = per-item <Thesis> entries, then the block
 			// formula LAST; a Proof's = the formula directly. Take the final
@@ -1096,7 +1347,9 @@ mizWalkItems(p : MizPrep) -> void {
 			mizXmlNextElementState(x);
 			while(\ -> x.nState == MizEStart, \ -> {
 				if (mizIsFrmEl(x.nElName)) {
-					p.lastBlockThesis ::= Some(mizInFormula(p.r));
+					bt = mizInFormula(p.r);
+					mizPrepCollectFrm(p, bt);   // ProcessFormula
+					p.lastBlockThesis ::= Some(bt);
 				} else {
 					mizXmlSkipElement(x);
 				}
@@ -1145,8 +1398,17 @@ mizWalkItems(p : MizPrep) -> void {
 			|| name == "CaseBlock" || name == "SupposeBlock"
 			|| name == "ReductionRegistration" || name == "Reducibility"
 			|| name == "IdentifyRegistration" || name == "Compatibility") {
-			// walk inside: these contain items/justifications of the same shape
-			mizWalkBlock(p);
+			// walk inside: these contain items/justifications of the same shape.
+			// Only the ones that ARE blocks of the original release; the
+			// correctness-condition wrappers are not blocks and keep everything.
+			relKind = if (name == "DefinitionBlock" || name == "Definition"
+					|| name == "RegistrationBlock" || name == "Registration"
+					|| name == "ReductionRegistration"
+					|| name == "IdentifyRegistration") relFreeConst
+				else if (name == "NotationBlock" || name == "CaseBlock"
+					|| name == "SupposeBlock") relTruncate
+				else relNone;
+			mizWalkBlock(p, relKind);
 		} else if (name == "Definiens") {
 			// the article's own definientia arrive inline; equals-definitions
 			// feed the equals-expansion, the rest the atom expansion pool
@@ -1167,11 +1429,14 @@ mizWalkItems(p : MizPrep) -> void {
 			// whole yields A = Tlast as the (labeled) fact
 			labelNr = mizXmlIntAttrDef(x, "nr", 0);
 			mizXmlNextElementState(x);
-			t0 = mizInTerm(p.r);
+			t0 = mizPrepCollectTrm(p, mizInTerm(p.r));   // ProcessTerm
 			cur = ref t0;
+			// ProcessIterSteps collects every step's equated term; the original
+			// does it once after the whole list is parsed, which is equivalent
+			// because each step's term is independent
 			while(\ -> x.nState == MizEStart && x.nElName == "IterStep", \ -> {
 				mizXmlNextElementState(x);
-				ti = mizInTerm(p.r);
+				ti = mizPrepCollectTrm(p, mizInTerm(p.r));
 				stepClaim = mizNewEqFrm(p.chk.env, mizCopyTrm(^cur), mizCopyTrm(ti));
 				mizJustify(p, stepClaim, 0);
 				cur := ti;
@@ -1190,6 +1455,7 @@ mizWalkItems(p : MizPrep) -> void {
 			while(\ -> x.nState == MizEStart, \ -> {
 				if (x.nElName == "Proposition") {
 					prC = mizReadProposition(p);
+					mizPrepCollectFrm(p, prC.second);   // ProcessProposition
 					if (prC.first > 0) mizSetLabeled(p, prC.first, prC.second);
 					p.prev ::= Some(prC.second);
 				} else {
@@ -1202,6 +1468,7 @@ mizWalkItems(p : MizPrep) -> void {
 			mizXmlNextElementState(x);
 			if (x.nState == MizEStart && x.nElName == "Proposition") {
 				prS = mizReadProposition(p);
+				mizPrepCollectFrm(p, prS.second);   // ProcessProposition
 				mizJustify(p, prS.second, 0);
 			}
 			while(\ -> x.nState == MizEStart, \ -> mizXmlSkipElement(x));
@@ -1214,10 +1481,12 @@ mizWalkItems(p : MizPrep) -> void {
 			fixedMarkP = envP.fixedVarNbr;
 			labelMarkP = sizeVector(p.labeled);
 			prevMarkP = p.prev;
+			infMarkP = sizeVector(envP.inferConstDef);
 			mizXmlNextElementState(x);
 			p.lastBlockThesis ::= None();
 			mizWalkItems(p);
 			mizXmlNextElementState(x);
+			mizReleaseBlock(p, relFreeConst, fixedMarkP, infMarkP);
 			envP.fixedVarNbr ::= fixedMarkP;
 			while(\ -> sizeVector(p.labeled) > labelMarkP,
 				\ -> removeVector(p.labeled, sizeVector(p.labeled) - 1));
@@ -1238,6 +1507,7 @@ mizWalkItems(p : MizPrep) -> void {
 			fixedMarkS = envS.fixedVarNbr;
 			labelMarkS = sizeVector(p.labeled);
 			prevMarkS = p.prev;
+			infMarkS = sizeVector(envS.inferConstDef);
 			schTypes : Vector<MizTyp> = makeVector(4);
 			schPremises = ref [];
 			schStmt : ref Maybe<MizFrm> = ref None();
@@ -1270,6 +1540,7 @@ mizWalkItems(p : MizPrep) -> void {
 					while(\ -> x.nState == MizEStart, \ -> {
 						if (x.nElName == "Proposition") {
 							prP = mizReadProposition(p);
+							mizPrepCollectFrm(p, prP.second);   // ProcessProposition
 							if (prP.first > 0) mizSetLabeled(p, prP.first, prP.second);
 							schPremises := arrayPush(^schPremises, prP.second);
 						} else {
@@ -1279,6 +1550,7 @@ mizWalkItems(p : MizPrep) -> void {
 					mizXmlNextElementState(x);
 				} else if (nm == "Proposition") {
 					prS = mizReadProposition(p);
+				mizPrepCollectFrm(p, prS.second);   // ProcessProposition
 					schStmt := Some(prS.second);
 					mizJustify(p, prS.second, 0);
 				} else {
@@ -1286,6 +1558,14 @@ mizWalkItems(p : MizPrep) -> void {
 				}
 			});
 			mizXmlNextElementState(x);
+			// FinishPublicScheme (stdprep.pas 671-682): expand the collected
+			// constants back out of the scheme's types and formulas, THEN free
+			// the block's constants
+			expW = mizExpandInferConstsW(envS);
+			iterVector(schTypes, \tE -> mizWithinTyp(expW, tE));
+			iter(^schPremises, \fE -> mizWithinFrm(expW, fE));
+			switch (^schStmt) { Some(stE): mizWithinFrm(expW, stE); None(): {} }
+			mizInferRelease(p.chk.idn, infMarkS);
 			envS.fixedVarNbr ::= fixedMarkS;
 			while(\ -> sizeVector(p.labeled) > labelMarkS,
 				\ -> removeVector(p.labeled, sizeVector(p.labeled) - 1));
