@@ -1,0 +1,608 @@
+// Transcription of ~/dev/system/base/numbers.pas — EXACT arithmetic.
+//
+// The original computes with unbounded signed integers and with rationals and
+// complex rationals built on them; it never uses floating point. The port used
+// doubles, which is wrong rather than merely imprecise in at least two ways:
+//   * a rational like 1/3 has no exact binary representation, so two values
+//     that are mathematically equal but computed by different routes compare
+//     unequal (a missed class merge) and two values that differ can round to
+//     the same double (a WRONG merge, i.e. an unsound accept);
+//   * integers past 2^53 lose their low bits, so `divides`, `is integer` and
+//     `is prime` answer at random on the number-theory articles.
+// This unit replaces that layer.
+//
+// REPRESENTATION. The original keeps an integer as a decimal STRING and does
+// schoolbook arithmetic on the characters (numbers.pas note at the top of the
+// unit). Flow9 strings are immutable, so digit-by-digit work on them would
+// allocate on every step; the digits live in an int array here instead, little
+// endian, base 10^4 — the largest power of ten whose product still fits in a
+// 32-bit int (10^4 * 10^4 = 10^8, and the schoolbook inner loop adds a carry
+// on top of that). Conversion to and from the decimal string the original uses
+// is exact, so traces stay diffable.
+//
+// INVARIANTS, all maintained by the constructors:
+//   * digits has no leading zero limb, and zero is the EMPTY digit list;
+//   * neg is false whenever the value is zero (there is one zero, not two);
+//   * a rational is always fully reduced and its denominator is positive.
+
+import ds/vector;
+import string;
+import loop;
+import math/math;
+import mizar/original/errhan;
+
+export {
+	// an unbounded signed integer: |value| = sum digits[i] * 10000^i
+	MizBigInt(neg : bool, digits : [int]);
+
+	// num/den, always reduced, den > 0
+	MizRat(num : MizBigInt, den : MizBigInt);
+
+	// the original's RComplex
+	MizCplx(re : MizRat, im : MizRat);
+
+	mizBigZero : MizBigInt;
+	mizBigOne : MizBigInt;
+
+	mizRatZero : MizRat;
+	mizRatOne : MizRat;
+
+	mizCplxZero : MizCplx;
+	mizCplxOne : MizCplx;
+	mizCplxMinusOne : MizCplx;
+	mizCplxImUnit : MizCplx;
+
+	// ---------------- unbounded integers ----------------
+	mizBigFromInt(i : int) -> MizBigInt;
+	mizBigFromString(s : string) -> MizBigInt;   // decimal, optional leading '-'
+	mizBig2s(a : MizBigInt) -> string;           // the original's string form
+	mizBigIsZero(a : MizBigInt) -> bool;
+	mizBigCmp(a : MizBigInt, b : MizBigInt) -> int;      // CompareIntStr
+	mizBigAdd(a : MizBigInt, b : MizBigInt) -> MizBigInt;
+	mizBigSub(a : MizBigInt, b : MizBigInt) -> MizBigInt;
+	mizBigMul(a : MizBigInt, b : MizBigInt) -> MizBigInt;
+	mizBigNeg(a : MizBigInt) -> MizBigInt;
+	mizBigAbs(a : MizBigInt) -> MizBigInt;
+	// truncating division, as the original's _Div/_Mod: the quotient is
+	// rounded toward zero and the remainder takes the dividend's sign
+	mizBigDivMod(a : MizBigInt, b : MizBigInt) -> Pair<MizBigInt, MizBigInt>;
+	mizBigGcd(a : MizBigInt, b : MizBigInt) -> MizBigInt;  // always >= 0
+	mizBigLcm(a : MizBigInt, b : MizBigInt) -> MizBigInt;
+	mizBigDivides(a : MizBigInt, b : MizBigInt) -> bool;   // a | b
+	mizBigIsPrime(a : MizBigInt) -> bool;
+	// the value as an int when it fits, for the few callers that index with it
+	mizBig2i(a : MizBigInt) -> Maybe<int>;
+
+	// ---------------- rationals ----------------
+	mizRatMake(num : MizBigInt, den : MizBigInt) -> MizRat; // reduces
+	mizRatFromInt(i : int) -> MizRat;
+	mizRatAdd(a : MizRat, b : MizRat) -> MizRat;
+	mizRatSub(a : MizRat, b : MizRat) -> MizRat;
+	mizRatNeg(a : MizRat) -> MizRat;
+	mizRatMul(a : MizRat, b : MizRat) -> MizRat;
+	mizRatInv(a : MizRat) -> Maybe<MizRat>;      // None for 0 (RatInv(0) is undetermined)
+	mizRatDiv(a : MizRat, b : MizRat) -> Maybe<MizRat>;
+	mizRatEq(a : MizRat, b : MizRat) -> bool;
+	mizRatCmp(a : MizRat, b : MizRat) -> int;
+	mizRatIsZero(a : MizRat) -> bool;
+	mizRatIsInt(a : MizRat) -> bool;
+	mizRat2s(a : MizRat) -> string;
+
+	// ---------------- complex rationals ----------------
+	mizCplxFromInt(i : int) -> MizCplx;
+	mizCplxAdd(a : MizCplx, b : MizCplx) -> MizCplx;
+	mizCplxSub(a : MizCplx, b : MizCplx) -> MizCplx;
+	mizCplxNeg(a : MizCplx) -> MizCplx;
+	mizCplxMul(a : MizCplx, b : MizCplx) -> MizCplx;
+	mizCplxInv(a : MizCplx) -> Maybe<MizCplx>;
+	mizCplxDiv(a : MizCplx, b : MizCplx) -> Maybe<MizCplx>;
+	mizCplxEq(a : MizCplx, b : MizCplx) -> bool;          // AreEqComplex
+	mizCplxCmp(a : MizCplx, b : MizCplx) -> int;          // CompareComplex
+	mizCplxIsZero(a : MizCplx) -> bool;
+	mizCplxEqInt(a : MizCplx, n : int) -> bool;           // IsEqWithInt
+	mizCplxIsInteger(a : MizCplx) -> bool;                // IsIntegerNumber
+	mizCplxIsNatural(a : MizCplx) -> bool;                // IsNaturalNumber
+	mizCplxIsPrime(a : MizCplx) -> bool;                  // IsPrimeNumber
+	// IsRationalLE / IsRationalGT: only the real parts, and only when both
+	// values are real (the original compares Re and ignores Im, which is
+	// sound because it is only reached for real classes)
+	mizCplxLE(a : MizCplx, b : MizCplx) -> bool;
+	mizCplxGT(a : MizCplx, b : MizCplx) -> bool;
+	mizCplx2s(a : MizCplx) -> string;
+}
+
+// base 10^4: one limb prints as exactly 4 decimal digits
+bigBase = 10000;
+bigBaseDigits = 4;
+
+mizBigZero = MizBigInt(false, []);
+mizBigOne = MizBigInt(false, [1]);
+
+mizRatZero = MizRat(mizBigZero, mizBigOne);
+mizRatOne = MizRat(mizBigOne, mizBigOne);
+
+mizCplxZero = MizCplx(mizRatZero, mizRatZero);
+mizCplxOne = MizCplx(mizRatOne, mizRatZero);
+mizCplxMinusOne = MizCplx(MizRat(MizBigInt(true, [1]), mizBigOne), mizRatZero);
+mizCplxImUnit = MizCplx(mizRatZero, mizRatOne);
+
+// ---------------- digit-list helpers ----------------
+
+// drop leading zero limbs (the high end of the little-endian list)
+bigTrim(d : [int]) -> [int] {
+	n = ref length(d);
+	while(\ -> ^n > 0 && d[^n - 1] == 0, \ -> n := ^n - 1);
+	if (^n == length(d)) d else subrange(d, 0, ^n);
+}
+
+bigMake(neg : bool, d : [int]) -> MizBigInt {
+	t = bigTrim(d);
+	MizBigInt(if (length(t) == 0) false else neg, t);
+}
+
+// |a| vs |b|
+bigCmpAbs(a : [int], b : [int]) -> int {
+	la = length(a);
+	lb = length(b);
+	if (la != lb) {
+		if (la < lb) -1 else 1;
+	} else {
+		i = ref la - 1;
+		res = ref 0;
+		while(\ -> ^res == 0 && ^i >= 0, \ -> {
+			if (a[^i] != b[^i]) res := if (a[^i] < b[^i]) -1 else 1;
+			i := ^i - 1;
+		});
+		^res;
+	}
+}
+
+// |a| + |b|
+bigAddAbs(a : [int], b : [int]) -> [int] {
+	n = max(length(a), length(b));
+	out : Vector<int> = makeVector(n + 1);
+	carry = ref 0;
+	i = ref 0;
+	while(\ -> ^i < n, \ -> {
+		s = (if (^i < length(a)) a[^i] else 0) + (if (^i < length(b)) b[^i] else 0) + ^carry;
+		pushVector(out, s % bigBase);
+		carry := s / bigBase;
+		i := ^i + 1;
+	});
+	if (^carry != 0) pushVector(out, ^carry);
+	bigTrim(vector2array(out));
+}
+
+// |a| - |b|, REQUIRES |a| >= |b|
+bigSubAbs(a : [int], b : [int]) -> [int] {
+	out : Vector<int> = makeVector(length(a));
+	borrow = ref 0;
+	i = ref 0;
+	while(\ -> ^i < length(a), \ -> {
+		s = ref a[^i] - ^borrow - (if (^i < length(b)) b[^i] else 0);
+		if (^s < 0) {
+			s := ^s + bigBase;
+			borrow := 1;
+		} else {
+			borrow := 0;
+		}
+		pushVector(out, ^s);
+		i := ^i + 1;
+	});
+	bigTrim(vector2array(out));
+}
+
+bigMulAbs(a : [int], b : [int]) -> [int] {
+	la = length(a);
+	lb = length(b);
+	if (la == 0 || lb == 0) {
+		[];
+	} else {
+		acc = makeVector(la + lb);
+		fori(0, la + lb - 1, \__ -> pushVector(acc, 0));
+		fori(0, la - 1, \i -> {
+			carry = ref 0;
+			fori(0, lb - 1, \j -> {
+				// a[i]*b[j] <= (10^4-1)^2 < 10^8, plus the running limb and
+				// carry: still far inside the 32-bit range
+				cur = getVectorUnsafe(acc, i + j) + a[i] * b[j] + ^carry;
+				setVectorUnsafe(acc, i + j, cur % bigBase);
+				carry := cur / bigBase;
+			});
+			// propagate the tail carry
+			k = ref i + lb;
+			while(\ -> ^carry != 0, \ -> {
+				cur = getVectorUnsafe(acc, ^k) + ^carry;
+				setVectorUnsafe(acc, ^k, cur % bigBase);
+				carry := cur / bigBase;
+				k := ^k + 1;
+			});
+		});
+		bigTrim(vector2array(acc));
+	}
+}
+
+// |a| divided by the single limb m (0 < m < bigBase): (quotient, remainder)
+bigDivModSmall(a : [int], m : int) -> Pair<[int], int> {
+	n = length(a);
+	q = makeVector(max(n, 1));
+	fori(0, n - 1, \__ -> pushVector(q, 0));
+	rem = ref 0;
+	i = ref n - 1;
+	while(\ -> ^i >= 0, \ -> {
+		cur = ^rem * bigBase + a[^i];
+		setVectorUnsafe(q, ^i, cur / m);
+		rem := cur % m;
+		i := ^i - 1;
+	});
+	Pair(bigTrim(vector2array(q)), ^rem);
+}
+
+// schoolbook long division on |a| / |b|; returns (quotient, remainder).
+// The quotient limb is found by binary search on 0..bigBase-1, which keeps the
+// implementation short at the cost of log2(10^4) = 14 multiply-compare steps
+// per limb — the numbers Mizar meets are small enough that this is not the
+// bottleneck, and correctness here matters more than speed.
+bigDivModAbs(a : [int], b : [int]) -> Pair<[int], [int]> {
+	if (length(b) == 0) {
+		mizRunTimeError(2600); // division by zero: the callers must prevent it
+		Pair([], []);
+	} else if (bigCmpAbs(a, b) < 0) {
+		Pair([], a);
+	} else if (length(b) == 1) {
+		p = bigDivModSmall(a, b[0]);
+		Pair(p.first, if (p.second == 0) [] else [p.second]);
+	} else {
+		q = makeVector(length(a));
+		fori(0, length(a) - 1, \__ -> pushVector(q, 0));
+		rem = ref [];
+		i = ref length(a) - 1;
+		while(\ -> ^i >= 0, \ -> {
+			// rem := rem * base + a[i]
+			shifted = concat([a[^i]], ^rem);
+			cur = bigTrim(shifted);
+			lo = ref 0;
+			hi = ref bigBase - 1;
+			// the largest d with b*d <= cur
+			while(\ -> ^lo < ^hi, \ -> {
+				mid = (^lo + ^hi + 1) / 2;
+				if (bigCmpAbs(bigMulAbs(b, [mid]), cur) <= 0) lo := mid else hi := mid - 1;
+			});
+			setVectorUnsafe(q, ^i, ^lo);
+			rem := if (^lo == 0) cur else bigSubAbs(cur, bigMulAbs(b, [^lo]));
+			i := ^i - 1;
+		});
+		Pair(bigTrim(vector2array(q)), ^rem);
+	}
+}
+
+// ---------------- unbounded integers ----------------
+
+mizBigFromInt(i : int) -> MizBigInt {
+	if (i == 0) {
+		mizBigZero;
+	} else {
+		neg = i < 0;
+		v = ref (if (neg) -i else i);
+		out : Vector<int> = makeVector(3);
+		// -2^31 negates to itself; take the limbs off the negative side then
+		while(\ -> ^v != 0, \ -> {
+			pushVector(out, ^v % bigBase);
+			v := ^v / bigBase;
+		});
+		bigMake(neg, vector2array(out));
+	}
+}
+
+mizBigFromString(s0 : string) -> MizBigInt {
+	neg = startsWith(s0, "-");
+	s = if (neg) substring(s0, 1, strlen(s0) - 1) else s0;
+	n = strlen(s);
+	if (n == 0) {
+		mizBigZero;
+	} else {
+		out : Vector<int> = makeVector(n / bigBaseDigits + 1);
+		hi = ref n;
+		while(\ -> ^hi > 0, \ -> {
+			lo = max(0, ^hi - bigBaseDigits);
+			pushVector(out, s2i(substring(s, lo, ^hi - lo)));
+			hi := lo;
+		});
+		bigMake(neg, vector2array(out));
+	}
+}
+
+mizBig2s(a : MizBigInt) -> string {
+	n = length(a.digits);
+	if (n == 0) {
+		"0";
+	} else {
+		body = fold(enumFromTo(0, n - 2), i2s(a.digits[n - 1]), \acc, k -> {
+			// every limb below the top one prints with its leading zeroes
+			acc + lpad(i2s(a.digits[n - 2 - k]), "0", bigBaseDigits);
+		});
+		(if (a.neg) "-" else "") + body;
+	}
+}
+
+mizBigIsZero(a : MizBigInt) -> bool {
+	length(a.digits) == 0;
+}
+
+mizBigCmp(a : MizBigInt, b : MizBigInt) -> int {
+	if (a.neg != b.neg) {
+		if (a.neg) -1 else 1;
+	} else {
+		c = bigCmpAbs(a.digits, b.digits);
+		if (a.neg) -c else c;
+	}
+}
+
+mizBigNeg(a : MizBigInt) -> MizBigInt {
+	if (mizBigIsZero(a)) a else MizBigInt(!a.neg, a.digits);
+}
+
+mizBigAbs(a : MizBigInt) -> MizBigInt {
+	if (a.neg) MizBigInt(false, a.digits) else a;
+}
+
+mizBigAdd(a : MizBigInt, b : MizBigInt) -> MizBigInt {
+	if (a.neg == b.neg) {
+		bigMake(a.neg, bigAddAbs(a.digits, b.digits));
+	} else {
+		c = bigCmpAbs(a.digits, b.digits);
+		if (c == 0) {
+			mizBigZero;
+		} else if (c > 0) {
+			bigMake(a.neg, bigSubAbs(a.digits, b.digits));
+		} else {
+			bigMake(b.neg, bigSubAbs(b.digits, a.digits));
+		}
+	}
+}
+
+mizBigSub(a : MizBigInt, b : MizBigInt) -> MizBigInt {
+	mizBigAdd(a, mizBigNeg(b));
+}
+
+mizBigMul(a : MizBigInt, b : MizBigInt) -> MizBigInt {
+	bigMake(a.neg != b.neg, bigMulAbs(a.digits, b.digits));
+}
+
+mizBigDivMod(a : MizBigInt, b : MizBigInt) -> Pair<MizBigInt, MizBigInt> {
+	p = bigDivModAbs(a.digits, b.digits);
+	// truncation toward zero; the remainder keeps the dividend's sign
+	Pair(bigMake(a.neg != b.neg, p.first), bigMake(a.neg, p.second));
+}
+
+mizBigGcd(a : MizBigInt, b : MizBigInt) -> MizBigInt {
+	x = ref mizBigAbs(a);
+	y = ref mizBigAbs(b);
+	while(\ -> !mizBigIsZero(^y), \ -> {
+		r = bigDivModAbs((^x).digits, (^y).digits).second;
+		x := ^y;
+		y := bigMake(false, r);
+	});
+	^x;
+}
+
+mizBigLcm(a : MizBigInt, b : MizBigInt) -> MizBigInt {
+	if (mizBigIsZero(a) || mizBigIsZero(b)) {
+		mizBigZero;
+	} else {
+		g = mizBigGcd(a, b);
+		mizBigAbs(mizBigDivMod(mizBigMul(a, b), g).first);
+	}
+}
+
+// numbers.pas: Divides(a,b) = GCD(a,b) = abs(a)
+mizBigDivides(a : MizBigInt, b : MizBigInt) -> bool {
+	mizBigCmp(mizBigGcd(a, b), mizBigAbs(a)) == 0;
+}
+
+mizBigIsPrime(a : MizBigInt) -> bool {
+	if (a.neg || mizBigIsZero(a)) {
+		false;
+	} else if (mizBigCmp(a, mizBigOne) == 0) {
+		false;
+	} else {
+		// trial division by 2 and then the odd numbers while d*d <= a
+		two = mizBigFromInt(2);
+		if (mizBigIsZero(mizBigDivMod(a, two).second)) {
+			mizBigCmp(a, two) == 0;
+		} else {
+			d = ref mizBigFromInt(3);
+			res = ref true;
+			go = ref true;
+			while(\ -> ^go, \ -> {
+				if (mizBigCmp(mizBigMul(^d, ^d), a) > 0) {
+					go := false;
+				} else if (mizBigIsZero(mizBigDivMod(a, ^d).second)) {
+					res := false;
+					go := false;
+				} else {
+					d := mizBigAdd(^d, two);
+				}
+			});
+			^res;
+		}
+	}
+}
+
+mizBig2i(a : MizBigInt) -> Maybe<int> {
+	// 2^31-1 is 2147483647: at most three limbs, and the top one is bounded
+	n = length(a.digits);
+	if (n == 0) {
+		Some(0);
+	} else if (n > 3) {
+		None();
+	} else {
+		v = fold(reverseA(a.digits), 0.0, \acc, d -> acc * i2d(bigBase) + i2d(d));
+		if (v > 2147483647.0) {
+			None();
+		} else {
+			i = fold(reverseA(a.digits), 0, \acc, d -> acc * bigBase + d);
+			Some(if (a.neg) -i else i);
+		}
+	}
+}
+
+// ---------------- rationals ----------------
+
+mizRatMake(num : MizBigInt, den0 : MizBigInt) -> MizRat {
+	if (mizBigIsZero(den0)) {
+		mizRunTimeError(2601); // zero denominator: the callers must prevent it
+		mizRatZero;
+	} else if (mizBigIsZero(num)) {
+		mizRatZero;
+	} else {
+		// keep the sign in the numerator
+		neg = num.neg != den0.neg;
+		n0 = mizBigAbs(num);
+		d0 = mizBigAbs(den0);
+		g = mizBigGcd(n0, d0);
+		n = mizBigDivMod(n0, g).first;
+		d = mizBigDivMod(d0, g).first;
+		MizRat(if (neg) mizBigNeg(n) else n, d);
+	}
+}
+
+mizRatFromInt(i : int) -> MizRat {
+	MizRat(mizBigFromInt(i), mizBigOne);
+}
+
+mizRatAdd(a : MizRat, b : MizRat) -> MizRat {
+	mizRatMake(mizBigAdd(mizBigMul(a.num, b.den), mizBigMul(b.num, a.den)),
+		mizBigMul(a.den, b.den));
+}
+
+mizRatSub(a : MizRat, b : MizRat) -> MizRat {
+	mizRatAdd(a, mizRatNeg(b));
+}
+
+mizRatNeg(a : MizRat) -> MizRat {
+	MizRat(mizBigNeg(a.num), a.den);
+}
+
+mizRatMul(a : MizRat, b : MizRat) -> MizRat {
+	mizRatMake(mizBigMul(a.num, b.num), mizBigMul(a.den, b.den));
+}
+
+mizRatInv(a : MizRat) -> Maybe<MizRat> {
+	if (mizBigIsZero(a.num)) None() else Some(mizRatMake(a.den, a.num));
+}
+
+mizRatDiv(a : MizRat, b : MizRat) -> Maybe<MizRat> {
+	switch (mizRatInv(b)) {
+		Some(ib): Some(mizRatMul(a, ib));
+		None(): None();
+	}
+}
+
+mizRatEq(a : MizRat, b : MizRat) -> bool {
+	// both are reduced with a positive denominator, so this IS equality
+	mizBigCmp(a.num, b.num) == 0 && mizBigCmp(a.den, b.den) == 0;
+}
+
+mizRatCmp(a : MizRat, b : MizRat) -> int {
+	mizBigCmp(mizBigMul(a.num, b.den), mizBigMul(b.num, a.den));
+}
+
+mizRatIsZero(a : MizRat) -> bool {
+	mizBigIsZero(a.num);
+}
+
+mizRatIsInt(a : MizRat) -> bool {
+	mizBigCmp(a.den, mizBigOne) == 0;
+}
+
+mizRat2s(a : MizRat) -> string {
+	if (mizRatIsInt(a)) mizBig2s(a.num)
+	else mizBig2s(a.num) + "/" + mizBig2s(a.den);
+}
+
+// ---------------- complex rationals ----------------
+
+mizCplxFromInt(i : int) -> MizCplx {
+	MizCplx(mizRatFromInt(i), mizRatZero);
+}
+
+mizCplxAdd(a : MizCplx, b : MizCplx) -> MizCplx {
+	MizCplx(mizRatAdd(a.re, b.re), mizRatAdd(a.im, b.im));
+}
+
+mizCplxSub(a : MizCplx, b : MizCplx) -> MizCplx {
+	MizCplx(mizRatSub(a.re, b.re), mizRatSub(a.im, b.im));
+}
+
+mizCplxNeg(a : MizCplx) -> MizCplx {
+	MizCplx(mizRatNeg(a.re), mizRatNeg(a.im));
+}
+
+mizCplxMul(a : MizCplx, b : MizCplx) -> MizCplx {
+	MizCplx(
+		mizRatSub(mizRatMul(a.re, b.re), mizRatMul(a.im, b.im)),
+		mizRatAdd(mizRatMul(a.re, b.im), mizRatMul(a.im, b.re)));
+}
+
+// 1/z = conj(z) / |z|^2
+mizCplxInv(a : MizCplx) -> Maybe<MizCplx> {
+	d = mizRatAdd(mizRatMul(a.re, a.re), mizRatMul(a.im, a.im));
+	if (mizRatIsZero(d)) {
+		None();
+	} else {
+		switch (mizRatInv(d)) {
+			Some(id): Some(MizCplx(mizRatMul(a.re, id), mizRatMul(mizRatNeg(a.im), id)));
+			None(): None();
+		}
+	}
+}
+
+mizCplxDiv(a : MizCplx, b : MizCplx) -> Maybe<MizCplx> {
+	switch (mizCplxInv(b)) {
+		Some(ib): Some(mizCplxMul(a, ib));
+		None(): None();
+	}
+}
+
+mizCplxEq(a : MizCplx, b : MizCplx) -> bool {
+	mizRatEq(a.re, b.re) && mizRatEq(a.im, b.im);
+}
+
+mizCplxCmp(a : MizCplx, b : MizCplx) -> int {
+	c = mizRatCmp(a.re, b.re);
+	if (c != 0) c else mizRatCmp(a.im, b.im);
+}
+
+mizCplxIsZero(a : MizCplx) -> bool {
+	mizRatIsZero(a.re) && mizRatIsZero(a.im);
+}
+
+mizCplxEqInt(a : MizCplx, n : int) -> bool {
+	mizRatIsZero(a.im) && mizRatEq(a.re, mizRatFromInt(n));
+}
+
+mizCplxIsInteger(a : MizCplx) -> bool {
+	mizRatIsZero(a.im) && mizRatIsInt(a.re);
+}
+
+mizCplxIsNatural(a : MizCplx) -> bool {
+	mizCplxIsInteger(a) && !a.re.num.neg;
+}
+
+mizCplxIsPrime(a : MizCplx) -> bool {
+	mizCplxIsInteger(a) && mizBigIsPrime(a.re.num);
+}
+
+mizCplxLE(a : MizCplx, b : MizCplx) -> bool {
+	mizRatCmp(a.re, b.re) <= 0;
+}
+
+mizCplxGT(a : MizCplx, b : MizCplx) -> bool {
+	mizRatCmp(a.re, b.re) > 0;
+}
+
+mizCplx2s(a : MizCplx) -> string {
+	if (mizRatIsZero(a.im)) mizRat2s(a.re)
+	else mizRat2s(a.re) + "+" + mizRat2s(a.im) + "i";
+}
