@@ -1,0 +1,141 @@
+// Gate for the `.xml` WRITER (iocorrel_write.flow), against the READER that M1
+// already proved: a ROUND TRIP over every expression element of a reference
+// analyzer report.
+//
+// For each <Typ>, <And>/<Not>/<For>/<Pred>/… and each term element the file
+// holds at a position where the reader can be entered, the test
+//   * ECHOes the source subtree verbatim (attributes in source order, one tag
+//     per line, `/>` for an empty element) — that IS the original's output
+//     format, so the echo is the reference;
+//   * reads it with mizInType / mizInFormula / mizInTerm and writes it back
+//     with the new writer;
+// and compares the two strings byte for byte.
+
+import mizar/original/errhan;
+import mizar/original/xml_parser;
+import mizar/original/correl;
+import mizar/original/iocorrel;
+import mizar/original/iocorrel_write;
+import net/url_parameter;
+import ds/vector;
+import sys/system;
+import fs/filesystem;
+import string;
+import loop;
+import math/math;
+import runtime;
+
+// echo the element the parser stands on, and leave the parser past it
+mizEcho(p : MizXmlParser, out : Vector<string>) -> void {
+	name = p.nElName;
+	pushVector(out, "<" + name);
+	iterVector(p.nAttrVals, \a -> pushVector(out, " " + a.name + "=\"" + a.value + "\""));
+	mizXmlNextElementState(p);
+	if (p.nState == MizEEnd) {
+		pushVector(out, "/>\n");
+		mizXmlNextElementState(p);
+	} else {
+		pushVector(out, ">\n");
+		while(\ -> p.nState != MizEEnd, \ -> mizEcho(p, out));
+		pushVector(out, "</" + name + ">\n");
+		mizXmlNextElementState(p);
+	}
+}
+
+// structural descent: `p` stands on a start tag. A target element is handed to
+// `handle`, which must consume its whole subtree; anything else is descended
+// into. Terminates with the document.
+mizScan(p : MizXmlParser, isTarget : (string) -> bool, handle : (MizXmlParser) -> void) -> void {
+	if (isTarget(p.nElName)) handle(p)
+	else {
+		mizXmlNextElementState(p);
+		if (p.nState == MizEEnd) mizXmlNextElementState(p)
+		else {
+			while(\ -> p.nState != MizEEnd, \ -> mizScan(p, isTarget, handle));
+			mizXmlNextElementState(p);
+		}
+	}
+}
+
+main() {
+	mml = getUrlParameterDef("mml", "/home/dmitry/dev/math/MML-test") + "/mml";
+	a = getUrlParameterDef("article", "xboole_0");
+	xml = getUrlParameterDef("xml", mml + "/" + a + ".xml");
+	content = getFileContentBinary(xml);
+
+	env = mizMakeCorrelEnv();
+	// the reader sorts a cluster by ADJUSTED attribute number, so the article's
+	// constructor table has to be in place — the real pipeline loads it before
+	// reading anything too (Load_EnvConstructors)
+	atr = getUrlParameterDef("atr", mml + "/" + a + ".atr");
+	if (fileExists(atr)) {
+		r0 = mizMakeVrfReader(mizXmlInitParsing(getFileContent(atr)), env);
+		r0.mml ::= true;
+		mizLoadConstructors(r0, getFileContent(atr));
+	}
+	// the report also speaks the ARTICLE'S OWN constructors, which the .atr (the
+	// imported environment) does not hold — the analyzer adds them as it reads.
+	// The harness pads the table with plain, non-redefined entries so the
+	// cluster sort has something to look at.
+	fori(0, coLAST, \k -> fori(1, 400, \__ -> {
+		mizPushConstr(env, mizMakeConstr(k, "", 0));
+		{}
+	}));
+	// `Const` is excluded: Out_VarTerm writes its `vid` out of the ANALYZER's
+	// FixedVar table, which this harness has no way to reconstruct.
+	isTarget = \nm : string -> nm != "Const"
+		&& (nm == "Typ" || mizIsFrmEl(nm) || mizIsTermEl(nm));
+
+	// PASS 1 — the echo of every target subtree, in document order
+	expected : Vector<string> = makeVector(4096);
+	tags : Vector<string> = makeVector(4096);
+	p = mizXmlInitParsing(content);
+	mizXmlNextElementState(p);
+	mizScan(p, isTarget, \pp -> {
+		pushVector(tags, pp.nElName);
+		acc : Vector<string> = makeVector(64);
+		mizEcho(pp, acc);
+		pushVector(expected, concatStrings(vector2array(acc)));
+	});
+
+	// PASS 2 — read each one back and write it out again
+	got : Vector<string> = makeVector(4096);
+	q = mizXmlInitParsing(content);
+	r = mizMakeVrfReader(q, env);
+	mizXmlNextElementState(q);
+	mizScan(q, isTarget, \qq -> {
+		nm = qq.nElName;
+		o = mizMakeVrfOut(env);
+		// Out_TypeWithId's `vid` is supplied BY THE CALLER (Out_TypeListWithIds
+		// for a Fraenkel, the analyzer for a Reservation or a Let), not stored
+		// on the type — so the harness reads it from the source and hands it back
+		vid = mizXmlIntAttrDef(qq, "vid", 0);
+		if (nm == "Typ") mizVOutTypeWithId(o, mizInType(r), vid)
+		else if (mizIsFrmEl(nm)) mizVOutFormula(o, mizInFormula(r))
+		else mizVOutTerm(o, mizInTerm(r));
+		pushVector(got, mizVrfOutContent(o));
+	});
+
+	bad = ref 0;
+	skipped = ref 0;
+	firstBad = ref "";
+	n = min(sizeVector(expected), sizeVector(got));
+	fori(0, n - 1, \i -> {
+		e = getVectorUnsafe(expected, i);
+		g = getVectorUnsafe(got, i);
+		// a subtree holding a <Const> cannot round-trip here: Out_VarTerm takes
+		// its `vid` from the ANALYZER's FixedVar table, which this harness has
+		// no way to reconstruct
+		if (strContains(e, "<Const ")) skipped := ^skipped + 1
+		else if (e != g) {
+			bad := ^bad + 1;
+			if (^firstBad == "") firstBad := "<" + getVectorUnsafe(tags, i)
+				+ ">\n--- expected ---\n" + e + "--- got ---\n" + g;
+		}
+	});
+	println("echoed " + i2s(sizeVector(expected)) + " rewritten " + i2s(sizeVector(got))
+		+ " compared " + i2s(n - ^skipped) + " skipped(Const) " + i2s(^skipped)
+		+ " mismatched " + i2s(^bad));
+	if (^bad > 0) println(^firstBad);
+	quit(if (^bad > 0 || sizeVector(expected) != sizeVector(got)) 1 else 0);
+}
