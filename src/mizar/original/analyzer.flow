@@ -90,6 +90,10 @@ export {
 		mutable stoppedAt : int,
 		// gFixedBase (analyzer.pas 370)
 		mutable fixedBase : int,
+		// gConstErr (CheckLocConst) and the two globals of ChangeSkFixedToBound
+		mutable constErr : bool,
+		mutable skListCount : int,
+		mutable skFrstConstNr : int,
 	);
 
 	CorrCondNbr = 6;
@@ -121,7 +125,8 @@ mizMakeAnalyzer(env : MizCorrelEnv, eh : MizErrHan, clusters : MizClusters,
 		{ v : Vector<MizFrm> = makeVector(CorrCondNbr + 1);
 		  fori(0, CorrCondNbr, \__ -> pushVector(v, mizNewIncorFrm())); v },
 		MaxArgNbr, 0, 0, 0, mizNewIncorFrm(),
-		MizLevelRec(0, 0, 0, 0, 0, 0, None(), false, None()), 0, 0);
+		MizLevelRec(0, 0, 0, 0, 0, 0, None(), false, None()), 0, 0,
+		false, 0, 0);
 	// the report's own header (Analyze, analyzer.pas 6672)
 	mizVOutString(a.out, "<?xml version=\"1.0\"?>\n");
 	mizVOutString(a.out,
@@ -936,10 +941,8 @@ mizAReasoning(a : MizAnalyzer) -> void {
 			lPos = mizInPos(a.inf);
 			mizVOutElStart0(a.out, "Conclusion");
 			mizInWord(a.inf);
-			lFrm = if (a.inf.curKind == ikBlcHereby) {
-				a.stoppedAt ::= ikBlcHereby;   // HereBy not transcribed yet
-				mizNewIncorFrm();
-			} else mizARegularStatement(a);
+			lFrm = if (a.inf.curKind == ikBlcHereby) mizAHereBy(a)
+				else mizARegularStatement(a);
 			if (a.stoppedAt == 0) {
 				lDefs = mizChopConcl(a, lFrm, lPos);
 				mizVOutElEnd(a.out, "Conclusion");
@@ -1031,8 +1034,22 @@ mizARegularStatement(a : MizAnalyzer) -> MizFrm {
 	mizInPos(a.inf);
 	mizInWord(a.inf);
 	if (a.inf.curKind == ikBlcDiffuse) {
-		a.stoppedAt ::= ikBlcDiffuse;      // DiffuseStatement not transcribed
-		mizNewIncorFrm();
+		mizInPos(a.inf);
+		mizVOutElStart(a.out, "Now");
+		if (lLabelNr != 0) {
+			mizVOutIntAttr(a.out, "nr", lLabelNr);
+			mizVOutIntAttr(a.out, "vid", lLabId);
+		}
+		mizVOutPosAsAttrs(a.out, a.eh.curPos);
+		mizVOutAttrEnd(a.out);
+		res = mizADiffuseStatement(a);
+		mizInWord(a.inf);
+		if (a.stoppedAt == 0) {
+			mizVOutEndPos(a.out, a.eh.curPos);
+			mizAOutBlockThesis(a, res);
+			mizVOutElEnd(a.out, "Now");
+		}
+		res.first;
 	} else {
 		lFrm = mizReadSentence(a, false);
 		mizInWord(a.inf);
@@ -1231,4 +1248,328 @@ mizAStatement(a : MizAnalyzer) -> void {
 	fori(lVarBase + 1, mizGVarNbr(a), \i -> {
 		fv = mizFixedVarAt(a, i); fv.skelConstNr ::= 0;
 	});
+}
+
+// ============ the DIFFUSE (`now`) family (analyzer.pas 3974-4453) ==========
+
+// CheckLocConst (911): a constant of THIS block that is not a skeleton
+// constant may not escape into a diffuse statement's result
+mizCheckLocConst(a : MizAnalyzer) -> MizWithin {
+	mizMakeWithin(\__, t -> {
+		switch (t) {
+			MizVarTrm(srt, varNr, __, __): {
+				if (srt == ikTrmConstant && varNr > a.gen.g.demBase
+					&& mizFixedVarAt(a, varNr).skelConstNr == 0) a.constErr ::= true;
+				t;
+			}
+			default: t;
+		}
+	});
+}
+
+// ChangeDeclConstToBound (3974)
+mizChangeDeclConstToBound(a : MizAnalyzer) -> MizWithin {
+	mizMakeWithin(\__, t -> {
+		switch (t) {
+			MizVarTrm(srt, varNr, __, __): {
+				if (srt == ikTrmLocus) t.sort ::= ikTrmBound
+				else if (srt == ikTrmBound) t.varNr ::= varNr + a.gen.g.genCount
+				else if (srt == ikTrmConstant) {
+					if (varNr > a.gen.g.demBase && mizFixedVarAt(a, varNr).skelConstNr != 0) {
+						t.varNr ::= mizFixedVarAt(a, varNr).skelConstNr;
+						t.sort ::= ikTrmBound;
+					}
+				}
+				t;
+			}
+			MizBaseTrm(srt, __):
+				if (srt == ikTrmIt) mizNewVarTrm(ikTrmBound, a.gen.g.genCount) else t;
+			default: t;
+		}
+	});
+}
+
+// SkelList (3991)
+mizSkelList(a : MizAnalyzer, form : int, frst : int) -> void {
+	gg = a.gen.g;
+	skList : Vector<MizTyp> = makeVector(4);
+	skOrig : Vector<MizTyp> = makeVector(4);
+	skIdents = mizInitIntSeq(4);
+	bad = ref false;
+	fori(frst + 1, mizGVarNbr(a), \k -> {
+		if (!^bad) {
+			lTyp0 = mizCopyTyp(mizFixedVarAt(a, k).typ);
+			a.constErr ::= false;
+			mizWithinTyp(mizCheckLocConst(a), lTyp0);
+			lTyp = if (a.constErr) { mizAErrImm(a, 50); mizNewIncorTyp() } else lTyp0;
+			if (lTyp.sort == ikError) { gg.err ::= true; bad := true; }
+			else {
+				pushVector(skOrig, mizCopyTyp(lTyp));
+				mizWithinTyp(mizChangeDeclConstToBound(a), lTyp);
+				pushVector(skList, lTyp);
+				mizSeqInsert(skIdents, mizFixedVarAt(a, k).ident);
+				{}
+			}
+		}
+	});
+	if (!^bad)
+		gg.lastEntry ::= Some(MizRsnConst(gg.lastEntry, form, skList, skIdents,
+			skOrig, frst));
+}
+
+// SkelSnt (4016)
+mizSkelSnt(a : MizAnalyzer, form : int, f : MizFrm) -> void {
+	gg = a.gen.g;
+	a.constErr ::= false;
+	mizWithinFrm(mizCheckLocConst(a), f);
+	if (a.constErr) { mizAErrImm(a, 68); gg.err ::= true; }
+	else if (mizFrmSort(f) == ikError) gg.err ::= true
+	else {
+		dSnt = mizCopyFrm(f);
+		mizWithinFrm(mizChangeDeclConstToBound(a), f);
+		gg.lastEntry ::= Some(MizRsnSnt(gg.lastEntry, form, f, dSnt));
+	}
+}
+
+// NewUnivList (4161)
+mizNewUnivList(fl : Vector<MizTyp>, ids : MizIntSeq, f0 : MizFrm) -> MizFrm {
+	if (mizFrmSort(f0) == ikError) mizNewIncorFrm()
+	else {
+		f = ref f0;
+		k = ref (sizeVector(fl) - 1);
+		while(\ -> ^k >= 0, \ -> {
+			f := mizNewUnivI(mizSeqValue(ids, ^k), mizCopyTyp(getVectorUnsafe(fl, ^k)), ^f);
+			k := ^k - 1;
+		});
+		^f;
+	}
+}
+
+// ChangeSkFixedToBound (4171)
+mizChangeSkFixedToBound(a : MizAnalyzer) -> MizWithin {
+	mizMakeWithin(\__, t -> {
+		switch (t) {
+			MizVarTrm(srt, varNr, __, __): {
+				if (srt == ikTrmBound) t.varNr ::= varNr + a.skListCount
+				else if (srt == ikTrmConstant && varNr > a.skFrstConstNr) {
+					t.sort ::= ikTrmBound;
+					t.varNr ::= varNr - a.skFrstConstNr;
+				}
+				t;
+			}
+			default: t;
+		}
+	});
+}
+
+// NewUnivList1 (4183) — fixes the local constants one level at a time
+mizNewUnivList1(a : MizAnalyzer, fl : Vector<MizTyp>, ids : MizIntSeq,
+		f0 : MizFrm, frstConstNr : int) -> MizFrm {
+	if (mizFrmSort(f0) == ikError) mizNewIncorFrm()
+	else {
+		a.skFrstConstNr ::= frstConstNr;
+		a.skListCount ::= sizeVector(fl);
+		mizWithinFrm(mizChangeSkFixedToBound(a), f0);
+		f = ref f0;
+		k = ref (sizeVector(fl) - 1);
+		while(\ -> ^k >= 0, \ -> {
+			a.skListCount ::= a.skListCount - 1;
+			lTyp = mizCopyTyp(getVectorUnsafe(fl, ^k));
+			mizWithinTyp(mizChangeSkFixedToBound(a), lTyp);
+			f := mizNewUnivI(mizSeqValue(ids, ^k), lTyp, ^f);
+			k := ^k - 1;
+		});
+		^f;
+	}
+}
+
+// ReasResult (4202) — unwind the skeleton chain into the block's result, and
+// the sub-results the block thesis reports in reverse
+mizReasResult(a : MizAnalyzer, f0 : MizFrm) -> Pair<MizFrm, Vector<MizFrm>> {
+	gg = a.gen.g;
+	subResults : Vector<MizFrm> = makeVector(4);
+	if (gg.err) Pair(mizNewIncorFrm(), subResults)
+	else {
+		fFrm = ref f0;
+		lFrm = ref mizCopyFrm(f0);
+		while(\ -> isSome(gg.lastEntry), \ -> {
+			pushVector(subResults, mizCopyFrm(^lFrm));
+			switch (gg.lastEntry) {
+				None(): {}
+				Some(e): {
+					switch (e) {
+						MizRsnSnt(prev, form, skSnt, dSnt): {
+							if (form == 65) {          // 'A'
+								fFrm := mizNewImpl(skSnt, ^fFrm);
+								lFrm := mizNewImpl(dSnt, ^lFrm);
+							} else if (form == 66) {   // 'B'
+								fFrm := mizNewConj(skSnt, ^fFrm);
+								lFrm := mizNewConj(dSnt, ^lFrm);
+							} else mizRunTimeError(2008);
+							gg.lastEntry ::= prev;
+						}
+						MizRsnConst(prev, form, skList, skIdents, skOrigTyps, skFrstConstNr): {
+							if (form == 67) {          // 'C'
+								fFrm := mizNewNeg(mizNewUnivList(skList, skIdents,
+									mizNewNeg(^fFrm)));
+								lFrm := mizNewNeg(mizNewUnivList1(a, skOrigTyps, skIdents,
+									mizNewNeg(^lFrm), skFrstConstNr));
+							} else if (form == 68) {   // 'D'
+								fFrm := mizNewUnivList(skList, skIdents, ^fFrm);
+								lFrm := mizNewUnivList1(a, skOrigTyps, skIdents, ^lFrm,
+									skFrstConstNr);
+							} else mizRunTimeError(2008);
+							gg.lastEntry ::= prev;
+						}
+					}
+				}
+			}
+		});
+		Pair(^fFrm, subResults);
+	}
+}
+
+// DiffReasoning (4032)
+mizADiffReasoning(a : MizAnalyzer) -> void {
+	env = a.env;
+	while(\ -> a.inf.curKind != ikMscEndBlock && a.stoppedAt == 0, \ -> {
+		k = a.inf.curKind;
+		gg = a.gen.g;
+		if (k == ikItmGeneralization) {
+			mizInPos(a.inf);
+			mizVOutElStart(a.out, "Let");
+			mizVOutIntAttr(a.out, "nr", mizGVarNbr(a) + 1);
+			mizVOutAttrEnd(a.out);
+			mizGetQualifiedList(a, 0);
+			fori(a.fixedBase + 1, mizGVarNbr(a), \i -> {
+				gg.genCount ::= gg.genCount + 1;
+				fv = mizFixedVarAt(a, i);
+				fv.skelConstNr ::= gg.genCount;
+			});
+			mizWriteQualified(a);
+			mizVOutElEnd(a.out, "Let");
+			mizSkelList(a, 68, a.fixedBase);          // 'D'
+		} else if (k == ikItmAssumption) {
+			mizInPos(a.inf);
+			mizVOutElStart0(a.out, "Assume");
+			mizInWord(a.inf);
+			conds = mizReadPropositions(a);
+			mizVOutPropositions(a.out, conds);
+			mizVOutElEnd(a.out, "Assume");
+			mizInWord(a.inf);
+			mizSkelSnt(a, 65, mizConjugatePropositions(conds));   // 'A'
+		} else if (k == ikItmExAssumption) {
+			lVarBase = mizGVarNbr(a);
+			mizInPos(a.inf);
+			mizVOutElStart(a.out, "Given");
+			mizVOutIntAttr(a.out, "nr", mizGVarNbr(a) + 1);
+			mizVOutAttrEnd(a.out);
+			mizGetQualifiedList(a, 0);
+			conds = mizReadPropositions(a);
+			mizInWord(a.inf);
+			lFrm = mizXFormula(a, mizConjugatePropositions(conds));
+			mizVOutPropos(a.out, 0, 0, a.eh.curPos, lFrm);
+			mizSkelSnt(a, 65, lFrm);
+			mizWriteQualified(a);
+			mizVOutPropositions(a.out, conds);
+			mizVOutElEnd(a.out, "Given");
+			fori(lVarBase + 1, mizGVarNbr(a), \i -> {
+				fv = mizFixedVarAt(a, i); fv.skelConstNr ::= 0;
+			});
+		} else if (k == ikItmExemplifWithEq) {
+			mizVOutElStart(a.out, "TakeAsVar");
+			mizVOutIntAttr(a.out, "nr", mizGVarNbr(a) + 1);
+			mizVOutAttrEnd(a.out);
+			mizInPos(a.inf);
+			mizInWord(a.inf);                       // 'I'
+			lId = a.inf.curNr;
+			lTrm = mizReadTerm(a);
+			mizSetGVarNbr(a, mizGVarNbr(a) + 1);
+			mizAssert(2521, mizGVarNbr(a) <= MaxVarNbr);
+			fv = mizFixedVarAt(a, mizGVarNbr(a));
+			fv.expandable ::= false;
+			fv.ident ::= lId;
+			fv.typ ::= mizGetTrmType(env, lTrm);
+			mizVOutTypeWithId(a.out, fv.typ, fv.ident);
+			mizVOutTerm(a.out, lTrm);
+			mizVOutElEnd(a.out, "TakeAsVar");
+			gg.genCount ::= gg.genCount + 1;
+			fv.skelConstNr ::= gg.genCount;
+			mizSkelList(a, 67, mizGVarNbr(a) - 1);   // 'C'
+			mizInWord(a.inf);
+		} else if (k == ikItmSimpleExemplif) {
+			mizInPos(a.inf);
+			mizAErrImm(a, 64);
+			gg.err ::= true;
+			mizReadTerm(a) |> \__ -> {};
+			mizInWord(a.inf);
+		} else if (k == ikItmConclusion) {
+			mizInPos(a.inf);
+			mizVOutElStart0(a.out, "Conclusion");
+			mizInWord(a.inf);
+			lFrm = if (a.inf.curKind == ikBlcHereby) mizAHereBy(a)
+				else mizARegularStatement(a);
+			mizVOutElEnd(a.out, "Conclusion");
+			if (a.stoppedAt == 0) mizSkelSnt(a, 66, lFrm);       // 'B'
+		} else if (k == ikBlcPerCases || k == ikBlcCase || k == ikBlcSuppose) {
+			a.stoppedAt ::= k;
+		} else {
+			mizAStatement(a);
+		}
+	});
+}
+
+// DiffuseStatement (4403)
+mizADiffuseStatement(a : MizAnalyzer) -> Pair<MizFrm, Vector<MizFrm>> {
+	env = a.env;
+	l = mizCopyLevel(a.gen.g);
+	l.locPredNbr ::= sizeVector(env.locPredDef);
+	l.locFuncNbr ::= sizeVector(env.locFuncDef);
+	mark = mizTTCollMark(env);
+	gg = a.gen.g;
+	gg.lastEntry ::= None();
+	gg.err ::= false;
+	gg.genCount ::= 0;
+	gg.demBase ::= mizGVarNbr(a);
+	mizInWord(a.inf);
+	mizADiffReasoning(a);
+	lResult = if (a.inf.curKind == ikBlcPerCases) {
+		a.stoppedAt ::= ikBlcPerCases;      // DiffPerCasesReasoning not transcribed
+		mizNewIncorFrm();
+	} else mizNewVerum();
+	res = mizReasResult(a, lResult);
+	mizDisposeLevel(a, l, mark);
+	mizInPos(a.inf);
+	res;
+}
+
+// the BlockThesis of a `now` block: the sub-results in REVERSE, then the result
+mizAOutBlockThesis(a : MizAnalyzer, res : Pair<MizFrm, Vector<MizFrm>>) -> void {
+	mizVOutElStart0(a.out, "BlockThesis");
+	z = ref (sizeVector(res.second) - 1);
+	while(\ -> ^z >= 0, \ -> {
+		mizVOutElStart0(a.out, "Thesis");
+		mizVOutFormula(a.out, getVectorUnsafe(res.second, ^z));
+		mizVOutNatFunc(a.out, "ThesisExpansions", mizInitNatFunc(1));
+		mizVOutElEnd(a.out, "Thesis");
+		z := ^z - 1;
+	});
+	mizVOutFormula(a.out, res.first);
+	mizVOutElEnd(a.out, "BlockThesis");
+}
+
+// HereBy (4426)
+mizAHereBy(a : MizAnalyzer) -> MizFrm {
+	mizInPos(a.inf);
+	mizVOutElStart(a.out, "Now");
+	mizVOutPosAsAttrs(a.out, a.eh.curPos);
+	mizVOutAttrEnd(a.out);
+	res = mizADiffuseStatement(a);
+	mizInWord(a.inf);
+	if (a.stoppedAt == 0) {
+		mizVOutEndPos(a.out, a.eh.curPos);
+		mizAOutBlockThesis(a, res);
+		mizVOutElEnd(a.out, "Now");
+	}
+	res.first;
 }
