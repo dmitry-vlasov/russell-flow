@@ -1,0 +1,2103 @@
+// Transcription of ~/dev/system/base/block_and_item.pas (ProcessingArticleObj,
+// the generic article walker) and base/first_identification.pas
+// (FirstIdentArticleObj, the FIRST IDENTIFICATION pass) — the M3 step that
+// turns a `.wsx` tree into a `.msx` tree.
+//
+// What the pass decides, for the whole article:
+//   * every VARIABLE occurrence: is it bound, a constant, a reserved variable,
+//     a private/schematic functor or predicate — and its serial and local
+//     number (VariableKind, serialnr, varnr);
+//   * every LABEL and every local reference: its proposition serial number and
+//     its label number;
+//   * every SCHEME and scheme justification: its scheme number;
+//   * RESERVED VARIABLES: a formula that mentions one gets an explicit
+//     universal quantifier wrapped around it, at the innermost scope where the
+//     variable is still free, and a `proof` block gets Generalization items for
+//     the reserved variables its statement left free.
+//
+// The tree is REWRITTEN IN PLACE, as the Pascal does: the annotations are
+// mutable fields on the WSM records (wsm.flow) and the walker writes them.
+// Where the Pascal uses a `var` parameter to REPLACE a node (a formula wrapped
+// in a quantifier, a placeholder turned into an error term) the port returns
+// the new node and the caller stores it back — a `var` parameter IS a return.
+//
+// ★ Every "set" here is a Pascal SORTED SET (mobjects NatSet / IntSet /
+//   Int2PairOfIntFunc: binary-search insert with dedup). The order is
+//   semantics, not decoration — see the M1 note in the port's memory.
+
+import ds/vector;
+import loop;
+import string;
+import math/math;
+import mizar/original/errhan;
+import mizar/original/formats;
+import mizar/original/wsm;
+
+export {
+	// The whole pass: annotate the text proper in place.
+	mizMsmProcessArticle(tp : MizWsBlock, eh : MizErrHan, formats : MizFormats) -> void;
+}
+
+// ------------------------------------------------------- sorted sets -------
+
+// NatSet / IntSet: a set of integers kept SORTED, deduped (mobjects.pas).
+mizNsSearch(v : Vector<int>, x : int) -> int {
+	// returns the insert position; the caller checks for equality
+	go = \lo, hi -> {
+		l = ref lo; h = ref hi;
+		while(\ -> ^l <= ^h, \ -> {
+			m = bitUshr(^l + ^h, 1);
+			c = getVectorUnsafe(v, m);
+			if (c < x) l := m + 1
+			else {
+				h := m - 1;
+				if (c == x) l := m;
+			}
+		});
+		^l;
+	};
+	go(0, sizeVector(v) - 1);
+}
+
+mizNsHas(v : Vector<int>, x : int) -> bool {
+	i = mizNsSearch(v, x);
+	i < sizeVector(v) && getVectorUnsafe(v, i) == x;
+}
+
+mizNsInsert(v : Vector<int>, x : int) -> void {
+	i = mizNsSearch(v, x);
+	if (!(i < sizeVector(v) && getVectorUnsafe(v, i) == x)) {
+		pushVector(v, x);
+		j = ref (sizeVector(v) - 1);
+		while(\ -> ^j > i, \ -> {
+			setVector(v, ^j, getVectorUnsafe(v, ^j - 1));
+			j := ^j - 1;
+		});
+		setVector(v, i, x);
+	}
+}
+
+mizNsEnlargeBy(v : Vector<int>, w : Vector<int>) -> void {
+	iterVector(w, \x -> mizNsInsert(v, x));
+}
+
+mizNsCopy(v : Vector<int>) -> Vector<int> {
+	r : Vector<int> = makeVector(max(1, sizeVector(v)));
+	iterVector(v, \x -> pushVector(r, x));
+	r;
+}
+
+mizNsClear(v : Vector<int>) -> void { clearVector(v); }
+
+mizNsAtDelete(v : Vector<int>, i : int) -> void { removeVector(v, i); }
+
+// Int2PairOfIntFunc: a SORTED map x -> (y1, y2), deduped by x.
+mizSubstSearch(v : Vector<MizIntTriple>, x : int) -> int {
+	l = ref 0; h = ref (sizeVector(v) - 1);
+	while(\ -> ^l <= ^h, \ -> {
+		m = bitUshr(^l + ^h, 1);
+		c = getVectorUnsafe(v, m).x;
+		if (c < x) l := m + 1
+		else {
+			h := m - 1;
+			if (c == x) l := m;
+		}
+	});
+	^l;
+}
+
+mizSubstHasInDom(v : Vector<MizIntTriple>, x : int) -> bool {
+	i = mizSubstSearch(v, x);
+	i < sizeVector(v) && getVectorUnsafe(v, i).x == x;
+}
+
+mizSubstAssign(v : Vector<MizIntTriple>, x : int, y1 : int, y2 : int) -> void {
+	i = mizSubstSearch(v, x);
+	if (i < sizeVector(v) && getVectorUnsafe(v, i).x == x) {
+		// Insert only complains on a conflicting duplicate; it never overwrites
+		{}
+	} else {
+		pushVector(v, MizIntTriple(x, y1, y2));
+		j = ref (sizeVector(v) - 1);
+		while(\ -> ^j > i, \ -> {
+			setVector(v, ^j, getVectorUnsafe(v, ^j - 1));
+			j := ^j - 1;
+		});
+		setVector(v, i, MizIntTriple(x, y1, y2));
+	}
+}
+
+// ------------------------------------------------------------ the state ----
+
+// gVariable (first_identification.pas 462)
+MizFiVar(
+	mutable varIdent : int,
+	mutable varPos : MizPos,
+	mutable origin : int,
+	mutable varKind : int,
+	mutable serialNr : int,
+	mutable varNr : int,
+	mutable pending : bool,
+);
+
+// gLabIdents / gDefLabels (454)
+MizFiLab(
+	mutable labId : int,
+	mutable propNr : int,
+	mutable labNr : int,
+	mutable definiensLab : bool,
+	mutable pending : bool,
+);
+
+// gReservedVar (507)
+MizFiResVar(
+	mutable resVarId : int,
+	mutable resVarPos : MizPos,
+	mutable resVarNr : int,
+	mutable pending : bool,
+	mutable resTypeNr : int,
+	freeVars : Vector<int>,
+);
+
+// gReservedType (516)
+MizFiResType(mutable typ : MizWsType, freeArgs : Vector<int>);
+
+// gPredVars / gFuncVars (479 / 487)
+MizFiLocal(
+	mutable id : int,
+	mutable pos : MizPos,
+	mutable arity : int,
+	mutable kind : int,
+	mutable serialNr : int,
+	mutable nr : int,
+);
+
+// the stack levels (FirstIdBlockObj / FirstIdItemObj / FirstIdSubexprObj)
+MizFiLevel ::= MizFiBlockLevel, MizFiItemLevel, MizFiSubexprLevel;
+	MizFiBlockLevel(
+		kind : int,
+		mutable labNbr : int, mutable labCntr : int, mutable propsNbr : int,
+		mutable locFuncNbr : int, mutable locPredNbr : int,
+		mutable privFuncBase : int, mutable privPredBase : int,
+		mutable varNbr : int, mutable constVarNbr : int,
+	);
+	MizFiItemLevel(
+		kind : int,
+		mutable itemWithBlock : bool,
+		mutable lastPropsNbr : int,
+		mutable lastLabelNbr : int,
+	);
+	MizFiSubexprLevel(mutable varNbr : int);
+
+MizFi(
+	eh : MizErrHan,
+	formats : MizFormats,
+
+	// labels
+	labIdents : Vector<MizFiLab>,      // 1-based
+	defLabels : Vector<MizFiLab>,      // 1-based
+	mutable labNbr : int, mutable labCntr : int,
+	mutable defLabNbr : int, mutable defLabBase : int,
+	mutable propsNbr : int,
+
+	// schemes
+	schemeIdent : Vector<int>,         // a NatSeq — insertion order, IndexOf
+	mutable canceledSch : int,
+
+	// variables
+	variable : Vector<MizFiVar>,       // 1-based, [0] is the sentinel
+	mutable varNbr : int,
+	mutable varSegmentBase : int, mutable recVarSegmentBase : int,
+	mutable defVarBase : int,
+	mutable boundVarNbr : int, mutable constVarNbr : int,
+	mutable boundsSerialNbr : int, mutable constsSerialNbr : int,
+	mutable defConstsSerialNbr : int,
+	involved : Vector<int>,
+	skelConstSet : Vector<int>,
+
+	// second-order variables
+	predVars : Vector<MizFiLocal>,     // 1-based
+	funcVars : Vector<MizFiLocal>,     // 1-based
+	mutable locFuncNbr : int, mutable locPredNbr : int,
+	mutable availableLocFuncNbr : int, mutable availableLocPredNbr : int,
+	mutable serialPrivFuncNbr : int, mutable serialPrivPredNbr : int,
+	mutable privFuncNbr : int, mutable privPredNbr : int,
+	mutable schFuncNbr : int, mutable schPredNbr : int,
+	mutable schFuncBase : int, mutable schPredBase : int,
+	mutable arityOfLocal : int,
+	mutable fieldNbr : int,
+	field : Vector<int>,               // 1-based
+
+	// reserved variables
+	mutable resVarNbr : int, mutable resVarBase : int, mutable resTypeNbr : int,
+	reservedVar : Vector<MizFiResVar>, // 1-based
+	reservedType : Vector<MizFiResType>, // 1-based
+
+	lastFreeVars : Vector<int>,
+	mutable processingReservationSegment : bool,
+
+	// the walker stack
+	stack : Vector<MizFiLevel>,
+	mutable blockLevel : MizFiBlockLevel,   // nBlockPtr
+);
+
+mizFiError(a : MizFi, pos : MizPos, nr : int) -> void { mizError(a.eh, pos, nr); }
+
+mizFiNewVar() -> MizFiVar { MizFiVar(0, mizZeroPos, 0, 0, 0, 0, true); }
+mizFiNewLab() -> MizFiLab { MizFiLab(0, 0, 0, false, true); }
+mizFiNewLocal() -> MizFiLocal { MizFiLocal(0, mizZeroPos, 0, 0, 0, 0); }
+
+// grow a 1-based vector so index i exists
+mizFiAtVar(a : MizFi, i : int) -> MizFiVar {
+	if (i < sizeVector(a.variable)) getVectorUnsafe(a.variable, i)
+	else { pushVector(a.variable, mizFiNewVar()); mizFiAtVar(a, i); }
+}
+mizFiAtLab(v : Vector<MizFiLab>, i : int) -> MizFiLab {
+	if (i < sizeVector(v)) getVectorUnsafe(v, i)
+	else { pushVector(v, mizFiNewLab()); mizFiAtLab(v, i); }
+}
+mizFiAtLocal(v : Vector<MizFiLocal>, i : int) -> MizFiLocal {
+	if (i < sizeVector(v)) getVectorUnsafe(v, i)
+	else { pushVector(v, mizFiNewLocal()); mizFiAtLocal(v, i); }
+}
+mizFiAtResVar(a : MizFi, i : int) -> MizFiResVar {
+	if (i < sizeVector(a.reservedVar)) getVectorUnsafe(a.reservedVar, i)
+	else {
+		pushVector(a.reservedVar, MizFiResVar(0, mizZeroPos, 0, true, 0, makeVector(4)));
+		mizFiAtResVar(a, i);
+	}
+}
+mizFiAtResType(a : MizFi, i : int) -> MizFiResType {
+	if (i < sizeVector(a.reservedType)) getVectorUnsafe(a.reservedType, i)
+	else {
+		pushVector(a.reservedType, MizFiResType(MizWsErrorType(mizZeroPos), makeVector(4)));
+		mizFiAtResType(a, i);
+	}
+}
+mizFiAtField(a : MizFi, i : int) -> int {
+	if (i < sizeVector(a.field)) getVectorUnsafe(a.field, i)
+	else { pushVector(a.field, 0); mizFiAtField(a, i); }
+}
+mizFiSetField(a : MizFi, i : int, x : int) -> void {
+	if (i < sizeVector(a.field)) setVector(a.field, i, x)
+	else { pushVector(a.field, 0); mizFiSetField(a, i, x); }
+}
+
+mizMakeFi(eh : MizErrHan, formats : MizFormats) -> MizFi {
+	variable : Vector<MizFiVar> = makeVector(64);
+	pushVector(variable, mizFiNewVar());     // gVariable[0]
+	labIdents : Vector<MizFiLab> = makeVector(64);
+	pushVector(labIdents, mizFiNewLab());
+	defLabels : Vector<MizFiLab> = makeVector(16);
+	pushVector(defLabels, mizFiNewLab());
+	predVars : Vector<MizFiLocal> = makeVector(16);
+	pushVector(predVars, MizFiLocal(0, mizZeroPos, 0, mizVkPrivatePred, 0, 0));
+	funcVars : Vector<MizFiLocal> = makeVector(16);
+	pushVector(funcVars, MizFiLocal(0, mizZeroPos, 0, mizVkPrivateFunc, 0, 0));
+	reservedVar : Vector<MizFiResVar> = makeVector(16);
+	pushVector(reservedVar, MizFiResVar(0, MizPos(1, 1), 0, true, 0, makeVector(4)));
+	reservedType : Vector<MizFiResType> = makeVector(16);
+	pushVector(reservedType, MizFiResType(MizWsErrorType(MizPos(1, 1)), makeVector(4)));
+	field : Vector<int> = makeVector(16);
+	pushVector(field, 0);
+	MizFi(eh, formats,
+		labIdents, defLabels, 0, 0, 0, 0, 0,
+		makeVector(8), 0,
+		variable, 0, 0, 0, 0, 0, 0, 0, 0, 0, makeVector(8), makeVector(8),
+		predVars, funcVars, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, field,
+		0, 0, 0, reservedVar, reservedType,
+		makeVector(8), false,
+		makeVector(32),
+		MizFiBlockLevel(mizBlMain, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+}
+
+// --------------------------------------------------- variable bookkeeping --
+
+// LookUp_Var (522) — search DOWN from gVarNbr
+mizFiLookUpVar(a : MizFi, id : int) -> int {
+	k = ref a.varNbr;
+	res = ref 0;
+	while(\ -> ^res == 0 && ^k >= 1, \ -> {
+		if (mizFiAtVar(a, ^k).varIdent == id) res := ^k;
+		k := ^k - 1;
+	});
+	^res;
+}
+
+// LookUp_ReservedVar (535)
+mizFiLookUpResVar(a : MizFi, id : int) -> int {
+	k = ref a.resVarNbr;
+	res = ref 0;
+	while(\ -> ^res == 0 && ^k >= 1, \ -> {
+		if (mizFiAtResVar(a, ^k).resVarId == id) res := ^k;
+		k := ^k - 1;
+	});
+	^res;
+}
+
+// AppVar (548)
+mizFiAppVar(a : MizFi, ident : int, varOrigin : int, varKind : int, pos : MizPos) -> void {
+	a.varNbr ::= a.varNbr + 1;
+	v = mizFiAtVar(a, a.varNbr);
+	v.origin ::= varOrigin;
+	v.varKind ::= varKind;
+	v.varPos ::= pos;
+	v.varIdent ::= ident;
+	v.pending ::= true;
+	v.serialNr ::= 0;
+	v.varNr ::= 0;
+	if (varOrigin == mizVkBound) {
+		a.boundsSerialNbr ::= a.boundsSerialNbr + 1;
+		v.serialNr ::= a.boundsSerialNbr;
+		a.boundVarNbr ::= a.boundVarNbr + 1;
+		v.varNr ::= a.boundVarNbr;
+	} else if (varOrigin == mizVkConstant) {
+		a.constsSerialNbr ::= a.constsSerialNbr + 1;
+		v.serialNr ::= a.constsSerialNbr;
+		a.constVarNbr ::= a.constVarNbr + 1;
+		v.varNr ::= a.constVarNbr;
+	} else if (varOrigin == mizVkReservedVar) {
+		v.origin ::= mizVkReservedVar;
+		if (varKind == mizVkBound) {
+			a.boundVarNbr ::= a.boundVarNbr + 1;
+			v.varNr ::= a.boundVarNbr;
+		} else if (varKind == mizVkConstant) {
+			a.constVarNbr ::= a.constVarNbr + 1;
+			v.varNr ::= a.constVarNbr;
+		}
+	} else if (varOrigin == mizVkFreeVar) {
+		v.serialNr ::= a.resVarNbr;
+	} else if (varOrigin == mizVkDefConstant) {
+		a.defConstsSerialNbr ::= a.defConstsSerialNbr + 1;
+		v.serialNr ::= a.defConstsSerialNbr;
+		a.constVarNbr ::= a.constVarNbr + 1;
+		v.varNr ::= a.constVarNbr;
+	}
+}
+
+// AppFuncVar (1200) / AppPredVar (1215)
+mizFiAppFuncVar(a : MizFi, id : int, pos : MizPos, kind : int, nr : int,
+	funcNr : int, arity : int) -> void {
+	a.locFuncNbr ::= a.locFuncNbr + 1;
+	f = mizFiAtLocal(a.funcVars, a.locFuncNbr);
+	f.id ::= id; f.pos ::= pos; f.arity ::= arity; f.kind ::= kind;
+	f.serialNr ::= nr; f.nr ::= funcNr;
+}
+
+mizFiAppPredVar(a : MizFi, id : int, pos : MizPos, kind : int, nr : int,
+	predNr : int, arity : int) -> void {
+	a.locPredNbr ::= a.locPredNbr + 1;
+	f = mizFiAtLocal(a.predVars, a.locPredNbr);
+	f.id ::= id; f.pos ::= pos; f.arity ::= arity; f.kind ::= kind;
+	f.serialNr ::= nr; f.nr ::= predNr;
+}
+
+mizFiLookUpPredVar(a : MizFi, id : int, arity : int) -> int {
+	k = ref a.availableLocPredNbr;
+	res = ref 0;
+	while(\ -> ^res == 0 && ^k >= 1, \ -> {
+		p = mizFiAtLocal(a.predVars, ^k);
+		if (p.id == id && p.arity == arity) res := ^k;
+		k := ^k - 1;
+	});
+	^res;
+}
+
+mizFiLookUpFuncVar(a : MizFi, id : int, arity : int) -> int {
+	k = ref a.availableLocFuncNbr;
+	res = ref 0;
+	while(\ -> ^res == 0 && ^k >= 1, \ -> {
+		f = mizFiAtLocal(a.funcVars, ^k);
+		if (f.id == id && f.arity == arity) res := ^k;
+		k := ^k - 1;
+	});
+	^res;
+}
+
+// Complete_FreeVars (739)
+mizFiCompleteFreeVars(a : MizFi, freeVars : Vector<int>) -> void {
+	work = mizNsCopy(freeVars);
+	while(\ -> sizeVector(work) > 0, \ -> {
+		rv = mizFiAtResVar(a, getVectorUnsafe(work, sizeVector(work) - 1));
+		fa = mizFiAtResType(a, rv.resTypeNr).freeArgs;
+		iterVector(mizNsCopy(fa), \x -> {
+			if (mizFiLookUpVar(a, mizFiAtResVar(a, x).resVarId) == 0) {
+				mizNsInsert(work, x);
+				mizNsInsert(freeVars, x);
+			}
+		});
+		mizNsAtDelete(work, sizeVector(work) - 1);
+	});
+}
+
+// AssignFreeVars (986)
+mizFiAssignFreeVars(a : MizFi, pos : MizPos, freeVar : int,
+	resSubst : Vector<MizIntTriple>) -> void {
+	fa = mizFiAtResType(a, mizFiAtResVar(a, freeVar).resTypeNr).freeArgs;
+	iterVector(mizNsCopy(fa), \x -> {
+		rv = mizFiAtResVar(a, x);
+		lVarNr = mizFiLookUpVar(a, rv.resVarId);
+		if (lVarNr != 0) {
+			gv = mizFiAtVar(a, lVarNr);
+			if (!(gv.origin == mizVkFreeVar || gv.origin == mizVkReservedVar))
+				mizFiError(a, pos, 163);
+			mizSubstAssign(resSubst, x, gv.varKind, gv.varNr);
+		} else mizSubstAssign(resSubst, x, mizVkReservedVar, rv.resVarNr);
+	});
+}
+
+// AnalyzeSimpleTerm (1275)
+mizFiAnalyzeSimpleTerm(a : MizFi, ident : int, pos : MizPos) -> MizWsSimpleTerm {
+	lVarNr = mizFiLookUpVar(a, ident);
+	varKind = ref mizVkConstant;
+	origin = ref mizVkConstant;
+	serialNr = ref 0;
+	nr = ref 0;
+	if (lVarNr != 0) {
+		gv = mizFiAtVar(a, lVarNr);
+		if (!gv.pending) {
+			origin := gv.origin;
+			varKind := gv.varKind;
+			serialNr := gv.serialNr;
+			nr := gv.varNr;
+		} else mizFiError(a, pos, 160);
+	} else {
+		rVarNr = mizFiLookUpResVar(a, ident);
+		origin := mizVkFreeVar;
+		varKind := mizVkFreeVar;
+		if (rVarNr != 0) {
+			rv = mizFiAtResVar(a, rVarNr);
+			if (rv.pending) mizFiError(a, pos, 160);
+			serialNr := rv.resVarNr;
+		} else mizFiError(a, pos, 140);
+	}
+	MizWsSimpleTerm(pos, ident, ^origin, ^varKind, ^serialNr, ^nr);
+}
+
+// ------------------------------------------------- the WithinExpr walker ---
+
+// abstract_syntax.pas WithinExprObj with its six concrete descendants of
+// first_identification.pas. The override set is small and closed, so the
+// dispatch is a `kind` switch, as the CONVENTIONS allow.
+mizWxFreeVars = 1;      // FreeVarsInExprObj
+mizWxFree2Res = 2;      // Free2ResVarsInExprObj
+mizWxAdjustScope = 3;   // AdjustFreeVarScopeObj
+mizWxAddFreeVar = 4;    // AddFreeVarInScopeObj
+mizWxSetVar = 5;        // SetVarInExpressionObj
+mizWxNoImplQual = 6;    // NoImplicitQualificationErrorObj
+
+MizWx(
+	a : MizFi,
+	kind : int,
+	freeVars : Vector<int>,
+	mutable freeVar : int,
+	mutable adjScopeNbr : int,
+	mutable adjScopeIndex : string,
+	mutable scopeIndex : string,
+	mutable branchNr : int,
+	// SetBoundVarStackedObj levels: (gVarNbr, gBoundVarNbr) saved on entry
+	stack : Vector<Pair<int, int>>,
+);
+
+mizWxMake(a : MizFi, kind : int, freeVar : int, adjScopeIndex : string) -> MizWx {
+	w = MizWx(a, kind, makeVector(8), freeVar, 0, adjScopeIndex, "", 64, makeVector(8));
+	if (kind == mizWxAddFreeVar || kind == mizWxSetVar) { aa = a; aa.boundVarNbr ::= 0; }
+	w;
+}
+
+// AdjustFreeVarScopeObj.Initialize (803)
+mizWxInitialize(w : MizWx, freeVar : int) -> void {
+	w.scopeIndex ::= "";
+	w.adjScopeIndex ::= "";
+	w.adjScopeNbr ::= 0;
+	w.branchNr ::= 64;   // pred('A')
+	w.freeVar ::= freeVar;
+}
+
+mizWxPushLevel(w : MizWx) -> void {
+	if (w.kind == mizWxAddFreeVar || w.kind == mizWxSetVar)
+		pushVector(w.stack, Pair(w.a.varNbr, w.a.boundVarNbr))
+	else pushVector(w.stack, Pair(-1, -1));
+}
+
+mizWxPopLevel(w : MizWx) -> void {
+	n = sizeVector(w.stack) - 1;
+	p = getVectorUnsafe(w.stack, n);
+	removeVector(w.stack, n);
+	if (p.first >= 0) {
+		aa = w.a;
+		aa.varNbr ::= p.first;
+		aa.boundVarNbr ::= p.second;
+	}
+}
+
+// AdjustFreeVarScopeObj.AdjustFreeVarScope (817) — the common prefix of the
+// scopes in which the free variable occurs
+mizWxAdjustFreeVarScope(w : MizWx) -> void {
+	if (w.adjScopeNbr > 0) {
+		if (w.adjScopeIndex != w.scopeIndex) {
+			la = strlen(w.adjScopeIndex);
+			ls = strlen(w.scopeIndex);
+			bound = if (la <= ls) la else ls;
+			diff = ref (bound + 1);
+			found = ref false;
+			fori(1, bound, \i -> {
+				if (!^found && getCharCodeAt(w.adjScopeIndex, i - 1) != getCharCodeAt(w.scopeIndex, i - 1)) {
+					diff := i;
+					found := true;
+				}
+			});
+			// delete(nAdjScopeIndex, lDifference, length) — keep the prefix
+			w.adjScopeIndex ::= substring(w.adjScopeIndex, 0, ^diff - 1);
+		}
+	} else w.adjScopeIndex ::= w.scopeIndex;
+	w.adjScopeNbr ::= w.adjScopeNbr + 1;
+}
+
+mizWxEnterBranch(w : MizWx) -> void {
+	w.branchNr ::= w.branchNr + 1;
+	w.scopeIndex ::= w.scopeIndex + fromCharCode(w.branchNr);
+	w.branchNr ::= 64;
+}
+
+mizWxLeaveBranch(w : MizWx) -> void {
+	n = strlen(w.scopeIndex);
+	w.branchNr ::= getCharCodeAt(w.scopeIndex, n - 1);
+	w.scopeIndex ::= substring(w.scopeIndex, 0, n - 1);
+}
+
+// ---- the hooks ----
+
+mizWxProcessVariable(w : MizWx, v : MizWsVariable) -> void {
+	if (w.kind == mizWxAddFreeVar || w.kind == mizWxSetVar) {
+		mizFiAppVar(w.a, v.ident, v.origin, mizVkBound, v.pos);
+		v.varKind ::= mizVkBound;
+		v.varNr ::= w.a.boundVarNbr;
+	}
+}
+
+mizWxProcessSimpleTerm(w : MizWx, t : MizWsSimpleTerm) -> void {
+	a = w.a;
+	if (w.kind == mizWxFreeVars) {
+		if (t.origin == mizVkFreeVar) mizNsInsert(w.freeVars, t.serialNr);
+	} else if (w.kind == mizWxFree2Res) {
+		if (t.origin == mizVkFreeVar && t.serialNr == w.freeVar)
+			t.origin ::= mizVkReservedVar;
+	} else if (w.kind == mizWxAddFreeVar) {
+		if (t.origin == mizVkFreeVar && t.serialNr == w.freeVar) {
+			t.origin ::= mizVkReservedVar;
+			t.varKind ::= mizVkBound;
+		}
+	} else if (w.kind == mizWxSetVar) {
+		if (t.varKind == mizVkBound) {
+			lVarNr = mizFiLookUpVar(a, t.ident);
+			t.varNr ::= mizFiAtVar(a, lVarNr).varNr;
+		} else if (t.origin == mizVkReservedVar) {
+			lVarNr = mizFiLookUpVar(a, t.ident);
+			gv = mizFiAtVar(a, lVarNr);
+			t.varKind ::= gv.varKind;
+			t.varNr ::= gv.varNr;
+		}
+	} else if (w.kind == mizWxAdjustScope) {
+		if (t.origin == mizVkFreeVar || t.origin == mizVkReservedVar) {
+			if (t.serialNr == w.freeVar) mizWxAdjustFreeVarScope(w)
+			else {
+				fa = mizFiAtResType(a, mizFiAtResVar(a, t.serialNr).resTypeNr).freeArgs;
+				done = ref false;
+				iterVector(mizNsCopy(fa), \x -> {
+					if (!^done && mizFiAtResVar(a, x).resVarNr == w.freeVar) {
+						mizWxAdjustFreeVarScope(w);
+						done := true;
+					}
+				});
+			}
+		}
+	} else if (w.kind == mizWxNoImplQual) {
+		if (t.origin == mizVkFreeVar || t.origin == mizVkReservedVar) {
+			if (!(w.freeVar == 0 || t.serialNr == 0)) {
+				if (t.serialNr == w.freeVar) mizFiError(a, t.pos, 143)
+				else {
+					fa = mizFiAtResType(a, mizFiAtResVar(a, t.serialNr).resTypeNr).freeArgs;
+					done = ref false;
+					iterVector(mizNsCopy(fa), \x -> {
+						if (!^done && mizFiAtResVar(a, x).resVarNr == w.freeVar) {
+							mizFiError(a, t.pos, 143);
+							done := true;
+						}
+					});
+				}
+			}
+		}
+	}
+}
+
+mizWxProcessImplSegment(w : MizWx, s : MizWsImplSegment) -> void {
+	a = w.a;
+	mizWxProcessVariable(w, s.ident);
+	if (w.kind == mizWxFreeVars) {
+		switch (s.resType) {
+			None(): {}
+			Some(rt): iterVector(rt.resSubst, \sb -> {
+				if (sb.y1 == mizVkReservedVar) mizNsInsert(w.freeVars, sb.y2);
+			});
+		}
+	} else if (w.kind == mizWxAdjustScope) {
+		fa = mizFiAtResType(a, mizFiAtResVar(a, s.ident.serialNr).resTypeNr).freeArgs;
+		has = mizNsHas(fa, w.freeVar);
+		inSubst = switch (s.resType) {
+			None(): false;
+			Some(rt): mizSubstHasInDom(rt.resSubst, w.freeVar);
+		};
+		if (has && !inSubst) mizWxAdjustFreeVarScope(w);
+	} else if (w.kind == mizWxSetVar) {
+		switch (s.resType) {
+			None(): {}
+			Some(rt): iterVector(rt.resSubst, \sb -> {
+				if (sb.y1 == mizVkReservedVar || sb.y1 == mizVkBound) {
+					rv = mizFiAtResVar(a, sb.x);
+					lVarNr = mizFiLookUpVar(a, rv.resVarId);
+					if (lVarNr != 0) {
+						gv = mizFiAtVar(a, lVarNr);
+						sb.y1 ::= gv.varKind;
+						sb.y2 ::= gv.varNr;
+					}
+				}
+			});
+		}
+	}
+}
+
+// ---- the generic walk ----
+
+mizWxProcessTermList(w : MizWx, ts : [MizWsTerm]) -> void {
+	iter(ts, \t -> { mizWxProcessTerm(w, t); {} });
+}
+
+mizWxProcessAdjective(w : MizWx, ad : MizWsAdjExpr) -> void {
+	switch (ad) {
+		MizWsAdjective(__, __, __, args): mizWxProcessTermList(w, args);
+		MizWsNegatedAdjective(__, arg): mizWxProcessAdjective(w, arg);
+	}
+}
+
+mizWxProcessType(w : MizWx, t : MizWsType) -> void {
+	switch (t) {
+		MizWsStandardType(__, __, args): mizWxProcessTermList(w, args);
+		MizWsStructType(__, __, args): mizWxProcessTermList(w, args);
+		MizWsClusteredType(__, cluster, typ): {
+			iter(cluster, \ad -> mizWxProcessAdjective(w, ad));
+			mizWxProcessType(w, typ);
+		}
+		default: {}
+	}
+}
+
+mizWxProcessVariablesSegment(w : MizWx, s : MizWsSegment) -> void {
+	switch (s) {
+		MizWsImplSegment(__, __, __): mizWxProcessImplSegment(w, s);
+		MizWsExplSegment(__, idents, typ): {
+			iter(idents, \v -> mizWxProcessVariable(w, v));
+			mizWxProcessType(w, typ);
+		}
+	}
+}
+
+// Process_QuantifiedFormula, overridden by AdjustFreeVarScope and AddFreeVar:
+// the scope is skipped when the quantifier binds the free variable itself.
+mizWxProcessQuantified(w : MizWx, f : MizWsFormula, segment : MizWsSegment,
+	scope : MizWsFormula, setScope : (MizWsFormula) -> void) -> void {
+	mizWxProcessVariablesSegment(w, segment);
+	skip = if (w.kind == mizWxAdjustScope || w.kind == mizWxAddFreeVar) {
+		switch (segment) {
+			MizWsImplSegment(__, ident, __): ident.serialNr == w.freeVar;
+			MizWsExplSegment(__, __, __): false;
+		}
+	} else false;
+	if (!skip) setScope(mizWxProcessFormula(w, scope));
+}
+
+mizWxProcessFormula(w : MizWx, f : MizWsFormula) -> MizWsFormula {
+	switch (f) {
+		MizWsNegatedFormula(__, arg): { f.arg ::= mizWxProcessFormula(w, arg); f }
+		MizWsConjunctiveFormula(__, l, r): {
+			f.left ::= mizWxProcessFormula(w, l);
+			f.right ::= mizWxProcessFormula(w, r); f
+		}
+		MizWsDisjunctiveFormula(__, l, r): {
+			f.left ::= mizWxProcessFormula(w, l);
+			f.right ::= mizWxProcessFormula(w, r); f
+		}
+		MizWsConditionalFormula(__, l, r): {
+			f.left ::= mizWxProcessFormula(w, l);
+			f.right ::= mizWxProcessFormula(w, r); f
+		}
+		MizWsBiconditionalFormula(__, l, r): {
+			f.left ::= mizWxProcessFormula(w, l);
+			f.right ::= mizWxProcessFormula(w, r); f
+		}
+		MizWsFlexaryConjunctiveFormula(__, l, r): {
+			f.left ::= mizWxProcessFormula(w, l);
+			f.right ::= mizWxProcessFormula(w, r); f
+		}
+		MizWsFlexaryDisjunctiveFormula(__, l, r): {
+			f.left ::= mizWxProcessFormula(w, l);
+			f.right ::= mizWxProcessFormula(w, r); f
+		}
+		MizWsRightSideOfPredicativeFormula(__, __, rargs): { mizWxProcessTermList(w, rargs); f }
+		MizWsPredicativeFormula(__, __, largs, rargs): {
+			mizWxProcessTermList(w, largs);
+			mizWxProcessTermList(w, rargs); f
+		}
+		MizWsMultiPredicativeFormula(__, scraps): {
+			f.scraps ::= map(scraps, \s -> mizWxProcessFormula(w, s)); f
+		}
+		MizWsPrivatePredicateFormula(__, __, args, __, __, __): {
+			mizWxProcessTermList(w, args); f
+		}
+		MizWsAttributiveFormula(__, subject, adjectives): {
+			f.subject ::= mizWxProcessTerm(w, subject);
+			iter(adjectives, \ad -> mizWxProcessAdjective(w, ad)); f
+		}
+		MizWsQualifyingFormula(__, subject, typ): {
+			f.subject ::= mizWxProcessTerm(w, subject);
+			mizWxProcessType(w, typ); f
+		}
+		MizWsUniversalFormula(__, segment, scope): {
+			mizWxPushLevel(w);
+			mizWxProcessQuantified(w, f, segment, scope, \nf -> f.scope ::= nf);
+			mizWxPopLevel(w); f
+		}
+		MizWsExistentialFormula(__, segment, scope): {
+			mizWxPushLevel(w);
+			mizWxProcessQuantified(w, f, segment, scope, \nf -> f.scope ::= nf);
+			mizWxPopLevel(w); f
+		}
+		default: f;
+	}
+}
+
+// Process_SimpleFraenkelTerm, overridden the same way as the quantifier
+mizWxProcessFraenkelHead(w : MizWx, postqual : [MizWsSegment],
+	sample : MizWsTerm, setSample : (MizWsTerm) -> void) -> void {
+	iter(postqual, \s -> mizWxProcessVariablesSegment(w, s));
+	skip = if (w.kind == mizWxAdjustScope || w.kind == mizWxAddFreeVar) {
+		exists(postqual, \s -> switch (s) {
+			MizWsImplSegment(__, ident, __): ident.serialNr == w.freeVar;
+			MizWsExplSegment(__, __, __): false;
+		});
+	} else false;
+	if (!skip) setSample(mizWxProcessTerm(w, sample));
+}
+
+mizWxProcessTerm(w : MizWx, t : MizWsTerm) -> MizWsTerm {
+	switch (t) {
+		MizWsSimpleTerm(__, __, __, __, __, __): { mizWxProcessSimpleTerm(w, t); t }
+		MizWsInfixTerm(__, __, largs, rargs): {
+			mizWxProcessTermList(w, largs);
+			mizWxProcessTermList(w, rargs); t
+		}
+		MizWsCircumfixTerm(__, __, __, args): { mizWxProcessTermList(w, args); t }
+		MizWsPrivateFunctorTerm(__, __, args, __, __, __): { mizWxProcessTermList(w, args); t }
+		MizWsAggregateTerm(__, __, args): { mizWxProcessTermList(w, args); t }
+		MizWsSelectorTerm(__, __, arg): { t.arg ::= mizWxProcessTerm(w, arg); t }
+		MizWsForgetfulFunctorTerm(__, __, arg): { t.arg ::= mizWxProcessTerm(w, arg); t }
+		MizWsFraenkelTerm(__, postqual, sample, formula): {
+			mizWxPushLevel(w);
+			mizWxEnterBranchIf(w);
+			mizWxProcessFraenkelHead(w, postqual, sample, \ns -> t.sample ::= ns);
+			mizWxFraenkelScope(w, t);
+			mizWxFinishFraenkel(w, t);
+			mizWxPopLevel(w); t
+		}
+		MizWsSimpleFraenkelTerm(__, postqual, sample): {
+			mizWxPushLevel(w);
+			mizWxEnterBranchIf(w);
+			mizWxProcessFraenkelHead(w, postqual, sample, \ns -> t.sample ::= ns);
+			mizWxFinishFraenkel(w, t);
+			mizWxPopLevel(w); t
+		}
+		MizWsQualificationTerm(__, subject, qualification): {
+			t.subject ::= mizWxProcessTerm(w, subject);
+			mizWxProcessType(w, qualification); t
+		}
+		MizWsExactlyTerm(__, subject): { t.subject ::= mizWxProcessTerm(w, subject); t }
+		MizWsGlobalChoiceTerm(__, choiceType): { mizWxProcessType(w, choiceType); t }
+		default: t;
+	}
+}
+
+// Process_StartFraenkelTerm — only the two scope visitors do anything
+mizWxEnterBranchIf(w : MizWx) -> void {
+	if (w.kind == mizWxAdjustScope || w.kind == mizWxAddFreeVar) mizWxEnterBranch(w);
+}
+
+// Process_FraenkelTermsScope (893 / 1040)
+mizWxFraenkelScope(w : MizWx, t : MizWsTerm) -> void {
+	switch (t) {
+		MizWsFraenkelTerm(__, __, __, formula): {
+			if (w.kind == mizWxAdjustScope || w.kind == mizWxAddFreeVar) {
+				mizWxEnterBranch(w);
+				nf = mizWxProcessFormula(w, formula);
+				t.formula ::= nf;
+				if (w.kind == mizWxAddFreeVar && w.scopeIndex == w.adjScopeIndex)
+					t.formula ::= mizWxWrapUniversal(w, t.formula, mizWsFormulaPos(t.formula));
+				mizWxLeaveBranch(w);
+			} else t.formula ::= mizWxProcessFormula(w, formula);
+		}
+		default: {}
+	}
+}
+
+// AddFreeVarInScopeObj.Process_FinishFraenkelTerm (1012) — prepend the segment
+mizWxFinishFraenkel(w : MizWx, t : MizWsTerm) -> void {
+	if (w.kind == mizWxAddFreeVar) {
+		if (w.scopeIndex == w.adjScopeIndex) {
+			a = w.a;
+			rv = mizFiAtResVar(a, w.freeVar);
+			pos = mizWsTermPos(t);
+			v = MizWsVariable(pos, rv.resVarId, mizVkReservedVar, mizVkBound, w.freeVar, 0);
+			rt = MizWsReservedDscrType(pos, v.ident, rv.resTypeNr, makeVector(4));
+			seg = MizWsImplSegment(pos, v, Some(rt));
+			mizFiAssignFreeVars(a, pos, w.freeVar, rt.resSubst);
+			switch (t) {
+				MizWsFraenkelTerm(__, postqual, __, __): t.postqual ::= concat([seg], postqual);
+				MizWsSimpleFraenkelTerm(__, postqual, __): t.postqual ::= concat([seg], postqual);
+				default: {}
+			}
+			w2 = mizWxMake(a, mizWxFree2Res, w.freeVar, "");
+			mizWxProcessTerm(w2, t);
+			{}
+		}
+		mizWxLeaveBranch(w);
+	} else if (w.kind == mizWxAdjustScope) mizWxLeaveBranch(w);
+}
+
+// the universal wrapper of AddFreeVarInScope / Process_FormulaWithFVScope
+mizWxWrapUniversal(w : MizWx, f : MizWsFormula, pos : MizPos) -> MizWsFormula {
+	a = w.a;
+	rv = mizFiAtResVar(a, w.freeVar);
+	v = MizWsVariable(pos, rv.resVarId, mizVkReservedVar, mizVkBound, w.freeVar, 0);
+	rt = MizWsReservedDscrType(pos, v.ident, rv.resTypeNr, makeVector(4));
+	seg = MizWsImplSegment(pos, v, Some(rt));
+	mizFiAssignFreeVars(a, pos, w.freeVar, rt.resSubst);
+	nf : MizWsFormula = MizWsUniversalFormula(pos, seg, f);
+	w2 = mizWxMake(a, mizWxFree2Res, w.freeVar, "");
+	mizWxProcessFormula(w2, nf);
+}
+
+// ================= the article walk (ProcessingArticleObj) ==================
+//
+// The generic walker of block_and_item.pas with FirstIdentArticleObj's
+// overrides folded in — there is exactly one descendant, as in M3 slice 3.
+
+mizFiTop(a : MizFi) -> MizFiLevel {
+	getVectorUnsafe(a.stack, sizeVector(a.stack) - 1);
+}
+
+mizFiTopSubexpr(a : MizFi) -> MizFiSubexprLevel {
+	l = mizFiTop(a);
+	switch (l) {
+		MizFiSubexprLevel(__): l;
+		default: MizFiSubexprLevel(0);
+	}
+}
+
+// ------------------------------------------------------------- labels ------
+
+// Process_Label (1468)
+mizFiProcessLabel(a : MizFi, lab : MizWsMaybeLabel) -> MizWsMaybeLabel {
+	a.propsNbr ::= a.propsNbr + 1;
+	switch (lab) {
+		MizWsNoLabel(): MizWsLabel(0, a.eh.curPos, a.propsNbr, 0);
+		MizWsLabel(idNr, pos, __, __): {
+			labelNr = ref 0;
+			if (idNr > 0) {
+				a.labNbr ::= a.labNbr + 1;
+				a.labCntr ::= a.labCntr + 1;
+				labelNr := a.labNbr - a.defLabNbr;
+				li = mizFiAtLab(a.labIdents, a.labNbr);
+				li.labId ::= idNr;
+				li.propNr ::= a.propsNbr;
+				li.labNr ::= a.labCntr;
+				li.pending ::= true;
+				li.definiensLab ::= false;
+			}
+			MizWsLabel(idNr, pos, a.propsNbr, ^labelNr);
+		}
+	}
+}
+
+// Process_DefiniensLabel (1503)
+mizFiProcessDefiniensLabel(a : MizFi, lab : MizWsMaybeLabel) -> MizWsMaybeLabel {
+	a.propsNbr ::= a.propsNbr + 1;
+	switch (lab) {
+		MizWsNoLabel(): MizWsLabel(0, a.eh.curPos, a.propsNbr, 0);
+		MizWsLabel(idNr, pos, __, __): {
+			labelNr = ref 0;
+			if (idNr > 0) {
+				a.defLabNbr ::= a.defLabNbr + 1;
+				labelNr := a.defLabBase + a.defLabNbr;
+				dl = mizFiAtLab(a.defLabels, a.defLabNbr);
+				dl.labId ::= idNr;
+				dl.propNr ::= a.propsNbr;
+				dl.labNr ::= 0;
+				dl.pending ::= true;
+				dl.definiensLab ::= true;
+				a.labNbr ::= a.labNbr + 1;
+				li = mizFiAtLab(a.labIdents, a.labNbr);
+				li.labId ::= dl.labId; li.propNr ::= dl.propNr; li.labNr ::= dl.labNr;
+				li.pending ::= dl.pending; li.definiensLab ::= dl.definiensLab;
+			}
+			MizWsLabel(idNr, pos, a.propsNbr, ^labelNr);
+		}
+	}
+}
+
+// Process_PrivateReference (1440)
+mizFiProcessPrivateReference(a : MizFi, r : MizWsLocalRef) -> void {
+	k = ref a.labNbr;
+	found = ref false;
+	refNr = ref 0; labNr = ref 0;
+	while(\ -> !^found && ^k >= 1, \ -> {
+		li = mizFiAtLab(a.labIdents, ^k);
+		if (li.labId == r.labId) {
+			found := true;
+			refNr := li.propNr;
+			labNr := li.labNr;
+			if (li.pending) {
+				mizFiError(a, r.pos, 145);
+				refNr := 0; labNr := 0;
+			}
+		};
+		k := ^k - 1;
+	});
+	if (!^found) mizFiError(a, r.pos, 144);
+	r.refNr ::= ^refNr;
+	r.labNr ::= ^labNr;
+}
+
+mizFiProcessReferences(a : MizFi, refs : [MizWsReference]) -> void {
+	iter(refs, \r -> switch (r) {
+		MizWsLocalRef(__, __, __, __): mizFiProcessPrivateReference(a, r);
+		default: {}
+	});
+}
+
+// ------------------------------------------------ justifications -----------
+
+// Process_StraightforwardJustification (1536) — a linked justification gains
+// an explicit local reference to the previous proposition
+mizFiProcessStraightforward(a : MizFi, j : MizWsStraightforward) -> void {
+	mizFiProcessReferences(a, j.refs);
+	if (j.linked) {
+		j.refs ::= concat([MizWsLocalRef(j.linkPos, 0, a.blockLevel.propsNbr, a.labCntr)], j.refs);
+	}
+	// ★ nLabelNr is NEVER set: the pass does not build an
+	// MSStraightforwardJustification, so Out_Link reads an unset field and the
+	// original writes 0 for every Link in the whole MML (675423 of them).
+}
+
+// Process_SchemeJustification (1554)
+mizFiProcessSchemeJust(a : MizFi, j : MizWsSchemeJust) -> void {
+	// ★ the pass REBUILDS the justification with Init(nInfPos, ...) and
+	// SchemeJustificationObj.Init sets nSchemeInfPos := aPos (wsmarticle.pas
+	// 1220) — the parser's scheme-name position is DISCARDED here.
+	j.schemeInfPos ::= j.pos;
+	if (j.schFileNr > 0) {
+		if (j.schemeIdNr == 0) mizError(a.eh, a.eh.curPos, 146);
+	} else if (j.schemeIdNr > 0) {
+		idx = mizSeqIndexOf(a.schemeIdent, j.schemeIdNr);
+		j.schemeNr ::= idx + 1 + a.canceledSch;
+		if (j.schemeNr == 0) mizError(a.eh, a.eh.curPos, 191);
+	}
+	mizFiProcessReferences(a, j.refs);
+}
+
+// NatSeq.IndexOf (mobjects.pas) — searches DOWNWARD, so it finds the LAST
+// occurrence; -1 when absent.
+mizSeqIndexOf(v : Vector<int>, x : int) -> int {
+	i = ref (sizeVector(v) - 1);
+	res = ref (-1);
+	while(\ -> ^res < 0 && ^i >= 0, \ -> {
+		if (getVectorUnsafe(v, ^i) == x) res := ^i;
+		i := ^i - 1;
+	});
+	^res;
+}
+
+mizFiProcessJustification(a : MizFi, j : MizWsJustification, block : Maybe<MizWsBlock>) -> void {
+	switch (j) {
+		MizWsStraightforward(__, __, __, __, __): mizFiProcessStraightforward(a, j);
+		MizWsSchemeJust(__, __, __, __, __, __): mizFiProcessSchemeJust(a, j);
+		MizWsProofJust(__): switch (block) { None(): {}; Some(b): mizFiProcessBlock(a, b); };
+		default: {}
+	}
+}
+
+// ------------------------------------------------------- expressions -------
+
+mizFiProcessTermList(a : MizFi, ts : [MizWsTerm]) -> [MizWsTerm] {
+	map(ts, \t -> mizFiProcessTerm(a, t));
+}
+
+mizFiProcessAdjective(a : MizFi, ad : MizWsAdjExpr) -> void {
+	switch (ad) {
+		MizWsAdjective(__, __, __, args): ad.args ::= mizFiProcessTermList(a, args);
+		MizWsNegatedAdjective(__, arg): mizFiProcessAdjective(a, arg);
+	}
+}
+
+mizFiProcessType(a : MizFi, t : MizWsType) -> void {
+	switch (t) {
+		MizWsStandardType(__, __, args): t.args ::= mizFiProcessTermList(a, args);
+		MizWsStructType(__, __, args): t.args ::= mizFiProcessTermList(a, args);
+		MizWsClusteredType(__, cluster, typ): {
+			iter(cluster, \ad -> mizFiProcessAdjective(a, ad));
+			mizFiProcessType(a, typ);
+		}
+		default: {}
+	}
+}
+
+// Process_Variable (1858)
+mizFiProcessVariable(a : MizFi, v : MizWsVariable) -> void {
+	mizFiAppVar(a, v.ident, mizVkBound, mizVkBound, v.pos);
+	gv = mizFiAtVar(a, a.varNbr);
+	v.origin ::= mizVkBound;
+	v.varKind ::= mizVkBound;
+	v.serialNr ::= gv.serialNr;
+	v.varNr ::= a.boundVarNbr;
+}
+
+// Process_FixedVariable (1911)
+mizFiProcessFixedVariable(a : MizFi, v : MizWsVariable) -> void {
+	mizFiAppVar(a, v.ident, mizVkConstant, mizVkConstant, v.pos);
+	gv = mizFiAtVar(a, a.varNbr);
+	v.origin ::= mizVkConstant;
+	v.varKind ::= mizVkConstant;
+	v.serialNr ::= gv.serialNr;
+	v.varNr ::= a.constVarNbr;
+	mizNsInsert(a.skelConstSet, a.varNbr);
+}
+
+// Process_ChoiceVariable (1935)
+mizFiProcessChoiceVariable(a : MizFi, v : MizWsVariable) -> void {
+	mizFiAppVar(a, v.ident, mizVkConstant, mizVkConstant, v.pos);
+	gv = mizFiAtVar(a, a.varNbr);
+	v.origin ::= mizVkConstant;
+	v.varKind ::= mizVkConstant;
+	v.serialNr ::= gv.serialNr;
+	v.varNr ::= a.constVarNbr;
+}
+
+// Process_DefConstant (1744)
+mizFiProcessDefConstant(a : MizFi, v : MizWsVariable) -> void {
+	mizFiAppVar(a, v.ident, mizVkDefConstant, mizVkConstant, v.pos);
+	gv = mizFiAtVar(a, a.varNbr);
+	v.origin ::= mizVkDefConstant;
+	v.varKind ::= mizVkConstant;
+	v.serialNr ::= gv.serialNr;
+	v.varNr ::= a.constVarNbr;
+}
+
+// MatchingImplicitlyQualifiedVariable (1870)
+mizFiMatchingImplSegment(a : MizFi, s : MizWsImplSegment, kind : int) -> void {
+	sid = s.ident;
+	lVarNr = mizFiLookUpResVar(a, sid.ident);
+	if (lVarNr == 0) mizFiError(a, s.pos, 140);
+	sid.serialNr ::= lVarNr;
+	{ gvv = mizFiAtVar(a, a.varNbr); gvv.serialNr ::= lVarNr; }
+	rt = MizWsReservedDscrType(s.pos, sid.ident,
+		mizFiAtResVar(a, lVarNr).resTypeNr, makeVector(4));
+	mizFiAssignFreeVars(a, s.pos, lVarNr, rt.resSubst);
+	if (kind == mizVkConstant || kind == mizVkDefConstant) {
+		iterVector(rt.resSubst, \sb -> {
+			if (sb.y1 == mizVkReservedVar) {
+				sb.y1 ::= kind;
+				sb.y2 ::= 0;
+				mizFiError(a, s.pos, 143);
+			}
+		});
+	}
+	s.resType ::= Some(rt);
+}
+
+mizFiProcessImplQualVariable(a : MizFi, s : MizWsImplSegment) -> void {
+	sid = s.ident;
+	mizFiProcessVariable(a, sid);
+	sid.origin ::= mizVkReservedVar;
+	{ gvv = mizFiAtVar(a, a.varNbr); gvv.origin ::= mizVkReservedVar; }
+	mizFiMatchingImplSegment(a, s, mizVkBound);
+}
+
+mizFiProcessImplQualFixedVariable(a : MizFi, s : MizWsImplSegment) -> void {
+	sid = s.ident;
+	mizFiProcessFixedVariable(a, sid);
+	sid.origin ::= mizVkReservedVar;
+	{ gvv = mizFiAtVar(a, a.varNbr); gvv.origin ::= mizVkReservedVar; }
+	mizFiMatchingImplSegment(a, s, mizVkConstant);
+}
+
+mizFiProcessImplQualChoiceVariable(a : MizFi, s : MizWsImplSegment) -> void {
+	sid = s.ident;
+	mizFiProcessChoiceVariable(a, sid);
+	sid.origin ::= mizVkReservedVar;
+	{ gvv = mizFiAtVar(a, a.varNbr); gvv.origin ::= mizVkReservedVar; }
+	mizFiMatchingImplSegment(a, s, mizVkConstant);
+}
+
+mizFiStartVariableSegment(a : MizFi) -> void { a.varSegmentBase ::= a.varNbr; }
+
+mizFiFinishVariableSegment(a : MizFi) -> void {
+	fori(a.varSegmentBase + 1, a.varNbr, \k -> { gvv = mizFiAtVar(a, k); gvv.pending ::= false; });
+	a.varSegmentBase ::= a.varNbr;
+}
+
+mizFiFinishOneVariableSegment(a : MizFi) -> void {
+	gvv = mizFiAtVar(a, a.varNbr);
+	gvv.pending ::= false;
+}
+
+// Process_VariablesSegment / FixedVariablesSegment / ChoiceVariablesSegment
+mizFiProcessVariablesSegment(a : MizFi, s : MizWsSegment) -> void {
+	mizFiStartVariableSegment(a);
+	switch (s) {
+		MizWsImplSegment(__, __, __): mizFiProcessImplQualVariable(a, s);
+		MizWsExplSegment(__, idents, typ): {
+			iter(idents, \v -> mizFiProcessVariable(a, v));
+			mizFiProcessType(a, typ);
+		}
+	}
+	mizFiFinishVariableSegment(a);
+}
+
+mizFiProcessFixedVariablesSegment(a : MizFi, s : MizWsSegment) -> void {
+	mizFiStartVariableSegment(a);
+	switch (s) {
+		MizWsImplSegment(__, __, __): mizFiProcessImplQualFixedVariable(a, s);
+		MizWsExplSegment(__, idents, typ): {
+			iter(idents, \v -> mizFiProcessFixedVariable(a, v));
+			mizFiProcessTypeWithFVScope(a, typ);
+		}
+	}
+	mizFiFinishVariableSegment(a);
+}
+
+mizFiProcessChoiceVariablesSegment(a : MizFi, s : MizWsSegment) -> void {
+	mizFiStartVariableSegment(a);
+	switch (s) {
+		MizWsImplSegment(__, __, __): mizFiProcessImplQualChoiceVariable(a, s);
+		MizWsExplSegment(__, idents, typ): {
+			iter(idents, \v -> mizFiProcessChoiceVariable(a, v));
+			mizFiProcessTypeWithFVScope(a, typ);
+		}
+	}
+	mizFiFinishVariableSegment(a);
+}
+
+// Process_Formula (943 in block_and_item, with the FirstIdent hooks)
+mizFiProcessFormula(a : MizFi, f : MizWsFormula) -> MizWsFormula {
+	switch (f) {
+		MizWsNegatedFormula(__, arg): { f.arg ::= mizFiProcessFormula(a, arg); f }
+		MizWsConjunctiveFormula(__, l, r): {
+			f.left ::= mizFiProcessFormula(a, l); f.right ::= mizFiProcessFormula(a, r); f
+		}
+		MizWsDisjunctiveFormula(__, l, r): {
+			f.left ::= mizFiProcessFormula(a, l); f.right ::= mizFiProcessFormula(a, r); f
+		}
+		MizWsConditionalFormula(__, l, r): {
+			f.left ::= mizFiProcessFormula(a, l); f.right ::= mizFiProcessFormula(a, r); f
+		}
+		MizWsBiconditionalFormula(__, l, r): {
+			f.left ::= mizFiProcessFormula(a, l); f.right ::= mizFiProcessFormula(a, r); f
+		}
+		MizWsFlexaryConjunctiveFormula(__, l, r): {
+			f.left ::= mizFiProcessFormula(a, l); f.right ::= mizFiProcessFormula(a, r); f
+		}
+		MizWsFlexaryDisjunctiveFormula(__, l, r): {
+			f.left ::= mizFiProcessFormula(a, l); f.right ::= mizFiProcessFormula(a, r); f
+		}
+		MizWsPredicativeFormula(__, __, largs, rargs): {
+			f.leftArgs ::= mizFiProcessTermList(a, largs);
+			f.rightArgs ::= mizFiProcessTermList(a, rargs); f
+		}
+		MizWsRightSideOfPredicativeFormula(__, __, rargs): {
+			f.rightArgs ::= mizFiProcessTermList(a, rargs); f
+		}
+		MizWsMultiPredicativeFormula(__, scraps): {
+			f.scraps ::= map(scraps, \s -> mizFiProcessFormula(a, s)); f
+		}
+		MizWsPrivatePredicateFormula(__, __, __, __, __, __): {
+			mizFiProcessPrivatePredicateFormula(a, f); f
+		}
+		MizWsAttributiveFormula(__, subject, adjectives): {
+			f.subject ::= mizFiProcessTerm(a, subject);
+			iter(adjectives, \ad -> mizFiProcessAdjective(a, ad)); f
+		}
+		MizWsQualifyingFormula(__, subject, typ): {
+			f.subject ::= mizFiProcessTerm(a, subject);
+			mizFiProcessType(a, typ); f
+		}
+		MizWsUniversalFormula(__, segment, scope): {
+			pushVector(a.stack, MizFiSubexprLevel(a.varNbr));
+			{ sx = mizFiTopSubexpr(a); sx.varNbr ::= a.varNbr; }
+			mizFiProcessVariablesSegment(a, segment);
+			f.scope ::= mizFiProcessFormula(a, scope);
+			a.varNbr ::= mizFiTopSubexpr(a).varNbr;
+			removeVector(a.stack, sizeVector(a.stack) - 1);
+			f
+		}
+		MizWsExistentialFormula(__, segment, scope): {
+			pushVector(a.stack, MizFiSubexprLevel(a.varNbr));
+			{ sx = mizFiTopSubexpr(a); sx.varNbr ::= a.varNbr; }
+			mizFiProcessVariablesSegment(a, segment);
+			f.scope ::= mizFiProcessFormula(a, scope);
+			a.varNbr ::= mizFiTopSubexpr(a).varNbr;
+			removeVector(a.stack, sizeVector(a.stack) - 1);
+			f
+		}
+		default: f;
+	}
+}
+
+// Process_PrivatePredicateFormula (2066)
+mizFiProcessPrivatePredicateFormula(a : MizFi, f : MizWsFormula) -> void {
+	switch (f) {
+		MizWsPrivatePredicateFormula(pos, predIdNr, args, __, __, __): {
+			lPredNr = mizFiLookUpPredVar(a, predIdNr, length(args));
+			if (lPredNr == 0) mizFiError(a, pos, 149);
+			f.args ::= mizFiProcessTermList(a, args);
+			pv = mizFiAtLocal(a.predVars, lPredNr);
+			f.predKind ::= pv.kind;
+			f.serialNr ::= pv.serialNr;
+			f.predNr ::= pv.nr;
+		}
+		default: {}
+	}
+}
+
+// Process_Term (1049 in block_and_item + FirstIdent's placeholder guard 2437)
+mizFiProcessTerm(a : MizFi, t : MizWsTerm) -> MizWsTerm {
+	switch (t) {
+		MizWsPlaceholderTerm(pos, locusNr): {
+			if (locusNr <= a.arityOfLocal) t
+			else {
+				mizError(a.eh, a.eh.curPos, 181);
+				MizWsErrorTerm(pos);
+			}
+		}
+		MizWsSimpleTerm(pos, ident, __, __, __, __): mizFiAnalyzeSimpleTerm(a, ident, pos);
+		MizWsInfixTerm(__, __, largs, rargs): {
+			t.leftArgs ::= mizFiProcessTermList(a, largs);
+			t.rightArgs ::= mizFiProcessTermList(a, rargs); t
+		}
+		MizWsCircumfixTerm(__, __, __, args): { t.args ::= mizFiProcessTermList(a, args); t }
+		MizWsPrivateFunctorTerm(pos, functorIdent, args, __, __, __): {
+			lFuncNr = mizFiLookUpFuncVar(a, functorIdent, length(args));
+			if (lFuncNr == 0) mizFiError(a, pos, 148);
+			t.args ::= mizFiProcessTermList(a, args);
+			fv = mizFiAtLocal(a.funcVars, lFuncNr);
+			t.funcKind ::= fv.kind;
+			t.serialNr ::= fv.serialNr;
+			t.funcNr ::= fv.nr;
+			t
+		}
+		MizWsAggregateTerm(__, __, args): { t.args ::= mizFiProcessTermList(a, args); t }
+		MizWsSelectorTerm(__, __, arg): { t.arg ::= mizFiProcessTerm(a, arg); t }
+		MizWsInternalSelectorTerm(pos, selectorSymbol, __): {
+			lFormatNr = mizLookUpPrefixFormat(a.formats, 85, selectorSymbol, 1);
+			lVarNr = ref 0;
+			fori(1, a.fieldNbr, \k -> {
+				if (^lVarNr == 0 && mizFiAtField(a, k) == lFormatNr) lVarNr := k;
+			});
+			if (^lVarNr == 0) mizFiError(a, pos, 154);
+			t.varNr ::= a.constVarNbr + ^lVarNr;
+			t
+		}
+		MizWsForgetfulFunctorTerm(__, __, arg): { t.arg ::= mizFiProcessTerm(a, arg); t }
+		MizWsFraenkelTerm(__, postqual, sample, formula): {
+			pushVector(a.stack, MizFiSubexprLevel(a.varNbr));
+			{ sx = mizFiTopSubexpr(a); sx.varNbr ::= a.varNbr; }
+			iter(postqual, \s -> mizFiProcessVariablesSegment(a, s));
+			t.sample ::= mizFiProcessTerm(a, sample);
+			t.formula ::= mizFiProcessFormula(a, formula);
+			a.varNbr ::= mizFiTopSubexpr(a).varNbr;
+			removeVector(a.stack, sizeVector(a.stack) - 1);
+			t
+		}
+		MizWsSimpleFraenkelTerm(__, postqual, sample): {
+			pushVector(a.stack, MizFiSubexprLevel(a.varNbr));
+			{ sx = mizFiTopSubexpr(a); sx.varNbr ::= a.varNbr; }
+			iter(postqual, \s -> mizFiProcessVariablesSegment(a, s));
+			t.sample ::= mizFiProcessTerm(a, sample);
+			a.varNbr ::= mizFiTopSubexpr(a).varNbr;
+			removeVector(a.stack, sizeVector(a.stack) - 1);
+			t
+		}
+		MizWsQualificationTerm(__, subject, qualification): {
+			t.subject ::= mizFiProcessTerm(a, subject);
+			mizFiProcessType(a, qualification); t
+		}
+		MizWsExactlyTerm(__, subject): { t.subject ::= mizFiProcessTerm(a, subject); t }
+		MizWsGlobalChoiceTerm(__, choiceType): { mizFiProcessType(a, choiceType); t }
+		default: t;
+	}
+}
+
+// ------------------------------------------- the free-variable scope pass --
+
+// the shared body of Process_TypeWithFVScope / TermWithFVScope (2455 / 2513)
+mizFiFVScopeExpr(a : MizFi, pos : MizPos, walk : (MizWx) -> void,
+	reportNoQual : bool) -> void {
+	lFV = mizWxMake(a, mizWxFreeVars, 0, "");
+	walk(lFV);
+	if (sizeVector(lFV.freeVars) > 0) {
+		mizFiCompleteFreeVars(a, lFV.freeVars);
+		lAFV = mizWxMake(a, mizWxAdjustScope, 0, "");
+		lNIQ = mizWxMake(a, mizWxNoImplQual, 0, "");
+		items = mizNsCopy(lFV.freeVars);
+		i = ref (sizeVector(items) - 1);
+		while(\ -> ^i >= 0, \ -> {
+			x = getVectorUnsafe(items, ^i);
+			mizWxInitialize(lAFV, x);
+			walk(lAFV);
+			if (strlen(lAFV.adjScopeIndex) == 0) {
+				if (reportNoQual) {
+					lNIQ.freeVar ::= x;
+					walk(lNIQ);
+					if (x != 0) mizFiError(a, pos, 143);
+				}
+			} else {
+				lAdd = mizWxMake(a, mizWxAddFreeVar, x, lAFV.adjScopeIndex);
+				walk(lAdd);
+			}
+			i := ^i - 1;
+		});
+	}
+	mizNsClear(a.lastFreeVars);
+	lSBV = mizWxMake(a, mizWxSetVar, 0, "");
+	walk(lSBV);
+}
+
+mizFiProcessTypeWithFVScope(a : MizFi, t : MizWsType) -> void {
+	mizFiProcessType(a, t);
+	mizFiFVScopeExpr(a, mizWsTypePos(t), \w -> mizWxProcessType(w, t),
+		!a.processingReservationSegment);
+}
+
+mizFiProcessTermWithFVScope(a : MizFi, t : MizWsTerm) -> MizWsTerm {
+	nt = mizFiProcessTerm(a, t);
+	mizFiFVScopeExpr(a, mizWsTermPos(nt), \w -> { mizWxProcessTerm(w, nt); {} }, true);
+	nt;
+}
+
+// Process_FormulaWithFVScope (2568) — the one that WRAPS the formula
+mizFiProcessFormulaWithFVScope(a : MizFi, f0 : MizWsFormula) -> MizWsFormula {
+	frm = ref mizFiProcessFormula(a, f0);
+	pos = mizWsFormulaPos(^frm);
+	lFV = mizWxMake(a, mizWxFreeVars, 0, "");
+	mizWxProcessFormula(lFV, ^frm);
+	if (sizeVector(lFV.freeVars) > 0) {
+		mizFiCompleteFreeVars(a, lFV.freeVars);
+		lAFV = mizWxMake(a, mizWxAdjustScope, 0, "");
+		i = ref (sizeVector(lFV.freeVars) - 1);
+		while(\ -> ^i >= 0 && sizeVector(lFV.freeVars) > 0, \ -> {
+			x = getVectorUnsafe(lFV.freeVars, ^i);
+			mizWxInitialize(lAFV, x);
+			mizWxProcessFormula(lAFV, ^frm);
+			if (strlen(lAFV.adjScopeIndex) == 0) {
+				// already bound by an enclosing implicit quantifier?
+				bound = ref false;
+				lFrm = ref ^frm;
+				stop = ref false;
+				while(\ -> !^stop, \ -> {
+					switch (^lFrm) {
+						MizWsNegatedFormula(__, arg): lFrm := arg;
+						MizWsUniversalFormula(__, segment, scope): {
+							switch (segment) {
+								MizWsImplSegment(__, ident, __):
+									if (ident.serialNr == x) { bound := true; stop := true; };
+								default: {}
+							};
+							if (!^stop) lFrm := scope;
+						}
+						MizWsExistentialFormula(__, segment, scope): {
+							switch (segment) {
+								MizWsImplSegment(__, ident, __):
+									if (ident.serialNr == x) { bound := true; stop := true; };
+								default: {}
+							};
+							if (!^stop) lFrm := scope;
+						}
+						default: stop := true;
+					}
+				});
+				if (^bound) mizNsAtDelete(lFV.freeVars, ^i)
+				else {
+					w2 = mizWxMake(a, mizWxAddFreeVar, x, "");
+					frm := mizWxWrapUniversal(w2, ^frm, pos);
+				}
+			} else {
+				lAdd = mizWxMake(a, mizWxAddFreeVar, x, lAFV.adjScopeIndex);
+				frm := mizWxProcessFormula(lAdd, ^frm);
+				mizNsAtDelete(lFV.freeVars, ^i);
+			}
+			i := ^i - 1;
+		});
+	}
+	mizNsClear(a.lastFreeVars);
+	if (sizeVector(lFV.freeVars) > 0) mizNsEnlargeBy(a.lastFreeVars, lFV.freeVars);
+	lSBV = mizWxMake(a, mizWxSetVar, 0, "");
+	mizWxProcessFormula(lSBV, ^frm);
+}
+
+// ------------------------------------------------ propositions and items ---
+
+mizFiProcessProposition(a : MizFi, p : MizWsProposition) -> void {
+	p.lab ::= mizFiProcessLabel(a, p.lab);
+	p.sentence ::= mizFiProcessFormulaWithFVScope(a, p.sentence);
+	mizNsClear(a.lastFreeVars);
+}
+
+mizFiProcessConditions(a : MizFi, ps : [MizWsProposition]) -> void {
+	iter(ps, \p -> mizFiProcessProposition(a, p));
+}
+
+mizFiProcessAssumptionConditions(a : MizFi, asm : MizWsAssumption) -> void {
+	switch (asm) {
+		MizWsSingleAssumption(__, prop): mizFiProcessProposition(a, prop);
+		MizWsCollectiveAssumption(__, conditions): mizFiProcessConditions(a, conditions);
+	}
+}
+
+// Process_CompactStatement (2412)
+mizFiProcessCompactStatement(a : MizFi, prop : MizWsProposition,
+	just : MizWsJustification, block : Maybe<MizWsBlock>) -> void {
+	prop.lab ::= mizFiProcessLabel(a, prop.lab);
+	prop.sentence ::= mizFiProcessFormulaWithFVScope(a, prop.sentence);
+	isProof = switch (just) { MizWsProofJust(__): true; default: false; };
+	if (!isProof) mizNsClear(a.lastFreeVars);
+	mizFiProcessJustification(a, just, block);
+}
+
+mizFiProcessRegularStatement(a : MizFi, st : MizWsStatement, block : Maybe<MizWsBlock>) -> void {
+	switch (st) {
+		MizWsDiffuseStatement(lab): {
+			st.lab ::= mizFiProcessLabel(a, lab);
+			switch (block) { None(): {}; Some(b): mizFiProcessBlock(a, b); }
+		}
+		MizWsCompactStatement(prop, just): mizFiProcessCompactStatement(a, prop, just, block);
+		MizWsIterativeEquality(prop, just, steps): {
+			mizFiProcessCompactStatement(a, prop, just, None());
+			iter(steps, \s -> {
+				s.term ::= mizFiProcessTermWithFVScope(a, s.term);
+				mizFiProcessJustification(a, s.justification, None());
+			});
+		}
+	}
+}
+
+mizFiProcessChoiceStatement(a : MizFi, c : MizWsChoiceStatement) -> void {
+	iter(c.qualVars, \s -> mizFiProcessChoiceVariablesSegment(a, s));
+	mizFiProcessConditions(a, c.conditions);
+	mizFiProcessJustification(a, c.justification, None());
+}
+
+// Process_StartReservedVariables (2088)
+mizFiStartReservedVariables(a : MizFi) -> void {
+	a.resVarBase ::= a.resVarNbr;
+	a.varSegmentBase ::= a.varNbr;
+	a.processingReservationSegment ::= true;
+}
+
+// Process_ReservedVariable (2199)
+mizFiProcessReservedVariable(a : MizFi, v : MizWsVariable) -> void {
+	a.resVarNbr ::= a.resVarNbr + 1;
+	rv = mizFiAtResVar(a, a.resVarNbr);
+	rv.resVarId ::= v.ident;
+	rv.resVarPos ::= v.pos;
+	rv.resVarNr ::= a.resVarNbr;
+	rv.pending ::= true;
+	rv.resTypeNr ::= a.resTypeNbr + 1;
+	mizNsClear(rv.freeVars);
+	v.origin ::= mizVkReservedVar;
+	v.varKind ::= mizVkReservedVar;
+	v.serialNr ::= a.resVarNbr;
+	v.varNr ::= 0;
+}
+
+// Process_FinishReservedVariables (2222)
+mizFiFinishReservedVariables(a : MizFi, seg : MizWsReservationSegment) -> void {
+	a.resTypeNbr ::= a.resTypeNbr + 1;
+	rt0 = mizFiAtResType(a, a.resTypeNbr);
+	rt0.typ ::= seg.resType;
+	lFV = mizWxMake(a, mizWxFreeVars, 0, "");
+	mizWxProcessType(lFV, seg.resType);
+	if (sizeVector(lFV.freeVars) > 0) mizFiCompleteFreeVars(a, lFV.freeVars);
+	iterVector(mizNsCopy(lFV.freeVars), \x -> {
+		w = mizWxMake(a, mizWxFree2Res, x, "");
+		mizWxProcessType(w, seg.resType);
+	});
+	lVarNbr = a.varNbr;
+	lFreeVars : Vector<MizWsType> = makeVector(4);
+	iterVector(mizNsCopy(lFV.freeVars), \x -> {
+		rv = mizFiAtResVar(a, x);
+		if (rv.resVarId > 0) {
+			mizFiAppVar(a, rv.resVarId, mizVkReservedVar, mizVkBound, rv.resVarPos);
+			rVarNr = mizFiLookUpResVar(a, rv.resVarId);
+			if (rVarNr == 0) mizFiError(a, rv.resVarPos, 140);
+			gvv = mizFiAtVar(a, a.varNbr);
+			gvv.varNr ::= a.boundVarNbr;
+			lResType = MizWsReservedDscrType(rv.resVarPos, rv.resVarId, rv.resTypeNr, makeVector(4));
+			iterVector(mizNsCopy(mizFiAtResType(a, rv.resTypeNr).freeArgs), \y -> {
+				rv2 = mizFiAtResVar(a, y);
+				lVarNr = mizFiLookUpVar(a, rv2.resVarId);
+				gv2 = mizFiAtVar(a, lVarNr);
+				if (!(gv2.origin == mizVkFreeVar || gv2.origin == mizVkReservedVar))
+					mizFiError(a, rv.resVarPos, 163);
+				mizSubstAssign(lResType.resSubst, y, gv2.varKind, gv2.varNr);
+			});
+			pushVector(lFreeVars, lResType);
+		}
+	});
+	lSBV = mizWxMake(a, mizWxSetVar, 0, "");
+	mizWxProcessType(lSBV, seg.resType);
+	a.varNbr ::= lVarNbr;
+	a.boundVarNbr ::= 0;
+	lVars = mizNsCopy(lFV.freeVars);
+	while(\ -> sizeVector(lVars) > 0, \ -> {
+		rv = mizFiAtResVar(a, getVectorUnsafe(lVars, sizeVector(lVars) - 1));
+		fa = mizFiAtResType(a, rv.resTypeNr).freeArgs;
+		mizNsEnlargeBy(lVars, mizNsCopy(fa));
+		mizNsEnlargeBy(lFV.freeVars, mizNsCopy(fa));
+		mizNsAtDelete(lVars, sizeVector(lVars) - 1);
+	});
+	seg.resVars ::= vector2array(lFV.freeVars);
+	seg.freeVars ::= vector2array(lFreeVars);
+	rt = mizFiAtResType(a, a.resTypeNbr);
+	mizNsClear(rt.freeArgs);
+	mizNsEnlargeBy(rt.freeArgs, lFV.freeVars);
+	fori(a.resVarBase + 1, a.resVarNbr, \k -> { rvv = mizFiAtResVar(a, k); rvv.pending ::= false; });
+	a.resVarBase ::= a.resVarNbr;
+	a.processingReservationSegment ::= false;
+}
+
+mizFiProcessReservationSegment(a : MizFi, seg : MizWsReservationSegment) -> void {
+	mizFiStartReservedVariables(a);
+	iter(seg.idents, \v -> mizFiProcessReservedVariable(a, v));
+	mizFiProcessTypeWithFVScope(a, seg.resType);
+	mizFiFinishReservedVariables(a, seg);
+}
+
+// ------------------------------------------------------------ patterns -----
+
+// Process_Locus (2095)
+mizFiProcessLocus(a : MizFi, l : MizWsLocus) -> void {
+	lVarNr = mizFiLookUpVar(a, l.varId);
+	if (lVarNr == 0) mizFiError(a, l.pos, 140);
+	gv = mizFiAtVar(a, lVarNr);
+	l.origin ::= gv.origin;
+	l.varKind ::= gv.varKind;
+	l.serialNr ::= gv.serialNr;
+	l.varNr ::= gv.varNr;
+	k = ref a.varNbr;
+	done = ref false;
+	while(\ -> !^done && ^k >= a.defVarBase + 1, \ -> {
+		v = mizFiAtVar(a, ^k);
+		if (v.varIdent == l.varId) {
+			done := true;
+			if (mizNsHas(a.skelConstSet, ^k)) {
+				if (mizNsHas(a.involved, v.varNr)) {
+					mizFiError(a, l.pos, 141);
+					l.varNr ::= 0;
+				};
+				mizNsInsert(a.involved, v.varNr);
+			} else {
+				mizFiError(a, l.pos, 179);
+				l.varNr ::= 0;
+			}
+		};
+		k := ^k - 1;
+	});
+	if (!^done) {
+		mizFiError(a, l.pos, 142);
+		l.varNr ::= 0;
+	}
+}
+
+mizFiProcessLoci(a : MizFi, ls : [MizWsLocus]) -> void {
+	iter(ls, \l -> mizFiProcessLocus(a, l));
+}
+
+// Process_Pattern (2136)
+mizFiProcessPattern(a : MizFi, p : MizWsPattern) -> void {
+	mizNsClear(a.involved);
+	switch (p) {
+		MizWsPredPattern(__, __, leftArgs, rightArgs): {
+			mizFiProcessLoci(a, leftArgs);
+			mizFiProcessLoci(a, rightArgs);
+		}
+		MizWsInfixFunctorPattern(__, __, leftArgs, rightArgs): {
+			mizFiProcessLoci(a, leftArgs);
+			mizFiProcessLoci(a, rightArgs);
+		}
+		MizWsCircumfixFunctorPattern(__, __, __, args): mizFiProcessLoci(a, args);
+		MizWsModePattern(__, __, args): mizFiProcessLoci(a, args);
+		MizWsAttrPattern(__, __, arg, args): {
+			mizFiProcessLocus(a, arg);
+			mizFiProcessLoci(a, args);
+			if (arg.varNr != a.varNbr) mizFiError(a, arg.pos, 374);
+		}
+	}
+}
+
+mizFiProcessLociEqualities(a : MizFi, es : [MizWsLociEquality]) -> void {
+	mizNsClear(a.involved);
+	iter(es, \e -> {
+		mizFiProcessLocus(a, e.left);
+		mizFiProcessLocus(a, e.right);
+	});
+}
+
+// ---------------------------------------------------------- definiens ------
+
+mizFiProcessDefExpr(a : MizFi, e : MizWsDefExpr) -> void {
+	if (e.exprKind == mizExTerm) {
+		switch (e.term) { None(): {}; Some(t): e.term ::= Some(mizFiProcessTermWithFVScope(a, t)); }
+	} else if (e.exprKind == mizExFormula) {
+		switch (e.formula) {
+			None(): {}
+			Some(fm): {
+				e.formula ::= Some(mizFiProcessFormulaWithFVScope(a, fm));
+				mizNsClear(a.lastFreeVars);
+			}
+		}
+	}
+}
+
+mizFiProcessDefiniens(a : MizFi, d : Maybe<MizWsDefiniens>) -> void {
+	switch (d) {
+		None(): {}
+		Some(def): switch (def) {
+			MizWsSimpleDefiniens(__, lab, expr): {
+				def.lab ::= mizFiProcessDefiniensLabel(a, lab);
+				mizFiProcessDefExpr(a, expr);
+			}
+			MizWsConditionalDefiniens(__, lab, partials, otherwise): {
+				def.lab ::= mizFiProcessDefiniensLabel(a, lab);
+				iter(partials, \pd -> {
+					mizFiProcessDefExpr(a, pd.partDefiniens);
+					pd.guard ::= mizFiProcessFormulaWithFVScope(a, pd.guard);
+					mizNsClear(a.lastFreeVars);
+				});
+				switch (otherwise) { None(): {}; Some(ow): mizFiProcessDefExpr(a, ow); }
+			}
+		}
+	}
+}
+
+// ------------------------------------------------------ schemes ------------
+
+mizFiProcessSchemeHead(a : MizFi, sch : MizWsScheme) -> void {
+	a.schFuncBase ::= a.schFuncNbr;
+	a.schPredBase ::= a.schPredNbr;
+	// gSchemeIdent is a NatSeq: InsertElem ALWAYS appends, duplicates included
+	pushVector(a.schemeIdent, sch.idNr);
+	sch.schemeNr ::= sizeVector(a.schemeIdent) + a.canceledSch;
+	iter(sch.params, \sg -> {
+		a.availableLocPredNbr ::= a.locPredNbr;
+		a.availableLocFuncNbr ::= a.locFuncNbr;
+		switch (sg) {
+			MizWsPredicateSegment(__, vars, typeExpList): {
+				iter(vars, \v -> mizFiProcessSchemePredicateVariable(a, v, length(typeExpList)));
+				iter(typeExpList, \t -> mizFiProcessTypeWithFVScope(a, t));
+			}
+			MizWsFunctorSegment(__, vars, typeExpList, specification): {
+				iter(vars, \v -> mizFiProcessSchemeFunctorVariable(a, v, length(typeExpList)));
+				iter(typeExpList, \t -> mizFiProcessTypeWithFVScope(a, t));
+				mizFiProcessTypeWithFVScope(a, specification);
+			}
+		}
+		a.availableLocPredNbr ::= a.locPredNbr;
+		a.availableLocFuncNbr ::= a.locFuncNbr;
+	});
+}
+
+mizFiProcessSchemePredicateVariable(a : MizFi, v : MizWsVariable, argNbr : int) -> void {
+	a.schPredNbr ::= a.schPredNbr + 1;
+	v.origin ::= mizVkSchematicPred;
+	v.varKind ::= mizVkSchematicPred;
+	v.serialNr ::= a.schPredNbr;
+	v.varNr ::= a.schPredNbr - a.schPredBase;
+	mizFiAppPredVar(a, v.ident, v.pos, mizVkSchematicPred, a.schPredNbr,
+		a.schPredNbr - a.schPredBase, argNbr);
+}
+
+mizFiProcessSchemeFunctorVariable(a : MizFi, v : MizWsVariable, argNbr : int) -> void {
+	a.schFuncNbr ::= a.schFuncNbr + 1;
+	v.origin ::= mizVkSchematicFunc;
+	v.varKind ::= mizVkSchematicFunc;
+	v.serialNr ::= a.schFuncNbr;
+	v.varNr ::= a.schFuncNbr - a.schFuncBase;
+	mizFiAppFuncVar(a, v.ident, v.pos, mizVkSchematicFunc, a.schFuncNbr,
+		a.schFuncNbr - a.schFuncBase, argNbr);
+}
+
+// ---------------------------------------------------- blocks and items -----
+
+mizFiStartBlock(a : MizFi, b : MizWsBlock, lvl : MizFiBlockLevel) -> void {
+	lvl.labNbr ::= a.labNbr;
+	lvl.labCntr ::= a.labCntr;
+	lvl.propsNbr ::= a.propsNbr + 1;
+	lvl.locFuncNbr ::= a.locFuncNbr;
+	lvl.locPredNbr ::= a.locPredNbr;
+	a.availableLocFuncNbr ::= a.locFuncNbr;
+	a.availableLocPredNbr ::= a.locPredNbr;
+	lvl.varNbr ::= a.varNbr;
+	lvl.constVarNbr ::= a.constVarNbr;
+	lvl.privFuncBase ::= a.privFuncNbr;
+	lvl.privPredBase ::= a.privPredNbr;
+	if (b.kind == mizBlNotation || b.kind == mizBlRegistration || b.kind == mizBlDefinition) {
+		a.defLabNbr ::= 0;
+		a.defLabBase ::= a.labNbr;
+		a.defVarBase ::= a.varNbr;
+		mizNsClear(a.skelConstSet);
+	} else if (b.kind == mizBlProof) {
+		// the reserved variables the statement left free become Generalization
+		// items at the head of the proof (first_identification.pas 1631)
+		if (sizeVector(a.lastFreeVars) > 0) {
+			gen = map(vector2array(a.lastFreeVars), \x -> {
+				rv = mizFiAtResVar(a, x);
+				it = mizWsNewItem(mizItGeneralization, b.pos);
+				it.content ::= MizWsSegmentContent(
+					mizWsMakeImplSegment(b.pos, mizWsMakeVariable(b.pos, rv.resVarId)));
+				it
+			});
+			old = vector2array(b.items);
+			clearVector(b.items);
+			iter(gen, \it -> pushVector(b.items, it));
+			iter(old, \it -> pushVector(b.items, it));
+			mizNsClear(a.lastFreeVars);
+		}
+	}
+}
+
+mizFiFinishBlock(a : MizFi, b : MizWsBlock, lvl : MizFiBlockLevel) -> void {
+	a.labNbr ::= lvl.labNbr;
+	a.labCntr ::= lvl.labCntr;
+	a.propsNbr ::= lvl.propsNbr;
+	if (sizeVector(a.stack) >= 2) {
+		prev = getVectorUnsafe(a.stack, sizeVector(a.stack) - 2);
+		switch (prev) {
+			MizFiItemLevel(__, __, __, __): prev.itemWithBlock ::= true;
+			default: {}
+		}
+	}
+	if (b.kind == mizBlDefinition) {
+		fori(1, a.defLabNbr, \i -> {
+			a.labNbr ::= a.labNbr + 1;
+			a.labCntr ::= a.labCntr + 1;
+			src = mizFiAtLab(a.defLabels, i);
+			dst = mizFiAtLab(a.labIdents, a.labNbr);
+			dst.labId ::= src.labId;
+			dst.propNr ::= src.propNr;
+			dst.definiensLab ::= src.definiensLab;
+			dst.labNr ::= a.labCntr;
+			dst.pending ::= false;
+		});
+		a.defLabNbr ::= 0;
+	}
+	a.varNbr ::= lvl.varNbr;
+	a.constVarNbr ::= lvl.constVarNbr;
+	a.locFuncNbr ::= lvl.locFuncNbr;
+	a.locPredNbr ::= lvl.locPredNbr;
+	a.availableLocFuncNbr ::= a.locFuncNbr;
+	a.availableLocPredNbr ::= a.locPredNbr;
+	a.privFuncNbr ::= lvl.privFuncBase;
+	a.privPredNbr ::= lvl.privPredBase;
+}
+
+mizFiProcessBlock(a : MizFi, b : MizWsBlock) -> void {
+	prevBlock = a.blockLevel;
+	lvl = MizFiBlockLevel(b.kind, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+	pushVector(a.stack, lvl);
+	{ eh1 = a.eh; eh1.curPos ::= b.pos; }
+	mizFiStartBlock(a, b, lvl);
+	a.blockLevel ::= lvl;
+	iterVector(b.items, \it -> mizFiProcessItem(a, it));
+	{ eh2 = a.eh; eh2.curPos ::= b.endPos; }
+	mizFiFinishBlock(a, b, lvl);
+	a.blockLevel ::= prevBlock;
+	removeVector(a.stack, sizeVector(a.stack) - 1);
+}
+
+mizFiStartItem(a : MizFi, it : MizWsItem, lvl : MizFiItemLevel) -> void {
+	lvl.itemWithBlock ::= false;
+	lvl.lastLabelNbr ::= a.labNbr;
+	if (it.kind == mizItRegularStatement || it.kind == mizItConclusion
+		|| it.kind == mizItTheorem) lvl.lastPropsNbr ::= a.propsNbr + 1;
+}
+
+mizFiFinishItem(a : MizFi, it : MizWsItem, lvl : MizFiItemLevel) -> void {
+	blk = a.blockLevel;
+	if (it.kind == mizItRegularStatement || it.kind == mizItConclusion
+		|| it.kind == mizItTheorem) {
+		if (!lvl.itemWithBlock) blk.propsNbr ::= a.propsNbr
+		else blk.propsNbr ::= lvl.lastPropsNbr;
+	} else if (it.kind == mizItAssumption || it.kind == mizItCaseHead
+		|| it.kind == mizItSupposeHead) blk.propsNbr ::= a.propsNbr
+	else blk.propsNbr ::= a.propsNbr + 1;
+	fori(lvl.lastLabelNbr + 1, a.labNbr, \i -> {
+		li = mizFiAtLab(a.labIdents, i);
+		if (!li.definiensLab) li.pending ::= false;
+	});
+}
+
+mizFiProcessItem(a : MizFi, it : MizWsItem) -> void {
+	{ eh3 = a.eh; eh3.curPos ::= it.pos; }
+	lvl = MizFiItemLevel(it.kind, false, 0, 0);
+	pushVector(a.stack, lvl);
+	mizFiStartItem(a, it, lvl);
+	mizFiProcessItemContent(a, it);
+	{ eh4 = a.eh; eh4.curPos ::= it.endPos; }
+	mizFiFinishItem(a, it, lvl);
+	removeVector(a.stack, sizeVector(a.stack) - 1);
+}
+
+mizFiProcessItemContent(a : MizFi, it : MizWsItem) -> void {
+	kind = it.kind;
+	blk = it.block;
+	c = it.content;
+	if (kind == mizItDefinition || kind == mizItSchemeBlock || kind == mizItCaseBlock) {
+		switch (blk) { None(): {}; Some(b): mizFiProcessBlock(a, b); }
+	} else switch (c) {
+		MizWsSchemeContent(sch): {
+			mizFiProcessSchemeHead(a, sch);
+			sch.conclusion ::= mizFiProcessFormulaWithFVScope(a, sch.conclusion);
+			mizNsClear(a.lastFreeVars);
+			mizFiProcessConditions(a, sch.premises);
+		}
+		MizWsStatementContent(st): {
+			if (kind == mizItTheorem) {
+				switch (st) {
+					MizWsCompactStatement(prop, just): mizFiProcessCompactStatement(a, prop, just, blk);
+					default: mizFiProcessRegularStatement(a, st, blk);
+				}
+			} else mizFiProcessRegularStatement(a, st, blk);
+		}
+		MizWsReservationSegment(__, __, __, __): mizFiProcessReservationSegment(a, c);
+		MizWsChoiceStatement(__, __, __): mizFiProcessChoiceStatement(a, c);
+		MizWsTypeChangingStatement(changes, typeExpr, just): {
+			a.recVarSegmentBase ::= a.varNbr;
+			iter(changes, \tc -> {
+				if (tc.kind == 0) {
+					// Process_RedefinedVariable (1714)
+					mizFiProcessDefConstant(a, tc.var_);
+					switch (tc.term) {
+						None(): {}
+						Some(t): tc.term ::= Some(mizFiProcessTermWithFVScope(a, t));
+					}
+				} else {
+					// Process_ImplicitlyRedefinedVariable (1704) — `reconsider x as T`
+					v = tc.var_;
+					tc.term ::= Some(mizFiAnalyzeSimpleTerm(a, v.ident, v.pos));
+					tc.kind ::= 0;
+					mizFiProcessDefConstant(a, v);
+				}
+			});
+			mizFiProcessTypeWithFVScope(a, typeExpr);
+			mizFiProcessJustification(a, just, None());
+			fori(a.recVarSegmentBase + 1, a.varNbr, \k -> { gvv = mizFiAtVar(a, k); gvv.pending ::= false; });
+			a.recVarSegmentBase ::= a.varNbr;
+		}
+		MizWsPrivFuncDefinition(funcId, typeExpList, term): {
+			a.availableLocFuncNbr ::= a.locFuncNbr;
+			mizFiProcessLocalFunctorVariable(a, funcId, length(typeExpList));
+			iter(typeExpList, \t -> mizFiProcessTypeWithFVScope(a, t));
+			c.term ::= mizFiProcessTermWithFVScope(a, term);
+			a.availableLocFuncNbr ::= a.locFuncNbr;
+			a.arityOfLocal ::= 0;
+		}
+		MizWsPrivPredDefinition(predId, typeExpList, sentence): {
+			a.availableLocPredNbr ::= a.locPredNbr;
+			mizFiProcessLocalPredicateVariable(a, predId, length(typeExpList));
+			iter(typeExpList, \t -> mizFiProcessTypeWithFVScope(a, t));
+			c.sentence ::= mizFiProcessFormulaWithFVScope(a, sentence);
+			a.availableLocPredNbr ::= a.locPredNbr;
+			a.arityOfLocal ::= 0;
+			mizNsClear(a.lastFreeVars);
+		}
+		MizWsConstantDefinition(varId, term): {
+			mizFiStartVariableSegment(a);
+			mizFiProcessDefConstant(a, varId);
+			c.term ::= mizFiProcessTermWithFVScope(a, term);
+			mizFiFinishOneVariableSegment(a);
+		}
+		MizWsSegmentContent(segment): mizFiProcessFixedVariablesSegment(a, segment);
+		MizWsAssumptionContent(asm): mizFiProcessAssumptionConditions(a, asm);
+		MizWsExistentialAssumption(qVars, conditions): {
+			iter(qVars, \s -> mizFiProcessChoiceVariablesSegment(a, s));
+			mizFiProcessConditions(a, conditions);
+		}
+		MizWsExample(varId, term): {
+			switch (varId) {
+				None(): switch (term) {
+					None(): {}
+					Some(t): c.term ::= Some(mizFiProcessTermWithFVScope(a, t));
+				}
+				Some(v): {
+					mizFiStartVariableSegment(a);
+					// Process_ExemplifyingVariable (1723)
+					lTrm = switch (term) {
+						None(): Some(mizFiAnalyzeSimpleTerm(a, v.ident, v.pos));
+						Some(__): None();
+					};
+					mizFiProcessDefConstant(a, v);
+					switch (term) {
+						None(): c.term ::= lTrm;
+						Some(t): c.term ::= Some(mizFiProcessTermWithFVScope(a, t));
+					}
+					mizFiFinishOneVariableSegment(a);
+				}
+			}
+		}
+		MizWsJustificationContent(just): mizFiProcessJustification(a, just, None());
+		MizWsCorrectnessCondition(__, __, just): mizFiProcessJustification(a, just, blk);
+		MizWsCorrectnessConditions(__, __, just): mizFiProcessJustification(a, just, blk);
+		MizWsPropertyContent(__, __, just): mizFiProcessJustification(a, just, blk);
+		MizWsModeDefinition(__, defKind, __, pattern, expansion, specification, definiens): {
+			mizFiProcessPattern(a, pattern);
+			if (defKind == 0) {
+				switch (expansion) { None(): {}; Some(t): mizFiProcessTypeWithFVScope(a, t); }
+			} else {
+				switch (specification) { None(): {}; Some(t): mizFiProcessTypeWithFVScope(a, t); }
+				mizFiProcessDefiniens(a, definiens);
+			}
+		}
+		MizWsAttrDefinition(__, __, pattern, definiens): {
+			mizFiProcessPattern(a, pattern);
+			mizFiProcessDefiniens(a, definiens);
+		}
+		MizWsPredDefinition(__, __, pattern, definiens): {
+			mizFiProcessPattern(a, pattern);
+			mizFiProcessDefiniens(a, definiens);
+		}
+		MizWsFuncDefinition(__, __, pattern, specification, __, definiens): {
+			mizFiProcessPattern(a, pattern);
+			switch (specification) { None(): {}; Some(t): mizFiProcessTypeWithFVScope(a, t); }
+			mizFiProcessDefiniens(a, definiens);
+		}
+		MizWsStructureDefinition(__, ancestors, pattern, fields): {
+			iter(ancestors, \t -> mizFiProcessTypeWithFVScope(a, t));
+			mizFiProcessPattern(a, pattern);
+			a.fieldNbr ::= 0;
+			iter(fields, \fs -> {
+				iter(fs.fields, \fl -> {
+					lFormatNr = mizFiCollectPrefixForm(a, 85, fl.symbol, 1);
+					a.fieldNbr ::= a.fieldNbr + 1;
+					mizFiSetField(a, a.fieldNbr, lFormatNr);
+				});
+				mizFiProcessTypeWithFVScope(a, fs.specification);
+			});
+		}
+		MizWsNotationDeclaration(__, __, newPattern, originPattern): {
+			mizFiProcessPattern(a, newPattern);
+			mizFiProcessPattern(a, originPattern);
+		}
+		MizWsCluster(__, ckind, antecedent, consequent, clusterType, clusterTerm): {
+			if (ckind == 0) {
+				iter(consequent, \ad -> mizFiProcessAdjective(a, ad));
+				switch (clusterType) { None(): {}; Some(t): mizFiProcessTypeWithFVScope(a, t); }
+			} else if (ckind == 1) {
+				iter(antecedent, \ad -> mizFiProcessAdjective(a, ad));
+				iter(consequent, \ad -> mizFiProcessAdjective(a, ad));
+				switch (clusterType) { None(): {}; Some(t): mizFiProcessTypeWithFVScope(a, t); }
+			} else {
+				switch (clusterTerm) {
+					None(): {}
+					Some(t): c.clusterTerm ::= Some(mizFiProcessTermWithFVScope(a, t));
+				}
+				iter(consequent, \ad -> mizFiProcessAdjective(a, ad));
+				switch (clusterType) { None(): {}; Some(t): mizFiProcessTypeWithFVScope(a, t); }
+			}
+		}
+		MizWsIdentifyRegistration(__, newPattern, originPattern, eqLoci): {
+			mizFiProcessPattern(a, newPattern);
+			mizFiProcessPattern(a, originPattern);
+			mizFiProcessLociEqualities(a, eqLoci);
+		}
+		MizWsReduceRegistration(__, originTerm, newTerm): {
+			// ★ THE READ-BACK SWAP. msmprocessor reads the .wsx back in, and
+			// Read_ItemContents for itReduction (wsmarticle.pas 4913) builds
+			//   Init(lPos, Read_Term, lTrm)
+			// with lTrm the FIRST child — so the term written as nOriginTerm is
+			// read into nNewTerm and back. The write order in Out_ItemContents
+			// is the other one, so the .msx has the two terms exchanged against
+			// the .wsx. This port never serialises in between, so it performs
+			// the same exchange here.
+			c.originTerm ::= newTerm;
+			c.newTerm ::= originTerm;
+			c.newTerm ::= mizFiProcessTermWithFVScope(a, c.newTerm);
+			c.originTerm ::= mizFiProcessTermWithFVScope(a, c.originTerm);
+		}
+		MizWsPropertyRegistration(__, sort_, sethoodType, just): {
+			if (sort_ == 12) {
+				switch (sethoodType) { None(): {}; Some(t): mizFiProcessTypeWithFVScope(a, t); }
+				switch (just) { None(): {}; Some(j): mizFiProcessJustification(a, j, blk); }
+			}
+		}
+		MizWsPragma(str): {
+			// Process_Pragma (1693): only `$CS<n>` moves the scheme counter
+			if (strLeft(str, 2) == "$C" && strlen(str) >= 3 && getCharAt(str, 2) == "S") {
+				lStr = trim(substring(str, 3, strlen(str) - 3));
+				k = ref 0;
+				while(\ -> ^k < strlen(lStr) && isDigit(getCharAt(lStr, ^k)), \ -> k := ^k + 1);
+				nbr = if (^k == 0) 1 else s2i(substring(lStr, 0, ^k));
+				a.canceledSch ::= a.canceledSch + nbr;
+			}
+		}
+		default: {}
+	}
+}
+
+mizFiProcessLocalFunctorVariable(a : MizFi, v : MizWsVariable, argNbr : int) -> void {
+	a.arityOfLocal ::= argNbr;
+	a.serialPrivFuncNbr ::= a.serialPrivFuncNbr + 1;
+	a.privFuncNbr ::= a.privFuncNbr + 1;
+	v.origin ::= mizVkPrivateFunc;
+	v.varKind ::= mizVkPrivateFunc;
+	v.serialNr ::= a.serialPrivFuncNbr;
+	v.varNr ::= a.privFuncNbr;
+	mizFiAppFuncVar(a, v.ident, v.pos, mizVkPrivateFunc, a.serialPrivFuncNbr,
+		a.privFuncNbr, argNbr);
+}
+
+mizFiProcessLocalPredicateVariable(a : MizFi, v : MizWsVariable, argNbr : int) -> void {
+	a.arityOfLocal ::= argNbr;
+	a.serialPrivPredNbr ::= a.serialPrivPredNbr + 1;
+	a.privPredNbr ::= a.privPredNbr + 1;
+	v.origin ::= mizVkPrivatePred;
+	v.varKind ::= mizVkPrivatePred;
+	v.serialNr ::= a.serialPrivPredNbr;
+	v.varNr ::= a.privPredNbr;
+	mizFiAppPredVar(a, v.ident, v.pos, mizVkPrivatePred, a.serialPrivPredNbr,
+		a.privPredNbr, argNbr);
+}
+
+// MFormatsList.CollectPrefixForm (_formats.pas) — unlike CollectFormat it
+// returns the EXISTING number when the format is already there.
+mizFiCollectPrefixForm(a : MizFi, kind : int, symNr : int, argsNbr : int) -> int {
+	n = mizLookUpPrefixFormat(a.formats, kind, symNr, argsNbr);
+	if (n != 0) n
+	else mizCollectFormat(a.formats, MizFormat(kind, symNr, argsNbr, 0, 0, 0));
+}
+
+// Process_Article (1570)
+mizMsmProcessArticle(tp : MizWsBlock, eh : MizErrHan, formats : MizFormats) -> void {
+	a = mizMakeFi(eh, formats);
+	root = MizFiBlockLevel(mizBlMain, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+	pushVector(a.stack, root);
+	a.blockLevel ::= root;
+	eh.curPos ::= MizPos(1, 1);
+	iterVector(tp.items, \it -> mizFiProcessItem(a, it));
+}
