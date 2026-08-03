@@ -1,0 +1,235 @@
+// Transcription of ~/dev/system/base/_formats.pas — the FORMATS collection
+// (<article>.frm) and the operator PRIORITIES, plus mscanner.pas LoadPrf for
+// the maximum-argument tables (<article>.prf). These are the parser's other
+// two inputs beside .miz and .dct.
+//
+// A format is a symbol together with the shape it is written in: how many
+// arguments stand to its left and to its right, and, for a bracket functor,
+// its closing symbol. The parser needs them to decide how far an operator
+// reaches; the format NUMBER is the position in the collection, and that is
+// what .wsx/.msx record.
+//
+// ★ THE COLLECTION IS AN MSortedList: items keep their INSERTION order (which
+//   is the format numbering, CollectFormat = Count + 1) and a SEPARATE sorted
+//   index drives the lookups (fIndex^[i] + 1). Both are reproduced here — the
+//   order of `items` is the numbering, `index` is the search order.
+
+import ds/vector;
+import loop;
+import string;
+import sys/system;
+import mizar/original/errhan;
+import mizar/original/xml_parser;
+
+export {
+	// MFormatObj / MPrefixFormatObj / MInfixFormatObj / MBracketFormatObj
+	// flattened into one record, as the port does elsewhere: the fields a
+	// given kind does not use stay 0, exactly as the Pascal constructors leave
+	// them.
+	MizFormat(
+		kind : int,          // the symbol kind character code
+		symNr : int,
+		rightArgsNbr : int,  // prefix and up
+		leftArgsNbr : int,   // infix and up
+		rightSymNr : int,    // bracket only
+		argsNbr : int,       // bracket only
+	);
+
+	MizFormats(
+		items : Vector<MizFormat>,   // INSERTION order — this is the numbering
+		index : Vector<int>,         // sorted order (CompareFormats)
+		// gPriority: (kind, symNr) -> value, only for 'O', 'L', 'K'
+		priority : Vector<Triple<int, int, int>>,
+	);
+
+	// mscanner.pas LoadPrf: the maximum number of arguments per symbol number
+	MizPrf(
+		modeMaxArgs : [int],
+		structModeMaxArgs : [int],
+		predMaxArgs : [int],
+	);
+
+	mizLoadFormats(frmPath : string) -> MizFormats;
+	mizLoadPrf(prfPath : string) -> MizPrf;
+
+	mizCompareFormats(a : MizFormat, b : MizFormat) -> int;
+
+	// LookUp_* return the format NUMBER (1-based) or 0
+	mizLookUpPrefixFormat(f : MizFormats, kind : int, symNr : int, argsNbr : int) -> int;
+	mizLookUpFuncFormat(f : MizFormats, symNr : int, lArgs : int, rArgs : int) -> int;
+	mizLookUpPredFormat(f : MizFormats, symNr : int, lArgs : int, rArgs : int) -> int;
+	mizLookUpBracketFormat(f : MizFormats, lSym : int, rSym : int,
+		argsNbr : int, lArgs : int, rArgs : int) -> int;
+
+	// CollectFormat: 0 if it was already there, otherwise the NEW number
+	mizCollectFormat(f : MizFormats, fmt : MizFormat) -> int;
+
+	mizFormatPriority(f : MizFormats, kind : int, symNr : int) -> int;
+	mizFormatsCount(f : MizFormats) -> int;
+	mizFormatAt(f : MizFormats, nr : int) -> MizFormat;   // 1-based
+}
+
+// CompareFormats (_formats.pas): kind, then symbol number, then — per kind —
+// the argument counts. 'J' and 'U' compare equal at the symbol.
+mizCompareFormats(a : MizFormat, b : MizFormat) -> int {
+	cmpI = \x, y -> if (x < y) -1 else if (x > y) 1 else 0;
+	c = cmpI(a.kind, b.kind);
+	if (c != 0) c
+	else {
+		c2 = cmpI(a.symNr, b.symNr);
+		if (c2 != 0) c2
+		else {
+			k = a.kind;
+			if (k == 74 || k == 85) {          // 'J', 'U'
+				0;
+			} else if (k == 71 || k == 76 || k == 77 || k == 86) {  // 'G','L','M','V'
+				cmpI(a.rightArgsNbr, b.rightArgsNbr);
+			} else if (k == 79 || k == 82) {   // 'O', 'R'
+				c3 = cmpI(a.leftArgsNbr, b.leftArgsNbr);
+				if (c3 != 0) c3 else cmpI(a.rightArgsNbr, b.rightArgsNbr);
+			} else if (k == 75) {              // 'K'
+				c3 = cmpI(a.rightSymNr, b.rightSymNr);
+				if (c3 != 0) c3 else {
+					c4 = cmpI(a.argsNbr, b.argsNbr);
+					if (c4 != 0) c4 else {
+						c5 = cmpI(a.leftArgsNbr, b.leftArgsNbr);
+						if (c5 != 0) c5 else cmpI(a.rightArgsNbr, b.rightArgsNbr);
+					}
+				}
+			} else {
+				// CompareFormats falls through with its initial 1 for any other
+				// kind — keep that, it is what Find sees
+				1;
+			}
+		}
+	}
+}
+
+mizFormatsCount(f : MizFormats) -> int { sizeVector(f.items); }
+mizFormatAt(f : MizFormats, nr : int) -> MizFormat { getVectorUnsafe(f.items, nr - 1); }
+
+// MSortedList.Find over `index`: returns Pair(found, position in the index)
+mizFormatsFind(f : MizFormats, fmt : MizFormat) -> Pair<bool, int> {
+	lo = ref 0;
+	hi = ref sizeVector(f.index) - 1;
+	found = ref false;
+	res = ref 0;
+	while(\ -> ^lo <= ^hi && !^found, \ -> {
+		m = (^lo + ^hi) / 2;
+		c = mizCompareFormats(getVectorUnsafe(f.items, getVectorUnsafe(f.index, m)), fmt);
+		if (c < 0) lo := m + 1
+		else if (c > 0) hi := m - 1
+		else { found := true; res := m; }
+	});
+	Pair(^found, if (^found) ^res else ^lo);
+}
+
+mizFormatsInsert(f : MizFormats, fmt : MizFormat) -> void {
+	p = mizFormatsFind(f, fmt);
+	nr = sizeVector(f.items);
+	pushVector(f.items, fmt);
+	// keep `index` sorted: shift up from the insertion position
+	pushVector(f.index, 0);
+	j = ref sizeVector(f.index) - 1;
+	while(\ -> ^j > p.second, \ -> {
+		setVectorUnsafe(f.index, ^j, getVectorUnsafe(f.index, ^j - 1));
+		j := ^j - 1;
+	});
+	setVectorUnsafe(f.index, p.second, nr);
+}
+
+mizCollectFormat(f : MizFormats, fmt : MizFormat) -> int {
+	p = mizFormatsFind(f, fmt);
+	if (p.first) {
+		0;
+	} else {
+		n = sizeVector(f.items) + 1;
+		mizFormatsInsert(f, fmt);
+		n;
+	}
+}
+
+mizLookUpFormat(f : MizFormats, fmt : MizFormat) -> int {
+	p = mizFormatsFind(f, fmt);
+	if (p.first) getVectorUnsafe(f.index, p.second) + 1 else 0;
+}
+
+mizLookUpPrefixFormat(f : MizFormats, kind : int, symNr : int, argsNbr : int) -> int {
+	mizLookUpFormat(f, MizFormat(kind, symNr, argsNbr, 0, 0, 0));
+}
+
+mizLookUpFuncFormat(f : MizFormats, symNr : int, lArgs : int, rArgs : int) -> int {
+	mizLookUpFormat(f, MizFormat(79, symNr, rArgs, lArgs, 0, 0));   // 'O'
+}
+
+mizLookUpPredFormat(f : MizFormats, symNr : int, lArgs : int, rArgs : int) -> int {
+	mizLookUpFormat(f, MizFormat(82, symNr, rArgs, lArgs, 0, 0));   // 'R'
+}
+
+mizLookUpBracketFormat(f : MizFormats, lSym : int, rSym : int,
+		argsNbr : int, lArgs : int, rArgs : int) -> int {
+	mizLookUpFormat(f, MizFormat(75, lSym, rArgs, lArgs, rSym, argsNbr)); // 'K'
+}
+
+mizFormatPriority(f : MizFormats, kind : int, symNr : int) -> int {
+	r = ref 0;
+	iterVector(f.priority, \t -> if (t.first == kind && t.second == symNr) r := t.third);
+	^r;
+}
+
+// MFormatsList.LoadFormats (_formats.pas): <Formats> with <Format .../> and
+// then <Priority .../> entries.
+mizLoadFormats(frmPath : string) -> MizFormats {
+	f = MizFormats(makeVector(256), makeVector(256), makeVector(16));
+	p = mizXmlInitParsing(getFileContentBinary(frmPath));
+	mizXmlNextElementState(p);
+	mizXmlAssert(p.nElName == "Formats");
+	mizXmlNextElementState(p);
+	while(\ -> p.nState != MizEEnd && p.nElName == "Format", \ -> {
+		kindS = mizXmlAttr(p, "kind");
+		kind = if (kindS == "") 0 else getCharCodeAt(kindS, 0);
+		symNr = mizXmlIntAttr(p, "symbolnr");
+		argNr = mizXmlIntAttrDef(p, "argnr", 0);
+		// In_Format (_formats.pas): an INFIX format stores leftargnr as its
+		// left count and argnr MINUS leftargnr as its right one; a bracket
+		// format keeps argnr as fArgsNbr with both arg counts 0.
+		fmt = if (kind == 79 || kind == 82) {            // 'O', 'R'
+			l = mizXmlIntAttrDef(p, "leftargnr", 0);
+			MizFormat(kind, symNr, argNr - l, l, 0, 0);
+		} else if (kind == 75) {                          // 'K'
+			MizFormat(kind, symNr, 0, 0,
+				mizXmlIntAttrDef(p, "rightsymbolnr", 0), argNr);
+		} else {
+			MizFormat(kind, symNr, argNr, 0, 0, 0);
+		};
+		mizFormatsInsert(f, fmt);
+		mizXmlAcceptEndState(p);
+		mizXmlNextElementState(p);
+	});
+	while(\ -> p.nState != MizEEnd, \ -> {
+		mizXmlAssert(p.nElName == "Priority");
+		kindS = mizXmlAttr(p, "kind");
+		kind = if (kindS == "") 0 else getCharCodeAt(kindS, 0);
+		pushVector(f.priority, Triple(kind, mizXmlIntAttr(p, "symbolnr"),
+			mizXmlIntAttr(p, "value")));
+		mizXmlAcceptEndState(p);
+		mizXmlNextElementState(p);
+	});
+	f;
+}
+
+// mscanner.pas LoadPrf: three sizes, then the three tables. Each table starts
+// with a 0 entry (the Insert(0) before the loop), so index i is symbol i.
+mizLoadPrf(prfPath : string) -> MizPrf {
+	nums = filtermap(strSplit(strReplaces(getFileContentBinary(prfPath),
+			["\n", " ", "\r", " ", "\t", " "]), " "),
+		\s -> if (s == "") None() else Some(s2i(s)));
+	take = \from : int, n : int -> concat([0], subrange(nums, from, n));
+	if (length(nums) < 3) {
+		MizPrf([0], [0], [0]);
+	} else {
+		nMode = nums[0]; nStruct = nums[1]; nPred = nums[2];
+		MizPrf(take(3, nMode), take(3 + nMode, nStruct),
+			take(3 + nMode + nStruct, nPred));
+	}
+}
