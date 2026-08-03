@@ -1,0 +1,202 @@
+// Transcription of ~/dev/system/kernel/correl.pas, part 4: PATTERNS and the
+// ARGUMENT-TYPE CHECK the analyzer resolves a notation with.
+//
+// A PatternObj (correl.pas 398) is one notation: its kind, the article and
+// absolute number it was declared under, its FORMAT (the shape it is written
+// in), the CONSTRUCTOR it denotes, its primary (loci) types, and the VISIBLE
+// sequence — which locus each written argument fills.
+//
+// CheckTypes (correl.pas 3032) decides whether an actual argument list fits a
+// pattern: it drops the arguments into gSubstTrm through Visible and then runs
+// CheckArgType over the primary types from the LAST one down, widening each
+// actual type towards the declared one and backtracking on failure. This is
+// the sibling of CheckLociTypes (correl_match.flow) — same idea, but plainly
+// recursive, and it is this one the analyzer uses.
+
+import ds/vector;
+import loop;
+import mizar/original/errhan;
+import mizar/original/mobjects;
+import mizar/original/lexicon;
+import mizar/original/limits;
+import mizar/original/builtin;
+import mizar/original/enums;
+import mizar/original/formats;
+import mizar/original/correl;
+import mizar/original/correl_inst;
+import mizar/original/correl_match;
+
+export {
+	// PatternObj. `format` is the format pointer when the pattern carries one
+	// directly (fFormat); `formNr` is its number in gFormats — the original
+	// says only one of the two should be set.
+	MizPattern(
+		kind : int,                       // NotationKind
+		mutable article : string,
+		mutable absNr : int,
+		mutable formNr : int,
+		mutable format : Maybe<MizFormat>,
+		mutable constrKind : int,         // rConstr.Kind (a kind character)
+		mutable constrNr : int,           // rConstr.Nr
+		mutable redefNr : int,
+		primTypes : Vector<MizTyp>,
+		visible : MizIntSeq,
+		mutable antonymic : bool,
+		mutable expansion : Maybe<MizTyp>,
+	);
+
+	mizMakePattern(kind : int, absNr : int, article : string) -> MizPattern;
+
+	// OriginalNr / AdjustedNr (correl.pas)
+	mizOriginalNr(env : MizCorrelEnv, kind : int, nr : int) -> int;
+	mizAdjustedNr(env : MizCorrelEnv, kind : int, nr : int) -> int;
+
+	// InsertArgument / CheckArgType / CheckTypes / Agree
+	mizInsertArgument(env : MizCorrelEnv, i : int) -> void;
+	mizCheckArgType(env : MizCorrelEnv, prim : Vector<MizTyp>, fk : int) -> bool;
+	mizCheckTypes(env : MizCorrelEnv, p : MizPattern, args : MizTrmList) -> bool;
+	mizAgree(env : MizCorrelEnv, args : MizTrmList, typList : Vector<MizTyp>) -> bool;
+}
+
+mizMakePattern(kind : int, absNr : int, article : string) -> MizPattern {
+	MizPattern(kind, article, absNr, 0, None(), ikError, 0, 0,
+		makeVector(4), mizInitIntSeq(4), false, None());
+}
+
+mizOriginalNr(env : MizCorrelEnv, kind : int, nr : int) -> int {
+	mizConstr(env, kind, nr).whichConstrNr;
+}
+
+mizAdjustedNr(env : MizCorrelEnv, kind : int, nr : int) -> int {
+	n = mizConstr(env, kind, nr).whichConstrNr;
+	if (n == 0) nr else n;
+}
+
+// ------------------------------------------------------------------------
+
+mizExactlyGet(env : MizCorrelEnv, i : int) -> bool {
+	if (i < sizeVector(env.exactly)) getVectorUnsafe(env.exactly, i) else false;
+}
+
+mizExactlySet(env : MizCorrelEnv, i : int, b : bool) -> void {
+	while(\ -> sizeVector(env.exactly) <= i, \ -> pushVector(env.exactly, false));
+	setVectorUnsafe(env.exactly, i, b);
+}
+
+mizExactlyClear(env : MizCorrelEnv) -> void {
+	fori(0, sizeVector(env.exactly) - 1, \i -> setVectorUnsafe(env.exactly, i, false));
+}
+
+// procedure InsertArgument (correl.pas)
+mizInsertArgument(env : MizCorrelEnv, i : int) -> void {
+	switch (env.gTrmList) {
+		MizTrmNil(): mizAssert(2537, false);
+		MizTrmElem(trm, next): {
+			if (mizTrmSort(trm) == ikTrmExactly) mizExactlySet(env, i, true);
+			mizSubstTrmSet(env, i, Some(trm));
+			env.gTrmList ::= next;
+		}
+	}
+}
+
+// function CheckArgType (correl.pas) — recursive, from the LAST primary down.
+// The Pascal uses two labels: 22 = success tail, 23 = failure tail. Both only
+// dispose wTyp, so they become plain returns here.
+mizCheckArgType(env : MizCorrelEnv, prim : Vector<MizTyp>, fk : int) -> bool {
+	lTyp = getVectorUnsafe(prim, fk - 1);
+	lSubstTrm0 = copyVector(env.substTrm);
+	subst = mizSubstTrmGet(env, fk);
+	mizAssert(2536, isSome(subst));
+	wTyp0 = mizGetTrmType(env, either(subst, mizNewIncorTrm()));
+	// RoundUpWith the term's own upper cluster, as the original does in place
+	lClusterPtr = mizCopyCluster(wTyp0.upper);
+	env.roundUpCluster(env, lClusterPtr, wTyp0);
+	wTyp0.upper ::= lClusterPtr;
+	// GetTrmType rewrites the shared substitution; restore it wholesale
+	mizRestoreSubst(env, lSubstTrm0);
+
+	if (!mizDecreasingAttrs(env, wTyp0, lTyp, \x, y -> mizEsAttrRev(env, x, y))) {
+		false;
+	} else {
+		// the undo mark: the Pascal compares gSubstTrm[i] against this snapshot
+		// by POINTER, which in this procedure only ever distinguishes "was
+		// empty" from "was filled" — the same rule mizResetNewerSubst uses
+		lSubstTrm = mizSnapshotSubst(env);
+		exact = mizExactlyGet(env, fk);
+		start : Maybe<MizTyp> = if (exact) Some(wTyp0)
+			else mizWideningOf(env, lTyp, wTyp0);
+		switch (start) {
+			None(): false;
+			Some(w0): {
+				// the first attempt, then the `repeat` that widens one step at
+				// a time until the type reaches `any` or stops widening
+				wTyp = ref w0;
+				res = ref false;
+				finished = ref false;
+				first = ref true;
+				while(\ -> !^finished, \ -> {
+					if (mizCompEsTyp(env, lTyp, ^wTyp, if (^first) exact else false)) {
+						if (fk == 1) { res := true; finished := true; }
+						else if (mizCheckArgType(env, prim, fk - 1)) { res := true; finished := true; }
+					}
+					if (!^finished) {
+						// undo whatever the failed attempt bound below fk
+						fori(1, fk - 1, \lArgNr -> {
+							if (!getVectorDef(lSubstTrm, lArgNr, false))
+								mizSubstTrmSet(env, lArgNr, None());
+						});
+						if (^first && exact) { finished := true; }
+						else if (^first && (lTyp.sort != ikTypMode
+							|| mizOriginalNr(env, coMode, lTyp.modNr) != 0)) {
+							finished := true;
+						} else {
+							first := false;
+							w = ^wTyp;
+							if (w.sort == ikTypMode && w.modNr == mizBuiltIn(env.builtIn, rqAny)) {
+								finished := true;
+							} else {
+								switch (mizWidening(env, w)) {
+									None(): finished := true;
+									Some(sTyp): switch (mizWideningOf(env, lTyp, sTyp)) {
+										None(): finished := true;
+										Some(w2): wTyp := w2;
+									}
+								}
+							}
+						}
+					}
+				});
+				^res;
+			}
+		}
+	}
+}
+
+// function CheckTypes (correl.pas 3032)
+mizCheckTypes(env : MizCorrelEnv, p : MizPattern, args : MizTrmList) -> bool {
+	mizDisposeSubstTrm(env);
+	mizExactlyClear(env);
+	if (sizeVector(p.primTypes) > 0) {
+		env.gTrmList ::= args;
+		fori(0, mizSeqCount(p.visible) - 1, \k ->
+			mizInsertArgument(env, mizSeqValue(p.visible, k)));
+		mizAssert(2538, env.gTrmList == MizTrmNil());
+		mizCheckArgType(env, p.primTypes, sizeVector(p.primTypes));
+	} else {
+		args == MizTrmNil();
+	}
+}
+
+// function Agree (correl.pas)
+mizAgree(env : MizCorrelEnv, args : MizTrmList, typList : Vector<MizTyp>) -> bool {
+	mizDisposeSubstTrm(env);
+	mizExactlyClear(env);
+	if (sizeVector(typList) > 0) {
+		env.gTrmList ::= args;
+		fori(0, sizeVector(typList) - 1, \i -> mizInsertArgument(env, i + 1));
+		mizAssert(2559, env.gTrmList == MizTrmNil());
+		mizCheckArgType(env, typList, sizeVector(typList));
+	} else {
+		args == MizTrmNil();
+	}
+}

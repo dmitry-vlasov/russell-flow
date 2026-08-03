@@ -19,6 +19,8 @@ import mizar/original/mobjects;
 import mizar/original/lexicon;
 import mizar/original/xml_parser;
 import mizar/original/correl;
+import mizar/original/enums;
+import mizar/original/correl_patt;
 import mizar/original/correl_inst;
 
 export {
@@ -36,6 +38,8 @@ export {
 
 	// GetLexemAttrs(atKind, atNr): kind char + nr
 	mizInLexem(r : MizVrfReader) -> Pair<int, int>;
+	// the same with explicit attribute names (GetLexemAttrs(aKind, aNr))
+	mizInLexemNamed(r : MizVrfReader, kindAttr : string, nrAttr : string) -> Pair<int, int>;
 
 	mizInTerm(r : MizVrfReader) -> MizTrm;
 	mizInTermList(r : MizVrfReader) -> MizTrmList;
@@ -56,8 +60,12 @@ export {
 	mizInArgCollInto(r : MizVrfReader, target : Vector<MizTyp>) -> void;
 	mizInTypeCollLoci(r : MizVrfReader) -> Vector<MizTyp>;
 	mizInConstructor1(r : MizVrfReader) -> MizConstr;
-	mizConstructorKind(ch : int) -> int;
 	mizLoadConstructors(r : MizVrfReader, content : string) -> void;
+
+	// In_IntSeq(aElem, aSeq) — <El><Int x="n"/>…</El>
+	mizInIntSeq(r : MizVrfReader, elem : string) -> MizIntSeq;
+	// In_Pattern — one <Pattern> of a `.eno` / `.dno`
+	mizInPattern(r : MizVrfReader) -> MizPattern;
 }
 
 mizMakeVrfReader(x : MizXmlParser, env : MizCorrelEnv) -> MizVrfReader {
@@ -99,6 +107,14 @@ mizIsFrmEl(name : string) -> bool {
 mizInLexem(r : MizVrfReader) -> Pair<int, int> {
 	kindS = mizXmlAttr(r.x, "kind");
 	nr = mizXmlIntAttrDef(r.x, "nr", 0);
+	kind = if (strlen(kindS) >= 1) getCharCodeAt(kindS, 0) else ikError;
+	Pair(kind, nr);
+}
+
+// GetLexemAttrs(aKind, aNr) with explicit attribute names
+mizInLexemNamed(r : MizVrfReader, kindAttr : string, nrAttr : string) -> Pair<int, int> {
+	kindS = mizXmlAttrDef(r.x, kindAttr, "");
+	nr = mizXmlIntAttrDef(r.x, nrAttr, 0);
 	kind = if (strlen(kindS) >= 1) getCharCodeAt(kindS, 0) else ikError;
 	Pair(kind, nr);
 }
@@ -413,19 +429,64 @@ mizXmlElem2Prop(name : string) -> int {
 	}
 }
 
-// ConstructorKind (enums.pas): kind char -> co*
-mizConstructorKind(kindChar : int) -> int {
-	if (kindChar == 77) coMode              // 'M'
-	else if (kindChar == 76) coStructMode   // 'L'
-	else if (kindChar == 86) coAttribute    // 'V'
-	else if (kindChar == 82) coPredicate    // 'R'
-	else if (kindChar == 75) coFunctor      // 'K'
-	else if (kindChar == 85) coSelector     // 'U'
-	else if (kindChar == 71 || kindChar == 74) coAggregate // 'G','J'
-	else {
-		mizRunTimeError(2211);
-		0;
+// ConstructorKind lives in enums.flow.
+
+// In_IntSeq (iocorrel.pas)
+mizInIntSeq(r : MizVrfReader, elem : string) -> MizIntSeq {
+	mizXmlAssert(r.x.nElName == elem);
+	seq = mizInitIntSeq(4);
+	mizXmlNextElementState(r.x);
+	while(\ -> r.x.nState != MizEEnd, \ -> {
+		mizSeqInsert(seq, mizXmlIntAttr(r.x, "x"));
+		mizXmlAcceptEndState(r.x);
+		mizXmlNextElementState(r.x);
+	});
+	mizXmlNextElementState(r.x);
+	seq;
+}
+
+// In_Pattern (iocorrel.pas 1047)
+mizInPattern(r : MizVrfReader) -> MizPattern {
+	nr = mizXmlIntAttr(r.x, "nr");
+	aid = mizXmlAttr(r.x, "aid");
+	lLex = mizInLexemNamed(r, "kind", "formatnr");
+	lConstr = mizInLexemNamed(r, "constrkind", "constrnr");
+	lAnt = mizXmlAttrDef(r.x, "antonymic", "false");
+	p = mizMakePattern(mizNotatKind(lLex.first), nr, aid);
+	p.redefNr ::= mizXmlIntAttrDef(r.x, "redefnr", 0);
+	mizXmlNextElementState(r.x);
+
+	p.formNr ::= lLex.second;
+	p.constrKind ::= lConstr.first;
+	p.constrNr ::= lConstr.second;
+	p.antonymic ::= lAnt == "true";
+
+	// the primary types, put in LocArgTyp as they are read
+	mizXmlAssert(r.x.nElName == "ArgTypes");
+	mizXmlNextElementState(r.x);
+	while(\ -> r.x.nState == MizEStart && r.x.nElName == "Typ", \ -> {
+		t = mizInType(r);
+		pushVector(p.primTypes, t);
+		n = sizeVector(p.primTypes);
+		while(\ -> sizeVector(r.env.locArgTyp) <= n,
+			\ -> pushVector(r.env.locArgTyp, mizNewIncorTyp()));
+		setVectorUnsafe(r.env.locArgTyp, n, t);
+	});
+	mizAssert(errElRedundant, r.x.nState == MizEEnd);
+	mizXmlNextElementState(r.x);
+
+	vis = mizInIntSeq(r, "Visible");
+	fori(0, mizSeqCount(vis) - 1, \i -> { mizSeqInsert(p.visible, mizSeqValue(vis, i)); {} });
+
+	if (r.x.nState != MizEEnd) {
+		mizXmlAssert(r.x.nElName == "Expansion");
+		mizXmlNextElementState(r.x);
+		p.expansion ::= Some(mizInType(r));
+		mizXmlNextElementState(r.x);
 	}
+	mizAssert(errElRedundant, r.x.nState == MizEEnd);
+	mizXmlNextElementState(r.x);
+	p;
 }
 
 mizInArgCollInto(r : MizVrfReader, target : Vector<MizTyp>) -> void {
