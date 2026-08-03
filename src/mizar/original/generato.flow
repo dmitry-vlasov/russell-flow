@@ -1,0 +1,426 @@
+// Transcription of ~/dev/system/kernel/generato.pas — the ANALYZER's front:
+//
+//   * the `.par` INPUT STREAM (kernel/inout.pas MizInStream: InWord / InInt /
+//     InPos / InBool / InString over the compact byte format the transfer step
+//     wrote);
+//   * the EXPRESSION TREE the loader builds (LoadTerm / LoadType / LoadFormula
+//     and LoadIPNColl) — a syntax-level tree that still speaks FORMAT numbers,
+//     not constructors;
+//   * `Analyze`, which resolves each node against the notation PATTERNS and
+//     produces the correl representation the checker already understands.
+//
+// The Pascal `Expression` hierarchy is a closed set of descendants each with
+// its own virtual `Analyze`, so it becomes one union with a `sort` character,
+// exactly as CONVENTIONS.md prescribes. Several Pascal classes share one
+// struct where they share their fields and are told apart by `sort`:
+//   MizExpStd    FunctorTerm / TypeExp / PredicateFormula / ResDesNode
+//                (StandardExpression: nConstrNr + Argumenty)
+//   MizExpQual   QualifiedTerm (qua / exactly) / QualifyingFormula
+//   MizExpAttred AttributedType / AttributiveFormula
+//   MizExpAtom   ItTerm / IncorrTerm / IncorrType / Verum / Thesis / IncorrFrm
+
+import ds/vector;
+import string;
+import loop;
+import mizar/original/errhan;
+import mizar/original/mobjects;
+import mizar/original/lexicon;
+import mizar/original/limits;
+import mizar/original/enums;
+import mizar/original/correl;
+import mizar/original/correl_patt;
+
+export {
+	// ---------------- the `.par` input stream ----------------
+	// MizInStream (inout.pas): a byte buffer with a cursor. `current` is the
+	// Lexem last read by InWord.
+	MizInStream(
+		buff : string,
+		mutable ind : int,
+		mutable curKind : int,
+		mutable curNr : int,
+		eh : MizErrHan,
+	);
+
+	mizInOpen(content : string, eh : MizErrHan) -> MizInStream;
+	mizInWord(s : MizInStream) -> void;
+	mizInInt(s : MizInStream) -> int;
+	mizInPos(s : MizInStream) -> MizPos;
+	mizInBool(s : MizInStream) -> bool;
+	mizInString(s : MizInStream) -> string;
+	mizInNewLines(s : MizInStream) -> void;
+
+	// ---------------- the expression tree ----------------
+	MizExp ::= MizExpStd, MizExpSimple, MizExpNumeral, MizExpSelector,
+		MizExpSubAggr, MizExpFraenkel, MizExpQual, MizExpAttred, MizExpChoice,
+		MizExpMulti, MizExpNeg, MizExpBin, MizExpQuant, MizExpAtom;
+
+		// StandardExpression: FunctorTerm (ikTrmFunctor/Aggreg/PrivFunc/SchFunc),
+		// TypeExp (ikTypMode/ikTypStruct), PredicateFormula (ikFrmPred/
+		// RSFrmPred/PrivPred/SchPred) and ResDesNode (ikExpResDes, which also
+		// uses `ident`).
+		MizExpStd(mutable sort : int, mutable pos : MizPos,
+			mutable constrNr : int, args : Vector<MizExp>, mutable ident : int);
+		// SimpleTerm: ikTrmBound / ikTrmConstant / ikTrmLocus
+		MizExpSimple(mutable sort : int, mutable pos : MizPos, mutable varNr : int);
+		MizExpNumeral(mutable pos : MizPos, mutable natVal : int);
+		MizExpSelector(mutable pos : MizPos, mutable select : int, mutable struct_ : MizExp);
+		MizExpSubAggr(mutable pos : MizPos, mutable subAggr : int, mutable fullAggr : MizExp);
+		// FraenkelTerm: the sample (with its bound-variable segments) and the
+		// comprehension formula
+		MizExpFraenkel(mutable pos : MizPos, boundVars : Vector<MizMultipleType>,
+			mutable sample : MizExp, mutable compr : MizExp);
+		// QualifiedExpression: ikTrmQua / ikTrmExactly / ikFrmQual
+		MizExpQual(mutable sort : int, mutable pos : MizPos,
+			mutable obiekt : MizExp, mutable kwalifikacja : MizExp);
+		// AttributedExpression: ikExpAttrTyp / ikFrmAttr
+		MizExpAttred(mutable sort : int, mutable pos : MizPos,
+			mutable podmiot : MizExp, adjectives : Vector<MizAttrNode>);
+		MizExpChoice(mutable pos : MizPos, mutable choiceType : MizExp);
+		MizExpMulti(mutable pos : MizPos, args : Vector<MizExp>,
+			mutable leftArgsCount : int);
+		MizExpNeg(mutable pos : MizPos, mutable arg : MizExp);
+		// ikFrmImplies / Iff / Or / Conj / FlexDisj / FlexConj
+		MizExpBin(mutable sort : int, mutable pos : MizPos,
+			mutable arg1 : MizExp, mutable arg2 : MizExp);
+		// ikFrmUniv / ikFrmEx
+		MizExpQuant(mutable sort : int, mutable pos : MizPos, quantVars : MizIntSeq,
+			mutable quantified : MizExp, mutable scope : MizExp);
+		// ikTrmIt / ikError (term, type or formula) / ikFrmVerum / ikFrmThesis
+		MizExpAtom(mutable sort : int, mutable pos : MizPos);
+
+	// AttrNode — one written adjective: its format number, position, sign and
+	// visible arguments
+	MizAttrNode(mutable nInt : int, mutable pos : MizPos, mutable neg : bool,
+		args : Vector<MizExp>);
+
+	// multipleTypeExp — one `x, y, z being T` segment of a Fraenkel sample
+	MizMultipleType(mutable numberOfCopies : int, mutable typ : MizExp,
+		idents : MizIntSeq);
+
+	mizExpSort(e : MizExp) -> int;
+	mizExpPos(e : MizExp) -> MizPos;
+
+	// ---------------- the loader ----------------
+	// The loader keeps the reader plus the position the original keeps in the
+	// errhan global CurPos: InPos writes it and every InitExp reads it.
+	mizLoadTerm(s : MizInStream) -> MizExp;
+	mizLoadType(s : MizInStream) -> MizExp;
+	mizLoadFormula(s : MizInStream) -> MizExp;
+	mizLoadIPNColl(s : MizInStream) -> Vector<MizAttrNode>;
+}
+
+// ------------------------------------------------------------ the stream ---
+
+// inout.pas CharKind: 1 other, 2 line break / EOF, 3 digit, 4 capital letter,
+// 0 everything else (space, punctuation, lowercase, high bytes are 1).
+mizCharKind(c : int) -> int {
+	if (c == 10 || c == 13 || c == 26) 2
+	else if (c < 32) 1
+	else if (c >= 48 && c <= 57) 3
+	else if (c >= 65 && c <= 90) 4
+	else if (c < 127) 0
+	else 1;
+}
+
+mizInOpen(content : string, eh : MizErrHan) -> MizInStream {
+	MizInStream(content, 0, 0, 0, eh);
+}
+
+mizInAt(s : MizInStream) -> int {
+	if (s.ind < strlen(s.buff)) getCharCodeAt(s.buff, s.ind) else 26;
+}
+
+mizInNext(s : MizInStream) -> void { s.ind ::= s.ind + 1; }
+
+mizInNewLines(s : MizInStream) -> void {
+	go = ref true;
+	while(\ -> ^go, \ -> {
+		c = mizInAt(s);
+		if (c == 26) mizRunTimeError(2200);
+		if (mizCharKind(c) == 2) mizInNext(s) else go := false;
+	});
+}
+
+// InInt: skip blanks and line breaks, then read the digits — a non-digit
+// leaves the value at 0 AND the cursor where it stands. The numeral term
+// depends on exactly that (see LoadTerm).
+mizInInt(s : MizInStream) -> int {
+	go = ref true;
+	while(\ -> ^go, \ -> {
+		while(\ -> mizInAt(s) == 32, \ -> mizInNext(s));
+		mizInNewLines(s);
+		if (mizInAt(s) != 32) go := false;
+	});
+	if (mizInAt(s) == 26) mizRunTimeError(2200);
+	v = ref 0;
+	while(\ -> mizCharKind(mizInAt(s)) == 3, \ -> {
+		v := ^v * 10 + (mizInAt(s) - 48);
+		mizInNext(s);
+	});
+	if (mizInAt(s) == 32) mizInNext(s);
+	^v;
+}
+
+mizInWord(s : MizInStream) -> void {
+	mizInNewLines(s);
+	if (mizInAt(s) == 26) mizRunTimeError(2200);
+	s.curKind ::= mizInAt(s);
+	mizInNext(s);
+	// Capital: only 'A'..'Z' carry a number
+	if (s.curKind >= 65 && s.curKind <= 90) s.curNr ::= mizInInt(s);
+}
+
+mizInBool(s : MizInStream) -> bool {
+	mizInWord(s);
+	s.curKind == 43;   // '+'
+}
+
+// InPos also assigns CurPos, which every InitExp then reads
+mizInPos(s : MizInStream) -> MizPos {
+	line = mizInInt(s);
+	col = mizInInt(s);
+	p = MizPos(line, col);
+	{ eh = s.eh; eh.curPos ::= p; }
+	p;
+}
+
+mizInString(s : MizInStream) -> string {
+	mizInNewLines(s);
+	acc : Vector<string> = makeVector(16);
+	go = ref true;
+	while(\ -> ^go, \ -> {
+		c = mizInAt(s);
+		if (c == 26) mizRunTimeError(2200);
+		if (mizCharKind(c) == 2) go := false
+		else { pushVector(acc, fromCharCode(c)); mizInNext(s); }
+	});
+	concatStrings(vector2array(acc));
+}
+
+// -------------------------------------------------------------- the tree ---
+
+mizExpSort(e : MizExp) -> int {
+	switch (e) {
+		MizExpStd(s, __, __, __, __): s;
+		MizExpSimple(s, __, __): s;
+		MizExpNumeral(__, __): ikTrmNumeral;
+		MizExpSelector(__, __, __): ikTrmSelector;
+		MizExpSubAggr(__, __, __): ikTrmSubAgreg;
+		MizExpFraenkel(__, __, __, __): ikTrmFraenkel;
+		MizExpQual(s, __, __, __): s;
+		MizExpAttred(s, __, __, __): s;
+		MizExpChoice(__, __): ikTrmChoice;
+		MizExpMulti(__, __, __): ikMultFrmPred;
+		MizExpNeg(__, __): ikFrmNeg;
+		MizExpBin(s, __, __, __): s;
+		MizExpQuant(s, __, __, __, __): s;
+		MizExpAtom(s, __): s;
+	}
+}
+
+mizExpPos(e : MizExp) -> MizPos {
+	switch (e) {
+		MizExpStd(__, p, __, __, __): p;
+		MizExpSimple(__, p, __): p;
+		MizExpNumeral(p, __): p;
+		MizExpSelector(p, __, __): p;
+		MizExpSubAggr(p, __, __): p;
+		MizExpFraenkel(p, __, __, __): p;
+		MizExpQual(__, p, __, __): p;
+		MizExpAttred(__, p, __, __): p;
+		MizExpChoice(p, __): p;
+		MizExpMulti(p, __, __): p;
+		MizExpNeg(p, __): p;
+		MizExpBin(__, p, __, __): p;
+		MizExpQuant(__, p, __, __, __): p;
+		MizExpAtom(__, p): p;
+	}
+}
+
+// ------------------------------------------------------------ the loader ---
+
+// LoadIPNColl (generato.pas 1362)
+mizLoadIPNColl(s : MizInStream) -> Vector<MizAttrNode> {
+	coll : Vector<MizAttrNode> = makeVector(2);
+	mizInWord(s);
+	while(\ -> s.curKind != 59, \ -> {          // ';'
+		pos = mizInPos(s);
+		mizInWord(s);
+		neg = s.curKind == 45;                   // '-'
+		mizInWord(s);
+		node = MizAttrNode(s.curNr, pos, neg, makeVector(2));
+		mizInWord(s);
+		while(\ -> s.curKind != 59, \ -> {
+			pushVector(node.args, mizLoadTerm(s));
+			mizInWord(s);
+		});
+		pushVector(coll, node);
+		mizInWord(s);
+	});
+	coll;
+}
+
+// LoadFormula (generato.pas 1382)
+mizLoadFormula(s : MizInStream) -> MizExp {
+	pos = mizInPos(s);
+	mizInWord(s);
+	k = s.curKind;
+	if (k == ikFrmPrivPred || k == ikFrmSchPred || k == ikFrmPred || k == ikRSFrmPred) {
+		f = MizExpStd(k, pos, s.curNr, makeVector(2), 0);
+		mizInWord(s);
+		while(\ -> s.curKind != 59, \ -> {
+			pushVector(f.args, mizLoadTerm(s));
+			mizInWord(s);
+		});
+		f;
+	} else if (k == ikMultFrmPred) {
+		f = MizExpMulti(pos, makeVector(2), 0);
+		pushVector(f.args, mizLoadFormula(s));
+		mizInWord(s);
+		f.leftArgsCount ::= s.curNr;
+		mizInWord(s);
+		while(\ -> s.curKind != 59, \ -> {
+			pushVector(f.args, mizLoadFormula(s));
+			mizInWord(s);
+		});
+		f;
+	} else if (k == ikFrmQual) {
+		obiekt = mizLoadTerm(s);
+		kwal = mizLoadType(s);
+		// ExpPos := CurPos, i.e. the position LoadType left behind
+		MizExpQual(k, s.eh.curPos, obiekt, kwal);
+	} else if (k == ikFrmAttr) {
+		podmiot = mizLoadTerm(s);
+		p2 = s.eh.curPos;
+		MizExpAttred(k, p2, podmiot, mizLoadIPNColl(s));
+	} else if (k == ikFrmNeg) {
+		MizExpNeg(pos, mizLoadFormula(s));
+	} else if (k == ikFrmImplies || k == ikFrmIff || k == ikFrmOr
+		|| k == ikFrmConj || k == ikFrmFlexDisj || k == ikFrmFlexConj) {
+		a1 = mizLoadFormula(s);
+		a2 = mizLoadFormula(s);
+		MizExpBin(k, pos, a1, a2);
+	} else if (k == ikFrmUniv || k == ikFrmEx) {
+		mizInWord(s);
+		quantNbr = s.curNr;
+		vars = mizInitIntSeq(quantNbr);
+		fori(1, quantNbr, \__ -> {
+			mizInWord(s);
+			mizSeqInsert(vars, s.curNr);
+			{}
+		});
+		q = mizLoadType(s);
+		sc = mizLoadFormula(s);
+		MizExpQuant(k, pos, vars, q, sc);
+	} else if (k == ikFrmVerum || k == ikFrmThesis || k == ikError) {
+		MizExpAtom(k, pos);
+	} else {
+		mizRunTimeError(2403);
+		MizExpAtom(ikError, pos);
+	}
+}
+
+// LoadTerm (generato.pas 1463). Note that LoadTerm does NOT read a position
+// first — only the node kinds that carry one call InPos.
+mizLoadTerm(s : MizInStream) -> MizExp {
+	mizInWord(s);
+	k = s.curKind;
+	if (k == ikTrmBound || k == ikTrmConstant || k == ikTrmLocus) {
+		// SimpleTerm.Init -> InitExp -> ExpPos := CurPos
+		MizExpSimple(k, s.eh.curPos, s.curNr);
+	} else if (k == ikTrmNumeral) {
+		// ★ the first 'N' is a bare kind character: InInt found no digit after
+		// it, left the value 0 and did NOT move — so this InWord reads the
+		// SECOND 'N' together with the value.
+		mizInWord(s);
+		MizExpNumeral(s.eh.curPos, s.curNr);
+	} else if (k == ikTrmPrivFunc || k == ikTrmSchFunc || k == ikTrmFunctor
+		|| k == ikTrmAggreg) {
+		nr = s.curNr;
+		pos = mizInPos(s);
+		t = MizExpStd(k, pos, nr, makeVector(2), 0);
+		mizInWord(s);
+		while(\ -> s.curKind != 59, \ -> {
+			pushVector(t.args, mizLoadTerm(s));
+			mizInWord(s);
+		});
+		t;
+	} else if (k == ikTrmSelector) {
+		nr = s.curNr;
+		pos = mizInPos(s);
+		MizExpSelector(pos, nr, mizLoadTerm(s));
+	} else if (k == ikTrmSubAgreg) {
+		nr = s.curNr;
+		pos = mizInPos(s);
+		MizExpSubAggr(pos, nr, mizLoadTerm(s));
+	} else if (k == ikTrmChoice) {
+		pos = mizInPos(s);
+		MizExpChoice(pos, mizLoadType(s));
+	} else if (k == ikTrmFraenkel) {
+		pos = mizInPos(s);
+		t = MizExpFraenkel(pos, makeVector(2), MizExpAtom(ikError, pos),
+			MizExpAtom(ikError, pos));
+		mizInWord(s);
+		while(\ -> s.curKind != 59, \ -> {
+			nCopies = s.curNr;
+			idents = mizInitIntSeq(nCopies);
+			fori(1, nCopies, \__ -> {
+				mizInWord(s);
+				mizSeqInsert(idents, s.curNr);
+				{}
+			});
+			typ = mizLoadType(s);
+			pushVector(t.boundVars, MizMultipleType(nCopies, typ, idents));
+			mizInWord(s);
+		});
+		t.sample ::= mizLoadTerm(s);
+		t.compr ::= mizLoadFormula(s);
+		t;
+	} else if (k == ikTrmQua || k == ikTrmExactly) {
+		obiekt = mizLoadTerm(s);
+		kwal = mizLoadType(s);
+		pos = mizInPos(s);
+		MizExpQual(k, pos, obiekt, kwal);
+	} else if (k == ikTrmIt || k == ikError) {
+		MizExpAtom(k, s.eh.curPos);
+	} else {
+		mizRunTimeError(2402);
+		MizExpAtom(ikError, s.eh.curPos);
+	}
+}
+
+// LoadType (generato.pas 1560)
+mizLoadType(s : MizInStream) -> MizExp {
+	pos = mizInPos(s);
+	mizInWord(s);
+	k = s.curKind;
+	if (k == ikTypMode || k == ikTypStruct) {
+		t = MizExpStd(k, pos, s.curNr, makeVector(2), 0);
+		mizInWord(s);
+		while(\ -> s.curKind != 59, \ -> {
+			pushVector(t.args, mizLoadTerm(s));
+			mizInWord(s);
+		});
+		t;
+	} else if (k == ikExpResDes) {
+		nr = s.curNr;
+		mizInWord(s);
+		t = MizExpStd(k, pos, nr, makeVector(2), s.curNr);
+		mizInWord(s);
+		while(\ -> s.curKind != 59, \ -> {
+			pushVector(t.args, mizLoadTerm(s));
+			mizInWord(s);
+		});
+		t;
+	} else if (k == ikExpAttrTyp) {
+		adjs = mizLoadIPNColl(s);
+		podmiot = mizLoadType(s);
+		MizExpAttred(k, s.eh.curPos, podmiot, adjs);
+	} else if (k == ikError) {
+		MizExpAtom(ikError, pos);
+	} else {
+		mizRunTimeError(2401);
+		MizExpAtom(ikError, pos);
+	}
+}
