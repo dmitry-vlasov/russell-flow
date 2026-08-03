@@ -840,7 +840,10 @@ mizWriteThesis(a : MizAnalyzer, lDefs : MizNatFunc) -> void {
 // Reasoning (3466) — the skeleton items of a proof
 mizAReasoning(a : MizAnalyzer) -> void {
 	env = a.env;
-	while(\ -> a.inf.curKind != ikMscEndBlock && a.stoppedAt == 0, \ -> {
+	// Reasoning `exit`s on these three — that is a normal return to the caller,
+	// not a stop (analyzer.pas 3649-3650)
+	leave = ref false;
+	while(\ -> !^leave && a.inf.curKind != ikMscEndBlock && a.stoppedAt == 0, \ -> {
 		k = a.inf.curKind;
 		if (k == ikItmGeneralization) {
 			lPos = mizInPos(a.inf);
@@ -949,8 +952,7 @@ mizAReasoning(a : MizAnalyzer) -> void {
 				mizWriteThesis(a, lDefs);
 			}
 		} else if (k == ikBlcPerCases || k == ikBlcCase || k == ikBlcSuppose) {
-			// the caller handles these
-			a.stoppedAt ::= k;
+			leave := true;
 		} else {
 			mizAStatement(a);
 		}
@@ -991,7 +993,8 @@ mizADemonstration(a : MizAnalyzer, thesisId : int, labId : int, thesis : MizFrm)
 	mizAReasoning(a);
 	if (a.stoppedAt == 0) {
 		if (a.inf.curKind == ikBlcPerCases) {
-			a.stoppedAt ::= ikBlcPerCases;   // PerCasesReasoning not transcribed
+			mizAPerCasesReasoning(a);
+			if (a.stoppedAt == 0) { mizInPos(a.inf); mizInWord(a.inf); }
 		} else {
 			mizInPos(a.inf);
 			mizInWord(a.inf);                // ikMscEndBlock
@@ -1432,7 +1435,8 @@ mizReasResult(a : MizAnalyzer, f0 : MizFrm) -> Pair<MizFrm, Vector<MizFrm>> {
 // DiffReasoning (4032)
 mizADiffReasoning(a : MizAnalyzer) -> void {
 	env = a.env;
-	while(\ -> a.inf.curKind != ikMscEndBlock && a.stoppedAt == 0, \ -> {
+	leave = ref false;
+	while(\ -> !^leave && a.inf.curKind != ikMscEndBlock && a.stoppedAt == 0, \ -> {
 		k = a.inf.curKind;
 		gg = a.gen.g;
 		if (k == ikItmGeneralization) {
@@ -1512,7 +1516,7 @@ mizADiffReasoning(a : MizAnalyzer) -> void {
 			mizVOutElEnd(a.out, "Conclusion");
 			if (a.stoppedAt == 0) mizSkelSnt(a, 66, lFrm);       // 'B'
 		} else if (k == ikBlcPerCases || k == ikBlcCase || k == ikBlcSuppose) {
-			a.stoppedAt ::= k;
+			leave := true;
 		} else {
 			mizAStatement(a);
 		}
@@ -1533,10 +1537,8 @@ mizADiffuseStatement(a : MizAnalyzer) -> Pair<MizFrm, Vector<MizFrm>> {
 	gg.demBase ::= mizGVarNbr(a);
 	mizInWord(a.inf);
 	mizADiffReasoning(a);
-	lResult = if (a.inf.curKind == ikBlcPerCases) {
-		a.stoppedAt ::= ikBlcPerCases;      // DiffPerCasesReasoning not transcribed
-		mizNewIncorFrm();
-	} else mizNewVerum();
+	lResult = if (a.inf.curKind == ikBlcPerCases) mizADiffPerCasesReasoning(a)
+		else mizNewVerum();
 	res = mizReasResult(a, lResult);
 	mizDisposeLevel(a, l, mark);
 	mizInPos(a.inf);
@@ -1572,4 +1574,248 @@ mizAHereBy(a : MizAnalyzer) -> MizFrm {
 		mizVOutElEnd(a.out, "Now");
 	}
 	res.first;
+}
+
+// ============ the PER-CASES families (3702 and 4238) ======================
+
+// PerCasesReasoning (3702) — inside a proof, where the thesis is known
+mizAPerCasesReasoning(a : MizAnalyzer) -> void {
+	env = a.env;
+	mizInPos(a.inf);
+	mizVOutElStart(a.out, "PerCasesReasoning");
+	mizVOutPosAsAttrs(a.out, a.eh.curPos);
+	mizVOutAttrEnd(a.out);
+	mizVOutElStart0(a.out, "BlockThesis");
+	mizVOutFormula(a.out, mizThesis(a));
+	mizVOutElEnd(a.out, "BlockThesis");
+	mizInWord(a.inf);
+	lInference = mizLoadInferenceObj(a);
+	mizInWord(a.inf);
+	perCasesFrm = ref mizNewNeg(mizNewVerum());
+	c = mizCopyLevel(a.gen.g);
+	c.locPredNbr ::= sizeVector(env.locPredDef);
+	c.locFuncNbr ::= sizeVector(env.locFuncDef);
+	lThesis = ref mizCopyFrm(mizThesis(a));
+	perCasesDefs = ref mizInitNatFunc(4);
+	perCasesDefsOk = ref true;
+	itisCase = ref false;
+	while(\ -> a.inf.curKind != ikMscEndBlock && a.stoppedAt == 0, \ -> {
+		k = a.inf.curKind;
+		mark = ref 0;
+		casePos = ref a.eh.curPos;
+		if (k == ikBlcCase) {
+			itisCase := true;
+			casePos := mizInPos(a.inf);
+			mizVOutElStart(a.out, "CaseBlock");
+			mizVOutPosAsAttrs(a.out, ^casePos);
+			mizVOutAttrEnd(a.out);
+			mark := mizTTCollMark(env);
+			mizInWord(a.inf);
+			conds = mizReadPropositions(a);
+			mizInWord(a.inf);
+			lFrm0 = mizConjugatePropositions(conds);
+			perCasesFrm := mizNewDisj(^perCasesFrm, mizCopyFrm(lFrm0));
+			if (mizFrmSort(lFrm0) == ikError) lThesis := mizNewIncorFrm();
+			firstDisjunct = ref mizNewIncorFrm();
+			if (mizFrmSort(^lThesis) == ikError) {
+				mizSetThesis(a, mizNewIncorFrm());
+			} else {
+				d = mizDecompose(mizNewNeg(^lThesis));
+				firstDisjunct := mizNewNeg(d.first);
+				lThesis := mizNewNeg(d.second);
+				mizSetThesis(a, mizCopyFrm(^firstDisjunct));
+				// spread the first disjunct until the case guard chops
+				chopping = ref true;
+				while(\ -> ^chopping, \ -> {
+					p = mizChopped(a, mizCopyFrm(lFrm0), true);
+					if (p.first) {
+						if (^perCasesDefsOk) mizNatJoin(^perCasesDefs, p.second);
+						chopping := false;
+					} else {
+						sp = mizSpreadAtomicFormula(a, ^firstDisjunct, true);
+						firstDisjunct := sp.second;
+						if (sp.first >= 0 && ^perCasesDefsOk) mizNatUp(^perCasesDefs, sp.first);
+						if (mizFrmSort(^firstDisjunct) == ikError) {
+							mizAError(a, ^casePos, 53);
+							mizSetThesis(a, mizNewIncorFrm());
+							lThesis := mizNewIncorFrm();
+							perCasesDefsOk := false;
+							chopping := false;
+						} else {
+							d2 = mizDecompose(mizNewNeg(^firstDisjunct));
+							firstDisjunct := mizNewNeg(d2.first);
+							lThesis := mizNewDisj(mizNewNeg(d2.second), ^lThesis);
+							mizSetThesis(a, mizCopyFrm(^firstDisjunct));
+						}
+					}
+				});
+			}
+			lFrm = mizNewImpl(lFrm0, mizCopyFrm(mizThesis(a)));
+			mizVOutElStart0(a.out, "BlockThesis");
+			mizVOutFormula(a.out, lFrm);
+			mizVOutElEnd(a.out, "BlockThesis");
+			mizVOutElStart0(a.out, "Case");
+			mizVOutPropositions(a.out, conds);
+			mizVOutElEnd(a.out, "Case");
+			mizVOutElStart0(a.out, "Thesis");
+			mizVOutFormula(a.out, mizThesis(a));
+			mizVOutNatFunc(a.out, "ThesisExpansions", mizInitNatFunc(1));
+			mizVOutElEnd(a.out, "Thesis");
+		} else if (k == ikBlcSuppose) {
+			itisCase := false;
+			casePos := mizInPos(a.inf);
+			mizVOutElStart(a.out, "SupposeBlock");
+			mizVOutPosAsAttrs(a.out, ^casePos);
+			mizVOutAttrEnd(a.out);
+			lThesis := switch (c.thesis) { Some(t): mizCopyFrm(t); None(): mizNewIncorFrm(); };
+			mark := mizTTCollMark(env);
+			mizInWord(a.inf);
+			conds = mizReadPropositions(a);
+			mizInWord(a.inf);
+			lFrm0 = mizConjugatePropositions(conds);
+			llThesis = mizNewImpl(mizCopyFrm(lFrm0), mizCopyFrm(^lThesis));
+			mizVOutElStart0(a.out, "BlockThesis");
+			mizVOutFormula(a.out, llThesis);
+			mizVOutElEnd(a.out, "BlockThesis");
+			mizVOutElStart0(a.out, "Suppose");
+			mizVOutPropositions(a.out, conds);
+			mizVOutElEnd(a.out, "Suppose");
+			mizVOutElStart0(a.out, "Thesis");
+			mizVOutFormula(a.out, ^lThesis);
+			mizVOutNatFunc(a.out, "ThesisExpansions", mizInitNatFunc(1));
+			mizVOutElEnd(a.out, "Thesis");
+			perCasesFrm := mizNewDisj(^perCasesFrm, lFrm0);
+			mizSetThesis(a, ^lThesis);
+			lThesis := mizCopyFrm(^lThesis);
+		} else {
+			mizRunTimeError(2641);
+		}
+		if (a.stoppedAt == 0) {
+			mizAReasoning(a);
+			if (a.inf.curKind == ikBlcPerCases) mizAPerCasesReasoning(a)
+			else if (mizFrmSort(mizThesis(a)) != ikFrmVerum
+				&& mizFrmSort(mizThesis(a)) != ikError) mizAError(a, ^casePos, 60);
+			if (a.stoppedAt == 0) {
+				mizAssert(2310, a.inf.curKind == ikMscEndBlock);
+				mizInPos(a.inf);
+				mizInWord(a.inf);
+				mizVOutEndPos(a.out, a.eh.curPos);
+				mizVOutElEnd(a.out, if (^itisCase) "CaseBlock" else "SupposeBlock");
+				mizDisposeLevel(a, c, ^mark);
+			}
+		}
+	});
+	if (a.stoppedAt == 0) {
+		mizVOutElStart0(a.out, "PerCases");
+		mizVOutPropos(a.out, 0, 0, a.eh.curPos, ^perCasesFrm);
+		mizVOutInference(a.out, lInference);
+		mizVOutElEnd(a.out, "PerCases");
+		mizVOutElStart0(a.out, "Thesis");
+		mizVOutFormula(a.out, ^lThesis);
+		mizVOutNatFunc(a.out, "ThesisExpansions",
+			if (^perCasesDefsOk) ^perCasesDefs else mizInitNatFunc(1));
+		mizVOutElEnd(a.out, "Thesis");
+		mizVOutEndPos(a.out, a.eh.curPos);
+		mizVOutElEnd(a.out, "PerCasesReasoning");
+		if (^itisCase && mizFrmSort(^lThesis) != ikError) {
+			ok = switch (^lThesis) {
+				MizNegFrm(arg, __): mizFrmSort(arg) == ikFrmVerum;
+				default: false;
+			};
+			if (!ok) mizAErrImm(a, 54);
+		}
+	}
+}
+
+// DiffPerCasesReasoning (4238) — inside a `now` block, where it is not
+mizADiffPerCasesReasoning(a : MizAnalyzer) -> MizFrm {
+	env = a.env;
+	mizInPos(a.inf);
+	mizVOutElStart(a.out, "PerCasesReasoning");
+	mizVOutPosAsAttrs(a.out, a.eh.curPos);
+	mizVOutAttrEnd(a.out);
+	mizInWord(a.inf);
+	lInference = mizLoadInferenceObj(a);
+	mizInWord(a.inf);
+	lPerCases = ref mizNewNeg(mizNewVerum());
+	c = mizCopyLevel(a.gen.g);
+	c.locPredNbr ::= sizeVector(env.locPredDef);
+	c.locFuncNbr ::= sizeVector(env.locFuncDef);
+	lResult : ref Maybe<MizFrm> = ref None();
+	isCase = a.inf.curKind == ikBlcCase;
+	if (!isCase && a.inf.curKind != ikBlcSuppose) mizRunTimeError(2493);
+	if (isCase) lResult := Some(mizNewNeg(mizNewVerum()));
+	mark = mizTTCollMark(env);
+	go = ref true;
+	while(\ -> ^go && a.stoppedAt == 0, \ -> {
+		casePos = mizInPos(a.inf);
+		mizVOutElStart(a.out, if (isCase) "CaseBlock" else "SupposeBlock");
+		mizVOutPosAsAttrs(a.out, casePos);
+		mizVOutAttrEnd(a.out);
+		mizInWord(a.inf);
+		conds = mizReadPropositions(a);
+		mizVOutElStart0(a.out, if (isCase) "Case" else "Suppose");
+		mizVOutPropositions(a.out, conds);
+		mizVOutElEnd(a.out, if (isCase) "Case" else "Suppose");
+		mizInWord(a.inf);
+		lGuard = mizConjugatePropositions(conds);
+		lPerCases := mizNewDisj(^lPerCases, mizCopyFrm(lGuard));
+		gg = a.gen.g;
+		gg.err ::= false;
+		gg.lastEntry ::= None();
+		if (isCase) mizSkelSnt(a, 66, mizCopyFrm(lGuard));      // 'B'
+		mizADiffReasoning(a);
+		rr = mizReasResult(a, mizNewVerum());
+		lFrm = ref rr.first;
+		subResults = rr.second;
+		if (a.inf.curKind == ikBlcPerCases) {
+			inner = mizADiffPerCasesReasoning(a);
+			if (mizFrmSort(inner) == ikError) c.err ::= true
+			else lFrm := mizNewConj(^lFrm, inner);
+		}
+		if (a.stoppedAt == 0) {
+			mizInPos(a.inf);
+			mizInWord(a.inf);
+			llThesis = mizNewImpl(lGuard, mizCopyFrm(^lFrm));
+			mizVOutEndPos(a.out, a.eh.curPos);
+			mizVOutElStart0(a.out, "BlockThesis");
+			// a suppose block reports its own result as the LAST sub-thesis
+			if (!isCase) pushVector(subResults, ^lFrm);
+			z = ref (sizeVector(subResults) - 1);
+			while(\ -> ^z >= 0, \ -> {
+				mizVOutElStart0(a.out, "Thesis");
+				mizVOutFormula(a.out, getVectorUnsafe(subResults, ^z));
+				mizVOutNatFunc(a.out, "ThesisExpansions", mizInitNatFunc(1));
+				mizVOutElEnd(a.out, "Thesis");
+				z := ^z - 1;
+			});
+			mizVOutFormula(a.out, llThesis);
+			mizVOutElEnd(a.out, "BlockThesis");
+			mizVOutElEnd(a.out, if (isCase) "CaseBlock" else "SupposeBlock");
+			if (mizFrmSort(^lFrm) == ikError) c.err ::= true;
+			if (isCase) {
+				if (mizFrmSort(^lFrm) != ikError)
+					lResult := Some(mizNewDisj(either(^lResult, mizNewIncorFrm()), ^lFrm));
+			} else {
+				switch (^lResult) {
+					None(): lResult := Some(^lFrm);
+					Some(prev): if (!mizEqFrm(env, prev, ^lFrm)) mizAErrImm(a, 59);
+				}
+			}
+			mizDisposeLevel(a, c, mark);
+			if (a.inf.curKind != (if (isCase) ikBlcCase else ikBlcSuppose)) go := false;
+		}
+	});
+	if (a.stoppedAt == 0) {
+		mizVOutElStart0(a.out, "PerCases");
+		mizVOutPropos(a.out, 0, 0, a.eh.curPos, ^lPerCases);
+		mizVOutInference(a.out, lInference);
+		mizVOutElEnd(a.out, "PerCases");
+		mizVOutEndPos(a.out, a.eh.curPos);
+		mizVOutElStart0(a.out, "BlockThesis");
+		mizVOutFormula(a.out, either(^lResult, mizNewIncorFrm()));
+		mizVOutElEnd(a.out, "BlockThesis");
+		mizVOutElEnd(a.out, "PerCasesReasoning");
+	}
+	either(^lResult, mizNewIncorFrm());
 }
