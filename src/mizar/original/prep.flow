@@ -67,6 +67,17 @@ export {
 		// the imported theorem statements InLibraries kept, in FILE ORDER;
 		// their constants are collected after CollectConstInEnvConstructors
 		pendingTheorems : Vector<MizFrm>,
+		// What the ITEM declared, held until the item's element ends.
+		// prephan.pas Parse_OneCluster (1756) / Parse_OneIdentify (1779) /
+		// Parse_OneReduction (1803) all read the declaration, then run the
+		// CORRECTNESS conditions, and only then call FinishLastItem — which is
+		// what installs it (FinishRCluster / FinishIdentify / FinishReduction,
+		// stdprep.pas 912/961/969-1110). So a registration is NOT available
+		// inside its own coherence/reducibility proof; the port used to install
+		// it as soon as the element was read, which is circular.
+		pendingClusters : Vector<MizAnyCluster>,
+		pendingReductions : Vector<MizReduction>,
+		pendingIdents : Vector<MizFuncIdent>,
 	);
 
 	// where a checked article's environment comes from. The three phases are
@@ -650,7 +661,7 @@ mizCheckArticleWith(mmlDir : string, article : string,
 	x = mizXmlInitParsingFile(mmlDir + "/" + article + ".xml");
 	r = mizMakeVrfReader(x, env);
 	defs = mizMakeDefinientia();
-	p = MizPrep(chk, r, makeVector(64), makeVector(64), None(), None(), makeTree(), defs, mizMakeSchemes(), 2, 0, 0, stats, makeVector(64));
+	p = MizPrep(chk, r, makeVector(64), makeVector(64), None(), None(), makeTree(), defs, mizMakeSchemes(), 2, 0, 0, stats, makeVector(64), makeVector(4), makeVector(4), makeVector(4));
 	loader.late(env, cl, idn, defs, p);
 	chk.atomicExpansions ::= \f -> mizAtomicExpansions(env, defs, f);
 	idn.equalsExpand ::= \idn2, funcNr, args -> mizEqualsExpandHook(defs, idn2, funcNr, args);
@@ -1219,6 +1230,29 @@ mizReleaseBlock(p : MizPrep, kind : int, varMark : int, infMark : int) -> void {
 	}
 }
 
+// FinishLastItem for a registration/reduction/identification item: install
+// what it declared, now that its correctness conditions have been checked
+mizFlushPendingDecls(p : MizPrep) -> void {
+	iterVector(p.pendingReductions, \r -> pushVector(p.chk.idn.reductions, r));
+	clearVector(p.pendingReductions);
+	iterVector(p.pendingIdents, \idf -> {
+		pushVector(p.chk.idn.identifications, idf);
+		mizIdentifyRetrofit(p.chk.idn, idf);   // FinishIdentify's retroactive pass
+	});
+	clearVector(p.pendingIdents);
+	iterVector(p.pendingClusters, \c -> {
+		switch (c) {
+			MizRCluster(__, __, __, cons, __): mizCollectConstInEnvCluster(p.chk.idn, cons.upper);
+			MizCCluster(__, __, __, __, cons, __): mizCollectConstInEnvCluster(p.chk.idn, cons.upper);
+			MizFCluster(__, __, __, cons, __, __): mizCollectConstInEnvCluster(p.chk.idn, cons.upper);
+		}
+		mizDeclareCluster(p.chk.env, p.chk.clusters, p.chk.idn, c);
+		mizClearRoundMemo(p.chk.clusters);
+		mizTTCollRelease(p.chk.env, 0);
+	});
+	clearVector(p.pendingClusters);
+}
+
 // walk a Proof/Now/CaseBlock-style block: save scope, process items, restore
 mizWalkBlock(p : MizPrep, relKind : int) -> void {
 	env = p.chk.env;
@@ -1536,24 +1570,24 @@ mizWalkItems(p : MizPrep) -> void {
 							MizFCluster(ar, an, __, __, __, __): "F " + ar + ":" + i2s(an);
 						}));
 					}
-					mizDeclareCluster(p.chk.env, p.chk.clusters, p.chk.idn, c);
-					// a new registration changes what RoundUpTrmType computes
-					// for EVERY term — neither cache can survive it
-					mizClearRoundMemo(p.chk.clusters);
-					mizTTCollRelease(p.chk.env, 0);
+					pushVector(p.pendingClusters, c);
 				}
 				None(): {}
 			}
 		} else if (name == "Reduction") {
+			nRed = sizeVector(p.chk.idn.reductions);
 			mizReadOneReduction(p.chk.idn, p.r);
+			if (sizeVector(p.chk.idn.reductions) > nRed) {
+				pushVector(p.pendingReductions, getVectorUnsafe(p.chk.idn.reductions, nRed));
+				removeVector(p.chk.idn.reductions, nRed);
+			}
 		} else if (name == "Identify") {
 			idnBefore = sizeVector(p.chk.idn.identifications);
 			mizReadOneIdentify(p.chk.idn, p.r);
-			// FinishIdentify's retroactive pass (stdprep.pas 922-952)
 			if (sizeVector(p.chk.idn.identifications) > idnBefore) {
-				mizIdentifyRetrofit(p.chk.idn,
-					getVectorUnsafe(p.chk.idn.identifications,
-						sizeVector(p.chk.idn.identifications) - 1));
+				pushVector(p.pendingIdents,
+					getVectorUnsafe(p.chk.idn.identifications, idnBefore));
+				removeVector(p.chk.idn.identifications, idnBefore);
 			}
 		} else if (name == "DefinitionBlock" || name == "RegistrationBlock"
 			|| name == "NotationBlock" || name == "Registration"
@@ -1574,6 +1608,12 @@ mizWalkItems(p : MizPrep) -> void {
 					|| name == "SupposeBlock") relTruncate
 				else relNone;
 			mizWalkBlock(p, relKind);
+			// FinishLastItem: ONLY these three are the item elements of
+			// Parse_OneCluster / Parse_OneIdentify / Parse_OneReduction
+			if (name == "Registration" || name == "ReductionRegistration"
+				|| name == "IdentifyRegistration") {
+				mizFlushPendingDecls(p);
+			}
 		} else if (name == "Definiens") {
 			// the article's own definientia arrive inline; equals-definitions
 			// feed the equals-expansion, the rest the atom expansion pool
