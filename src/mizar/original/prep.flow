@@ -64,6 +64,9 @@ export {
 		mutable ownTheoremNr : int,
 		mutable ownDefNr : int,
 		stats : MizPrepStats,
+		// the imported theorem statements InLibraries kept, in FILE ORDER;
+		// their constants are collected after CollectConstInEnvConstructors
+		pendingTheorems : Vector<MizFrm>,
 	);
 
 	// where a checked article's environment comes from. The three phases are
@@ -134,14 +137,73 @@ mizLoadRequirementsFile(env : MizCorrelEnv, path : string) -> void {
 	});
 }
 
+// InLibraries (stdprep.pas 694) loads ONLY the theorems the article actually
+// cites — the sets come from the `.ref` file (mizprep.pas 95-98, ReferNbrLoad
+// at justhan.pas 270) — and it calls CollectConstInFrm on every statement it
+// keeps (725 for 'T', 737 for 'D'). Both halves matter: the filter decides
+// WHICH constants exist, the collection decides WHEN they are interned, and the
+// numbering that comes out of it drives the order ProcessReductions visits
+// classes.
+// Format: whitespace-separated `.X1 X2 Y` triplets, `;` ends a section; the
+// three sections are, in order, schemes, theorems, definitional theorems.
+MizRefNbrs(schemes : Tree<int, bool>, theorems : Tree<int, bool>, defs : Tree<int, bool>);
+
+mizRefKey(art : int, nr : int) -> int { art * 100000 + nr }
+
+mizLoadRefNbrs(content : string) -> Maybe<MizRefNbrs> {
+	if (content == "") None() else {
+		flat = strReplace(strReplace(strReplace(content, "\n", " "), "\r", " "), "\t", " ");
+		toks = filter(strSplit(flat, " "), \t -> t != "");
+		sets : [ref Tree<int, bool>] = [ref makeTree(), ref makeTree(), ref makeTree()];
+		sec = ref 0;
+		i = ref 0;
+		while(\ -> ^i < length(toks), \ -> {
+			t = toks[^i];
+			if (startsWith(t, ";")) {
+				sec := ^sec + 1;
+				rest = substring(t, 1, strlen(t) - 1);
+				if (rest != "" && startsWith(rest, ".")) {
+					// `;.1 1 1` — the next section's first triplet is glued on
+					if (^sec < 3 && ^i + 2 < length(toks)) {
+						a = s2i(substring(rest, 1, strlen(rest) - 1));
+						n = s2i(toks[^i + 1]);
+						sets[^sec] := setTree(^(sets[^sec]), mizRefKey(a, n), true);
+						i := ^i + 2;
+					}
+				}
+				i := ^i + 1;
+			} else if (startsWith(t, ".")) {
+				if (^sec < 3 && ^i + 2 < length(toks)) {
+					a = s2i(substring(t, 1, strlen(t) - 1));
+					n = s2i(toks[^i + 1]);
+					sets[^sec] := setTree(^(sets[^sec]), mizRefKey(a, n), true);
+				}
+				i := ^i + 3;
+			} else {
+				i := ^i + 1;
+			}
+		});
+		Some(MizRefNbrs(^(sets[0]), ^(sets[1]), ^(sets[2])));
+	}
+}
+
 mizLoadTheorems(p : MizPrep, content : string) -> void {
-	res = mizLoadTheoremTree(p.r.env, content);
+	mizLoadTheoremsRef(p, content, None());
+}
+
+mizLoadTheoremsRef(p : MizPrep, content : string, refs : Maybe<MizRefNbrs>) -> void {
+	res = mizLoadTheoremTreeC(p.r.env, content, refs, Some(p));
 	p.theorems ::= res.first;
 	p.ownArticleNr ::= res.second;
 }
 
 // the .eth payload as (key -> formula, own article nr)
 mizLoadTheoremTree(env : MizCorrelEnv, content : string) -> Pair<Tree<int, MizFrm>, int> {
+	mizLoadTheoremTreeC(env, content, None(), None());
+}
+
+mizLoadTheoremTreeC(env : MizCorrelEnv, content : string, refs : Maybe<MizRefNbrs>,
+		p0 : Maybe<MizPrep>) -> Pair<Tree<int, MizFrm>, int> {
 	if (content == "") {
 		Pair(makeTree(), 1);
 	} else {
@@ -159,11 +221,27 @@ mizLoadTheoremTree(env : MizCorrelEnv, content : string) -> Pair<Tree<int, MizFr
 				kindS = mizXmlAttr(x, "kind");
 				kind = if (kindS == "T") kindT else kindD;
 				if (articlenr > ^maxArt) maxArt := articlenr;
+				keep = switch (refs) {
+					None(): true;
+					Some(rn): containsKeyTree(
+						if (kind == kindT) rn.theorems else rn.defs,
+						mizRefKey(articlenr, nr));
+				};
 				mizXmlNextElementState(x);
 				f = mizInFormula(r2);
 				// after the formula: at </Theorem>; advance
 				mizXmlNextElementState(x);
-				acc := setTree(^acc, mizThKey(kind, articlenr, nr), f);
+				if (keep) {
+					// InLibraries collects the kept statement's constants — but
+					// InitPrepData runs CollectConstInEnvConstructors FIRST
+					// (1226) and InLibraries LAST (1261), so the statements are
+					// only queued here and collected after the env pass.
+					switch (p0) {
+						Some(pp): pushVector(pp.pendingTheorems, f);
+						None(): {}
+					}
+					acc := setTree(^acc, mizThKey(kind, articlenr, nr), f);
+				}
 			} else {
 				mizXmlSkipElement(x);
 			}
@@ -575,7 +653,7 @@ mizCheckArticleWith(mmlDir : string, article : string,
 	x = mizXmlInitParsingFile(mmlDir + "/" + article + ".xml");
 	r = mizMakeVrfReader(x, env);
 	defs = mizMakeDefinientia();
-	p = MizPrep(chk, r, makeVector(64), makeVector(64), None(), None(), makeTree(), defs, mizMakeSchemes(), 2, 0, 0, stats);
+	p = MizPrep(chk, r, makeVector(64), makeVector(64), None(), None(), makeTree(), defs, mizMakeSchemes(), 2, 0, 0, stats, makeVector(64));
 	loader.late(env, cl, idn, defs, p);
 	chk.atomicExpansions ::= \f -> mizAtomicExpansions(env, defs, f);
 	idn.equalsExpand ::= \idn2, funcNr, args -> mizEqualsExpandHook(defs, idn2, funcNr, args);
@@ -617,6 +695,10 @@ mizCheckArticleWith(mmlDir : string, article : string,
 	});
 
 	mizCollectConstInEnvConstructors(env, idn, cl);
+	// InLibraries (stdprep.pas 1261, after CollectConstInEnvConstructors at
+	// 1226): every theorem statement it kept has its constants collected
+	iterVector(p.pendingTheorems, \tf -> mizPrepCollectFrm(p, tf));
+	clearVector(p.pendingTheorems);
 	if (getUrlParameterDef("dbg-nzt", "") == "1") {
 		println("NZT after  collect " + mizFullTyp2s(env.nonZeroTyp));
 		println("ENV constants interned: " + i2s(sizeVector(env.inferConstDef)));
@@ -660,6 +742,8 @@ mizCollectConstInEnvConstructors(env : MizCorrelEnv, idn : MizIdentify,
 	// Finish*Cluster re-rounding) — both fixed, and the stride is now
 	// byte-identical with it on and off.
 	if (getUrlParameterDef("collect-types", "") != "0") {
+		if (getUrlParameterDef("dbg-envphase", "") == "1")
+			println("ENVPHASE nonzero nconst=" + i2s(sizeVector(env.inferConstDef)));
 		mizCollectConstInTyp(idn, env.nonZeroTyp);
 		// stdprep.pas 1120: ONE loop `for c := Low(ConstructorsKind) to High`,
 		// so the kinds are visited in the ENUM's order — coMode, coStructMode
@@ -670,7 +754,9 @@ mizCollectConstInEnvConstructors(env : MizCorrelEnv, idn : MizIdentify,
 		// instantiation, so a different order really does give a different
 		// class graph (newton05 836:72).
 		iter([coMode, coStructMode, coAttribute, coPredicate,
-				coFunctor, coSelector, coAggregate], \k ->
+				coFunctor, coSelector, coAggregate], \k -> {
+			if (getUrlParameterDef("dbg-envphase", "") == "1")
+				println("ENVPHASE kind" + i2s(k) + " nconst=" + i2s(sizeVector(env.inferConstDef)));
 			iteriVector(env.constrs[k], \i, c ->
 				if (i > 0) {
 					if (k == coStructMode) {
@@ -683,8 +769,8 @@ mizCollectConstInEnvConstructors(env : MizCorrelEnv, idn : MizIdentify,
 						}
 					}
 				}
-			)
-		);
+			);
+		});
 	}
 
 	// The registrations' consequent UPPER clusters (stdprep.pas 1135-1159).
@@ -693,10 +779,16 @@ mizCollectConstInEnvConstructors(env : MizCorrelEnv, idn : MizIdentify,
 	// recursion never ends (the surreal*/fomodel*/hilb10_1 stack overflows).
 	// The original deliberately does NOT collect the primary lists, cluster
 	// types, antecedents or cluster terms — all commented out at 1139-1158.
+	envPh = \n : string -> if (getUrlParameterDef("dbg-envphase", "") == "1")
+		println("ENVPHASE " + n + " nconst=" + i2s(sizeVector(env.inferConstDef)));
 	if (getUrlParameterDef("collect-regs", "") != "0") {
+		envPh("registered");
 		iterVector(cl.registered, \r -> mizCollectConstInEnvCluster(idn, r.consequent.upper));
+		envPh("conditional");
 		iterVector(cl.conditional, \c -> mizCollectConstInEnvCluster(idn, c.consequent.upper));
+		envPh("functor");
 		iterVector(cl.functor, \f -> mizCollectConstInEnvCluster(idn, f.consequent.upper));
+		envPh("done");
 	}
 }
 
@@ -710,7 +802,8 @@ mizFileEnvLoader(mmlDir : string, article : string) -> MizEnvLoader {
 		},
 		\env, cl -> mizLoadClusters(env, cl, getFileContent(mmlDir + "/" + article + ".ecl")),
 		\env, cl, idn, defs, p -> {
-			mizLoadTheorems(p, getFileContent(mmlDir + "/" + article + ".eth"));
+			mizLoadTheoremsRef(p, getFileContent(mmlDir + "/" + article + ".eth"),
+				mizLoadRefNbrs(getFileContent(mmlDir + "/" + article + ".ref")));
 			mizLoadReductions(env, idn, getFileContent(mmlDir + "/" + article + ".erd"));
 			mizLoadIdentifications(env, idn, getFileContent(mmlDir + "/" + article + ".eid"));
 			mizLoadSchemes(p, getFileContent(mmlDir + "/" + article + ".esh"));
