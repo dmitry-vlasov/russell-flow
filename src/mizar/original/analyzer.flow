@@ -88,6 +88,8 @@ export {
 		// character the main loop did not know, so a partial run says exactly
 		// where it stopped instead of aborting.
 		mutable stoppedAt : int,
+		// gFixedBase (analyzer.pas 370)
+		mutable fixedBase : int,
 	);
 
 	CorrCondNbr = 6;
@@ -119,7 +121,7 @@ mizMakeAnalyzer(env : MizCorrelEnv, eh : MizErrHan, clusters : MizClusters,
 		{ v : Vector<MizFrm> = makeVector(CorrCondNbr + 1);
 		  fori(0, CorrCondNbr, \__ -> pushVector(v, mizNewIncorFrm())); v },
 		MaxArgNbr, 0, 0, 0, mizNewIncorFrm(),
-		MizLevelRec(0, 0, 0, 0, 0, 0, None(), false, None()), 0);
+		MizLevelRec(0, 0, 0, 0, 0, 0, None(), false, None()), 0, 0);
 	// the report's own header (Analyze, analyzer.pas 6672)
 	mizVOutString(a.out, "<?xml version=\"1.0\"?>\n");
 	mizVOutString(a.out,
@@ -325,8 +327,7 @@ mizAJustify(a : MizAnalyzer, thesisId : int, labId : int, thesis : MizFrm) -> vo
 	} else if (k == ikBlcProof) {
 		mizInPos(a.inf);
 		mizInWord(a.inf);
-		// Demonstration is not transcribed yet
-		a.stoppedAt ::= ikBlcProof;
+		mizADemonstration(a, thesisId, labId, thesis);
 	} else {
 		mizVOutPropos(a.out, thesisId, labId, a.eh.curPos, thesis);
 		mizVOutEl1(a.out, "SkippedProof");
@@ -367,8 +368,867 @@ mizAnalyze(a : MizAnalyzer) -> void {
 		else if (k == ikItmReservation) mizAReservation(a)
 		else if (k == ikItmCanceled) mizACanceled(a)
 		else if (k == ikItmTheorem) mizATheorem(a)
+		else if (k == 69 || k == ikItmPrivConstant || k == ikItmPrivFunc
+			|| k == ikItmPrivPred || k == ikItmReconsidering || k == ikItmChoice)
+			mizAStatement(a)
 		else a.stoppedAt ::= k;
 		if (a.stoppedAt == 0) mizVOutNewLine(a.out);
 	});
 	if (a.stoppedAt == 0) mizVOutElEnd(a.out, "Article");
+}
+
+// ================== the reasoning machinery (3103-4460) ====================
+
+// FixedVar[n], growing (the original is array[1..MaxVarNbr])
+mizFixedVarAt(a : MizAnalyzer, n : int) -> MizFixedVar {
+	env = a.env;
+	while(\ -> sizeVector(env.fixedVar) <= n,
+		\ -> pushVector(env.fixedVar, MizFixedVar(0, mizNewIncorTyp(), false, None(), 0)));
+	getVectorUnsafe(env.fixedVar, n);
+}
+
+mizGVarNbr(a : MizAnalyzer) -> int { a.gen.g.varNbr; }
+mizSetGVarNbr(a : MizAnalyzer, n : int) -> void {
+	gg = a.gen.g; gg.varNbr ::= n;
+	e = a.env; e.fixedVarNbr ::= n;
+}
+
+mizThesis(a : MizAnalyzer) -> MizFrm {
+	switch (a.gen.g.thesis) { Some(f): f; None(): mizNewIncorFrm(); }
+}
+mizSetThesis(a : MizAnalyzer, f : MizFrm) -> void { gg = a.gen.g; gg.thesis ::= Some(f); }
+
+// SpreadLocPred (3103) — strip the private-predicate wrappers, and the
+// `not P` shape where P's expansion is itself a negation
+mizSpreadLocPred(f0 : MizFrm) -> MizFrm {
+	f = ref f0;
+	go = ref true;
+	while(\ -> ^go, \ -> {
+		while(\ -> mizFrmSort(^f) == ikFrmPrivPred, \ -> {
+			switch (^f) { MizLocPredFrm(__, __, predExp, __): f := predExp; default: {} }
+		});
+		done = ref true;
+		switch (^f) {
+			MizNegFrm(arg, __): switch (arg) {
+				MizLocPredFrm(__, __, predExp, __): {
+					lFrm1 = ref predExp;
+					while(\ -> mizFrmSort(^lFrm1) == ikFrmPrivPred, \ -> {
+						switch (^lFrm1) {
+							MizLocPredFrm(__, __, pe, __): lFrm1 := pe;
+							default: {}
+						}
+					});
+					switch (^lFrm1) {
+						MizNegFrm(inner, __): { f := inner; done := false; }
+						default: {}
+					}
+				}
+				default: {}
+			}
+			default: {}
+		}
+		if (mizFrmSort(^f) != ikFrmPrivPred && ^done) go := false;
+	});
+	^f;
+}
+
+// Decompose (3140): head = the first conjunct, tail = the rest (verum if none)
+mizDecompose(f : MizFrm) -> Pair<MizFrm, MizFrm> {
+	switch (f) {
+		MizConjFrm(conjuncts, __): {
+			if (sizeVector(conjuncts) == 0) Pair(f, mizNewVerum())
+			else {
+				head = getVectorUnsafe(conjuncts, 0);
+				rest : Vector<MizFrm> = makeVector(sizeVector(conjuncts) - 1);
+				fori(1, sizeVector(conjuncts) - 1, \i -> pushVector(rest, getVectorUnsafe(conjuncts, i)));
+				tail = if (sizeVector(rest) == 1) getVectorUnsafe(rest, 0)
+					else MizConjFrm(rest, f.pattNr);
+				Pair(head, tail);
+			}
+		}
+		default: Pair(f, mizNewVerum());
+	}
+}
+
+// SpreadAtomicFormula (3162) — returns the Definientia index (1-based) or -1,
+// and the replacement formula
+mizSpreadAtomicFormula(a : MizAnalyzer, f0 : MizFrm, conclusion : bool) -> Pair<int, MizFrm> {
+	env = a.env;
+	f1 = mizSpreadLocPred(f0);
+	negPair = switch (f1) {
+		MizNegFrm(arg, __): Pair(mizSpreadLocPred(arg), true);
+		default: Pair(f1, false);
+	};
+	f = negPair.first;
+	negated = negPair.second;
+	kind = ref mizFrmSort(f);
+	args : ref MizTrmList = ref MizTrmNil();
+	nr = ref 0;
+	if (^kind == ikFrmPred) {
+		switch (f) {
+			MizPredFrm(__, __, __, __): { q = mizAdjustFrm(env, f); nr := q.first; args := q.second; }
+			default: {}
+		}
+	} else if (^kind == ikFrmAttr) {
+		switch (f) {
+			MizPredFrm(__, __, __, __): { q = mizAdjustAttrFrm(env, f); nr := q.first; args := q.second; }
+			default: {}
+		}
+	} else if (^kind == ikFrmQual) {
+		switch (f) {
+			MizQualFrm(trm, typ, __): {
+				if (typ.sort == ikTypMode && sizeVector(typ.lower.items) == 0) {
+					kind := ikTypMode;
+					q = mizAdjustTyp(env, typ);
+					nr := q.first;
+					// the qualified TERM becomes the last argument
+					last = MizTrmElem(trm, MizTrmNil());
+					args := switch (q.second) {
+						MizTrmNil(): last;
+						MizTrmElem(__, __): {
+							le = mizLastElem(q.second);
+							le.next ::= last;
+							q.second;
+						}
+					};
+				}
+			}
+			default: {}
+		}
+	}
+	item : ref Maybe<MizDefiniens> = ref None();
+	res = ref (-1);
+	i = ref (sizeVector(a.defs.all) - 1);
+	while(\ -> isNone(^item) && ^i >= 0, \ -> {
+		d = getVectorUnsafe(a.defs.all, ^i);
+		if (mizMatches(env, ^kind, ^nr, ^args, d)) { item := Some(d); res := ^i + 1; }
+		i := ^i - 1;
+	});
+	switch (^item) {
+		None(): Pair(^res, mizNewIncorFrm());
+		Some(d): Pair(^res, mizSpreadFrm(env, d,
+			mizCreateArgList(env, sizeVector(d.primaries)), negated, conclusion));
+	}
+}
+
+MaxExpansionNbr = 20;
+
+// Chopped (3223) — destructive on the thesis, as the original is
+mizChopped(a : MizAnalyzer, form0 : MizFrm, conclusion : bool) -> Pair<bool, MizNatFunc> {
+	defs = mizInitNatFunc(4);
+	if (mizFrmSort(mizThesis(a)) == ikError) Pair(true, defs)
+	else if (mizFrmSort(form0) == ikError) {
+		mizSetThesis(a, mizNewIncorFrm());
+		Pair(true, defs);
+	} else {
+		form = ref form0;
+		ok = ref true;
+		running = ref true;
+		while(\ -> ^running && mizFrmSort(^form) != ikFrmVerum, \ -> {
+			dh = mizDecompose(^form);
+			fHead = ref dh.first;
+			form := dh.second;
+			dt = mizDecompose(mizThesis(a));
+			tHead = ref dt.first;
+			mizSetThesis(a, dt.second);
+			matched = ref false;
+			ii = ref 1;
+			while(\ -> !^matched && ^running && ^ii <= MaxExpansionNbr, \ -> {
+				if (mizEqFrm(a.env, ^fHead, ^tHead)) matched := true
+				else {
+					// the inner repeat: align two private predicates
+					inner = ref true;
+					while(\ -> ^inner && !^matched, \ -> {
+						if (mizFrmSort(^fHead) == ikFrmPrivPred
+							&& mizFrmSort(^tHead) == ikFrmPrivPred) {
+							pf = switch (^fHead) { MizLocPredFrm(pn, __, __, __): pn; default: 0; };
+							pt = switch (^tHead) { MizLocPredFrm(pn, __, __, __): pn; default: 0; };
+							if (pf < pt) {
+								d2 = mizDecompose(mizNewConj(mizSpreadLocPred(^tHead), mizThesis(a)));
+								tHead := d2.first;
+								mizSetThesis(a, d2.second);
+							} else if (pf == pt) { ok := false; running := false; }
+							else {
+								d2 = mizDecompose(mizNewConj(mizSpreadLocPred(^fHead), ^form));
+								fHead := d2.first;
+								form := d2.second;
+							}
+						}
+						if (^running && !^matched) {
+							if (mizEqFrm(a.env, ^fHead, ^tHead)) matched := true
+							else {
+								d3 = mizDecompose(mizNewConj(mizSpreadLocPred(^fHead), ^form));
+								fHead := d3.first;
+								form := d3.second;
+								if (mizEqFrm(a.env, ^fHead, ^tHead)) matched := true
+								else {
+									d4 = mizDecompose(mizNewConj(mizSpreadLocPred(^tHead), mizThesis(a)));
+									tHead := d4.first;
+									mizSetThesis(a, d4.second);
+									if (mizEqFrm(a.env, ^fHead, ^tHead)) matched := true;
+								}
+							}
+						}
+						if (!^running || ^matched
+							|| (mizFrmSort(^fHead) != ikFrmPrivPred
+								&& mizFrmSort(^tHead) != ikFrmPrivPred)) inner := false;
+					});
+					if (^running && !^matched) {
+						sp = mizSpreadAtomicFormula(a, ^tHead, conclusion);
+						tHead := sp.second;
+						if (sp.first >= 0) mizNatUp(defs, sp.first);
+						if (mizFrmSort(^tHead) == ikError) { ok := false; running := false; }
+						else {
+							d5 = mizDecompose(mizNewConj(^tHead, mizThesis(a)));
+							tHead := d5.first;
+							mizSetThesis(a, d5.second);
+						}
+					}
+				}
+				ii := ^ii + 1;
+			});
+			if (^running && !^matched) { ok := false; running := false; }
+		});
+		if (!^ok) mizNatDeleteAll(defs);
+		Pair(^ok, defs);
+	}
+}
+
+// ChangeBoundToDecl (3287)
+mizChangeBoundToDecl(a : MizAnalyzer) -> MizWithin {
+	mizMakeWithin(\__, t -> {
+		switch (t) {
+			MizVarTrm(srt, varNr, __, __): {
+				if (srt == ikTrmBound) {
+					if (varNr > 1) t.varNr ::= varNr - 1
+					else { t.sort ::= ikTrmConstant; t.varNr ::= varNr + a.fixedBase; }
+				}
+				t;
+			}
+			default: t;
+		}
+	});
+}
+
+// SetTaken (3295)
+mizSetTaken(a : MizAnalyzer) -> MizWithin {
+	mizMakeWithin(\__, t -> {
+		switch (t) {
+			MizVarTrm(srt, varNr, __, __): {
+				if (srt == ikTrmConstant && varNr == mizGVarNbr(a)) {
+					t.sort ::= ikTrmLocus; t.varNr ::= 1;
+				}
+				t;
+			}
+			default: t;
+		}
+	});
+}
+
+// ChopVars (3311)
+mizChopVars(a : MizAnalyzer, widenable : bool, conclusion : bool, pos : MizPos) -> MizNatFunc {
+	env = a.env;
+	lDefs = mizInitNatFunc(4);
+	if (mizFrmSort(mizThesis(a)) == ikError) lDefs
+	else {
+		stop = ref false;
+		kk = ref (a.fixedBase + 1);
+		while(\ -> !^stop && ^kk <= mizGVarNbr(a), \ -> {
+			// expand until the thesis is universal
+			found = ref false;
+			ii = ref 1;
+			while(\ -> !^found && !^stop && ^ii <= MaxExpansionNbr, \ -> {
+				mizSetThesis(a, mizSpreadLocPred(mizThesis(a)));
+				if (mizFrmSort(mizThesis(a)) == ikFrmUniv) found := true
+				else {
+					sp = mizSpreadAtomicFormula(a, mizThesis(a), conclusion);
+					mizSetThesis(a, sp.second);
+					if (sp.first >= 0) mizNatUp(lDefs, sp.first);
+					if (mizFrmSort(mizThesis(a)) == ikError) {
+						mizAError(a, pos, 55);
+						mizNatDeleteAll(lDefs);
+						stop := true;
+					}
+				}
+				ii := ^ii + 1;
+			});
+			if (!^found && !^stop) {
+				mizAError(a, pos, 55);
+				mizSetThesis(a, mizNewIncorFrm());
+				mizNatDeleteAll(lDefs);
+				stop := true;
+			}
+			if (!^stop) {
+				mizWithinFrm(mizChangeBoundToDecl(a), mizThesis(a));
+				a.fixedBase ::= a.fixedBase + 1;
+				fv = mizFixedVarAt(a, ^kk);
+				if (fv.typ.sort == ikError) {
+					mizSetThesis(a, mizNewIncorFrm());
+					mizNatDeleteAll(lDefs);
+					stop := true;
+				} else {
+					th = mizThesis(a);
+					switch (th) {
+						MizUnivFrm(__, __, quantified, scope, __): {
+							// the widenable / non-widenable branches only differ in
+							// which comparison licenses the step; both keep the scope
+							okStep = if (widenable)
+								mizIsWiderThan(env, quantified, mizCopyTyp(fv.typ))
+								else mizEqTyp(env, quantified, fv.typ);
+							if (okStep) {
+								mizSetThesis(a, scope);
+							} else if (mizIsWiderThan(env, fv.typ, mizCopyTyp(quantified))
+								&& mizEqualClusters(fv.typ, quantified, \x, y -> mizEqAttr(env, x, y))) {
+								// re-qualify: `for x being T holds P` becomes
+								// `x is T1 implies … implies P`
+								lTh = ref mizCopyFrm(scope);
+								lTyp = ref mizCopyTyp(quantified);
+								loop = ref true;
+								while(\ -> ^loop, \ -> {
+									lTh := mizNewImpl(mizNewQualFrm(
+										mizNewVarTrm(ikTrmConstant, ^kk), mizCopyTyp(^lTyp)), ^lTh);
+									switch (mizWidening(env, ^lTyp)) {
+										None(): loop := false;
+										Some(w): {
+											lTyp := w;
+											if (mizEqRadices(env, w, fv.typ)) loop := false;
+										}
+									}
+								});
+								mizSetThesis(a, ^lTh);
+								stop := true;
+							} else {
+								if (widenable) mizAError(a, pos, 57) else mizAErrImm(a, 56);
+								mizSetThesis(a, mizNewIncorFrm());
+								mizNatDeleteAll(lDefs);
+								stop := true;
+							}
+						}
+						default: {
+							mizSetThesis(a, mizNewIncorFrm());
+							stop := true;
+						}
+					}
+				}
+			}
+			kk := ^kk + 1;
+		});
+		lDefs;
+	}
+}
+
+// ChopConcl (3411) / ChopAssum (3428)
+mizChopConcl(a : MizAnalyzer, form : MizFrm, pos : MizPos) -> MizNatFunc {
+	p = mizChopped(a, form, true);
+	if (!p.first) { mizSetThesis(a, mizNewIncorFrm()); mizAError(a, pos, 51); }
+	p.second;
+}
+
+mizChopAssum(a : MizAnalyzer, form : MizFrm, pos : MizPos) -> MizNatFunc {
+	mizSetThesis(a, mizNewNeg(mizThesis(a)));
+	p = mizChopped(a, form, false);
+	if (!p.first) { mizSetThesis(a, mizNewIncorFrm()); mizAError(a, pos, 52); }
+	mizSetThesis(a, mizNewNeg(mizThesis(a)));
+	p.second;
+}
+
+// ChangeFixedToBound (372) / xFormula (383)
+mizChangeFixedToBound(a : MizAnalyzer) -> MizWithin {
+	mizMakeWithin(\__, t -> {
+		switch (t) {
+			MizVarTrm(srt, varNr, __, __): {
+				if (srt == ikTrmBound) t.varNr ::= varNr + (mizGVarNbr(a) - a.fixedBase)
+				else if (srt == ikTrmConstant && varNr > a.fixedBase) {
+					t.sort ::= ikTrmBound; t.varNr ::= varNr - a.fixedBase;
+				}
+				t;
+			}
+			default: t;
+		}
+	});
+}
+
+mizXFormula(a : MizAnalyzer, form0 : MizFrm) -> MizFrm {
+	form = ref mizNewNeg(form0);
+	bad = ref false;
+	kk = ref mizGVarNbr(a);
+	while(\ -> !^bad && ^kk >= a.fixedBase + 1, \ -> {
+		lTyp = mizFixedVarAt(a, ^kk).typ;
+		if (lTyp.sort == ikError) bad := true
+		else form := mizNewUnivI(mizFixedVarAt(a, ^kk).ident, mizCopyTyp(lTyp), ^form);
+		kk := ^kk - 1;
+	});
+	if (^bad) mizNewIncorFrm()
+	else {
+		mizWithinFrm(mizChangeFixedToBound(a), ^form);
+		mizNewNeg(^form);
+	}
+}
+
+// GetQualifiedList (396) / WriteQualified (449)
+mizGetQualifiedList(a : MizAnalyzer, skelConstNr : int) -> void {
+	a.fixedBase ::= mizGVarNbr(a);
+	mizInWord(a.inf);
+	while(\ -> a.inf.curKind == 81, \ -> {          // 'Q'
+		lNbr = mizGVarNbr(a);
+		cnt = a.inf.curNr;
+		mizSetGVarNbr(a, lNbr + cnt);
+		fori(1, cnt, \i -> {
+			mizInWord(a.inf);                        // 'I'
+			fv = mizFixedVarAt(a, lNbr + i);
+			fv.ident ::= a.inf.curNr;
+		});
+		lTyp = mizReadType(a);
+		fori(lNbr + 1, mizGVarNbr(a), \i -> {
+			fv = mizFixedVarAt(a, i);
+			fv.skelConstNr ::= skelConstNr;
+			fv.typ ::= if (i == mizGVarNbr(a)) lTyp else mizCopyTyp(lTyp);
+			fv.expandable ::= false;
+		});
+		mizInWord(a.inf);
+	});
+}
+
+mizWriteQualified(a : MizAnalyzer) -> void {
+	fori(a.fixedBase + 1, mizGVarNbr(a), \i -> {
+		fv = mizFixedVarAt(a, i);
+		mizVOutTypeWithId(a.out, fv.typ, fv.ident);
+	});
+}
+
+// DisposeLevel (3445)
+mizDisposeLevel(a : MizAnalyzer, f : MizLevelRec, mark : int) -> void {
+	env = a.env;
+	while(\ -> sizeVector(env.locPredDef) > f.locPredNbr,
+		\ -> removeVector(env.locPredDef, sizeVector(env.locPredDef) - 1));
+	while(\ -> sizeVector(env.locFuncDef) > f.locFuncNbr,
+		\ -> removeVector(env.locFuncDef, sizeVector(env.locFuncDef) - 1));
+	gg = a.gen.g;
+	gg.locPredNbr ::= f.locPredNbr;
+	gg.locFuncNbr ::= f.locFuncNbr;
+	gg.varNbr ::= f.varNbr;
+	gg.skelConstNbr ::= f.skelConstNbr;
+	gg.demBase ::= f.demBase;
+	gg.genCount ::= f.genCount;
+	gg.lastEntry ::= f.lastEntry;
+	gg.err ::= f.err;
+	gg.thesis ::= f.thesis;
+	e2 = a.env; e2.fixedVarNbr ::= f.varNbr;
+	mizTTCollRelease(env, mark);
+}
+
+mizCopyLevel(g : MizLevelRec) -> MizLevelRec {
+	MizLevelRec(g.locPredNbr, g.locFuncNbr, g.varNbr, g.skelConstNbr,
+		g.demBase, g.genCount, g.lastEntry, g.err, g.thesis);
+}
+
+// ------------------------------------- Reasoning / Demonstration / Statement
+
+// WriteThesis, the local of Reasoning (3476)
+mizWriteThesis(a : MizAnalyzer, lDefs : MizNatFunc) -> void {
+	mizVOutElStart0(a.out, "Thesis");
+	mizVOutFormula(a.out, mizThesis(a));
+	mizVOutNatFunc(a.out, "ThesisExpansions", lDefs);
+	mizVOutElEnd(a.out, "Thesis");
+}
+
+// Reasoning (3466) — the skeleton items of a proof
+mizAReasoning(a : MizAnalyzer) -> void {
+	env = a.env;
+	while(\ -> a.inf.curKind != ikMscEndBlock && a.stoppedAt == 0, \ -> {
+		k = a.inf.curKind;
+		if (k == ikItmGeneralization) {
+			lPos = mizInPos(a.inf);
+			mizVOutElStart(a.out, "Let");
+			mizVOutIntAttr(a.out, "nr", mizGVarNbr(a) + 1);
+			mizVOutAttrEnd(a.out);
+			switch (mizThesis(a)) {
+				MizFlexFrm(__, __, __, __, __, expansion, __): mizSetThesis(a, expansion);
+				default: {}
+			}
+			mizGetQualifiedList(a, 0);
+			gg = a.gen.g;
+			fori(a.fixedBase + 1, mizGVarNbr(a), \i -> {
+				gg.genCount ::= gg.genCount + 1;
+				fv = mizFixedVarAt(a, i);
+				fv.skelConstNr ::= gg.genCount;
+			});
+			mizWriteQualified(a);
+			mizVOutElEnd(a.out, "Let");
+			lDefs = mizChopVars(a, false, false, lPos);
+			mizWriteThesis(a, lDefs);
+		} else if (k == ikItmAssumption) {
+			lPos = mizInPos(a.inf);
+			mizVOutElStart0(a.out, "Assume");
+			mizInWord(a.inf);
+			conds = mizReadPropositions(a);
+			mizVOutPropositions(a.out, conds);
+			mizVOutElEnd(a.out, "Assume");
+			mizInWord(a.inf);
+			lFrm = mizConjugatePropositions(conds);
+			lDefs = mizChopAssum(a, lFrm, lPos);
+			mizWriteThesis(a, lDefs);
+		} else if (k == ikItmExAssumption) {
+			lVarBase = mizGVarNbr(a);
+			lPos = mizInPos(a.inf);
+			mizVOutElStart(a.out, "Given");
+			mizVOutIntAttr(a.out, "nr", mizGVarNbr(a) + 1);
+			mizVOutAttrEnd(a.out);
+			mizGetQualifiedList(a, 0);
+			conds = mizReadPropositions(a);
+			mizInWord(a.inf);
+			lFrm = mizXFormula(a, mizConjugatePropositions(conds));
+			mizVOutPropos(a.out, 0, 0, a.eh.curPos, lFrm);
+			lDefs = mizChopAssum(a, lFrm, lPos);
+			mizWriteQualified(a);
+			mizVOutPropositions(a.out, conds);
+			mizVOutElEnd(a.out, "Given");
+			fori(lVarBase + 1, mizGVarNbr(a), \i -> {
+				fv = mizFixedVarAt(a, i); fv.skelConstNr ::= 0;
+			});
+			mizWriteThesis(a, lDefs);
+		} else if (k == ikItmExemplifWithEq) {
+			lPos = mizInPos(a.inf);
+			mizVOutElStart(a.out, "TakeAsVar");
+			mizVOutIntAttr(a.out, "nr", mizGVarNbr(a) + 1);
+			mizVOutAttrEnd(a.out);
+			mizInWord(a.inf);                      // 'I'
+			lId = a.inf.curNr;
+			lTrm = mizReadTerm(a);
+			a.fixedBase ::= mizGVarNbr(a);
+			mizSetGVarNbr(a, mizGVarNbr(a) + 1);
+			mizAssert(2521, mizGVarNbr(a) <= MaxVarNbr);
+			fv = mizFixedVarAt(a, mizGVarNbr(a));
+			fv.expandable ::= false;
+			fv.ident ::= lId;
+			fv.typ ::= mizGetTrmType(env, lTrm);
+			mizAStripFlexUnderNeg(a);
+			mizSetThesis(a, mizNewNeg(mizThesis(a)));
+			lDefs = mizChopVars(a, true, true, lPos);
+			mizSetThesis(a, mizNewNeg(mizThesis(a)));
+			mizVOutTypeWithId(a.out, fv.typ, fv.ident);
+			mizVOutTerm(a.out, lTrm);
+			mizVOutElEnd(a.out, "TakeAsVar");
+			mizWriteThesis(a, lDefs);
+			mizInWord(a.inf);
+		} else if (k == ikItmSimpleExemplif) {
+			lPos = mizInPos(a.inf);
+			mizVOutElStart0(a.out, "Take");
+			lTrm = mizReadTerm(a);
+			mizVOutTerm(a.out, lTrm);
+			mizVOutElEnd(a.out, "Take");
+			a.fixedBase ::= mizGVarNbr(a);
+			mizSetGVarNbr(a, mizGVarNbr(a) + 1);
+			fv = mizFixedVarAt(a, mizGVarNbr(a));
+			fv.ident ::= 0;
+			fv.typ ::= mizGetTrmType(env, lTrm);
+			fv.expandable ::= false;
+			mizAStripFlexUnderNeg(a);
+			mizSetThesis(a, mizNewNeg(mizThesis(a)));
+			lDefs = mizChopVars(a, true, true, lPos);
+			mizSetThesis(a, mizNewNeg(mizThesis(a)));
+			mizWithinFrm(mizSetTaken(a), mizThesis(a));
+			mizSetThesis(a, mizInstFrm(env, mizThesis(a), MizTrmElem(lTrm, MizTrmNil())));
+			mizSetGVarNbr(a, mizGVarNbr(a) - 1);
+			mizInWord(a.inf);
+			mizWriteThesis(a, lDefs);
+		} else if (k == ikItmConclusion) {
+			lPos = mizInPos(a.inf);
+			mizVOutElStart0(a.out, "Conclusion");
+			mizInWord(a.inf);
+			lFrm = if (a.inf.curKind == ikBlcHereby) {
+				a.stoppedAt ::= ikBlcHereby;   // HereBy not transcribed yet
+				mizNewIncorFrm();
+			} else mizARegularStatement(a);
+			if (a.stoppedAt == 0) {
+				lDefs = mizChopConcl(a, lFrm, lPos);
+				mizVOutElEnd(a.out, "Conclusion");
+				mizWriteThesis(a, lDefs);
+			}
+		} else if (k == ikBlcPerCases || k == ikBlcCase || k == ikBlcSuppose) {
+			// the caller handles these
+			a.stoppedAt ::= k;
+		} else {
+			mizAStatement(a);
+		}
+	});
+}
+
+// the two exemplification branches strip a flex expansion under a negation
+mizAStripFlexUnderNeg(a : MizAnalyzer) -> void {
+	switch (mizThesis(a)) {
+		MizNegFrm(arg, __): switch (arg) {
+			MizFlexFrm(__, __, __, __, __, expansion, __):
+				mizSetThesis(a, mizNewNeg(expansion));
+			default: {}
+		}
+		default: {}
+	}
+}
+
+// Demonstration (3906)
+mizADemonstration(a : MizAnalyzer, thesisId : int, labId : int, thesis : MizFrm) -> void {
+	env = a.env;
+	mizVOutPropos(a.out, thesisId, labId, a.eh.curPos, thesis);
+	mizVOutElStart(a.out, "Proof");
+	if (thesisId != 0) {
+		mizVOutIntAttr(a.out, "nr", thesisId);
+		mizVOutIntAttr(a.out, "vid", labId);
+	}
+	mizVOutPosAsAttrs(a.out, a.eh.curPos);
+	mizVOutAttrEnd(a.out);
+	mizVOutElStart0(a.out, "BlockThesis");
+	mizVOutFormula(a.out, thesis);
+	mizVOutElEnd(a.out, "BlockThesis");
+	l = mizCopyLevel(a.gen.g);
+	l.locPredNbr ::= sizeVector(env.locPredDef);
+	l.locFuncNbr ::= sizeVector(env.locFuncDef);
+	mark = mizTTCollMark(env);
+	mizSetThesis(a, mizCopyFrm(thesis));
+	mizAReasoning(a);
+	if (a.stoppedAt == 0) {
+		if (a.inf.curKind == ikBlcPerCases) {
+			a.stoppedAt ::= ikBlcPerCases;   // PerCasesReasoning not transcribed
+		} else {
+			mizInPos(a.inf);
+			mizInWord(a.inf);                // ikMscEndBlock
+			th = mizThesis(a);
+			if (mizFrmSort(th) != ikFrmVerum && mizFrmSort(th) != ikError) {
+				d = mizDecompose(th);
+				head = ref d.first;
+				mizSetThesis(a, d.second);
+				fin = ref false;
+				ii = ref 1;
+				while(\ -> !^fin && ^ii <= MaxExpansionNbr, \ -> {
+					if (mizFrmSort(^head) == ikFrmVerum) fin := true
+					else {
+						sp = mizSpreadAtomicFormula(a, ^head, true);
+						head := sp.second;
+						if (mizFrmSort(^head) == ikError) fin := true
+						else {
+							d2 = mizDecompose(mizNewConj(^head, mizThesis(a)));
+							head := d2.first;
+							mizSetThesis(a, d2.second);
+						}
+					}
+					ii := ^ii + 1;
+				});
+			}
+		}
+	}
+	if (a.stoppedAt == 0) {
+		mizVOutEndPos(a.out, a.eh.curPos);
+		mizVOutElEnd(a.out, "Proof");
+	}
+	mizDisposeLevel(a, l, mark);
+}
+
+// RegularStatement (4492)
+mizARegularStatement(a : MizAnalyzer) -> MizFrm {
+	env = a.env;
+	lLabelNr = a.inf.curNr;
+	lLabId = mizInInt(a.inf);
+	mizInPos(a.inf);
+	mizInWord(a.inf);
+	if (a.inf.curKind == ikBlcDiffuse) {
+		a.stoppedAt ::= ikBlcDiffuse;      // DiffuseStatement not transcribed
+		mizNewIncorFrm();
+	} else {
+		lFrm = mizReadSentence(a, false);
+		mizInWord(a.inf);
+		k = a.inf.curKind;
+		if (k == 34) {                     // '"'
+			inf = mizLoadInferenceObj(a);
+			mizInWord(a.inf);
+			if (a.inf.curKind == ikItmIterEquality) {
+				mizAIterEquality(a, lLabelNr, lLabId, lFrm, inf);
+			} else {
+				mizVOutPropos(a.out, lLabelNr, lLabId, a.eh.curPos, lFrm);
+				mizVOutInference(a.out, inf);
+				lFrm;
+			}
+		} else if (k == ikBlcProof) {
+			mizInPos(a.inf);
+			mizInWord(a.inf);
+			mizADemonstration(a, lLabelNr, lLabId, lFrm);
+			lFrm;
+		} else {
+			mizVOutPropos(a.out, lLabelNr, lLabId, a.eh.curPos, lFrm);
+			mizVOutEl1(a.out, "SkippedProof");
+			lFrm;
+		}
+	}
+}
+
+// the iterative-equality branch of RegularStatement (4557)
+mizAIterEquality(a : MizAnalyzer, labelNr : int, labId : int, lFrm : MizFrm,
+		inf0 : MizInference) -> MizFrm {
+	env = a.env;
+	pr : ref Maybe<Pair<MizTrm, MizTrm>> = ref None();
+	switch (lFrm) {
+		MizPredFrm(srt, __, __, __): if (srt == ikFrmPred) {
+			q = mizAdjustFrm(env, lFrm);
+			if (q.first == mizBuiltIn(env.builtIn, rqEqualsTo)) {
+				l = mizTrmListNth(q.second, 0);
+				r = mizTrmListNth(q.second, 1);
+				pr := Some(Pair(mizCopyTrm(l), mizCopyTrm(r)));
+			}
+		}
+		default: {}
+	}
+	sides = switch (^pr) {
+		Some(p): p;
+		None(): {
+			if (mizFrmSort(lFrm) != ikError) mizAErrImm(a, 159);
+			Pair(mizNewIncorTrm(), mizNewIncorTrm());
+		}
+	};
+	leftSide = sides.first;
+	steps : Vector<MizIterStep> = makeVector(4);
+	pushVector(steps, MizIterStep(inf0, sides.second));
+	last = ref sides.second;
+	go = ref true;
+	while(\ -> ^go, \ -> {
+		mizInPos(a.inf);
+		lTrm = mizReadTerm(a);
+		mizInWord(a.inf);
+		inf = mizLoadInferenceObj(a);
+		mizInWord(a.inf);
+		pushVector(steps, MizIterStep(inf, lTrm));
+		last := lTrm;
+		if (a.inf.curKind != ikItmIterEquality) go := false;
+	});
+	mizVOutElStart(a.out, "IterEquality");
+	if (labelNr != 0) {
+		mizVOutIntAttr(a.out, "nr", labelNr);
+		mizVOutIntAttr(a.out, "vid", labId);
+	}
+	mizVOutPosAsAttrs(a.out, a.eh.curPos);
+	mizVOutAttrEnd(a.out);
+	mizVOutTerm(a.out, leftSide);
+	iterVector(steps, \st -> mizVOutIterStep(a.out, st));
+	mizVOutElEnd(a.out, "IterEquality");
+	mizNewEqFrm(env, leftSide, mizCopyTrm(^last));
+}
+
+// Statement (4651)
+mizAStatement(a : MizAnalyzer) -> void {
+	env = a.env;
+	lVarBase = mizGVarNbr(a);
+	k = a.inf.curKind;
+	if (k == ikItmPrivConstant) {
+		mizVOutElStart(a.out, "Set");
+		mizVOutIntAttr(a.out, "nr", mizGVarNbr(a) + 1);
+		mizVOutAttrEnd(a.out);
+		mizInWord(a.inf);                    // 'I'
+		lId = a.inf.curNr;
+		lTrm = mizReadTerm(a);
+		mizInWord(a.inf);
+		mizSetGVarNbr(a, mizGVarNbr(a) + 1);
+		mizAssert(2520, mizGVarNbr(a) <= MaxVarNbr);
+		fv = mizFixedVarAt(a, mizGVarNbr(a));
+		fv.ident ::= lId;
+		fv.expandable ::= true;
+		fv.def ::= Some(lTrm);
+		fv.typ ::= mizCopyTrmType(env, lTrm);
+		mizVOutTerm(a.out, lTrm);
+		mizVOutTypeWithId(a.out, fv.typ, fv.ident);
+		mizVOutElEnd(a.out, "Set");
+	} else if (k == ikItmPrivFunc) {
+		mark = mizTTCollMark(env);
+		mizInWord(a.inf);
+		lId = a.inf.curNr;
+		mizVOutElStart(a.out, "DefFunc");
+		lArgs = mizAnalizeArgTypeList(a);
+		lTrm = mizReadTerm(a);
+		lTyp0 = mizGetTrmType(env, lTrm);
+		lTyp = if (lTyp0.sort == ikError) mizCopyTyp(a.anyTyp) else lTyp0;
+		pushVector(env.locFuncDef, MizFuncDef(lId, lArgs, lTrm, lTyp));
+		mizInWord(a.inf);
+		mizVOutIntAttr(a.out, "nr", sizeVector(env.locFuncDef));
+		mizVOutIntAttr(a.out, "vid", lId);
+		mizVOutAttrEnd(a.out);
+		mizVOutArgTypes(a.out, lArgs);
+		mizVOutTerm(a.out, lTrm);
+		mizVOutType(a.out, lTyp);
+		mizVOutElEnd(a.out, "DefFunc");
+		mizTTCollRelease(env, mark);
+	} else if (k == ikItmPrivPred) {
+		mark = mizTTCollMark(env);
+		mizInWord(a.inf);
+		lId = a.inf.curNr;
+		mizVOutElStart(a.out, "DefPred");
+		lArgs = mizAnalizeArgTypeList(a);
+		mizASetBVN(a, 0);
+		lFrm = mizReadSentence(a, false);
+		mizInWord(a.inf);
+		mizTTCollRelease(env, mark);
+		pushVector(env.locPredDef, MizPredDef(lId, lArgs, lFrm));
+		mizVOutIntAttr(a.out, "nr", sizeVector(env.locPredDef));
+		mizVOutIntAttr(a.out, "vid", lId);
+		mizVOutAttrEnd(a.out);
+		mizVOutArgTypes(a.out, lArgs);
+		mizVOutFormula(a.out, lFrm);
+		mizVOutElEnd(a.out, "DefPred");
+	} else if (k == ikItmReconsidering) {
+		mizVOutElStart(a.out, "Reconsider");
+		mizVOutIntAttr(a.out, "nr", mizGVarNbr(a) + 1);
+		mizVOutAttrEnd(a.out);
+		locBase = mizGVarNbr(a);
+		mizInWord(a.inf);
+		while(\ -> a.inf.curKind != 59, \ -> {
+			mizSetGVarNbr(a, mizGVarNbr(a) + 1);
+			mizAssert(2522, mizGVarNbr(a) <= MaxVarNbr);
+			mizASetBVN(a, 0);
+			mizInWord(a.inf);                  // 'I'
+			fv = mizFixedVarAt(a, mizGVarNbr(a));
+			fv.ident ::= a.inf.curNr;
+			lTrm0 = mizAnalyzeTrm(a.gen, mizLoadTerm(a.inf));
+			lTrm = switch (lTrm0) {
+				MizQuaTrm(trmProper, __, __, __): trmProper;
+				default: lTrm0;
+			};
+			fv.expandable ::= false;
+			fv.def ::= Some(lTrm);
+			mizInWord(a.inf);
+		});
+		mizInWord(a.inf);
+		lTyp = mizReadType(a);
+		fori(locBase + 1, mizGVarNbr(a), \i -> {
+			fv = mizFixedVarAt(a, i);
+			mizVOutTypeWithId(a.out, lTyp, fv.ident);
+			switch (fv.def) { Some(d): mizVOutTerm(a.out, d); None(): {} }
+		});
+		fori(locBase + 1, mizGVarNbr(a), \i -> {
+			fv = mizFixedVarAt(a, i); fv.typ ::= mizCopyTyp(lTyp);
+		});
+		lFrm = ref mizNewVerum();
+		fori(locBase + 1, mizGVarNbr(a), \i -> {
+			fv = mizFixedVarAt(a, i);
+			switch (fv.def) {
+				Some(d): lFrm := mizNewConj(^lFrm, mizNewQualFrm(d, mizCopyTyp(lTyp)));
+				None(): {}
+			}
+		});
+		mizAJustify(a, 0, 0, ^lFrm);
+		mizVOutElEnd(a.out, "Reconsider");
+	} else if (k == ikItmChoice) {
+		mizVOutElStart(a.out, "Consider");
+		mizVOutIntAttr(a.out, "nr", mizGVarNbr(a) + 1);
+		mizVOutAttrEnd(a.out);
+		mizGetQualifiedList(a, 0);
+		conds = mizReadPropositions(a);
+		lFrm = mizXFormula(a, mizConjugatePropositions(conds));
+		mizAJustify(a, 0, 0, lFrm);
+		mizWriteQualified(a);
+		mizVOutPropositions(a.out, conds);
+		mizVOutElEnd(a.out, "Consider");
+	} else if (k == 69) {                   // 'E' — a labelled regular statement
+		mizARegularStatement(a) |> \__ -> {};
+	} else {
+		mizRunTimeError(2070);
+	}
+	fori(lVarBase + 1, mizGVarNbr(a), \i -> {
+		fv = mizFixedVarAt(a, i); fv.skelConstNr ::= 0;
+	});
 }
