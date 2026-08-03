@@ -1,0 +1,2433 @@
+// Transcription of ~/dev/system/base/parseraddition.pas — the WSM BUILDER the
+// parser drives.
+//
+// The original declares three abstract stacks in syntax.pas (BlockObj / ItemObj
+// / SubexpObj, all methods empty) and ONE concrete descendant of each here.
+// Because the override set is closed and has exactly one member, the port
+// flattens the virtual dispatch: every `gSubexpPtr^.Foo` in the grammar becomes
+// a call to `mizSubFoo(p)` and the abstract no-op bodies simply have no
+// counterpart. The three stacks themselves are kept — they are real state.
+//
+// The unit's file-level `var`s (gLastTerm, gLastType, TermNbr, Term, gPattern,
+// …) become fields of MizParser, the one per-article state record, as the
+// CONVENTIONS require. Their names are kept.
+//
+// ★ THE TERM STACK IS THE HEART OF IT. Every visible argument is pushed onto
+//   `Term` by FinishArgument and popped in bulk by CreateArgs(base), which
+//   truncates the stack. Index 0 is unused — the Pascal array is written to at
+//   Term[TermNbr] with TermNbr starting at 0 and pre-incremented.
+
+import ds/vector;
+import loop;
+import string;
+import mizar/original/errhan;
+import mizar/original/scanner;
+import mizar/original/formats;
+import mizar/original/wsm;
+
+export {
+	// extBlockObj
+	MizExtBlock(
+		kind : int,
+		mutable lastWSItem : Maybe<MizWsItem>,
+		mutable lastWSBlock : MizWsBlock,
+		mutable linked : bool,
+		mutable linkAllowed : bool,
+		mutable linkProhibited : bool,
+		mutable linkPos : MizPos,
+		mutable inDiffuse : bool,
+		mutable lastSentence : Maybe<MizWsFormula>,
+		mutable hasAssumptions : bool,
+	);
+
+	// extItemObj
+	MizExtItem(
+		kind : int,
+		mutable itemPos : MizPos,
+		mutable lastWSItem : MizWsItem,
+		mutable labelIdNr : int,
+		mutable labelIdPos : MizPos,
+		mutable label : MizWsMaybeLabel,
+		mutable propPos : MizPos,
+		mutable inference : Maybe<MizWsJustification>,
+		mutable linkable : bool,
+		mutable regularStatementKind : int,
+		mutable itAllowed : bool,
+	);
+
+	// extSubexpObj
+	MizExtSubexp(
+		mutable termBase : int,
+		mutable rightArgBase : int,
+		mutable subexpPos : MizPos,
+		mutable notPos : MizPos,
+		mutable restrPos : MizPos,
+		mutable quaPos : MizPos,
+		mutable spelling : int,
+		mutable symbolNr : int,
+		mutable rSymbolNr : int,
+		mutable connective : int,
+		mutable nextWord : int,
+		mutable modeKind : int,
+		mutable modeNr : int,
+		mutable rightSideOfPredPos : MizPos,
+		multiPredicateList : Vector<MizWsFormula>,
+		mutable sample : MizWsTerm,
+		mutable allPos : MizPos,
+		postQualList : Vector<MizWsSegment>,
+		qualifiedSegments : Vector<MizWsSegment>,
+		segmentIdentColl : Vector<MizWsVariable>,
+		mutable segmentPos : MizPos,
+		mutable firstSententialOperand : MizWsFormula,
+		mutable restriction : Maybe<MizWsFormula>,
+		attrCollection : Vector<MizWsAdjExpr>,
+		mutable noneOcc : bool,
+		mutable nonPos : MizPos,
+		mutable postNegated : bool,
+		mutable argListNbr : int,
+		argListStart : Vector<int>,
+		argListLength : Vector<int>,
+		funcInstance : Vector<int>,
+		funcSymPri : Vector<int>,
+		funcPos : Vector<MizPos>,
+	);
+
+	// One per article: the scanner registers, the three stacks and every
+	// file-level var of parser.pas / parseraddition.pas.
+	MizParser(
+		eh : MizErrHan,
+		sc : MizScanner,
+		formats : MizFormats,
+		prf : MizPrf,
+		articleId : string,
+		articleExt : string,
+
+		// mscanner.pas token registers
+		mutable prevWord : MizScLexem,
+		mutable curWord : MizScLexem,
+		mutable aheadWord : MizScLexem,
+		mutable prevPos : MizPos,
+		mutable curPos : MizPos,
+		mutable aheadPos : MizPos,
+
+		// parser.pas
+		mutable stillCorrect : bool,
+
+		// the stacks
+		blocks : Vector<MizExtBlock>,
+		items : Vector<MizExtItem>,
+		subexps : Vector<MizExtSubexp>,
+		expKinds : Vector<int>,
+
+		// the article being built
+		mutable textProper : MizWsBlock,
+		mutable lastWSBlock : MizWsBlock,
+		mutable lastWSItem : Maybe<MizWsItem>,
+
+		// the expression registers
+		mutable lastType : Maybe<MizWsType>,
+		mutable lastTerm : MizWsTerm,
+		mutable lastFormula : MizWsFormula,
+		mutable lastAdjective : MizWsAdjExpr,
+
+		// the term stack (Term / TermNbr)
+		term : Vector<MizWsTerm>,
+		mutable termNbr : int,
+
+		mutable subItemKind : int,
+		schemeParams : Vector<MizWsSchemeSegment>,
+		typeList : Vector<MizWsType>,
+		schVarIds : Vector<MizWsVariable>,
+		mutable theFileNr : int,
+		mutable definitional : bool,
+		mutable privateId : int,
+		mutable privateIdPos : MizPos,
+		reconsiderList : Vector<MizWsTypeChange>,
+		mutable paramNbr : int,
+		mutable leftLociNbr : int,
+		mutable defKind : int,
+		mutable fieldsNbr : int,
+		mutable defLabId : int,
+		mutable defLabPos : MizPos,
+		mutable defLabel : MizWsMaybeLabel,
+		qualifiedSegment : Vector<MizWsVariable>,
+		qualifiedSegmentList : Vector<MizWsSegment>,
+		mutable segmentPos : MizPos,
+		correctnessConditions : Vector<bool>,   // set of CorrectnessKind
+		mutable definingWay : int,
+		mutable redefinitions : bool,
+		mutable constructorNr : int,
+		mutable proofCnt : int,
+		mutable dolAllowed : bool,
+		mutable itAllowedG : bool,
+		mutable inAggrPattern : bool,
+		resIdents : Vector<MizWsVariable>,
+		mutable resPos : MizPos,
+		mutable subItemPos : MizPos,
+
+		leftLoci : Vector<MizWsLocus>,
+		params : Vector<MizWsLocus>,
+		mutable hasParams : bool,       // gParams <> nil
+		mutable defPos : MizPos,
+		mutable locus : MizWsLocus,
+		mutable patternPos : MizPos,
+		mutable pattern : MizWsPattern,
+		mutable newPatternPos : MizPos,
+		mutable newPattern : MizWsPattern,
+		mutable leftTermInReduction : MizWsTerm,
+		mutable leftLocus : MizWsLocus,
+		identifyEqLociList : Vector<MizWsLociEquality>,
+		mutable hasIdentifyEqLoci : bool,
+		structPrefixes : Vector<MizWsType>,
+		mutable strPos : MizPos,
+		mutable sgmPos : MizPos,
+		structFields : Vector<MizWsFieldSegment>,
+		structFieldsSegment : Vector<MizWsFieldSymbol>,
+		mutable definiensProhibited : bool,
+		mutable expandable : bool,
+		mutable specification : Maybe<MizWsType>,
+		mutable definiens : Maybe<MizWsDefiniens>,
+		partialDefs : Vector<MizWsPartDef>,
+		mutable hasPartialDefs : bool,
+		mutable partDefTerm : MizWsTerm,
+		mutable partDefFormula : MizWsFormula,
+		mutable meansPos : MizPos,
+		mutable otherwiseTerm : Maybe<MizWsTerm>,
+		mutable otherwiseFormula : Maybe<MizWsFormula>,
+		attrColl : Vector<MizWsAdjExpr>,
+		antecedent : Vector<MizWsAdjExpr>,
+		consequent : Vector<MizWsAdjExpr>,
+		mutable clusterTerm : MizWsTerm,
+		mutable clusterSort : int,
+		mutable propertySort : int,
+		mutable corrCondSort : int,
+		mutable localScheme : bool,
+		mutable schemeIdNr : int,
+		mutable schemePos : MizPos,
+		mutable schemeIdPos : MizPos,
+		mutable schemeConclusion : MizWsFormula,
+		schemePremises : Vector<MizWsProposition>,
+		mutable suchThatOcc : bool,
+		mutable suchPos : MizPos,
+		mutable thatPos : MizPos,
+		premises : Vector<MizWsProposition>,
+		mutable hasPremises : bool,
+		mutable iterPos : MizPos,
+		iterativeSteps : Vector<MizWsIterativeStep>,
+		mutable iterativeLastFormula : MizWsFormula,
+		mutable inference2 : Maybe<MizWsJustification>,   // gInference
+		mutable proofPragma : bool,
+		mutable axiomsAllowed : bool,
+
+		// parser.pas gVisibleNbr, and the three MUTABLE max-argument tables of
+		// mscanner.pas — a pattern raises its symbol's entry as it is read.
+		mutable visibleNbr : int,
+		modeMaxArgs : Vector<int>,
+		structModeMaxArgs : Vector<int>,
+		predMaxArgs : Vector<int>,
+	);
+
+	mizMakeParser(eh : MizErrHan, sc : MizScanner, formats : MizFormats,
+		prf : MizPrf, articleId : string, articleExt : string) -> MizParser;
+
+	// the stack tops
+	mizBlk(p : MizParser) -> MizExtBlock;
+	mizItm(p : MizParser) -> MizExtItem;
+	mizSub(p : MizParser) -> MizExtSubexp;
+
+	// syntax.pas Kill* / Create*
+	mizCreateBlock(p : MizParser, kind : int) -> void;
+	mizKillBlock(p : MizParser) -> void;
+	mizCreateItem(p : MizParser, kind : int) -> void;
+	mizKillItem(p : MizParser) -> void;
+	mizCreateExpression(p : MizParser, kind : int) -> void;
+	mizKillExpression(p : MizParser) -> void;
+	mizCreateSubexpression(p : MizParser) -> void;
+	mizKillSubexpression(p : MizParser) -> void;
+
+	mizGetIdentifier(p : MizParser) -> int;
+	mizCreateArgs(p : MizParser, base : int) -> [MizWsTerm];
+
+	// ---- extBlockObj ----
+	mizBlkProcessBegin(p : MizParser) -> void;
+	mizBlkProcessPragma(p : MizParser) -> void;
+	mizBlkStartProperText(p : MizParser) -> void;
+	mizBlkProcessRedefine(p : MizParser) -> void;
+	mizBlkProcessLink(p : MizParser) -> void;
+	mizBlkStartSchemeDemonstration(p : MizParser) -> void;
+	mizBlkFinishSchemeDemonstration(p : MizParser) -> void;
+
+	// ---- extItemObj ----
+	mizItmProcessModeSynonym(p : MizParser) -> void;
+	mizItmProcessAttrSynonym(p : MizParser) -> void;
+	mizItmProcessAttrAntonym(p : MizParser) -> void;
+	mizItmProcessPredSynonym(p : MizParser) -> void;
+	mizItmProcessPredAntonym(p : MizParser) -> void;
+	mizItmProcessFuncSynonym(p : MizParser) -> void;
+	mizItmStartAttributes(p : MizParser) -> void;
+	mizItmStartSentence(p : MizParser) -> void;
+	mizItmFinishAntecedent(p : MizParser) -> void;
+	mizItmFinishConsequent(p : MizParser) -> void;
+	mizItmFinishClusterTerm(p : MizParser) -> void;
+	mizItmProcessFuncIdentify(p : MizParser) -> void;
+	mizItmCompleteFuncIdentify(p : MizParser) -> void;
+	mizItmProcessLeftLocus(p : MizParser) -> void;
+	mizItmProcessRightLocus(p : MizParser) -> void;
+	mizItmProcessFuncReduction(p : MizParser) -> void;
+	mizItmStartFixedVariables(p : MizParser) -> void;
+	mizItmStartFixedSegment(p : MizParser) -> void;
+	mizItmProcessFixedVariable(p : MizParser) -> void;
+	mizItmProcessBeing(p : MizParser) -> void;
+	mizItmFinishFixedSegment(p : MizParser) -> void;
+	mizItmFinishFixedVariables(p : MizParser) -> void;
+	mizItmStartAssumption(p : MizParser) -> void;
+	mizItmFinishAssumption(p : MizParser) -> void;
+	mizItmStartCollectiveAssumption(p : MizParser) -> void;
+	mizItmProcessMeans(p : MizParser) -> void;
+	mizItmProcessEquals(p : MizParser) -> void;
+	mizItmFinishOtherwise(p : MizParser) -> void;
+	mizItmStartDefiniens(p : MizParser) -> void;
+	mizItmStartGuard(p : MizParser) -> void;
+	mizItmFinishGuard(p : MizParser) -> void;
+	mizItmFinishSpecification(p : MizParser) -> void;
+	mizItmFinishConstructionType(p : MizParser) -> void;
+	mizItmStartExpansion(p : MizParser) -> void;
+	mizItmStartAttributePattern(p : MizParser) -> void;
+	mizItmFinishAttributePattern(p : MizParser) -> void;
+	mizItmFinishSethoodProperties(p : MizParser) -> void;
+	mizItmStartModePattern(p : MizParser) -> void;
+	mizItmFinishModePattern(p : MizParser) -> void;
+	mizItmStartPredicatePattern(p : MizParser) -> void;
+	mizItmProcessPredicateSymbol(p : MizParser) -> void;
+	mizItmFinishPredicatePattern(p : MizParser) -> void;
+	mizItmStartFunctorPattern(p : MizParser) -> void;
+	mizItmProcessFunctorSymbol(p : MizParser) -> void;
+	mizItmFinishFunctorPattern(p : MizParser) -> void;
+	mizItmStartVisible(p : MizParser) -> void;
+	mizItmProcessVisible(p : MizParser) -> void;
+	mizItmFinishPrefix(p : MizParser) -> void;
+	mizItmProcessStructureSymbol(p : MizParser) -> void;
+	mizItmStartFields(p : MizParser) -> void;
+	mizItmFinishFields(p : MizParser) -> void;
+	mizItmStartAggrPattSegment(p : MizParser) -> void;
+	mizItmProcessField(p : MizParser) -> void;
+	mizItmFinishAggrPattSegment(p : MizParser) -> void;
+	mizItmProcessSchemeName(p : MizParser) -> void;
+	mizItmStartSchemeQualification(p : MizParser) -> void;
+	mizItmFinishSchemeQualification(p : MizParser) -> void;
+	mizItmStartSchemeSegment(p : MizParser) -> void;
+	mizItmProcessSchemeVariable(p : MizParser) -> void;
+	mizItmFinishSchemeSegment(p : MizParser) -> void;
+	mizItmFinishSchemeThesis(p : MizParser) -> void;
+	mizItmFinishSchemePremise(p : MizParser) -> void;
+	mizItmStartReservationSegment(p : MizParser) -> void;
+	mizItmProcessReservedIdentifier(p : MizParser) -> void;
+	mizItmFinishReservationSegment(p : MizParser) -> void;
+	mizItmStartPrivateDefiniendum(p : MizParser) -> void;
+	mizItmFinishLocusType(p : MizParser) -> void;
+	mizItmFinishPrivateConstant(p : MizParser) -> void;
+	mizItmStartPrivateConstant(p : MizParser) -> void;
+	mizItmStartPrivateDefiniens(p : MizParser) -> void;
+	mizItmFinishPrivateFuncDefinienition(p : MizParser) -> void;
+	mizItmFinishPrivatePredDefinienition(p : MizParser) -> void;
+	mizItmProcessReconsideredVariable(p : MizParser) -> void;
+	mizItmFinishReconsideredTerm(p : MizParser) -> void;
+	mizItmFinishDefaultTerm(p : MizParser) -> void;
+	mizItmFinishCondition(p : MizParser) -> void;
+	mizItmFinishHypothesis(p : MizParser) -> void;
+	mizItmProcessExemplifyingVariable(p : MizParser) -> void;
+	mizItmFinishExemplifyingVariable(p : MizParser) -> void;
+	mizItmStartExemplifyingTerm(p : MizParser) -> void;
+	mizItmFinishExemplifyingTerm(p : MizParser) -> void;
+	mizItmProcessCorrectness(p : MizParser) -> void;
+	mizItmStartConstructionType(p : MizParser) -> void;
+	mizItmProcessLabel(p : MizParser) -> void;
+	mizItmStartRegularStatement(p : MizParser) -> void;
+	mizItmProcessDefiniensLabel(p : MizParser) -> void;
+	mizItmProcessSchemeReference(p : MizParser) -> void;
+	mizItmStartLibraryReferences(p : MizParser) -> void;
+	mizItmStartSchemeLibraryReference(p : MizParser) -> void;
+	mizItmProcessPrivateReference(p : MizParser) -> void;
+	mizItmProcessDef(p : MizParser) -> void;
+	mizItmProcessTheoremNumber(p : MizParser) -> void;
+	mizItmProcessSchemeNumber(p : MizParser) -> void;
+	mizItmStartJustification(p : MizParser) -> void;
+	mizItmStartSimpleJustification(p : MizParser) -> void;
+	mizItmFinishSimpleJustification(p : MizParser) -> void;
+	mizItmFinishCompactStatement(p : MizParser) -> void;
+	mizItmStartIterativeStep(p : MizParser) -> void;
+	mizItmFinishIterativeStep(p : MizParser) -> void;
+	mizItmFinishDefiniens(p : MizParser) -> void;
+
+	// ---- extSubexpObj ----
+	mizSubStartAttributes(p : MizParser) -> void;
+	mizSubProcessNon(p : MizParser) -> void;
+	mizSubProcessAttribute(p : MizParser) -> void;
+	mizSubStartAttributeArguments(p : MizParser) -> void;
+	mizSubCompleteAttributeArguments(p : MizParser) -> void;
+	mizSubFinishAttributeArguments(p : MizParser) -> void;
+	mizSubCompleteAdjectiveCluster(p : MizParser) -> void;
+	mizSubCompleteClusterTerm(p : MizParser) -> void;
+	mizSubProcessSimpleTerm(p : MizParser) -> void;
+	mizSubProcessQua(p : MizParser) -> void;
+	mizSubFinishQualifiedTerm(p : MizParser) -> void;
+	mizSubProcessExactly(p : MizParser) -> void;
+	mizSubFinishArgument(p : MizParser) -> void;
+	mizSubFinishTerm(p : MizParser) -> void;
+	mizSubStartType(p : MizParser) -> void;
+	mizSubProcessModeSymbol(p : MizParser) -> void;
+	mizSubFinishType(p : MizParser) -> void;
+	mizSubInsertIncorrType(p : MizParser) -> void;
+	mizSubCompleteType(p : MizParser) -> void;
+	mizSubStartLongTerm(p : MizParser) -> void;
+	mizSubFinishLongTerm(p : MizParser) -> void;
+	mizSubProcessFunctorSymbol(p : MizParser) -> void;
+	mizSubFinishArgList(p : MizParser) -> void;
+	mizSubStartFraenkelTerm(p : MizParser) -> void;
+	mizSubStartPostqualification(p : MizParser) -> void;
+	mizSubStartPostqualifyingSegment(p : MizParser) -> void;
+	mizSubProcessPostqualifiedVariable(p : MizParser) -> void;
+	mizSubStartPostqualificationSpecyfication(p : MizParser) -> void;
+	mizSubFinishPostqualifyingSegment(p : MizParser) -> void;
+	mizSubFinishFraenkelTerm(p : MizParser) -> void;
+	mizSubStartSimpleFraenkelTerm(p : MizParser) -> void;
+	mizSubFinishSimpleFraenkelTerm(p : MizParser) -> void;
+	mizSubStartPrivateTerm(p : MizParser) -> void;
+	mizSubFinishPrivateTerm(p : MizParser) -> void;
+	mizSubStartBracketedTerm(p : MizParser) -> void;
+	mizSubFinishBracketedTerm(p : MizParser) -> void;
+	mizSubStartAggregateTerm(p : MizParser) -> void;
+	mizSubFinishAggregateTerm(p : MizParser) -> void;
+	mizSubStartSelectorTerm(p : MizParser) -> void;
+	mizSubFinishSelectorTerm(p : MizParser) -> void;
+	mizSubStartForgetfulTerm(p : MizParser) -> void;
+	mizSubFinishForgetfulTerm(p : MizParser) -> void;
+	mizSubStartChoiceTerm(p : MizParser) -> void;
+	mizSubFinishChoiceTerm(p : MizParser) -> void;
+	mizSubProcessNumeralTerm(p : MizParser) -> void;
+	mizSubProcessItTerm(p : MizParser) -> void;
+	mizSubProcessLocusTerm(p : MizParser) -> void;
+	mizSubInsertIncorrTerm(p : MizParser) -> void;
+	mizSubInsertIncorrBasic(p : MizParser) -> void;
+	mizSubInsertIncorrFormula(p : MizParser) -> void;
+	mizSubProcessThesis(p : MizParser) -> void;
+	mizSubProcessAtomicFormula(p : MizParser) -> void;
+	mizSubProcessPredicateSymbol(p : MizParser) -> void;
+	mizSubProcessRightSideOfPredicateSymbol(p : MizParser) -> void;
+	mizSubFinishPredicativeFormula(p : MizParser) -> void;
+	mizSubFinishRightSideOfPredicativeFormula(p : MizParser) -> void;
+	mizSubStartMultiPredicativeFormula(p : MizParser) -> void;
+	mizSubFinishMultiPredicativeFormula(p : MizParser) -> void;
+	mizSubFinishQualifyingFormula(p : MizParser) -> void;
+	mizSubFinishAttributiveFormula(p : MizParser) -> void;
+	mizSubStartPrivateFormula(p : MizParser) -> void;
+	mizSubFinishPrivateFormula(p : MizParser) -> void;
+	mizSubProcessContradiction(p : MizParser) -> void;
+	mizSubProcessNegative(p : MizParser) -> void;
+	mizSubProcessNegation(p : MizParser) -> void;
+	mizSubProcessBinaryConnective(p : MizParser) -> void;
+	mizSubProcessFlexDisjunction(p : MizParser) -> void;
+	mizSubProcessFlexConjunction(p : MizParser) -> void;
+	mizSubStartRestriction(p : MizParser) -> void;
+	mizSubFinishRestriction(p : MizParser) -> void;
+	mizSubFinishBinaryFormula(p : MizParser) -> void;
+	mizSubFinishFlexDisjunction(p : MizParser) -> void;
+	mizSubFinishFlexConjunction(p : MizParser) -> void;
+	mizSubStartExistential(p : MizParser) -> void;
+	mizSubStartUniversal(p : MizParser) -> void;
+	mizSubStartQualifiedSegment(p : MizParser) -> void;
+	mizSubStartQualifyingType(p : MizParser) -> void;
+	mizSubFinishQualifiedSegment(p : MizParser) -> void;
+	mizSubProcessVariable(p : MizParser) -> void;
+	mizSubFinishExistential(p : MizParser) -> void;
+	mizSubFinishUniversal(p : MizParser) -> void;
+
+	// error helpers shared with parser.flow
+	mizSemErrP(p : MizParser, errNr : int) -> void;
+	mizErrImmP(p : MizParser, errNr : int) -> void;
+	mizErrorP(p : MizParser, pos : MizPos, errNr : int) -> void;
+}
+
+// mscanner.pas TokenKind ordinals used here and in parser.flow are defined in
+// parser.flow (mizSy*); the few this file needs are repeated as literals with
+// the Pascal name in a comment.
+sySemicolon = 59; syNow = 60; syThen = 192; syHence = 185; syRedefine = 229;
+syScheme = 228; syProof = 47; syFrom = 34; syBy = 39; syDotEquals = 193;
+syColon = 58; syComma = 44; syWhen = 119; sySuch = 251; syCorrectness = 135;
+syArrow = 211; syNon = 169; sySet = 224; syOf = 248; syImplies = 243;
+syIff = 240; syOr = 167; syAmpersand = 38; syEqual = 61;
+syIdentifier = 73; syNumeral = 78; syAttributeSymbol = 86; syModeSymbol = 77;
+syStructureSymbol = 71; syPredicateSymbol = 82; syInfixOperatorSymbol = 79;
+syLeftCircumfixSymbol = 75; syLeftParanthesis = 40; syLeftSquareBracket = 91;
+syLeftCurlyBracket = 123; syReferenceSort = 81;
+
+mizMakeParser(eh : MizErrHan, sc : MizScanner, formats : MizFormats,
+	prf : MizPrf, articleId : string, articleExt : string) -> MizParser {
+	zero = mizZeroPos;
+	noTerm = MizWsErrorTerm(zero);
+	noFrm = MizWsErrorFormula(zero);
+	noAdj = MizWsAdjective(zero, 0, false, []);
+	noLocus = MizWsLocus(zero, 0);
+	noPattern = MizWsModePattern(zero, 0, []);
+	term : Vector<MizWsTerm> = makeVector(64);
+	pushVector(term, noTerm);   // index 0 is never used
+	corr : Vector<bool> = makeVector(8);
+	fori(0, 6, \__ -> pushVector(corr, false));
+	// ONE text proper: gWSTextProper and gLastWSBlock are the same object
+	tp = mizWsTextProper(articleId, articleExt, zero);
+	MizParser(eh, sc, formats, prf, articleId, articleExt,
+		MizScLexem(0, 0, "", 0, 0), MizScLexem(0, 0, "", 0, 0), MizScLexem(0, 0, "", 0, 0),
+		zero, MizPos(1, 1), zero,
+		true,
+		makeVector(16), makeVector(16), makeVector(16), makeVector(16),
+		tp, tp, None(),
+		None(), noTerm, noFrm, noAdj,
+		term, 0,
+		0, makeVector(8), makeVector(8), makeVector(8), 0, false, 0, zero,
+		makeVector(8), 0, 0, 0, 0, 0, zero, MizWsNoLabel(),
+		makeVector(8), makeVector(8), zero, corr, 0, false, 0, 0,
+		false, false, false, makeVector(8), zero, zero,
+		makeVector(8), makeVector(8), false, zero, noLocus, zero, noPattern,
+		zero, noPattern, noTerm, noLocus, makeVector(8), false,
+		makeVector(8), zero, zero, makeVector(8), makeVector(8),
+		false, false, None(), None(), makeVector(8), false, noTerm, noFrm,
+		zero, None(), None(),
+		makeVector(8), makeVector(8), makeVector(8), noTerm, 0, 0, 0,
+		false, 0, zero, zero, noFrm, makeVector(8),
+		false, zero, zero, makeVector(8), false,
+		zero, makeVector(8), noFrm, None(), true, false,
+		0, mizIntVec(prf.modeMaxArgs), mizIntVec(prf.structModeMaxArgs),
+		mizIntVec(prf.predMaxArgs));
+}
+
+mizIntVec(a : [int]) -> Vector<int> {
+	v : Vector<int> = makeVector(max(1, length(a)));
+	iter(a, \x -> pushVector(v, x));
+	v;
+}
+
+// ------------------------------------------------------------- helpers -----
+
+mizErrorP(p : MizParser, pos : MizPos, errNr : int) -> void {
+	mizError(p.eh, pos, errNr);
+}
+
+mizErrImmP(p : MizParser, errNr : int) -> void {
+	mizError(p.eh, p.curPos, errNr);
+}
+
+mizSemErrP(p : MizParser, errNr : int) -> void {
+	if (p.stillCorrect) mizErrImmP(p, errNr);
+}
+
+mizBlk(p : MizParser) -> MizExtBlock {
+	getVectorUnsafe(p.blocks, sizeVector(p.blocks) - 1);
+}
+
+mizItm(p : MizParser) -> MizExtItem {
+	getVectorUnsafe(p.items, sizeVector(p.items) - 1);
+}
+
+mizSub(p : MizParser) -> MizExtSubexp {
+	getVectorUnsafe(p.subexps, sizeVector(p.subexps) - 1);
+}
+
+mizGetIdentifier(p : MizParser) -> int {
+	if (p.curWord.kind == syIdentifier) p.curWord.nr else 0;
+}
+
+// CreateArgs (parseraddition.pas 1852) — pop Term[aBase..TermNbr]
+mizCreateArgs(p : MizParser, base : int) -> [MizWsTerm] {
+	res = if (p.termNbr < base) [] else generate(base, p.termNbr + 1, \k -> getVectorUnsafe(p.term, k));
+	p.termNbr ::= base - 1;
+	res;
+}
+
+mizCheckTermLimit(p : MizParser) -> void {
+	if (sizeVector(p.term) <= p.termNbr + 1) {
+		pushVector(p.term, MizWsErrorTerm(mizZeroPos));
+		mizCheckTermLimit(p);
+	}
+}
+
+mizSetTerm(p : MizParser, i : int, t : MizWsTerm) -> void {
+	mizCheckTermLimit(p);
+	setVector(p.term, i, t);
+}
+
+mizClearVector(v : Vector<?>) -> void { clearVector(v); }
+
+mizPopVector(v : Vector<?>) -> void {
+	if (sizeVector(v) > 0) removeVector(v, sizeVector(v) - 1);
+}
+
+mizMoveList(v : Vector<?>) -> [?] {
+	res = vector2array(v);
+	mizClearVector(v);
+	res;
+}
+
+mizVecPushAll(v : Vector<?>, xs : [?]) -> void { iter(xs, \x -> pushVector(v, x)); }
+
+// grow an int vector so index i exists
+mizIntAt(v : Vector<int>, i : int) -> int { if (i < sizeVector(v)) getVectorUnsafe(v, i) else 0; }
+
+mizIntSet(v : Vector<int>, i : int, x : int) -> void {
+	if (sizeVector(v) <= i) { pushVector(v, 0); mizIntSet(v, i, x); } else setVector(v, i, x);
+}
+
+mizPosAt(v : Vector<MizPos>, i : int) -> MizPos {
+	if (i < sizeVector(v)) getVectorUnsafe(v, i) else mizZeroPos;
+}
+
+mizPosSet(v : Vector<MizPos>, i : int, x : MizPos) -> void {
+	if (sizeVector(v) <= i) { pushVector(v, mizZeroPos); mizPosSet(v, i, x); } else setVector(v, i, x);
+}
+
+// ------------------------------------------------------- the three stacks --
+
+mizCreateBlock(p : MizParser, kind : int) -> void {
+	b = MizExtBlock(kind, p.lastWSItem, p.lastWSBlock, false, false, true,
+		p.curPos, false, None(), false);
+	p.redefinitions ::= false;
+	if (kind == mizBlMain) {
+		b.inDiffuse ::= true;
+		p.proofCnt ::= 0;
+	} else {
+		p.lastWSBlock ::= mizWsNewBlock(kind, p.curPos);
+		mizAssert(2341, isSome(p.lastWSItem));
+		switch (p.lastWSItem) {
+			None(): {}
+			Some(it): {
+				if (it.kind == mizItDefinition || it.kind == mizItRegularStatement
+					|| it.kind == mizItSchemeBlock || it.kind == mizItTheorem
+					|| it.kind == mizItConclusion || it.kind == mizItCaseBlock
+					|| it.kind == mizItCorrCond || it.kind == mizItCorrectness
+					|| it.kind == mizItProperty || it.kind == mizItPropertyRegistration) {
+					it.block ::= Some(p.lastWSBlock);
+				}
+			}
+		}
+		prev = mizBlk(p);
+		if (kind == mizBlDefinition) b.inDiffuse ::= false
+		else if (kind == mizBlNotation) b.inDiffuse ::= false
+		else if (kind == mizBlDiffuse) b.inDiffuse ::= true
+		else if (kind == mizBlHereby) b.inDiffuse ::= true
+		else if (kind == mizBlProof) {
+			b.lastSentence ::= Some(p.lastFormula);
+			p.proofCnt ::= p.proofCnt + 1;
+		}
+		else if (kind == mizBlCase) b.inDiffuse ::= prev.inDiffuse
+		else if (kind == mizBlSuppose) b.inDiffuse ::= prev.inDiffuse
+		else if (kind == mizBlRegistration) b.inDiffuse ::= false
+		else if (kind == mizBlPublicScheme) b.inDiffuse ::= false;
+	}
+	pushVector(p.blocks, b);
+}
+
+// extBlockObj.Pop + destructor
+mizKillBlock(p : MizParser) -> void {
+	b = mizBlk(p);
+	lwb = p.lastWSBlock;
+	lwb.endPos ::= p.curPos;
+	if (b.kind == mizBlProof) {
+		switch (b.lastSentence) { None(): {}; Some(f): p.lastFormula ::= f; }
+		p.proofCnt ::= p.proofCnt - 1;
+	}
+	p.lastWSItem ::= b.lastWSItem;
+	p.lastWSBlock ::= b.lastWSBlock;
+	mizPopVector(p.blocks);
+}
+
+mizCreateItem(p : MizParser, kind : int) -> void {
+	// ★ wsTextProper.NewItem / NewBlock IGNORE the position they are given and
+	// use CurPos (wsmarticle.pas 1101/1106) — the passed one is dead.
+	it = MizExtItem(kind, p.curPos, mizWsNewItem(kind, p.curPos), 0, mizZeroPos,
+		// nRegularStatementKind starts at stDiffuseStatement (0): a `hereby`
+		// conclusion never calls StartRegularStatement and stays diffuse.
+		MizWsNoLabel(), mizZeroPos, None(), false, 0, false);
+	p.clusterSort ::= 0;
+	p.itAllowedG ::= false;
+	p.inAggrPattern ::= false;
+	p.dolAllowed ::= false;
+	p.specification ::= None();
+	p.lastType ::= None();
+	p.definiensProhibited ::= false;
+	p.definingWay ::= 0;
+	p.definiens ::= None();
+	p.hasPartialDefs ::= false;
+	mizClearVector(p.partialDefs);
+	deferred = kind == mizItReservation || kind == mizItConstantDefinition
+		|| kind == mizItExemplification || kind == mizItGeneralization
+		|| kind == mizItLociDeclaration;
+	if (!deferred) {
+		w = mizWsNewItem(kind, p.curPos);
+		p.lastWSItem ::= Some(w);
+		it.lastWSItem ::= w;
+	}
+	mizItemInitCase(p, it, kind);
+	if (!deferred) {
+		switch (p.lastWSItem) { None(): {}; Some(w): pushVector(p.lastWSBlock.items, w); }
+	}
+	pushVector(p.items, it);
+}
+
+mizItemInitCase(p : MizParser, it : MizExtItem, kind : int) -> void {
+	clearCorr = \ -> fori(0, 6, \i -> setVector(p.correctnessConditions, i, false));
+	if (kind == mizItExistentialAssumption) { b_ = mizBlk(p); b_.hasAssumptions ::= true; }
+	else if (kind == mizItProperty) {
+		p.propertySort ::= p.curWord.nr;
+		k = p.curWord.nr;
+		// 1 symmetry 2 reflexivity 3 irreflexivity 5 transitivity
+		// 7 connectedness 8 asymmetry: predicate properties
+		if (k == 1 || k == 2 || k == 3 || k == 5 || k == 7 || k == 8) {
+			if (p.defKind != mizItDefPred) { mizErrImmP(p, 81); p.propertySort ::= 0; }
+		} else if (k == 4 || k == 6 || k == 9) {   // associativity commutativity idempotence
+			if (p.defKind != mizItDefFunc) { mizErrImmP(p, 82); p.propertySort ::= 0; }
+		} else if (k == 10 || k == 11) {           // involutiveness projectivity
+			if (p.defKind != mizItDefFunc) { mizErrImmP(p, 83); p.propertySort ::= 0; }
+		} else if (k == 12) {                       // sethood
+			if (p.defKind != mizItDefMode || p.expandable) { mizErrImmP(p, 86); p.propertySort ::= 0; }
+		}
+	}
+	else if (kind == mizItReconsider) mizClearVector(p.reconsiderList)
+	else if (kind == mizItRegularStatement) it.linkable ::= true
+	else if (kind == mizItConclusion) it.linkable ::= true
+	else if (kind == mizItCaseHead) { if (p.aheadWord.kind != 252) it.linkable ::= true }
+	else if (kind == mizItSupposeHead) { if (p.aheadWord.kind != 252) it.linkable ::= true }
+	else if (kind == mizItTheorem) it.linkable ::= true
+	else if (kind == mizItAxiom) { if (!p.axiomsAllowed) mizErrImmP(p, 66) }
+	else if (kind == mizItAssumption) {
+		if (p.aheadWord.kind != 252) it.linkable ::= true;
+		p.hasPremises ::= false;
+		mizClearVector(p.premises);
+	}
+	else if (kind == mizItDefMode) {
+		it.itAllowed ::= true; clearCorr(); p.expandable ::= false;
+		p.defPos ::= p.curPos; p.defKind ::= kind;
+	}
+	else if (kind == mizItDefAttr || kind == mizItAttrSynonym || kind == mizItAttrAntonym
+		|| kind == mizItModeNotation || kind == mizItFuncNotation
+		|| kind == mizItDefPred || kind == mizItPredSynonym || kind == mizItCluster
+		|| kind == mizItIdentify || kind == mizItReduction) {
+		clearCorr(); p.defPos ::= p.curPos; p.defKind ::= kind;
+	}
+	else if (kind == mizItDefFunc) {
+		it.itAllowed ::= true; clearCorr();
+		p.defPos ::= p.curPos; p.defKind ::= kind;
+	}
+	else if (kind == mizItPropertyRegistration) {
+		clearCorr(); p.defPos ::= p.curPos; p.defKind ::= kind;
+		p.propertySort ::= p.curWord.nr;
+	}
+	else if (kind == mizItDefStruct) {
+		clearCorr(); p.defPos ::= p.curPos; p.defKind ::= kind;
+		mizClearVector(p.structPrefixes);
+	}
+	else if (kind == mizItCanceled) mizErrImmP(p, 88)
+	else if (kind == mizItCorrCond) {
+		k = p.curWord.nr;
+		if (k >= 0 && k <= 6 && getVectorUnsafe(p.correctnessConditions, k)) {
+			setVector(p.correctnessConditions, k, false);
+			p.corrCondSort ::= k;
+			if (p.redefinitions && k == 1 && mizBlk(p).hasAssumptions) mizErrImmP(p, 243);
+		} else {
+			mizErrImmP(p, 72);
+			p.corrCondSort ::= 0;
+		}
+	}
+	else if (kind == mizItCorrectness) {
+		if (p.redefinitions && mizBlk(p).hasAssumptions) mizErrImmP(p, 243);
+	}
+	else if (kind == mizItSchemeBlock) {
+		p.localScheme ::= p.curWord.kind != syScheme;
+		p.schemePos ::= p.curPos;
+	}
+}
+
+mizKillItem(p : MizParser) -> void {
+	it = mizItm(p);
+	switch (p.lastWSItem) { None(): {}; Some(w): w.endPos ::= p.prevPos; }
+	mizItemPopDefiniensCheck(p, it);
+	mizItemPopContent(p, it);
+	b = mizBlk(p);
+	if (b.linked) {
+		mizErrorP(p, b.linkPos, 178);
+		b.linked ::= false;
+	}
+	b.linkAllowed ::= it.linkable;
+	b.linkProhibited ::= !it.linkable;
+	if (!p.stillCorrect) {
+		b.linkAllowed ::= false;
+		b.linkProhibited ::= false;
+	}
+	if (p.definingWay != 0) {
+		switch (p.definiens) {
+			None(): {}
+			Some(d): switch (d) {
+				MizWsConditionalDefiniens(__, __, __, __): setVector(p.correctnessConditions, 3, true);
+				MizWsSimpleDefiniens(__, __, __): {}
+			}
+		}
+		if (p.redefinitions) setVector(p.correctnessConditions, 2, true);
+	}
+	mizPopVector(p.items);
+}
+
+mizItemPopDefiniensCheck(p : MizParser, it : MizExtItem) -> void {
+	if (it.kind == mizItDefPred || it.kind == mizItDefFunc
+		|| it.kind == mizItDefMode || it.kind == mizItDefAttr) {
+		if (p.definingWay != 0) {
+			if (p.definiensProhibited && !p.axiomsAllowed) {
+				mizErrorP(p, p.meansPos, 254);
+				p.definingWay ::= 0;
+			}
+		} else if (!p.redefinitions && !p.definiensProhibited && !p.axiomsAllowed) {
+			mizSemErrP(p, 253);
+		}
+	}
+}
+
+mizItmInference(p : MizParser, it : MizExtItem) -> MizWsJustification {
+	switch (it.inference) { None(): MizWsInfError(p.curPos); Some(j): j; }
+}
+
+mizItemPopContent(p : MizParser, it : MizExtItem) -> void {
+	kind = it.kind;
+	setContent = \c : MizWsContent -> { w = it.lastWSItem; w.content ::= c; };
+	if (kind == mizItTheorem) {
+		setContent(MizWsStatementContent(MizWsCompactStatement(
+			MizWsProposition(it.label, p.lastFormula, it.propPos), mizItmInference(p, it))));
+	} else if (kind == mizItPerCases) {
+		setContent(MizWsJustificationContent(mizItmInference(p, it)));
+	} else if (kind == mizItReconsider) {
+		lt = switch (p.lastType) { None(): MizWsErrorType(p.curPos); Some(t): t; };
+		setContent(MizWsTypeChangingStatement(vector2array(p.reconsiderList), lt,
+			mizItmInference(p, it)));
+	} else if (kind == mizItChoice) {
+		setContent(MizWsChoiceStatement(vector2array(p.qualifiedSegmentList),
+			vector2array(p.premises), mizItmInference(p, it)));
+		p.hasPremises ::= false;
+		mizClearVector(p.premises);
+	} else if (kind == mizItConclusion || kind == mizItRegularStatement) {
+		if (it.regularStatementKind == 0) {
+			setContent(MizWsStatementContent(MizWsDiffuseStatement(it.label)));
+		} else if (it.regularStatementKind == 1) {
+			setContent(MizWsStatementContent(MizWsCompactStatement(
+				MizWsProposition(it.label, p.lastFormula, it.propPos), mizItmInference(p, it))));
+		} else {
+			inf2 = switch (p.inference2) { None(): MizWsInfError(p.curPos); Some(j): j; };
+			setContent(MizWsStatementContent(MizWsIterativeEquality(
+				MizWsProposition(it.label, p.iterativeLastFormula, it.propPos),
+				inf2, vector2array(p.iterativeSteps))));
+		}
+	} else if (kind == mizItGeneralization || kind == mizItLociDeclaration) {
+		segs = vector2array(p.qualifiedSegmentList);
+		n = length(segs);
+		fori(0, n - 1, \k -> {
+			w = mizWsNewItem(kind, p.curPos);
+			p.lastWSItem ::= Some(w);
+			it.lastWSItem ::= w;
+			w.content ::= MizWsSegmentContent(segs[k]);
+			w.endPos ::= if (k == n - 1) p.prevPos else mizWsSegmentPos(segs[k + 1]);
+			pushVector(p.lastWSBlock.items, w);
+		});
+		mizClearVector(p.qualifiedSegmentList);
+		if (p.hasPremises) {
+			w = mizWsNewItem(mizItAssumption, p.curPos);
+			w.content ::= MizWsAssumptionContent(
+				MizWsCollectiveAssumption(p.thatPos, vector2array(p.premises)));
+			p.hasPremises ::= false;
+			mizClearVector(p.premises);
+			w.endPos ::= p.prevPos;
+			p.lastWSItem ::= Some(w);
+			it.lastWSItem ::= w;
+			pushVector(p.lastWSBlock.items, w);
+		}
+	} else if (kind == mizItExistentialAssumption) {
+		setContent(MizWsExistentialAssumption(vector2array(p.qualifiedSegmentList),
+			vector2array(p.premises)));
+		p.hasPremises ::= false;
+		mizClearVector(p.premises);
+	} else if (kind == mizItSupposeHead || kind == mizItCaseHead || kind == mizItAssumption) {
+		if (p.hasPremises) {
+			c = MizWsAssumptionContent(MizWsCollectiveAssumption(p.thatPos, vector2array(p.premises)));
+			switch (p.lastWSItem) { None(): {}; Some(w): w.content ::= c; }
+			p.hasPremises ::= false;
+			mizClearVector(p.premises);
+		} else {
+			c = MizWsAssumptionContent(MizWsSingleAssumption(it.itemPos,
+				MizWsProposition(it.label, p.lastFormula, it.propPos)));
+			switch (p.lastWSItem) { None(): {}; Some(w): w.content ::= c; }
+		}
+	} else if (kind == mizItDefMode) {
+		if (p.expandable) {
+			setContent(MizWsModeDefinition(p.patternPos, 0, false, p.pattern,
+				p.lastType, None(), None()));
+		} else {
+			setContent(MizWsModeDefinition(p.patternPos, 1, p.redefinitions, p.pattern,
+				None(), p.specification, p.definiens));
+			if (!p.redefinitions) setVector(p.correctnessConditions, 4, true);
+		}
+	} else if (kind == mizItDefFunc) {
+		setContent(MizWsFuncDefinition(p.patternPos, p.redefinitions, p.pattern,
+			p.specification, p.definingWay, p.definiens));
+	} else if (kind == mizItDefAttr) {
+		setContent(MizWsAttrDefinition(p.patternPos, p.redefinitions, p.pattern, p.definiens));
+	} else if (kind == mizItDefPred) {
+		setContent(MizWsPredDefinition(p.patternPos, p.redefinitions, p.pattern, p.definiens));
+	} else if (kind == mizItDefStruct) {
+		setContent(MizWsStructureDefinition(p.patternPos, vector2array(p.structPrefixes),
+			MizWsModePattern(p.patternPos, p.constructorNr, vector2array(p.params)),
+			vector2array(p.structFields)));
+	} else if (kind == mizItPredSynonym || kind == mizItPredAntonym
+		|| kind == mizItFuncNotation || kind == mizItModeNotation
+		|| kind == mizItAttrSynonym || kind == mizItAttrAntonym) {
+		setContent(MizWsNotationDeclaration(p.newPatternPos, kind, p.newPattern, p.pattern));
+	} else if (kind == mizItCluster) {
+		if (p.clusterSort == 0) {
+			setContent(MizWsCluster(it.itemPos, 0, [], vector2array(p.consequent),
+				p.lastType, None()));
+			setVector(p.correctnessConditions, 4, true);
+		} else if (p.clusterSort == 1) {
+			setContent(MizWsCluster(it.itemPos, 1, vector2array(p.antecedent),
+				vector2array(p.consequent), p.lastType, None()));
+			setVector(p.correctnessConditions, 1, true);
+		} else {
+			setContent(MizWsCluster(it.itemPos, 2, [], vector2array(p.consequent),
+				p.lastType, Some(p.clusterTerm)));
+			setVector(p.correctnessConditions, 1, true);
+		}
+	} else if (kind == mizItIdentify) {
+		setContent(MizWsIdentifyRegistration(it.itemPos, p.newPattern, p.pattern,
+			if (p.hasIdentifyEqLoci) vector2array(p.identifyEqLociList) else []));
+		setVector(p.correctnessConditions, 2, true);
+	} else if (kind == mizItReduction) {
+		setContent(MizWsReduceRegistration(it.itemPos, p.leftTermInReduction, p.lastTerm));
+		setVector(p.correctnessConditions, 6, true);
+	} else if (kind == mizItPropertyRegistration) {
+		switch (it.lastWSItem.content) {
+			MizWsPropertyRegistration(pos, sort_, ty, __):
+				{
+					w = it.lastWSItem;
+					w.content ::= MizWsPropertyRegistration(pos, sort_, ty,
+						Some(mizItmInference(p, it)));
+				}
+			default: {}
+		}
+	} else if (kind == mizItCorrCond) {
+		setContent(MizWsCorrectnessCondition(it.itemPos, p.corrCondSort, mizItmInference(p, it)));
+	} else if (kind == mizItCorrectness) {
+		conds = filter(enumFromTo(0, 6), \i -> getVectorUnsafe(p.correctnessConditions, i));
+		setContent(MizWsCorrectnessConditions(it.itemPos, conds, mizItmInference(p, it)));
+	} else if (kind == mizItProperty) {
+		setContent(MizWsPropertyContent(it.itemPos, p.propertySort, mizItmInference(p, it)));
+	} else if (kind == mizItSchemeHead) {
+		setContent(MizWsSchemeContent(MizWsScheme(p.schemeIdNr, p.schemeIdPos,
+			vector2array(p.schemeParams), vector2array(p.schemePremises), p.schemeConclusion)));
+	}
+}
+
+mizCreateExpression(p : MizParser, kind : int) -> void {
+	pushVector(p.expKinds, kind);
+	p.termNbr ::= 0;
+}
+
+mizKillExpression(p : MizParser) -> void {
+	if (sizeVector(p.expKinds) == 0) mizRunTimeError(2143) else mizPopVector(p.expKinds);
+}
+
+mizCreateSubexpression(p : MizParser) -> void {
+	s = MizExtSubexp(p.termNbr, 0, mizZeroPos, mizZeroPos, mizZeroPos, mizZeroPos,
+		0, 0, 0, 0, 0, 0, 0, mizZeroPos, makeVector(4), MizWsErrorTerm(mizZeroPos),
+		mizZeroPos, makeVector(4), makeVector(4), makeVector(4), mizZeroPos,
+		MizWsErrorFormula(mizZeroPos), None(), makeVector(4), false, mizZeroPos,
+		false, 0, makeVector(24), makeVector(24), makeVector(24), makeVector(24),
+		makeVector(24));
+	mizIntSet(s.argListStart, 0, p.termNbr + 1);
+	pushVector(p.subexps, s);
+}
+
+mizKillSubexpression(p : MizParser) -> void {
+	if (sizeVector(p.subexps) == 0) mizRunTimeError(2144) else mizPopVector(p.subexps);
+}
+
+// ---------------------------------------------------------- extBlockObj ----
+
+mizBlkProcessBegin(p : MizParser) -> void {
+	b = mizBlk(p);
+	b.linkAllowed ::= false;
+	b.linkProhibited ::= true;
+	w = mizWsNewItem(mizItSection, p.curPos);
+	p.lastWSItem ::= Some(w);
+	b.lastWSItem ::= Some(w);
+	pushVector(p.lastWSBlock.items, w);
+}
+
+mizBlkProcessPragma(p : MizParser) -> void {
+	b = mizBlk(p);
+	b.linkAllowed ::= false;
+	b.linkProhibited ::= true;
+	w = mizWsNewItem(mizItPragma, p.curPos);
+	w.content ::= MizWsPragma(p.curWord.spelling);
+	p.lastWSItem ::= Some(w);
+	b.lastWSItem ::= Some(w);
+	pushVector(p.lastWSBlock.items, w);
+}
+
+mizBlkStartProperText(p : MizParser) -> void {
+	tp = p.textProper;
+	tp.pos ::= p.curPos;
+}
+
+mizBlkProcessRedefine(p : MizParser) -> void {
+	p.redefinitions ::= p.curWord.kind == syRedefine;
+}
+
+mizBlkProcessLink(p : MizParser) -> void {
+	if (p.curWord.kind == syThen || p.curWord.kind == syHence) {
+		b = mizBlk(p);
+		if (b.linkProhibited) mizErrImmP(p, 164);
+		b.linked ::= true;
+		b.linkPos ::= p.curPos;
+	}
+}
+
+mizBlkStartSchemeDemonstration(p : MizParser) -> void {
+	p.proofCnt ::= p.proofCnt + 1;
+	if (!p.proofPragma) {
+		w = mizWsNewItem(mizItConclusion, p.curPos);
+		w.content ::= MizWsStatementContent(MizWsCompactStatement(
+			MizWsProposition(MizWsLabel(0, p.curPos), MizWsThesis(p.curPos), p.curPos),
+			MizWsSkippedProof(p.curPos)));
+		p.lastWSItem ::= Some(w);
+		pushVector(p.lastWSBlock.items, w);
+	}
+}
+
+mizBlkFinishSchemeDemonstration(p : MizParser) -> void {
+	p.proofCnt ::= p.proofCnt - 1;
+}
+
+// ----------------------------------------------------------- extItemObj ----
+
+mizItmProcessModeSynonym(p : MizParser) -> void {
+	p.newPatternPos ::= p.patternPos; p.newPattern ::= p.pattern;
+}
+mizItmProcessAttrSynonym(p : MizParser) -> void { mizItmProcessModeSynonym(p); }
+mizItmProcessAttrAntonym(p : MizParser) -> void { mizItmProcessModeSynonym(p); }
+mizItmProcessPredSynonym(p : MizParser) -> void { mizItmProcessModeSynonym(p); }
+mizItmProcessPredAntonym(p : MizParser) -> void { mizItmProcessModeSynonym(p); }
+mizItmProcessFuncSynonym(p : MizParser) -> void { mizItmProcessModeSynonym(p); }
+
+mizItmStartAttributes(p : MizParser) -> void { mizClearVector(p.attrColl); }
+
+mizItmStartSentence(p : MizParser) -> void {
+	v_ = mizItm(p);
+	v_.propPos ::= p.curPos;
+}
+
+mizItmFinishAntecedent(p : MizParser) -> void {
+	p.clusterSort ::= 1;
+	mizClearVector(p.antecedent);
+	mizVecPushAll(p.antecedent, vector2array(p.attrColl));
+}
+
+mizItmFinishConsequent(p : MizParser) -> void {
+	mizClearVector(p.consequent);
+	mizVecPushAll(p.consequent, vector2array(p.attrColl));
+}
+
+mizItmFinishClusterTerm(p : MizParser) -> void {
+	p.clusterSort ::= 2;
+	p.clusterTerm ::= p.lastTerm;
+}
+
+mizItmProcessFuncIdentify(p : MizParser) -> void {
+	p.newPatternPos ::= p.patternPos; p.newPattern ::= p.pattern;
+}
+
+mizItmCompleteFuncIdentify(p : MizParser) -> void {
+	p.hasIdentifyEqLoci ::= p.curWord.kind == syWhen;
+	mizClearVector(p.identifyEqLociList);
+}
+
+mizItmProcessLeftLocus(p : MizParser) -> void {
+	p.leftLocus ::= MizWsLocus(p.curPos, mizGetIdentifier(p));
+}
+
+mizItmProcessRightLocus(p : MizParser) -> void {
+	pushVector(p.identifyEqLociList,
+		MizWsLociEquality(p.prevPos, p.leftLocus, MizWsLocus(p.curPos, mizGetIdentifier(p))));
+}
+
+mizItmProcessFuncReduction(p : MizParser) -> void {
+	p.newPatternPos ::= p.patternPos;
+	p.leftTermInReduction ::= p.lastTerm;
+}
+
+mizItmStartFixedVariables(p : MizParser) -> void { mizClearVector(p.qualifiedSegmentList); }
+
+mizItmStartFixedSegment(p : MizParser) -> void {
+	mizClearVector(p.qualifiedSegment);
+	p.segmentPos ::= p.curPos;
+}
+
+mizItmProcessFixedVariable(p : MizParser) -> void {
+	pushVector(p.qualifiedSegment, MizWsVariable(p.curPos, mizGetIdentifier(p)));
+}
+
+mizItmProcessBeing(p : MizParser) -> void { p.lastType ::= None(); }
+
+mizItmFinishFixedSegment(p : MizParser) -> void {
+	switch (p.lastType) {
+		Some(t): pushVector(p.qualifiedSegmentList,
+			MizWsExplSegment(p.segmentPos, mizMoveList(p.qualifiedSegment), t));
+		None(): {
+			iter(vector2array(p.qualifiedSegment), \v ->
+				pushVector(p.qualifiedSegmentList, MizWsImplSegment(v.pos, v)));
+			mizClearVector(p.qualifiedSegment);
+		}
+	}
+}
+
+mizItmFinishFixedVariables(p : MizParser) -> void {
+	p.suchThatOcc ::= p.curWord.kind == sySuch;
+	p.suchPos ::= p.curPos;
+	p.hasPremises ::= false;
+	mizClearVector(p.premises);
+}
+
+mizItmStartAssumption(p : MizParser) -> void {
+	p.hasPremises ::= true;
+	mizClearVector(p.premises);
+	p.thatPos ::= p.curPos;
+}
+
+mizItmFinishAssumption(p : MizParser) -> void {
+	v_ = mizBlk(p);
+	v_.hasAssumptions ::= true;
+}
+
+mizItmStartCollectiveAssumption(p : MizParser) -> void { mizItmStartAssumption(p); }
+
+mizItmProcessMeans(p : MizParser) -> void {
+	p.defLabId ::= 0;
+	p.defLabPos ::= p.curPos;
+	p.definingWay ::= 1;
+	p.otherwiseTerm ::= None();
+	p.otherwiseFormula ::= None();
+	p.meansPos ::= p.curPos;
+}
+
+mizItmProcessEquals(p : MizParser) -> void {
+	mizItmProcessMeans(p);
+	p.definingWay ::= 2;
+}
+
+mizItmFinishOtherwise(p : MizParser) -> void {
+	if (p.definingWay == 2) p.otherwiseTerm ::= Some(p.lastTerm)
+	else p.otherwiseFormula ::= Some(p.lastFormula);
+}
+
+mizItmStartDefiniens(p : MizParser) -> void { p.itAllowedG ::= mizItm(p).itAllowed; }
+
+mizItmStartGuard(p : MizParser) -> void {
+	p.hasPartialDefs ::= true;
+	p.itAllowedG ::= false;
+	if (p.definingWay == 1) p.partDefFormula ::= p.lastFormula
+	else p.partDefTerm ::= p.lastTerm;
+}
+
+mizItmFinishGuard(p : MizParser) -> void {
+	p.itAllowedG ::= mizItm(p).itAllowed;
+	if (p.definingWay == 1) {
+		pushVector(p.partialDefs, MizWsPartDef(
+			MizWsDefExpr(mizExFormula, None(), Some(p.partDefFormula)), p.lastFormula));
+	} else if (p.definingWay == 2) {
+		pushVector(p.partialDefs, MizWsPartDef(
+			MizWsDefExpr(mizExTerm, Some(p.partDefTerm), None()), p.lastFormula));
+	}
+}
+
+mizItmFinishSpecification(p : MizParser) -> void { p.specification ::= p.lastType; }
+mizItmFinishConstructionType(p : MizParser) -> void { p.specification ::= p.lastType; }
+
+mizItmStartExpansion(p : MizParser) -> void {
+	if (p.redefinitions) mizErrImmP(p, 271);
+	p.definiensProhibited ::= true;
+	p.expandable ::= true;
+}
+
+mizItmStartAttributePattern(p : MizParser) -> void {
+	p.paramNbr ::= 0;
+	p.hasParams ::= false;
+	mizClearVector(p.params);
+	p.locus ::= MizWsLocus(p.curPos, mizGetIdentifier(p));
+}
+
+mizItmFinishAttributePattern(p : MizParser) -> void {
+	if (p.curWord.kind == syAttributeSymbol && p.stillCorrect) {
+		mizCollectFormat(p.formats, MizFormat(86, p.curWord.nr, p.paramNbr, 0, 0, 0));
+		{}
+	}
+	p.patternPos ::= p.curPos;
+	p.constructorNr ::= p.curWord.nr;
+	p.pattern ::= MizWsAttrPattern(p.patternPos, p.constructorNr, p.locus,
+		vector2array(p.params));
+}
+
+mizItmFinishSethoodProperties(p : MizParser) -> void {
+	it = mizItm(p);
+	w = it.lastWSItem;
+	w.content ::= MizWsPropertyRegistration(it.itemPos, p.propertySort,
+		p.lastType, None());
+}
+
+mizItmStartModePattern(p : MizParser) -> void {
+	p.paramNbr ::= 0;
+	p.hasParams ::= false;
+	mizClearVector(p.params);
+	p.patternPos ::= p.curPos;
+	p.constructorNr ::= p.curWord.nr;
+}
+
+mizItmFinishModePattern(p : MizParser) -> void {
+	if (p.stillCorrect) {
+		mizCollectFormat(p.formats, MizFormat(77, p.constructorNr, p.paramNbr, 0, 0, 0));
+		{}
+	}
+	p.pattern ::= MizWsModePattern(p.patternPos, p.constructorNr, vector2array(p.params));
+}
+
+mizItmStartPredicatePattern(p : MizParser) -> void {
+	p.paramNbr ::= 0;
+	p.hasParams ::= false;
+	mizClearVector(p.params);
+}
+
+mizItmProcessPredicateSymbol(p : MizParser) -> void {
+	p.patternPos ::= p.curPos;
+	p.leftLociNbr ::= p.paramNbr;
+	mizClearVector(p.leftLoci);
+	mizVecPushAll(p.leftLoci, vector2array(p.params));
+	p.paramNbr ::= 0;
+	p.hasParams ::= false;
+	mizClearVector(p.params);
+	p.constructorNr ::= p.curWord.nr;
+}
+
+mizItmFinishPredicatePattern(p : MizParser) -> void {
+	if (p.stillCorrect) {
+		mizCollectFormat(p.formats, MizFormat(82, p.constructorNr, p.paramNbr,
+			p.leftLociNbr, 0, 0));
+		{}
+	}
+	p.pattern ::= MizWsPredPattern(p.patternPos, p.constructorNr,
+		vector2array(p.leftLoci), vector2array(p.params));
+}
+
+mizItmStartFunctorPattern(p : MizParser) -> void {
+	p.patternPos ::= p.curPos;
+	p.subItemKind ::= p.curWord.kind;
+	if (p.curWord.kind == syLeftCircumfixSymbol) p.constructorNr ::= p.curWord.nr
+	else if (p.curWord.kind == syLeftSquareBracket) {
+		p.subItemKind ::= syLeftCircumfixSymbol;
+		p.constructorNr ::= 1;
+	} else if (p.curWord.kind == syLeftCurlyBracket) {
+		p.subItemKind ::= syLeftCircumfixSymbol;
+		p.constructorNr ::= 2;
+	} else p.constructorNr ::= 0;
+	p.paramNbr ::= 0;
+	p.hasParams ::= false;
+	mizClearVector(p.params);
+}
+
+mizItmProcessFunctorSymbol(p : MizParser) -> void {
+	p.patternPos ::= p.curPos;
+	if (p.curWord.kind == syInfixOperatorSymbol) {
+		p.subItemKind ::= syInfixOperatorSymbol;
+		p.constructorNr ::= p.curWord.nr;
+		p.leftLociNbr ::= p.paramNbr;
+		mizClearVector(p.leftLoci);
+		mizVecPushAll(p.leftLoci, vector2array(p.params));
+		p.paramNbr ::= 0;
+		p.hasParams ::= false;
+		mizClearVector(p.params);
+	}
+}
+
+mizItmFinishFunctorPattern(p : MizParser) -> void {
+	if (p.subItemKind == syLeftCircumfixSymbol) {
+		rNr = p.curWord.nr;
+		if (p.stillCorrect) {
+			mizCollectFormat(p.formats, MizFormat(75, p.constructorNr, 0, 0, rNr, p.paramNbr));
+			{}
+		}
+		p.pattern ::= MizWsCircumfixFunctorPattern(p.patternPos, p.constructorNr, rNr,
+			vector2array(p.params));
+	} else {
+		if (p.subItemKind == syInfixOperatorSymbol && p.stillCorrect) {
+			mizCollectFormat(p.formats, MizFormat(79, p.constructorNr, p.paramNbr,
+				p.leftLociNbr, 0, 0));
+			{}
+		}
+		p.pattern ::= MizWsInfixFunctorPattern(p.patternPos, p.constructorNr,
+			vector2array(p.leftLoci), vector2array(p.params));
+	}
+}
+
+mizItmStartVisible(p : MizParser) -> void {
+	p.hasParams ::= true;
+	mizClearVector(p.params);
+}
+
+mizItmProcessVisible(p : MizParser) -> void {
+	p.paramNbr ::= p.paramNbr + 1;
+	if (p.hasParams) pushVector(p.params, MizWsLocus(p.curPos, mizGetIdentifier(p)));
+}
+
+mizItmFinishPrefix(p : MizParser) -> void {
+	switch (p.lastType) { None(): {}; Some(t): pushVector(p.structPrefixes, t); }
+}
+
+mizItmProcessStructureSymbol(p : MizParser) -> void {
+	p.constructorNr ::= 0;
+	p.patternPos ::= p.curPos;
+	if (p.curWord.kind == syStructureSymbol) p.constructorNr ::= p.curWord.nr;
+	mizCollectFormat(p.formats, MizFormat(74, p.constructorNr, 1, 0, 0, 0));  // 'J'
+	p.paramNbr ::= 0;
+	p.hasParams ::= false;
+	mizClearVector(p.params);
+}
+
+mizItmStartFields(p : MizParser) -> void {
+	mizCollectFormat(p.formats, MizFormat(76, p.constructorNr, p.paramNbr, 0, 0, 0));  // 'L'
+	p.inAggrPattern ::= true;
+	mizClearVector(p.structFields);
+	p.fieldsNbr ::= 0;
+}
+
+mizItmFinishFields(p : MizParser) -> void {
+	mizCollectFormat(p.formats, MizFormat(71, p.constructorNr, p.fieldsNbr, 0, 0, 0));  // 'G'
+	{}
+}
+
+mizItmStartAggrPattSegment(p : MizParser) -> void {
+	mizClearVector(p.structFieldsSegment);
+	p.sgmPos ::= p.curPos;
+}
+
+mizItmProcessField(p : MizParser) -> void {
+	mizCollectFormat(p.formats, MizFormat(85, p.curWord.nr, 1, 0, 0, 0));  // 'U'
+	pushVector(p.structFieldsSegment, MizWsFieldSymbol(p.curPos, p.curWord.nr));
+	p.fieldsNbr ::= p.fieldsNbr + 1;
+}
+
+mizItmFinishAggrPattSegment(p : MizParser) -> void {
+	lt = switch (p.lastType) { None(): MizWsErrorType(p.curPos); Some(t): t; };
+	pushVector(p.structFields, MizWsFieldSegment(p.sgmPos,
+		mizMoveList(p.structFieldsSegment), lt));
+}
+
+mizItmProcessSchemeName(p : MizParser) -> void {
+	p.schemeIdNr ::= mizGetIdentifier(p);
+	p.schemeIdPos ::= p.curPos;
+	mizClearVector(p.schemeParams);
+}
+
+mizItmStartSchemeQualification(p : MizParser) -> void {
+	p.subItemKind ::= p.curWord.kind;
+	mizClearVector(p.typeList);
+}
+
+mizItmFinishSchemeQualification(p : MizParser) -> void { p.subItemPos ::= p.curPos; }
+
+mizItmStartSchemeSegment(p : MizParser) -> void {
+	p.subItemPos ::= p.curPos;
+	mizClearVector(p.schVarIds);
+}
+
+mizItmProcessSchemeVariable(p : MizParser) -> void {
+	pushVector(p.schVarIds, MizWsVariable(p.curPos, mizGetIdentifier(p)));
+}
+
+mizItmFinishSchemeSegment(p : MizParser) -> void {
+	if (p.subItemKind == syLeftParanthesis) {
+		lt = switch (p.lastType) { None(): MizWsErrorType(p.curPos); Some(t): t; };
+		pushVector(p.schemeParams, MizWsFunctorSegment(p.subItemPos,
+			mizMoveList(p.schVarIds), mizMoveList(p.typeList), lt));
+	} else if (p.subItemKind == syLeftSquareBracket) {
+		pushVector(p.schemeParams, MizWsPredicateSegment(p.subItemPos,
+			mizMoveList(p.schVarIds), mizMoveList(p.typeList)));
+	}
+}
+
+mizItmFinishSchemeThesis(p : MizParser) -> void {
+	p.schemeConclusion ::= p.lastFormula;
+	mizClearVector(p.schemePremises);
+}
+
+mizItmFinishSchemePremise(p : MizParser) -> void {
+	it = mizItm(p);
+	pushVector(p.schemePremises, MizWsProposition(it.label, p.lastFormula, it.propPos));
+}
+
+mizItmStartReservationSegment(p : MizParser) -> void {
+	mizClearVector(p.resIdents);
+	p.resPos ::= p.curPos;
+}
+
+mizItmProcessReservedIdentifier(p : MizParser) -> void {
+	pushVector(p.resIdents, MizWsVariable(p.curPos, mizGetIdentifier(p)));
+}
+
+mizItmFinishReservationSegment(p : MizParser) -> void {
+	w = mizWsNewItem(mizItReservation, p.curPos);
+	p.lastWSItem ::= Some(w);
+	{ v_ = mizItm(p); v_.lastWSItem ::= w; }
+	lt = switch (p.lastType) { None(): MizWsErrorType(p.curPos); Some(t): t; };
+	w.content ::= MizWsReservationSegment(mizMoveList(p.resIdents), lt);
+	w.endPos ::= p.prevPos;
+	pushVector(p.lastWSBlock.items, w);
+}
+
+mizItmStartPrivateDefiniendum(p : MizParser) -> void {
+	p.privateId ::= mizGetIdentifier(p);
+	p.privateIdPos ::= p.curPos;
+	p.dolAllowed ::= true;
+	mizClearVector(p.typeList);
+}
+
+mizItmFinishLocusType(p : MizParser) -> void {
+	switch (p.lastType) { None(): {}; Some(t): pushVector(p.typeList, t); }
+}
+
+mizItmFinishPrivateConstant(p : MizParser) -> void {
+	it = mizItm(p);
+	w = mizWsNewItem(mizItConstantDefinition, p.curPos);
+	p.lastWSItem ::= Some(w);
+	it.lastWSItem ::= w;
+	w.content ::= MizWsConstantDefinition(MizWsVariable(p.privateIdPos, p.privateId), p.lastTerm);
+	w.endPos ::= p.prevPos;
+	pushVector(p.lastWSBlock.items, w);
+	it.itemPos ::= p.curPos;
+}
+
+mizItmStartPrivateConstant(p : MizParser) -> void {
+	p.privateId ::= mizGetIdentifier(p);
+	p.privateIdPos ::= p.curPos;
+}
+
+mizItmStartPrivateDefiniens(p : MizParser) -> void { p.dolAllowed ::= true; }
+
+mizItmFinishPrivateFuncDefinienition(p : MizParser) -> void {
+	w = mizItm(p).lastWSItem;
+	w.content ::= MizWsPrivFuncDefinition(
+		MizWsVariable(p.privateIdPos, p.privateId), mizMoveList(p.typeList), p.lastTerm);
+}
+
+mizItmFinishPrivatePredDefinienition(p : MizParser) -> void {
+	w = mizItm(p).lastWSItem;
+	w.content ::= MizWsPrivPredDefinition(
+		MizWsVariable(p.privateIdPos, p.privateId), mizMoveList(p.typeList), p.lastFormula);
+}
+
+mizItmProcessReconsideredVariable(p : MizParser) -> void {
+	p.privateId ::= mizGetIdentifier(p);
+	p.privateIdPos ::= p.curPos;
+}
+
+mizItmFinishReconsideredTerm(p : MizParser) -> void {
+	pushVector(p.reconsiderList, MizWsTypeChange(0,
+		MizWsVariable(p.privateIdPos, p.privateId), Some(p.lastTerm)));
+}
+
+mizItmFinishDefaultTerm(p : MizParser) -> void {
+	pushVector(p.reconsiderList, MizWsTypeChange(1,
+		MizWsVariable(p.privateIdPos, p.privateId), None()));
+}
+
+mizItmFinishCondition(p : MizParser) -> void {
+	it = mizItm(p);
+	p.hasPremises ::= true;
+	pushVector(p.premises, MizWsProposition(it.label, p.lastFormula, it.propPos));
+}
+
+mizItmFinishHypothesis(p : MizParser) -> void {
+	if (p.hasPremises) {
+		it = mizItm(p);
+		pushVector(p.premises, MizWsProposition(it.label, p.lastFormula, it.propPos));
+	}
+}
+
+mizItmProcessExemplifyingVariable(p : MizParser) -> void {
+	p.privateId ::= mizGetIdentifier(p);
+	p.privateIdPos ::= p.curPos;
+}
+
+mizItmFinishExemplifyingVariable(p : MizParser) -> void {
+	it = mizItm(p);
+	w = mizWsNewItem(mizItExemplification, p.curPos);
+	p.lastWSItem ::= Some(w);
+	it.lastWSItem ::= w;
+	w.content ::= MizWsExample(Some(MizWsVariable(p.privateIdPos, p.privateId)), Some(p.lastTerm));
+	w.endPos ::= p.prevPos;
+	pushVector(p.lastWSBlock.items, w);
+	it.itemPos ::= p.curPos;
+}
+
+mizItmStartExemplifyingTerm(p : MizParser) -> void {
+	if (p.curWord.kind == syIdentifier && mizBlk(p).inDiffuse
+		&& (p.aheadWord.kind == syComma || p.aheadWord.kind == sySemicolon)) {
+		p.privateId ::= mizGetIdentifier(p);
+		p.privateIdPos ::= p.curPos;
+	} else p.privateId ::= 0;
+}
+
+mizItmFinishExemplifyingTerm(p : MizParser) -> void {
+	it = mizItm(p);
+	w = mizWsNewItem(mizItExemplification, p.curPos);
+	p.lastWSItem ::= Some(w);
+	it.lastWSItem ::= w;
+	w.content ::= if (p.privateId != 0)
+		MizWsExample(Some(MizWsVariable(p.privateIdPos, p.privateId)), None())
+	else MizWsExample(None(), Some(p.lastTerm));
+	w.endPos ::= p.prevPos;
+	pushVector(p.lastWSBlock.items, w);
+	it.itemPos ::= p.curPos;
+}
+
+mizItmProcessCorrectness(p : MizParser) -> void {
+	if (p.curWord.kind != syCorrectness) {
+		any = exists(enumFromTo(0, 6), \i -> getVectorUnsafe(p.correctnessConditions, i));
+		if (any && !p.axiomsAllowed) mizErrorP(p, p.defPos, 73);
+	}
+}
+
+mizItmStartConstructionType(p : MizParser) -> void {
+	if (p.redefinitions && p.curWord.kind == syArrow)
+		setVector(p.correctnessConditions, 1, true);
+}
+
+mizItmProcessLabel(p : MizParser) -> void {
+	it = mizItm(p);
+	it.labelIdNr ::= 0;
+	it.labelIdPos ::= p.curPos;
+	if (p.curWord.kind == syIdentifier && p.aheadWord.kind == syColon)
+		it.labelIdNr ::= p.curWord.nr;
+	it.label ::= MizWsLabel(it.labelIdNr, it.labelIdPos);
+}
+
+mizItmStartRegularStatement(p : MizParser) -> void {
+	{ v_ = mizItm(p); v_.regularStatementKind ::= if (p.curWord.kind == syNow) 0 else 1; }
+}
+
+mizItmProcessDefiniensLabel(p : MizParser) -> void {
+	p.defLabId ::= 0;
+	p.defLabPos ::= p.curPos;
+	if (p.curWord.kind == syIdentifier && p.aheadWord.kind == syColon)
+		p.defLabId ::= p.curWord.nr;
+	p.defLabel ::= MizWsLabel(p.defLabId, p.defLabPos);
+}
+
+mizItmProcessSchemeReference(p : MizParser) -> void {
+	if (p.curWord.kind == syIdentifier) {
+		it = mizItm(p);
+		switch (it.inference) {
+			None(): {}
+			Some(inf): switch (inf) {
+				MizWsSchemeJust(pos, refs, fileNr, __, __):
+					it.inference ::= Some(MizWsSchemeJust(pos, refs, fileNr, p.curWord.nr, p.curPos));
+				default: {}
+			}
+		}
+	}
+}
+
+mizItmStartLibraryReferences(p : MizParser) -> void { p.theFileNr ::= p.curWord.nr; }
+mizItmStartSchemeLibraryReference(p : MizParser) -> void { p.theFileNr ::= p.curWord.nr; }
+
+mizItmAddRef(p : MizParser, r : MizWsReference) -> void {
+	it = mizItm(p);
+	switch (it.inference) {
+		None(): {}
+		Some(inf): switch (inf) {
+			MizWsStraightforward(pos, refs, linked, linkPos):
+				it.inference ::= Some(MizWsStraightforward(pos, arrayPush(refs, r), linked, linkPos));
+			MizWsSchemeJust(pos, refs, fileNr, idNr, ipos):
+				it.inference ::= Some(MizWsSchemeJust(pos, arrayPush(refs, r), fileNr, idNr, ipos));
+			default: {}
+		}
+	}
+}
+
+mizItmProcessPrivateReference(p : MizParser) -> void {
+	mizItmAddRef(p, MizWsLocalRef(p.curPos, mizGetIdentifier(p)));
+}
+
+mizItmProcessDef(p : MizParser) -> void {
+	p.definitional ::= p.curWord.kind == syReferenceSort && p.curWord.nr == 1;  // syDef
+}
+
+mizItmProcessTheoremNumber(p : MizParser) -> void {
+	if (p.curWord.kind == syNumeral) {
+		if (p.curWord.nr == 0) mizErrImmP(p, 146)
+		else if (p.definitional)
+			mizItmAddRef(p, MizWsDefinitionRef(p.curPos, p.theFileNr, p.curWord.nr))
+		else mizItmAddRef(p, MizWsTheoremRef(p.curPos, p.theFileNr, p.curWord.nr));
+	}
+}
+
+mizItmProcessSchemeNumber(p : MizParser) -> void {
+	if (p.curWord.kind == syNumeral) {
+		if (p.curWord.nr == 0) mizErrImmP(p, 146)
+		else {
+			it = mizItm(p);
+			switch (it.inference) {
+				None(): {}
+				Some(inf): switch (inf) {
+					MizWsSchemeJust(pos, refs, __, __, __):
+						it.inference ::= Some(MizWsSchemeJust(pos, refs, p.theFileNr,
+							p.curWord.nr, p.prevPos));
+					default: {}
+				}
+			}
+		}
+	}
+}
+
+mizItmStartJustification(p : MizParser) -> void {
+	it = mizItm(p);
+	it.inference ::= None();
+	if (p.curWord.kind == syProof) {
+		it.inference ::= Some(if (p.proofPragma) MizWsProofJust(p.curPos)
+			else MizWsSkippedProof(p.curPos));
+	}
+}
+
+mizItmStartSimpleJustification(p : MizParser) -> void {
+	it = mizItm(p);
+	b = mizBlk(p);
+	if (p.curWord.kind == syFrom) {
+		it.inference ::= Some(MizWsSchemeJust(p.curPos, [], 0, 0, mizZeroPos));
+	} else if (p.curWord.kind == syBy) {
+		it.inference ::= Some(MizWsStraightforward(p.curPos, [], b.linked, b.linkPos));
+	} else {
+		it.inference ::= Some(MizWsStraightforward(p.prevPos, [], b.linked, b.linkPos));
+	}
+}
+
+mizItmFinishSimpleJustification(p : MizParser) -> void {
+	it = mizItm(p);
+	b = mizBlk(p);
+	inf = mizItmInference(p, it);
+	bad = !p.stillCorrect
+		|| (p.curWord.kind != sySemicolon && p.curWord.kind != syDotEquals)
+		|| (switch (inf) {
+			MizWsStraightforward(__, __, linked, __): linked && !b.linkAllowed;
+			MizWsSchemeJust(__, __, __, idNr, __): idNr == 0;
+			default: false;
+		});
+	if (bad) it.inference ::= Some(MizWsInfError(mizWsJustPos(inf)));
+	isStraight = switch (mizItmInference(p, it)) {
+		MizWsStraightforward(__, __, __, __): true;
+		MizWsInfError(__): true;
+		default: false;
+	};
+	if (isStraight) b.linked ::= false;
+}
+
+mizItmFinishCompactStatement(p : MizParser) -> void {
+	if (p.curWord.kind == syDotEquals) {
+		it = mizItm(p);
+		p.iterativeLastFormula ::= p.lastFormula;
+		it.regularStatementKind ::= 2;
+		{ v_ = mizBlk(p); v_.linked ::= false; }
+		mizClearVector(p.iterativeSteps);
+		p.inference2 ::= it.inference;
+	}
+}
+
+mizItmStartIterativeStep(p : MizParser) -> void { p.iterPos ::= p.curPos; }
+
+mizItmFinishIterativeStep(p : MizParser) -> void {
+	it = mizItm(p);
+	pushVector(p.iterativeSteps, MizWsIterativeStep(p.iterPos, p.lastTerm,
+		mizItmInference(p, it)));
+}
+
+mizItmFinishDefiniens(p : MizParser) -> void {
+	if (p.definingWay == 1) {
+		if (p.hasPartialDefs) {
+			ow = switch (p.otherwiseFormula) {
+				None(): None();
+				Some(f): Some(MizWsDefExpr(mizExFormula, None(), Some(f)));
+			};
+			p.definiens ::= Some(MizWsConditionalDefiniens(p.meansPos, p.defLabel,
+				vector2array(p.partialDefs), ow));
+		} else {
+			p.definiens ::= Some(MizWsSimpleDefiniens(p.meansPos, p.defLabel,
+				MizWsDefExpr(mizExFormula, None(), Some(p.lastFormula))));
+		}
+	} else if (p.definingWay == 2) {
+		if (p.hasPartialDefs) {
+			ow = switch (p.otherwiseTerm) {
+				None(): None();
+				Some(t): Some(MizWsDefExpr(mizExTerm, Some(t), None()));
+			};
+			p.definiens ::= Some(MizWsConditionalDefiniens(p.meansPos, p.defLabel,
+				vector2array(p.partialDefs), ow));
+		} else {
+			p.definiens ::= Some(MizWsSimpleDefiniens(p.meansPos, p.defLabel,
+				MizWsDefExpr(mizExTerm, Some(p.lastTerm), None())));
+		}
+	}
+	if (!p.redefinitions && mizItm(p).kind == mizItDefFunc) {
+		fori(0, 6, \i -> setVector(p.correctnessConditions, i, false));
+		if (p.definingWay == 1) {
+			setVector(p.correctnessConditions, 4, true);   // existence
+			setVector(p.correctnessConditions, 5, true);   // uniqueness
+		} else if (p.definingWay == 2) {
+			setVector(p.correctnessConditions, 1, true);   // coherence
+		}
+	}
+}
+
+// --------------------------------------------------------- extSubexpObj ----
+
+mizSubStartAttributes(p : MizParser) -> void {
+	mizClearVector(mizSub(p).attrCollection);
+	p.lastType ::= None();
+}
+
+mizSubProcessNon(p : MizParser) -> void {
+	s = mizSub(p);
+	s.noneOcc ::= p.curWord.kind == syNon;
+	s.nonPos ::= p.curPos;
+}
+
+mizSubProcessAttribute(p : MizParser) -> void {
+	s = mizSub(p);
+	if (p.curWord.kind == syAttributeSymbol) {
+		fmt = mizLookUpPrefixFormat(p.formats, 86, p.curWord.nr, p.termNbr - s.termBase + 1);
+		if (fmt == 0) {
+			p.lastAdjective ::= MizWsAdjective(p.curPos, 0, false, mizCreateArgs(p, s.termBase + 1));
+			mizErrorP(p, p.curPos, 175);
+		} else {
+			a = MizWsAdjective(p.curPos, p.curWord.nr, false, mizCreateArgs(p, s.termBase + 1));
+			p.lastAdjective ::= if (s.noneOcc) MizWsNegatedAdjective(s.nonPos, a) else a;
+		}
+	} else {
+		p.lastAdjective ::= MizWsAdjective(p.curPos, 0, false, mizCreateArgs(p, s.termBase + 1));
+	}
+	pushVector(s.attrCollection, p.lastAdjective);
+}
+
+mizSubStartAttributeArguments(p : MizParser) -> void {
+	v_ = mizSub(p);
+	v_.termBase ::= p.termNbr;
+}
+
+mizSubCompleteAttributeArguments(p : MizParser) -> void {
+	s = mizSub(p);
+	s.subexpPos ::= p.curPos;
+	s.rightArgBase ::= p.termNbr;
+}
+
+mizSubFinishAttributeArguments(p : MizParser) -> void {
+	mizSubCompleteAttributeArguments(p);
+}
+
+mizSubCompleteAdjectiveCluster(p : MizParser) -> void {
+	mizClearVector(p.attrColl);
+	mizVecPushAll(p.attrColl, mizMoveList(mizSub(p).attrCollection));
+}
+
+mizSubCompleteClusterTerm(p : MizParser) -> void {
+	s = mizSub(p);
+	if (p.termNbr - s.termBase > 1) {
+		mizErrImmP(p, 379);
+		p.lastTerm ::= MizWsErrorTerm(p.curPos);
+	}
+}
+
+mizSubProcessSimpleTerm(p : MizParser) -> void {
+	p.lastTerm ::= MizWsSimpleTerm(p.curPos, mizGetIdentifier(p));
+}
+
+mizSubProcessQua(p : MizParser) -> void {
+	v_ = mizSub(p);
+	v_.quaPos ::= p.curPos;
+}
+
+mizSubFinishQualifiedTerm(p : MizParser) -> void {
+	s = mizSub(p);
+	lt = switch (p.lastType) { None(): MizWsErrorType(p.curPos); Some(t): t; };
+	mizSetTerm(p, p.termNbr, MizWsQualificationTerm(s.quaPos, getVectorUnsafe(p.term, p.termNbr), lt));
+}
+
+mizSubProcessExactly(p : MizParser) -> void {
+	s = mizSub(p);
+	s.quaPos ::= p.curPos;
+	mizSetTerm(p, p.termNbr, MizWsExactlyTerm(s.quaPos, getVectorUnsafe(p.term, p.termNbr)));
+}
+
+mizSubFinishArgument(p : MizParser) -> void {
+	p.termNbr ::= p.termNbr + 1;
+	mizSetTerm(p, p.termNbr, p.lastTerm);
+}
+
+mizSubFinishTerm(p : MizParser) -> void {
+	p.lastTerm ::= getVectorUnsafe(p.term, p.termNbr);
+	p.termNbr ::= p.termNbr - 1;
+}
+
+mizSubStartType(p : MizParser) -> void { p.lastType ::= None(); }
+
+mizSubProcessModeSymbol(p : MizParser) -> void {
+	s = mizSub(p);
+	s.modeKind ::= p.curWord.kind;
+	s.modeNr ::= p.curWord.nr;
+	if (p.curWord.kind == sySet) s.modeKind ::= syModeSymbol;
+	s.subexpPos ::= p.curPos;
+}
+
+mizSubFinishType(p : MizParser) -> void {
+	s = mizSub(p);
+	if (s.modeKind == syModeSymbol) {
+		fmt = mizLookUpPrefixFormat(p.formats, 77, s.modeNr, p.termNbr - s.termBase);
+		if (fmt == 0) mizErrorP(p, s.subexpPos, 151);
+		p.lastType ::= Some(MizWsStandardType(s.subexpPos, s.modeNr, mizCreateArgs(p, s.termBase + 1)));
+	} else if (s.modeKind == syStructureSymbol) {
+		fmt = mizLookUpPrefixFormat(p.formats, 76, s.modeNr, p.termNbr - s.termBase);
+		if (fmt == 0) mizSemErrP(p, 185);
+		p.lastType ::= Some(MizWsStructType(s.subexpPos, s.modeNr, mizCreateArgs(p, s.termBase + 1)));
+	} else {
+		p.lastType ::= Some(MizWsErrorType(p.curPos));
+	}
+}
+
+mizSubInsertIncorrType(p : MizParser) -> void {
+	p.lastType ::= Some(MizWsErrorType(p.curPos));
+}
+
+mizSubCompleteType(p : MizParser) -> void {
+	s = mizSub(p);
+	mizAssert(5433, isSome(p.lastType));
+	if (sizeVector(s.attrCollection) > 0) {
+		lt = switch (p.lastType) { None(): MizWsErrorType(p.curPos); Some(t): t; };
+		p.lastType ::= Some(MizWsClusteredType(mizWsTypePos(lt),
+			vector2array(s.attrCollection), lt));
+		mizClearVector(s.attrCollection);
+	}
+}
+
+mizSubStartLongTerm(p : MizParser) -> void {
+	s = mizSub(p);
+	s.argListNbr ::= 0;
+	mizIntSet(s.argListLength, 0, p.termNbr - s.termBase);
+}
+
+mizSubProcessFunctorSymbol(p : MizParser) -> void {
+	s = mizSub(p);
+	s.argListNbr ::= s.argListNbr + 1;
+	mizIntSet(s.argListStart, s.argListNbr, p.termNbr + 1);
+	mizPosSet(s.funcPos, s.argListNbr, p.curPos);
+	mizIntSet(s.funcInstance, s.argListNbr, p.curWord.nr);
+	mizIntSet(s.funcSymPri, s.argListNbr, 0);
+}
+
+mizSubFinishArgList(p : MizParser) -> void {
+	s = mizSub(p);
+	mizIntSet(s.argListLength, s.argListNbr,
+		p.termNbr - mizIntAt(s.argListStart, s.argListNbr) + 1);
+}
+
+// FinishLongTerm (parseraddition.pas 2026): the operator-priority balancing.
+// ArgsLength[k].l / .r are the argument counts the k-th functor claims; the
+// `Exchange` moves one argument across a functor boundary until every functor
+// has a format. The gotos become early returns from mizBalance.
+mizSubFinishLongTerm(p : MizParser) -> void {
+	s = mizSub(p);
+	n = s.argListNbr;
+	argL : Vector<int> = makeVector(n + 2);
+	argR : Vector<int> = makeVector(n + 2);
+	toRight : Vector<bool> = makeVector(n + 2);
+	fori(0, n + 1, \__ -> { pushVector(argL, 0); pushVector(argR, 0); pushVector(toRight, false); });
+	exchange = \i -> {
+		l = getVectorUnsafe(argL, i);
+		setVector(argL, i, getVectorUnsafe(argR, i - 1));
+		setVector(argR, i - 1, l);
+		setVector(toRight, i - 1, !getVectorUnsafe(toRight, i - 1));
+	};
+	lookUp = \k -> mizLookUpFuncFormat(p.formats, mizIntAt(s.funcInstance, k),
+		getVectorUnsafe(argL, k), getVectorUnsafe(argR, k));
+	setVector(argL, 1, mizIntAt(s.argListLength, 0));
+	setVector(toRight, 0, true);
+	fori(1, n - 1, \k -> {
+		if (mizFormatPriority(p.formats, 79, mizIntAt(s.funcInstance, k))
+			< mizFormatPriority(p.formats, 79, mizIntAt(s.funcInstance, k + 1))) {
+			setVector(argR, k, 1);
+			setVector(argL, k + 1, mizIntAt(s.argListLength, k));
+			setVector(toRight, k, true);
+		} else {
+			setVector(argR, k, mizIntAt(s.argListLength, k));
+			setVector(argL, k + 1, 1);
+			setVector(toRight, k, false);
+		}
+	});
+	setVector(argR, n, mizIntAt(s.argListLength, n));
+	setVector(toRight, n, false);
+	mizBalanceLongTerm(p, s, n, argL, argR, toRight, exchange, lookUp);
+	mizAssembleLongTerm(p, s, n, argL, argR, toRight);
+}
+
+mizBalanceLongTerm(p : MizParser, s : MizExtSubexp, n : int, argL : Vector<int>,
+	argR : Vector<int>, toRight : Vector<bool>, exchange : (int) -> void,
+	lookUp : (int) -> int) -> void {
+	fpos = \k -> mizPosAt(s.funcPos, k);
+	if (n == 1) {
+		if (lookUp(1) == 0) mizErrorP(p, fpos(1), 165);
+	} else {
+		bl = ref 1;
+		abort = ref false;
+		if (lookUp(1) == 0) {
+			exchange(2);
+			bl := 2;
+			if (lookUp(1) == 0) { mizErrorP(p, fpos(1), 166); abort := true; }
+		}
+		if (!^abort) {
+			k = ref 2;
+			while(\ -> !^abort && ^k <= n - 1, \ -> {
+				corrected = ref false;
+				if (lookUp(^k) == 0) {
+					exchange(^k + 1);
+					newBl = ref ^bl;
+					if (lookUp(^k) == 0) {
+						if (^bl == ^k) {
+							mizErrorP(p, fpos(^k - 1), 168);
+							mizErrorP(p, fpos(^k), 169);
+							abort := true;
+						} else {
+							exchange(^k + 1);
+							exchange(^k);
+							newBl := ^k;
+							if (lookUp(^k) == 0) {
+								exchange(^k + 1);
+								newBl := ^k + 1;
+								if (lookUp(^k) == 0) {
+									mizErrorP(p, fpos(^k), 167);
+									abort := true;
+								}
+							}
+							if (!^abort) {
+								j = ref (^k - 1);
+								while(\ -> !^abort && !^corrected && ^j >= ^bl + 1, \ -> {
+									if (lookUp(^j) != 0) corrected := true
+									else {
+										exchange(^j);
+										if (lookUp(^j) == 0) {
+											mizErrorP(p, fpos(^j), 168);
+											mizErrorP(p, fpos(^k), 169);
+											abort := true;
+										}
+									}
+									j := ^j - 1;
+								});
+								if (!^abort && !^corrected) {
+									if (lookUp(^bl) == 0) {
+										mizErrorP(p, fpos(^bl), 170);
+										mizErrorP(p, fpos(^k), 171);
+										abort := true;
+									}
+								}
+							}
+						}
+					}
+					if (!^abort && !^corrected) bl := ^newBl;
+				}
+				k := ^k + 1;
+			});
+		}
+		if (!^abort) {
+			j = ref n;
+			done = ref false;
+			while(\ -> !^abort && !^done && ^j >= ^bl + 1, \ -> {
+				if (lookUp(^j) != 0) done := true
+				else {
+					exchange(^j);
+					if (lookUp(^j) == 0) {
+						mizErrorP(p, fpos(^j), 172);
+						mizErrorP(p, fpos(n), 173);
+						abort := true;
+					}
+				}
+				j := ^j - 1;
+			});
+			if (!^abort && !^done) {
+				if (lookUp(^bl) == 0) {
+					mizErrorP(p, fpos(^bl), 174);
+					mizErrorP(p, fpos(n), 175);
+				}
+			}
+		}
+	}
+}
+
+mizAssembleLongTerm(p : MizParser, s : MizExtSubexp, n : int, argL : Vector<int>,
+	argR : Vector<int>, toRight : Vector<bool>) -> void {
+	fori(1, n, \ak -> {
+		mizIntSet(s.funcSymPri, ak, mizFormatPriority(p.formats, 79, mizIntAt(s.funcInstance, ak)));
+	});
+	depoFunc : Vector<int> = makeVector(n + 2);
+	depoArgs : Vector<[MizWsTerm]> = makeVector(n + 2);
+	kn = ref n;
+	while(\ -> ^kn >= 2, \ -> {
+		k = ^kn;
+		if (getVectorUnsafe(toRight, k - 1)) {
+			rightArgs = mizCreateArgs(p, mizIntAt(s.argListStart, k));
+			leftArgs = mizCreateArgs(p, mizIntAt(s.argListStart, k - 1));
+			trm : ref MizWsTerm = ref MizWsInfixTerm(mizPosAt(s.funcPos, k),
+				mizIntAt(s.funcInstance, k), leftArgs, rightArgs);
+			stop = ref false;
+			while(\ -> !^stop && sizeVector(depoFunc) > 0, \ -> {
+				j = sizeVector(depoFunc) - 1;
+				fnr = getVectorUnsafe(depoFunc, j);
+				if (mizIntAt(s.funcSymPri, fnr) <= mizIntAt(s.funcSymPri, k - 1)) stop := true
+				else {
+					args = getVectorUnsafe(depoArgs, j);
+					mizPopVector(depoFunc);
+					mizPopVector(depoArgs);
+					trm := MizWsInfixTerm(mizPosAt(s.funcPos, fnr), mizIntAt(s.funcInstance, fnr),
+						[^trm], args);
+				}
+			});
+			p.lastTerm ::= ^trm;
+			mizSubFinishArgument(p);
+		} else {
+			pushVector(depoFunc, k);
+			pushVector(depoArgs, mizCreateArgs(p, mizIntAt(s.argListStart, k)));
+		}
+		kn := ^kn - 1;
+	});
+	rightArgs1 = mizCreateArgs(p, mizIntAt(s.argListStart, 1));
+	leftArgs1 = mizCreateArgs(p, mizIntAt(s.argListStart, 0));
+	trm : ref MizWsTerm = ref MizWsInfixTerm(mizPosAt(s.funcPos, 1),
+		mizIntAt(s.funcInstance, 1), leftArgs1, rightArgs1);
+	while(\ -> sizeVector(depoFunc) > 0, \ -> {
+		j = sizeVector(depoFunc) - 1;
+		fnr = getVectorUnsafe(depoFunc, j);
+		args = getVectorUnsafe(depoArgs, j);
+		mizPopVector(depoFunc);
+		mizPopVector(depoArgs);
+		trm := MizWsInfixTerm(mizPosAt(s.funcPos, fnr), mizIntAt(s.funcInstance, fnr),
+			[^trm], args);
+	});
+	p.lastTerm ::= ^trm;
+}
+
+mizSubStartFraenkelTerm(p : MizParser) -> void {
+	v_ = mizSub(p);
+	v_.sample ::= p.lastTerm;
+}
+
+mizSubStartPostqualification(p : MizParser) -> void {
+	mizClearVector(mizSub(p).postQualList);
+}
+
+mizSubStartPostqualifyingSegment(p : MizParser) -> void {
+	mizClearVector(mizSub(p).segmentIdentColl);
+}
+
+mizSubProcessPostqualifiedVariable(p : MizParser) -> void {
+	pushVector(mizSub(p).segmentIdentColl, MizWsVariable(p.curPos, mizGetIdentifier(p)));
+}
+
+mizSubStartPostqualificationSpecyfication(p : MizParser) -> void {
+	{ v_ = mizSub(p); v_.segmentPos ::= p.curPos; }
+	p.lastType ::= None();
+}
+
+mizSubFinishPostqualifyingSegment(p : MizParser) -> void {
+	s = mizSub(p);
+	switch (p.lastType) {
+		Some(t): pushVector(s.postQualList,
+			MizWsExplSegment(s.segmentPos, vector2array(s.segmentIdentColl), t));
+		None(): iter(vector2array(s.segmentIdentColl), \v ->
+			pushVector(s.postQualList, MizWsImplSegment(v.pos, v)));
+	}
+	mizClearVector(s.segmentIdentColl);
+}
+
+mizSubFinishFraenkelTerm(p : MizParser) -> void {
+	s = mizSub(p);
+	p.lastTerm ::= MizWsFraenkelTerm(p.curPos, mizMoveList(s.postQualList),
+		s.sample, p.lastFormula);
+}
+
+mizSubStartSimpleFraenkelTerm(p : MizParser) -> void {
+	v_ = mizSub(p);
+	v_.allPos ::= p.curPos;
+}
+
+mizSubFinishSimpleFraenkelTerm(p : MizParser) -> void {
+	s = mizSub(p);
+	p.lastTerm ::= MizWsSimpleFraenkelTerm(s.allPos, mizMoveList(s.postQualList), s.sample);
+}
+
+mizSubStartPrivateTerm(p : MizParser) -> void {
+	s = mizSub(p);
+	s.subexpPos ::= p.curPos;
+	s.spelling ::= p.curWord.nr;
+}
+
+mizSubFinishPrivateTerm(p : MizParser) -> void {
+	s = mizSub(p);
+	p.lastTerm ::= MizWsPrivateFunctorTerm(s.subexpPos, s.spelling,
+		mizCreateArgs(p, s.termBase + 1));
+}
+
+mizSubStartBracketedTerm(p : MizParser) -> void {
+	v_ = mizSub(p);
+	v_.symbolNr ::= p.curWord.nr;
+}
+
+mizSubFinishBracketedTerm(p : MizParser) -> void {
+	s = mizSub(p);
+	if (p.stillCorrect) {
+		s.rSymbolNr ::= p.curWord.nr;
+		fmt = mizLookUpBracketFormat(p.formats, s.symbolNr, s.rSymbolNr,
+			p.termNbr - s.termBase, 0, 0);
+		if (fmt == 0) mizSemErrP(p, 152);
+		p.lastTerm ::= MizWsCircumfixTerm(p.curPos, s.symbolNr, s.rSymbolNr,
+			mizCreateArgs(p, s.termBase + 1));
+	}
+}
+
+mizSubStartAggregateTerm(p : MizParser) -> void {
+	v_ = mizSub(p);
+	v_.symbolNr ::= p.curWord.nr;
+}
+
+mizSubFinishAggregateTerm(p : MizParser) -> void {
+	s = mizSub(p);
+	fmt = mizLookUpPrefixFormat(p.formats, 71, s.symbolNr, p.termNbr - s.termBase);
+	if (fmt == 0) mizErrorP(p, p.curPos, 176);
+	p.lastTerm ::= MizWsAggregateTerm(p.curPos, s.symbolNr, mizCreateArgs(p, s.termBase + 1));
+}
+
+mizSubStartSelectorTerm(p : MizParser) -> void {
+	s = mizSub(p);
+	s.symbolNr ::= p.curWord.nr;
+	s.subexpPos ::= p.curPos;
+	s.nextWord ::= p.aheadWord.kind;
+}
+
+mizSubFinishSelectorTerm(p : MizParser) -> void {
+	s = mizSub(p);
+	fmt = mizLookUpPrefixFormat(p.formats, 85, s.symbolNr, 1);
+	if (fmt == 0) mizErrorP(p, s.subexpPos, 182);
+	if (s.nextWord == syOf) {
+		p.lastTerm ::= MizWsSelectorTerm(s.subexpPos, s.symbolNr, p.lastTerm);
+	} else if (p.inAggrPattern) {
+		p.lastTerm ::= MizWsInternalSelectorTerm(s.subexpPos, s.symbolNr);
+	} else {
+		p.lastTerm ::= MizWsErrorTerm(s.subexpPos);
+		mizErrorP(p, s.subexpPos, 329);
+	}
+}
+
+mizSubStartForgetfulTerm(p : MizParser) -> void {
+	s = mizSub(p);
+	s.symbolNr ::= p.curWord.nr;
+	s.subexpPos ::= p.curPos;
+	s.nextWord ::= p.aheadWord.kind;
+}
+
+mizSubFinishForgetfulTerm(p : MizParser) -> void {
+	s = mizSub(p);
+	if (p.stillCorrect) {
+		fmt = mizLookUpPrefixFormat(p.formats, 74, s.symbolNr, 1);
+		if (fmt == 0) mizErrorP(p, s.subexpPos, 184);
+	}
+	p.lastTerm ::= MizWsForgetfulFunctorTerm(s.subexpPos, s.symbolNr, p.lastTerm);
+}
+
+mizSubStartChoiceTerm(p : MizParser) -> void {
+	v_ = mizSub(p);
+	v_.subexpPos ::= p.curPos;
+}
+
+mizSubFinishChoiceTerm(p : MizParser) -> void {
+	s = mizSub(p);
+	lt = switch (p.lastType) { None(): MizWsErrorType(p.curPos); Some(t): t; };
+	p.lastTerm ::= MizWsGlobalChoiceTerm(s.subexpPos, lt);
+}
+
+mizSubProcessNumeralTerm(p : MizParser) -> void {
+	p.lastTerm ::= MizWsNumeralTerm(p.curPos, p.curWord.nr);
+}
+
+mizSubProcessItTerm(p : MizParser) -> void {
+	if (p.itAllowedG) p.lastTerm ::= MizWsItTerm(p.curPos)
+	else {
+		p.lastTerm ::= MizWsErrorTerm(p.curPos);
+		mizErrImmP(p, 251);
+	}
+}
+
+mizSubProcessLocusTerm(p : MizParser) -> void {
+	if (p.dolAllowed) p.lastTerm ::= MizWsPlaceholderTerm(p.curPos, p.curWord.nr)
+	else {
+		p.lastTerm ::= MizWsErrorTerm(p.curPos);
+		mizErrImmP(p, 181);
+	}
+}
+
+mizSubInsertIncorrTerm(p : MizParser) -> void { p.lastTerm ::= MizWsErrorTerm(p.curPos); }
+
+mizSubInsertIncorrBasic(p : MizParser) -> void {
+	p.lastFormula ::= MizWsErrorFormula(p.curPos);
+	p.termNbr ::= mizSub(p).termBase;
+}
+
+mizSubInsertIncorrFormula(p : MizParser) -> void {
+	p.lastFormula ::= MizWsErrorFormula(p.curPos);
+}
+
+mizSubProcessThesis(p : MizParser) -> void {
+	if (p.proofCnt > 0) p.lastFormula ::= MizWsThesis(p.curPos)
+	else {
+		mizErrImmP(p, 65);
+		p.lastFormula ::= MizWsErrorFormula(p.curPos);
+	}
+}
+
+mizSubProcessAtomicFormula(p : MizParser) -> void {
+	s = mizSub(p);
+	s.subexpPos ::= p.curPos;
+	s.symbolNr ::= 0;
+	if (p.curWord.kind == 144) {   // sy_Is
+		if (p.termNbr - s.termBase != 1) {
+			mizErrImmP(p, 157);
+			p.termNbr ::= s.termBase;
+			mizSubInsertIncorrTerm(p);
+			mizSubFinishArgument(p);
+		}
+	}
+	s.rightArgBase ::= p.termNbr;
+	s.termBase ::= p.termNbr;
+	s.postNegated ::= false;
+	s.argListNbr ::= 0;
+	mizIntSet(s.argListStart, 0, p.termNbr + 1);
+}
+
+mizSubProcessPredicateSymbol(p : MizParser) -> void {
+	s = mizSub(p);
+	s.subexpPos ::= p.curPos;
+	s.symbolNr ::= if (p.curWord.kind == syEqual || p.curWord.kind == syPredicateSymbol)
+		p.curWord.nr else 0;
+	s.rightArgBase ::= p.termNbr;
+}
+
+mizSubProcessRightSideOfPredicateSymbol(p : MizParser) -> void {
+	s = mizSub(p);
+	s.rightSideOfPredPos ::= p.curPos;
+	s.symbolNr ::= if (p.curWord.kind == syEqual || p.curWord.kind == syPredicateSymbol)
+		p.curWord.nr else 0;
+	s.rightArgBase ::= p.termNbr;
+}
+
+mizSubFinishPredicativeFormula(p : MizParser) -> void {
+	s = mizSub(p);
+	fmt = mizLookUpPredFormat(p.formats, s.symbolNr, s.rightArgBase - s.termBase,
+		p.termNbr - s.rightArgBase);
+	if (fmt == 0) mizErrorP(p, s.subexpPos, 153);
+	rightArgs = mizCreateArgs(p, s.rightArgBase + 1);
+	leftArgs = mizCreateArgs(p, s.termBase + 1);
+	p.lastFormula ::= MizWsPredicativeFormula(s.subexpPos, s.symbolNr, leftArgs, rightArgs);
+}
+
+mizSubFinishRightSideOfPredicativeFormula(p : MizParser) -> void {
+	s = mizSub(p);
+	frm = switch (p.lastFormula) {
+		MizWsNegatedFormula(__, arg): arg;
+		default: p.lastFormula;
+	};
+	leftArgsNbr = switch (frm) {
+		MizWsRightSideOfPredicativeFormula(__, __, rargs): length(rargs);
+		default: 0;
+	};
+	fmt = mizLookUpPredFormat(p.formats, s.symbolNr, leftArgsNbr, p.termNbr - s.rightArgBase);
+	if (fmt == 0) mizErrorP(p, s.subexpPos, 153);
+	rightArgs = mizCreateArgs(p, s.rightArgBase + 1);
+	p.lastFormula ::= MizWsRightSideOfPredicativeFormula(s.subexpPos, s.symbolNr, rightArgs);
+	pushVector(s.multiPredicateList, p.lastFormula);
+}
+
+mizSubStartMultiPredicativeFormula(p : MizParser) -> void {
+	s = mizSub(p);
+	mizClearVector(s.multiPredicateList);
+	pushVector(s.multiPredicateList, p.lastFormula);
+}
+
+mizSubFinishMultiPredicativeFormula(p : MizParser) -> void {
+	s = mizSub(p);
+	p.lastFormula ::= MizWsMultiPredicativeFormula(s.subexpPos, mizMoveList(s.multiPredicateList));
+}
+
+mizSubFinishQualifyingFormula(p : MizParser) -> void {
+	s = mizSub(p);
+	mizAssert(5430, isSome(p.lastType));
+	lt0 = switch (p.lastType) { None(): MizWsErrorType(p.curPos); Some(t): t; };
+	lt = if (sizeVector(s.attrCollection) > 0)
+		MizWsClusteredType(mizWsTypePos(lt0), vector2array(s.attrCollection), lt0)
+	else lt0;
+	p.lastType ::= Some(lt);
+	f = MizWsQualifyingFormula(s.subexpPos, getVectorUnsafe(p.term, p.termNbr), lt);
+	p.lastFormula ::= if (s.postNegated) MizWsNegatedFormula(s.notPos, f) else f;
+	p.termNbr ::= p.termNbr - 1;
+}
+
+mizSubFinishAttributiveFormula(p : MizParser) -> void {
+	s = mizSub(p);
+	f = MizWsAttributiveFormula(s.subexpPos, getVectorUnsafe(p.term, p.termNbr),
+		mizMoveList(s.attrCollection));
+	p.lastFormula ::= if (s.postNegated) MizWsNegatedFormula(s.notPos, f) else f;
+	p.termNbr ::= p.termNbr - 1;
+}
+
+mizSubStartPrivateFormula(p : MizParser) -> void {
+	s = mizSub(p);
+	s.termBase ::= p.termNbr;
+	s.subexpPos ::= p.curPos;
+	s.spelling ::= p.curWord.nr;
+}
+
+mizSubFinishPrivateFormula(p : MizParser) -> void {
+	s = mizSub(p);
+	p.lastFormula ::= MizWsPrivatePredicateFormula(s.subexpPos, s.spelling,
+		mizCreateArgs(p, s.termBase + 1));
+}
+
+mizSubProcessContradiction(p : MizParser) -> void {
+	p.lastFormula ::= MizWsContradiction(p.curPos);
+}
+
+mizSubProcessNegative(p : MizParser) -> void {
+	p.lastFormula ::= MizWsNegatedFormula(p.curPos, p.lastFormula);
+}
+
+mizSubProcessNegation(p : MizParser) -> void {
+	s = mizSub(p);
+	s.postNegated ::= !s.postNegated;
+	s.notPos ::= p.curPos;
+}
+
+mizSubProcessBinaryConnective(p : MizParser) -> void {
+	s = mizSub(p);
+	s.connective ::= p.curWord.kind;
+	s.firstSententialOperand ::= p.lastFormula;
+	s.subexpPos ::= p.curPos;
+}
+
+mizSubProcessFlexDisjunction(p : MizParser) -> void {
+	{ v_ = mizSub(p); v_.firstSententialOperand ::= p.lastFormula; }
+}
+
+mizSubProcessFlexConjunction(p : MizParser) -> void {
+	{ v_ = mizSub(p); v_.firstSententialOperand ::= p.lastFormula; }
+}
+
+mizSubStartRestriction(p : MizParser) -> void {
+	v_ = mizSub(p);
+	v_.restrPos ::= p.curPos;
+}
+
+mizSubFinishRestriction(p : MizParser) -> void {
+	{ v_ = mizSub(p); v_.restriction ::= Some(p.lastFormula); }
+}
+
+mizSubFinishBinaryFormula(p : MizParser) -> void {
+	s = mizSub(p);
+	l = s.firstSententialOperand;
+	r = p.lastFormula;
+	if (s.connective == syImplies) p.lastFormula ::= MizWsConditionalFormula(s.subexpPos, l, r)
+	else if (s.connective == syIff) p.lastFormula ::= MizWsBiconditionalFormula(s.subexpPos, l, r)
+	else if (s.connective == syOr) p.lastFormula ::= MizWsDisjunctiveFormula(s.subexpPos, l, r)
+	else if (s.connective == syAmpersand) p.lastFormula ::= MizWsConjunctiveFormula(s.subexpPos, l, r)
+	else mizRunTimeError(3124);
+}
+
+mizSubFinishFlexDisjunction(p : MizParser) -> void {
+	s = mizSub(p);
+	p.lastFormula ::= MizWsFlexaryDisjunctiveFormula(p.curPos, s.firstSententialOperand, p.lastFormula);
+}
+
+mizSubFinishFlexConjunction(p : MizParser) -> void {
+	s = mizSub(p);
+	p.lastFormula ::= MizWsFlexaryConjunctiveFormula(p.curPos, s.firstSententialOperand, p.lastFormula);
+}
+
+mizSubStartExistential(p : MizParser) -> void {
+	s = mizSub(p);
+	mizClearVector(s.qualifiedSegments);
+	s.subexpPos ::= p.curPos;
+}
+
+mizSubStartUniversal(p : MizParser) -> void { mizSubStartExistential(p); }
+
+mizSubStartQualifiedSegment(p : MizParser) -> void {
+	s = mizSub(p);
+	mizClearVector(s.segmentIdentColl);
+	s.segmentPos ::= p.curPos;
+}
+
+mizSubStartQualifyingType(p : MizParser) -> void { p.lastType ::= None(); }
+
+mizSubFinishQualifiedSegment(p : MizParser) -> void {
+	s = mizSub(p);
+	switch (p.lastType) {
+		None(): {
+			iter(vector2array(s.segmentIdentColl), \v ->
+				pushVector(s.qualifiedSegments, MizWsImplSegment(v.pos, v)));
+			mizClearVector(s.segmentIdentColl);
+		}
+		Some(t): pushVector(s.qualifiedSegments,
+			MizWsExplSegment(s.segmentPos, mizMoveList(s.segmentIdentColl), t));
+	}
+}
+
+mizSubProcessVariable(p : MizParser) -> void {
+	pushVector(mizSub(p).segmentIdentColl, MizWsVariable(p.curPos, mizGetIdentifier(p)));
+}
+
+mizSubFinishExistential(p : MizParser) -> void {
+	s = mizSub(p);
+	segs = vector2array(s.qualifiedSegments);
+	n = length(segs);
+	k = ref (n - 1);
+	while(\ -> ^k >= 1, \ -> {
+		p.lastFormula ::= MizWsExistentialFormula(mizWsSegmentPos(segs[^k]), segs[^k], p.lastFormula);
+		k := ^k - 1;
+	});
+	if (n > 0) p.lastFormula ::= MizWsExistentialFormula(s.subexpPos, segs[0], p.lastFormula);
+	mizClearVector(s.qualifiedSegments);
+}
+
+mizSubFinishUniversal(p : MizParser) -> void {
+	s = mizSub(p);
+	switch (s.restriction) {
+		None(): {}
+		Some(r): p.lastFormula ::= MizWsConditionalFormula(s.restrPos, r, p.lastFormula);
+	}
+	segs = vector2array(s.qualifiedSegments);
+	n = length(segs);
+	k = ref (n - 1);
+	while(\ -> ^k >= 1, \ -> {
+		p.lastFormula ::= MizWsUniversalFormula(mizWsSegmentPos(segs[^k]), segs[^k], p.lastFormula);
+		k := ^k - 1;
+	});
+	if (n > 0) p.lastFormula ::= MizWsUniversalFormula(s.subexpPos, segs[0], p.lastFormula);
+}

@@ -1,0 +1,1117 @@
+// Transcription of the WRITER half of ~/dev/system/base/wsmarticle.pas
+// (OutWSMizFileObj + Write_WSMizArticle) over the XML primitives of
+// base/xml_inout.pas (XMLOutStreamObj).
+//
+// The output is compared BYTE FOR BYTE against the original's `.wsx`, so every
+// detail of xml_inout is reproduced: two-space-free indentation (one space per
+// nesting level), `/>` for an empty element, the attribute order of each
+// procedure, and the `&#xNN;` quoting of any character outside the valid set.
+//
+// ★ Write_WSMizArticle sets nMizarAppearance := true (wsmarticle.pas 3469), so
+//   every `spelling` attribute IS written. The names come from InitScannerNames,
+//   which reads the raw bytes of the `.dct` — a symbol is a BYTE STRING and each
+//   byte outside the valid set is quoted on its own.
+
+import ds/vector;
+import string;
+import loop;
+
+import math/math;
+import fs/filesystem;
+import sys/system;
+import mizar/original/errhan;
+import mizar/original/wsm;
+
+export {
+	// InitScannerNames (wsmarticle.pas 1948): one name array per symbol kind,
+	// indexed by symbol number, plus the identifiers the scanner collected.
+	MizWsNames(
+		attribute : [string],
+		structure : [string],
+		mode : [string],
+		predicate : [string],
+		functor : [string],
+		selector : [string],
+		leftBracket : [string],
+		rightBracket : [string],
+		mmlIdentifier : [string],
+		identifier : [string],
+	);
+
+	// dctPath = <article>.dct; idents = the scanner's identifier collection,
+	// in discovery order (identifier number = index + 1).
+	mizWsInitScannerNames(dctPath : string, idents : [string]) -> MizWsNames;
+
+	mizQuoteStrForXML(s : string) -> string;
+
+	// Write_WSMizArticle: the whole text proper as one string.
+	mizWriteWSMizArticle(tp : MizWsBlock, names : MizWsNames) -> string;
+}
+
+// ---------------------------------------------------------------- names ----
+
+mizQuoteStrForXML(s : string) -> string {
+	n = strlen(s);
+	parts : Vector<string> = makeVector(n);
+	fori(0, n - 1, \i -> {
+		c = getCharCodeAt(s, i);
+		valid =
+			(c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57)
+			|| c == 45 /* - */ || c == 32 /* space */ || c == 44 /* , */
+			|| c == 46 /* . */ || c == 92 /* \ */ || c == 47 /* / */
+			|| c == 95 /* _ */ || c == 91 /* [ */ || c == 93 /* ] */
+			|| c == 33 /* ! */ || c == 59 /* ; */ || c == 58 /* : */
+			|| c == 61 /* = */;
+		pushVector(parts, if (valid) fromCharCode(c) else "&#x" + mizHex2(c) + ";");
+	});
+	concatStrings(vector2array(parts));
+}
+
+// IntToHex(c, 2) — uppercase, at least two digits
+mizHex2(c : int) -> string {
+	digits = "0123456789ABCDEF";
+	if (c < 256) {
+		getCharAt(digits, bitAnd(bitUshr(c, 4), 15)) + getCharAt(digits, bitAnd(c, 15));
+	} else {
+		mizFormatHexTail(c);
+	}
+}
+
+mizFormatHexTail(c : int) -> string {
+	digits = "0123456789ABCDEF";
+	if (c == 0) "" else mizFormatHexTail(bitUshr(c, 4)) + getCharAt(digits, bitAnd(c, 15));
+}
+
+mizWsSetAt(v : Vector<string>, i : int, s : string) -> void {
+	if (sizeVector(v) <= i) {
+		pushVector(v, "");
+		mizWsSetAt(v, i, s);
+	} else setVector(v, i, s);
+}
+
+mizWsInitScannerNames(dctPath : string, idents : [string]) -> MizWsNames {
+	content = getFileContentBinary(dctPath);
+	mk = \ -> { v : Vector<string> = makeVector(64); pushVector(v, ""); v };
+	attribute = mk(); structure = mk(); mode = mk(); predicate = mk();
+	functor = mk(); selector = mk(); leftBracket = mk(); rightBracket = mk();
+	mmlIdent = mk();
+	iter(strSplit(content, "\n"), \ln -> {
+		if (strlen(ln) >= 3) {
+			kind = getCharCodeAt(ln, 0);
+			i = ref 1;
+			while(\ -> ^i < strlen(ln) && isDigit(substring(ln, ^i, 1)), \ -> i := ^i + 1);
+			nr = s2i(substring(ln, 1, ^i - 1));
+			// readln(lDct,lKind,lNr,lDummy,lString): one separator character
+			str = mizQuoteStrForXML(substring(ln, ^i + 1, strlen(ln) - ^i - 1));
+			if (kind == 65) mizWsSetAt(mmlIdent, nr, str)         // 'A'
+			else if (kind == 71) mizWsSetAt(structure, nr, str)   // 'G'
+			else if (kind == 77) mizWsSetAt(mode, nr, str)        // 'M'
+			else if (kind == 75) mizWsSetAt(leftBracket, nr, str) // 'K'
+			else if (kind == 76) mizWsSetAt(rightBracket, nr, str)// 'L'
+			else if (kind == 79) mizWsSetAt(functor, nr, str)     // 'O'
+			else if (kind == 82) mizWsSetAt(predicate, nr, str)   // 'R'
+			else if (kind == 85) mizWsSetAt(selector, nr, str)    // 'U'
+			else if (kind == 86) mizWsSetAt(attribute, nr, str);  // 'V'
+		}
+	});
+	// the built-in homonyms (wsmarticle.pas 1988-1996)
+	mizWsSetAt(attribute, 1, "strict");
+	mizWsSetAt(mode, 1, "set");
+	mizWsSetAt(predicate, 1, "=");
+	mizWsSetAt(leftBracket, 1, "[");  mizWsSetAt(rightBracket, 1, "]");
+	mizWsSetAt(leftBracket, 2, "{");  mizWsSetAt(rightBracket, 2, "}");
+	mizWsSetAt(leftBracket, 3, "(");  mizWsSetAt(rightBracket, 3, ")");
+	MizWsNames(
+		vector2array(attribute), vector2array(structure),
+		vector2array(mode), vector2array(predicate),
+		vector2array(functor), vector2array(selector),
+		vector2array(leftBracket), vector2array(rightBracket),
+		vector2array(mmlIdent),
+		concat([""], idents),
+	);
+}
+
+mizNameAt(names : [string], nr : int) -> string {
+	if (nr >= 0 && nr < length(names)) names[nr] else "";
+}
+
+// --------------------------------------------------------------- stream ----
+
+MizXmlOut(out : Vector<string>, mutable indent : int, names : MizWsNames);
+
+mizOutString(o : MizXmlOut, s : string) -> void { pushVector(o.out, s); }
+
+mizOutIndent(o : MizXmlOut) -> void {
+	mizOutString(o, strRepeat(" ", o.indent));
+}
+
+mizOutXElStart(o : MizXmlOut, el : string) -> void {
+	mizOutIndent(o);
+	o.indent ::= o.indent + 1;
+	mizOutString(o, "<" + el);
+}
+
+mizOutXAttrEnd(o : MizXmlOut) -> void { mizOutString(o, ">\n"); }
+
+mizOutXElStart0(o : MizXmlOut, el : string) -> void {
+	mizOutXElStart(o, el); mizOutXAttrEnd(o);
+}
+
+mizOutXElEnd0(o : MizXmlOut) -> void {
+	mizOutString(o, "/>\n");
+	o.indent ::= o.indent - 1;
+}
+
+mizOutXEl1(o : MizXmlOut, el : string) -> void {
+	mizOutXElStart(o, el); mizOutXElEnd0(o);
+}
+
+mizOutXElEnd(o : MizXmlOut, el : string) -> void {
+	o.indent ::= o.indent - 1;
+	mizOutIndent(o);
+	mizOutString(o, "</" + el + ">\n");
+}
+
+mizOutXAttr(o : MizXmlOut, at : string, val : string) -> void {
+	mizOutString(o, " " + at + "=\"" + val + "\"");
+}
+
+mizOutXIntAttr(o : MizXmlOut, at : string, val : int) -> void {
+	mizOutXAttr(o, at, i2s(val));
+}
+
+mizOutPos(o : MizXmlOut, p : MizPos) -> void {
+	mizOutXIntAttr(o, "line", p.line);
+	mizOutXIntAttr(o, "col", p.col);
+}
+
+mizOutXElWithPos(o : MizXmlOut, el : string, p : MizPos) -> void {
+	mizOutXElStart(o, el); mizOutPos(o, p); mizOutXElEnd0(o);
+}
+
+// ------------------------------------------------------------ the writer ---
+
+mizWriteWSMizArticle(tp : MizWsBlock, names : MizWsNames) -> string {
+	o = MizXmlOut(makeVector(4096), 0, names);
+	mizOutString(o, "<?xml version=\"1.0\"?>\n");
+	mizOutTextProper(o, tp);
+	concatStrings(vector2array(o.out));
+}
+
+mizOutTextProper(o : MizXmlOut, tp : MizWsBlock) -> void {
+	mizOutXElStart(o, mizBlockName[mizBlMain]);
+	mizOutXAttr(o, "articleid", tp.articleId);
+	mizOutXAttr(o, "articleext", tp.articleExt);
+	mizOutPos(o, tp.pos);
+	mizOutXAttrEnd(o);
+	iterVector(tp.items, \it -> mizOutItem(o, it));
+	mizOutXElEnd(o, mizBlockName[mizBlMain]);
+}
+
+mizOutBlock(o : MizXmlOut, b : MizWsBlock) -> void {
+	mizOutXElStart(o, "Block");
+	mizOutXAttr(o, "kind", mizBlockName[b.kind]);
+	mizOutPos(o, b.pos);
+	mizOutXIntAttr(o, "posline", b.endPos.line);
+	mizOutXIntAttr(o, "poscol", b.endPos.col);
+	mizOutXAttrEnd(o);
+	iterVector(b.items, \it -> mizOutItem(o, it));
+	mizOutXElEnd(o, "Block");
+}
+
+mizOutTermList(o : MizXmlOut, ts : [MizWsTerm]) -> void {
+	iter(ts, \t -> mizOutTerm(o, t));
+}
+
+mizOutAdjective(o : MizXmlOut, a : MizWsAdjExpr) -> void {
+	switch (a) {
+		MizWsAdjective(pos, symbol, __, args): {
+			mizOutXElStart(o, "Adjective");
+			mizOutXIntAttr(o, "nr", symbol);
+			mizOutXAttr(o, "spelling", mizNameAt(o.names.attribute, symbol));
+			mizOutPos(o, pos);
+			if (args == []) mizOutXElEnd0(o)
+			else {
+				mizOutXAttrEnd(o);
+				mizOutTermList(o, args);
+				mizOutXElEnd(o, "Adjective");
+			}
+		}
+		MizWsNegatedAdjective(pos, arg): {
+			mizOutXElStart(o, "NegatedAdjective");
+			mizOutPos(o, pos);
+			mizOutXAttrEnd(o);
+			mizOutAdjective(o, arg);
+			mizOutXElEnd(o, "NegatedAdjective");
+		}
+	}
+}
+
+mizOutAdjectiveList(o : MizXmlOut, cluster : [MizWsAdjExpr]) -> void {
+	mizOutXElStart(o, "Adjective-Cluster");
+	if (cluster == []) mizOutXElEnd0(o)
+	else {
+		mizOutXAttrEnd(o);
+		iter(cluster, \a -> mizOutAdjective(o, a));
+		mizOutXElEnd(o, "Adjective-Cluster");
+	}
+}
+
+mizOutType(o : MizXmlOut, t : MizWsType) -> void {
+	switch (t) {
+		MizWsStandardType(pos, modeSymbol, args): {
+			nm = mizTypeName[1];
+			mizOutXElStart(o, nm);
+			mizOutXIntAttr(o, "nr", modeSymbol);
+			mizOutXAttr(o, "spelling", mizNameAt(o.names.mode, modeSymbol));
+			mizOutPos(o, pos);
+			if (args == []) mizOutXElEnd0(o)
+			else { mizOutXAttrEnd(o); mizOutTermList(o, args); mizOutXElEnd(o, nm); }
+		}
+		MizWsStructType(pos, structSymbol, args): {
+			nm = mizTypeName[2];
+			mizOutXElStart(o, nm);
+			mizOutXIntAttr(o, "nr", structSymbol);
+			mizOutXAttr(o, "spelling", mizNameAt(o.names.structure, structSymbol));
+			mizOutPos(o, pos);
+			if (args == []) mizOutXElEnd0(o)
+			else { mizOutXAttrEnd(o); mizOutTermList(o, args); mizOutXElEnd(o, nm); }
+		}
+		MizWsClusteredType(pos, cluster, typ): {
+			nm = mizTypeName[3];
+			mizOutXElStart(o, nm);
+			mizOutPos(o, pos);
+			mizOutXAttrEnd(o);
+			mizOutAdjectiveList(o, cluster);
+			mizOutType(o, typ);
+			mizOutXElEnd(o, nm);
+		}
+		MizWsErrorType(pos): mizOutXElWithPos(o, mizTypeName[0], pos);
+		MizWsReservedDscrType(pos): mizOutXElWithPos(o, mizTypeName[4], pos);
+	}
+}
+
+mizOutVariable(o : MizXmlOut, v : MizWsVariable) -> void {
+	mizOutXElStart(o, "Variable");
+	mizOutXIntAttr(o, "idnr", v.ident);
+	mizOutXAttr(o, "spelling", mizIdentRepr(o, v.ident));
+	mizOutPos(o, v.pos);
+	mizOutXElEnd0(o);
+}
+
+mizIdentRepr(o : MizXmlOut, idNr : int) -> string {
+	if (idNr > 0) mizNameAt(o.names.identifier, idNr) else "";
+}
+
+mizOutVariableSegment(o : MizXmlOut, s : MizWsSegment) -> void {
+	switch (s) {
+		MizWsImplSegment(pos, ident): {
+			nm = mizSegmentKindName[0];
+			mizOutXElStart(o, nm);
+			mizOutPos(o, pos);
+			mizOutXAttrEnd(o);
+			mizOutVariable(o, ident);
+			mizOutXElEnd(o, nm);
+		}
+		MizWsExplSegment(pos, idents, typ): {
+			nm = mizSegmentKindName[1];
+			mizOutXElStart(o, nm);
+			mizOutPos(o, pos);
+			mizOutXAttrEnd(o);
+			mizOutXElStart0(o, "Variables");
+			iter(idents, \v -> mizOutVariable(o, v));
+			mizOutXElEnd(o, "Variables");
+			mizOutType(o, typ);
+			mizOutXElEnd(o, nm);
+		}
+	}
+}
+
+mizOutBinaryFormula(o : MizXmlOut, nm : string, pos : MizPos, l : MizWsFormula, r : MizWsFormula) -> void {
+	mizOutXElStart(o, nm);
+	mizOutPos(o, pos);
+	mizOutXAttrEnd(o);
+	mizOutFormula(o, l);
+	mizOutFormula(o, r);
+	mizOutXElEnd(o, nm);
+}
+
+mizOutArguments(o : MizXmlOut, args : [MizWsTerm]) -> void {
+	if (args == []) mizOutXEl1(o, "Arguments")
+	else {
+		mizOutXElStart0(o, "Arguments");
+		mizOutTermList(o, args);
+		mizOutXElEnd(o, "Arguments");
+	}
+}
+
+mizOutFormula(o : MizXmlOut, f : MizWsFormula) -> void {
+	switch (f) {
+		MizWsNegatedFormula(pos, arg): {
+			nm = mizFormulaName[11];
+			mizOutXElStart(o, nm); mizOutPos(o, pos); mizOutXAttrEnd(o);
+			mizOutFormula(o, arg);
+			mizOutXElEnd(o, nm);
+		}
+		MizWsConjunctiveFormula(pos, l, r): mizOutBinaryFormula(o, mizFormulaName[12], pos, l, r);
+		MizWsDisjunctiveFormula(pos, l, r): mizOutBinaryFormula(o, mizFormulaName[13], pos, l, r);
+		MizWsConditionalFormula(pos, l, r): mizOutBinaryFormula(o, mizFormulaName[14], pos, l, r);
+		MizWsBiconditionalFormula(pos, l, r): mizOutBinaryFormula(o, mizFormulaName[15], pos, l, r);
+		MizWsFlexaryConjunctiveFormula(pos, l, r): mizOutBinaryFormula(o, mizFormulaName[16], pos, l, r);
+		MizWsFlexaryDisjunctiveFormula(pos, l, r): mizOutBinaryFormula(o, mizFormulaName[17], pos, l, r);
+		MizWsPredicativeFormula(pos, predNr, leftArgs, rightArgs): {
+			nm = mizFormulaName[4];
+			mizOutXElStart(o, nm);
+			mizOutXIntAttr(o, "nr", predNr);
+			mizOutXAttr(o, "spelling", mizNameAt(o.names.predicate, predNr));
+			mizOutPos(o, pos);
+			mizOutXAttrEnd(o);
+			mizOutArguments(o, leftArgs);
+			mizOutArguments(o, rightArgs);
+			mizOutXElEnd(o, nm);
+		}
+		MizWsRightSideOfPredicativeFormula(pos, predNr, rightArgs): {
+			nm = mizFormulaName[3];
+			mizOutXElStart(o, nm);
+			mizOutXIntAttr(o, "nr", predNr);
+			mizOutXAttr(o, "spelling", mizNameAt(o.names.predicate, predNr));
+			mizOutPos(o, pos);
+			mizOutXAttrEnd(o);
+			mizOutArguments(o, rightArgs);
+			mizOutXElEnd(o, nm);
+		}
+		MizWsMultiPredicativeFormula(pos, scraps): {
+			nm = mizFormulaName[5];
+			mizOutXElStart(o, nm); mizOutPos(o, pos); mizOutXAttrEnd(o);
+			iter(scraps, \s -> mizOutFormula(o, s));
+			mizOutXElEnd(o, nm);
+		}
+		MizWsPrivatePredicateFormula(pos, predIdNr, args): {
+			nm = mizFormulaName[6];
+			mizOutXElStart(o, nm);
+			mizOutXIntAttr(o, "idnr", predIdNr);
+			mizOutXAttr(o, "spelling", mizIdentRepr(o, predIdNr));
+			mizOutPos(o, pos);
+			if (args == []) mizOutXElEnd0(o)
+			else { mizOutXAttrEnd(o); mizOutTermList(o, args); mizOutXElEnd(o, nm); }
+		}
+		MizWsAttributiveFormula(pos, subject, adjectives): {
+			nm = mizFormulaName[7];
+			mizOutXElStart(o, nm); mizOutPos(o, pos); mizOutXAttrEnd(o);
+			mizOutTerm(o, subject);
+			mizOutAdjectiveList(o, adjectives);
+			mizOutXElEnd(o, nm);
+		}
+		MizWsQualifyingFormula(pos, subject, typ): {
+			nm = mizFormulaName[8];
+			mizOutXElStart(o, nm); mizOutPos(o, pos); mizOutXAttrEnd(o);
+			mizOutTerm(o, subject);
+			mizOutType(o, typ);
+			mizOutXElEnd(o, nm);
+		}
+		MizWsUniversalFormula(pos, segment, scope): {
+			nm = mizFormulaName[9];
+			mizOutXElStart(o, nm); mizOutPos(o, pos); mizOutXAttrEnd(o);
+			mizOutVariableSegment(o, segment);
+			mizOutFormula(o, scope);
+			mizOutXElEnd(o, nm);
+		}
+		MizWsExistentialFormula(pos, segment, scope): {
+			nm = mizFormulaName[10];
+			mizOutXElStart(o, nm); mizOutPos(o, pos); mizOutXAttrEnd(o);
+			mizOutVariableSegment(o, segment);
+			mizOutFormula(o, scope);
+			mizOutXElEnd(o, nm);
+		}
+		MizWsContradiction(pos): mizOutXElWithPos(o, mizFormulaName[2], pos);
+		MizWsThesis(pos): mizOutXElWithPos(o, mizFormulaName[1], pos);
+		MizWsErrorFormula(pos): mizOutXElWithPos(o, mizFormulaName[0], pos);
+	}
+}
+
+mizOutTerm(o : MizXmlOut, t : MizWsTerm) -> void {
+	switch (t) {
+		MizWsPlaceholderTerm(pos, locusNr): {
+			mizOutXElStart(o, mizTermName[1]);
+			mizOutXIntAttr(o, "nr", locusNr);
+			mizOutXAttr(o, "spelling", mizQuoteStrForXML("$" + i2s(locusNr)));
+			mizOutPos(o, pos);
+			mizOutXElEnd0(o);
+		}
+		MizWsSimpleTerm(pos, ident): {
+			mizOutXElStart(o, mizTermName[3]);
+			mizOutXIntAttr(o, "idnr", ident);
+			mizOutXAttr(o, "spelling", mizIdentRepr(o, ident));
+			mizOutPos(o, pos);
+			mizOutXElEnd0(o);
+		}
+		MizWsNumeralTerm(pos, value): {
+			mizOutXElStart(o, mizTermName[2]);
+			mizOutXIntAttr(o, "number", value);
+			mizOutPos(o, pos);
+			mizOutXElEnd0(o);
+		}
+		MizWsInfixTerm(pos, functorSymbol, leftArgs, rightArgs): {
+			nm = mizTermName[5];
+			mizOutXElStart(o, nm);
+			mizOutXIntAttr(o, "nr", functorSymbol);
+			mizOutXAttr(o, "spelling", mizNameAt(o.names.functor, functorSymbol));
+			mizOutPos(o, pos);
+			mizOutXAttrEnd(o);
+			mizOutArguments(o, leftArgs);
+			mizOutArguments(o, rightArgs);
+			mizOutXElEnd(o, nm);
+		}
+		MizWsCircumfixTerm(pos, leftBracket, rightBracket, args): {
+			nm = mizTermName[6];
+			mizOutXElStart(o, nm);
+			mizOutXIntAttr(o, "nr", leftBracket);
+			mizOutXAttr(o, "spelling", mizNameAt(o.names.leftBracket, leftBracket));
+			mizOutPos(o, pos);
+			mizOutXAttrEnd(o);
+			mizOutXElStart(o, "Right-Circumflex-Symbol");
+			mizOutXIntAttr(o, "nr", rightBracket);
+			mizOutXAttr(o, "spelling", mizNameAt(o.names.rightBracket, rightBracket));
+			mizOutPos(o, pos);
+			mizOutXElEnd0(o);
+			mizOutTermList(o, args);
+			mizOutXElEnd(o, nm);
+		}
+		MizWsPrivateFunctorTerm(pos, functorIdent, args): {
+			nm = mizTermName[4];
+			mizOutXElStart(o, nm);
+			mizOutXIntAttr(o, "idnr", functorIdent);
+			mizOutXAttr(o, "spelling", mizIdentRepr(o, functorIdent));
+			mizOutPos(o, pos);
+			if (args == []) mizOutXElEnd0(o)
+			else { mizOutXAttrEnd(o); mizOutTermList(o, args); mizOutXElEnd(o, nm); }
+		}
+		MizWsAggregateTerm(pos, structSymbol, args): {
+			nm = mizTermName[7];
+			mizOutXElStart(o, nm);
+			mizOutXIntAttr(o, "nr", structSymbol);
+			mizOutXAttr(o, "spelling", mizNameAt(o.names.structure, structSymbol));
+			mizOutPos(o, pos);
+			if (args == []) mizOutXElEnd0(o)
+			else { mizOutXAttrEnd(o); mizOutTermList(o, args); mizOutXElEnd(o, nm); }
+		}
+		MizWsSelectorTerm(pos, selectorSymbol, arg): {
+			nm = mizTermName[10];
+			mizOutXElStart(o, nm);
+			mizOutXIntAttr(o, "nr", selectorSymbol);
+			mizOutXAttr(o, "spelling", mizNameAt(o.names.selector, selectorSymbol));
+			mizOutPos(o, pos);
+			mizOutXAttrEnd(o);
+			mizOutTerm(o, arg);
+			mizOutXElEnd(o, nm);
+		}
+		MizWsInternalSelectorTerm(pos, selectorSymbol): {
+			mizOutXElStart(o, mizTermName[11]);
+			mizOutXIntAttr(o, "nr", selectorSymbol);
+			mizOutXAttr(o, "spelling", mizNameAt(o.names.selector, selectorSymbol));
+			mizOutPos(o, pos);
+			mizOutXElEnd0(o);
+		}
+		MizWsForgetfulFunctorTerm(pos, structSymbol, arg): {
+			nm = mizTermName[8];
+			mizOutXElStart(o, nm);
+			mizOutXIntAttr(o, "nr", structSymbol);
+			mizOutXAttr(o, "spelling", mizNameAt(o.names.structure, structSymbol));
+			mizOutPos(o, pos);
+			mizOutXAttrEnd(o);
+			mizOutTerm(o, arg);
+			mizOutXElEnd(o, nm);
+		}
+		MizWsInternalForgetfulFunctorTerm(pos, structSymbol): {
+			mizOutXElStart(o, mizTermName[9]);
+			mizOutXIntAttr(o, "nr", structSymbol);
+			mizOutPos(o, pos);
+			mizOutXElEnd0(o);
+		}
+		MizWsFraenkelTerm(pos, postqual, sample, formula): {
+			nm = mizTermName[15];
+			mizOutXElStart(o, nm); mizOutPos(o, pos); mizOutXAttrEnd(o);
+			iter(postqual, \s -> mizOutVariableSegment(o, s));
+			mizOutTerm(o, sample);
+			mizOutFormula(o, formula);
+			mizOutXElEnd(o, nm);
+		}
+		MizWsSimpleFraenkelTerm(pos, postqual, sample): {
+			nm = mizTermName[14];
+			mizOutXElStart(o, nm); mizOutPos(o, pos); mizOutXAttrEnd(o);
+			iter(postqual, \s -> mizOutVariableSegment(o, s));
+			mizOutTerm(o, sample);
+			mizOutXElEnd(o, nm);
+		}
+		MizWsQualificationTerm(pos, subject, qualification): {
+			nm = mizTermName[12];
+			mizOutXElStart(o, nm); mizOutPos(o, pos); mizOutXAttrEnd(o);
+			mizOutTerm(o, subject);
+			mizOutType(o, qualification);
+			mizOutXElEnd(o, nm);
+		}
+		// wsExactlyTerm is written under the QUALIFICATION name (wsmarticle 2639)
+		MizWsExactlyTerm(pos, subject): {
+			nm = mizTermName[12];
+			mizOutXElStart(o, nm); mizOutPos(o, pos); mizOutXAttrEnd(o);
+			mizOutTerm(o, subject);
+			mizOutXElEnd(o, nm);
+		}
+		MizWsGlobalChoiceTerm(pos, choiceType): {
+			nm = mizTermName[13];
+			mizOutXElStart(o, nm); mizOutPos(o, pos); mizOutXAttrEnd(o);
+			mizOutType(o, choiceType);
+			mizOutXElEnd(o, nm);
+		}
+		MizWsItTerm(pos): mizOutXElWithPos(o, mizTermName[16], pos);
+		MizWsErrorTerm(__): mizOutXEl1(o, mizTermName[0]);
+	}
+}
+
+mizOutTypeList(o : MizXmlOut, ts : [MizWsType]) -> void {
+	mizOutXElStart0(o, "Type-List");
+	iter(ts, \t -> mizOutType(o, t));
+	mizOutXElEnd(o, "Type-List");
+}
+
+mizOutLocus(o : MizXmlOut, l : MizWsLocus) -> void {
+	mizOutXElStart(o, "Locus");
+	mizOutXIntAttr(o, "idnr", l.varId);
+	mizOutXAttr(o, "spelling", mizIdentRepr(o, l.varId));
+	mizOutPos(o, l.pos);
+	mizOutXElEnd0(o);
+}
+
+mizOutLoci(o : MizXmlOut, ls : [MizWsLocus]) -> void {
+	if (ls == []) mizOutXEl1(o, "Loci")
+	else {
+		mizOutXElStart0(o, "Loci");
+		iter(ls, \l -> mizOutLocus(o, l));
+		mizOutXElEnd(o, "Loci");
+	}
+}
+
+mizOutPattern(o : MizXmlOut, p : MizWsPattern) -> void {
+	switch (p) {
+		MizWsPredPattern(pos, symbol, leftArgs, rightArgs): {
+			nm = "Predicate-Pattern";
+			mizOutXElStart(o, nm);
+			mizOutXIntAttr(o, "nr", symbol);
+			mizOutXAttr(o, "spelling", mizNameAt(o.names.predicate, symbol));
+			mizOutPos(o, pos);
+			mizOutXAttrEnd(o);
+			mizOutLoci(o, leftArgs);
+			mizOutLoci(o, rightArgs);
+			mizOutXElEnd(o, nm);
+		}
+		MizWsInfixFunctorPattern(pos, symbol, leftArgs, rightArgs): {
+			nm = mizFunctorPatternName[0];
+			mizOutXElStart(o, nm);
+			mizOutXIntAttr(o, "nr", symbol);
+			mizOutXAttr(o, "spelling", mizNameAt(o.names.functor, symbol));
+			mizOutPos(o, pos);
+			mizOutXAttrEnd(o);
+			mizOutLoci(o, leftArgs);
+			mizOutLoci(o, rightArgs);
+			mizOutXElEnd(o, nm);
+		}
+		MizWsCircumfixFunctorPattern(pos, leftBracket, rightBracket, args): {
+			nm = mizFunctorPatternName[1];
+			mizOutXElStart(o, nm);
+			mizOutXIntAttr(o, "nr", leftBracket);
+			mizOutXAttr(o, "spelling", mizNameAt(o.names.leftBracket, leftBracket));
+			mizOutPos(o, pos);
+			mizOutXAttrEnd(o);
+			mizOutXElStart(o, "Right-Circumflex-Symbol");
+			mizOutXIntAttr(o, "nr", rightBracket);
+			mizOutXAttr(o, "spelling", mizNameAt(o.names.rightBracket, rightBracket));
+			mizOutXAttrEnd(o);
+			mizOutXElEnd(o, "Right-Circumflex-Symbol");
+			mizOutLoci(o, args);
+			mizOutXElEnd(o, nm);
+		}
+		MizWsModePattern(pos, symbol, args): {
+			nm = "Mode-Pattern";
+			mizOutXElStart(o, nm);
+			mizOutXIntAttr(o, "nr", symbol);
+			mizOutXAttr(o, "spelling", mizNameAt(o.names.mode, symbol));
+			mizOutPos(o, pos);
+			mizOutXAttrEnd(o);
+			mizOutLoci(o, args);
+			mizOutXElEnd(o, nm);
+		}
+		MizWsAttrPattern(pos, symbol, arg, args): {
+			nm = "Attribute-Pattern";
+			mizOutXElStart(o, nm);
+			mizOutXIntAttr(o, "nr", symbol);
+			mizOutXAttr(o, "spelling", mizNameAt(o.names.attribute, symbol));
+			mizOutPos(o, pos);
+			mizOutXAttrEnd(o);
+			mizOutLocus(o, arg);
+			mizOutLoci(o, args);
+			mizOutXElEnd(o, nm);
+		}
+	}
+}
+
+mizOutLabel(o : MizXmlOut, l : MizWsMaybeLabel) -> void {
+	switch (l) {
+		MizWsNoLabel(): {}
+		MizWsLabel(idNr, pos): {
+			mizOutXElStart(o, "Label");
+			mizOutXIntAttr(o, "idnr", idNr);
+			mizOutXAttr(o, "spelling", mizIdentRepr(o, idNr));
+			mizOutPos(o, pos);
+			mizOutXElEnd0(o);
+		}
+	}
+}
+
+mizOutDefExpr(o : MizXmlOut, e : MizWsDefExpr) -> void {
+	if (e.exprKind == mizExTerm) {
+		switch (e.term) { None(): {}; Some(t): mizOutTerm(o, t); }
+	} else if (e.exprKind == mizExFormula) {
+		switch (e.formula) { None(): {}; Some(f): mizOutFormula(o, f); }
+	}
+}
+
+mizOutDefiniens(o : MizXmlOut, d : Maybe<MizWsDefiniens>) -> void {
+	switch (d) {
+		None(): {}
+		Some(def): {
+			mizOutXElStart(o, "Definiens");
+			switch (def) {
+				MizWsSimpleDefiniens(pos, lab, expr): {
+					mizOutPos(o, pos);
+					mizOutXAttr(o, "kind", mizDefiniensKindName[0]);
+					mizOutXAttr(o, "shape", mizExpName[expr.exprKind]);
+					mizOutXAttrEnd(o);
+					mizOutLabel(o, lab);
+					mizOutDefExpr(o, expr);
+				}
+				MizWsConditionalDefiniens(pos, lab, partials, otherwise): {
+					mizOutPos(o, pos);
+					mizOutXAttr(o, "kind", mizDefiniensKindName[1]);
+					exprKind = switch (otherwise) {
+						Some(ow): ow.exprKind;
+						None(): if (partials != []) partials[0].partDefiniens.exprKind else mizExFormula;
+					};
+					mizOutXAttr(o, "shape", mizExpName[exprKind]);
+					mizOutXAttrEnd(o);
+					mizOutLabel(o, lab);
+					iter(partials, \pd -> {
+						mizOutXElStart0(o, "Partial-Definiens");
+						mizOutDefExpr(o, pd.partDefiniens);
+						mizOutFormula(o, pd.guard);
+						mizOutXElEnd(o, "Partial-Definiens");
+					});
+					switch (otherwise) { None(): {}; Some(ow): mizOutDefExpr(o, ow); }
+				}
+			}
+			mizOutXElEnd(o, "Definiens");
+		}
+	}
+}
+
+mizOutProposition(o : MizXmlOut, p : MizWsProposition) -> void {
+	mizOutXElStart(o, "Proposition");
+	mizOutXAttrEnd(o);
+	mizOutLabel(o, p.lab);
+	mizOutFormula(o, p.sentence);
+	mizOutXElEnd(o, "Proposition");
+}
+
+mizOutReferences(o : MizXmlOut, refs : [MizWsReference]) -> void {
+	iter(refs, \r -> switch (r) {
+		MizWsLocalRef(pos, labId): {
+			mizOutXElStart(o, mizReferenceKindName[0]);
+			mizOutPos(o, pos);
+			mizOutXIntAttr(o, "idnr", labId);
+			mizOutXAttr(o, "spelling", mizIdentRepr(o, labId));
+			mizOutXElEnd0(o);
+		}
+		MizWsTheoremRef(pos, articleNr, theoNr): {
+			mizOutXElStart(o, mizReferenceKindName[1]);
+			mizOutPos(o, pos);
+			mizOutXIntAttr(o, "nr", articleNr);
+			mizOutXAttr(o, "spelling", mizNameAt(o.names.mmlIdentifier, articleNr));
+			mizOutXIntAttr(o, "number", theoNr);
+			mizOutXElEnd0(o);
+		}
+		MizWsDefinitionRef(pos, articleNr, defNr): {
+			mizOutXElStart(o, mizReferenceKindName[2]);
+			mizOutPos(o, pos);
+			mizOutXIntAttr(o, "nr", articleNr);
+			mizOutXAttr(o, "spelling", mizNameAt(o.names.mmlIdentifier, articleNr));
+			mizOutXIntAttr(o, "number", defNr);
+			mizOutXElEnd0(o);
+		}
+	});
+}
+
+mizOutJustification(o : MizXmlOut, j : MizWsJustification, block : Maybe<MizWsBlock>) -> void {
+	switch (j) {
+		MizWsStraightforward(pos, refs, linked, linkPos): {
+			nm = mizInferenceName[1];
+			mizOutXElStart(o, nm);
+			mizOutPos(o, pos);
+			if (!linked && refs == []) mizOutXElEnd0(o)
+			else {
+				mizOutXAttrEnd(o);
+				if (linked) {
+					mizOutXElStart(o, "Link");
+					mizOutPos(o, linkPos);
+					mizOutXElEnd0(o);
+				}
+				mizOutReferences(o, refs);
+				mizOutXElEnd(o, nm);
+			}
+		}
+		MizWsSchemeJust(pos, refs, schFileNr, schemeIdNr, schemeInfPos): {
+			nm = mizInferenceName[2];
+			mizOutXElStart(o, nm);
+			mizOutXIntAttr(o, "nr", schFileNr);
+			mizOutXIntAttr(o, "idnr", schemeIdNr);
+			if (schFileNr > 0) mizOutXAttr(o, "spelling", mizNameAt(o.names.mmlIdentifier, schFileNr))
+			else if (schemeIdNr > 0) mizOutXAttr(o, "spelling", mizIdentRepr(o, schemeIdNr));
+			mizOutPos(o, pos);
+			mizOutXIntAttr(o, "posline", schemeInfPos.line);
+			mizOutXIntAttr(o, "poscol", schemeInfPos.col);
+			mizOutXAttrEnd(o);
+			mizOutReferences(o, refs);
+			mizOutXElEnd(o, nm);
+		}
+		MizWsInfError(pos): mizOutXElWithPos(o, mizInferenceName[0], pos);
+		MizWsSkippedProof(pos): mizOutXElWithPos(o, mizInferenceName[4], pos);
+		MizWsProofJust(__): switch (block) { None(): {}; Some(b): mizOutBlock(o, b); };
+	}
+}
+
+mizOutCompactStatement(o : MizXmlOut, prop : MizWsProposition,
+	just : MizWsJustification, block : Maybe<MizWsBlock>) -> void {
+	mizOutProposition(o, prop);
+	mizOutJustification(o, just, block);
+}
+
+mizOutRegularStatement(o : MizXmlOut, st : MizWsStatement, block : Maybe<MizWsBlock>) -> void {
+	switch (st) {
+		MizWsDiffuseStatement(lab): {
+			mizOutLabel(o, lab);
+			switch (block) { None(): {}; Some(b): mizOutBlock(o, b); }
+		}
+		MizWsCompactStatement(prop, just): mizOutCompactStatement(o, prop, just, block);
+		MizWsIterativeEquality(prop, just, steps): {
+			mizOutCompactStatement(o, prop, just, None());
+			iter(steps, \s -> {
+				mizOutXElStart(o, "Iterative-Step");
+				mizOutPos(o, s.pos);
+				mizOutXAttrEnd(o);
+				mizOutTerm(o, s.term);
+				mizOutJustification(o, s.justification, None());
+				mizOutXElEnd(o, "Iterative-Step");
+			});
+		}
+	}
+}
+
+mizStatementShape(st : MizWsStatement) -> int {
+	switch (st) {
+		MizWsDiffuseStatement(__): 0;
+		MizWsCompactStatement(__, __): 1;
+		MizWsIterativeEquality(__, __, __): 2;
+	}
+}
+
+// Out_ItemContentsAttr (wsmarticle.pas 3024) — the case is on the ITEM KIND,
+// so a theorem's compact statement gets NO shape attribute.
+mizOutItemContentsAttr(o : MizXmlOut, it : MizWsItem) -> void {
+	if (it.kind != mizItConclusion && it.kind != mizItRegularStatement) {
+		mizOutItemContentsAttrRest(o, it);
+	} else switch (it.content) {
+		MizWsStatementContent(st): mizOutXAttr(o, "shape", mizRegularStatementName[mizStatementShape(st)]);
+		default: {}
+	}
+}
+
+mizOutItemContentsAttrRest(o : MizXmlOut, it : MizWsItem) -> void {
+	switch (it.content) {
+		MizWsCorrectnessCondition(__, csort, __): mizOutXAttr(o, "condition", mizCorrectnessName[csort]);
+		MizWsCorrectnessConditions(__, __, __): mizOutXAttr(o, "condition", mizCorrectnessName[0]);
+		MizWsPropertyContent(__, psort, __): mizOutXAttr(o, "property", mizPropertyName[psort]);
+		MizWsFuncDefinition(__, __, __, __, definingWay, __): mizOutXAttr(o, "shape", mizDefiningWayName[definingWay]);
+		MizWsPropertyRegistration(__, rsort, __, __): mizOutXAttr(o, "property", mizPropertyName[rsort]);
+		MizWsPragma(str): mizOutXAttr(o, "spelling", mizQuoteStrForXML(str));
+		default: {}
+	}
+}
+
+mizOutSchemeSegment(o : MizXmlOut, s : MizWsSchemeSegment) -> void {
+	switch (s) {
+		MizWsPredicateSegment(pos, vars, typeExpList): {
+			nm = mizSchemeSegmentName[0];
+			mizOutXElStart(o, nm); mizOutPos(o, pos); mizOutXAttrEnd(o);
+			mizOutXElStart0(o, "Variables");
+			iter(vars, \v -> mizOutVariable(o, v));
+			mizOutXElEnd(o, "Variables");
+			mizOutTypeList(o, typeExpList);
+			mizOutXElEnd(o, nm);
+		}
+		MizWsFunctorSegment(pos, vars, typeExpList, specification): {
+			nm = mizSchemeSegmentName[1];
+			mizOutXElStart(o, nm); mizOutPos(o, pos); mizOutXAttrEnd(o);
+			mizOutXElStart0(o, "Variables");
+			iter(vars, \v -> mizOutVariable(o, v));
+			mizOutXElEnd(o, "Variables");
+			mizOutTypeList(o, typeExpList);
+			mizOutXElStart0(o, "Type-Specification");
+			mizOutType(o, specification);
+			mizOutXElEnd(o, "Type-Specification");
+			mizOutXElEnd(o, nm);
+		}
+	}
+}
+
+mizOutTypeSpecification(o : MizXmlOut, t : Maybe<MizWsType>) -> void {
+	switch (t) {
+		None(): {}
+		Some(ty): {
+			mizOutXElStart0(o, "Type-Specification");
+			mizOutType(o, ty);
+			mizOutXElEnd(o, "Type-Specification");
+		}
+	}
+}
+
+mizOutItemContents(o : MizXmlOut, it : MizWsItem) -> void {
+	blk = it.block;
+	switch (it.content) {
+		MizWsNoContent(): {}
+		MizWsSchemeContent(sch): {
+			mizOutXElStart(o, "Scheme");
+			mizOutXIntAttr(o, "idnr", sch.idNr);
+			mizOutXAttr(o, "spelling", mizIdentRepr(o, sch.idNr));
+			mizOutXElEnd0(o);
+			mizOutXElStart0(o, "Schematic-Variables");
+			iter(sch.params, \p -> mizOutSchemeSegment(o, p));
+			mizOutXElEnd(o, "Schematic-Variables");
+			mizOutFormula(o, sch.conclusion);
+			if (sch.premises != []) {
+				mizOutXElStart0(o, "Provisional-Formulas");
+				iter(sch.premises, \p -> mizOutProposition(o, p));
+				mizOutXElEnd(o, "Provisional-Formulas");
+			}
+		}
+		MizWsReservationSegment(idents, resType): {
+			mizOutXElStart0(o, "Variables");
+			iter(idents, \v -> mizOutVariable(o, v));
+			mizOutXElEnd(o, "Variables");
+			mizOutType(o, resType);
+		}
+		MizWsStatementContent(st): {
+			// a theorem item carries a compact statement too
+			if (it.kind == mizItTheorem) {
+				switch (st) {
+					MizWsCompactStatement(prop, just): mizOutCompactStatement(o, prop, just, blk);
+					default: mizOutRegularStatement(o, st, blk);
+				}
+			} else mizOutRegularStatement(o, st, blk);
+		}
+		MizWsChoiceStatement(qualVars, conditions, just): {
+			iter(qualVars, \s -> mizOutVariableSegment(o, s));
+			mizOutXElStart0(o, "Conditions");
+			iter(conditions, \p -> mizOutProposition(o, p));
+			mizOutXElEnd(o, "Conditions");
+			mizOutJustification(o, just, None());
+		}
+		MizWsTypeChangingStatement(changes, typeExpr, just): {
+			iter(changes, \tc -> {
+				if (tc.kind == 0) {
+					mizOutXElStart0(o, "Equality");
+					mizOutVariable(o, tc.var_);
+					switch (tc.term) { None(): {}; Some(t): mizOutTerm(o, t); }
+					mizOutXElEnd(o, "Equality");
+				} else mizOutVariable(o, tc.var_);
+			});
+			mizOutType(o, typeExpr);
+			mizOutJustification(o, just, None());
+		}
+		MizWsPrivFuncDefinition(funcId, typeExpList, term): {
+			mizOutVariable(o, funcId);
+			mizOutTypeList(o, typeExpList);
+			mizOutTerm(o, term);
+		}
+		MizWsPrivPredDefinition(predId, typeExpList, sentence): {
+			mizOutVariable(o, predId);
+			mizOutTypeList(o, typeExpList);
+			mizOutFormula(o, sentence);
+		}
+		MizWsConstantDefinition(varId, term): {
+			mizOutVariable(o, varId);
+			mizOutTerm(o, term);
+		}
+		MizWsSegmentContent(segment): mizOutVariableSegment(o, segment);
+		MizWsAssumptionContent(assumption): {
+			switch (assumption) {
+				MizWsSingleAssumption(pos, prop): {
+					nm = mizAssumptionKindName[0];
+					mizOutXElStart(o, nm); mizOutPos(o, pos); mizOutXAttrEnd(o);
+					mizOutProposition(o, prop);
+					mizOutXElEnd(o, nm);
+				}
+				MizWsCollectiveAssumption(pos, conditions): {
+					nm = mizAssumptionKindName[1];
+					mizOutXElStart(o, nm); mizOutPos(o, pos); mizOutXAttrEnd(o);
+					mizOutXElStart0(o, "Conditions");
+					iter(conditions, \p -> mizOutProposition(o, p));
+					mizOutXElEnd(o, "Conditions");
+					mizOutXElEnd(o, nm);
+				}
+			}
+		}
+		MizWsExistentialAssumption(qVars, conditions): {
+			iter(qVars, \s -> mizOutVariableSegment(o, s));
+			mizOutXElStart0(o, "Conditions");
+			iter(conditions, \p -> mizOutProposition(o, p));
+			mizOutXElEnd(o, "Conditions");
+		}
+		MizWsExample(varId, term): {
+			switch (varId) { None(): {}; Some(v): mizOutVariable(o, v); }
+			switch (term) { None(): {}; Some(t): mizOutTerm(o, t); }
+		}
+		MizWsJustificationContent(just): mizOutJustification(o, just, None());
+		MizWsCorrectnessCondition(__, __, just): mizOutJustification(o, just, blk);
+		MizWsCorrectnessConditions(__, conditions, just): {
+			mizOutXElStart0(o, "CorrectnessConditions");
+			iter(conditions, \s -> {
+				mizOutXElStart(o, mizItemName[mizItCorrectness]);
+				mizOutXAttr(o, "condition", mizCorrectnessName[s]);
+				mizOutXElEnd0(o);
+			});
+			mizOutXElEnd(o, "CorrectnessConditions");
+			mizOutJustification(o, just, blk);
+		}
+		MizWsPropertyContent(__, __, just): mizOutJustification(o, just, blk);
+		MizWsModeDefinition(__, defKind, redefinition, pattern, expansion, specification, definiens): {
+			if (redefinition) mizOutXEl1(o, "Redefine");
+			mizOutPattern(o, pattern);
+			if (defKind == 0) {
+				mizOutXElStart0(o, mizModeDefinitionSortName[0]);
+				switch (expansion) { None(): {}; Some(t): mizOutType(o, t); }
+				mizOutXElEnd(o, mizModeDefinitionSortName[0]);
+			} else {
+				mizOutXElStart0(o, mizModeDefinitionSortName[1]);
+				mizOutTypeSpecification(o, specification);
+				mizOutDefiniens(o, definiens);
+				mizOutXElEnd(o, mizModeDefinitionSortName[1]);
+			}
+		}
+		MizWsAttrDefinition(__, redefinition, pattern, definiens): {
+			if (redefinition) mizOutXEl1(o, "Redefine");
+			mizOutPattern(o, pattern);
+			mizOutDefiniens(o, definiens);
+		}
+		MizWsPredDefinition(__, redefinition, pattern, definiens): {
+			if (redefinition) mizOutXEl1(o, "Redefine");
+			mizOutPattern(o, pattern);
+			mizOutDefiniens(o, definiens);
+		}
+		MizWsFuncDefinition(__, redefinition, pattern, specification, __, definiens): {
+			if (redefinition) mizOutXEl1(o, "Redefine");
+			mizOutPattern(o, pattern);
+			mizOutTypeSpecification(o, specification);
+			mizOutDefiniens(o, definiens);
+		}
+		MizWsStructureDefinition(pos, ancestors, pattern, fields): {
+			mizOutXElStart0(o, "Ancestors");
+			iter(ancestors, \t -> mizOutType(o, t));
+			mizOutXElEnd(o, "Ancestors");
+			nm = "Structure-Pattern";
+			switch (pattern) {
+				MizWsModePattern(__, symbol, args): {
+					mizOutXElStart(o, nm);
+					mizOutXIntAttr(o, "nr", symbol);
+					mizOutXAttr(o, "spelling", mizNameAt(o.names.structure, symbol));
+					mizOutPos(o, pos);
+					mizOutXAttrEnd(o);
+					mizOutLoci(o, args);
+				}
+				default: {}
+			}
+			iter(fields, \fs -> {
+				mizOutXElStart(o, "Field-Segment");
+				mizOutPos(o, fs.pos);
+				mizOutXAttrEnd(o);
+				iter(fs.fields, \f -> {
+					mizOutXElStart(o, "Selector");
+					mizOutXIntAttr(o, "nr", f.symbol);
+					mizOutXAttr(o, "spelling", mizNameAt(o.names.selector, f.symbol));
+					mizOutPos(o, f.pos);
+					mizOutXElEnd0(o);
+				});
+				mizOutType(o, fs.specification);
+				mizOutXElEnd(o, "Field-Segment");
+			});
+			mizOutXElEnd(o, nm);
+		}
+		MizWsNotationDeclaration(__, __, newPattern, originPattern): {
+			mizOutPattern(o, originPattern);
+			mizOutPattern(o, newPattern);
+		}
+		MizWsCluster(pos, kind, antecedent, consequent, clusterType, clusterTerm): {
+			nm = mizClusterRegistrationName[kind];
+			mizOutXElStart(o, nm); mizOutPos(o, pos); mizOutXAttrEnd(o);
+			if (kind == 0) {
+				mizOutAdjectiveList(o, consequent);
+				switch (clusterType) { None(): {}; Some(t): mizOutType(o, t); }
+			} else if (kind == 1) {
+				mizOutAdjectiveList(o, antecedent);
+				mizOutAdjectiveList(o, consequent);
+				switch (clusterType) { None(): {}; Some(t): mizOutType(o, t); }
+			} else {
+				switch (clusterTerm) { None(): {}; Some(t): mizOutTerm(o, t); }
+				mizOutAdjectiveList(o, consequent);
+				switch (clusterType) { None(): {}; Some(t): mizOutType(o, t); }
+			}
+			mizOutXElEnd(o, nm);
+		}
+		MizWsIdentifyRegistration(__, newPattern, originPattern, eqLoci): {
+			mizOutPattern(o, originPattern);
+			mizOutPattern(o, newPattern);
+			iter(eqLoci, \e -> {
+				mizOutXElStart(o, "LociEquality");
+				mizOutPos(o, e.pos);
+				mizOutXAttrEnd(o);
+				mizOutLocus(o, e.left);
+				mizOutLocus(o, e.right);
+				mizOutXElEnd(o, "LociEquality");
+			});
+		}
+		MizWsPropertyRegistration(__, rsort, sethoodType, just): {
+			// only sethood carries a body (wsmarticle.pas 3421)
+			if (rsort == 12) {
+				switch (sethoodType) { None(): {}; Some(t): mizOutType(o, t); }
+				switch (just) { None(): {}; Some(j): mizOutJustification(o, j, blk); }
+			}
+		}
+		MizWsReduceRegistration(__, originTerm, newTerm): {
+			mizOutTerm(o, originTerm);
+			mizOutTerm(o, newTerm);
+		}
+		MizWsPragma(__): {}
+	}
+}
+
+mizOutItem(o : MizXmlOut, it : MizWsItem) -> void {
+	mizOutXElStart(o, "Item");
+	mizOutXAttr(o, "kind", mizItemName[it.kind]);
+	hasContent = it.content != MizWsNoContent();
+	if (hasContent) mizOutItemContentsAttr(o, it);
+	mizOutPos(o, it.pos);
+	mizOutXIntAttr(o, "posline", it.endPos.line);
+	mizOutXIntAttr(o, "poscol", it.endPos.col);
+	mizOutXAttrEnd(o);
+	if (!hasContent) {
+		switch (it.block) { None(): {}; Some(b): mizOutBlock(o, b); }
+	} else mizOutItemContents(o, it);
+	mizOutXElEnd(o, "Item");
+}
