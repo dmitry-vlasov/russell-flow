@@ -1,0 +1,372 @@
+// Transcription of ~/dev/system/base/scanner.pas — the Mizar tokeniser (M3).
+//
+// The scanner turns a .miz source line into a stream of tokens against the
+// VOCABULARY produced by the accommodator (<article>.dct). Its two halves:
+//
+//   GetPhrase  reads the next non-blank run of characters off the current
+//              line, stripping comments and enforcing the line-length limit;
+//   SliceIt    cuts that phrase into tokens by LONGEST MATCH against the
+//              symbol table, falling back to numeral / identifier.
+//
+// ★ THE SYMBOL TABLE IS A SORTED LIST AND THE SORT ORDER IS THE ALGORITHM.
+//   SliceIt walks the sorted index FORWARD while the candidate still shares a
+//   prefix with the phrase (scanner.pas 320-330), so a plain byte-wise string
+//   order (MSortedStrList / CompareStringPtr, mobjects.pas 1485) is required —
+//   any other order silently changes which symbol is found.
+//
+// Positions are 1-based, as in the Pascal; strings are indexed 1-based through
+// mizScChar so the transcription reads like the original.
+
+import ds/vector;
+import loop;
+import string;
+import math/math;
+import fs/filesystem;
+import sys/system;
+import mizar/original/errhan;
+
+export {
+	// TokenObj: one vocabulary symbol. kind is the LEXEM KIND CHARACTER as a
+	// code (mscanner's TokenKind ordinal is that same code).
+	MizScToken(kind : int, nr : int, spelling : string);
+
+	// the token as the scanner delivers it, with its position
+	MizScLexem(kind : int, nr : int, spelling : string, line : int, col : int);
+
+	MizScanner(
+		// the vocabulary, sorted by spelling, plus the index of the first
+		// entry starting with each character (fFirstChar)
+		tokens : Vector<MizScToken>,
+		firstChar : Vector<int>,
+		// identifiers, discovered as the text is scanned, numbered from 1
+		idents : Vector<MizScToken>,
+		// the source, split into lines
+		lines : Vector<string>,
+		mutable lineNr : int,          // index of the NEXT line to read
+		mutable currentLine : string,  // always ends with a space
+		mutable phrase : string,
+		mutable phraseLine : int,
+		mutable phraseCol : int,
+		mutable posLine : int,
+		mutable posCol : int,
+		tokensBuf : Vector<MizScLexem>,
+		allowed : Vector<int>,         // identifier characters (DefaultAllowed)
+		mutable lexem : MizScLexem,    // the current token
+		mutable longLines : bool,
+	);
+
+	mizScNumeral : int;      // 'N'
+	mizScIdentifier : int;   // 'I'
+	mizScErrorSymbol : int;  // '?'
+	mizScEOT : int;          // '!'
+
+	mizScLoadDct(dctPath : string) -> Pair<Vector<MizScToken>, Vector<int>>;
+	mizInitScanning(mizPath : string, dctPath : string) -> MizScanner;
+	mizScGetToken(sc : MizScanner) -> void;   // advances sc.lexem
+	mizScAllowUnderscore(sc : MizScanner, on : bool) -> void;
+}
+
+mizScNumeral      = 78;   // 'N'
+mizScIdentifier   = 73;   // 'I'
+mizScErrorSymbol  = 63;   // '?'
+mizScEOT          = 33;   // '!'
+
+mizScMaxLineLength = 80;
+mizScMaxConstInt = 2147483647;
+
+// Pascal 1-based character access; out of range yields ' ' the way a Pascal
+// string read past its end never happens here (every line ends with a space).
+mizScChar(s : string, i : int) -> int {
+	if (i >= 1 && i <= strlen(s)) getCharCodeAt(s, i - 1) else 32;
+}
+
+// DefaultAllowed (scanner.pas 93): 1 = identifier letter, 2 = digit (also a
+// letter INSIDE an identifier), 0 = not. '_' is allowed until `begin`.
+mizScDefaultAllowed() -> Vector<int> {
+	v = makeVector(256);
+	fori(0, 255, \i -> pushVector(v, 0));
+	setVectorUnsafe(v, 48, 1);                       // '0'
+	fori(49, 57, \i -> setVectorUnsafe(v, i, 2));    // '1'..'9'
+	fori(65, 90, \i -> setVectorUnsafe(v, i, 1));    // 'A'..'Z'
+	setVectorUnsafe(v, 95, 1);                       // '_'
+	fori(97, 122, \i -> setVectorUnsafe(v, i, 1));   // 'a'..'z'
+	v;
+}
+
+mizScAllowUnderscore(sc : MizScanner, on : bool) -> void {
+	setVectorUnsafe(sc.allowed, 95, if (on) 1 else 0);
+}
+
+mizScIsIdentifierLetter(sc : MizScanner, ch : int) -> bool {
+	ch >= 0 && ch < 256 && getVectorUnsafe(sc.allowed, ch) != 0;
+}
+
+// TokensCollection.LoadDct (scanner.pas 130). One line per symbol:
+//   <kind char><nr><one separator char><spelling to end of line>
+// The collection is MSortedStrList — sorted by SPELLING, byte-wise.
+mizScLoadDct(dctPath : string) -> Pair<Vector<MizScToken>, Vector<int>> {
+	content = getFileContentBinary(dctPath);
+	toks : Vector<MizScToken> = makeVector(256);
+	iter(strSplit(content, "\n"), \ln -> {
+		if (strlen(ln) >= 3) {
+			kind = getCharCodeAt(ln, 0);
+			// the number runs to the separator character
+			i = ref 1;
+			while(\ -> ^i < strlen(ln) && isDigit(substring(ln, ^i, 1)), \ -> i := ^i + 1);
+			nr = s2i(substring(ln, 1, ^i - 1));
+			spelling = substring(ln, ^i + 1, strlen(ln) - ^i - 1);
+			if (spelling != "") pushVector(toks, MizScToken(kind, nr, spelling));
+		}
+	});
+	sorted = sortCustom(vector2array(toks), \t -> t.spelling, true);
+	out : Vector<MizScToken> = makeVector(sizeVector(toks));
+	iter(sorted, \t -> pushVector(out, t));
+	// fFirstChar: for every character, the index of the first symbol starting
+	// with it, or -1
+	fc = makeVector(256);
+	fori(0, 255, \__ -> pushVector(fc, -1));
+	fori(0, sizeVector(out) - 1, \i -> {
+		c = getCharCodeAt(getVectorUnsafe(out, i).spelling, 0);
+		if (c >= 0 && c < 256 && getVectorUnsafe(fc, c) == -1) setVectorUnsafe(fc, c, i);
+	});
+	Pair(out, fc);
+}
+
+mizInitScanning(mizPath : string, dctPath : string) -> MizScanner {
+	dct = mizScLoadDct(dctPath);
+	src = getFileContentBinary(mizPath);
+	lines : Vector<string> = makeVector(1024);
+	// Pascal readln/eof: a FINAL newline does not make one more empty line
+	raw = strSplit(src, "\n");
+	rawN = if (length(raw) > 0 && raw[length(raw) - 1] == "")
+		subrange(raw, 0, length(raw) - 1) else raw;
+	iter(rawN, \l -> pushVector(lines, rtrim2(l, "\r")));
+	sc = MizScanner(dct.first, dct.second, makeVector(256), lines,
+		0, " ", "  ", 0, 0, 0, 0, makeVector(80), mizScDefaultAllowed(),
+		MizScLexem(32, 0, "", 0, 0), false);
+	mizScGetToken(sc);
+	sc;
+}
+
+// MScannObj.EndOfText (scanner.pas 506)
+mizScEndOfText(sc : MizScanner) -> bool {
+	sc.phraseCol >= strlen(sc.currentLine) && sc.lineNr >= sizeVector(sc.lines);
+}
+
+// Prohibited (scanner.pas 439): every control character and everything above
+// '~' is replaced by chr(31), which SliceIt reports as error 201.
+mizScProhibited(c : int) -> bool {
+	c < 32 || c > 126;
+}
+
+// MScannObj.GetPhrase (scanner.pas 439)
+mizScGetPhrase(sc : MizScanner) -> void {
+	sc.phraseCol ::= sc.phraseCol + strlen(sc.phrase) - 1;
+	stop = ref false;
+	while(\ -> !^stop && mizScChar(sc.currentLine, sc.phraseCol) == 32, \ -> {
+		if (sc.phraseCol >= strlen(sc.currentLine)) {
+			if (mizScEndOfText(sc)) {
+				stop := true;
+			} else {
+				sc.posLine ::= sc.posLine + 1;
+				sc.phraseLine ::= sc.phraseLine + 1;
+				raw = getVectorUnsafe(sc.lines, sc.lineNr);
+				sc.lineNr ::= sc.lineNr + 1;
+				line = ref raw;
+				pragma = strIndexOf(^line, "::$") == 0 && strContains(^line, "::$");
+				if (pragma) {
+					// a ::$ pragma line is kept whole
+					line := rtrim2(^line, " ") + " ";
+					sc.currentLine ::= ^line;
+					sc.phrase ::= ^line;
+					sc.phraseCol ::= 1;
+					sc.posCol ::= 0;
+					stop := true;
+				} else {
+					k = strIndexOf(^line, "::");
+					if (k >= 0) line := substring(^line, 0, k) + " ";
+					line := rtrim2(^line, " ");
+					// replace prohibited characters by chr(31)
+					line := strGlue(map(s2a(^line), \ch ->
+						if (mizScProhibited(ch)) fromCharCode(31) else fromCharCode(ch)), "");
+					line := ^line + " ";
+					if (!sc.longLines && strlen(^line) > mizScMaxLineLength) {
+						cut = substring(^line, 0, mizScMaxLineLength);
+						line := substring(cut, 0, mizScMaxLineLength - 2)
+							+ fromCharCode(30) + " ";
+					}
+					sc.currentLine ::= ^line;
+					sc.phraseCol ::= 0;
+					sc.posCol ::= 0;
+				}
+			}
+		}
+		if (!^stop) sc.phraseCol ::= sc.phraseCol + 1;
+	});
+	if (!^stop) {
+		i = ref sc.phraseCol;
+		go = ref true;
+		while(\ -> ^go && ^i <= strlen(sc.currentLine), \ -> {
+			if (mizScChar(sc.currentLine, ^i) == 32) go := false else i := ^i + 1;
+		});
+		sc.phrase ::= substring(sc.currentLine, sc.phraseCol - 1,
+			^i - sc.phraseCol + 1);
+	}
+}
+
+// MTokeniser.SliceIt (scanner.pas 260)
+mizScSliceIt(sc : MizScanner) -> void {
+	phrase = sc.phrase;
+	pushTok = \k : int, nr : int, sp : string, col : int ->
+		pushVector(sc.tokensBuf, MizScLexem(k, nr, sp, sc.phraseLine, col));
+
+	if (sc.phraseCol == 1 && strIndexOf(phrase, "::$") == 0) {
+		pushTok(32, 0, substring(phrase, 2, strlen(phrase) - 3), sc.phraseCol);
+		if (strIndexOf(phrase, "::$EOF") == 0) {
+			pushTok(mizScEOT, 0, phrase, sc.phraseCol);
+		}
+	} else {
+		curr = ref 1;
+		while(\ -> mizScChar(phrase, ^curr) != 32, \ -> {
+			endIdent = ref ^curr;
+			if (mizScIsIdentifierLetter(sc, mizScChar(phrase, ^endIdent))) {
+				while(\ -> ^endIdent < strlen(phrase)
+						&& mizScIsIdentifierLetter(sc, mizScChar(phrase, ^endIdent)),
+					\ -> endIdent := ^endIdent + 1);
+			}
+			identLength = ^endIdent - ^curr;
+			if (mizScChar(phrase, ^endIdent) <= 31) {
+				col = sc.phraseCol + ^endIdent - 1;
+				pushTok(mizScErrorSymbol,
+					if (mizScChar(phrase, ^endIdent) == 30) 200 else 201, "", col);
+				curr := ^endIdent + 1;
+			} else {
+				endIdent := ^endIdent - 1;
+				// 2. longest match in the symbol table
+				endOfPhrase = ref ^curr;
+				found = ref -1;
+				endOfSymbol = ref (^endOfPhrase - 1);
+				lToken = ref getVectorUnsafe(sc.firstChar, mizScChar(phrase, ^endOfPhrase));
+				endOfPhrase := ^endOfPhrase + 1;
+				if (^lToken >= 0) {
+					lIndex = ref 2;
+					go = ref true;
+					while(\ -> ^go, \ -> {
+						cand = getVectorUnsafe(sc.tokens, ^lToken).spelling;
+						if (^lIndex > strlen(cand)) {
+							found := ^lToken;
+							endOfSymbol := ^endOfPhrase - 1;
+						}
+						if (mizScChar(phrase, ^endOfPhrase) == 32) {
+							go := false;
+						} else if (^lIndex <= strlen(cand)
+							&& mizScChar(cand, ^lIndex) == mizScChar(phrase, ^endOfPhrase)) {
+							lIndex := ^lIndex + 1;
+							endOfPhrase := ^endOfPhrase + 1;
+						} else if (^lToken < sizeVector(sc.tokens) - 1) {
+							nxt = getVectorUnsafe(sc.tokens, ^lToken + 1).spelling;
+							if (substring(cand, 0, ^lIndex - 1) == substring(nxt, 0, ^lIndex - 1)) {
+								lToken := ^lToken + 1;
+							} else {
+								go := false;
+							}
+						} else {
+							go := false;
+						}
+					});
+				}
+				if (^endOfSymbol < ^endIdent) {
+					// an identifier or a numeral wins over the symbol
+					spelling = substring(phrase, ^curr - 1, identLength);
+					col = sc.phraseCol + ^endIdent - 1;
+					c0 = mizScChar(phrase, ^curr);
+					isNum = if (c0 > 48 && c0 <= 57) {
+						failed = ref false;
+						fori(1, identLength - 1, \i -> {
+							ci = mizScChar(phrase, ^curr + i);
+							if (ci < 48 || ci > 57) failed := true;
+						});
+						!^failed;
+					} else false;
+					if (isNum) {
+						if (identLength > strlen(i2s(mizScMaxConstInt))) {
+							pushTok(mizScErrorSymbol, 202, spelling, col);
+						} else {
+							num = s2i(spelling);
+							if (num > mizScMaxConstInt || num < 0) {
+								pushTok(mizScErrorSymbol, 202, spelling, col);
+							} else {
+								pushTok(mizScNumeral, num, spelling, col);
+							}
+						}
+					} else {
+						nr = mizScIdentNr(sc, spelling);
+						pushTok(mizScIdentifier, nr, spelling, col);
+					}
+					curr := ^endIdent + 1;
+				} else if (^found >= 0) {
+					ft = getVectorUnsafe(sc.tokens, ^found);
+					col = sc.phraseCol + ^endOfSymbol - 1;
+					pushTok(ft.kind, ft.nr, ft.spelling, col);
+					curr := ^endOfSymbol + 1;
+				} else {
+					col = sc.phraseCol + ^curr - 1;
+					pushTok(mizScErrorSymbol, 203,
+						substring(phrase, ^curr - 1, 1), col);
+					curr := ^curr + 1;
+				}
+			}
+		});
+	}
+}
+
+// fIdents: a sorted list; a new spelling gets Count+1 as its number, and the
+// number of the EXISTING entry is reused otherwise (scanner.pas 375-381).
+mizScIdentNr(sc : MizScanner, spelling : string) -> int {
+	lo = ref 0;
+	hi = ref sizeVector(sc.idents) - 1;
+	foundAt = ref -1;
+	while(\ -> ^lo <= ^hi && ^foundAt < 0, \ -> {
+		m = (^lo + ^hi) / 2;
+		s = getVectorUnsafe(sc.idents, m).spelling;
+		if (s < spelling) lo := m + 1
+		else if (s > spelling) hi := m - 1
+		else foundAt := m;
+	});
+	if (^foundAt >= 0) {
+		getVectorUnsafe(sc.idents, ^foundAt).nr;
+	} else {
+		nr = sizeVector(sc.idents) + 1;
+		// insert at ^lo, keeping the list sorted
+		n = sizeVector(sc.idents);
+		pushVector(sc.idents, MizScToken(mizScIdentifier, nr, spelling));
+		j = ref n;
+		while(\ -> ^j > ^lo, \ -> {
+			setVectorUnsafe(sc.idents, ^j, getVectorUnsafe(sc.idents, ^j - 1));
+			j := ^j - 1;
+		});
+		setVectorUnsafe(sc.idents, ^lo, MizScToken(mizScIdentifier, nr, spelling));
+		nr;
+	}
+}
+
+// MTokeniser.GetToken (scanner.pas 408)
+mizScGetToken(sc : MizScanner) -> void {
+	if (sc.lexem.kind != mizScEOT) {
+		if (sizeVector(sc.tokensBuf) > 0) {
+			sc.lexem ::= getVectorUnsafe(sc.tokensBuf, 0);
+			removeVector(sc.tokensBuf, 0);
+		} else {
+			mizScGetPhrase(sc);
+			if (mizScEndOfText(sc)) {
+				sc.lexem ::= MizScLexem(mizScEOT, 0, "", sc.phraseLine, sc.phraseCol + 1);
+			} else {
+				mizScSliceIt(sc);
+				if (sizeVector(sc.tokensBuf) > 0) {
+					sc.lexem ::= getVectorUnsafe(sc.tokensBuf, 0);
+					removeVector(sc.tokensBuf, 0);
+				}
+			}
+		}
+	}
+}
