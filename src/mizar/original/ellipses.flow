@@ -19,18 +19,27 @@
 // The instance list is what lets the checker close `P(0) & ... & P(3)` goals
 // by ground reasoning instead of by instantiating the universal.
 //
-// The rest of ellipses.pas (ProcessEllipses and the Ellipses* comparisons) is
-// ANALYZER-side and is not part of the checker closure.
+// The ANALYZER side (ProcessEllipses and the Ellipses* comparisons, lines
+// 40-651) follows below: it is what BUILDS a flex formula out of the two
+// written conjuncts.
 
 import ds/vector;
 import mizar/original/lexicon;
 import mizar/original/builtin;
 import mizar/original/correl;
 import mizar/original/correl_inst;
+import mizar/original/errhan;
+import mizar/original/roundcl;
+import loop;
 
 export {
 	// ExpandFlexAsTrue (ellipses.pas 711)
 	mizExpandFlexAsTrue(env : MizCorrelEnv, f : MizFrm) -> MizFrm;
+
+	// ProcessEllipses (ellipses.pas 477): NewFlexConj / NewFlexDisj. `conj` is
+	// true for `&`, false for `or`.
+	mizProcessEllipses(env : MizCorrelEnv, eh : MizErrHan, clusters : MizClusters,
+		f1 : MizFrm, f2 : MizFrm, conj : bool) -> MizFrm;
 }
 
 mizElAsVar(t : MizTrm) -> MizVarTrm {
@@ -204,5 +213,505 @@ mizExpandFlexAsFalse(env : MizCorrelEnv, f : MizFrm) -> MizFrm {
 		}
 	} else {
 		mizCopyExpFrm(f);
+	}
+}
+
+// ==================== the ANALYZER side (ellipses.pas 40-651) ==============
+
+// PP = ^TrmPtr — a POINTER INTO a term slot. The algorithm rewrites the two
+// formulas through these, so the port models a slot as its getter and setter.
+MizTrmSlot(get : () -> MizTrm, set : (MizTrm) -> void);
+
+// TTermPair (ellipses.pas 15): one aligned pair of subterms, its argument
+// pairs, and the pair it came from
+MizTermPair(
+	t1 : MizTrmSlot,
+	t2 : MizTrmSlot,
+	mutable args : Maybe<Vector<MizTermPair>>,
+	predPair : Maybe<MizTermPair>,
+);
+
+// the unit globals StartCollection / PathsCollection / ResultsCollection
+MizEll(
+	env : MizCorrelEnv,
+	eh : MizErrHan,
+	clusters : MizClusters,
+	start : Vector<MizTermPair>,
+	paths : Vector<MizTermPair>,
+	results : Vector<Maybe<MizTermPair>>,
+	mutable lociNr : int,
+);
+
+mizTrmListSlot(cell : MizTrmElem) -> MizTrmSlot {
+	MizTrmSlot(\ -> cell.trm, \t -> cell.trm ::= t);
+}
+
+// InsertTermsToStartCollection (ellipses.pas 51)
+mizEllInsertTerms(e : MizEll, l1 : MizTrmList, l2 : MizTrmList) -> void {
+	a1 = ref l1;
+	a2 = ref l2;
+	while(\ -> switch (^a1) { MizTrmElem(__, __): true; MizTrmNil(): false; }, \ -> {
+		switch (^a1) {
+			MizTrmElem(__, n1): {
+				c1 = ^a1;
+				switch (^a2) {
+					MizTrmElem(__, n2): {
+						c2 = ^a2;
+						switch (c1) {
+							MizTrmElem(__, __): switch (c2) {
+								MizTrmElem(__, __): pushVector(e.start,
+									MizTermPair(mizTrmListSlot(c1), mizTrmListSlot(c2), None(), None()));
+								MizTrmNil(): {}
+							}
+							MizTrmNil(): {}
+						}
+						a2 := n2;
+					}
+					MizTrmNil(): {}
+				}
+				a1 := n1;
+			}
+			MizTrmNil(): {}
+		}
+	});
+}
+
+// CollectTermsFromAdjectives (64)
+mizEllCollectFromAdj(e : MizEll, a1 : MizAttr, a2 : MizAttr) -> void {
+	if (a1.attrNr == a2.attrNr && a1.neg == a2.neg)
+		mizEllInsertTerms(e, a1.args, a2.args);
+}
+
+// CollectTermsFromTypes (70)
+mizEllCollectFromTypes(e : MizEll, t1 : MizTyp, t2 : MizTyp) -> void {
+	if (t1.sort == t2.sort && (t1.sort == ikTypMode || t1.sort == ikTypStruct)
+		&& t1.modNr == t2.modNr) {
+		mizEllInsertTerms(e, t1.modArgs, t2.modArgs);
+		fori(0, sizeVector(t1.lower.items) - 1, \i ->
+			if (i < sizeVector(t2.lower.items))
+				mizEllCollectFromAdj(e, getVectorUnsafe(t1.lower.items, i),
+					getVectorUnsafe(t2.lower.items, i)));
+		fori(0, sizeVector(t1.upper.items) - 1, \i ->
+			if (i < sizeVector(t2.upper.items))
+				mizEllCollectFromAdj(e, getVectorUnsafe(t1.upper.items, i),
+					getVectorUnsafe(t2.upper.items, i)));
+	}
+}
+
+// CollectTermsFromFormulas (89)
+mizEllCollectFromFrms(e : MizEll, f1 : MizFrm, f2 : MizFrm) -> void {
+	if (mizFrmSort(f1) == mizFrmSort(f2)) {
+		switch (f1) {
+			MizNegFrm(a1, __): switch (f2) {
+				MizNegFrm(a2, __): mizEllCollectFromFrms(e, a1, a2);
+				default: {}
+			}
+			MizConjFrm(c1, __): switch (f2) {
+				MizConjFrm(c2, __): fori(0, sizeVector(c1) - 1, \k ->
+					if (k < sizeVector(c2))
+						mizEllCollectFromFrms(e, getVectorUnsafe(c1, k), getVectorUnsafe(c2, k)));
+				default: {}
+			}
+			MizQualFrm(__, ty1, __): switch (f2) {
+				MizQualFrm(__, ty2, __): {
+					pushVector(e.start, MizTermPair(
+						MizTrmSlot(\ -> f1.trm, \t -> f1.trm ::= t),
+						MizTrmSlot(\ -> f2.trm, \t -> f2.trm ::= t), None(), None()));
+					mizEllCollectFromTypes(e, ty1, ty2);
+				}
+				default: {}
+			}
+			MizPredFrm(__, __, a1, __): switch (f2) {
+				MizPredFrm(__, __, a2, __): mizEllInsertTerms(e, a1, a2);
+				default: {}
+			}
+			MizLocPredFrm(__, a1, x1, __): switch (f2) {
+				MizLocPredFrm(__, a2, x2, __): {
+					mizEllInsertTerms(e, a1, a2);
+					mizEllCollectFromFrms(e, x1, x2);
+				}
+				default: {}
+			}
+			MizUnivFrm(__, __, q1, s1, __): switch (f2) {
+				MizUnivFrm(__, __, q2, s2, __): {
+					mizEllCollectFromTypes(e, q1, q2);
+					mizEllCollectFromFrms(e, s1, s2);
+				}
+				default: {}
+			}
+			MizFlexFrm(__, l1, r1, __, __, __, __): switch (f2) {
+				MizFlexFrm(__, l2, r2, __, __, __, __): {
+					mizEllCollectFromFrms(e, l1, l2);
+					mizEllCollectFromFrms(e, r1, r2);
+				}
+				default: {}
+			}
+			MizUniqFrm(__): {}     // verum / thesis / error
+			MizBinFrm(__, __, __, __): mizRunTimeError(2610);
+		}
+	}
+}
+
+// PrepareSubtermsCollection (147)
+mizEllPrepareSubterms(e : MizEll, pair : MizTermPair) -> void {
+	t1 = pair.t1.get();
+	t2 = pair.t2.get();
+	s1 = mizTrmSort(t1);
+	collectArgs = \l1 : MizTrmList, l2 : MizTrmList -> {
+		v : Vector<MizTermPair> = makeVector(8);
+		a1 = ref l1;
+		a2 = ref l2;
+		while(\ -> switch (^a1) { MizTrmElem(__, __): true; MizTrmNil(): false; }, \ -> {
+			switch (^a1) {
+				MizTrmElem(__, n1): {
+					c1 = ^a1;
+					switch (^a2) {
+						MizTrmElem(__, n2): {
+							c2 = ^a2;
+							switch (c1) {
+								MizTrmElem(__, __): switch (c2) {
+									MizTrmElem(__, __): pushVector(v, MizTermPair(
+										mizTrmListSlot(c1), mizTrmListSlot(c2), None(), Some(pair)));
+									MizTrmNil(): {}
+								}
+								MizTrmNil(): {}
+							}
+							a2 := n2;
+						}
+						MizTrmNil(): {}
+					}
+					a1 := n1;
+				}
+				MizTrmNil(): {}
+			}
+		});
+		pair.args ::= Some(v);
+		iterVector(v, \p -> mizEllPrepareSubterms(e, p));
+	};
+	if (s1 == ikTrmLocus || s1 == ikTrmBound || s1 == ikTrmConstant
+		|| s1 == ikTrmInfConst || s1 == ikTrmEqConst || s1 == ikTrmFreeVar
+		|| s1 == ikTrmLambdaVar || s1 == ikTrmNumeral || s1 == ikTrmFraenkel
+		|| s1 == ikTrmIt || s1 == ikError) {
+		{}
+	} else if (s1 == ikTrmChoice) {
+		if (s1 == mizTrmSort(t2)) switch (t1) {
+			MizChoiceTrm(ty1, __, __): switch (t2) {
+				MizChoiceTrm(ty2, __, __):
+					if (ty1.modNr == ty2.modNr) collectArgs(ty1.modArgs, ty2.modArgs);
+				default: {}
+			}
+			default: {}
+		}
+	} else if (s1 == ikTrmSchFunc || s1 == ikTrmAggreg || s1 == ikTrmPrivFunc
+		|| s1 == ikTrmSelector || s1 == ikTrmFunctor) {
+		if (s1 == mizTrmSort(t2)) {
+			n1 = mizEllFuncNr(t1);
+			n2 = mizEllFuncNr(t2);
+			if (n1 == n2) collectArgs(mizEllFuncArgs(t1), mizEllFuncArgs(t2));
+		}
+	} else {
+		mizRunTimeError(2150);
+	}
+}
+
+mizEllFuncNr(t : MizTrm) -> int {
+	switch (t) {
+		MizFuncTrm(__, funcNr, __, __, __): funcNr;
+		MizPrivFuncTrm(funcNr, __, __, __, __): funcNr;
+		default: 0;
+	}
+}
+
+mizEllFuncArgs(t : MizTrm) -> MizTrmList {
+	switch (t) {
+		MizFuncTrm(__, __, args, __, __): args;
+		MizPrivFuncTrm(__, args, __, __, __): args;
+		default: MizTrmNil();
+	}
+}
+
+// PreparePathsCollection (196)
+mizEllPreparePaths(e : MizEll, coll : Vector<MizTermPair>) -> void {
+	iterVector(coll, \p -> switch (p.args) {
+		Some(sub): mizEllPreparePaths(e, sub);
+		None(): if (!mizStrictEqTrm(e.env, p.t1.get(), p.t2.get()))
+			pushVector(e.paths, p);
+	});
+}
+
+// PrepareStructure (209)
+mizEllPrepareStructure(e : MizEll) -> void {
+	iterVector(e.start, \p -> mizEllPrepareSubterms(e, p));
+	mizEllPreparePaths(e, e.start);
+	fori(0, sizeVector(e.paths) - 1, \__ -> pushVector(e.results, None()));
+}
+
+// NewNaturalCluster (380) / HasNaturalAdjective (388)
+mizEllNaturalCluster(env : MizCorrelEnv) -> MizAttrColl {
+	c = mizNewEmptyCluster();
+	mizAttrCollInsert(env, c, MizAttr(1, mizBuiltIn(env.builtIn, rqNatural),
+		MizTrmNil(), false, 0));
+	c;
+}
+
+mizEllHasNatural(e : MizEll, t : MizTrm) -> bool {
+	mizAttrCollIsSubsetOf(e.env, mizEllNaturalCluster(e.env),
+		mizGetTrmType(e.env, t).upper, \x, y -> mizStrictEqAttr(e.env, x, y));
+}
+
+// ComparePairs (393)
+mizEllComparePairs(e : MizEll, p1 : MizTermPair, p2 : MizTermPair) -> bool {
+	if (!(mizEllHasNatural(e, p1.t1.get()) && mizEllHasNatural(e, p1.t2.get())
+		&& mizEllHasNatural(e, p2.t1.get()) && mizEllHasNatural(e, p2.t2.get()))) false
+	else mizStrictEqTrm(e.env, p1.t1.get(), p2.t1.get())
+		&& mizStrictEqTrm(e.env, p1.t2.get(), p2.t2.get());
+}
+
+// FindDifference (402) — walk up each path until every one of them agrees on
+// the same difference
+mizEllFindDifference(e : MizEll) -> Maybe<MizTermPair> {
+	if (sizeVector(e.paths) == 0) None()
+	else {
+		lPair0 : ref Maybe<MizTermPair> = ref Some(getVectorUnsafe(e.paths, 0));
+		setVectorUnsafe(e.results, 0, ^lPair0);
+		ok = ref true;
+		done = ref false;
+		while(\ -> !^done, \ -> {
+			switch (^lPair0) {
+				None(): done := true;
+				Some(p0): {
+					ok := true;
+					a = ref 1;
+					while(\ -> ^ok && ^a < sizeVector(e.paths), \ -> {
+						ok := false;
+						lPair : ref Maybe<MizTermPair> = ref Some(getVectorUnsafe(e.paths, ^a));
+						inner = ref true;
+						while(\ -> ^inner, \ -> {
+							switch (^lPair) {
+								None(): inner := false;
+								Some(p): {
+									if (mizEllComparePairs(e, p0, p)) {
+										setVectorUnsafe(e.results, ^a, Some(p));
+										ok := true;
+										inner := false;
+									} else lPair := p.predPair;
+								}
+							}
+						});
+						a := ^a + 1;
+					});
+					if (^ok) done := true
+					else {
+						lPair0 := p0.predPair;
+						setVectorUnsafe(e.results, 0, ^lPair0);
+					}
+				}
+			}
+		});
+		^lPair0;
+	}
+}
+
+// EllipsesEqAttr (264) / EllipsesEqTyp (270) / EllipsesEqFrm (284)
+mizEllipsesEqAttr(a1 : MizAttr, a2 : MizAttr) -> bool {
+	a1.attrNr == a2.attrNr && a1.neg == a2.neg;
+}
+
+mizEllipsesEqTyp(t1 : MizTyp, t2 : MizTyp) -> bool {
+	if (t1.sort != t2.sort) false
+	else if (t1.sort == ikTypMode || t1.sort == ikTypStruct)
+		t1.modNr == t2.modNr && mizEqualClusters(t1, t2, mizEllipsesEqAttr)
+	else if (t1.sort == ikError) true
+	else { mizRunTimeError(2004); false }
+}
+
+mizEllFlatConj(v : Vector<MizFrm>) -> Vector<MizFrm> {
+	out : Vector<MizFrm> = makeVector(sizeVector(v));
+	iterVector(v, \f0 -> {
+		f = mizSkipLocPred(f0);
+		switch (f) {
+			MizConjFrm(inner, __): iterVector(inner, \g -> pushVector(out, g));
+			default: pushVector(out, f);
+		}
+	});
+	out;
+}
+
+mizEllipsesEqFrm(env : MizCorrelEnv, g1 : MizFrm, g2 : MizFrm) -> bool {
+	f1 = mizSkipLocPred(g1);
+	f2 = mizSkipLocPred(g2);
+	if (mizFrmSort(f1) != mizFrmSort(f2)) false
+	else switch (f1) {
+		MizUniqFrm(__): true;                     // verum / thesis / error
+		MizNegFrm(a1, __): switch (f2) {
+			MizNegFrm(a2, __): mizEllipsesEqFrm(env, a1, a2);
+			default: false;
+		}
+		MizQualFrm(__, ty1, __): switch (f2) {
+			MizQualFrm(__, ty2, __): mizEllipsesEqTyp(ty1, ty2);
+			default: false;
+		}
+		MizConjFrm(c1, __): switch (f2) {
+			MizConjFrm(c2, __): {
+				if (sizeVector(c1) == sizeVector(c2)) {
+					r = ref true;
+					fori(0, sizeVector(c1) - 1, \k -> if (^r)
+						r := mizEllipsesEqFrm(env, getVectorUnsafe(c1, k), getVectorUnsafe(c2, k)));
+					^r;
+				} else {
+					l1 = mizEllFlatConj(c1);
+					l2 = mizEllFlatConj(c2);
+					if (sizeVector(l1) != sizeVector(l2)) false
+					else {
+						r = ref true;
+						fori(0, sizeVector(l1) - 1, \k -> if (^r)
+							r := mizEllipsesEqFrm(env, getVectorUnsafe(l1, k), getVectorUnsafe(l2, k)));
+						^r;
+					}
+				}
+			}
+			default: false;
+		}
+		MizPredFrm(__, p1, __, __): switch (f2) {
+			MizPredFrm(__, p2, __, __): p1 == p2;
+			default: false;
+		}
+		MizLocPredFrm(p1, __, __, __): switch (f2) {
+			MizLocPredFrm(p2, __, __, __): p1 == p2;
+			default: false;
+		}
+		MizUnivFrm(__, __, q1, s1, __): switch (f2) {
+			MizUnivFrm(__, __, q2, s2, __):
+				mizEllipsesEqTyp(q1, q2) && mizEllipsesEqFrm(env, s1, s2);
+			default: false;
+		}
+		MizFlexFrm(__, l1, r1, __, __, __, __): switch (f2) {
+			MizFlexFrm(__, l2, r2, __, __, __, __):
+				mizEllipsesEqFrm(env, l1, l2) && mizEllipsesEqFrm(env, r1, r2);
+			default: false;
+		}
+		MizBinFrm(__, __, __, __): { mizRunTimeError(2047); false }
+	}
+}
+
+// StrictEqTrm / StrictEqFrm (correl.pas 3814 / 3851) — EqTrm/EqFrm with
+// StrictEqAttr comparing the clusters
+mizStrictEqTyp(env : MizCorrelEnv, a : MizTyp, b : MizTyp) -> bool {
+	if (a.sort != b.sort) false
+	else if (a.sort == ikError) true
+	else mizEqualClusters(a, b, \x, y -> mizStrictEqAttr(env, x, y))
+		&& mizEqTyp(env, a, b);
+}
+
+mizStrictEqTrm(env : MizCorrelEnv, a : MizTrm, b : MizTrm) -> bool {
+	mizEqTrm(env, a, b);
+}
+
+mizStrictEqFrm(env : MizCorrelEnv, a : MizFrm, b : MizFrm) -> bool {
+	mizEqFrm(env, a, b);
+}
+
+// ProcessEllipses (477)
+mizProcessEllipses(env : MizCorrelEnv, eh : MizErrHan, clusters : MizClusters,
+		f1 : MizFrm, f2 : MizFrm, conj : bool) -> MizFrm {
+	pos = eh.curPos;
+	if (mizFrmSort(f1) == ikError || mizFrmSort(f2) == ikError) {
+		mizError(eh, pos, 280);
+		mizNewIncorFrm();
+	} else if (mizBuiltIn(env.builtIn, rqNatural) == 0) {
+		mizError(eh, pos, 281);
+		mizNewIncorFrm();
+	} else if (mizBuiltIn(env.builtIn, rqLessOrEqual) == 0) {
+		mizError(eh, pos, 282);
+		mizNewIncorFrm();
+	} else {
+		lFrm1 = mizCopyFrm(f1);
+		lFrm2 = mizCopyFrm(f2);
+		if (mizStrictEqFrm(env, lFrm1, lFrm2)) {
+			mizError(eh, pos, 283);
+			mizNewIncorFrm();
+		} else if (!mizEllipsesEqFrm(env, lFrm1, lFrm2)) {
+			mizError(eh, pos, 284);
+			mizNewIncorFrm();
+		} else {
+			e = MizEll(env, eh, clusters, makeVector(8), makeVector(64),
+				makeVector(64), 0);
+			mizEllCollectFromFrms(e, lFrm1, lFrm2);
+			mizEllPrepareStructure(e);
+			switch (mizEllFindDifference(e)) {
+				None(): { mizError(eh, pos, 285); mizNewIncorFrm() }
+				Some(pair): {
+					if (!mizEllHasNatural(e, pair.t1.get())) {
+						mizError(eh, pos, 286);
+						mizNewIncorFrm();
+					} else if (!mizEllHasNatural(e, pair.t2.get())) {
+						mizError(eh, pos, 287);
+						mizNewIncorFrm();
+					} else {
+						lLeftGuardTrm = mizCopyTrm(pair.t1.get());
+						lRightGuardTrm = mizCopyTrm(pair.t2.get());
+						e.lociNr ::= env.boundVarNbr + 1;
+						iterVector(e.results, \m -> switch (m) {
+							None(): {}
+							Some(p): {
+								p.t1.set(mizNewVarTrm(ikTrmLocus, e.lociNr));
+								p.t2.set(mizNewVarTrm(ikTrmLocus, e.lociNr));
+							}
+						});
+						nat = mizEllNaturalCluster(env);
+						lTyp = mizNewStandardTyp(ikTypMode, nat,
+							mizEllNaturalCluster(env), mizBuiltIn(env.builtIn, rqSetMode),
+							MizTrmNil());
+						mizTypRoundUp(env, clusters, lTyp);
+						leftList = MizTrmElem(lLeftGuardTrm,
+							MizTrmElem(mizNewVarTrm(ikTrmLocus, e.lociNr), MizTrmNil()));
+						rightList = MizTrmElem(mizNewVarTrm(ikTrmLocus, e.lociNr),
+							MizTrmElem(lRightGuardTrm, MizTrmNil()));
+						lLeftGuardFrm = MizPredFrm(ikFrmPred,
+							mizBuiltIn(env.builtIn, rqLessOrEqual), leftList, 0);
+						lRightGuardFrm = MizPredFrm(ikFrmPred,
+							mizBuiltIn(env.builtIn, rqLessOrEqual), rightList, 0);
+						// NewExpansion: for x st g1 & g2 holds F
+						mkExpansion = \body -> {
+							ex = mizNewUniv(lTyp, mizNewNeg(mizNewConj(
+								mizNewConj(mizCopyFrm(lLeftGuardFrm), mizCopyFrm(lRightGuardFrm)),
+								body)));
+							// IncBoundVar then LociToBoundVar, in that order
+							mizWithinFrm(mizMakeWithin(\__, t -> {
+								switch (t) {
+									MizVarTrm(srt, varNr, __, __): {
+										if (srt == ikTrmBound && varNr >= e.lociNr)
+											t.varNr ::= varNr + 1;
+										t;
+									}
+									default: t;
+								}
+							}), ex);
+							mizWithinFrm(mizMakeWithin(\__, t -> {
+								switch (t) {
+									MizVarTrm(srt, __, __, __): {
+										if (srt == ikTrmLocus) {
+											t.sort ::= ikTrmBound;
+											t.varNr ::= e.lociNr;
+										}
+										t;
+									}
+									default: t;
+								}
+							}), ex);
+							ex;
+						};
+						if (conj) {
+							MizFlexFrm(ikFrmFlexConj, f1, f2, lLeftGuardTrm,
+								lRightGuardTrm, mkExpansion(mizNewNeg(lFrm1)), 0);
+						} else {
+							mizNewNeg(MizFlexFrm(ikFrmFlexConj, mizNewNeg(f1),
+								mizNewNeg(f2), lLeftGuardTrm, lRightGuardTrm,
+								mkExpansion(lFrm1), 0));
+						}
+					}
+				}
+			}
+		}
 	}
 }
