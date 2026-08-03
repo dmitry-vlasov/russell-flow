@@ -1,0 +1,1293 @@
+// Transcription of ~/dev/system/kernel/trans2analyzer.pas (Transfer2AnalyserObj
+// and its Store* procedures) over the SECOND walker of base/block_and_item.pas
+// (BlockAndItemObj, lines 240-650 — NOT the ProcessingArticleObj one that M3's
+// msm.flow uses).
+//
+// The step turns the MSM tree into the `<article>.par` byte stream the analyzer
+// reads, and the `<article>.ref` reference counts. `.par` is an InFile/InWord
+// token format (kernel/inout.pas): one KIND CHARACTER per node, a decimal
+// number after it when the character is a capital letter, and positions written
+// as two decimal numbers. Bytes above 127 are ordinary kind characters, so the
+// stream is written with setFileContentBytes, never as text.
+//
+// The virtual dispatch is flattened as in M3 slice 3: BlockAndItemObj has
+// exactly one descendant here, so `Process_X` calls become plain functions and
+// the overridden method is the only body.
+
+import ds/vector;
+import string;
+import loop;
+
+import mizar/original/errhan;
+import mizar/original/lexicon;
+import mizar/original/formats;
+import mizar/original/limits;
+import mizar/original/mobjects;
+import mizar/original/pragmas;
+import mizar/original/wsm;
+
+export {
+	// mobjects.pas BinIntFunc — a SORTED map (x1, x2) -> y, deduped, ordered by
+	// CompareIntPairs. TheoReferNbr / DefReferNbr / SchReferNbr are these.
+	MizIntTriplet(x1 : int, x2 : int, mutable y : int);
+
+	MizT2A(
+		eh : MizErrHan,
+		formats : MizFormats,
+		pragmas : MizPragmas,
+		out : Vector<string>,             // the `.par` bytes
+		mutable constVarNbr : int,        // gConstVarNbr
+		stack : Vector<int>,              // Transfer2AnalyserBlockObj.nConstVarNbr
+		theoRefer : Vector<MizIntTriplet>,
+		defRefer : Vector<MizIntTriplet>,
+		schRefer : Vector<MizIntTriplet>,
+		// BlockAndItemObj.nBlockPtr — nil at the text-proper level
+		mutable inBlock : bool,
+	);
+
+	// procedure Transfer2Analyzer: build the state, walk the article, finish.
+	mizTransfer2Analyzer(tp : MizWsBlock, eh : MizErrHan, formats : MizFormats,
+		pragmas : MizPragmas) -> MizT2A;
+
+	mizT2AParContent(a : MizT2A) -> string;
+	mizT2ARefContent(a : MizT2A) -> string;
+}
+
+// ------------------------------------------------------- the out stream ----
+
+// inout.pas Capital: only 'A'..'Z' carry a number after the kind character.
+mizT2ACapital(c : int) -> bool { c >= 65 && c <= 90 }
+
+mizT2AOutChar(a : MizT2A, c : int) -> void {
+	pushVector(a.out, fromCharCode(c));
+}
+
+mizT2AOutString(a : MizT2A, s : string) -> void {
+	pushVector(a.out, s);
+}
+
+mizT2AOutInt(a : MizT2A, i : int) -> void {
+	pushVector(a.out, i2s(i));
+	pushVector(a.out, " ");
+}
+
+mizT2AOutWord(a : MizT2A, c : int, i : int) -> void {
+	mizT2AOutChar(a, c);
+	if (mizT2ACapital(c)) mizT2AOutInt(a, i);
+}
+
+mizT2AOutPos(a : MizT2A, p : MizPos) -> void {
+	mizT2AOutInt(a, p.line);
+	mizT2AOutInt(a, p.col);
+}
+
+mizT2AOutCharAndPos(a : MizT2A, c : int, p : MizPos) -> void {
+	mizT2AOutChar(a, c);
+	mizT2AOutPos(a, p);
+}
+
+mizT2AOutWordAndPos(a : MizT2A, c : int, i : int, p : MizPos) -> void {
+	mizT2AOutWord(a, c, i);
+	mizT2AOutPos(a, p);
+}
+
+mizT2AOutBool(a : MizT2A, b : bool) -> void {
+	mizT2AOutChar(a, if (b) 43 else 45);   // '+' / '-'
+}
+
+mizT2AOutNewLine(a : MizT2A) -> void { mizT2AOutChar(a, 10); }
+
+// ------------------------------------------------------------ BinIntFunc ---
+
+// BinIntFunc.Search (mobjects.pas 3016): binary search by CompareIntPairs.
+mizBinSearch(v : Vector<MizIntTriplet>, x1 : int, x2 : int) -> Pair<bool, int> {
+	lo = ref 0;
+	hi = ref sizeVector(v) - 1;
+	found = ref false;
+	while(\ -> ^lo <= ^hi, \ -> {
+		i = (^lo + ^hi) / 2;
+		t = getVectorUnsafe(v, i);
+		c = mizCompareIntPairs(t.x1, t.x2, x1, x2);
+		if (c < 0) lo := i + 1
+		else {
+			hi := i - 1;
+			if (c == 0) { found := true; lo := i; }
+		}
+	});
+	Pair(^found, ^lo);
+}
+
+// BinIntFunc.Up (3074): increment, or insert with 1.
+mizBinUp(v : Vector<MizIntTriplet>, x1 : int, x2 : int) -> void {
+	p = mizBinSearch(v, x1, x2);
+	if (p.first) {
+		t = getVectorUnsafe(v, p.second);
+		t.y ::= t.y + 1;
+	} else {
+		mizVectorAtInsert(v, p.second, MizIntTriplet(x1, x2, 1));
+	}
+}
+
+// BinIntFunc.Assign (3060)
+mizBinAssign(v : Vector<MizIntTriplet>, x1 : int, x2 : int, y : int) -> void {
+	p = mizBinSearch(v, x1, x2);
+	if (!p.first) mizVectorAtInsert(v, p.second, MizIntTriplet(x1, x2, y));
+}
+
+// ------------------------------------------------------------- the store ---
+
+mizT2AStoreAdjective(a : MizT2A, neg : bool, ad : MizWsAdjExpr) -> void {
+	switch (ad) {
+		MizWsAdjective(pos, symbol, __, args): {
+			mizT2AOutCharAndPos(a, 46, pos);          // '.'
+			mizT2AOutChar(a, if (neg) 45 else 43);    // '-' / '+'
+			fmt = mizLookUpPrefixFormat(a.formats, 86, symbol, length(args) + 1);  // 'V'
+			mizT2AOutWord(a, ikAtrPos, fmt);
+			mizT2AStoreTermList(a, args);
+		}
+		MizWsNegatedAdjective(__, arg): mizT2AStoreAdjective(a, true, arg);
+	}
+}
+
+mizT2AStoreAdjectiveList(a : MizT2A, cluster : [MizWsAdjExpr]) -> void {
+	iter(cluster, \ad -> mizT2AStoreAdjective(a, false, ad));
+	mizT2AOutChar(a, 59);   // ';'
+}
+
+mizT2AStoreType(a : MizT2A, t : MizWsType) -> void {
+	mizT2AOutPos(a, mizWsTypePos(t));
+	switch (t) {
+		MizWsStandardType(__, modeSymbol, args): {
+			mizT2AOutChar(a, ikTypMode);
+			mizT2AOutInt(a, mizLookUpPrefixFormat(a.formats, 77, modeSymbol, length(args)));  // 'M'
+			mizT2AStoreTermList(a, args);
+		}
+		MizWsStructType(__, structSymbol, args): {
+			mizT2AOutChar(a, ikTypStruct);
+			mizT2AOutInt(a, mizLookUpPrefixFormat(a.formats, 76, structSymbol, length(args))); // 'L'
+			mizT2AStoreTermList(a, args);
+		}
+		MizWsClusteredType(__, cluster, typ): {
+			mizT2AOutChar(a, ikExpAttrTyp);
+			mizT2AStoreAdjectiveList(a, cluster);
+			mizT2AStoreType(a, typ);
+		}
+		MizWsErrorType(__): mizT2AOutChar(a, ikError);
+		// wsReservedDscrType has no case in StoreType — only the position is
+		// written. StoreResDesType is used wherever one really occurs.
+		MizWsReservedDscrType(__, __, __, __): {}
+	}
+}
+
+mizT2AStoreResDesType(a : MizT2A, t : MizWsReservedDscrType) -> void {
+	mizT2AOutPos(a, t.pos);
+	mizT2AOutChar(a, ikExpResDes);
+	mizT2AOutInt(a, t.resTypeNr);
+	mizT2AOutWord(a, 73, t.ident);   // 'I'
+	iterVector(t.resSubst, \sb -> {
+		k = sb.y1;
+		if (k == mizVkBound || k == mizVkConstant || k == mizVkDefConstant || sb.y2 > 0) {
+			mizT2AOutChar(a, 46);   // '.'
+			if (k == mizVkFreeVar || k == mizVkReservedVar) mizT2AOutChar(a, ikTrmFreeVar)
+			else if (k == mizVkBound) mizT2AOutChar(a, ikTrmBound)
+			else if (k == mizVkConstant || k == mizVkDefConstant) mizT2AOutChar(a, ikTrmConstant);
+			mizT2AOutInt(a, sb.y2);
+		}
+	});
+	mizT2AOutChar(a, 59);   // ';'
+}
+
+mizT2AResDesOf(t : MizWsType) -> MizWsReservedDscrType {
+	switch (t) {
+		MizWsReservedDscrType(__, __, __, __): t;
+		default: { mizRunTimeError(2842); MizWsReservedDscrType(mizZeroPos, 0, 0, makeVector(1)) }
+	}
+}
+
+mizT2AStoreVariableSegment(a : MizT2A, s : MizWsSegment) -> void {
+	switch (s) {
+		MizWsImplSegment(__, ident, resType): {
+			mizT2AOutWord(a, 78, 1);            // 'N'
+			mizT2AOutWord(a, 73, ident.ident);  // 'I'
+			switch (resType) {
+				None(): mizRunTimeError(2843);
+				Some(rt): mizT2AStoreResDesType(a, rt);
+			}
+		}
+		MizWsExplSegment(__, idents, typ): {
+			mizT2AOutWord(a, 78, length(idents));   // 'N'
+			iter(idents, \v -> mizT2AOutWord(a, 73, v.ident));
+			mizT2AStoreType(a, typ);
+		}
+	}
+}
+
+mizT2AStoreTermListElements(a : MizT2A, ts : [MizWsTerm]) -> void {
+	iter(ts, \t -> { mizT2AOutChar(a, 46); mizT2AStoreTerm(a, t); });
+}
+
+mizT2AStoreTermList(a : MizT2A, ts : [MizWsTerm]) -> void {
+	mizT2AStoreTermListElements(a, ts);
+	mizT2AOutChar(a, 59);   // ';'
+}
+
+mizT2AStoreTypeList(a : MizT2A, ts : [MizWsType]) -> void {
+	iter(ts, \t -> { mizT2AOutChar(a, 46); mizT2AStoreType(a, t); });
+	mizT2AOutChar(a, 59);   // ';'
+}
+
+mizT2AStoreFormula(a : MizT2A, f : MizWsFormula) -> void {
+	mizT2AOutPos(a, mizWsFormulaPos(f));
+	switch (f) {
+		MizWsNegatedFormula(__, arg): {
+			isBot = switch (arg) { MizWsContradiction(__): true; default: false; };
+			if (isBot) mizT2AOutChar(a, ikFrmVerum)
+			else {
+				mizT2AOutChar(a, ikFrmNeg);
+				mizT2AStoreFormula(a, arg);
+			}
+		}
+		MizWsConjunctiveFormula(__, l, r): {
+			mizT2AOutChar(a, ikFrmConj); mizT2AStoreFormula(a, l); mizT2AStoreFormula(a, r);
+		}
+		MizWsDisjunctiveFormula(__, l, r): {
+			mizT2AOutChar(a, ikFrmOr); mizT2AStoreFormula(a, l); mizT2AStoreFormula(a, r);
+		}
+		MizWsConditionalFormula(__, l, r): {
+			mizT2AOutChar(a, ikFrmImplies); mizT2AStoreFormula(a, l); mizT2AStoreFormula(a, r);
+		}
+		MizWsBiconditionalFormula(__, l, r): {
+			mizT2AOutChar(a, ikFrmIff); mizT2AStoreFormula(a, l); mizT2AStoreFormula(a, r);
+		}
+		MizWsFlexaryConjunctiveFormula(__, l, r): {
+			mizT2AOutChar(a, ikFrmFlexConj); mizT2AStoreFormula(a, l); mizT2AStoreFormula(a, r);
+		}
+		MizWsFlexaryDisjunctiveFormula(__, l, r): {
+			mizT2AOutChar(a, ikFrmFlexDisj); mizT2AStoreFormula(a, l); mizT2AStoreFormula(a, r);
+		}
+		MizWsPredicativeFormula(__, predNr, leftArgs, rightArgs): {
+			mizT2AOutChar(a, ikFrmPred);
+			mizT2AOutInt(a, mizLookUpPredFormat(a.formats, predNr, length(leftArgs), length(rightArgs)));
+			mizT2AStoreTermListElements(a, leftArgs);
+			mizT2AStoreTermList(a, rightArgs);
+		}
+		MizWsMultiPredicativeFormula(__, scraps): mizT2AStoreMultiPredicative(a, scraps);
+		MizWsPrivatePredicateFormula(__, __, args, predKind, __, predNr): {
+			if (predKind == mizVkSchematicPred) mizT2AOutChar(a, ikFrmSchPred)
+			else mizT2AOutChar(a, ikFrmPrivPred);
+			mizT2AOutInt(a, predNr);
+			mizT2AStoreTermList(a, args);
+		}
+		MizWsAttributiveFormula(__, subject, adjectives): {
+			mizT2AOutChar(a, ikFrmAttr);
+			mizT2AStoreTerm(a, subject);
+			mizT2AStoreAdjectiveList(a, adjectives);
+		}
+		MizWsQualifyingFormula(__, subject, typ): {
+			mizT2AOutChar(a, ikFrmQual);
+			mizT2AStoreTerm(a, subject);
+			mizT2AStoreType(a, typ);
+		}
+		MizWsUniversalFormula(__, segment, scope): {
+			mizT2AOutChar(a, ikFrmUniv);
+			mizT2AStoreVariableSegment(a, segment);
+			mizT2AStoreFormula(a, scope);
+		}
+		MizWsExistentialFormula(__, segment, scope): {
+			mizT2AOutChar(a, ikFrmEx);
+			mizT2AStoreVariableSegment(a, segment);
+			mizT2AStoreFormula(a, scope);
+		}
+		MizWsContradiction(pos): {
+			mizT2AOutChar(a, ikFrmNeg);
+			mizT2AOutPos(a, pos);
+			mizT2AOutChar(a, ikFrmVerum);
+		}
+		MizWsThesis(__): mizT2AOutChar(a, ikFrmThesis);
+		MizWsErrorFormula(__): mizT2AOutChar(a, ikError);
+		// no case in StoreFormula — only the position is written
+		MizWsRightSideOfPredicativeFormula(__, __, __): {}
+	}
+}
+
+// the wsMultiPredicativeFormula branch of StoreFormula (299-334)
+mizT2AStoreMultiPredicative(a : MizT2A, scraps : [MizWsFormula]) -> void {
+	mizT2AOutChar(a, ikMultFrmPred);
+	first = scraps[0];
+	mizT2AStoreFormula(a, first);
+	head = switch (first) {
+		MizWsNegatedFormula(__, arg): arg;
+		default: first;
+	};
+	leftCount = ref switch (head) {
+		MizWsPredicativeFormula(__, __, __, rightArgs): length(rightArgs);
+		default: 0;
+	};
+	mizT2AOutChar(a, 76);   // 'L'
+	mizT2AOutInt(a, ^leftCount);
+	fori(1, length(scraps) - 1, \i -> {
+		mizT2AOutChar(a, 46);   // '.'
+		scrap = scraps[i];
+		inner = switch (scrap) {
+			MizWsNegatedFormula(npos, arg): {
+				mizT2AOutPos(a, npos);
+				mizT2AOutChar(a, ikFrmNeg);
+				arg;
+			}
+			default: scrap;
+		};
+		switch (inner) {
+			MizWsRightSideOfPredicativeFormula(rpos, predNr, rightArgs): {
+				mizT2AOutPos(a, rpos);
+				mizT2AOutChar(a, ikRSFrmPred);
+				mizT2AOutInt(a, mizLookUpPredFormat(a.formats, predNr, ^leftCount, length(rightArgs)));
+				mizT2AStoreTermList(a, rightArgs);
+				leftCount := length(rightArgs);
+			}
+			default: {}
+		}
+	});
+	mizT2AOutChar(a, 59);   // ';'
+}
+
+mizT2AStoreTerm(a : MizT2A, t : MizWsTerm) -> void {
+	switch (t) {
+		MizWsPlaceholderTerm(__, locusNr): {
+			mizT2AOutChar(a, ikTrmLocus);
+			mizT2AOutInt(a, locusNr);
+		}
+		MizWsSimpleTerm(__, __, __, varKind, __, varNr): {
+			if (varKind == mizVkFreeVar) mizT2AOutChar(a, ikTrmLocus)
+			else if (varKind == mizVkReservedVar) mizT2AOutChar(a, ikTrmFreeVar)
+			else if (varKind == mizVkBound) mizT2AOutChar(a, ikTrmBound)
+			else if (varKind == mizVkConstant || varKind == mizVkDefConstant)
+				mizT2AOutChar(a, ikTrmConstant);
+			mizT2AOutInt(a, varNr);
+		}
+		MizWsNumeralTerm(__, value): {
+			mizT2AOutChar(a, ikTrmNumeral);
+			mizT2AOutWord(a, ikTrmNumeral, value);
+		}
+		MizWsInfixTerm(pos, functorSymbol, leftArgs, rightArgs): {
+			mizT2AOutChar(a, ikTrmFunctor);
+			mizT2AOutInt(a, mizLookUpFuncFormat(a.formats, functorSymbol,
+				length(leftArgs), length(rightArgs)));
+			mizT2AOutPos(a, pos);
+			mizT2AStoreTermListElements(a, leftArgs);
+			mizT2AStoreTermList(a, rightArgs);
+		}
+		MizWsCircumfixTerm(pos, leftBracket, rightBracket, args): {
+			mizT2AOutChar(a, ikTrmFunctor);
+			mizT2AOutInt(a, mizLookUpBracketFormat(a.formats, leftBracket, rightBracket,
+				length(args), 0, 0));
+			mizT2AOutPos(a, pos);
+			mizT2AStoreTermList(a, args);
+		}
+		MizWsPrivateFunctorTerm(pos, __, args, funcKind, __, funcNr): {
+			if (funcKind == mizVkSchematicFunc) mizT2AOutChar(a, ikTrmSchFunc)
+			else mizT2AOutChar(a, ikTrmPrivFunc);
+			mizT2AOutInt(a, funcNr);
+			mizT2AOutPos(a, pos);
+			mizT2AStoreTermList(a, args);
+		}
+		MizWsAggregateTerm(pos, structSymbol, args): {
+			mizT2AOutChar(a, ikTrmAggreg);
+			mizT2AOutInt(a, mizLookUpPrefixFormat(a.formats, 71, structSymbol, length(args)));  // 'G'
+			mizT2AOutPos(a, pos);
+			mizT2AStoreTermList(a, args);
+		}
+		MizWsSelectorTerm(pos, selectorSymbol, arg): {
+			mizT2AOutChar(a, ikTrmSelector);
+			mizT2AOutInt(a, mizLookUpPrefixFormat(a.formats, 85, selectorSymbol, 1));   // 'U'
+			mizT2AOutPos(a, pos);
+			mizT2AStoreTerm(a, arg);
+		}
+		MizWsInternalSelectorTerm(__, __, varNr): {
+			mizT2AOutChar(a, ikTrmConstant);
+			mizT2AOutInt(a, varNr);
+		}
+		MizWsForgetfulFunctorTerm(pos, structSymbol, arg): {
+			mizT2AOutChar(a, ikTrmSubAgreg);
+			mizT2AOutInt(a, mizLookUpPrefixFormat(a.formats, 74, structSymbol, 1));    // 'J'
+			mizT2AOutPos(a, pos);
+			mizT2AStoreTerm(a, arg);
+		}
+		MizWsInternalForgetfulFunctorTerm(__, __): {}
+		MizWsSimpleFraenkelTerm(pos, postqual, sample): {
+			mizT2AOutChar(a, ikTrmFraenkel);
+			mizT2AOutPos(a, pos);
+			iter(postqual, \s -> mizT2AStoreVariableSegment(a, s));
+			mizT2AOutChar(a, 59);   // ';'
+			mizT2AStoreTerm(a, sample);
+			mizT2AOutPos(a, pos);
+			mizT2AOutChar(a, ikFrmVerum);
+		}
+		MizWsFraenkelTerm(pos, postqual, sample, formula): {
+			mizT2AOutChar(a, ikTrmFraenkel);
+			mizT2AOutPos(a, pos);
+			iter(postqual, \s -> mizT2AStoreVariableSegment(a, s));
+			mizT2AOutChar(a, 59);   // ';'
+			mizT2AStoreTerm(a, sample);
+			mizT2AStoreFormula(a, formula);
+		}
+		MizWsQualificationTerm(pos, subject, qualification): {
+			mizT2AOutChar(a, ikTrmQua);
+			mizT2AStoreTerm(a, subject);
+			mizT2AStoreType(a, qualification);
+			mizT2AOutPos(a, pos);
+		}
+		MizWsExactlyTerm(pos, subject): {
+			mizT2AOutChar(a, ikTrmExactly);
+			mizT2AStoreTerm(a, subject);
+			mizT2AOutPos(a, pos);
+		}
+		MizWsGlobalChoiceTerm(pos, choiceType): {
+			mizT2AOutChar(a, ikTrmChoice);
+			mizT2AOutPos(a, pos);
+			mizT2AStoreType(a, choiceType);
+		}
+		MizWsItTerm(__): mizT2AOutChar(a, ikTrmIt);
+		MizWsErrorTerm(__): mizT2AOutChar(a, ikError);
+	}
+}
+
+// InfFirstLetter: array[InferenceKind] of char = ('?','''','"','/','i')
+mizT2AInfFirstLetter(j : MizWsJustification) -> int {
+	switch (j) {
+		MizWsInfError(__): 63;         // '?'
+		MizWsStraightforward(__, __, __, __, __): 39;   // '\''
+		MizWsSchemeJust(__, __, __, __, __, __): 34;    // '"'
+		MizWsProofJust(__): 47;        // '/'
+		MizWsSkippedProof(__): 105;    // 'i'
+	}
+}
+
+mizT2AStoreInference(a : MizT2A, j : MizWsJustification) -> void {
+	mizT2AOutChar(a, 34);   // '"'
+	mizT2AOutChar(a, mizT2AInfFirstLetter(j));
+	lStart = switch (j) {
+		MizWsSchemeJust(__, __, schFileNr, schemeIdNr, __, schemeNr): {
+			mizT2AOutInt(a, schFileNr);
+			if (schFileNr == 0) mizT2AOutInt(a, schemeNr) else mizT2AOutInt(a, schemeIdNr);
+			mizT2AOutBool(a, false);
+			0;
+		}
+		MizWsStraightforward(__, __, linked, __, __): {
+			mizT2AOutInt(a, 0);
+			mizT2AOutInt(a, 0);
+			mizT2AOutBool(a, linked);
+			if (linked) 1 else 0;
+		}
+		default: {
+			mizT2AOutInt(a, 0);
+			mizT2AOutInt(a, 0);
+			mizT2AOutBool(a, false);
+			0;
+		}
+	};
+	refs = switch (j) {
+		MizWsStraightforward(__, rs, __, __, __): rs;
+		MizWsSchemeJust(__, rs, __, __, __, __): rs;
+		default: [];
+	};
+	notSimple = switch (j) {
+		MizWsInfError(__): true;
+		MizWsSkippedProof(__): true;
+		default: false;
+	};
+	if (!notSimple) {
+		fori(lStart, length(refs) - 1, \i -> {
+			switch (refs[i]) {
+				MizWsLocalRef(pos, labId, refNr, labNr): {
+					mizT2AOutChar(a, 108);   // 'l'
+					if (refNr == 0) mizT2AOutInt(a, 0) else mizT2AOutInt(a, labNr);
+					mizT2AOutInt(a, labId);
+					mizT2AOutPos(a, pos);
+				}
+				MizWsTheoremRef(pos, articleNr, theoNr): {
+					mizT2AOutChar(a, 116);   // 't'
+					mizT2AOutInt(a, articleNr);
+					mizT2AOutInt(a, theoNr);
+					mizT2AOutPos(a, pos);
+				}
+				MizWsDefinitionRef(pos, articleNr, defNr): {
+					mizT2AOutChar(a, 100);   // 'd'
+					mizT2AOutInt(a, articleNr);
+					mizT2AOutInt(a, defNr);
+					mizT2AOutPos(a, pos);
+				}
+			}
+		});
+	}
+	mizT2AOutChar(a, 59);   // ';'
+	mizT2AOutPos(a, mizWsJustPos(j));
+}
+
+mizT2AStoreFormat(a : MizT2A, p : MizWsPattern) -> void {
+	switch (p) {
+		MizWsPredPattern(pos, symbol, leftArgs, rightArgs): {
+			fmt = mizT2ACollectPredForm(a, symbol, length(leftArgs), length(rightArgs));
+			mizT2AOutWordAndPos(a, 82, fmt, pos);    // 'R'
+			iter(leftArgs, \l -> mizT2AOutWord(a, ikTrmLocus, l.varNr));
+			iter(rightArgs, \l -> mizT2AOutWord(a, ikTrmLocus, l.varNr));
+			mizT2AOutChar(a, 59);
+		}
+		MizWsInfixFunctorPattern(pos, symbol, leftArgs, rightArgs): {
+			fmt = mizLookUpFuncFormat(a.formats, symbol, length(leftArgs), length(rightArgs));
+			mizT2AOutWordAndPos(a, 75, fmt, pos);    // 'K'
+			iter(leftArgs, \l -> mizT2AOutWord(a, ikTrmLocus, l.varNr));
+			iter(rightArgs, \l -> mizT2AOutWord(a, ikTrmLocus, l.varNr));
+			mizT2AOutChar(a, 59);
+		}
+		MizWsCircumfixFunctorPattern(pos, leftBracket, rightBracket, args): {
+			fmt = mizLookUpBracketFormat(a.formats, leftBracket, rightBracket, length(args), 0, 0);
+			mizT2AOutWordAndPos(a, 75, fmt, pos);    // 'K'
+			iter(args, \l -> mizT2AOutWord(a, ikTrmLocus, l.varNr));
+			mizT2AOutChar(a, 59);
+		}
+		MizWsModePattern(pos, symbol, args): {
+			// itDefMode and itDefStruct differ only in the kind letter; the
+			// caller decides. This is the itDefMode shape.
+			fmt = mizLookUpPrefixFormat(a.formats, 77, symbol, length(args));   // 'M'
+			mizT2AOutWordAndPos(a, 77, fmt, pos);
+			iter(args, \l -> mizT2AOutWord(a, ikTrmLocus, l.varNr));
+			mizT2AOutChar(a, 59);
+		}
+		MizWsAttrPattern(pos, symbol, arg, args): {
+			fmt = mizLookUpPrefixFormat(a.formats, 86, symbol, length(args) + 1);  // 'V'
+			mizT2AOutWordAndPos(a, 86, fmt, pos);
+			iter(args, \l -> mizT2AOutWord(a, ikTrmLocus, l.varNr));
+			mizT2AOutWord(a, ikTrmLocus, arg.varNr);
+			mizT2AOutChar(a, 59);
+		}
+	}
+}
+
+// itDefStruct's StoreFormat branch: the same ModePattern written as 'L'
+mizT2AStoreStructFormat(a : MizT2A, p : MizWsPattern) -> void {
+	switch (p) {
+		MizWsModePattern(pos, symbol, args): {
+			fmt = mizLookUpPrefixFormat(a.formats, 76, symbol, length(args));   // 'L'
+			mizT2AOutWordAndPos(a, 76, fmt, pos);
+			iter(args, \l -> mizT2AOutWord(a, ikTrmLocus, l.varNr));
+			mizT2AOutChar(a, 59);
+		}
+		default: {}
+	}
+}
+
+// MFormatsList.CollectPredForm / CollectPrefixForm (_formats.pas 232 / 221):
+// unlike CollectFormat they return the EXISTING number.
+mizT2ACollectPredForm(a : MizT2A, symNr : int, lArgs : int, rArgs : int) -> int {
+	n = mizLookUpPredFormat(a.formats, symNr, lArgs, rArgs);
+	if (n != 0) n
+	else mizCollectFormat(a.formats, MizFormat(82, symNr, rArgs, lArgs, 0, 0));
+}
+
+mizT2ACollectPrefixForm(a : MizT2A, kind : int, symNr : int, argsNbr : int) -> int {
+	n = mizLookUpPrefixFormat(a.formats, kind, symNr, argsNbr);
+	if (n != 0) n
+	else mizCollectFormat(a.formats, MizFormat(kind, symNr, argsNbr, 0, 0, 0));
+}
+
+mizT2AStoreDefExpr(a : MizT2A, e : MizWsDefExpr) -> void {
+	if (e.exprKind == mizExTerm) {
+		switch (e.term) { None(): {}; Some(t): mizT2AStoreTerm(a, t); }
+	} else if (e.exprKind == mizExFormula) {
+		switch (e.formula) { None(): {}; Some(f): mizT2AStoreFormula(a, f); }
+	}
+}
+
+mizT2AStoreDefiniens(a : MizT2A, d : Maybe<MizWsDefiniens>, present : int) -> void {
+	switch (d) {
+		None(): {}
+		Some(def): {
+			mizT2AOutChar(a, present);   // 'm' or 'e'
+			lab = switch (def) {
+				MizWsSimpleDefiniens(__, l, __): l;
+				MizWsConditionalDefiniens(__, l, __, __): l;
+			};
+			switch (lab) {
+				MizWsNoLabel(): mizRunTimeError(2844);
+				MizWsLabel(idNr, pos, __, labelNr): {
+					mizT2AOutWord(a, 69, labelNr);   // 'E'
+					mizT2AOutInt(a, idNr);
+					mizT2AOutPos(a, pos);
+				}
+			}
+			switch (def) {
+				MizWsSimpleDefiniens(__, __, expr): {
+					if (expr.exprKind == mizExTerm) {
+						mizT2AOutChar(a, 101);   // 'e'
+						mizT2AOutChar(a, 59);
+						mizT2AOutChar(a, 111);   // 'o'
+						switch (expr.term) { None(): {}; Some(t): mizT2AStoreTerm(a, t); }
+					} else if (expr.exprKind == mizExFormula) {
+						mizT2AOutChar(a, 109);   // 'm'
+						mizT2AOutChar(a, 59);
+						mizT2AOutChar(a, 111);   // 'o'
+						switch (expr.formula) { None(): {}; Some(f): mizT2AStoreFormula(a, f); }
+					}
+				}
+				MizWsConditionalDefiniens(__, __, partials, otherwise): {
+					if (partials[0].partDefiniens.exprKind == mizExTerm)
+						mizT2AOutChar(a, 101)     // 'e'
+					else mizT2AOutChar(a, 109);   // 'm'
+					iter(partials, \pd -> {
+						mizT2AOutChar(a, 46);   // '.'
+						mizT2AStoreDefExpr(a, pd.partDefiniens);
+						mizT2AStoreFormula(a, pd.guard);
+					});
+					mizT2AOutChar(a, 59);
+					switch (otherwise) {
+						None(): mizT2AOutChar(a, 110);   // 'n'
+						Some(e): { mizT2AOutChar(a, 111); mizT2AStoreDefExpr(a, e); }  // 'o'
+					}
+				}
+			}
+		}
+	}
+}
+
+// ------------------------------------------------- CheckClusterTermObj -----
+
+// trans2analyzer.pas 776: a functorial registration's term may not contain a
+// global choice term or a Fraenkel term. The original REWRITES the offending
+// node's sort to wsErrorTerm in place; here the node is replaced.
+mizT2ACheckClusterTerm(a : MizT2A, t : MizWsTerm) -> MizWsTerm {
+	switch (t) {
+		MizWsGlobalChoiceTerm(pos, __): { mizError(a.eh, pos, 224); MizWsErrorTerm(pos) }
+		MizWsFraenkelTerm(pos, __, __, __): { mizError(a.eh, pos, 225); MizWsErrorTerm(pos) }
+		MizWsInfixTerm(__, __, leftArgs, rightArgs): {
+			t.leftArgs ::= map(leftArgs, \x -> mizT2ACheckClusterTerm(a, x));
+			t.rightArgs ::= map(rightArgs, \x -> mizT2ACheckClusterTerm(a, x));
+			t;
+		}
+		MizWsCircumfixTerm(__, __, __, args): {
+			t.args ::= map(args, \x -> mizT2ACheckClusterTerm(a, x)); t;
+		}
+		MizWsPrivateFunctorTerm(__, __, args, __, __, __): {
+			t.args ::= map(args, \x -> mizT2ACheckClusterTerm(a, x)); t;
+		}
+		MizWsAggregateTerm(__, __, args): {
+			t.args ::= map(args, \x -> mizT2ACheckClusterTerm(a, x)); t;
+		}
+		MizWsSelectorTerm(__, __, arg): { t.arg ::= mizT2ACheckClusterTerm(a, arg); t; }
+		MizWsForgetfulFunctorTerm(__, __, arg): { t.arg ::= mizT2ACheckClusterTerm(a, arg); t; }
+		MizWsQualificationTerm(__, subject, __): {
+			t.subject ::= mizT2ACheckClusterTerm(a, subject); t;
+		}
+		MizWsExactlyTerm(__, subject): {
+			t.subject ::= mizT2ACheckClusterTerm(a, subject); t;
+		}
+		MizWsSimpleFraenkelTerm(pos, __, __): { mizError(a.eh, pos, 225); MizWsErrorTerm(pos) }
+		default: t;
+	}
+}
+
+// -------------------------------------------------------- item pieces ------
+
+mizT2AProcessLabel(a : MizT2A, lab : MizWsMaybeLabel) -> void {
+	switch (lab) {
+		MizWsNoLabel(): {}
+		MizWsLabel(idNr, pos, __, labelNr): {
+			mizT2AOutWord(a, 69, labelNr);   // 'E'
+			mizT2AOutInt(a, idNr);
+			mizT2AOutPos(a, pos);
+		}
+	}
+}
+
+mizT2AProcessProposition(a : MizT2A, p : MizWsProposition) -> void {
+	mizT2AProcessLabel(a, p.lab);
+	mizT2AOutChar(a, ikMscPrefix);
+	mizT2AStoreFormula(a, p.sentence);
+}
+
+mizT2AProcessConditions(a : MizT2A, conds : [MizWsProposition]) -> void {
+	iter(conds, \p -> mizT2AProcessProposition(a, p));
+	mizT2AOutChar(a, 59);   // ';'
+}
+
+mizT2AProcessAssumptionConditions(a : MizT2A, asm : MizWsAssumption) -> void {
+	switch (asm) {
+		MizWsSingleAssumption(__, prop): {
+			mizT2AProcessProposition(a, prop);
+			mizT2AOutChar(a, 59);
+		}
+		MizWsCollectiveAssumption(__, conditions): mizT2AProcessConditions(a, conditions);
+	}
+}
+
+mizT2AProcessCompactStatement(a : MizT2A, prop : MizWsProposition) -> void {
+	mizT2AProcessLabel(a, prop.lab);
+	mizT2AOutChar(a, ikMscPrefix);
+	mizT2AStoreFormula(a, prop.sentence);
+}
+
+mizT2AProcessRegularStatementStart(a : MizT2A, st : MizWsStatement) -> void {
+	switch (st) {
+		MizWsDiffuseStatement(lab): mizT2AProcessLabel(a, lab);
+		MizWsCompactStatement(prop, __): mizT2AProcessCompactStatement(a, prop);
+		MizWsIterativeEquality(prop, __, __): mizT2AProcessCompactStatement(a, prop);
+	}
+}
+
+mizT2AProcessFixedVariablesSegment(a : MizT2A, s : MizWsSegment) -> void {
+	switch (s) {
+		MizWsImplSegment(__, ident, resType): {
+			a.constVarNbr ::= a.constVarNbr + 1;
+			mizT2AOutWord(a, 81, 1);            // 'Q'
+			mizT2AOutWord(a, 73, ident.ident);  // 'I'
+			switch (resType) {
+				None(): mizRunTimeError(2843);
+				Some(rt): mizT2AStoreResDesType(a, rt);
+			}
+		}
+		MizWsExplSegment(__, idents, typ): {
+			mizT2AOutWord(a, 81, length(idents));   // 'Q'
+			iter(idents, \v -> {
+				a.constVarNbr ::= a.constVarNbr + 1;
+				mizT2AOutWord(a, 73, v.ident);
+			});
+			mizT2AStoreType(a, typ);
+		}
+	}
+}
+
+// ------------------------------------------------------ justifications -----
+
+mizT2AProcessLibraryReference(a : MizT2A, r : MizWsReference) -> void {
+	switch (r) {
+		MizWsTheoremRef(__, articleNr, theoNr): mizBinUp(a.theoRefer, articleNr, theoNr);
+		MizWsDefinitionRef(__, articleNr, defNr): mizBinUp(a.defRefer, articleNr, defNr);
+		default: {}
+	}
+}
+
+mizT2AProcessReferences(a : MizT2A, refs : [MizWsReference]) -> void {
+	iter(refs, \r -> switch (r) {
+		MizWsLocalRef(__, __, __, __): {}    // Process_PrivateReference is empty
+		default: mizT2AProcessLibraryReference(a, r);
+	});
+}
+
+// Transfer2AnalyserObj.Process_SchemeJustification (1469) does NOT call the
+// inherited method, so a scheme justification's references are NOT counted.
+mizT2AProcessSchemeJustification(a : MizT2A, j : MizWsSchemeJust) -> void {
+	if (j.schFileNr > 0) {
+		if (j.schemeIdNr > 0) mizBinUp(a.schRefer, j.schFileNr, j.schemeIdNr);
+	} else if (j.schemeIdNr > 0) {
+		if (j.schemeNr > 0) mizBinUp(a.schRefer, 0, j.schemeNr);
+	}
+}
+
+mizT2AProcessJustification(a : MizT2A, j : MizWsJustification, blk : Maybe<MizWsBlock>) -> void {
+	// inherited Process_Justification (block_and_item.pas 513)
+	switch (j) {
+		MizWsStraightforward(__, refs, __, __, __): mizT2AProcessReferences(a, refs);
+		MizWsSchemeJust(__, __, __, __, __, __): mizT2AProcessSchemeJustification(a, j);
+		MizWsProofJust(__): switch (blk) { None(): {}; Some(b): mizT2AProcessBlock(a, b); }
+		default: {}
+	}
+	isProof = switch (j) { MizWsProofJust(__): true; default: false; };
+	if (!isProof) mizT2AStoreInference(a, j);
+}
+
+mizT2AProcessIterativeEquality(a : MizT2A, steps : [MizWsIterativeStep]) -> void {
+	iter(steps, \st -> {
+		mizT2AOutCharAndPos(a, ikItmIterEquality, st.pos);
+		mizT2AStoreTerm(a, st.term);
+		mizT2AProcessJustification(a, st.justification, None());
+	});
+}
+
+mizT2AProcessRegularStatement(a : MizT2A, st : MizWsStatement, blk : Maybe<MizWsBlock>) -> void {
+	switch (st) {
+		MizWsDiffuseStatement(__): switch (blk) {
+			None(): {}
+			Some(b): mizT2AProcessBlock(a, b);
+		}
+		MizWsCompactStatement(__, just): mizT2AProcessJustification(a, just, blk);
+		MizWsIterativeEquality(__, just, steps): {
+			mizT2AProcessJustification(a, just, blk);
+			mizT2AProcessIterativeEquality(a, steps);
+		}
+	}
+}
+
+// --------------------------------------------------------- item content ----
+
+mizT2AProcessItemsContent(a : MizT2A, kind : int, itemPos : MizPos, c : MizWsContent) -> void {
+	switch (c) {
+		MizWsNoContent(): {}
+		MizWsSchemeContent(sch): {
+			// itSchemeHead
+			mizT2AOutCharAndPos(a, ikBlcScheme, a.eh.curPos);
+			mizT2AOutWord(a, 83, sch.schemeNr);   // 'S'
+			mizT2AOutInt(a, sch.idNr);
+			mizT2AOutPos(a, a.eh.curPos);
+			iter(sch.params, \sg -> switch (sg) {
+				MizWsPredicateSegment(__, vars, typeExpList): {
+					iter(vars, \v -> mizT2AOutWord(a, ikFrmSchPred, v.ident));
+					mizT2AOutChar(a, 59);
+					mizT2AStoreTypeList(a, typeExpList);
+				}
+				MizWsFunctorSegment(__, vars, typeExpList, specification): {
+					iter(vars, \v -> mizT2AOutWord(a, ikTrmSchFunc, v.ident));
+					mizT2AOutChar(a, 59);
+					mizT2AStoreTypeList(a, typeExpList);
+					mizT2AOutChar(a, ikMscSpecification);
+					mizT2AStoreType(a, specification);
+				}
+			});
+			mizT2AOutChar(a, 59);
+			mizT2AOutChar(a, ikMscPrefix);
+			mizT2AStoreFormula(a, sch.conclusion);
+			mizT2AProcessConditions(a, sch.premises);
+		}
+		MizWsStatementContent(st): {
+			if (kind == mizItTheorem) {
+				mizT2AOutCharAndPos(a, ikItmTheorem, a.eh.curPos);
+				switch (st) {
+					MizWsCompactStatement(prop, __): mizT2AProcessCompactStatement(a, prop);
+					MizWsIterativeEquality(prop, __, __): mizT2AProcessCompactStatement(a, prop);
+					MizWsDiffuseStatement(__): {}
+				}
+			} else if (kind == mizItConclusion) {
+				mizT2AOutCharAndPos(a, ikItmConclusion, a.eh.curPos);
+				mizT2AProcessRegularStatementStart(a, st);
+			} else {
+				mizT2AProcessRegularStatementStart(a, st);
+			}
+		}
+		MizWsReservationSegment(idents, resType, __, freeVars): {
+			mizT2AOutChar(a, ikItmReservation);
+			iter(idents, \v -> mizT2AOutWord(a, 73, v.ident));   // 'I'
+			mizT2AOutChar(a, 59);
+			iter(freeVars, \fv -> {
+				mizT2AOutChar(a, 46);   // '.'
+				mizT2AStoreResDesType(a, mizT2AResDesOf(fv));
+			});
+			mizT2AOutChar(a, 59);
+			mizT2AStoreType(a, resType);
+		}
+		MizWsChoiceStatement(qualVars, conditions, __): {
+			mizT2AOutChar(a, ikItmChoice);
+			iter(qualVars, \s -> {
+				mizT2AProcessFixedVariablesSegment(a, s);
+				mizT2AOutNewLine(a);
+			});
+			mizT2AProcessConditions(a, conditions);
+		}
+		MizWsTypeChangingStatement(changes, typeExpr, __): {
+			mizT2AOutChar(a, ikItmReconsidering);
+			iter(changes, \tc -> {
+				a.constVarNbr ::= a.constVarNbr + 1;
+				mizT2AOutWord(a, 73, tc.var_.ident);   // 'I'
+				mizT2AOutChar(a, 46);                  // '.'
+				switch (tc.term) { None(): {}; Some(t): mizT2AStoreTerm(a, t); }
+			});
+			mizT2AOutChar(a, 59);
+			mizT2AOutChar(a, ikMscAs);
+			mizT2AStoreType(a, typeExpr);
+		}
+		MizWsPrivFuncDefinition(funcId, typeExpList, term): {
+			mizT2AOutChar(a, ikItmPrivFunc);
+			mizT2AOutWord(a, ikTrmPrivFunc, funcId.ident);
+			mizT2AStoreTypeList(a, typeExpList);
+			mizT2AStoreTerm(a, term);
+		}
+		MizWsPrivPredDefinition(predId, typeExpList, sentence): {
+			mizT2AOutChar(a, ikItmPrivPred);
+			mizT2AOutWord(a, ikFrmPrivPred, predId.ident);
+			mizT2AStoreTypeList(a, typeExpList);
+			mizT2AStoreFormula(a, sentence);
+		}
+		MizWsConstantDefinition(varId, term): {
+			a.constVarNbr ::= a.constVarNbr + 1;
+			mizT2AOutChar(a, ikItmPrivConstant);
+			mizT2AOutWord(a, 73, varId.ident);   // 'I'
+			mizT2AStoreTerm(a, term);
+		}
+		MizWsSegmentContent(segment): {
+			// itLociDeclaration and itGeneralization
+			mizT2AOutCharAndPos(a, ikItmGeneralization, mizWsSegmentPos(segment));
+			mizT2AProcessFixedVariablesSegment(a, segment);
+		}
+		MizWsAssumptionContent(asm): {
+			if (kind == mizItAssumption) mizT2AOutCharAndPos(a, ikItmAssumption, a.eh.curPos);
+			mizT2AProcessAssumptionConditions(a, asm);
+		}
+		MizWsExistentialAssumption(qVars, conditions): {
+			mizT2AOutCharAndPos(a, ikItmExAssumption, a.eh.curPos);
+			iter(qVars, \s -> mizT2AProcessFixedVariablesSegment(a, s));
+			mizT2AProcessConditions(a, conditions);
+		}
+		MizWsExample(varId, term): {
+			switch (varId) {
+				None(): mizT2AOutCharAndPos(a, ikItmSimpleExemplif, a.eh.curPos);
+				Some(v): {
+					a.constVarNbr ::= a.constVarNbr + 1;
+					mizT2AOutCharAndPos(a, ikItmExemplifWithEq, a.eh.curPos);
+					mizT2AOutWord(a, 73, v.ident);   // 'I'
+				}
+			}
+			switch (term) { None(): {}; Some(t): mizT2AStoreTerm(a, t); }
+		}
+		MizWsJustificationContent(__): {
+			// itPerCases
+			mizT2AOutCharAndPos(a, ikBlcPerCases, a.eh.curPos);
+		}
+		MizWsCorrectnessCondition(__, sort_, __): {
+			mizT2AOutWordAndPos(a, 89, sort_, a.eh.curPos);   // 'Y'
+		}
+		MizWsCorrectnessConditions(__, __, __): {
+			mizT2AOutCharAndPos(a, ikItmCorrectness, a.eh.curPos);
+		}
+		MizWsPropertyContent(__, sort_, __): {
+			mizT2AOutWordAndPos(a, ikTrmFreeVar, sort_, a.eh.curPos);
+		}
+		MizWsModeDefinition(__, defKind, redefinition, pattern, expansion, specification, definiens): {
+			if (defKind == 0) {
+				mizT2AOutCharAndPos(a, ikItmDefExpandMode, itemPos);
+				mizT2AStoreFormat(a, pattern);
+				switch (expansion) { None(): {}; Some(t): mizT2AStoreType(a, t); }
+			} else {
+				if (redefinition) mizT2AOutCharAndPos(a, ikItmRedefMode, itemPos)
+				else mizT2AOutCharAndPos(a, ikItmDefMode, itemPos);
+				mizT2AStoreFormat(a, pattern);
+				switch (specification) {
+					None(): {}
+					Some(t): { mizT2AOutChar(a, ikMscSpecification); mizT2AStoreType(a, t); }
+				}
+				mizT2AStoreDefiniens(a, definiens, 109);   // 'm'
+			}
+		}
+		MizWsAttrDefinition(__, redefinition, pattern, definiens): {
+			if (redefinition) mizT2AOutCharAndPos(a, ikItmRedefPrAttr, itemPos)
+			else mizT2AOutCharAndPos(a, ikItmDefPrAttr, itemPos);
+			mizT2AStoreFormat(a, pattern);
+			mizT2AStoreDefiniens(a, definiens, 109);
+		}
+		MizWsPredDefinition(__, redefinition, pattern, definiens): {
+			if (redefinition) mizT2AOutCharAndPos(a, ikItmRedefPred, itemPos)
+			else mizT2AOutCharAndPos(a, ikItmDefPred, itemPos);
+			mizT2AStoreFormat(a, pattern);
+			mizT2AStoreDefiniens(a, definiens, 109);
+		}
+		MizWsFuncDefinition(__, redefinition, pattern, specification, definingWay, definiens): {
+			if (redefinition) mizT2AOutCharAndPos(a, ikItmRedefFunc, a.eh.curPos)
+			else mizT2AOutCharAndPos(a, ikItmDefFunc, a.eh.curPos);
+			mizT2AStoreFormat(a, pattern);
+			switch (specification) {
+				None(): {}
+				Some(t): { mizT2AOutChar(a, ikMscSpecification); mizT2AStoreType(a, t); }
+			}
+			if (definingWay == 1) mizT2AStoreDefiniens(a, definiens, 109)        // means
+			else if (definingWay == 2) mizT2AStoreDefiniens(a, definiens, 101);  // equals
+		}
+		MizWsStructureDefinition(strPos, ancestors, pattern, fields): {
+			mizT2AOutCharAndPos(a, ikItmDefStruct, itemPos);
+			iter(ancestors, \t -> {
+				mizT2AOutChar(a, ikMscPrefix);
+				mizT2AStoreType(a, t);
+			});
+			mizT2AStoreStructFormat(a, pattern);
+			fieldsNbr = ref 0;
+			iter(fields, \fs -> {
+				mizT2AOutWord(a, 81, length(fs.fields));   // 'Q'
+				iter(fs.fields, \__ -> {
+					mizT2AOutWord(a, 73, 0);   // 'I'
+					fieldsNbr := ^fieldsNbr + 1;
+				});
+				mizT2AStoreType(a, fs.specification);
+			});
+			structSym = switch (pattern) {
+				MizWsModePattern(__, symbol, __): symbol;
+				default: 0;
+			};
+			f1 = mizLookUpPrefixFormat(a.formats, 71, structSym, ^fieldsNbr);   // 'G'
+			mizT2AOutWordAndPos(a, 71, f1, strPos);
+			f2 = mizLookUpPrefixFormat(a.formats, 74, structSym, 1);            // 'J'
+			mizT2AOutWordAndPos(a, ikTrmSubAgreg, f2, strPos);
+			iter(fields, \fs -> iter(fs.fields, \fl -> {
+				fmt = mizT2ACollectPrefixForm(a, 85, fl.symbol, 1);   // 'U'
+				mizT2AOutWordAndPos(a, ikTrmSelector, fmt, fl.pos);
+				mizT2AOutWord(a, ikTrmLocus, a.constVarNbr + 1);
+				mizT2AOutChar(a, 59);
+			}));
+			// the aggregate format is collected but not written — the analyzer
+			// generates the extra argument (trans2analyzer.pas 1307)
+			ignoreFmt = mizT2ACollectPrefixForm(a, 71, structSym, ^fieldsNbr);
+			if (ignoreFmt < 0) {}
+		}
+		MizWsNotationDeclaration(__, __, newPattern, originPattern): {
+			if (kind == mizItFuncNotation) {
+				mizT2AOutCharAndPos(a, ikItmDefFunc, a.eh.curPos);
+				mizT2AStoreFormat(a, newPattern);
+				mizT2AOutCharAndPos(a, ikMscSynonym, itemPos);
+				mizT2AStoreFormat(a, originPattern);
+			} else if (kind == mizItPredSynonym) {
+				mizT2AOutCharAndPos(a, ikItmDefPred, itemPos);
+				mizT2AStoreFormat(a, newPattern);
+				mizT2AOutCharAndPos(a, ikMscSynonym, itemPos);
+				mizT2AStoreFormat(a, originPattern);
+			} else if (kind == mizItModeNotation) {
+				mizT2AOutCharAndPos(a, ikItmDefMode, itemPos);
+				mizT2AStoreFormat(a, newPattern);
+				mizT2AOutCharAndPos(a, ikMscSynonym, itemPos);
+				mizT2AStoreFormat(a, originPattern);
+			} else if (kind == mizItAttrSynonym) {
+				mizT2AOutCharAndPos(a, ikItmDefPrAttr, itemPos);
+				mizT2AStoreFormat(a, newPattern);
+				mizT2AOutChar(a, ikMscSynonym);
+				mizT2AOutCharAndPos(a, ikItmDefPrAttr, itemPos);
+				mizT2AStoreFormat(a, originPattern);
+			} else if (kind == mizItPredAntonym) {
+				mizT2AOutCharAndPos(a, ikItmDefPred, a.eh.curPos);
+				mizT2AStoreFormat(a, newPattern);
+				mizT2AOutCharAndPos(a, ikMscAntonym, itemPos);
+				mizT2AStoreFormat(a, originPattern);
+			} else if (kind == mizItAttrAntonym) {
+				mizT2AOutCharAndPos(a, ikItmDefPrAttr, itemPos);
+				mizT2AStoreFormat(a, newPattern);
+				mizT2AOutChar(a, ikMscAntonym);
+				mizT2AOutCharAndPos(a, ikItmDefPrAttr, itemPos);
+				mizT2AStoreFormat(a, originPattern);
+			}
+		}
+		MizWsCluster(__, ckind, antecedent, consequent, clusterType, clusterTerm): {
+			if (ckind == 0) {
+				mizT2AOutCharAndPos(a, ikItmCluRegistered, a.eh.curPos);
+				mizT2AStoreAdjectiveList(a, consequent);
+				switch (clusterType) { None(): {}; Some(t): mizT2AStoreType(a, t); }
+			} else if (ckind == 1) {
+				mizT2AOutCharAndPos(a, ikItmCluConditional, a.eh.curPos);
+				mizT2AStoreAdjectiveList(a, antecedent);
+				mizT2AStoreAdjectiveList(a, consequent);
+				switch (clusterType) { None(): {}; Some(t): mizT2AStoreType(a, t); }
+			} else {
+				mizT2AOutCharAndPos(a, ikItmCluFunctor, a.eh.curPos);
+				switch (clusterTerm) {
+					None(): {}
+					Some(t): {
+						c.clusterTerm ::= Some(mizT2ACheckClusterTerm(a, t));
+						switch (c.clusterTerm) { None(): {}; Some(t2): mizT2AStoreTerm(a, t2); }
+					}
+				}
+				mizT2AStoreAdjectiveList(a, consequent);
+				switch (clusterType) {
+					None(): {}
+					Some(t): { mizT2AOutChar(a, 46); mizT2AStoreType(a, t); }
+				}
+			}
+		}
+		MizWsIdentifyRegistration(__, newPattern, originPattern, eqLoci): {
+			mizT2AOutCharAndPos(a, ikIdFunctors, itemPos);
+			mizT2AStoreFormat(a, newPattern);
+			mizT2AStoreFormat(a, originPattern);
+			iter(eqLoci, \eq -> {
+				mizT2AOutWordAndPos(a, ikTrmLocus, eq.left.varNr, eq.left.pos);
+				mizT2AOutWordAndPos(a, ikTrmLocus, eq.right.varNr, eq.right.pos);
+			});
+			mizT2AOutChar(a, 59);
+		}
+		MizWsReduceRegistration(__, originTerm, newTerm): {
+			mizT2AOutCharAndPos(a, ikReduceFunctors, itemPos);
+			// ★ THE READ-BACK SWAP, A SECOND TIME. Transfer2Analyzer reads the
+			// `.msx` back in, and Read_ItemContents for itReduction
+			// (wsmarticle.pas 4913) puts the FIRST child in nNewTerm. msm.flow
+			// leaves the tree in the state that WRITES the `.msx`, so the pair
+			// is exchanged once more here.
+			mizT2AStoreTerm(a, newTerm);
+			mizT2AStoreTerm(a, originTerm);
+		}
+		MizWsPropertyRegistration(pos, sort_, sethoodType, __): {
+			if (sort_ == 12) {   // sySethood
+				mizT2AOutWordAndPos(a, ikProperty, sort_, pos);
+				switch (sethoodType) { None(): {}; Some(t): mizT2AStoreType(a, t); }
+			}
+		}
+		MizWsPragma(str): {
+			cp = mizCanceledPragma(str);
+			if (cp.first == "D" || cp.first == "S" || cp.first == "T") {
+				if ((cp.first == "S" || cp.first == "T") && a.inBlock)
+					mizError(a.eh, itemPos, 278);
+				fori(1, cp.second, \__ -> {
+					mizT2AOutChar(a, ikItmCanceled);
+					mizT2AOutChar(a, getCharCodeAt(cp.first, 0));
+				});
+			} else {
+				mizInsertPragma(a.pragmas, itemPos.line, str);
+			}
+		}
+	}
+	// itSection has no content record in the port — handled by the caller
+}
+
+// ------------------------------------------------------- blocks and items --
+
+mizT2AProcessStartBlock(a : MizT2A, b : MizWsBlock) -> void {
+	setVector(a.stack, sizeVector(a.stack) - 1, a.constVarNbr);
+	k = b.kind;
+	if (k == mizBlDiffuse || k == mizBlHereby) {
+		mizT2AOutNewLine(a);
+		mizT2AOutCharAndPos(a, ikBlcDiffuse, b.pos);
+		mizT2AOutNewLine(a);
+	} else if (k == mizBlProof) {
+		mizT2AOutNewLine(a);
+		mizT2AOutCharAndPos(a, ikBlcProof, b.pos);
+		mizT2AOutNewLine(a);
+	} else if (k == mizBlCase) {
+		mizT2AOutNewLine(a);
+		mizT2AOutCharAndPos(a, ikBlcCase, b.pos);
+		mizT2AOutNewLine(a);
+	} else if (k == mizBlSuppose) {
+		mizT2AOutNewLine(a);
+		mizT2AOutCharAndPos(a, ikBlcSuppose, b.pos);
+		mizT2AOutNewLine(a);
+	} else if (k == mizBlDefinition) {
+		mizT2AOutCharAndPos(a, ikBlcDefinition, b.pos);
+	} else if (k == mizBlNotation) {
+		mizT2AOutCharAndPos(a, ikBlcNotation, b.pos);
+	} else if (k == mizBlRegistration) {
+		mizT2AOutCharAndPos(a, ikBlcRegistration, b.pos);
+	}
+}
+
+mizT2AProcessFinishBlock(a : MizT2A, b : MizWsBlock) -> void {
+	k = b.kind;
+	if (k != mizBlMain) {
+		eh = a.eh;
+		eh.curPos ::= b.endPos;
+		mizT2AOutCharAndPos(a, ikMscEndBlock, b.endPos);
+	}
+	a.constVarNbr ::= getVectorUnsafe(a.stack, sizeVector(a.stack) - 1);
+}
+
+mizT2AProcessBlock(a : MizT2A, b : MizWsBlock) -> void {
+	{ eh = a.eh; eh.curPos ::= b.pos; }
+	wasInBlock = a.inBlock;
+	a.inBlock ::= true;
+	pushVector(a.stack, 0);
+	mizT2AProcessStartBlock(a, b);
+	iterVector(b.items, \it -> mizT2AProcessItem(a, it));
+	mizT2AProcessFinishBlock(a, b);
+	removeVector(a.stack, sizeVector(a.stack) - 1);
+	a.inBlock ::= wasInBlock;
+}
+
+mizT2AProcessItem(a : MizT2A, it : MizWsItem) -> void {
+	{ eh = a.eh; eh.curPos ::= it.pos; }
+	kind = it.kind;
+	// Process_ItemsContent runs only when the item HAS a content record —
+	// `if aContent <> nil` (988). A Section item and an Axiom item carry none,
+	// so they contribute nothing but the closing newline.
+	mizT2AProcessItemsContent(a, kind, it.pos, it.content);
+	blk = it.block;
+	c = it.content;
+	if (kind == mizItDefinition || kind == mizItSchemeBlock || kind == mizItCaseBlock) {
+		switch (blk) { None(): {}; Some(b): mizT2AProcessBlock(a, b); }
+	} else if (kind == mizItTheorem) {
+		switch (c) {
+			MizWsStatementContent(st): switch (st) {
+				MizWsCompactStatement(__, just): mizT2AProcessJustification(a, just, blk);
+				MizWsIterativeEquality(__, just, __): mizT2AProcessJustification(a, just, blk);
+				default: {}
+			}
+			default: {}
+		}
+	} else if (kind == mizItRegularStatement || kind == mizItConclusion) {
+		switch (c) {
+			MizWsStatementContent(st): mizT2AProcessRegularStatement(a, st, blk);
+			default: {}
+		}
+	} else if (kind == mizItChoice) {
+		switch (c) {
+			MizWsChoiceStatement(__, __, just): mizT2AProcessJustification(a, just, None());
+			default: {}
+		}
+	} else if (kind == mizItReconsider) {
+		switch (c) {
+			MizWsTypeChangingStatement(__, __, just): mizT2AProcessJustification(a, just, None());
+			default: {}
+		}
+	} else if (kind == mizItPerCases) {
+		switch (c) {
+			MizWsJustificationContent(just): mizT2AProcessJustification(a, just, None());
+			default: {}
+		}
+	} else if (kind == mizItCorrCond) {
+		switch (c) {
+			MizWsCorrectnessCondition(__, __, just): mizT2AProcessJustification(a, just, blk);
+			default: {}
+		}
+	} else if (kind == mizItCorrectness) {
+		switch (c) {
+			MizWsCorrectnessConditions(__, __, just): mizT2AProcessJustification(a, just, blk);
+			default: {}
+		}
+	} else if (kind == mizItProperty) {
+		switch (c) {
+			MizWsPropertyContent(__, __, just): mizT2AProcessJustification(a, just, blk);
+			default: {}
+		}
+	} else if (kind == mizItPropertyRegistration) {
+		switch (c) {
+			MizWsPropertyRegistration(__, sort_, __, just): {
+				if (sort_ == 12) switch (just) {
+					None(): {}
+					Some(j): mizT2AProcessJustification(a, j, blk);
+				}
+			}
+			default: {}
+		}
+	}
+	{ eh2 = a.eh; eh2.curPos ::= it.endPos; }
+	mizT2AOutNewLine(a);   // Process_FinishItem
+}
+
+// --------------------------------------------------------------- driver ----
+
+mizTransfer2Analyzer(tp : MizWsBlock, eh : MizErrHan, formats : MizFormats,
+		pragmas : MizPragmas) -> MizT2A {
+	a = MizT2A(eh, formats, pragmas, makeVector(1024), 0, makeVector(50),
+		makeVector(64), makeVector(64), makeVector(16), false);
+	// Transfer2AnalyserObj.Init (806)
+	eh.curPos ::= MizPos(1, 1);
+	mizBinAssign(a.theoRefer, 0, 0, 0);
+	mizBinAssign(a.defRefer, 0, 0, 0);
+	mizBinAssign(a.schRefer, 0, 0, 0);
+	// Process_Article (252): the blMain level is pushed but Process_StartBlock
+	// is never called for it
+	pushVector(a.stack, 0);
+	iterVector(tp.items, \it -> mizT2AProcessItem(a, it));
+	// Done (826)
+	mizT2AOutChar(a, 33);   // '!'
+	mizCompletePragmas(a.pragmas, a.eh.curPos.line);
+	a;
+}
+
+mizT2AParContent(a : MizT2A) -> string {
+	concatStrings(vector2array(a.out));
+}
+
+mizT2ARefSection(v : Vector<MizIntTriplet>, from : int) -> string {
+	parts : Vector<string> = makeVector(sizeVector(v) * 7 + 1);
+	fori(from, sizeVector(v) - 1, \i -> {
+		t = getVectorUnsafe(v, i);
+		pushVector(parts, ".");
+		pushVector(parts, i2s(t.x1) + " ");
+		pushVector(parts, i2s(t.x2) + " ");
+		pushVector(parts, i2s(t.y) + " ");
+		pushVector(parts, "\n");
+	});
+	pushVector(parts, ";");
+	concatStrings(vector2array(parts));
+}
+
+mizT2ARefContent(a : MizT2A) -> string {
+	mizT2ARefSection(a.schRefer, 0) + mizT2ARefSection(a.theoRefer, 1)
+		+ mizT2ARefSection(a.defRefer, 1);
+}
