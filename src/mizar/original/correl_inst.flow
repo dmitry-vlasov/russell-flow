@@ -386,19 +386,9 @@ mizGetTrmType(env : MizCorrelEnv, t : MizTrm) -> MizTyp {
 	srt = mizTrmSort(t);
 	if (srt == ikTrmFunctor || srt == ikTrmSelector || srt == ikTrmAggreg) {
 		p = mizTTCollSearch(env, t);
-		if (p.first && getUrlParameterDef("no-tt-cache", "") != "1") {
-			mizCopyTyp(getVectorUnsafe(env.ttColl, p.second).typ);
-		} else {
-			entry = MizTTPair(mizCopyTrm(t), mizCopyTrmType(env, t), env.termScope);
-			mizVectorAtInsert(env.ttColl, p.second, entry);
-			if (env.termScope > env.ttMaxScope) env.ttMaxScope ::= env.termScope;
-			rounded = env.roundUpTrmType(env, t);
-			cl = mizCopyCluster(rounded.upper);
-			env.roundUpCluster(env, cl, rounded);
-			rounded.upper ::= cl;
-			entry.typ ::= rounded;
-			mizCopyTyp(rounded);
-		}
+		place = if (p.first && getUrlParameterDef("no-tt-cache", "") != "1") p.second
+			else mizInsertTermInTTCollAt(env, t);
+		mizCopyTyp(getVectorUnsafe(env.ttColl, place).typ);
 	} else {
 		mizCopyTrmType(env, t);
 	}
@@ -895,11 +885,47 @@ mizNewDisj(a : MizFrm, b : MizFrm) -> MizFrm {
 	lNeg2;
 }
 
-// InsertTermInTTColl (correl.pas 1151) — the same body GetTrmType runs, with
-// the type thrown away.
+// InsertTermInTTColl (correl.pas 1151)
 mizInsertTermInTTColl(env : MizCorrelEnv, t : MizTrm) -> void {
+	mizInsertTermInTTCollAt(env, t) |> \__ -> {};
+}
+
+// ★ THE ARGUMENT RECURSION IS THE POINT (correl.pas 1157-1174), and it runs
+//   BEFORE this term's own Search. Every functor / selector / aggregate
+//   ARGUMENT is inserted — and therefore ROUNDED — first, so by the time this
+//   term is rounded its subterms already have their final types. Without it a
+//   nested term's arguments are rounded in the middle of the outer rounding,
+//   when the outer entry still holds the RAW type it was inserted with, and
+//   CheckLociTypes refuses a conditional registration it should accept:
+//   frechet2's thesis lost `non empty` off M3(K10(K11(K128(),U1(c1)))).
+// ★ The entry is re-found BY IDENTITY afterwards (correl.pas 1186): the
+//   recursive calls insert into the same SORTED collection, so the index the
+//   Search returned is stale by then.
+mizInsertTermInTTCollAt(env : MizCorrelEnv, t : MizTrm) -> int {
+	srt0 = mizTrmSort(t);
+	if (srt0 == ikTrmFunctor || srt0 == ikTrmSelector || srt0 == ikTrmAggreg) {
+		switch (t) {
+			MizFuncTrm(__, __, args, __, __): {
+				l = ref args;
+				while(\ -> switch (^l) { MizTrmElem(__, __): true; MizTrmNil(): false; }, \ -> {
+					switch (^l) {
+						MizTrmElem(a0, next): {
+							a1 = mizSkipPrivFunc(a0);
+							sa = mizTrmSort(a1);
+							if (sa == ikTrmFunctor || sa == ikTrmSelector || sa == ikTrmAggreg)
+								mizInsertTermInTTCollAt(env, a1) |> \__ -> {};
+							l := next;
+						}
+						MizTrmNil(): {}
+					}
+				});
+			}
+			default: {}
+		}
+	}
 	p = mizTTCollSearch(env, t);
-	if (!p.first) {
+	if (p.first) p.second
+	else {
 		entry = MizTTPair(mizCopyTrm(t), mizCopyTrmType(env, t), env.termScope);
 		mizVectorAtInsert(env.ttColl, p.second, entry);
 		if (env.termScope > env.ttMaxScope) env.ttMaxScope ::= env.termScope;
@@ -908,6 +934,11 @@ mizInsertTermInTTColl(env : MizCorrelEnv, t : MizTrm) -> void {
 		env.roundUpCluster(env, cl, rounded);
 		rounded.upper ::= cl;
 		entry.typ ::= rounded;
+		// re-find by identity — the rounding may have inserted more entries
+		place = ref (-1);
+		fori(0, sizeVector(env.ttColl) - 1, \i ->
+			if (^place < 0 && getVectorUnsafe(env.ttColl, i) == entry) place := i);
+		if (^place >= 0) ^place else p.second;
 	}
 }
 
