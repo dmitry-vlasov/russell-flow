@@ -119,6 +119,11 @@ export {
 		mutable gPropPos : MizPos,
 		// gDefThNr (5537): counts the definitional theorems, canceled included
 		mutable gDefThNr : int,
+		// RegClusterBase / CondClusterBase / FuncClusterBase (Analyze 6663):
+		// where the ARTICLE's own registrations start
+		mutable regClusterBase : int,
+		mutable condClusterBase : int,
+		mutable funcClusterBase : int,
 	);
 
 	// gDefNode's record
@@ -186,7 +191,7 @@ mizMakeAnalyzer(env : MizCorrelEnv, eh : MizErrHan, clusters : MizClusters,
 		{ v : Vector<bool> = makeVector(CorrCondNbr + 1);
 		  fori(0, CorrCondNbr, \__ -> pushVector(v, false)); v },
 		map(enumFromTo(0, coLAST), \k -> mizConstrCount(env, k) - 1),
-		0, 0, 0, 0, mizZeroPos, 0);
+		0, 0, 0, 0, mizZeroPos, 0, 0, 0, 0);
 	// the report's own header (Analyze, analyzer.pas 6672)
 	mizVOutString(a.out, "<?xml version=\"1.0\"?>\n");
 	mizVOutString(a.out,
@@ -428,6 +433,9 @@ mizAnalyze(a : MizAnalyzer) -> void {
 	// AnyTyp (6666) — the widest mode, the default of an omitted specification
 	a.anyTyp ::= mizNewStandardTyp(ikTypMode, mizNewEmptyCluster(),
 		mizNewEmptyCluster(), mizBuiltIn(a.env.builtIn, rqAny), MizTrmNil());
+	a.regClusterBase ::= sizeVector(a.clusters.registered);
+	a.condClusterBase ::= sizeVector(a.clusters.conditional);
+	a.funcClusterBase ::= sizeVector(a.clusters.functor);
 	mizASetBVN(a, 0);
 	mizInWord(a.inf);
 	while(\ -> a.inf.curKind != 33 && a.stoppedAt == 0, \ -> {     // '!'
@@ -439,6 +447,7 @@ mizAnalyze(a : MizAnalyzer) -> void {
 		else if (k == ikBlcScheme) mizAScheme(a)
 		else if (k == ikBlcDefinition) mizADefinition(a)
 		else if (k == ikBlcNotation) mizANotation(a)
+		else if (k == ikBlcRegistration) mizARegistration(a)
 		else if (k == 69 || k == ikItmPrivConstant || k == ikItmPrivFunc
 			|| k == ikItmPrivPred || k == ikItmReconsidering || k == ikItmChoice)
 			mizAStatement(a)
@@ -4033,8 +4042,7 @@ mizCloseDef(a : MizAnalyzer) -> void {
 	mizNotatAddExtItems(a.gen);
 	a.gPrimNbr ::= 0;
 	a.dPrimLength ::= 0;
-	// the three cluster lists' AddExtItems have no counterpart yet: only the
-	// Registration block adds a cluster as EXT, and it is not landed
+	mizClustersAddExtItems(a.env, a.clusters);
 }
 
 // MAttrCollection.ClearPids (correl.pas 2679)
@@ -4293,3 +4301,429 @@ mizANotation(a : MizAnalyzer) -> void {
 		mizDisposeLevel(a, l, mark);
 	}
 }
+
+// ============ the REGISTRATION block (2006-2311, 6155-6376) ================
+
+// InitLociForCluster (1173) — mark the loci the cluster itself reaches
+mizInitLociForCluster(a : MizAnalyzer, c : MizAttrColl) -> void {
+	cc = mizCopyCluster(c);
+	mizWithinCluster(mizChangeToLoci(a), cc);
+	mizWithinCluster(mizSetLociOccW(a), cc);
+}
+
+// AllLociAccessibleInTyp (1181) / AllLociAccessibleInTrm (1199)
+mizAllLociAccessibleIn(a : MizAnalyzer, typList : Vector<MizTyp>,
+		seed : () -> void) -> bool {
+	seed();
+	res = ref true;
+	stop = ref false;
+	i = ref (sizeVector(typList) - 1);
+	while(\ -> !^stop && ^i >= 0, \ -> {
+		t = getVectorUnsafe(typList, ^i);
+		if (t.sort == ikError) { res := false; stop := true; }
+		else if (!mizLociOccAt(a, ^i + 1)) { res := false; stop := true; }
+		else {
+			mizWithinTyp(mizSetLociOccW(a), t);
+			i := ^i - 1;
+		}
+	});
+	^res;
+}
+
+mizAllLociAccessibleInTyp(a : MizAnalyzer, typList : Vector<MizTyp>,
+		typ : MizTyp) -> bool {
+	mizAllLociAccessibleIn(a, typList, \ -> {
+		t = mizCopyTyp(typ);
+		mizWithinTyp(mizChangeToLoci(a), t);
+		mizWithinTyp(mizSetLociOccW(a), t);
+	});
+}
+
+mizAllLociAccessibleInTrm(a : MizAnalyzer, typList : Vector<MizTyp>,
+		trm : MizTrm) -> bool {
+	mizAllLociAccessibleIn(a, typList, \ -> {
+		t = mizCopyTrm(trm);
+		mizWithinTrm(mizChangeToLoci(a), t) |> \__ -> {};
+		mizWithinTrm(mizSetLociOccW(a), t) |> \__ -> {};
+	});
+}
+
+// AnalyzeCluster (2006) — the written adjectives of a registration, with the
+// sign flipped exactly as AnalyzeAttributes does, but NOT inserted anywhere
+mizAnalyzeClusterAttrs(a : MizAnalyzer, list : Vector<MizAttrNode>,
+		typ : MizTyp) -> Vector<MizAttr> {
+	lTyp = mizCopyTyp(typ);
+	res : Vector<MizAttr> = makeVector(sizeVector(list));
+	stop = ref false;
+	z = ref (sizeVector(list) - 1);
+	while(\ -> !^stop && ^z >= 0, \ -> {
+		node = getVectorUnsafe(list, ^z);
+		switch (mizAnalyzeAttribute(a.gen, node, lTyp)) {
+			None(): {
+				if (lTyp.sort != ikError && node.nInt != 0)
+					mizAError(a, node.pos, 115);
+				stop := true;
+			}
+			Some(attr): {
+				if (node.neg) { if (attr.neg != 0) attr.neg ::= 1 }
+				else { attr.neg ::= if (attr.neg == 0) 1 else 0 }
+				if (!lTyp.lower.consistent) {
+					mizAError(a, node.pos, 95);
+					lTyp.sort ::= ikError;
+					stop := true;
+				} else {
+					mizVectorAtInsert(res, 0, attr);
+					z := ^z - 1;
+				}
+			}
+		}
+	});
+	res;
+}
+
+// AddToCluster (2047)
+mizAddToCluster(a : MizAnalyzer, list : Vector<MizAttr>, c : MizAttrColl) -> void {
+	iterVector(list, \at -> mizAttrCollInsert(a.env, c, at));
+	if (!c.consistent) mizAErrImm(a, 95);
+}
+
+// RClusterObj.RegisterCluster (correl.pas 1622)
+mizRegisterRCluster(a : MizAnalyzer, absNr : int, clu : MizAttrColl,
+		prim : Vector<MizTyp>, typ : MizTyp) -> MizRCluster {
+	env = a.env;
+	mizSetLocArgTyp(env, prim);
+	lower = mizCopyCluster(clu);
+	mizAttrCollEnlargeBy(env, lower, typ.upper);
+	upper = mizCopyCluster(clu);
+	mizAttrCollEnlargeBy(env, upper, typ.upper);
+	mizRoundUpCluster(env, a.clusters, upper, typ);
+	if (!upper.consistent) mizAError(a, a.eh.curPos, 95);
+	mizWithinCluster(mizChangeToLoci(a), lower);
+	mizWithinCluster(mizChangeToLoci(a), upper);
+	lTyp = mizAdjustedType(env, typ);
+	lTyp.lower ::= mizNewEmptyCluster();
+	lTyp.upper ::= mizNewEmptyCluster();
+	mizWithinTyp(mizChangeToLoci(a), lTyp);
+	MizRCluster(a.articleId, absNr, prim, MizClusterRec(lower, upper), lTyp);
+}
+
+// CClusterObj.RegisterCluster (correl.pas 1670)
+mizRegisterCCluster(a : MizAnalyzer, absNr : int, ante : MizAttrColl,
+		cons : MizAttrColl, prim : Vector<MizTyp>, typ : MizTyp) -> MizCCluster {
+	lower = cons;
+	upper = mizCopyCluster(cons);
+	lTyp = mizCopyTyp(typ);
+	mizWithinCluster(mizChangeToLoci(a), lower);
+	mizWithinCluster(mizChangeToLoci(a), upper);
+	mizWithinTyp(mizChangeToLoci(a), lTyp);
+	mizWithinCluster(mizChangeToLoci(a), ante);
+	MizCCluster(a.articleId, absNr, prim, ante, MizClusterRec(lower, upper), lTyp);
+}
+
+// FClusterObj.RegisterCluster (correl.pas 1705)
+mizRegisterFCluster(a : MizAnalyzer, absNr : int, clu : MizAttrColl,
+		prim : Vector<MizTyp>, trm : MizTrm, typ : Maybe<MizTyp>) -> MizFCluster {
+	env = a.env;
+	srt = mizTrmSort(trm);
+	if (srt == ikTrmFunctor || srt == ikTrmSelector || srt == ikTrmAggreg) {
+		clusterTerm = switch (trm) {
+			MizFuncTrm(s2, __, __, __, __): if (s2 == ikTrmFunctor) {
+				q = mizAdjustTrm(env, trm);
+				mizNewFuncTrm(q.first, mizCopyTrmList(q.second));
+			} else mizCopyTrm(trm);
+			default: mizCopyTrm(trm);
+		};
+		mizSetLocArgTyp(env, prim);
+		clusterType = switch (typ) { Some(t): Some(mizCopyTyp(t)); None(): None(); };
+		lTyp = switch (clusterType) {
+			Some(t): t;
+			None(): mizRoundUpTrmType(env, a.clusters, clusterTerm);
+		};
+		lower = mizCopyCluster(clu);
+		upper = mizCopyCluster(clu);
+		mizAttrCollEnlargeBy(env, upper, lTyp.upper);
+		mizRoundUpCluster(env, a.clusters, upper, lTyp);
+		if (!upper.consistent) mizAError(a, a.eh.curPos, 95);
+		mizWithinTrm(mizChangeToLoci(a), clusterTerm) |> \__ -> {};
+		mizWithinCluster(mizChangeToLoci(a), lower);
+		mizWithinCluster(mizChangeToLoci(a), upper);
+		switch (clusterType) {
+			Some(t): mizWithinTyp(mizChangeToLoci(a), t);
+			None(): {}
+		}
+		MizFCluster(a.articleId, absNr, prim, MizClusterRec(lower, upper),
+			clusterTerm, clusterType);
+	} else {
+		MizFCluster(a.articleId, absNr, makeVector(0),
+			MizClusterRec(mizNewEmptyCluster(), mizNewEmptyCluster()),
+			mizNewIncorTrm(), None());
+	}
+}
+
+// the attributive formula a cluster registration proves: `B1 is <adjectives>`
+mizClusterAttrFrm(a : MizAnalyzer, pos : MizPos,
+		list : Vector<MizAttrNode>) -> MizFrm {
+	mizAnalyzeFrm(a.gen, MizExpAttred(ikFrmAttr, pos,
+		MizExpSimple(ikTrmBound, pos, 1), list));
+}
+
+// DefExistentialCluster (2058)
+mizDefExistentialCluster(a : MizAnalyzer) -> void {
+	env = a.env;
+	lErrorOcc = ref false;
+	mizInPos(a.inf);
+	lPos = a.eh.curPos;
+	lList = mizLoadIPNColl(a.inf);
+	lTyp = mizReadType(a);
+	mizInWord(a.inf);
+	llTyp = mizAdjustedType(env, lTyp);
+	mizASetBVN(a, 1);
+	mizSetBoundVar(env, 1, lTyp);
+	lFrm = mizClusterAttrFrm(a, lPos, lList);
+	lClusterPtr = mizCopyCluster(llTyp.lower);
+	lAttrs = mizAnalyzeClusterAttrs(a, lList, lTyp);
+	mizAddToCluster(a, lAttrs, lClusterPtr);
+	mizSetCorrCond(a, 4, mizNewNeg(mizNewUniv(lTyp, mizNewNeg(lFrm))));
+	setVectorUnsafe(a.corrCondSet, 4, true);
+	lTypList = mizCreateLociList(a, 1, a.dPrimLength);
+	mizInitAccess(a);
+	mizInitLociForCluster(a, lClusterPtr);
+	if (!mizAllLociAccessibleInTyp(a, lTypList, llTyp)) {
+		lErrorOcc := true;
+		mizAErrImm(a, 100);
+	}
+	if (llTyp.sort == ikError || a.gen.constInExportableItemOcc) lErrorOcc := true;
+	if (!^lErrorOcc) {
+		lAbsNr = 1 + sizeVector(a.clusters.registered)
+			+ sizeVector(a.clusters.registeredExt) - a.regClusterBase;
+		r = mizRegisterRCluster(a, lAbsNr, lClusterPtr, lTypList, llTyp);
+		mizInsertRClusterExt(a.clusters, r);
+		mizVOutRCluster(a.out, r);
+	} else mizVOutErrCluster(a.out, "RCluster", a.articleId);
+	mizASetBVN(a, 0);
+}
+
+// DefConditionalCluster (2116)
+mizDefConditionalCluster(a : MizAnalyzer) -> void {
+	env = a.env;
+	lErrorOcc = ref false;
+	mizInPos(a.inf);
+	lPos = a.eh.curPos;
+	lList = mizLoadIPNColl(a.inf);
+	lList1 = mizLoadIPNColl(a.inf);
+	lTyp = mizReadType(a);
+	llTyp = mizAdjustedType(env, lTyp);
+	lClusterPtr = mizCopyCluster(llTyp.lower);
+	lAttrs1 = mizAnalyzeClusterAttrs(a, lList, lTyp);
+	mizAddToCluster(a, lAttrs1, lClusterPtr);
+	lClusterPtr1 = mizCopyCluster(llTyp.lower);
+	lAttrs2 = mizAnalyzeClusterAttrs(a, lList1, lTyp);
+	mizAddToCluster(a, lAttrs2, lClusterPtr1);
+	mizASetBVN(a, 1);
+	mizSetBoundVar(env, 1, lTyp);
+	lFrm = mizClusterAttrFrm(a, lPos, lList);
+	lFrm1 = mizClusterAttrFrm(a, lPos, lList1);
+	mizSetCorrCond(a, 1, mizNewUniv(lTyp, mizNewImpl(lFrm, lFrm1)));
+	setVectorUnsafe(a.corrCondSet, 1, true);
+	llTyp.lower ::= mizNewEmptyCluster();
+	llTyp.upper ::= mizNewEmptyCluster();
+	lTypList = mizCreateLociList(a, 1, a.dPrimLength);
+	mizInitAccess(a);
+	mizInitLociForCluster(a, lClusterPtr);
+	if (!mizAllLociAccessibleInTyp(a, lTypList, llTyp)) {
+		lErrorOcc := true;
+		mizAErrImm(a, 100);
+	}
+	if (llTyp.sort == ikError || a.gen.constInExportableItemOcc) lErrorOcc := true;
+	if (!^lErrorOcc) {
+		lAbsNr = 1 + sizeVector(a.clusters.conditional)
+			+ sizeVector(a.clusters.conditionalExt) - a.condClusterBase;
+		c = mizRegisterCCluster(a, lAbsNr, lClusterPtr, lClusterPtr1, lTypList, llTyp);
+		mizInsertCClusterExt(a.clusters, c);
+		mizVOutCCluster(a.out, c);
+	} else mizVOutErrCluster(a.out, "CCluster", a.articleId);
+	mizInWord(a.inf);
+	mizASetBVN(a, 0);
+}
+
+// DefFunctorCluster (2182)
+mizDefFunctorCluster(a : MizAnalyzer) -> void {
+	env = a.env;
+	lErrorOcc = ref false;
+	mizInPos(a.inf);
+	mizASetBVN(a, 0);
+	lTrm0 = mizAnalyzeTrm(a.gen, mizLoadTerm(a.inf));
+	srt0 = mizTrmSort(lTrm0);
+	lTrm = if (srt0 == ikTrmFunctor || srt0 == ikTrmSelector || srt0 == ikTrmAggreg
+			|| srt0 == ikError) lTrm0
+		else { mizAErrImm(a, 96); lErrorOcc := true; mizNewIncorTrm() };
+	llTrm = switch (lTrm) {
+		MizFuncTrm(s2, __, __, __, __): if (s2 == ikTrmFunctor) {
+			q = mizAdjustTrm(env, lTrm);
+			mizNewFuncTrm(q.first, mizCopyTrmList(q.second));
+		} else mizCopyTrm(lTrm);
+		default: mizCopyTrm(lTrm);
+	};
+	lList = mizLoadIPNColl(a.inf);
+	mizInWord(a.inf);
+	llTyp : Maybe<MizTyp> = if (a.inf.curKind == 46) {          // '.'
+		t = mizReadType(a);
+		mizInWord(a.inf);
+		if (t.sort == ikError) None() else Some(t);
+	} else None();
+	lTyp = switch (llTyp) {
+		Some(t): mizCopyTyp(t);
+		None(): mizGetTrmType(env, llTrm);
+	};
+	lClusterPtr = mizCopyCluster(lTyp.lower);
+	lAttrs = mizAnalyzeClusterAttrs(a, lList, lTyp);
+	condFrm = switch (llTyp) {
+		Some(__): {
+			mizASetBVN(a, 1);
+			mizSetBoundVar(env, 1, lTyp);
+			lFrm = mizNewEqFrm(env, mizNewVarTrm(ikTrmBound, 1), mizCopyTrm(lTrm));
+			conjuncts : Vector<MizFrm> = makeVector(sizeVector(lAttrs));
+			iterVector(lAttrs, \at -> {
+				f = mizNewPredFrm(ikFrmAttr, at.attrNr,
+					mizAddToTrmList(mizCopyTrmList(at.args),
+						mizNewVarTrm(ikTrmBound, 1)), 0);
+				pushVector(conjuncts, if (at.neg == 0) mizNewNeg(f) else f);
+			});
+			res = mizNewUniv(mizCopyTyp(lTyp),
+				mizNewImpl(lFrm, mizNewConjFrm(conjuncts)));
+			mizASetBVN(a, 0);
+			res;
+		}
+		None(): {
+			conjuncts : Vector<MizFrm> = makeVector(sizeVector(lAttrs));
+			iterVector(lAttrs, \at -> {
+				f = mizNewPredFrm(ikFrmAttr, at.attrNr,
+					mizAddToTrmList(mizCopyTrmList(at.args), mizCopyTrm(lTrm)), 0);
+				pushVector(conjuncts, if (at.neg == 0) mizNewNeg(f) else f);
+			});
+			mizNewConjFrm(conjuncts);
+		}
+	};
+	mizSetCorrCond(a, 1, condFrm);
+	setVectorUnsafe(a.corrCondSet, 1, true);
+	mizAddToCluster(a, lAttrs, lClusterPtr);
+	lTypList = mizCreateLociList(a, 1, a.dPrimLength);
+	mizInitAccess(a);
+	if (!mizAllLociAccessibleInTrm(a, lTypList, llTrm)) {
+		lErrorOcc := true;
+		mizAErrImm(a, 100);
+	}
+	if (mizTrmSort(llTrm) == ikError || a.gen.constInExportableItemOcc)
+		lErrorOcc := true;
+	if (!^lErrorOcc) {
+		lAbsNr = 1 + sizeVector(a.clusters.functor)
+			+ sizeVector(a.clusters.functorExt) - a.funcClusterBase;
+		f = mizRegisterFCluster(a, lAbsNr, lClusterPtr, lTypList, llTrm, llTyp);
+		mizInsertFClusterExt(a.clusters, f);
+		mizVOutFCluster(a.out, f);
+	} else mizVOutErrCluster(a.out, "FCluster", a.articleId);
+}
+
+// Registration (6184)
+mizARegistration(a : MizAnalyzer) -> void {
+	env = a.env;
+	gg = a.gen.g;
+	mizInPos(a.inf);
+	a.gMaxArgNbr ::= 2 * MaxArgNbr;
+	a.definiendumArgs ::= MizTrmNil();
+	l = mizCopyLevel(gg);
+	l.locPredNbr ::= sizeVector(env.locPredDef);
+	l.locFuncNbr ::= sizeVector(env.locFuncDef);
+	mizOpenDef(a);
+	mizVOutElStart(a.out, "RegistrationBlock");
+	mizVOutPosAsAttrs(a.out, a.eh.curPos);
+	mizVOutAttrEnd(a.out);
+	mark = mizTTCollMark(env);
+	gg.genCount ::= 0;
+	gg.demBase ::= gg.varNbr;
+	clearVector(a.definitionList);
+	while(\ -> a.inf.curKind != ikMscEndBlock && a.stoppedAt == 0, \ -> {
+		mizClearCorrConds(a);
+		k = a.inf.curKind;
+		gn = a.gen;
+		regItem = \el : string, read : () -> void -> {
+			mizVOutElStart0(a.out, el);
+			gn.exportableItem ::= true;
+			gn.constInExportableItemOcc ::= false;
+			read();
+			gn.exportableItem ::= false;
+			gn.constInExportableItemOcc ::= false;
+			mizACorrectness(a);
+			mizVOutElEnd(a.out, el);
+		};
+		if (k == ikItmGeneralization) {
+			gn.exportableItem ::= true;
+			gn.constInExportableItemOcc ::= false;
+			mizAParametrization(a);
+			gn.exportableItem ::= false;
+			gn.constInExportableItemOcc ::= false;
+		} else if (k == ikItmCluRegistered) {
+			regItem("Registration", \ -> mizDefExistentialCluster(a));
+		} else if (k == ikItmCluConditional) {
+			regItem("Registration", \ -> mizDefConditionalCluster(a));
+		} else if (k == ikItmCluFunctor) {
+			regItem("Registration", \ -> mizDefFunctorCluster(a));
+			// RETROSPECTIVE ROUNDING: every term already collected is
+			// re-rounded with the cluster just registered
+			iterVector(env.ttColl, \it -> mizRoundUpItem(a, it));
+		} else if (k == 69 || k == ikItmPrivConstant || k == ikItmPrivFunc
+			|| k == ikItmPrivPred || k == ikItmReconsidering || k == ikItmChoice) {
+			mizAStatement(a);
+		} else a.stoppedAt ::= k;
+	});
+	if (a.stoppedAt == 0) {
+		mizInPos(a.inf);
+		mizInWord(a.inf);
+		mizVOutEndPos(a.out, a.eh.curPos);
+		mizVOutElEnd(a.out, "RegistrationBlock");
+		lRoundUpClusters = sizeVector(a.clusters.conditionalExt) > 0
+			|| sizeVector(a.clusters.functorExt) > 0;
+		a.definiendumArgs ::= MizTrmNil();
+		mizCloseDef(a);
+		mizDisposeLevel(a, l, mark);
+		a.gMaxArgNbr ::= MaxArgNbr;
+		if (lRoundUpClusters) {
+			mizTypRoundUp(env, a.clusters, env.nonZeroTyp);
+			iterVector(a.clusters.registered, \r -> {
+				mizSetLocArgTyp(env, r.primaries);
+				mizRoundUpCluster(env, a.clusters, r.consequent.upper, r.clusterType);
+				mizTTCollFreeAll(env);
+			});
+		}
+		mizTTCollRelease(env, mark);
+	}
+}
+
+// RoundUpItem (6155) — re-round one collected term's type against the
+// FUNCTOR clusters, the PENDING ones included
+mizRoundUpItem(a : MizAnalyzer, item : MizTTPair) -> void {
+	env = a.env;
+	cl = a.clusters;
+	lClusterPtr = mizCopyCluster(item.typ.upper);
+	stop = ref false;
+	switch (mizFClusterInterval(env, cl, item.trm)) {
+		Some(iv): fori(iv.first, iv.second, \i -> {
+			if (!^stop) {
+				mizFClusterRoundUpWith(env, getVectorUnsafe(cl.functor, i),
+					item.trm, item.typ, lClusterPtr) |> \__ -> {};
+				if (!lClusterPtr.consistent) stop := true;
+			}
+		});
+		None(): {}
+	}
+	iterVector(cl.functorExt, \fc -> {
+		if (!^stop) {
+			mizFClusterRoundUpWith(env, fc, item.trm, item.typ, lClusterPtr) |> \__ -> {};
+			if (!lClusterPtr.consistent) stop := true;
+		}
+	});
+	{ t = item.typ; t.upper ::= lClusterPtr; }
+}
+
+// gTermCollection.FreeAll
+mizTTCollFreeAll(env : MizCorrelEnv) -> void { clearVector(env.ttColl); }
