@@ -42,7 +42,13 @@ export {
 
 	MizClusters(
 		registered : Vector<MizRCluster>,
-		functor : Vector<MizFCluster>,        // sorted by CmpFuncCluster
+		// FunctorCluster is an MSortedExtList: Items stay in INSERTION order and
+		// a separate fIndex gives the CmpFuncCluster order. Iteration over
+		// Items^[k] (the env round-up, the equalizer, the accommodator) is
+		// INSERTION order; only FindInterval/AtIndex (correl.pas 1123,
+		// analyzer.pas 6168) go through the index.
+		functor : Vector<MizFCluster>,        // Items — INSERTION order
+		functorIndex : Vector<int>,           // fIndex — CmpFuncCluster order
 		conditional : Vector<MizCCluster>,
 		// the EXT tail of the three MExtLists (mobjects.pas 1002): a cluster
 		// the analyzer registers inside a block is PENDING — the rounding
@@ -130,6 +136,7 @@ export {
 	mizCmpFuncTrm(env : MizCorrelEnv, a : MizTrm, b : MizTrm) -> int;
 
 	// MSortedExtList.FindInterval over the functor clusters
+	mizFClusterAt(cl : MizClusters, i : int) -> MizFCluster;
 	mizFClusterInterval(env : MizCorrelEnv, cl : MizClusters,
 		t : MizTrm) -> Maybe<Pair<int, int>>;
 	// LocArgTyp[1..] := these primaries (the Pascal `move(...)` before every
@@ -144,7 +151,7 @@ export {
 }
 
 mizMakeClusters() -> MizClusters {
-	MizClusters(makeVector(16), makeVector(16), makeVector(16),
+	MizClusters(makeVector(16), makeVector(16), makeVector(16), makeVector(16),
 		makeVector(8), makeVector(8), makeVector(8),
 		makeVector(64), makeVector(64), mizInitIntSeq(16), 0, 0, 0,
 		makeVector(8), makeVector(8), makeVector(8), 0, makeTree(), true,
@@ -173,6 +180,11 @@ mizCondIndexAt(cl : MizClusters, neg : int, adjNr : int) -> MizNatFunc {
 
 // MCondClList.AddExtObject: index the antecedent attrs, record the fire count
 mizInsertCCluster(env : MizCorrelEnv, cl : MizClusters, c : MizCCluster) -> void {
+	if (mizTryAllDbg()) println("CCL " + c.article + ":" + i2s(c.absNr)
+		+ " ante=[" + mizCluster2s(c.antecedent) + "]"
+		+ " cons=[" + mizCluster2s(c.consequent.upper) + "]"
+		+ " typ=" + mizFullTyp2s(c.clusterType)
+		+ " prims=" + strGlue(map(vector2array(c.primaries), mizFullTyp2s), " "));
 	pushVector(cl.conditional, c);
 	nr = sizeVector(cl.conditional) - 1;
 	iterVector(c.antecedent.items, \a -> {
@@ -225,20 +237,32 @@ mizClustersAddExtItems(env : MizCorrelEnv, cl : MizClusters) -> void {
 	clearVector(cl.functorExt);
 }
 
+// MSortedExtList.Insert -> InsertExt + AddExtObject (mobjects.pas 1148/1224):
+// the item is APPENDED to Items and its raw position threaded into fIndex at
+// the FindRight place — after every equal key, so within a group of equal keys
+// the index order IS the insertion order.
 mizInsertFCluster(env : MizCorrelEnv, cl : MizClusters, f : MizFCluster) -> void {
-	pos = ref sizeVector(cl.functor);
+	pushVector(cl.functor, f);
+	raw = sizeVector(cl.functor) - 1;
+	pos = ref sizeVector(cl.functorIndex);
 	while(\ -> ^pos > 0 && mizCmpFuncTrm(env,
-			getVectorUnsafe(cl.functor, ^pos - 1).clusterTerm, f.clusterTerm) > 0,
+			mizFClusterAt(cl, ^pos - 1).clusterTerm, f.clusterTerm) > 0,
 		\ -> pos := ^pos - 1);
-	mizVectorAtInsert(cl.functor, ^pos, f);
+	mizVectorAtInsert(cl.functorIndex, ^pos, raw);
+}
+
+// AtIndex (mobjects.pas 1141) — Items^[fIndex^[i]]
+mizFClusterAt(cl : MizClusters, i : int) -> MizFCluster {
+	getVectorUnsafe(cl.functor, getVectorUnsafe(cl.functorIndex, i));
 }
 
 // FindInterval: [left, right] of functor clusters whose term compares 0
 mizFClusterInterval(env : MizCorrelEnv, cl : MizClusters, t : MizTrm) -> Maybe<Pair<int, int>> {
-	n = sizeVector(cl.functor);
+	// the bounds are positions IN fIndex — every read goes through AtIndex
+	n = sizeVector(cl.functorIndex);
 	left = ref -1;
 	fori(0, n - 1, \i -> {
-		if (^left < 0 && mizCmpFuncTrm(env, getVectorUnsafe(cl.functor, i).clusterTerm, t) == 0) {
+		if (^left < 0 && mizCmpFuncTrm(env, mizFClusterAt(cl, i).clusterTerm, t) == 0) {
 			left := i;
 		}
 	});
@@ -247,7 +271,7 @@ mizFClusterInterval(env : MizCorrelEnv, cl : MizClusters, t : MizTrm) -> Maybe<P
 	} else {
 		right = ref ^left;
 		while(\ -> ^right + 1 < n && mizCmpFuncTrm(env,
-				getVectorUnsafe(cl.functor, ^right + 1).clusterTerm, t) == 0,
+				mizFClusterAt(cl, ^right + 1).clusterTerm, t) == 0,
 			\ -> right := ^right + 1);
 		Some(Pair(^left, ^right));
 	}
@@ -597,7 +621,7 @@ mizRoundUpTrmTypeWithType(env : MizCorrelEnv, cl : MizClusters,
 					if (mizIntSetIsInSet(used, ^i)) {
 						i := ^i + 1;
 					} else {
-						fc : MizFCluster = getVectorUnsafe(cl.functor, ^i);
+						fc : MizFCluster = mizFClusterAt(cl, ^i);
 						fired = mizFClusterRoundUpWith(env, fc, t, typ, ^cluster);
 						if (dbg) println("  ROUND fc[" + i2s(^i) + "] "
 							+ fc.article + ":" + i2s(fc.absNr)
@@ -838,6 +862,10 @@ mizEnvRoundUp(env : MizCorrelEnv, cl : MizClusters) -> void {
 	// functor clusters: the consequent is enlarged by the cluster type's own
 	// upper cluster (the term's rounded type when no type is given)
 	iterVector(cl.functor, \f -> {
+		if (mizTryAllDbg()) println("FCL " + f.article + ":" + i2s(f.absNr)
+			+ " trm=" + mizTrm2s(f.clusterTerm)
+			+ " cons=[" + mizCluster2s(f.consequent.upper) + "]"
+			+ " prims=" + strGlue(map(vector2array(f.primaries), mizFullTyp2s), " "));
 		mizSetLocArgTyp(env, f.primaries);
 		ty = switch (f.clusterType) {
 			Some(t): t;
