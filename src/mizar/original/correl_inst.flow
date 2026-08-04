@@ -47,6 +47,7 @@ export {
 	// gTermCollection scoping (MarkTermsInTTColl / RemoveTermsFromTTColl)
 	mizTTCollMark(env : MizCorrelEnv) -> int;
 	mizTTCollRelease(env : MizCorrelEnv, mark : int) -> void;
+	mizTTCollFreeAll(env : MizCorrelEnv) -> void;
 
 	// widening family
 	mizEqRadices(env : MizCorrelEnv, a : MizTyp, b : MizTyp) -> bool;
@@ -388,8 +389,9 @@ mizGetTrmType(env : MizCorrelEnv, t : MizTrm) -> MizTyp {
 		if (p.first && getUrlParameterDef("no-tt-cache", "") != "1") {
 			mizCopyTyp(getVectorUnsafe(env.ttColl, p.second).typ);
 		} else {
-			entry = MizTTPair(mizCopyTrm(t), mizCopyTrmType(env, t));
+			entry = MizTTPair(mizCopyTrm(t), mizCopyTrmType(env, t), env.termScope);
 			mizVectorAtInsert(env.ttColl, p.second, entry);
+			if (env.termScope > env.ttMaxScope) env.ttMaxScope ::= env.termScope;
 			rounded = env.roundUpTrmType(env, t);
 			cl = mizCopyCluster(rounded.upper);
 			env.roundUpCluster(env, cl, rounded);
@@ -404,13 +406,52 @@ mizGetTrmType(env : MizCorrelEnv, t : MizTrm) -> MizTyp {
 
 // MarkTermsInTTColl / RemoveTermsFromTTColl (checker.pas 335 / 434): the
 // collection is scoped to one inference.
+// MarkTermsInTTColl (correl.pas 1099) — `inc(gTermScope)`, nothing else.
 mizTTCollMark(env : MizCorrelEnv) -> int {
-	sizeVector(env.ttColl);
+	env.termScope ::= env.termScope + 1;
+	env.termScope;
 }
 
+// RemoveTermsFromTTColl (correl.pas 1200) — `dec(gTermScope)`, then DELETE
+// every entry stamped above the new scope and Pack. The collection is SORTED
+// by CompTrms, so the entries a scope created are scattered through it: a
+// position mark that pops the tail keeps the wrong ones alive. A surviving
+// stale entry poisons GetTrmType, which returns the ROUNDED type it holds —
+// commacat's first deffunc gained a `non empty` its argument no longer had.
+// The `mark` argument is the scope this release returns to; the original
+// simply decrements, so it is used only to keep the port's call sites honest.
 mizTTCollRelease(env : MizCorrelEnv, mark : int) -> void {
-	while(\ -> sizeVector(env.ttColl) > mark,
-		\ -> removeVector(env.ttColl, sizeVector(env.ttColl) - 1));
+	mizIgnoreInt(mark);
+	env.termScope ::= env.termScope - 1;
+	scope = env.termScope;
+	// ttMaxScope is the highest stamp present. When nothing is stamped above
+	// the new scope the original's loop deletes nothing and Pack is a no-op,
+	// so skip the walk — the checker runs this per inference.
+	if (env.ttMaxScope > scope) {
+		n = sizeVector(env.ttColl);
+		w = ref 0;
+		mx = ref 0;
+		fori(0, n - 1, \i -> {
+			e = getVectorUnsafe(env.ttColl, i);
+			if (e.termScope <= scope) {
+				if (^w != i) setVectorUnsafe(env.ttColl, ^w, e);
+				if (e.termScope > ^mx) mx := e.termScope;
+				w := ^w + 1;
+			}
+		});
+		while(\ -> sizeVector(env.ttColl) > ^w,
+			\ -> removeVector(env.ttColl, sizeVector(env.ttColl) - 1));
+		env.ttMaxScope ::= ^mx;
+	}
+}
+
+mizIgnoreInt(i : int) -> void {}
+
+// gTermCollection.FreeAll (iocorrel.pas 3295) — the whole collection, and the
+// scope counter is untouched (the original's FreeAll does not move it).
+mizTTCollFreeAll(env : MizCorrelEnv) -> void {
+	clearVector(env.ttColl);
+	env.ttMaxScope ::= 0;
 }
 
 // ---------------- widening ----------------
@@ -859,8 +900,9 @@ mizNewDisj(a : MizFrm, b : MizFrm) -> MizFrm {
 mizInsertTermInTTColl(env : MizCorrelEnv, t : MizTrm) -> void {
 	p = mizTTCollSearch(env, t);
 	if (!p.first) {
-		entry = MizTTPair(mizCopyTrm(t), mizCopyTrmType(env, t));
+		entry = MizTTPair(mizCopyTrm(t), mizCopyTrmType(env, t), env.termScope);
 		mizVectorAtInsert(env.ttColl, p.second, entry);
+		if (env.termScope > env.ttMaxScope) env.ttMaxScope ::= env.termScope;
 		rounded = env.roundUpTrmType(env, t);
 		cl = mizCopyCluster(rounded.upper);
 		env.roundUpCluster(env, cl, rounded);
