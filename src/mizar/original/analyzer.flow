@@ -132,6 +132,10 @@ export {
 		// RegPropertiesBase (6686): where the ARTICLE's own registrations start
 		mutable propertyCount : int,
 		mutable propertyCond : MizFrm,      // gPropertyCond (2609)
+		// the STRUCTURE family's own globals (analyzer.pas 2659-2661)
+		mutable gPrimLength : int,
+		gSelectRepresentation : Vector<Maybe<MizTrm>>,   // [1..MaxArgNbr]
+		gSelectorNr : Vector<int>,                       // [1..MaxArgNbr]
 	);
 
 	// gDefNode's record
@@ -164,6 +168,12 @@ export {
 	);
 
 	CorrCondNbr = 6;
+
+	// analyzer.pas 53-56
+	errFieldHomonimy = 91;
+	errFieldTypeInconsistent = 92;
+	errIncompletePrefix = 93;
+	errNonStructPrefix = 94;
 
 	mizMakeAnalyzer(env : MizCorrelEnv, eh : MizErrHan, clusters : MizClusters,
 		gen : MizGen, defs : MizDefinientia, idents : MizIdentify,
@@ -199,7 +209,8 @@ mizMakeAnalyzer(env : MizCorrelEnv, eh : MizErrHan, clusters : MizClusters,
 		{ v : Vector<bool> = makeVector(CorrCondNbr + 1);
 		  fori(0, CorrCondNbr, \__ -> pushVector(v, false)); v },
 		map(enumFromTo(0, coLAST), \k -> mizConstrCount(env, k) - 1),
-		0, 0, 0, 0, mizZeroPos, 0, 0, 0, 0, 0, 0, 0, mizNewIncorFrm());
+		0, 0, 0, 0, mizZeroPos, 0, 0, 0, 0, 0, 0, 0, mizNewIncorFrm(),
+		0, makeVector(8), makeVector(8));
 	// the report's own header (Analyze, analyzer.pas 6672)
 	mizVOutString(a.out, "<?xml version=\"1.0\"?>\n");
 	mizVOutString(a.out,
@@ -2448,6 +2459,435 @@ mizCheckAccess(a : MizAnalyzer, p : MizPattern) -> void {
 	}
 }
 
+// ---------------- the STRUCTURE family (2663-3040) ------------------------
+
+// FormalArgs (109): the loci 1..nbr as a term list
+mizFormalArgs(nbr : int) -> MizTrmList {
+	l = ref MizTrmNil();
+	i = ref nbr;
+	while(\ -> ^i >= 1, \ -> {
+		l := MizTrmElem(mizNewVarTrm(ikTrmLocus, ^i), ^l);
+		i := ^i - 1;
+	});
+	^l;
+}
+
+// RenewPrimaries (82)
+mizRenewPrimaries(a : MizAnalyzer, prevLength : int) -> void {
+	a.gPrimNbr ::= prevLength;
+	a.dPrimLength ::= prevLength;
+}
+
+// RenewConst (102): a constant beyond the current frame collapses onto it
+mizRenewConst(a : MizAnalyzer) -> MizWithin {
+	mizMakeWithin(\__, t -> {
+		switch (t) {
+			MizVarTrm(srt, varNr, __, __): {
+				if (srt == ikTrmConstant && varNr > mizGVarNbr(a)) t.varNr ::= mizGVarNbr(a);
+				t;
+			}
+			default: t;
+		}
+	});
+}
+
+// GetConstQualifiedList (423) — GetQualifiedList with nSkelConstNr := -1
+mizGetConstQualifiedList(a : MizAnalyzer) -> void {
+	mizGetQualifiedList(a, -1);
+}
+
+// AppendLocus (458): one more locus, shared by the `abstract` attribute and
+// the selector functions
+mizAppendLocus(a : MizAnalyzer, typ : MizTyp) -> void {
+	env = a.env;
+	gg = a.gen.g;
+	mizSetGVarNbr(a, gg.varNbr + 1);
+	fv = mizFixedVarAt(a, gg.varNbr);
+	fv.ident ::= 0;
+	fv.typ ::= typ;
+	fv.expandable ::= false;
+	if (a.dPrimLength >= a.gMaxArgNbr) mizOverflowError(937);
+	a.dPrimLength ::= a.dPrimLength + 1;
+	if (a.gPrimNbr >= a.gMaxArgNbr) mizOverflowError(937);
+	a.gPrimNbr ::= a.gPrimNbr + 1;
+	gg.genCount ::= gg.genCount + 1;
+	fv2 = mizFixedVarAt(a, gg.varNbr);
+	fv2.skelConstNr ::= gg.genCount;
+	while(\ -> sizeVector(a.locusAsConst) <= gg.genCount,
+		\ -> pushVector(a.locusAsConst, 0));
+	setVectorUnsafe(a.locusAsConst, gg.genCount, gg.varNbr);
+	while(\ -> sizeVector(a.constNr) <= a.gPrimNbr, \ -> pushVector(a.constNr, 0));
+	setVectorUnsafe(a.constNr, a.gPrimNbr, gg.varNbr);
+	t = mizAdjustedType(env, typ);
+	mizWithinTyp(mizChangeToLoci(a), t);
+	while(\ -> sizeVector(a.gPrimaries) <= a.gPrimNbr,
+		\ -> pushVector(a.gPrimaries, mizNewIncorTyp()));
+	setVectorUnsafe(a.gPrimaries, a.gPrimNbr, t);
+}
+
+mizSelectRepAt(a : MizAnalyzer, i : int) -> Maybe<MizTrm> {
+	if (i >= 1 && i < sizeVector(a.gSelectRepresentation))
+		getVectorUnsafe(a.gSelectRepresentation, i) else None();
+}
+mizSetSelectRep(a : MizAnalyzer, i : int, t : Maybe<MizTrm>) -> void {
+	while(\ -> sizeVector(a.gSelectRepresentation) <= i,
+		\ -> pushVector(a.gSelectRepresentation, None()));
+	setVectorUnsafe(a.gSelectRepresentation, i, t);
+}
+mizSelectorNrAt(a : MizAnalyzer, i : int) -> int {
+	if (i >= 1 && i < sizeVector(a.gSelectorNr))
+		getVectorUnsafe(a.gSelectorNr, i) else 0;
+}
+mizSetSelectorNr(a : MizAnalyzer, i : int, nr : int) -> void {
+	while(\ -> sizeVector(a.gSelectorNr) <= i, \ -> pushVector(a.gSelectorNr, 0));
+	setVectorUnsafe(a.gSelectorNr, i, nr);
+}
+
+// SetStruct (2663): a field locus becomes the selector term that reads it
+mizSetStructW(a : MizAnalyzer) -> MizWithin {
+	mizMakeWithin(\__, t -> {
+		switch (t) {
+			MizVarTrm(srt, varNr, __, __): {
+				if (srt == ikTrmLocus && varNr > a.gPrimLength) {
+					j = varNr - a.gPrimLength;
+					switch (mizSelectRepAt(a, j)) {
+						None():
+							mizNewLocFuncTrm(ikTrmSelector, mizSelectorNrAt(a, j),
+								mizFormalArgs(a.gPrimLength + 1));
+						Some(rep): {
+							switch (rep) {
+								MizFuncTrm(__, fn, args, __, __):
+									mizNewLocFuncTrm(ikTrmSelector, fn,
+										mizCopyTrmList(args));
+								default: t;
+							}
+						}
+					}
+				} else t;
+			}
+			default: t;
+		}
+	});
+}
+
+// AnalyzeSelector (2683) — returns (constructor number, the completed args)
+mizAnalyzeSelector(a : MizAnalyzer, argList : MizTrmList,
+		select : int) -> Pair<int, MizTrmList> {
+	env = a.env;
+	res : ref Maybe<Pair<int, MizTrmList>> = ref None();
+	k = ref (mizNotatCount(a.gen, noSelector) - 1);
+	while(\ -> isNone(^res) && ^k >= 0, \ -> {
+		p = mizNotatAt(a.gen, noSelector, ^k);
+		if (p.formNr == select && mizCheckTypes(env, p, argList)) {
+			complete = mizCreateArgList(env, sizeVector(p.primTypes));
+			mizRemoveQua(complete);
+			res := Some(Pair(p.constrNr, complete));
+		}
+		k := ^k - 1;
+	});
+	switch (^res) {
+		Some(r): r;
+		None(): Pair(0, argList);
+	}
+}
+
+// DefStruct (2705)
+mizDefStruct(a : MizAnalyzer) -> void {
+	env = a.env;
+	gg = a.gen.g;
+	mizInPos(a.inf);
+	mizInWord(a.inf);
+	// ---- the prefix declarations ----
+	a.gDefPos ::= a.eh.curPos;
+	lStructPos = a.eh.curPos;
+	// Pascal Constr[k].Count INCLUDES the dummy at slot 0; mizConstrCount does
+	// not, so every `Count` below is mizConstrCount + 1
+	lOldSelNbr = mizConstrCount(env, coSelector) + 1;
+	lPrefixes : Vector<MizTyp> = makeVector(2);
+	while(\ -> a.inf.curKind == ikMscPrefix, \ -> {
+		lTyp = mizReadType(a);
+		mizInWord(a.inf);
+		if (lTyp.sort == ikTypStruct) {
+			if (sizeVector(lTyp.lower.items) != 0) mizAErrImm(a, 90);
+			pushVector(lPrefixes, lTyp);
+		} else mizAErrImm(a, errNonStructPrefix);
+	});
+
+	// ---- the structure mode ----
+	a.gDefPos ::= a.eh.curPos;
+	pStruct = mizAGetPattern(a, noStructMode);
+	mizCheckAccess(a, pStruct);
+	mizNotatInsertExt(a.gen, pStruct);
+	{
+		ps = mizLastPattern(a, noStructMode);
+		ps.constrKind ::= 76;                       // 'L'
+		ps.constrNr ::= mizConstrCount(env, coStructMode) + 1;
+	}
+	// the type of the single visible argument of the selector functions
+	lStructTyp = mizNewStandardTyp(ikTypStruct, mizNewEmptyCluster(),
+		mizNewEmptyCluster(), mizConstrCount(env, coStructMode) + 1,
+		mizFormalArgs(a.dPrimLength));
+
+	// the situation right after the structure mode declaration
+	a.gPrimLength ::= a.dPrimLength;
+	lVarBase = gg.varNbr;
+	lGenBase = gg.genCount;
+	lFieldBase = a.gPrimNbr;
+
+	// ---- the loci of the fields ----
+	mizGetConstQualifiedList(a);
+
+	// ---- the selector function types ----
+	lSelectFuncTyp : Vector<MizTyp> = makeVector(8);
+	pushVector(lSelectFuncTyp, mizNewIncorTyp());      // 1-based
+	fori(1, gg.varNbr - lVarBase, \j -> {
+		fv = mizFixedVarAt(a, lVarBase + j);
+		t = mizCopyTyp(fv.typ);
+		gg.genCount ::= gg.genCount + 1;
+		fv.skelConstNr ::= gg.genCount;
+		while(\ -> sizeVector(a.locusAsConst) <= gg.genCount,
+			\ -> pushVector(a.locusAsConst, 0));
+		setVectorUnsafe(a.locusAsConst, gg.genCount, lVarBase + j);
+		mizWithinTyp(mizChangeToLoci(a), t);
+		pushVector(lSelectFuncTyp, t);
+	});
+	gg.genCount ::= gg.genCount - (gg.varNbr - lVarBase);
+	mizParamDecl(a, lVarBase);
+
+	// ---- the aggregating functor ----
+	a.gDefPos ::= a.eh.curPos;
+	pAggr = mizMakePattern(noAggregate, mizAbsNotatNr(a, noAggregate), a.articleId);
+	mizNotatInsertExt(a.gen, pAggr);
+	mizInitAccess(a);
+	// a special GetFormat: every field locus counts as visible
+	fori(lFieldBase + 1, a.gPrimNbr, \j -> mizSetLociOcc(a, j, true));
+	{
+		pa = mizLastPattern(a, noAggregate);
+		pa.formNr ::= a.inf.curNr;
+		mizInPos(a.inf);
+		mizInWord(a.inf);
+		fori(1, a.dPrimLength, \k ->
+			pushVector(pa.primTypes, mizCopyTyp(getVectorUnsafe(a.gPrimaries, k))));
+		fori(a.gPrimLength + 1, a.dPrimLength, \k -> { mizSeqInsert(pa.visible, k); {} });
+		mizCheckAccess(a, pa);
+		if (mizLastPattern(a, noStructMode).formNr == 0) pa.formNr ::= 0;
+		pa.constrKind ::= ikTrmAggreg;
+		pa.constrNr ::= mizConstrCount(env, coAggregate) + 1;
+		// ConstrTypObj.InitForPattern (correl.pas 1494) copies AND ChangeToLoci
+		lTypPtr0 = mizCopyTyp(lStructTyp);
+		mizWithinTyp(mizChangeToLoci(a), lTypPtr0);
+		absNr = 1 + mizConstrCount(env, coAggregate) - 1 - a.constrBase[coAggregate];
+		c = mizMakeConstr(coAggregate, a.articleId, absNr);
+		iterVector(pa.primTypes, \t -> pushVector(c.primaries, mizCopyTyp(t)));
+		c.typ ::= Some(lTypPtr0);
+		c.aggregBase ::= a.gPrimLength;
+		mizPushConstr(env, c) |> \__ -> {};
+	}
+
+	// restore the situation after the structure mode declaration
+	mizRenewPrimaries(a, a.gPrimLength);
+	mizSetGVarNbr(a, lVarBase);
+	gg.genCount ::= lGenBase;
+
+	// the locus shared by the `abstract` attribute and the selectors
+	mizAppendLocus(a, lStructTyp);
+
+	lAggrColl = mizInitIntSeq(4);
+	lStructColl = mizInitNatSet(4);
+
+	// ---- the prefixes' own field sets ----
+	lPrefColl : Vector<MizNatFunc> = makeVector(sizeVector(lPrefixes) + 1);
+	iterVector(lPrefixes, \pt ->
+		pushVector(lPrefColl, mizCopyNatFunc(mizConstr(env, coStructMode, pt.modNr).fields)));
+
+	// ---- the forgetful functor ----
+	a.gDefPos ::= a.eh.curPos;
+	pForget = mizMakePattern(noForgetFunctor, mizAbsNotatNr(a, noForgetFunctor),
+		a.articleId);
+	mizNotatInsertExt(a.gen, pForget);
+	{
+		pf = mizLastPattern(a, noForgetFunctor);
+		pf.formNr ::= a.inf.curNr;
+		mizInPos(a.inf);
+		mizInWord(a.inf);
+		fori(1, a.dPrimLength, \k ->
+			pushVector(pf.primTypes, mizCopyTyp(getVectorUnsafe(a.gPrimaries, k))));
+		mizSeqInsert(pf.visible, a.dPrimLength) |> \__ -> {};
+		pf.constrKind ::= ikTrmSubAgreg;
+		pf.constrNr ::= mizConstrCount(env, coStructMode) + 1;
+	}
+
+	// ---- the selector functors ----
+	lSelFuncNr = ref 0;
+	clearVector(a.gSelectRepresentation);
+	lStructSelectors = mizInitNatSet(8);
+	while(\ -> a.inf.curKind == ikTrmSelector, \ -> {
+		pSel = mizAGetPattern(a, noSelector);
+		if (mizNatElemNr(lStructSelectors, pSel.formNr) >= 0)
+			mizAErrImm(a, errFieldHomonimy);
+		mizNatInsertElem(lStructSelectors, pSel.formNr);
+		mizCheckAccess(a, pSel);
+		mizInWord(a.inf);
+		lSelFuncNr := ^lSelFuncNr + 1;
+		lSelectorTyp = getVectorUnsafe(lSelectFuncTyp, ^lSelFuncNr);
+		mizWithinTyp(mizSetStructW(a), lSelectorTyp);
+		// try to find the field among the prefixes
+		lSelectorNr = ref 0;
+		found = ref false;
+		pn = ref 0;
+		while(\ -> !^found && ^pn < sizeVector(lPrefixes), \ -> {
+			lPrefNr = ^pn;
+			fvv = mizFixedVarAt(a, gg.varNbr);
+			fvv.typ ::= mizCopyTyp(getVectorUnsafe(lPrefixes, lPrefNr));
+			lFuncArgs0 = MizTrmElem(mizNewVarTrm(ikTrmConstant, gg.varNbr), MizTrmNil());
+			r = mizAnalyzeSelector(a, lFuncArgs0, pSel.formNr);
+			if (r.first != 0) {
+				lSelectorNr := r.first;
+				mizSetSelectRep(a, ^lSelFuncNr,
+					Some(mizNewLocFuncTrm(ikTrmSelector, r.first, r.second)));
+				lSelectTyp = switch (mizConstr(env, coSelector, r.first).typ) {
+					Some(ct): mizInstTyp(env, ct, r.second);
+					None(): mizNewIncorTyp();
+				};
+				a.gSuperfluous ::= 0;
+				mizWithinTyp(mizChangeToConst(a), lSelectorTyp);
+				if (!mizEqTyp(env, lSelectorTyp, lSelectTyp))
+					mizAErrImm(a, errFieldTypeInconsistent);
+				// the same field must agree in every LATER prefix too
+				fori(lPrefNr + 1, sizeVector(lPrefixes) - 1, \llPrefNr -> {
+					mizSetGVarNbr(a, gg.varNbr + 1);
+					fv2 = mizFixedVarAt(a, gg.varNbr);
+					fv2.ident ::= 0;
+					fv2.typ ::= mizCopyTyp(getVectorUnsafe(lPrefixes, llPrefNr));
+					lFuncArgs1 = MizTrmElem(mizNewVarTrm(ikTrmConstant, gg.varNbr),
+						MizTrmNil());
+					r2 = mizAnalyzeSelector(a, lFuncArgs1, pSel.formNr);
+					mizSetGVarNbr(a, gg.varNbr - 1);
+					if (r2.first != 0) {
+						if (^lSelectorNr == r2.first) {
+							llSelectTyp = switch (mizConstr(env, coSelector, ^lSelectorNr).typ) {
+								Some(ct2): mizInstTyp(env, ct2, r2.second);
+								None(): mizNewIncorTyp();
+							};
+							mizWithinTyp(mizRenewConst(a), llSelectTyp);
+							if (!mizEqTyp(env, lSelectorTyp, llSelectTyp))
+								mizAErrImm(a, errFieldTypeInconsistent);
+							mizNatDeleteElem(getVectorUnsafe(lPrefColl, llPrefNr),
+								^lSelectorNr);
+						} else mizAErrImm(a, errFieldHomonimy);
+					}
+				});
+				mizNatDeleteElem(getVectorUnsafe(lPrefColl, lPrefNr), ^lSelectorNr);
+				found := true;
+			}
+			pn := ^pn + 1;
+		});
+		if (!^found) {
+			// a NEW selector
+			pSel.constrKind ::= ikTrmSelector;
+			pSel.constrNr ::= mizConstrCount(env, coSelector) + 1;
+			mizNotatInsertExt(a.gen, pSel);
+			absNr = 1 + mizConstrCount(env, coSelector) - 1 - a.constrBase[coSelector];
+			c = mizMakeConstr(coSelector, a.articleId, absNr);
+			iterVector(pSel.primTypes, \t -> pushVector(c.primaries, mizCopyTyp(t)));
+			cty = mizCopyTyp(lSelectorTyp);
+			mizWithinTyp(mizChangeToLoci(a), cty);
+			c.typ ::= Some(cty);
+			lSelectorNr := mizPushConstr(env, c);
+		}
+		// remember the locus -> selector recoding, for SetStruct
+		mizSetSelectorNr(a, ^lSelFuncNr, ^lSelectorNr);
+		mizNatInsertElem(lStructColl, ^lSelectorNr);
+		mizSeqInsert(lAggrColl, ^lSelectorNr) |> \__ -> {};
+	});
+
+	// ---- the prefixes must be exhausted ----
+	fori(0, sizeVector(lPrefixes) - 1, \lPrefNr -> {
+		if (mizNatCount(getVectorUnsafe(lPrefColl, lPrefNr)) != 0)
+			mizAErrImm(a, errIncompletePrefix);
+		mizWithinTyp(mizChangeToLoci(a), getVectorUnsafe(lPrefixes, lPrefNr));
+	});
+
+	// ---- the selector collection into the aggregate constructor ----
+	cAggr = mizConstr(env, coAggregate, mizConstrCount(env, coAggregate));
+	mizSeqClear(cAggr.aggrFields);
+	fori(0, mizSeqCount(lAggrColl) - 1, \i ->
+		{ mizSeqInsert(cAggr.aggrFields, mizSeqValue(lAggrColl, i)); {} });
+	{
+		absNr = 1 + mizConstrCount(env, coStructMode) - 1 - a.constrBase[coStructMode];
+		psc = mizLastPattern(a, noStructMode);
+		c = mizMakeConstr(coStructMode, a.articleId, absNr);
+		iterVector(psc.primTypes, \t -> pushVector(c.primaries, mizCopyTyp(t)));
+		mizNatDeleteAll(c.fields);
+		mizNatEnlargeBy(c.fields, lStructColl);
+		c.structModeAggrNr ::= mizConstrCount(env, coAggregate);
+		iterVector(lPrefixes, \t -> pushVector(c.prefixes, t));
+		mizPushConstr(env, c) |> \__ -> {};
+	}
+
+	// ---- the `abstract` attribute ----
+	a.gDefPos ::= lStructPos;
+	pAttr = mizMakePattern(noAttribute, mizAbsNotatNr(a, noAttribute), a.articleId);
+	mizNotatInsertExt(a.gen, pAttr);
+	lTypPtr = mizCopyTyp(lStructTyp);
+	lAbsNrAttr = 1 + mizConstrCount(env, coAttribute) - 1 - a.constrBase[coAttribute];
+	cAttr = ref mizMakeConstr(coAttribute, a.articleId, lAbsNrAttr);
+	{
+		pat = mizLastPattern(a, noAttribute);
+		pat.formNr ::= 1;                              // "abstract"
+		pat.antonymic ::= false;
+		fori(1, a.dPrimLength, \k ->
+			pushVector(pat.primTypes, mizCopyTyp(getVectorUnsafe(a.gPrimaries, k))));
+		mizSeqInsert(pat.visible, mizFixedVarAt(a, gg.varNbr).skelConstNr) |> \__ -> {};
+		pat.constrKind ::= ikFrmAttr;
+		pat.constrNr ::= mizConstrCount(env, coAttribute) + 1;
+		c = mizMakeConstr(coAttribute, a.articleId, lAbsNrAttr);
+		iterVector(pat.primTypes, \t -> pushVector(c.primaries, mizCopyTyp(t)));
+		cat = mizCopyTyp(lTypPtr);
+		mizWithinTyp(mizChangeToLoci(a), cat);
+		c.typ ::= Some(cat);
+		c.properties ::= bitOr(c.properties, bitShl(1, syAbstractness));
+		mizPushConstr(env, c) |> \__ -> {};
+		cAttr := c;
+	}
+
+	// ---- the existential registration ----
+	lClusterPtr = mizNewEmptyCluster();
+	mizAttrCollInsert(env, lClusterPtr,
+		MizAttr(1, mizConstrCount(env, coAttribute),
+			mizFormalArgs(a.dPrimLength - 1), false, 0));
+	lTypList = mizCreateLociList(a, 1, a.dPrimLength - 1);
+	lTyp1 = mizCopyTyp(lTypPtr);
+	lAbsRegNr = 1 + sizeVector(a.clusters.registered)
+		+ sizeVector(a.clusters.registeredExt) - a.regClusterBase;
+	rc = mizRegisterRCluster(a, lAbsRegNr, lClusterPtr, lTypList, lTyp1);
+	mizInsertRClusterExt(a.clusters, rc);
+	switch (mizConstr(env, coAggregate, mizConstrCount(env, coAggregate)).typ) {
+		Some(at): {
+			at.lower ::= lClusterPtr;
+			at.upper ::= mizCopyCluster(lClusterPtr);
+		}
+		None(): {}
+	}
+	// restore the situation after the structure mode declaration
+	mizRenewPrimaries(a, a.gPrimLength);
+	mizSetGVarNbr(a, lVarBase);
+	gg.genCount ::= lGenBase;
+
+	// the ATTRIBUTE goes first — it must be known before any cluster holding
+	// it is read, or CompAttr's comparison faults (analyzer.pas 3020)
+	mizVOutConstructor(a.out, ^cAttr, mizConstrCount(env, coAttribute));
+	mizVOutConstructor(a.out, mizConstr(env, coStructMode,
+		mizConstrCount(env, coStructMode)), mizConstrCount(env, coStructMode));
+	mizVOutConstructor(a.out, mizConstr(env, coAggregate,
+		mizConstrCount(env, coAggregate)), mizConstrCount(env, coAggregate));
+	fori(lOldSelNbr, mizConstrCount(env, coSelector), \k ->
+		mizVOutConstructor(a.out, mizConstr(env, coSelector, k), k));
+	mizVOutElStart0(a.out, "Registration");
+	mizVOutRCluster(a.out, rc);
+	mizVOutElEnd(a.out, "Registration");
+}
+
 // the last pattern of a kind — the one just inserted as EXT
 mizLastPattern(a : MizAnalyzer, kind : int) -> MizPattern {
 	mizNotatAt(a.gen, kind, mizNotatCount(a.gen, kind) - 1);
@@ -4207,6 +4647,23 @@ mizADefinition(a : MizAnalyzer) -> void {
 				\ -> if (a.gSuperfluous != 0 || a.gSpecified || a.gPropertiesOcc)
 					mizInsertFunctor(a),
 				\ -> mizDefFuncTail(a), true);
+		} else if (k == ikItmDefStruct) {
+			// analyzer.pas 6079 — no definiens label, and Correctness /
+			// ProcessProperties still run after DefStruct
+			mizVOutElStart(a.out, "Definition");
+			mizVOutAttr(a.out, "kind", "G");
+			mizVOutAttrEnd(a.out);
+			gn.exportableItem ::= true;
+			gn.constInExportableItemOcc ::= false;
+			mizDefStruct(a);
+			gn.exportableItem ::= false;
+			gn.constInExportableItemOcc ::= false;
+			mizACorrectness(a);
+			mizProcessProperties(a, 71);                       // 'G'
+			if (a.stoppedAt == 0) {
+				mizDoPatterns(a, notatBase);
+				mizVOutElEnd(a.out, "Definition");
+			}
 		} else if (k == ikItmCanceled) {
 			mizInWord(a.inf);
 			ck = a.inf.curKind;
