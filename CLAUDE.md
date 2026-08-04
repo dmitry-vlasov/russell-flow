@@ -55,6 +55,26 @@ Never hardcode absolute paths to math libraries in `russell.conf` files.
 - JVM stack is 128m (`-Xss128m`) for deep proof-search recursion — don't reduce it
 - `switch` in Flow9 must be exhaustive or have a `default` branch; for datasets outside the project run from the math dir — `mm2ru.rus` uses CWD as import root
 
+## Mizar port (`src/mizar/original/`) — HARD RULES
+This tree is a TRANSCRIPTION of `~/dev/system/{base,kernel}/*.pas`. It is not
+our design, and a discrepancy is a question about the ORIGINAL's logic.
+
+1. **Pascal first.** Before editing anything here, open the Pascal procedure
+   that produces the differing output and read it. Do not reason about the
+   Flow9 code to explain a diff.
+2. **Cite it.** Every fix commit names the `file.pas:line` it transcribes. A
+   fix that cannot cite one is a guess — do not commit it.
+3. **Bucket before fixing.** Never chase byte diffs one article at a time. Run
+   `src/mizar/original/audit/bucket.sh` over the failing set first; the
+   articles cluster into a few causes.
+4. **Suspect the shared units, not the new code.** The analyzer calls 78
+   routines that were ported for the checker only and are exact on 1.4M
+   checker inferences while still being half-implemented for other inputs.
+   `src/mizar/original/audit/callees.py` lists them.
+5. **Port-only machinery is a bug source.** Caches, memos and bounds the
+   original does not have (rounded-type memo, growable arrays where Pascal has
+   fixed ones) diverge silently. Mark them, and turn them off when in doubt.
+
 ## Compact Instructions
 Use `/compact` manually at ~65% context fill — don't wait for auto-compaction.
 When compacting, preserve the handoff strictly in this format:
