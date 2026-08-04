@@ -94,6 +94,50 @@ export {
 		mutable constErr : bool,
 		mutable skListCount : int,
 		mutable skFrstConstNr : int,
+		// gDefNode (analyzer.pas 545)
+		dn : MizDefNode,
+		// DefinitionList / gEssentials (1056)
+		definitionList : Vector<MizDefNodeItem>,
+		mutable gEssentials : MizIntSeq,
+		// gDefiniendumArgs / gDefArgsError (520)
+		mutable definiendumArgs : MizTrmList,
+		mutable defArgsError : bool,
+		mutable constrError : bool,
+		// gCorrCond[k] <> nil in the original is "this condition was generated";
+		// a Flow vector cannot hold nil, so the flag rides beside it
+		corrCondSet : Vector<bool>,
+		// ConstrBase[kind] (Analyze 6660): where the ARTICLE's own
+		// constructors start, so an absolute number can be computed
+		constrBase : [int],
+	);
+
+	// gDefNode's record
+	MizDefNode(
+		mutable meansOccurs : int,     // ' ' / 'm' / 'e'
+		mutable specified : bool,
+		mutable positive : bool,
+		mutable pos1 : MizPos,
+		mutable pos2 : MizPos,
+		mutable kind : int,            // 'R' 'V' 'M' 'K' 'L'
+		mutable labNr : int,
+		mutable labId : int,
+		mutable len : int,
+		primaries : Vector<MizTyp>,
+	);
+
+	// DefNodeObj (analyzer.pas 38) — one entry of DefinitionList
+	MizDefNodeItem(
+		meansOccurs : int,
+		constrKind : int,
+		constrNr : int,
+		skId : int,
+		skLabId : int,
+		def : Maybe<MizDef>,
+		skVarNbr : int,
+		skIt : int,
+		prefix : Maybe<MizRsnEntry>,
+		essentials : MizIntSeq,
+		primaryList : Vector<MizTyp>,
 	);
 
 	CorrCondNbr = 6;
@@ -126,7 +170,12 @@ mizMakeAnalyzer(env : MizCorrelEnv, eh : MizErrHan, clusters : MizClusters,
 		  fori(0, CorrCondNbr, \__ -> pushVector(v, mizNewIncorFrm())); v },
 		MaxArgNbr, 0, 0, 0, mizNewIncorFrm(),
 		MizLevelRec(0, 0, 0, 0, 0, 0, None(), false, None()), 0, 0,
-		false, 0, 0);
+		false, 0, 0,
+		MizDefNode(32, false, false, mizZeroPos, mizZeroPos, 0, 0, 0, 0, makeVector(4)),
+		makeVector(4), mizInitIntSeq(4), MizTrmNil(), false, false,
+		{ v : Vector<bool> = makeVector(CorrCondNbr + 1);
+		  fori(0, CorrCondNbr, \__ -> pushVector(v, false)); v },
+		map(enumFromTo(0, coLAST), \k -> mizConstrCount(env, k) - 1));
 	// the report's own header (Analyze, analyzer.pas 6672)
 	mizVOutString(a.out, "<?xml version=\"1.0\"?>\n");
 	mizVOutString(a.out,
@@ -1921,4 +1970,779 @@ mizAScheme(a : MizAnalyzer) -> void {
 		mizVOutElEnd(a.out, "SchemeBlock");
 	}
 	mizTTCollRelease(env, mark);
+}
+
+// ============ the DEFINITION block (analyzer.pas 458-2710, 5735) ===========
+
+// ChangeBoundAndIt (494) / …It1 (790) / …It2 (811): `it` becomes a bound
+// variable and the existing bound variables shift out of its way
+mizChangeBoundAndItN(itNr : int, inc0 : int) -> MizWithin {
+	mizMakeWithin(\__, t -> {
+		switch (t) {
+			MizBaseTrm(srt, __):
+				if (srt == ikTrmIt) mizNewVarTrm(ikTrmBound, itNr) else t;
+			MizVarTrm(srt, varNr, __, __): {
+				if (srt == ikTrmBound) t.varNr ::= varNr + inc0;
+				t;
+			}
+			default: t;
+		}
+	});
+}
+
+// LociList (507)
+mizLociList(a : MizAnalyzer, len : int) -> MizTrmList {
+	l = ref MizTrmNil();
+	k = ref len;
+	while(\ -> ^k >= a.gSuperfluous + 1, \ -> {
+		l := MizTrmElem(mizNewVarTrm(ikTrmConstant,
+			getVectorUnsafe(a.locusAsConst, ^k)), ^l);
+		k := ^k - 1;
+	});
+	^l;
+}
+
+// CreateConstList (1238) / CreateTrmList (1247)
+mizCreateConstList(a : MizAnalyzer, list : MizIntSeq) -> MizTrmList {
+	l = ref MizTrmNil();
+	k = ref (mizSeqCount(list) - 1);
+	while(\ -> ^k >= 0, \ -> {
+		l := MizTrmElem(mizNewVarTrm(ikTrmConstant,
+			getVectorUnsafe(a.constNr, mizSeqValue(list, ^k))), ^l);
+		k := ^k - 1;
+	});
+	^l;
+}
+
+mizItTyp(a : MizAnalyzer) -> MizTyp { a.env.itTyp; }
+
+// ReNewArgs (601): drop the leading elements past aNbr
+mizReNewArgs(nbr : int, args : MizTrmList) -> MizTrmList {
+	mizDropCells(args, mizTrmListLength(args) - nbr);
+}
+
+mizDefPartials(a : MizAnalyzer) -> Vector<MizPartDef> {
+	switch (a.gDefiniens) {
+		Some(d): switch (d.def) { Some(dd): dd.partials; None(): makeVector(0); };
+		None(): makeVector(0);
+	}
+}
+
+mizDefOtherwise(a : MizAnalyzer) -> Maybe<MizDefBody> {
+	switch (a.gDefiniens) {
+		Some(d): switch (d.def) { Some(dd): dd.otherwise; None(): None(); };
+		None(): None();
+	}
+}
+
+mizDefSort(a : MizAnalyzer) -> int {
+	switch (a.gDefiniens) {
+		Some(d): switch (d.def) { Some(dd): dd.sort; None(): 0; };
+		None(): 0;
+	}
+}
+
+mizBodyAsFrm(a : MizAnalyzer, b : MizDefBody) -> MizFrm {
+	switch (b) {
+		MizDefFrm(f): f;
+		MizDefTrm(t): mizNewEqFrm(a.env, mizNewItTrm(), t);
+	}
+}
+
+// Coherence (573)
+mizCoherence(a : MizAnalyzer, ff : int) -> MizFrm {
+	env = a.env;
+	if (ff == 77) {                    // 'M'
+		p = mizNotatAt(a.gen, noMode, mizNotatCount(a.gen, noMode) - 1);
+		lArgs = mizLociList(a, sizeVector(p.primTypes));
+		c = mizConstr(env, coMode, a.gWhichOne);
+		upper = switch (c.typ) {
+			Some(ct): mizInstCluster(env, ct.upper, lArgs);
+			None(): mizNewEmptyCluster();
+		};
+		oldType = mizNewStandardTyp(ikTypMode, mizNewEmptyCluster(), upper,
+			a.gWhichOne, lArgs);
+		mizNewUniv(oldType, mizNewQualFrm(mizNewVarTrm(ikTrmBound, 1),
+			mizCopyTyp(mizItTyp(a))));
+	} else if (ff == 75) {             // 'K'
+		p = mizNotatAt(a.gen, noFunctor, mizNotatCount(a.gen, noFunctor) - 1);
+		lArgs = mizLociList(a, sizeVector(p.primTypes));
+		mizNewQualFrm(mizNewFuncTrm(a.gWhichOne, lArgs), mizCopyTyp(mizItTyp(a)));
+	} else { mizRunTimeError(2005); mizNewIncorFrm() }
+}
+
+// Compatibility (614)
+mizCompatibility(a : MizAnalyzer, ff : int) -> MizFrm {
+	env = a.env;
+	if (isNone(a.gDefiniens) || a.defArgsError || a.gWhichOne == 0) mizNewIncorFrm()
+	else {
+		args = a.definiendumArgs;
+		lDefiniendum = if (ff == 77) {
+			mizNewQualFrm(mizNewItTrm(), mizNewStandardTyp(ikTypMode,
+				mizNewEmptyCluster(), mizInstCluster(env, mizItTyp(a).upper, args),
+				a.gWhichOne, args));
+		} else if (ff == 75) {
+			n = sizeVector(mizConstr(env, coFunctor, a.gWhichOne).primaries);
+			mizNewEqFrm(env, mizNewItTrm(), mizNewFuncTrm(a.gWhichOne, mizReNewArgs(n, args)));
+		} else if (ff == 82) {         // 'R'
+			mizNewPredFrm(ikFrmPred, a.gWhichOne, args, 0);
+		} else if (ff == 86) {         // 'V'
+			n = sizeVector(mizConstr(env, coAttribute, a.gWhichOne).primaries);
+			mizNewPredFrm(ikFrmAttr, a.gWhichOne, mizReNewArgs(n, args), 0);
+		} else { mizRunTimeError(2006); mizNewIncorFrm() };
+		a.definiendumArgs ::= MizTrmNil();
+		partBiCond = \f -> mizNewBicond(mizCopyFrm(lDefiniendum), mizCopyFrm(f));
+		lOth = ref mizNewVerum();
+		cFrm = ref mizNewVerum();
+		hasOther = isSome(mizDefOtherwise(a));
+		iterVector(mizDefPartials(a), \pd -> {
+			if (hasOther) lOth := mizNewConj(^lOth, mizNewNeg(mizCopyFrm(pd.guard)));
+			lFrm = mizBodyAsFrm(a, pd.body);
+			cFrm := mizNewConj(^cFrm, mizNewImpl(mizCopyFrm(pd.guard), partBiCond(lFrm)));
+		});
+		switch (mizDefOtherwise(a)) {
+			Some(b): cFrm := mizNewConj(^cFrm, mizNewImpl(^lOth, partBiCond(mizBodyAsFrm(a, b))));
+			None(): {}
+		}
+		if (ff == 75 || ff == 77) {
+			mizWithinFrm(mizChangeBoundAndItN(1, 1), ^cFrm);
+			mizNewUniv(mizCopyTyp(mizItTyp(a)), ^cFrm);
+		} else ^cFrm;
+	}
+}
+
+// Consistency (683)
+mizConsistency(a : MizAnalyzer, ff : int) -> MizFrm {
+	env = a.env;
+	if (isNone(a.gDefiniens)) mizNewIncorFrm()
+	else {
+		partials = mizDefPartials(a);
+		mizAssert(2522, sizeVector(partials) != 0);
+		srt = mizDefSort(a);
+		cFrm = ref mizNewVerum();
+		fori(0, sizeVector(partials) - 1, \i -> {
+			pi = getVectorUnsafe(partials, i);
+			fori(i + 1, sizeVector(partials) - 1, \j -> {
+				pj = getVectorUnsafe(partials, j);
+				cFrm2 = mizNewConj(mizCopyFrm(pi.guard), mizCopyFrm(pj.guard));
+				pair = if (srt == 109) {                // 'm'
+					Pair(mizCopyFrm(mizBodyAsFrm(a, pi.body)),
+						mizCopyFrm(mizBodyAsFrm(a, pj.body)));
+				} else {                                 // 'e'
+					mk = \b -> switch (b) {
+						MizDefTrm(t): mizNewEqFrm(env, mizNewItTrm(), mizCopyTrm(t));
+						MizDefFrm(f): mizCopyFrm(f);
+					};
+					Pair(mk(pi.body), mk(pj.body));
+				};
+				eq = mizNewBicond(pair.first, pair.second);
+				cFrm := mizNewConj(^cFrm, mizNewImpl(cFrm2, eq));
+			});
+		});
+		if (ff == 77 || ff == 75) {
+			mizWithinFrm(mizChangeBoundAndItN(1, 1), ^cFrm);
+			mizNewUniv(mizCopyTyp(mizItTyp(a)), ^cFrm);
+		} else ^cFrm;
+	}
+}
+
+// Existence (729)
+mizExistence(a : MizAnalyzer, ff : int) -> MizFrm {
+	if (isNone(a.gDefiniens)) mizNewIncorFrm()
+	else {
+		partExCond = \f0 -> {
+			f = mizCopyFrm(f0);
+			if (mizFrmSort(f) == ikError) f
+			else {
+				mizWithinFrm(mizChangeBoundAndItN(1, 1), f);
+				mizNewExis(mizCopyTyp(mizItTyp(a)), f);
+			}
+		};
+		hasOther = isSome(mizDefOtherwise(a));
+		lOth = ref mizNewVerum();
+		cFrm = ref mizNewVerum();
+		iterVector(mizDefPartials(a), \pd -> {
+			if (hasOther) lOth := mizNewConj(^lOth, mizNewNeg(mizCopyFrm(pd.guard)));
+			cFrm := mizNewConj(^cFrm, mizNewImpl(mizCopyFrm(pd.guard),
+				partExCond(mizBodyAsFrm(a, pd.body))));
+		});
+		switch (mizDefOtherwise(a)) {
+			Some(b): cFrm := mizNewConj(^cFrm,
+				mizNewImpl(^lOth, partExCond(mizBodyAsFrm(a, b))));
+			None(): {}
+		}
+		^cFrm;
+	}
+}
+
+// CoherenceEq (761)
+mizCoherenceEq(a : MizAnalyzer) -> MizFrm {
+	if (isNone(a.gDefiniens)) mizNewIncorFrm()
+	else {
+		mizAssert(2598, mizDefSort(a) == 101);   // 'e'
+		hasOther = isSome(mizDefOtherwise(a));
+		lOth = ref mizNewVerum();
+		cFrm = ref mizNewVerum();
+		trmOf = \b -> switch (b) { MizDefTrm(t): mizCopyTrm(t); MizDefFrm(__): mizNewIncorTrm(); };
+		iterVector(mizDefPartials(a), \pd -> {
+			if (hasOther) lOth := mizNewConj(^lOth, mizNewNeg(mizCopyFrm(pd.guard)));
+			cFrm := mizNewConj(^cFrm, mizNewImpl(mizCopyFrm(pd.guard),
+				mizNewQualFrm(trmOf(pd.body), mizCopyTyp(mizItTyp(a)))));
+		});
+		switch (mizDefOtherwise(a)) {
+			Some(b): cFrm := mizNewConj(^cFrm, mizNewImpl(^lOth,
+				mizNewQualFrm(trmOf(b), mizCopyTyp(mizItTyp(a)))));
+			None(): {}
+		}
+		^cFrm;
+	}
+}
+
+// NewGuard (804) / PartUniCond (825) / Uniqueness (840)
+mizNewGuard(f0 : MizFrm) -> MizFrm {
+	if (mizFrmSort(f0) == ikError) f0
+	else {
+		f = mizCopyFrm(f0);
+		mizWithinFrm(mizChangeBoundAndItN(1, 2), f);
+		f;
+	}
+}
+
+mizPartUniCond(a : MizAnalyzer, f0 : MizFrm) -> MizFrm {
+	if (mizFrmSort(f0) == ikError) f0
+	else {
+		c1 = mizCopyFrm(f0);
+		c2 = mizCopyFrm(f0);
+		mizWithinFrm(mizChangeBoundAndItN(1, 2), c1);
+		mizWithinFrm(mizChangeBoundAndItN(2, 2), c2);
+		mizNewImpl(mizNewConj(c1, c2), mizNewEqFrm(a.env,
+			mizNewVarTrm(ikTrmBound, 1), mizNewVarTrm(ikTrmBound, 2)));
+	}
+}
+
+mizUniqueness(a : MizAnalyzer) -> MizFrm {
+	if (isNone(a.gDefiniens)) mizNewIncorFrm()
+	else {
+		hasOther = isSome(mizDefOtherwise(a));
+		lOth = ref mizNewVerum();
+		cFrm = ref mizNewVerum();
+		iterVector(mizDefPartials(a), \pd -> {
+			if (hasOther) lOth := mizNewConj(^lOth, mizNewNeg(mizNewGuard(pd.guard)));
+			cFrm := mizNewConj(^cFrm, mizNewImpl(mizNewGuard(pd.guard),
+				mizPartUniCond(a, mizBodyAsFrm(a, pd.body))));
+		});
+		switch (mizDefOtherwise(a)) {
+			Some(b): cFrm := mizNewConj(^cFrm,
+				mizNewImpl(^lOth, mizPartUniCond(a, mizBodyAsFrm(a, b))));
+			None(): {}
+		}
+		lTyp = mizCopyTyp(mizItTyp(a));
+		mizNewUniv(mizCopyTyp(lTyp), mizNewUniv(lTyp, ^cFrm));
+	}
+}
+
+// Nr2CorrEl (xmldict.pas)
+mizNr2CorrEl(n : int) -> string {
+	if (n == 1) "Coherence"
+	else if (n == 2) "Compatibility"
+	else if (n == 3) "Consistency"
+	else if (n == 4) "Existence"
+	else if (n == 5) "Uniqueness"
+	else if (n == 6) "Reducibility"
+	else "UnknownCorrCond";
+}
+
+mizCorrCondAt(a : MizAnalyzer, n : int) -> MizFrm { getVectorUnsafe(a.gCorrCond, n); }
+mizSetCorrCond(a : MizAnalyzer, n : int, f : MizFrm) -> void {
+	setVectorUnsafe(a.gCorrCond, n, f);
+}
+mizClearCorrConds(a : MizAnalyzer) -> void {
+	fori(1, CorrCondNbr, \k -> setVectorUnsafe(a.gCorrCond, k, mizNewVerum()));
+	fori(1, CorrCondNbr, \k -> setVectorUnsafe(a.corrCondSet, k, false));
+}
+
+// Correctness (865)
+mizACorrectness(a : MizAnalyzer) -> void {
+	while(\ -> a.inf.curKind == 89 && a.stoppedAt == 0, \ -> {     // 'Y'
+		nr = a.inf.curNr;
+		mizInPos(a.inf);
+		mizAssert(2514, getVectorUnsafe(a.corrCondSet, nr) || nr == 0);
+		mizVOutElStart0(a.out, mizNr2CorrEl(nr));
+		mizAJustify(a, 0, 0, mizCorrCondAt(a, nr));
+		if (nr != 0) setVectorUnsafe(a.corrCondSet, nr, false);
+		mizVOutElEnd(a.out, mizNr2CorrEl(nr));
+	});
+	if (a.inf.curKind == ikItmCorrectness && a.stoppedAt == 0) {
+		mizVOutElStart0(a.out, "Correctness");
+		mizInPos(a.inf);
+		cFrm = ref mizNewVerum();
+		fori(1, CorrCondNbr, \k -> {
+			if (getVectorUnsafe(a.corrCondSet, k)) {
+				cFrm := mizNewConj(^cFrm, mizCorrCondAt(a, k));
+				mizVOutElStart0(a.out, mizNr2CorrEl(k));
+				mizVOutFormula(a.out, mizCorrCondAt(a, k));
+				mizVOutElEnd(a.out, mizNr2CorrEl(k));
+			}
+		});
+		mizAJustify(a, 0, 0, ^cFrm);
+		mizVOutElEnd(a.out, "Correctness");
+	}
+}
+
+// -------------------- patterns and constructors (1090-1420) ---------------
+
+// ChangeToLoci (correl.pas 1372): a constant of this definition becomes its
+// locus. gDefBase is the analyzer's own OpenDef mark.
+mizChangeToLoci(a : MizAnalyzer) -> MizWithin {
+	mizMakeWithin(\__, t -> {
+		switch (t) {
+			MizVarTrm(srt, varNr, __, __): {
+				if (srt == ikTrmConstant && varNr > a.gDefBase
+					&& mizFixedVarAt(a, varNr).skelConstNr != 0) {
+					t.sort ::= ikTrmLocus;
+					t.varNr ::= mizFixedVarAt(a, varNr).skelConstNr;
+				}
+				t;
+			}
+			default: t;
+		}
+	});
+}
+
+// SetLociOcc (91)
+mizSetLociOccW(a : MizAnalyzer) -> MizWithin {
+	mizMakeWithin(\__, t -> {
+		switch (t) {
+			MizVarTrm(srt, varNr, __, __): {
+				if (srt == ikTrmLocus) mizSetLociOcc(a, varNr, true);
+				t;
+			}
+			default: t;
+		}
+	});
+}
+
+mizSetLociOcc(a : MizAnalyzer, i : int, b : bool) -> void {
+	while(\ -> sizeVector(a.lociOcc) <= i, \ -> pushVector(a.lociOcc, false));
+	setVectorUnsafe(a.lociOcc, i, b);
+}
+mizLociOccAt(a : MizAnalyzer, i : int) -> bool {
+	if (i < sizeVector(a.lociOcc)) getVectorUnsafe(a.lociOcc, i) else false;
+}
+
+// AdjustedType (correl.pas 3184): the type with its mode adjusted to the
+// redefinition origin
+mizAdjustedType(env : MizCorrelEnv, t : MizTyp) -> MizTyp {
+	if (t.sort == ikTypMode) {
+		q = mizAdjustTyp(env, t);
+		mizNewStandardTyp(ikTypMode, mizCopyCluster(t.lower), mizCopyCluster(t.upper),
+			q.first, mizCopyTrmList(q.second));
+	} else if (t.sort == ikTypStruct) {
+		mizNewStandardTyp(ikTypStruct, mizCopyCluster(t.lower), mizCopyCluster(t.upper),
+			t.modNr, mizCopyTrmList(t.modArgs));
+	} else if (t.sort == ikError) {
+		mizNewIncorTyp();
+	} else { mizRunTimeError(2133); mizNewIncorTyp() }
+}
+
+// AbsNotatNr (1116)
+mizAbsNotatNr(a : MizAnalyzer, nk : int) -> int {
+	1 + mizNotatCount(a.gen, nk) - getVectorUnsafe(a.gen.notatBase, nk);
+}
+
+// ReadPattern (1102)
+mizAReadPattern(a : MizAnalyzer) -> Pair<int, MizIntSeq> {
+	formNr = a.inf.curNr;
+	mizInPos(a.inf);
+	vis = mizInitIntSeq(4);
+	mizInWord(a.inf);
+	while(\ -> a.inf.curKind != 59, \ -> {
+		mizSeqInsert(vis, a.inf.curNr);
+		mizInWord(a.inf);
+	});
+	Pair(formNr, vis);
+}
+
+// GetPattern (1121)
+mizAGetPattern(a : MizAnalyzer, kind : int) -> MizPattern {
+	p = mizMakePattern(kind, mizAbsNotatNr(a, kind), a.articleId);
+	rp = mizAReadPattern(a);
+	p.formNr ::= rp.first;
+	fori(0, mizSeqCount(rp.second) - 1, \k -> { mizSeqInsert(p.visible, mizSeqValue(rp.second, k)); {} });
+	fori(1, a.dPrimLength, \k ->
+		pushVector(p.primTypes, mizCopyTyp(getVectorUnsafe(a.gPrimaries, k))));
+	// the visible list is remapped from constant numbers to loci
+	fori(0, mizSeqCount(p.visible) - 1, \k -> {
+		v = mizSeqValue(p.visible, k);
+		if (v != 0) mizSeqAtPut(p.visible, k, mizFixedVarAt(a, v).skelConstNr)
+		else { mizSeqAtPut(p.visible, k, 0); p.formNr ::= 0; }
+	});
+	p;
+}
+
+mizInitAccess(a : MizAnalyzer) -> void {
+	fori(0, sizeVector(a.lociOcc) - 1, \i -> setVectorUnsafe(a.lociOcc, i, false));
+}
+
+// CheckAccess (1145) — every locus must be reachable from the visible ones
+mizCheckAccess(a : MizAnalyzer, p : MizPattern) -> void {
+	mizInitAccess(a);
+	if (p.formNr != 0) {
+		fori(0, mizSeqCount(p.visible) - 1, \k -> {
+			v = mizSeqValue(p.visible, k);
+			if (v != 0) mizSetLociOcc(a, v, true);
+		});
+		stop = ref false;
+		i = ref (sizeVector(p.primTypes) - 1);
+		while(\ -> !^stop && ^i >= 0, \ -> {
+			t = getVectorUnsafe(p.primTypes, ^i);
+			if (t.sort == ikError) { p.formNr ::= 0; stop := true; }
+			else if (!mizLociOccAt(a, ^i + 1)) {
+				p.formNr ::= 0;
+				mizAErrImm(a, 100);
+				stop := true;
+			} else {
+				mizWithinTyp(mizSetLociOccW(a), t);
+				i := ^i - 1;
+			}
+		});
+	}
+}
+
+// the last pattern of a kind — the one just inserted as EXT
+mizLastPattern(a : MizAnalyzer, kind : int) -> MizPattern {
+	mizNotatAt(a.gen, kind, mizNotatCount(a.gen, kind) - 1);
+}
+
+// CompatibleArgs (523)
+mizCompatibleArgs(a : MizAnalyzer, l : int) -> bool {
+	env = a.env;
+	s = a.dPrimLength - l;
+	a.defArgsError ::= false;
+	if (s < 0) { mizAErrImm(a, 107); a.defArgsError ::= true; false }
+	else {
+		ok = ref true;
+		fori(1, l, \i -> {
+			if (^ok) {
+				switch (mizSubstTrmGet(env, i)) {
+					Some(t): switch (t) {
+						MizVarTrm(srt, varNr, __, __): {
+							if (srt == ikTrmConstant && mizFixedVarAt(a, varNr).skelConstNr != 0) {
+								if (mizFixedVarAt(a, varNr).skelConstNr != s + i) {
+									mizAErrImm(a, 109); a.defArgsError ::= true; ok := false;
+								}
+							} else { mizAErrImm(a, 108); a.defArgsError ::= true; ok := false; }
+						}
+						default: { mizAErrImm(a, 108); a.defArgsError ::= true; ok := false; }
+					}
+					None(): { mizAErrImm(a, 108); a.defArgsError ::= true; ok := false; }
+				}
+			}
+		});
+		if (^ok) {
+			args = ref MizTrmNil();
+			i = ref l;
+			while(\ -> ^i >= 1, \ -> {
+				switch (mizSubstTrmGet(env, ^i)) {
+					Some(t): args := MizTrmElem(mizCopyTrm(t), ^args);
+					None(): {}
+				}
+				i := ^i - 1;
+			});
+			a.definiendumArgs ::= ^args;
+		}
+		^ok;
+	}
+}
+
+// ReadDefiniens (960)
+mizAReadDefiniens(a : MizAnalyzer, negate : bool, prim : Vector<MizTyp>,
+		typ : Maybe<MizTyp>) -> void {
+	env = a.env;
+	dn = a.dn;
+	dn.meansOccurs ::= 32;      // ' '
+	dn.specified ::= false;
+	a.gDefiniens ::= None();
+	k0 = a.inf.curKind;
+	if (k0 == 109 || k0 == 101) {      // 'm' / 'e'
+		dn.meansOccurs ::= k0;
+		mizInWord(a.inf);
+		lLabId = mizInInt(a.inf);
+		dn.pos1 ::= a.eh.curPos;
+		clearVector(dn.primaries);
+		fori(1, dn.len, \k -> pushVector(dn.primaries,
+			mizCopyTyp(getVectorUnsafe(prim, k - 1))));
+		switch (typ) {
+			Some(t0): {
+				dn.specified ::= true;
+				t = mizAdjustedType(env, t0);
+				mizWithinTyp(mizChangeToLoci(a), t);
+				pushVector(dn.primaries, t);
+			}
+			None(): {}
+		}
+		dn.labNr ::= a.inf.curNr;
+		dn.labId ::= lLabId;
+		dn.pos2 ::= mizInPos(a.inf);
+		mizInWord(a.inf);
+		defSort = a.inf.curKind;
+		rawPartials : Vector<Pair<MizExp, MizExp>> = makeVector(2);
+		mizInWord(a.inf);
+		while(\ -> a.inf.curKind != 59, \ -> {
+			body = if (defSort == 109) mizLoadFormula(a.inf) else mizLoadTerm(a.inf);
+			guard = mizLoadFormula(a.inf);
+			pushVector(rawPartials, Pair(body, guard));
+			mizInWord(a.inf);
+		});
+		mizInWord(a.inf);
+		rawOther : Maybe<MizExp> = if (a.inf.curKind == 110) None()      // 'n'
+			else if (a.inf.curKind == 111) {                              // 'o'
+				Some(if (defSort == 109) mizLoadFormula(a.inf) else mizLoadTerm(a.inf));
+			} else { mizRunTimeError(2520); None() };
+		// analyse the pieces in the same order the original does
+		partials : Vector<MizPartDef> = makeVector(sizeVector(rawPartials));
+		iterVector(rawPartials, \pr -> {
+			body : MizDefBody = if (defSort == 109)
+				MizDefFrm({ mizASetBVN(a, 0); mizReadSentenceExp(a, pr.first, negate) })
+				else MizDefTrm(mizAnalyzeTermTop(a, pr.first));
+			guard = { mizASetBVN(a, 0); mizReadSentenceExp(a, pr.second, false) };
+			pushVector(partials, MizPartDef(body, guard));
+		});
+		otherwise : Maybe<MizDefBody> = switch (rawOther) {
+			None(): None();
+			Some(e): Some(if (defSort == 109)
+				MizDefFrm({ mizASetBVN(a, 0); mizReadSentenceExp(a, e, negate) })
+				else MizDefTrm(mizAnalyzeTermTop(a, e)));
+		};
+		def = MizDef(defSort, partials, otherwise);
+		a.gDefiniens ::= Some(MizDefiniens(dn.kind, 0, a.articleId, 0,
+			makeVector(0), mizInitIntSeq(0), mizNewVerum(), Some(def)));
+		// the local-constant check over the definiens
+		a.constErr ::= false;
+		iterVector(partials, \pd -> {
+			switch (pd.body) {
+				MizDefFrm(f): mizWithinFrm(mizCheckLocConst(a), f);
+				MizDefTrm(t): { mizWithinTrm(mizCheckLocConst(a), t); {} }
+			}
+			mizWithinFrm(mizCheckLocConst(a), pd.guard);
+		});
+		switch (otherwise) {
+			Some(b): switch (b) {
+				MizDefFrm(f): mizWithinFrm(mizCheckLocConst(a), f);
+				MizDefTrm(t): { mizWithinTrm(mizCheckLocConst(a), t); {} }
+			}
+			None(): {}
+		}
+		if (a.constErr) {
+			mizAErrImm(a, 69);
+			a.gDefiniens ::= Some(MizDefiniens(ikError, 0, a.articleId, 0,
+				makeVector(0), mizInitIntSeq(0), mizNewIncorFrm(), None()));
+		}
+		if (sizeVector(mizDefPartials(a)) != 0) {
+			mizSetCorrCond(a, 3, mizConsistency(a, dn.kind));
+			setVectorUnsafe(a.corrCondSet, 3, true);
+		}
+		if (a.gRedef) {
+			mizSetCorrCond(a, 2, mizCompatibility(a, dn.kind));
+			setVectorUnsafe(a.corrCondSet, 2, true);
+		}
+		mizInWord(a.inf);
+	}
+}
+
+// AnalyzeSnt (944) over an already-loaded expression
+mizReadSentenceExp(a : MizAnalyzer, e : MizExp, neg : bool) -> MizFrm {
+	f = mizAnalyzeFrm(a.gen, e);
+	if (neg) mizNewNeg(f) else f;
+}
+
+// WriteDefiniens (1075)
+mizAWriteDefiniens(a : MizAnalyzer) -> void {
+	dn = a.dn;
+	if (dn.meansOccurs != 32) {
+		a.gEssentials ::= mizInitIntSeq(4);
+		fori(a.gSuperfluous + 1, dn.len, \k -> { mizSeqInsert(a.gEssentials, k); {} });
+		if (dn.specified) { mizSeqInsert(a.gEssentials, dn.len + 1); {} }
+		skIt0 = a.gen.g.genCount;
+		skIt = if (dn.kind == 82 || dn.kind == 86) skIt0 else skIt0 + 1;
+		prims : Vector<MizTyp> = makeVector(sizeVector(dn.primaries));
+		iterVector(dn.primaries, \t -> pushVector(prims, t));
+		pushVector(a.definitionList, MizDefNodeItem(dn.meansOccurs, dn.kind,
+			a.gWhichOne, dn.labNr, dn.labId,
+			switch (a.gDefiniens) { Some(d): d.def; None(): None(); },
+			mizGVarNbr(a), skIt, a.gen.g.lastEntry,
+			mizCopyIntSeq(a.gEssentials), prims));
+	}
+}
+
+// WriteDefiniensLabel (560)
+mizAWriteDefiniensLabel(a : MizAnalyzer) -> void {
+	if (a.dn.meansOccurs != 32) {
+		mizVOutIntAttr(a.out, "nr", a.dn.labNr);
+		mizVOutIntAttr(a.out, "vid", a.dn.labId);
+		mizVOutPosAsAttrs(a.out, a.dn.pos2);
+	}
+}
+
+// ------------------------- the PREDICATE definition family (1217-1409) ----
+
+// find the pattern of `kind` whose format matches and whose args type-check,
+// scanning the COMMITTED patterns downwards. Returns its index or -1.
+mizFindOriginPattern(a : MizAnalyzer, kind : int, coKind : int, formNr : int,
+		args : MizTrmList) -> int {
+	env = a.env;
+	res = ref (-1);
+	k = ref (mizNotatCommitted(a.gen, kind) - 1);
+	while(\ -> ^res < 0 && ^k >= 0, \ -> {
+		p = mizNotatAt(a.gen, kind, ^k);
+		if (mizOriginalNr(env, coKind, p.constrNr) == 0 && p.formNr == formNr
+			&& mizCheckTypes(env, p, args)) res := ^k;
+		k := ^k - 1;
+	});
+	^res;
+}
+
+mizResetProperties(a : MizAnalyzer) -> void {
+	gp = a.gProperties;
+	gp.properties ::= 0;
+	gp.firstArg ::= 0;
+	gp.secondArg ::= 0;
+}
+
+// the common tail of Redef*/Notat* pattern procedures: adopt the origin's
+// constructor, superfluous count and properties
+mizAdoptOrigin(a : MizAnalyzer, coKind : int, originNr : int) -> void {
+	env = a.env;
+	c = mizConstr(env, coKind, originNr);
+	a.gWhichOne ::= originNr;
+	a.gSuperfluous ::= a.dPrimLength - sizeVector(c.primaries);
+	gp = a.gProperties;
+	gp.properties ::= c.properties;
+	gp.firstArg ::= c.firstArg + a.gSuperfluous;
+	gp.secondArg ::= c.secondArg + a.gSuperfluous;
+}
+
+// DefPredPattern (1217)
+mizDefPredPattern(a : MizAnalyzer) -> void {
+	mizInPos(a.inf);
+	mizInWord(a.inf);
+	a.gDefPos ::= a.eh.curPos;
+	p = mizAGetPattern(a, noPredicate);
+	mizCheckAccess(a, p);
+	mizNotatInsertExt(a.gen, p);
+	mizInWord(a.inf);
+	p.constrKind ::= ikFrmPred;
+	mizResetProperties(a);
+	a.redefAntonym ::= false;
+	{ dnq1 = a.dn; dnq1.kind ::= 82; }                     // 'R'
+	{ dnq2 = a.dn; dnq2.len ::= sizeVector(p.primTypes); }
+	mizAReadDefiniens(a, false, p.primTypes, None());
+}
+
+// RedefPredPattern (1259)
+mizRedefPredPattern(a : MizAnalyzer) -> void {
+	env = a.env;
+	a.gRedef ::= true;
+	mizInPos(a.inf);
+	mizInWord(a.inf);
+	a.gDefPos ::= a.eh.curPos;
+	p = mizAGetPattern(a, noPredicate);
+	mizCheckAccess(a, p);
+	mizNotatInsertExt(a.gen, p);
+	mizInWord(a.inf);
+	mizResetProperties(a);
+	a.redefAntonym ::= false;
+	mizDisposeSubstTrm(env);
+	p.constrKind ::= ikFrmPred;
+	if (p.formNr != 0) {
+		lArgs = mizCreateConstList(a, p.visible);
+		k = mizFindOriginPattern(a, noPredicate, coPredicate, p.formNr, lArgs);
+		if (k < 0) mizAErrImm(a, 112)
+		else {
+			op = mizNotatAt(a.gen, noPredicate, k);
+			if (op.antonymic) a.redefAntonym ::= true;
+			if (mizCompatibleArgs(a, sizeVector(op.primTypes)))
+				mizAdoptOrigin(a, coPredicate, op.constrNr);
+		}
+	}
+	mizDisposeSubstTrm(env);
+	{ dnq3 = a.dn; dnq3.kind ::= 82; }
+	{ dnq4 = a.dn; dnq4.len ::= sizeVector(p.primTypes); }
+	mizAReadDefiniens(a, a.redefAntonym, p.primTypes, None());
+}
+
+// NotatPredPattern (1315)
+mizNotatPredPattern(a : MizAnalyzer) -> void {
+	env = a.env;
+	a.gRedef ::= true;
+	mizInPos(a.inf);
+	mizInWord(a.inf);
+	a.gDefPos ::= a.eh.curPos;
+	p = mizAGetPattern(a, noPredicate);
+	mizCheckAccess(a, p);
+	mizNotatInsertExt(a.gen, p);
+	mizInWord(a.inf);
+	lSynonym = a.inf.curKind == ikMscSynonym;
+	mizInPos(a.inf);
+	mizInWord(a.inf);
+	origin = mizAGetPattern(a, noPredicate);
+	mizCheckAccess(a, origin);
+	mizInWord(a.inf);
+	mizResetProperties(a);
+	a.redefAntonym ::= false;
+	mizDisposeSubstTrm(env);
+	origin.constrKind ::= ikFrmPred;
+	foundK = ref (-1);
+	if (origin.formNr != 0) {
+		lArgs = mizCreateConstList(a, origin.visible);
+		k = mizFindOriginPattern(a, noPredicate, coPredicate, origin.formNr, lArgs);
+		foundK := k;
+		if (k < 0) mizAErrImm(a, 112)
+		else {
+			op = mizNotatAt(a.gen, noPredicate, k);
+			if (op.antonymic) a.redefAntonym ::= true;
+			if (mizCompatibleArgs(a, sizeVector(op.primTypes))) {
+				o = mizOriginalNr(env, coPredicate, op.constrNr);
+				mizAdoptOrigin(a, coPredicate, if (o == 0) op.constrNr else o);
+			}
+		}
+	}
+	p.constrKind ::= ikFrmPred;
+	p.constrNr ::= a.gWhichOne;
+	p.antonymic ::= lSynonym == a.redefAntonym;
+	p.redefNr ::= ^foundK + 1;
+	mizDisposeSubstTrm(env);
+	{ dnq5 = a.dn; dnq5.kind ::= 82; }
+	{ dnq6 = a.dn; dnq6.len ::= sizeVector(origin.primTypes); }
+	mizAReadDefiniens(a, a.redefAntonym, origin.primTypes, None());
+}
+
+// InsertPredicate (1386) — creates the constructor and reports it
+mizInsertConstructorFor(a : MizAnalyzer, coKind : int, kind : int) -> void {
+	env = a.env;
+	p = mizLastPattern(a, kind);
+	absNr = 1 + mizConstrCount(env, coKind) - 1 - a.constrBase[coKind];
+	c = mizMakeConstr(coKind, a.articleId, absNr);
+	iterVector(p.primTypes, \t -> pushVector(c.primaries, mizCopyTyp(t)));
+	c.properties ::= a.gProperties.properties;
+	c.firstArg ::= a.gProperties.firstArg;
+	c.secondArg ::= a.gProperties.secondArg;
+	c.whichConstrNr ::= a.gWhichOne;
+	c.superfluous ::= a.gSuperfluous;
+	a.gWhichOne ::= mizConstrCount(env, coKind);
+	mizPushConstr(env, c) |> \__ -> {};
+	mizVOutConstructor(a.out, c, a.gWhichOne);
+}
+
+// DefPredTail (1402) / DefAttrTail (1410)
+mizDefPredTail(a : MizAnalyzer) -> void {
+	p = mizLastPattern(a, noPredicate);
+	p.constrNr ::= a.gWhichOne;
+	p.antonymic ::= a.redefAntonym;
+}
+
+mizDefAttrTail(a : MizAnalyzer) -> void {
+	p = mizLastPattern(a, noAttribute);
+	p.constrNr ::= a.gWhichOne;
+	p.antonymic ::= a.redefAntonym;
 }
