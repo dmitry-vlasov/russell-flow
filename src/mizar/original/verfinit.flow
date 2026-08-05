@@ -1,0 +1,196 @@
+// Transcription of ~/dev/system/kernel/verfinit.pas — the verifier DRIVER.
+// MSMVerifyArticle (verfinit.pas 93) runs every pass in ONE process:
+//
+//   {Parser}   InitScanning; InitWSMizarArticle; Parse
+//   {MSM}      MSMAnalyzer; Transfer2Analyzer
+//   {Analyzer} Analyze; DisposeAnalyze
+//   {Checker}  gPrBlockPtr Init; InitPrepData; Prepare
+//
+// with the three restricting options of GetOptions: CheckerOnly (-c) skips
+// straight to the checker over an existing .xml, ParserOnly (-p) stops after
+// Transfer2Analyzer, AnalyzerOnly (-a) stops after Analyze.
+//
+// The passes are INDEPENDENT, exactly as in the original: Analyze builds its
+// own environment (Load_EnvConstructors, analyzer.pas 6658) and the checker's
+// preparation builds its own again (InitPrepData -> Load_EnvConstructors,
+// stdprep.pas 1178). The one thing that flows from the analyzer to the
+// checker is the REPORT — the original hands it over as the .xml file it just
+// wrote; here it is handed over as the same bytes in memory
+// (mizCheckArticleContent).
+//
+// HARNESS LIMITS, deliberate: the original also writes the .frx, .wsx, .msx
+// and .par intermediates (StoreFormats / Write_WSMizArticle / MSMAnalyzer /
+// Transfer2Analyzer). Their byte-exactness is gated separately (M3, M4 slice
+// 1), and the in-memory handoff between the passes is the same data, so this
+// driver writes only what the caller asks for: the analyzer report.
+
+import mizar/original/errhan;
+import mizar/original/scanner;
+import mizar/original/formats;
+import mizar/original/wsm;
+import mizar/original/parseraddition;
+import mizar/original/parser;
+import mizar/original/msm;
+import mizar/original/pragmas;
+import mizar/original/trans2analyzer;
+import mizar/original/correl;
+import mizar/original/correl_patt;
+import mizar/original/roundcl;
+import mizar/original/identify;
+import mizar/original/definientia;
+import mizar/original/schemes;
+import mizar/original/iocorrel;
+import mizar/original/generato;
+import mizar/original/enums;
+import mizar/original/analyzer;
+import mizar/original/prep;
+import net/url_parameter;
+import ds/vector;
+import fs/filesystem;
+import string;
+import loop;
+import runtime;
+
+export {
+	// what one MSMVerifyArticle run produced. `xml` is the analyzer report
+	// ("" when the analyzer pass did not run), `stoppedAt` the port-only
+	// unknown-item-kind scaffold flag of MizAnalyzer (0 = ran to the end),
+	// `stats` the checker verdict (None when the checker pass did not run).
+	MizVerifyRun(
+		eh : MizErrHan,
+		xml : string,
+		stoppedAt : int,
+		stats : Maybe<MizPrepStats>,
+	);
+
+	// MSMVerifyArticle (verfinit.pas 93). mmlDir is the directory holding the
+	// article's .miz and its accommodated environment files; loader supplies
+	// the constructors/registrations environment for both the analyzer and
+	// the checker pass (mizFileEnvLoader for Mizar-accommodated flat files,
+	// mizAccomEnvLoader for prel/).
+	mizMSMVerifyArticle(mmlDir : string, article : string, mizFiles : string,
+		loader : MizEnvLoader,
+		checkerOnly : bool, parserOnly : bool, analyzerOnly : bool) -> MizVerifyRun;
+
+	// LoadSGN (analyzer.pas 6598): the accommodated notations of the `.eno`
+	mizLoadSGN(gen : MizGen, env : MizCorrelEnv, path : string) -> void;
+}
+
+mizLoadSGN(gen : MizGen, env : MizCorrelEnv, path : string) -> void {
+	x = mizXmlInitParsing(getFileContentBinary(path));
+	r = mizMakeVrfReader(x, env);
+	r.mml ::= true;
+	mizXmlNextElementState(x);
+	mizXmlAssert(x.nElName == "Notations");
+	mizXmlNextElementState(x);
+	while(\ -> x.nState != MizEEnd, \ -> {
+		mizXmlAssert(x.nElName == "Pattern");
+		p = mizInPattern(r);
+		pushVector(gen.notat[p.kind], p);
+		// analyzer.pas 6618 — gTermCollection.FreeAll after EVERY pattern, so
+		// the collection is EMPTY when Analyze starts. Without it a term typed
+		// during the environment phase (where LocArgTyp holds that pattern's
+		// loci) survives, and GetTrmType hands the article the stale ROUNDED
+		// type: commacat's first deffunc gained a `non empty` from it.
+		mizTTCollFreeAll(env);
+	});
+	fori(0, mizNotationKindCount - 1, \k ->
+		setVectorUnsafe(gen.notatBase, k, sizeVector(gen.notat[k])));
+}
+
+// the Analyzer pass: Analyze's OWN prologue (analyzer.pas 6655-6690) followed
+// by the item loop. Returns the report and the scaffold flag.
+mizVerfAnalyzerPass(eh : MizErrHan, mmlDir : string, article : string,
+		mizFiles : string, loader : MizEnvLoader, par : string) -> Pair<string, int> {
+	base = mmlDir + "/" + article;
+	env = mizMakeCorrelEnv();
+	clusters = mizMakeClusters();
+	// the original has no rounded-type memo, and the analyzer never clears the
+	// port's — its key is a constant number that changes meaning per block
+	clusters.useRoundMemo ::= false;
+	// the roundcl hooks must be wired BEFORE anything asks for a term's type:
+	// GetTrmType routes a functor term through RoundUpTrmType, and the default
+	// stub returns an incorrect type, which fails every CheckTypes
+	mizWireRoundcl(env, clusters);
+	loader.early(env);
+	idents0 = mizMakeIdentify(env);
+	// ItTyp / NonZeroTyp / gRevReq — Load_EnvConstructors builds them for the
+	// analyzer exactly as for the checker; without NonZeroTyp every numeral
+	// argument fails CheckTypes
+	mizInitReqTypes(env, idents0);
+	loader.clusters(env, clusters);
+	mizInitNonZeroCluster(env);
+	// the environment round-up, exactly as the checker path does it before
+	// reading anything (Load_EnvConstructors / AfterClusters)
+	mizEnvRoundUp(env, clusters);
+	idents = idents0;
+	defs = mizMakeDefinientia();
+	schemes = mizMakeSchemes();
+	gen = mizMakeGen(env, eh, clusters);
+
+	// ---- the rest of Analyze's prologue (analyzer.pas 6677-6686), IN THE
+	// ORIGINAL'S ORDER. Each reader clears gTermCollection after every item,
+	// so nothing one of them types survives into the next.
+	mizLoadSGN(gen, env, base + ".eno");                              // 6677
+	// LoadDefinitions (6681) — the `.dfs` ALONE. LoadEqualities (the `.dfe`)
+	// and LoadExpansions (the `.dfx`) are stdprep.pas 1183/1184, the
+	// CHECKER's preparation, where LoadDefinitions is in turn commented out.
+	mizLoadDefinitions(env, defs, mmlDir, article);                   // 6681
+	// gIdentifications.Init(0) (6682) and gReductions.Init(0) (6683):
+	// Analyze loads NEITHER. LoadIdentify/LoadReductions are stdprep.pas
+	// 1188/1190 — the CHECKER's preparation, a different entry point.
+	// LoadPropertiesReg (6685): the registered sethood properties
+	// FrOpVarTypeOK needs; without them every Fraenkel term over a mode that
+	// is not itself `sethood` reports error 129
+	mizLoadPropertiesReg(env, getFileContent(mmlDir + "/" + article + ".epr")); // 6685
+
+	an = mizMakeAnalyzer(env, eh, clusters, gen, defs, idents, schemes,
+		par, toUpperCase(article), mizFiles);
+	mizAnalyze(an);
+	Pair(mizAnalyzerXml(an), an.stoppedAt);
+}
+
+mizMSMVerifyArticle(mmlDir : string, article : string, mizFiles : string,
+		loader : MizEnvLoader,
+		checkerOnly : bool, parserOnly : bool, analyzerOnly : bool) -> MizVerifyRun {
+	base = mmlDir + "/" + article;
+	eh = mizMakeErrHan();
+	xml = ref "";
+	stoppedAt = ref 0;
+
+	// {------------------ Parsing ------------------------}
+	par = if (!checkerOnly) {
+		sc = mizInitScanning(base + ".miz", base + ".dct");
+		formats = mizLoadFormats(base + ".frm");
+		prf = mizLoadPrf(base + ".prf");
+		p = mizMakeParser(eh, sc, formats, prf, toUpperCase(article), ".miz");
+		mizStartScanner(p);
+		mizCreateBlock(p, mizBlMain);
+		mizParse(p);
+		// {MSM}
+		mizMsmProcessArticle(p.textProper, eh, p.formats);
+		t = mizTransfer2Analyzer(p.textProper, eh, p.formats, mizMakePragmas());
+		mizT2AParContent(t);
+	} else "";
+
+	if (!parserOnly) {
+		// {------------------ Analyser ------------------------}
+		if (!checkerOnly) {
+			r = mizVerfAnalyzerPass(eh, mmlDir, article, mizFiles, loader, par);
+			xml := r.first;
+			stoppedAt := r.second;
+		}
+		// {------------------ Checker ------------------------}
+		if (!analyzerOnly) {
+			// CheckerOnly reads the .xml already on disk; the full chain reads
+			// the report the analyzer pass just produced
+			content = if (checkerOnly) getFileContent(base + ".xml") else ^xml;
+			stats = mizCheckArticleContent(mmlDir, article, loader, content);
+			MizVerifyRun(eh, ^xml, ^stoppedAt, Some(stats));
+		} else {
+			MizVerifyRun(eh, ^xml, ^stoppedAt, None());
+		}
+	} else {
+		MizVerifyRun(eh, ^xml, ^stoppedAt, None());
+	}
+}

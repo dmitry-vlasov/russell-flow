@@ -1,59 +1,16 @@
-// M4 gate 2 — the ANALYZER. Runs the whole chain in one process:
+// M4 gate 2 — the ANALYZER. Runs the chain in one process through the real
+// driver (verfinit.flow, MSMVerifyArticle with AnalyzerOnly set):
 //   .miz --parser--> WSM --MSM--> MSM --Transfer2Analyzer--> .par
 //        --Analyze--> .xml
 // and writes the report to `out=<file>` for a byte compare against
 // ~/mizar_oracle/m4ref/<article>.xml.
 
-import mizar/original/errhan;
-import mizar/original/scanner;
-import mizar/original/formats;
-import mizar/original/wsm;
-import mizar/original/parseraddition;
-import mizar/original/parser;
-import mizar/original/msm;
-import mizar/original/pragmas;
-import mizar/original/trans2analyzer;
-import mizar/original/correl;
-import mizar/original/correl_patt;
-import mizar/original/roundcl;
-import mizar/original/identify;
-import mizar/original/definientia;
-import mizar/original/schemes;
-import mizar/original/iocorrel;
-import mizar/original/generato;
-import mizar/original/enums;
-import mizar/original/analyzer;
-import mizar/original/prep;
+import mizar/original/verfinit;
 import net/url_parameter;
-import ds/vector;
 import sys/system;
 import fs/filesystem;
 import string;
-import loop;
 import runtime;
-
-// LoadSGN (analyzer.pas 6598): the accommodated notations of `.eno`
-mizLoadSGN(gen : MizGen, env : MizCorrelEnv, path : string) -> void {
-	x = mizXmlInitParsing(getFileContentBinary(path));
-	r = mizMakeVrfReader(x, env);
-	r.mml ::= true;
-	mizXmlNextElementState(x);
-	mizXmlAssert(x.nElName == "Notations");
-	mizXmlNextElementState(x);
-	while(\ -> x.nState != MizEEnd, \ -> {
-		mizXmlAssert(x.nElName == "Pattern");
-		p = mizInPattern(r);
-		pushVector(gen.notat[p.kind], p);
-		// analyzer.pas 6618 — gTermCollection.FreeAll after EVERY pattern, so
-		// the collection is EMPTY when Analyze starts. Without it a term typed
-		// during the environment phase (where LocArgTyp holds that pattern's
-		// loci) survives, and GetTrmType hands the article the stale ROUNDED
-		// type: commacat's first deffunc gained a `non empty` from it.
-		mizTTCollFreeAll(env);
-	});
-	fori(0, mizNotationKindCount - 1, \k ->
-		setVectorUnsafe(gen.notatBase, k, sizeVector(gen.notat[k])));
-}
 
 main() {
 	mmlRoot = getUrlParameterDef("mml", "/home/dmitry/dev/math/MML-test");
@@ -61,77 +18,16 @@ main() {
 	a = getUrlParameterDef("article", "xboole_0");
 	out = getUrlParameterDef("out", "/tmp/port.xml");
 	mizFiles = getUrlParameterDef("mizfiles", "/usr/local/share/mizar/");
-	base = mml + "/" + a;
 
-	eh = mizMakeErrHan();
+	r = mizMSMVerifyArticle(mml, a, mizFiles, mizFileEnvLoader(mml, a),
+		false, false, true); // AnalyzerOnly
 
-	// ---- M3: parse and run the MSM step ----
-	sc = mizInitScanning(base + ".miz", base + ".dct");
-	formats = mizLoadFormats(base + ".frm");
-	prf = mizLoadPrf(base + ".prf");
-	p = mizMakeParser(eh, sc, formats, prf, toUpperCase(a), ".miz");
-	mizStartScanner(p);
-	mizCreateBlock(p, mizBlMain);
-	mizParse(p);
-	mizMsmProcessArticle(p.textProper, eh, p.formats);
-
-	// ---- M4 slice 1: the `.par` ----
-	t = mizTransfer2Analyzer(p.textProper, eh, p.formats, mizMakePragmas());
-	par = mizT2AParContent(t);
-
-	// ---- the environment the analyzer reads ----
-	env = mizMakeCorrelEnv();
-	clusters = mizMakeClusters();
-	// the original has no rounded-type memo, and the analyzer never clears the
-	// port's — its key is a constant number that changes meaning per block
-	clusters.useRoundMemo ::= false;
-	// the roundcl hooks must be wired BEFORE anything asks for a term's type:
-	// GetTrmType routes a functor term through RoundUpTrmType, and the default
-	// stub returns an incorrect type, which fails every CheckTypes
-	mizWireRoundcl(env, clusters);
-	loader = mizFileEnvLoader(mml, a);
-	loader.early(env);
-	idents0 = mizMakeIdentify(env);
-	// ItTyp / NonZeroTyp / gRevReq — Load_EnvConstructors builds them for the
-	// analyzer exactly as for the checker; without NonZeroTyp every numeral
-	// argument fails CheckTypes
-	mizInitReqTypes(env, idents0);
-	loader.clusters(env, clusters);
-	mizInitNonZeroCluster(env);
-	// the environment round-up, exactly as the checker path does it before
-	// reading anything (Load_EnvConstructors / AfterClusters)
-	mizEnvRoundUp(env, clusters);
-	idents = idents0;
-	defs = mizMakeDefinientia();
-	schemes = mizMakeSchemes();
-	gen = mizMakeGen(env, eh, clusters);
-
-	// ---- the rest of Analyze's prologue (analyzer.pas 6677-6686), IN THE
-	// ORIGINAL'S ORDER. Each reader clears gTermCollection after every item,
-	// so nothing one of them types survives into the next.
-	mizLoadSGN(gen, env, base + ".eno");                              // 6677
-	// LoadDefinitions (6681) — the `.dfs` ALONE. LoadEqualities (the `.dfe`)
-	// and LoadExpansions (the `.dfx`) are stdprep.pas 1183/1184, the
-	// CHECKER's preparation, where LoadDefinitions is in turn commented out.
-	mizLoadDefinitions(env, defs, mml, a);                            // 6681
-	// gIdentifications.Init(0) (6682) and gReductions.Init(0) (6683):
-	// Analyze loads NEITHER. LoadIdentify/LoadReductions are stdprep.pas
-	// 1188/1190 — the CHECKER's preparation, a different entry point.
-	// LoadPropertiesReg (6685): the registered sethood properties
-	// FrOpVarTypeOK needs; without them every Fraenkel term over a mode that
-	// is not itself `sethood` reports error 129
-	mizLoadPropertiesReg(env, getFileContent(mml + "/" + a + ".epr")); // 6685
-
-	an = mizMakeAnalyzer(env, eh, clusters, gen, defs, idents, schemes,
-		par, toUpperCase(a), mizFiles);
-	mizAnalyze(an);
-
-	ok = setFileContentBytes(out, mizAnalyzerXml(an));
+	ok = setFileContentBytes(out, r.xml);
 	if (!ok) println("cannot write " + out);
-	if (an.stoppedAt != 0) println("stopped at kind " + i2s(an.stoppedAt));
+	if (r.stoppedAt != 0) println("stopped at kind " + i2s(r.stoppedAt));
 	if (getUrlParameterDef("errs", "") == "1") {
-		println("errors " + i2s(eh.errorNbr));
-		print(mizErrors2s(eh));
+		println("errors " + i2s(r.eh.errorNbr));
+		print(mizErrors2s(r.eh));
 	}
 	quit(0);
 }
