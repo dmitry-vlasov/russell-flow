@@ -41,21 +41,21 @@ export {
 	MizAnyCluster ::= MizRCluster, MizFCluster, MizCCluster;
 
 	MizClusters(
-		registered : Vector<MizRCluster>,
-		// FunctorCluster is an MSortedExtList: Items stay in INSERTION order and
-		// a separate fIndex gives the CmpFuncCluster order. Iteration over
-		// Items^[k] (the env round-up, the equalizer, the accommodator) is
-		// INSERTION order; only FindInterval/AtIndex (correl.pas 1123,
-		// analyzer.pas 6168) go through the index.
-		functor : Vector<MizFCluster>,        // Items — INSERTION order
-		functorIndex : Vector<int>,           // fIndex — CmpFuncCluster order
-		conditional : Vector<MizCCluster>,
-		// the EXT tail of the three MExtLists (mobjects.pas 1002): a cluster
-		// the analyzer registers inside a block is PENDING — the rounding
-		// never sees it until CloseDef commits it (AddExtItems)
-		registeredExt : Vector<MizRCluster>,
-		functorExt : Vector<MizFCluster>,
-		conditionalExt : Vector<MizCCluster>,
+		// correl.pas 470-472. THE REGISTRIES ARE THE ORIGINAL'S CONTAINERS:
+		// RegisteredCluster is an MExtList, FunctorCluster an MSortedExtList,
+		// ConditionalCluster an MCondClList (an MExtList whose AddExtObject
+		// also indexes the antecedent — roundcl.pas 132).
+		//   * the EXT TAIL: a registration the analyzer makes inside a block
+		//     is PENDING and the rounding does not see it until CloseDef
+		//     commits it (AddExtItems).
+		//   * FunctorCluster keeps TWO ORDERS: Items in INSERTION order —
+		//     what the env round-up (iocorrel.pas 3318), the equalizer
+		//     (equalizer.pas 2078) and the accommodator (acc_han.pas 1005)
+		//     walk — and fIndex in CmpFuncCluster order, which ONLY
+		//     FindInterval/AtIndex (correl.pas 1123, analyzer.pas 6168) use.
+		registered : MizExtList<MizRCluster>,
+		functor : MizSortedExtList<MizFCluster>,
+		conditional : MizExtList<MizCCluster>,
 		// nAttrClusters[neg][adjusted attr nr] -> set of conditional indices
 		condIndexPos : Vector<MizNatFunc>,    // index = adjusted attr nr
 		condIndexNeg : Vector<MizNatFunc>,
@@ -101,7 +101,7 @@ export {
 	// MExtList.InsertExt / AddExtItems over the three cluster registries
 	mizInsertRClusterExt(cl : MizClusters, r : MizRCluster) -> void;
 	mizInsertCClusterExt(cl : MizClusters, c : MizCCluster) -> void;
-	mizInsertFClusterExt(cl : MizClusters, f : MizFCluster) -> void;
+	mizInsertFClusterExt(env : MizCorrelEnv, cl : MizClusters, f : MizFCluster) -> void;
 	mizClustersAddExtItems(env : MizCorrelEnv, cl : MizClusters) -> void;
 
 	// wire the rounding hooks of the env to these registries
@@ -151,8 +151,12 @@ export {
 }
 
 mizMakeClusters() -> MizClusters {
-	MizClusters(makeVector(16), makeVector(16), makeVector(16), makeVector(16),
-		makeVector(8), makeVector(8), makeVector(8),
+	MizClusters(mizNewExtList(16),
+		// the comparison is refreshed from the current environment at every
+		// insert and every search (mizFClusterCompare); CmpFuncCluster reads
+		// the constructor table, which the original has as a global.
+		mizNewSortedExtList(16, \a : MizFCluster, b : MizFCluster -> 0),
+		mizNewExtList(16),
 		makeVector(64), makeVector(64), mizInitIntSeq(16), 0, 0, 0,
 		makeVector(8), makeVector(8), makeVector(8), 0, makeTree(), true,
 		s2i(getUrlParameterDef("dbg-round", "0")), 0, 0);
@@ -165,7 +169,7 @@ mizWireRoundcl(env : MizCorrelEnv, cl : MizClusters) -> void {
 }
 
 mizInsertRCluster(cl : MizClusters, r : MizRCluster) -> void {
-	pushVector(cl.registered, r);
+	mizExtListInsert(cl.registered, r);
 }
 
 mizCondIndex(cl : MizClusters, neg : int) -> Vector<MizNatFunc> {
@@ -178,15 +182,21 @@ mizCondIndexAt(cl : MizClusters, neg : int, adjNr : int) -> MizNatFunc {
 	getVectorUnsafe(idx, adjNr);
 }
 
-// MCondClList.AddExtObject: index the antecedent attrs, record the fire count
+// MCondClList.Insert (roundcl.pas 154) = InsertExt + AddExtObject
 mizInsertCCluster(env : MizCorrelEnv, cl : MizClusters, c : MizCCluster) -> void {
 	if (mizTryAllDbg()) println("CCL " + c.article + ":" + i2s(c.absNr)
 		+ " ante=[" + mizCluster2s(c.antecedent) + "]"
 		+ " cons=[" + mizCluster2s(c.consequent.upper) + "]"
 		+ " typ=" + mizFullTyp2s(c.clusterType)
 		+ " prims=" + strGlue(map(vector2array(c.primaries), mizFullTyp2s), " "));
-	pushVector(cl.conditional, c);
-	nr = sizeVector(cl.conditional) - 1;
+	mizExtListInsert(cl.conditional, c);
+	mizIndexCCluster(env, cl, c, mizExtListCount(cl.conditional) - 1);
+}
+
+// The rest of MCondClList.AddExtObject (roundcl.pas 132): the committed
+// cluster's number goes into the slot of every attribute of its antecedent,
+// and its antecedent's size is the initial fire count.
+mizIndexCCluster(env : MizCorrelEnv, cl : MizClusters, c : MizCCluster, nr : int) -> void {
 	iterVector(c.antecedent.items, \a -> {
 		mizNatInsertElem(mizCondIndexAt(cl, a.neg, mizAdjustedAttrNr(env, a)), nr);
 	});
@@ -214,67 +224,65 @@ mizCmpFuncTrm(env : MizCorrelEnv, a : MizTrm, b : MizTrm) -> int {
 	}
 }
 
-// sorted insert into the functor registry
+// MExtList.InsertExt over the three registries (mobjects.pas 1002)
 mizInsertRClusterExt(cl : MizClusters, r : MizRCluster) -> void {
-	pushVector(cl.registeredExt, r);
+	mizExtListInsertExt(cl.registered, r);
 }
 mizInsertCClusterExt(cl : MizClusters, c : MizCCluster) -> void {
-	pushVector(cl.conditionalExt, c);
+	mizExtListInsertExt(cl.conditional, c);
 }
-mizInsertFClusterExt(cl : MizClusters, f : MizFCluster) -> void {
-	pushVector(cl.functorExt, f);
+mizInsertFClusterExt(env : MizCorrelEnv, cl : MizClusters, f : MizFCluster) -> void {
+	mizFClusterCompare(env, cl);
+	mizSortedExtListInsertExt(cl.functor, f);
 }
 
-// AddExtItems for the three registries: a pending cluster joins through the
-// ordinary insert, which is what maintains the port's own indices (the
-// original folds it into the sorted fIndex through AddExtObject)
+// AddExtItems (mobjects.pas 1058/1236, roundcl.pas 151). RegisteredCluster
+// only moves the boundary; ConditionalCluster's own AddExtObject also indexes
+// the antecedent (roundcl.pas 132); FunctorCluster's threads the item's
+// position into fIndex through FindRight.
 mizClustersAddExtItems(env : MizCorrelEnv, cl : MizClusters) -> void {
-	iterVector(cl.registeredExt, \r -> mizInsertRCluster(cl, r));
-	clearVector(cl.registeredExt);
-	iterVector(cl.conditionalExt, \c -> mizInsertCCluster(env, cl, c));
-	clearVector(cl.conditionalExt);
-	iterVector(cl.functorExt, \f -> mizInsertFCluster(env, cl, f));
-	clearVector(cl.functorExt);
+	mizExtListAddExtItems(cl.registered);
+	while(\ -> mizExtListExtCount(cl.conditional) > 0, \ -> {
+		c = mizExtListAtExt(cl.conditional, mizExtListCount(cl.conditional));
+		mizExtListAddExtObject(cl.conditional);
+		mizIndexCCluster(env, cl, c, mizExtListCount(cl.conditional) - 1);
+	});
+	mizFClusterCompare(env, cl);
+	mizSortedExtListAddExtItems(cl.functor);
 }
 
-// MSortedExtList.Insert -> InsertExt + AddExtObject (mobjects.pas 1148/1224):
-// the item is APPENDED to Items and its raw position threaded into fIndex at
-// the FindRight place — after every equal key, so within a group of equal keys
-// the index order IS the insertion order.
+// CmpFuncCluster (correl.pas 1697) needs the constructor table, which the
+// original reads from a global. Refresh the container's comparison with the
+// current environment before any insert or search goes through fIndex.
+mizFClusterCompare(env : MizCorrelEnv, cl : MizClusters) -> void {
+	fc = cl.functor;
+	fc.compare ::= \a : MizFCluster, b : MizFCluster ->
+		mizCmpFuncTrm(env, a.clusterTerm, b.clusterTerm);
+}
+
+// MSortedExtList.Insert -> InsertExt + AddExtObject (mobjects.pas 1148/1224)
 mizInsertFCluster(env : MizCorrelEnv, cl : MizClusters, f : MizFCluster) -> void {
-	pushVector(cl.functor, f);
-	raw = sizeVector(cl.functor) - 1;
-	pos = ref sizeVector(cl.functorIndex);
-	while(\ -> ^pos > 0 && mizCmpFuncTrm(env,
-			mizFClusterAt(cl, ^pos - 1).clusterTerm, f.clusterTerm) > 0,
-		\ -> pos := ^pos - 1);
-	mizVectorAtInsert(cl.functorIndex, ^pos, raw);
+	mizFClusterCompare(env, cl);
+	mizSortedExtListInsert(cl.functor, f);
 }
 
 // AtIndex (mobjects.pas 1141) — Items^[fIndex^[i]]
 mizFClusterAt(cl : MizClusters, i : int) -> MizFCluster {
-	getVectorUnsafe(cl.functor, getVectorUnsafe(cl.functorIndex, i));
+	mizSortedExtListAtIndex(cl.functor, i);
 }
 
-// FindInterval: [left, right] of functor clusters whose term compares 0
+// FindInterval (mobjects.pas 1128) — a BINARY search over fIndex, inclusive
+// on both ends. It is a binary search over an order that the original never
+// re-sorts, so it must stay one: a linear scan is not the same function once
+// the order is stale.
 mizFClusterInterval(env : MizCorrelEnv, cl : MizClusters, t : MizTrm) -> Maybe<Pair<int, int>> {
-	// the bounds are positions IN fIndex — every read goes through AtIndex
-	n = sizeVector(cl.functorIndex);
-	left = ref -1;
-	fori(0, n - 1, \i -> {
-		if (^left < 0 && mizCmpFuncTrm(env, mizFClusterAt(cl, i).clusterTerm, t) == 0) {
-			left := i;
-		}
-	});
-	if (^left < 0) {
-		None();
-	} else {
-		right = ref ^left;
-		while(\ -> ^right + 1 < n && mizCmpFuncTrm(env,
-				mizFClusterAt(cl, ^right + 1).clusterTerm, t) == 0,
-			\ -> right := ^right + 1);
-		Some(Pair(^left, ^right));
-	}
+	mizFClusterCompare(env, cl);
+	// FindInterval keys on a CLUSTER, and CmpFuncCluster compares the cluster
+	// TERMS; the key is the sought term wrapped in a throw-away registration.
+	key = MizFCluster("", 0, makeVector(0),
+		MizClusterRec(MizAttrColl(makeVector(0), true), MizAttrColl(makeVector(0), true)), t, None());
+	r = mizSortedExtListFindInterval(cl.functor, key);
+	if (r.first) Some(Pair(r.second, r.third)) else None();
 }
 
 // EnlargeBy under the loci substitution: insert instantiated copies
@@ -430,7 +438,7 @@ mizTryRounding(env : MizCorrelEnv, cond : MizCCluster, typ : MizTyp,
 mizRoundUpCluster(env : MizCorrelEnv, cl : MizClusters,
 		cluster : MizAttrColl, typ : MizTyp) -> void {
 	cl.nRoundCluster ::= cl.nRoundCluster + 1;
-	nCond = sizeVector(cl.conditional);
+	nCond = mizExtListCount(cl.conditional);
 	if (nCond > 0) {
 		// this recursion level's scratch buffers (grown once, then reused)
 		depth = cl.scratchDepth;
@@ -513,7 +521,7 @@ mizRoundUpCluster(env : MizCorrelEnv, cl : MizClusters,
 			last = getVectorUnsafe(jobStack, sizeVector(jobStack) - 1);
 			removeVector(jobStack, sizeVector(jobStack) - 1);
 			setVectorUnsafe(inJobs, last, false);
-			if (mizTryRounding(env, getVectorUnsafe(cl.conditional, last), typ, cluster)) {
+			if (mizTryRounding(env, mizExtListAt(cl.conditional, last), typ, cluster)) {
 				cur := handleUsageAndFire((^cur).first, (^cur).second);
 			}
 		});
@@ -842,7 +850,7 @@ mizConstrTypRoundUp(env : MizCorrelEnv, cl : MizClusters, c : MizConstr) -> void
 
 mizEnvRoundUp(env : MizCorrelEnv, cl : MizClusters) -> void {
 	// registered clusters: every primary type, then the consequent
-	iterVector(cl.registered, \r -> {
+	iter(mizExtListItems(cl.registered), \r -> {
 		if (mizTryAllDbg()) println("RCL " + i2s(r.absNr) + " " + r.article
 			+ " cons=[" + mizCluster2s(r.consequent.upper) + "]"
 			+ " typ=" + mizFullTyp2s(r.clusterType)
@@ -863,7 +871,7 @@ mizEnvRoundUp(env : MizCorrelEnv, cl : MizClusters) -> void {
 	});
 	// functor clusters: the consequent is enlarged by the cluster type's own
 	// upper cluster (the term's rounded type when no type is given)
-	iterVector(cl.functor, \f -> {
+	iter(mizSortedExtListItems(cl.functor), \f -> {
 		if (mizTryAllDbg()) println("FCL " + f.article + ":" + i2s(f.absNr)
 			+ " trm=" + mizTrm2s(f.clusterTerm)
 			+ " cons=[" + mizCluster2s(f.consequent.upper) + "]"
