@@ -344,6 +344,12 @@ export {
 	// CompTrms family — the canonical order used by sorted collections.
 	// Honors env.strictCompare exactly as gStrictCompare does.
 	mizCompTrms(env : MizCorrelEnv, a : MizTrm, b : MizTrm) -> int;
+	// the REST of the CompTrms family (correl.pas 2360-2510) — the ADJUSTING
+	// comparators CompTrms recurses into. NOT the size-first Compare* family.
+	mizCompClusters(env : MizCorrelEnv, a : MizAttrColl, b : MizAttrColl) -> int;
+	mizCompTyps(env : MizCorrelEnv, a : MizTyp, b : MizTyp) -> int;
+	mizCompTypColls(env : MizCorrelEnv, a : Vector<MizTyp>, b : Vector<MizTyp>) -> int;
+	mizCompFrms(env : MizCorrelEnv, a : MizFrm, b : MizFrm) -> int;
 	mizCompTrmLists(env : MizCorrelEnv, a : MizTrmList, b : MizTrmList) -> int;
 	mizCompAbsAttr(env : MizCorrelEnv, a : MizAttr, b : MizAttr) -> int;   // adjusted nr + args
 	mizCompAttr(env : MizCorrelEnv, a : MizAttr, b : MizAttr) -> int;      // + neg
@@ -1716,6 +1722,130 @@ mizAsFlexFrm(f : MizFrm) -> MizFlexFrm {
 
 // ---------------- CompTrms family + sorted cluster insert ----------------
 
+// CompClusters (correl.pas 2360): count, then per-item CompAttr — the
+// ADJUSTED attribute number plus the sign, item by item in stored order.
+mizCompClusters(env : MizCorrelEnv, a : MizAttrColl, b : MizAttrColl) -> int {
+	c = mizCmpInt(sizeVector(a.items), sizeVector(b.items));
+	if (c != 0) {
+		c;
+	} else {
+		res = ref 0;
+		i = ref 0;
+		while(\ -> ^i < sizeVector(a.items) && ^res == 0, \ -> {
+			res := mizCompAttr(env, getVectorUnsafe(a.items, ^i),
+				getVectorUnsafe(b.items, ^i));
+			i := ^i + 1;
+		});
+		^res;
+	}
+}
+
+// CompTyps (correl.pas 2394): sort, RAW mode number (the adjusting variant is
+// commented out in the original), the LOWER cluster ONLY — never the upper,
+// which is what rounding mutates — then the mode arguments.
+mizCompTyps(env : MizCorrelEnv, a : MizTyp, b : MizTyp) -> int {
+	c1 = mizCmpInt(a.sort, b.sort);
+	if (c1 != 0) c1
+	else {
+		c2 = mizCmpInt(a.modNr, b.modNr);
+		if (c2 != 0) c2
+		else {
+			c3 = mizCompClusters(env, a.lower, b.lower);
+			if (c3 != 0) c3
+			else mizCompTrmLists(env, a.modArgs, b.modArgs);
+		}
+	}
+}
+
+// CompTypColls (correl.pas 2375)
+mizCompTypColls(env : MizCorrelEnv, a : Vector<MizTyp>, b : Vector<MizTyp>) -> int {
+	c = mizCmpInt(sizeVector(a), sizeVector(b));
+	if (c != 0) {
+		c;
+	} else {
+		res = ref 0;
+		i = ref 0;
+		while(\ -> ^i < sizeVector(a) && ^res == 0, \ -> {
+			res := mizCompTyps(env, getVectorUnsafe(a, ^i), getVectorUnsafe(b, ^i));
+			i := ^i + 1;
+		});
+		^res;
+	}
+}
+
+// CompFrms (correl.pas 2426). Pred and Attr formulas compare ADJUSTED unless
+// gStrictCompare; SchPred and PrivPred always raw. No LocPred skipping — the
+// original compares a PrivPred by its number directly.
+mizCompFrms(env : MizCorrelEnv, fa : MizFrm, fb : MizFrm) -> int {
+	c0 = mizCmpInt(mizFrmSort(fa), mizFrmSort(fb));
+	if (c0 != 0) {
+		c0;
+	} else {
+		switch (fa) {
+			MizUniqFrm(__): 0; // Verum / Thesis / Error
+			MizNegFrm(arg, __): {
+				nb = mizAsNegFrm(fb);
+				mizCompFrms(env, arg, nb.arg);
+			}
+			MizQualFrm(trm, typ, __): {
+				qb = mizAsQualFrm(fb);
+				c = mizCompTrms(env, trm, qb.trm);
+				if (c != 0) c else mizCompTyps(env, typ, qb.typ);
+			}
+			MizConjFrm(conjuncts, __): {
+				cb = mizAsConjFrm(fb);
+				c = mizCmpInt(sizeVector(conjuncts), sizeVector(cb.conjuncts));
+				if (c != 0) {
+					c;
+				} else {
+					res = ref 0;
+					i = ref 0;
+					while(\ -> ^i < sizeVector(conjuncts) && ^res == 0, \ -> {
+						res := mizCompFrms(env, getVectorUnsafe(conjuncts, ^i),
+							getVectorUnsafe(cb.conjuncts, ^i));
+						i := ^i + 1;
+					});
+					^res;
+				}
+			}
+			MizPredFrm(srt, predNr, args, __): {
+				pb = mizAsPredFrm(fb);
+				if (srt == ikFrmAttr && !env.strictCompare) {
+					pa2 = mizAdjustAttrFrm(env, fa |> mizAsPredFrm);
+					pb2 = mizAdjustAttrFrm(env, pb);
+					c = mizCmpInt(pa2.first, pb2.first);
+					if (c != 0) c else mizCompTrmLists(env, pa2.second, pb2.second);
+				} else if (srt == ikFrmPred && !env.strictCompare) {
+					pa2 = mizAdjustFrm(env, fa |> mizAsPredFrm);
+					pb2 = mizAdjustFrm(env, pb);
+					c = mizCmpInt(pa2.first, pb2.first);
+					if (c != 0) c else mizCompTrmLists(env, pa2.second, pb2.second);
+				} else {
+					// ikFrmSchPred always; Attr/Pred under gStrictCompare
+					c = mizCmpInt(predNr, pb.predNr);
+					if (c != 0) c else mizCompTrmLists(env, args, pb.args);
+				}
+			}
+			// ikFrmPrivPred rides PredFrmPtr in the original (2453) — raw
+			// number and arguments; the port gives it its own record
+			MizLocPredFrm(predNr, args, __, __): {
+				lb = mizAsLocPredFrm(fb);
+				c = mizCmpInt(predNr, lb.predNr);
+				if (c != 0) c else mizCompTrmLists(env, args, lb.args);
+			}
+			MizUnivFrm(__, __, quantified, scope, __): {
+				ub = mizAsUnivFrm(fb);
+				c = mizCompTyps(env, quantified, ub.quantified);
+				if (c != 0) c else mizCompFrms(env, scope, ub.scope);
+			}
+			default: {
+				mizRunTimeError(2049);
+				0;
+			}
+		}
+	}
+}
+
 mizCompTrms(env : MizCorrelEnv, ta : MizTrm, tb : MizTrm) -> int {
 	a = if (env.strictCompare) ta else mizSkipPrivFunc(ta);
 	b = if (env.strictCompare) tb else mizSkipPrivFunc(tb);
@@ -1746,38 +1876,31 @@ mizCompTrms(env : MizCorrelEnv, ta : MizTrm, tb : MizTrm) -> int {
 				c = mizCmpInt(funcNr, pb2.funcNr);
 				if (c != 0) c else mizCompTrmLists(env, args, pb2.args);
 			}
+			// CompTrms recurses into ITS OWN family — CompTypColls / CompFrms /
+			// CompTyps (correl.pas 2560-2573), the ADJUSTING comparators —
+			// never into the size-first Compare* family (868-1017). The port
+			// used to call mizCompareTyps/mizCompareFrms here, so two Fraenkel
+			// terms differing in a redefined constructor number, a PrivFunc
+			// wrapper, or an upper cluster compared UNEQUAL where the original
+			// says EQUAL — and EnlargeBy kept a duplicate adjective (friends1).
+			// The field order is the original's: LambdaArgs, scope, compr.
 			MizFraenkelTrm(lambdaArgs, scope, compr, __, __, __): {
 				kb = mizAsFraenkelTrm2(b);
-				c = mizCompTrms(env, scope, kb.scope);
+				c = mizCompTypColls(env, lambdaArgs, kb.lambdaArgs);
 				if (c != 0) c
 				else {
-					c2 = mizCompareFrms(compr, kb.compr);
-					if (c2 != 0) c2
-					else {
-						c3 = mizCmpInt(sizeVector(lambdaArgs), sizeVector(kb.lambdaArgs));
-						if (c3 != 0) {
-							c3;
-						} else {
-							res = ref 0;
-							i = ref 0;
-							while(\ -> ^i < sizeVector(lambdaArgs) && ^res == 0, \ -> {
-								res := mizCompareTyps(getVectorUnsafe(lambdaArgs, ^i),
-									getVectorUnsafe(kb.lambdaArgs, ^i));
-								i := ^i + 1;
-							});
-							^res;
-						}
-					}
+					c2 = mizCompTrms(env, scope, kb.scope);
+					if (c2 != 0) c2 else mizCompFrms(env, compr, kb.compr);
 				}
 			}
 			MizChoiceTrm(typ, __, __): {
 				hb = mizAsChoiceTrm2(b);
-				mizCompareTyps(typ, hb.choiceTyp);
+				mizCompTyps(env, typ, hb.choiceTyp);
 			}
 			MizQuaTrm(trmProper, qua, __, __): {
 				qb = mizAsQuaTrm2(b);
 				c = mizCompTrms(env, trmProper, qb.trmProper);
-				if (c != 0) c else mizCompareTyps(qua, qb.qua);
+				if (c != 0) c else mizCompTyps(env, qua, qb.qua);
 			}
 			MizBaseTrm(srt, __): 0; // It / Error
 		}
