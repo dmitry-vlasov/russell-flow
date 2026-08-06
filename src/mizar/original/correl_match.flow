@@ -55,22 +55,38 @@ mizSubstTrmGet(env : MizCorrelEnv, k : int) -> Maybe<MizTrm> {
 	getVectorDef(env.substTrm, k, None());
 }
 
+// THE write path for gSubstTrm. It keeps env.substMask exact; see the field's
+// comment in correl.flow. Anything that writes substTrm directly must either
+// come through here or fix the mask itself.
 mizSubstTrmSet(env : MizCorrelEnv, k : int, t : Maybe<MizTrm>) -> void {
 	setVectorUnsafe(env.substTrm, k, t);
+	bit = bitShl(1, k);
+	env.substMask ::= if (isSome(t)) bitOr(env.substMask, bit)
+		else bitAnd(env.substMask, bitNot(bit));
 }
 
 // DisposeSubstTrm — clear every slot. Tail-recursive rather than fori: it runs
 // once per TryRounding and per pattern match, and the closure showed up at
 // 3.6% of samples over the MML.
-mizDisposeSubstFrom(v : Vector<Maybe<MizTrm>>, k : int, n : int) -> void {
-	if (k < n) {
-		if (isSome(getVectorUnsafe(v, k))) setVectorUnsafe(v, k, None());
-		mizDisposeSubstFrom(v, k + 1, n);
+mizDisposeSubstFrom(v : Vector<Maybe<MizTrm>>, k : int, n : int, filled : int) -> void {
+	if (filled != 0 && k < n) {
+		bit = bitShl(1, k);
+		if (bitAnd(filled, bit) != 0) {
+			setVectorUnsafe(v, k, None());
+			mizDisposeSubstFrom(v, k + 1, n, bitXor(filled, bit));
+		} else {
+			mizDisposeSubstFrom(v, k + 1, n, filled);
+		}
 	}
 }
 
+// DisposeSubstTrm — clear every slot. The mask says which ones those are, so
+// an already-empty substitution costs one int test.
 mizDisposeSubstTrm(env : MizCorrelEnv) -> void {
-	mizDisposeSubstFrom(env.substTrm, 1, sizeVector(env.substTrm));
+	if (env.substMask != 0) {
+		mizDisposeSubstFrom(env.substTrm, 1, sizeVector(env.substTrm), env.substMask);
+		env.substMask ::= 0;
+	}
 }
 
 mizCreateArgList(env : MizCorrelEnv, len : int) -> MizTrmList {
@@ -159,9 +175,13 @@ mizEsTrm(env : MizCorrelEnv, f0 : MizTrm, a : MizTrm) -> bool {
 							mizEsTrmList(env, args, fa.args);
 						} else {
 							ff : MizFuncTrm = mizEsAsFunc(f0);
-							p1 = mizAdjustTrm(env, ff);
-							p2 = mizAdjustTrm(env, fa);
-							p1.first == p2.first && mizEsTrmList(env, p1.second, p2.second);
+							// as in CompTrms: the adjusted numbers decide first
+							mizAdjustedFuncNr(env, ff) == mizAdjustedFuncNr(env, fa)
+							&& {
+								p1 = mizAdjustTrm(env, ff);
+								p2 = mizAdjustTrm(env, fa);
+								mizEsTrmList(env, p1.second, p2.second);
+							}
 						}
 					} else {
 						funcNr == fa.funcNr && mizEsTrmList(env, args, fa.args);
@@ -658,6 +678,7 @@ mizEsAsUniv(f : MizFrm) -> MizUnivFrm {
 mizRestoreSubst(env : MizCorrelEnv, snap : Vector<Maybe<MizTrm>>) -> void {
 	clearVector(env.substTrm);
 	iterVector(snap, \m -> pushVector(env.substTrm, m));
+	env.substMask ::= mizSnapshotSubstFrom(env.substTrm, 1, sizeVector(env.substTrm), 0);
 }
 
 // is_SethoodType (identify.pas 643): some REGISTERED sethood property covers

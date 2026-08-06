@@ -20,6 +20,7 @@ import ds/vector;
 import loop;
 import math/math;
 import math/bits;
+import net/url_parameter;
 import mizar/original/errhan;
 import mizar/original/mobjects;
 import mizar/original/lexicon;
@@ -164,6 +165,13 @@ export {
 		mutable itTyp : MizTyp,              // ItTyp
 		mutable nonZeroTyp : MizTyp,         // NonZeroTyp (numeral type)
 		substTrm : Vector<Maybe<MizTrm>>,    // gSubstTrm[1..2*MaxArgNbr]; slot 0 dummy
+		// WHICH slots of substTrm are filled, as a bitmask. gSubstTrm is a
+		// FIXED 27 entries, so the whole set fits in one int. It is an exact
+		// mirror of substTrm — every write goes through mizSubstTrmSet,
+		// mizDisposeSubstTrm, mizRestoreSubst or the undo below — and it makes
+		// the snapshot free and the usual undo (nothing was bound) an int test.
+		// `subst-check=1` re-derives it and compares, to prove it stays exact.
+		mutable substMask : int,
 		mutable itIsChecker : bool,          // ItIsChecker
 		// RoundUpTrmType hook: set by the equalizer support (functor-cluster
 		// rounding); defaults to plain CopyTrmType-based typing
@@ -322,7 +330,9 @@ export {
 	// AdjustTrm/AdjustTyp/AdjustAttr/AdjustFrm: map through redefinitions.
 	// Returned pair: (adjusted nr, argument list with superfluous skipped).
 	mizAdjustTrm(env : MizCorrelEnv, t : MizFuncTrm) -> Pair<int, MizTrmList>;
+	mizAdjustedFuncNr(env : MizCorrelEnv, t : MizFuncTrm) -> int;   // the guard half
 	mizAdjustTyp(env : MizCorrelEnv, t : MizTyp) -> Pair<int, MizTrmList>;
+	mizAdjustedModNr(env : MizCorrelEnv, t : MizTyp) -> int;   // the guard half
 	mizAdjustAttr(env : MizCorrelEnv, a : MizAttr) -> Pair<int, MizTrmList>;
 	mizAdjustedAttrNr(env : MizCorrelEnv, a : MizAttr) -> int;
 	mizAdjustFrm(env : MizCorrelEnv, f : MizPredFrm) -> Pair<int, MizTrmList>;
@@ -359,6 +369,8 @@ export {
 	// which is what the verifier's hottest loop (mizAttrCollIsSubsetOf) did
 	// per candidate: 31% of all samples over the MML.
 	mizSnapshotSubst(env : MizCorrelEnv) -> int;
+	// re-derive the mask from substTrm itself (mizRestoreSubst, subst-check)
+	mizSnapshotSubstFrom(v : Vector<Maybe<MizTrm>>, k : int, n : int, acc : int) -> int;
 	mizResetNewerSubst(env : MizCorrelEnv, snap : int) -> void;
 	mizResetNewerSubstUpTo(env : MizCorrelEnv, snap : int, upto : int) -> void;
 	mizCompAbsAttr(env : MizCorrelEnv, a : MizAttr, b : MizAttr) -> int;   // adjusted nr + args
@@ -479,6 +491,7 @@ mizMakeCorrelEnv() -> MizCorrelEnv {
 			fori(0, 26, \__ -> pushVector(st, None())); // 2*MaxArgNbr + dummy 0
 			st;
 		},
+		0,
 		false,
 		\e, __ -> mizNewIncorTyp(), // replaced by roundcl wiring
 		\__, __, __ -> {},          // replaced by roundcl wiring
@@ -1186,12 +1199,30 @@ mizCompareTrms(ta : MizTrm, tb : MizTrm) -> int {
 
 // ---------------- adjusted access ----------------
 
+// the ADJUSTED FUNCTOR NUMBER alone (AdjustedFuncNr, correl.pas 3452) — the
+// guard half of AdjustTrm, without the Pair and without dropping arguments
+mizAdjustedFuncNr(env : MizCorrelEnv, t : MizFuncTrm) -> int {
+	c = mizConstr(env, coFunctor, t.funcNr);
+	if (c.whichConstrNr != 0) c.whichConstrNr else t.funcNr;
+}
+
 mizAdjustTrm(env : MizCorrelEnv, t : MizFuncTrm) -> Pair<int, MizTrmList> {
 	c = mizConstr(env, coFunctor, t.funcNr);
 	if (c.whichConstrNr != 0) {
 		Pair(c.whichConstrNr, mizTrmListDrop(t.args, c.superfluous));
 	} else {
 		Pair(t.funcNr, t.args);
+	}
+}
+
+// the ADJUSTED MODE NUMBER alone — the guard half of AdjustTyp, without the
+// Pair and without dropping the superfluous arguments. AdjustedNr (correl.pas
+// 3441) is exactly this half.
+mizAdjustedModNr(env : MizCorrelEnv, t : MizTyp) -> int {
+	if (t.sort == ikTypStruct) t.modNr
+	else {
+		c = mizConstr(env, coMode, t.modNr);
+		if (c.whichConstrNr != 0) c.whichConstrNr else t.modNr;
 	}
 }
 
@@ -1296,9 +1327,12 @@ mizEqTrm(env : MizCorrelEnv, ta : MizTrm, tb : MizTrm) -> bool {
 				fb = mizAsFuncTrm(b);
 				if (srt == ikTrmFunctor) {
 					fa2 = mizAsFuncTrm(a);
-					pa = mizAdjustTrm(env, fa2);
-					pb = mizAdjustTrm(env, fb);
-					pa.first == pb.first && mizEqTrmList(env, pa.second, pb.second);
+					mizAdjustedFuncNr(env, fa2) == mizAdjustedFuncNr(env, fb)
+					&& {
+						pa = mizAdjustTrm(env, fa2);
+						pb = mizAdjustTrm(env, fb);
+						mizEqTrmList(env, pa.second, pb.second);
+					}
 				} else {
 					funcNr == fb.funcNr && mizEqTrmList(env, args, fb.args);
 				}
@@ -1875,10 +1909,15 @@ mizCompTrms(env : MizCorrelEnv, ta : MizTrm, tb : MizTrm) -> int {
 					if (c != 0) c else mizCompTrmLists(env, args, fb.args);
 				} else {
 					fa2 = mizAsFuncTrm2(a);
-					pa = mizAdjustTrm(env, fa2);
-					pb = mizAdjustTrm(env, fb);
-					c = mizCmpInt(pa.first, pb.first);
-					if (c != 0) c else mizCompTrmLists(env, pa.second, pb.second);
+					// the adjusted NUMBERS decide first; the argument lists are
+					// needed only when they agree, so the Pair (and the drop of
+					// the superfluous arguments) waits until then
+					c = mizCmpInt(mizAdjustedFuncNr(env, fa2), mizAdjustedFuncNr(env, fb));
+					if (c != 0) c else {
+						pa = mizAdjustTrm(env, fa2);
+						pb = mizAdjustTrm(env, fb);
+						mizCompTrmLists(env, pa.second, pb.second);
+					}
 				}
 			}
 			MizPrivFuncTrm(funcNr, args, __, __, __): {
@@ -2005,33 +2044,66 @@ mizAsQuaTrm2(t : MizTrm) -> MizQuaTrm { mizAsQuaTrm(t); }
 // actually changed. Both loops are tail-recursive rather than fori/mapVector
 // because this pair sits under the verifier's hottest loop — as a bool Vector
 // plus a closure-driven scan it cost 32% of all samples over the MML.
+// re-derive the mask from the substitution itself; only `subst-check=1` and
+// mizRestoreSubst need this — everything else keeps env.substMask in step
 mizSnapshotSubstFrom(v : Vector<Maybe<MizTrm>>, k : int, n : int, acc : int) -> int {
 	if (k >= n) acc
 	else mizSnapshotSubstFrom(v, k + 1, n,
 		if (isSome(getVectorUnsafe(v, k))) bitOr(acc, bitShl(1, k)) else acc);
 }
 
-mizSnapshotSubst(env : MizCorrelEnv) -> int {
-	mizSnapshotSubstFrom(env.substTrm, 1, sizeVector(env.substTrm), 0);
+// `lSubstTrm := gSubstTrm` — now just reading the mask the env maintains.
+gMizSubstCheck : ref int = ref -1;
+mizSubstCheck() -> bool {
+	if (^gMizSubstCheck < 0)
+		gMizSubstCheck := if (getUrlParameterDef("subst-check", "") == "1") 1 else 0;
+	^gMizSubstCheck == 1;
 }
 
-mizResetNewerFrom(v : Vector<Maybe<MizTrm>>, k : int, n : int, snap : int) -> void {
-	if (k < n) {
-		if (bitAnd(snap, bitShl(1, k)) == 0 && isSome(getVectorUnsafe(v, k))) {
-			setVectorUnsafe(v, k, None());
+mizSnapshotSubst(env : MizCorrelEnv) -> int {
+	if (mizSubstCheck()) {
+		real = mizSnapshotSubstFrom(env.substTrm, 1, sizeVector(env.substTrm), 0);
+		if (real != env.substMask) {
+			println("SUBSTMASK DESYNC: mask=" + i2s(env.substMask)
+				+ " actual=" + i2s(real));
+			mizRunTimeError(2999);
 		}
-		mizResetNewerFrom(v, k + 1, n, snap);
+	}
+	env.substMask;
+}
+
+// clear the slots in `diff`, and stop as soon as it is exhausted — the usual
+// case is diff = 0, i.e. the attempt bound nothing and there is nothing to undo
+mizResetNewerFrom(v : Vector<Maybe<MizTrm>>, k : int, n : int, diff : int) -> void {
+	if (diff != 0 && k < n) {
+		bit = bitShl(1, k);
+		if (bitAnd(diff, bit) != 0) {
+			setVectorUnsafe(v, k, None());
+			mizResetNewerFrom(v, k + 1, n, bitXor(diff, bit));
+		} else {
+			mizResetNewerFrom(v, k + 1, n, diff);
+		}
 	}
 }
 
 // reset every slot that was empty at the snapshot
 mizResetNewerSubst(env : MizCorrelEnv, snap : int) -> void {
-	mizResetNewerFrom(env.substTrm, 1, sizeVector(env.substTrm), snap);
+	diff = bitAnd(env.substMask, bitNot(snap));
+	if (diff != 0) {
+		mizResetNewerFrom(env.substTrm, 1, sizeVector(env.substTrm), diff);
+		env.substMask ::= bitAnd(env.substMask, snap);
+	}
 }
 
 // the same, over slots 1..upto-1 only — CheckArgType (correl.pas 3011) undoes
 // exactly `for lArgNr := 1 to fk-1`, not the whole substitution
 mizResetNewerSubstUpTo(env : MizCorrelEnv, snap : int, upto : int) -> void {
-	mizResetNewerFrom(env.substTrm, 1, min(upto, sizeVector(env.substTrm)), snap);
+	// only the bits below `upto` may be cleared
+	below = bitShl(1, min(upto, sizeVector(env.substTrm))) - 1;
+	diff = bitAnd(bitAnd(env.substMask, bitNot(snap)), below);
+	if (diff != 0) {
+		mizResetNewerFrom(env.substTrm, 1, sizeVector(env.substTrm), diff);
+		env.substMask ::= bitAnd(env.substMask, bitNot(diff));
+	}
 }
 
