@@ -1,0 +1,379 @@
+// Transcription of the accommodator's VOCABULARY pass:
+//   accdict.pas  ProcessVocabularies (155-241), InitDictBase (115)
+//   dicthan.pas  TSymbol / TVocabulary / GetPublicVoc / GetPrivateVoc
+//   scanner.pas  TokensCollection.LoadDct / SaveDct / SaveXDct (129-205)
+//
+// Inputs: MizFiles/mizar.dct (the built-in dictionary), MizFiles/mml.vct (the
+// public vocabulary file), dict/*.voc (private vocabularies), and the .evl
+// directives. Outputs, ALL IN MEMORY: the token collection (what the scanner
+// needs — the .dct content), the .dcx bytes, the per-vocabulary bases
+// (DictBase — what ProcessNotation's symbol renumbering needs), the priority
+// table and gSymBase.
+//
+// Character/byte discipline: every input is read with getFileContentBinary,
+// so a char code IS the file byte (mizar.dct holds raw byte 0xAF). String
+// order is the Pascal's byte-wise order; codes 128-255 compare identically
+// in UTF-16, so plain string comparison matches.
+
+import ds/vector;
+import string;
+import loop;
+import math/math;
+import fs/filesystem;
+import sys/system;
+import mizar/original/errhan;
+import mizar/original/mobjects;
+
+export {
+	// TSymbol (dicthan.pas 21): kind is the symbol-kind CHARACTER CODE
+	MizVocSym(kind : int, repr : string, infinitive : string, prior : int);
+
+	// TVocabulary: per-kind counts (index = char code) + the symbols
+	MizVocabulary(symbolCnt : Vector<int>, reprs : [MizVocSym]);
+
+	// TokenObj: one dictionary entry
+	MizDctTok(kind : int, nr : int, spelling : string);
+
+	// TokensCollection + the accommodation state ProcessVocabularies builds
+	MizDict(
+		// Items, INSERTION order — SaveDct/SaveXDct write this order
+		toks : Vector<MizDctTok>,
+		// fIndex: positions of toks sorted by spelling (byte-wise)
+		index : Vector<int>,
+		// TokCounter at the end of the run
+		tokCounter : Vector<int>,
+		// DictBase: per vocabulary article, (name, TokCounter snapshot AFTER
+		// it). Entry 0 is the empty-name base, as in InitDictBase.
+		dictBase : Vector<Pair<string, Vector<int>>>,
+		// gPriority: (kind char code, symbol nr) -> priority, 'O'/'K'/'L'
+		priority : Vector<Triple<int, int, int>>,
+		// gSymBase: TokCounter after the vocabularies, before the 'A' idents
+		symBase : Vector<int>,
+	);
+
+	// ProcessVocabularies (accdict.pas 155). vocabularies/theorems/schemes
+	// are the .evl directive article lists, in file order. mmlDir is the
+	// directory that holds dict/ (the article's own private vocabularies).
+	mizProcessVocabularies(mizFiles : string, mmlDir : string,
+		vocabularies : [string], theorems : [string], schemes : [string]) -> MizDict;
+
+	// SaveXDct — the .dcx bytes; SaveDct — the .dct bytes (for the scanner)
+	mizDcxContent(d : MizDict, articleId : string, mizFiles : string) -> string;
+	mizDctContent(d : MizDict) -> string;
+
+	// QuoteStrForXML (xml_inout.pas 81) — the ENV writers' quoting
+	mizQuoteEnvXML(s : string) -> string;
+
+	// lookups ProcessNotation needs
+	mizDictIndexOfStr(d : MizDict, s : string) -> int;   // over dictBase NAMES
+	mizDictBaseAt(d : MizDict, i : int) -> Vector<int>;
+}
+
+// the 8 kinds a vocabulary may declare (AvailableSymbols, dicthan.pas 14),
+// in 'A'..'Z' order: G K L M O R U V
+gMizVocKinds = [71, 75, 76, 77, 79, 82, 85, 86];
+
+mizStandardPriority = 64;
+
+// ---------------------------------------------------------------- symbols ----
+
+// IsValidSymbol (dicthan.pas 60)
+mizIsValidSymbol(line : string) -> bool {
+	l = trim(line);
+	if (strlen(l) <= 1) false
+	else {
+		kind = getCharCodeAt(l, 0);
+		if (!contains(gMizVocKinds, kind)) false
+		else {
+			rest = substring(l, 1, strlen(l) - 1);
+			if (kind == 79) { // 'O': optional trailing priority number
+				p = strIndexOf(rest, " ");
+				if (p < 0) true
+				else {
+					prioS = trim(substring(rest, p, strlen(rest) - p));
+					body = trim(substring(rest, 0, p));
+					isDigits(prioS) && body != "";
+				}
+			} else if (kind == 82) { // 'R': at most one space (infinitive)
+				p = strIndexOf(rest, " ");
+				if (p < 0) true
+				else {
+					tail = trim(substring(rest, p, strlen(rest) - p));
+					!strContains(tail, " ");
+				}
+			} else {
+				!strContains(rest, " ");
+			}
+		}
+	}
+}
+
+// TSymbol.Extract (dicthan.pas 108)
+mizExtractSymbol(line : string) -> MizVocSym {
+	kind = getCharCodeAt(line, 0);
+	repr0 = trim(substring(line, 1, strlen(line) - 1));
+	if (kind == 79) { // 'O'
+		p = strIndexOf(repr0, " ");
+		if (p < 0) MizVocSym(kind, repr0, "", mizStandardPriority)
+		else MizVocSym(kind, trim(substring(repr0, 0, p)), "",
+			s2i(trim(substring(repr0, p + 1, strlen(repr0) - p - 1))));
+	} else if (kind == 82) { // 'R'
+		p = strIndexOf(repr0, " ");
+		if (p < 0) MizVocSym(kind, repr0, "", 0)
+		else MizVocSym(kind, trim(substring(repr0, 0, p)),
+			trim(substring(repr0, p + 1, strlen(repr0) - p - 1)), 0);
+	} else {
+		MizVocSym(kind, repr0, "", 0);
+	}
+}
+
+// TSymbol.Load (dicthan.pas 155): an empty or invalid line yields the blank
+// symbol, exactly as the Pascal leaves the fresh object
+mizLoadSymbolLine(line : string) -> MizVocSym {
+	l = trim(line);
+	if (strlen(l) == 0 || !mizIsValidSymbol(l)) MizVocSym(0, "", "", 0)
+	else mizExtractSymbol(l);
+}
+
+// ------------------------------------------------------------ vocabularies ----
+
+// split byte content into lines on #10, dropping a trailing #13 if any
+mizVocLines(content : string) -> [string] {
+	map(strSplit(content, "\n"), \l ->
+		if (endsWith(l, "\r")) substring(l, 0, strlen(l) - 1) else l);
+}
+
+// TVocabulary.LoadVoc (dicthan.pas 224): the counts line, then the symbols.
+// `lines` is the whole file; `at` the index of the counts line. Returns the
+// vocabulary and the index just past its last symbol line.
+mizLoadVoc(lines : [string], at : int) -> Pair<MizVocabulary, int> {
+	cnt : Vector<int> = makeVector(91);
+	fori(0, 90, \__ -> pushVector(cnt, 0));
+	counts = lines[at];
+	// Read(lKind, lNbr, lDummy) x8: "G3 K0 L0 M1 O7 R2 U4 V6 "
+	total = fold(filtermap(strSplit(trim(counts), " "), \w0 -> {
+		w = trim(w0);
+		if (w == "") None() else Some(w);
+	}), 0, \acc, w -> {
+		k = getCharCodeAt(w, 0);
+		n = s2i(substring(w, 1, strlen(w) - 1));
+		setVectorUnsafe(cnt, k, n);
+		acc + n;
+	});
+	reprs = map(enumFromTo(1, total), \i -> mizLoadSymbolLine(lines[at + i]));
+	Pair(MizVocabulary(cnt, reprs), at + total + 1);
+}
+
+// GetPublicVoc (dicthan.pas 266): scan mml.vct from the TOP for "#<name>"
+mizGetPublicVoc(vctLines : [string], name : string) -> Maybe<MizVocabulary> {
+	n = length(vctLines);
+	i = ref 0;
+	found = ref -1;
+	while(\ -> ^found < 0 && ^i < n, \ -> {
+		l = vctLines[^i];
+		if (strlen(l) > 0 && getCharAt(l, 0) == "#"
+			&& substring(l, 1, strlen(l) - 1) == name) found := ^i + 1;
+		i := ^i + 1;
+	});
+	if (^found < 0) None() else Some(mizLoadVoc(vctLines, ^found).first);
+}
+
+// ReadPrivateVoc (dicthan.pas 199): every line, only the valid ones counted
+mizReadPrivateVoc(content : string) -> MizVocabulary {
+	cnt : Vector<int> = makeVector(91);
+	fori(0, 90, \__ -> pushVector(cnt, 0));
+	reprs = filtermap(mizVocLines(content), \l0 -> {
+		l = trim(l0);
+		if (strlen(l) > 1 && mizIsValidSymbol(l)) {
+			s = mizExtractSymbol(l);
+			setVectorUnsafe(cnt, s.kind, getVectorUnsafe(cnt, s.kind) + 1);
+			Some(s);
+		} else {
+			None();
+		}
+	});
+	MizVocabulary(cnt, reprs);
+}
+
+// ---------------------------------------------------------------- tokens ----
+
+// MSortedStrList.Search over the sorted index: Pair(found, index position)
+mizDictFind(toks : Vector<MizDctTok>, index : Vector<int>, s : string) -> Pair<bool, int> {
+	lo = ref 0;
+	hi = ref sizeVector(index) - 1;
+	res = ref -1;
+	while(\ -> ^res < 0 && ^lo <= ^hi, \ -> {
+		mid = (^lo + ^hi) / 2;
+		c = genericCompare(getVectorUnsafe(toks, getVectorUnsafe(index, mid)).spelling, s);
+		if (c < 0) lo := mid + 1
+		else if (c > 0) hi := mid - 1
+		else res := mid;
+	});
+	if (^res >= 0) Pair(true, ^res) else Pair(false, ^lo);
+}
+
+// CollectToken (scanner.pas 116): reject a duplicate SPELLING
+mizCollectToken(toks : Vector<MizDctTok>, index : Vector<int>,
+		kind : int, nr : int, spelling : string) -> bool {
+	p = mizDictFind(toks, index, spelling);
+	if (p.first) {
+		false;
+	} else {
+		pushVector(toks, MizDctTok(kind, nr, spelling));
+		mizVectorAtInsert(index, p.second, sizeVector(toks) - 1);
+		true;
+	}
+}
+
+// ------------------------------------------------------ ProcessVocabularies ----
+
+mizProcessVocabularies(mizFiles : string, mmlDir : string,
+		vocabularies : [string], theorems : [string], schemes : [string]) -> MizDict {
+	toks : Vector<MizDctTok> = makeVector(256);
+	index : Vector<int> = makeVector(256);
+
+	// gTokens.LoadDct(MizFiles+'mizar') — kind char, number digits, one
+	// separator char, spelling to end of line; seekEof skips blank lines
+	iter(mizVocLines(getFileContentBinary(mizFiles + "mizar.dct")), \l -> {
+		if (trim(l) != "") {
+			kind = getCharCodeAt(l, 0);
+			rest = substring(l, 1, strlen(l) - 1);
+			ndigits = ref 0;
+			while(\ -> ^ndigits < strlen(rest)
+					&& isDigit(getCharAt(rest, ^ndigits)), \ -> ndigits := ^ndigits + 1);
+			nr = s2i(substring(rest, 0, ^ndigits));
+			spelling = substring(rest, ^ndigits + 1, strlen(rest) - ^ndigits - 1);
+			p = mizDictFind(toks, index, spelling);
+			pushVector(toks, MizDctTok(kind, nr, spelling));
+			mizVectorAtInsert(index, p.second, sizeVector(toks) - 1);
+		}
+	});
+
+	// InitDictBase (accdict.pas 115)
+	tokCounter : Vector<int> = makeVector(91);
+	fori(0, 90, \__ -> pushVector(tokCounter, 0));
+	setVectorUnsafe(tokCounter, 77, 1);   // 'M' "set"
+	setVectorUnsafe(tokCounter, 82, 1);   // 'R' "="
+	setVectorUnsafe(tokCounter, 75, 3);   // 'K' [ { (
+	setVectorUnsafe(tokCounter, 76, 3);   // 'L' ] } )
+	dictBase : Vector<Pair<string, Vector<int>>> = makeVector(8);
+	pushVector(dictBase, Pair("", mizCopyIntVector(tokCounter)));
+	priority : Vector<Triple<int, int, int>> = makeVector(16);
+
+	vctLines = mizVocLines(getFileContentBinary(mizFiles + "mml.vct"));
+
+	// ProcessVocabulary per directive article, in file order
+	iter(vocabularies, \art -> {
+		privPath = mmlDir + "/dict/" + toLowerCase(art) + ".voc";
+		voc = if (fileExists(privPath))
+			Some(mizReadPrivateVoc(getFileContentBinary(privPath)))
+		else mizGetPublicVoc(vctLines, art);
+		switch (voc) {
+			Some(v): iter(v.reprs, \s -> {
+				// AddSymbol (accdict.pas 167)
+				k = s.kind;
+				setVectorUnsafe(tokCounter, k, getVectorUnsafe(tokCounter, k) + 1);
+				nr = getVectorUnsafe(tokCounter, k);
+				prior = if (s.prior == 0) mizStandardPriority else s.prior;
+				if (k == 79 || k == 75 || k == 76)
+					pushVector(priority, Triple(k, nr, prior));
+				__x1 = mizCollectToken(toks, index, k, nr, s.repr);
+				if (s.infinitive != "") {
+					__x2 = mizCollectToken(toks, index, k, nr, s.infinitive);
+					{}
+				}
+			});
+			None(): mizRunTimeError(801);
+		}
+		// the DictBase entry records the counters AFTER this vocabulary
+		pushVector(dictBase, Pair(art, mizCopyIntVector(tokCounter)));
+	});
+
+	symBase = mizCopyIntVector(tokCounter);
+
+	// the 'A' article identifiers: theorems, then schemes not already present
+	addIdent = \art : string -> {
+		setVectorUnsafe(tokCounter, 65, getVectorUnsafe(tokCounter, 65) + 1);
+		__x3 = mizCollectToken(toks, index, 65, getVectorUnsafe(tokCounter, 65), art);
+		{}
+	};
+	iter(theorems, addIdent);
+	iter(schemes, \art -> {
+		if (!mizDictFind(toks, index, art).first) addIdent(art);
+	});
+
+	MizDict(toks, index, tokCounter, dictBase, priority, symBase);
+}
+
+mizCopyIntVector(v : Vector<int>) -> Vector<int> {
+	r : Vector<int> = makeVector(sizeVector(v));
+	iterVector(v, \x -> pushVector(r, x));
+	r;
+}
+
+// ---------------------------------------------------------------- writers ----
+
+// QuoteStrForXML (xml_inout.pas 81): chars outside the valid table become
+// &#xHH; with two UPPERCASE hex digits
+mizQuoteEnvXML(s : string) -> string {
+	n = strlen(s);
+	fold(enumFromTo(0, n - 1), "", \acc, i -> {
+		c = getCharCodeAt(s, i);
+		valid =
+			(c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57)
+			|| c == 45 || c == 32 || c == 44 || c == 46 || c == 92 || c == 47
+			|| c == 95 || c == 91 || c == 93 || c == 33 || c == 59 || c == 58
+			|| c == 61;
+		acc + (if (valid) getCharAt(s, i)
+			else "&#x" + toUpperCase(mizFormatHex(c, 2)) + ";");
+	});
+}
+
+mizFormatHex(v : int, minDigits : int) -> string {
+	h = mizFormatHexDigits(v, "");
+	if (strlen(h) >= minDigits) h else strRepeat("0", minDigits - strlen(h)) + h;
+}
+
+mizFormatHexDigits(v : int, acc : string) -> string {
+	if (v == 0 && acc != "") acc
+	else if (v == 0) "0"
+	else mizFormatHexDigits(v / 16, getCharAt("0123456789abcdef", v % 16) + acc);
+}
+
+// SaveXDct (scanner.pas 177): Items in INSERTION order
+mizDcxContent(d : MizDict, articleId : string, mizFiles : string) -> string {
+	out : Vector<string> = makeVector(sizeVector(d.toks) + 4);
+	pushVector(out, "<?xml version=\"1.0\"?>\n");
+	pushVector(out, "<Symbols aid=\"" + articleId + "\" mizfiles=\""
+		+ mizQuoteEnvXML(mizFiles) + "\">\n");
+	iterVector(d.toks, \t -> pushVector(out,
+		" <Symbol kind=\"" + mizQuoteEnvXML(fromCharCode(t.kind))
+		+ "\" nr=\"" + i2s(t.nr)
+		+ "\" name=\"" + mizQuoteEnvXML(t.spelling) + "\"/>\n"));
+	pushVector(out, "</Symbols>\n");
+	mizConcatStrings(out);
+}
+
+// SaveDct (scanner.pas 155)
+mizDctContent(d : MizDict) -> string {
+	out : Vector<string> = makeVector(sizeVector(d.toks));
+	iterVector(d.toks, \t -> pushVector(out,
+		fromCharCode(t.kind) + i2s(t.nr) + " " + t.spelling + "\n"));
+	mizConcatStrings(out);
+}
+
+mizConcatStrings(v : Vector<string>) -> string {
+	strGlue(vector2array(v), "");
+}
+
+mizDictIndexOfStr(d : MizDict, s : string) -> int {
+	r = ref -1;
+	fori(0, sizeVector(d.dictBase) - 1, \i -> {
+		if (^r < 0 && getVectorUnsafe(d.dictBase, i).first == s) r := i;
+	});
+	^r;
+}
+
+mizDictBaseAt(d : MizDict, i : int) -> Vector<int> {
+	getVectorUnsafe(d.dictBase, i).second;
+}
