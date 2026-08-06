@@ -40,6 +40,7 @@ export {
 		mutable atomicExpansions : (MizFrm) -> [MizFrm],
 		mutable debug : bool,
 		census : MizCensus,
+		derivation : Vector<string>,         // derivation=1 narration, per inference
 	);
 
 	// The refutation census — the first, verdict-shaped slice of the checker's
@@ -58,6 +59,13 @@ export {
 	mizMakeCensus() -> MizCensus;
 	mizCensusMergeInto(target : MizCensus, src : MizCensus) -> void;
 
+	// derivation=1: the checker narrates its refutation as text — per disjunct
+	// a header, per closing step the evidence (the unifier pushes the premise
+	// it instantiated and the winning substitution). Purely observational;
+	// prep.flow prints and clears it per inference. The renderer is gated on
+	// the flag, so with it off the cost is one cached int test.
+	mizDerivOn() -> bool;
+
 	mizMakeChecker(env : MizCorrelEnv, idn : MizIdentify, clusters : MizClusters) -> MizChecker;
 
 	// InferenceChecker: premises (¬thesis + linked + cited) -> error codes in
@@ -70,7 +78,25 @@ export {
 
 mizMakeChecker(env : MizCorrelEnv, idn : MizIdentify, clusters : MizClusters) -> MizChecker {
 	MizChecker(env, idn, clusters, mizInitIntSeq(4), \__, __ -> 0, \__ -> [], false,
-		mizMakeCensus());
+		mizMakeCensus(), makeVector(0));
+}
+
+// one attribute in the derivation narration: ±V<nr>(<args>)
+mizDerivAttr2s(a : MizAttr) -> string {
+	(if (a.neg == 0) "-" else "+") + "V" + i2s(a.attrNr)
+		+ (switch (a.args) {
+			MizTrmNil(): "";
+			default: "(" + mizTrmList2s(a.args) + ")";
+		});
+}
+
+// cached derivation=1 flag: -1 = not read yet, then 0/1
+gMizDerivOn : ref int = ref -1;
+
+mizDerivOn() -> bool {
+	if (^gMizDerivOn < 0)
+		gMizDerivOn := if (getUrlParameterDef("derivation", "") == "1") 1 else 0;
+	^gMizDerivOn == 1;
 }
 
 mizMakeCensus() -> MizCensus {
@@ -415,6 +441,7 @@ mizInferenceChecker(chk : MizChecker, inference : Vector<MizFrm>) -> void {
 	env = chk.env;
 	idn = chk.idn;
 	mizSeqClear(chk.chErrNr);
+	clearVector(chk.derivation);
 	// marks: collected constants added during THIS inference are dropped after
 	infMark = sizeVector(env.inferConstDef);
 	ttMark = mizTTCollMark(env);   // MarkTermsInTTColl (checker.pas 335)
@@ -456,6 +483,15 @@ mizInferenceChecker(chk : MizChecker, inference : Vector<MizFrm>) -> void {
 			}
 			env.itIsChecker ::= true;
 			env.boundVarNbr ::= 0;
+			if (mizDerivOn()) {
+				pushVector(chk.derivation, "disjunct " + i2s(di + 1) + " of "
+					+ i2s(sizeVector(normalForm.evals)) + ", literals:");
+				fori(0, mizNatCount(eval) - 1, \z -> {
+					it = mizNatItem(eval, z);
+					pushVector(chk.derivation, "  " + (if (it.y == 0) "-" else "+")
+						+ " " + mizFrm2s(getVectorUnsafe(pre.basic, it.x)));
+				});
+			}
 			eq = mizMakeEqualizer(env, idn, chk.clusters, pre);
 			mizEquate(eq, eval);
 			if (chk.debug) mizDumpEqClasses(eq);
@@ -472,10 +508,35 @@ mizInferenceChecker(chk : MizChecker, inference : Vector<MizFrm>) -> void {
 			}
 			if (eq.trmOvfl) anyTrmOvfl := true;
 			env.itIsChecker ::= false;
+			if (mizDerivOn() && eq.contr > 0 && eq.contr < 45) {
+				// the equalizer family: find the class whose supercluster was
+				// refuted and name the clashing attribute pair (the equalizer
+				// stops at the first inconsistency, so there is at most one)
+				fori(1, mizTrmNbr(eq), \ci -> {
+					rec = mizTrmSAt(eq, ci);
+					if (!rec.superCluster.consistent) {
+						surface = switch (rec.eqClass) {
+							MizTrmElem(t, __): mizTrm2s(t);
+							MizTrmNil(): mizTrm2s(rec.term);
+						};
+						switch (rec.superCluster.refutedBy) {
+							Some(pr): pushVector(chk.derivation,
+								"  attribute clash on class E" + i2s(ci)
+								+ " (" + surface + "): "
+								+ mizDerivAttr2s(pr.first) + " vs "
+								+ mizDerivAttr2s(pr.second));
+							None(): pushVector(chk.derivation,
+								"  attribute clash on class E" + i2s(ci));
+						}
+					}
+				});
+			}
 			// census: which rule closed this disjunct (0 = not refuted)
 			cs = chk.census;
 			mizCensusBump(cs.codes, max(0, eq.contr));
 			cs.disjuncts ::= cs.disjuncts + 1;
+			if (mizDerivOn())
+				pushVector(chk.derivation, "  closed by contr " + i2s(eq.contr));
 		});
 		// census: the case-split width; 0 disjuncts = the inference was
 		// settled by normalization alone
