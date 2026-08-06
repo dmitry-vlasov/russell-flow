@@ -1,0 +1,447 @@
+// Transcription of the accommodator's NOTATION pass:
+//   acc_han.pas  ProcessNotation (386-517), CollectFormat (307-385),
+//                AccessiblePattern (285), InitNotations (278),
+//                OutNotations (611-631, the .eno writer), SaveFRM (273)
+//   impobjs.pas  ImpNotationObj.GetNotation (422) — the .dno reader
+//   iocorrel.pas In_PatternWithFormat (1095), OutMMLFileObj.
+//                Out_PatternWithFormat's env sibling OutVRFFileObj.
+//                Out_Pattern (2909) — the .eno pattern element
+//   _formats.pas In_Format (296), MFormatObj.Out_Format (328),
+//                MFormatsList.StoreFormats (371, the .frm writer)
+//
+// Inputs: prel/*.dno + the DictBase/token state the vocabulary pass built
+// (accom_dict.flow) + the constructor frames of the merged table
+// (accom.flow). Outputs, ALL IN MEMORY: the translated pattern table
+// (Notat[kind] — what LoadSGN otherwise reads from the .eno), the format
+// collection, and the .eno / .frm bytes for the byte gate.
+
+import ds/vector;
+import string;
+import loop;
+import math/math;
+import fs/filesystem;
+import sys/system;
+import mizar/original/errhan;
+import mizar/original/mobjects;
+import mizar/original/lexicon;
+import mizar/original/enums;
+import mizar/original/limits;
+import mizar/original/builtin;
+import mizar/original/correl;
+import mizar/original/correl_patt;
+import mizar/original/formats;
+import mizar/original/iocorrel;
+import mizar/original/iocorrel_write;
+import mizar/original/accom;
+import mizar/original/accom_dict;
+
+export {
+	// ImpNotationObj: the parsed .dno
+	MizImpNotation(
+		signature : [string],                       // <Signature> article ids
+		vocabularies : [Pair<string, Vector<int>>], // name -> per-kind counts
+		patterns : [MizPattern],                    // with format inline
+		formats : [MizFormat],                      // parallel to patterns
+	);
+
+	mizGetNotation(env : MizCorrelEnv, path : string) -> MizImpNotation;
+
+	// the notation state ProcessNotation builds: Notat[kind] in insertion
+	// order plus the growing format collection
+	MizAccNotat(
+		notat : [Vector<MizPattern>],   // by NotationKind (8)
+		formats : MizFormats,
+	);
+	mizMakeAccNotat() -> MizAccNotat;
+
+	// ProcessNotation (acc_han.pas 386) over the notations directive
+	mizProcessNotation(acc : MizAccom, dict : MizDict, an : MizAccNotat,
+		notations : [string]) -> void;
+
+	// the writers: StoreFormats -> .frm bytes, OutNotations -> .eno bytes
+	mizFrmContent(an : MizAccNotat, dict : MizDict) -> string;
+	mizEnoContent(an : MizAccNotat, env : MizCorrelEnv,
+		articleId : string, mizFiles : string) -> string;
+}
+
+// ------------------------------------------------------------ .dno reader ----
+
+// In_Format (_formats.pas 296)
+mizInFormatEl(r : MizVrfReader) -> MizFormat {
+	kind = getCharCodeAt(mizXmlAttr(r.x, "kind"), 0);
+	symNr = mizXmlIntAttr(r.x, "symbolnr");
+	argNr = mizXmlIntAttr(r.x, "argnr");
+	f = if (kind == 79 || kind == 82) { // 'O' 'R'
+		l = mizXmlIntAttr(r.x, "leftargnr");
+		MizFormat(kind, symNr, argNr - l, l, 0, 0);
+	} else if (kind == 75) { // 'K'
+		rs = mizXmlIntAttr(r.x, "rightsymbolnr");
+		MizFormat(kind, symNr, 0, 0, rs, argNr);
+	} else { // 'J','U','V','G','L','M'
+		MizFormat(kind, symNr, argNr, 0, 0, 0);
+	};
+	mizXmlAcceptEndState(r.x);
+	mizXmlNextElementState(r.x);
+	f;
+}
+
+// In_PatternWithFormat (iocorrel.pas 1095), .dno flavor: the format is an
+// INLINE element and there is no formatnr/relnr
+mizInPatternWithFormat(r : MizVrfReader) -> Pair<MizPattern, MizFormat> {
+	nr = mizXmlIntAttr(r.x, "nr");
+	aid = mizXmlAttr(r.x, "aid");
+	lConstr = mizInLexemNamed(r, "constrkind", "constrnr");
+	lAnt = mizXmlAttrDef(r.x, "antonymic", "false");
+	kindCh = getCharCodeAt(mizXmlAttr(r.x, "kind"), 0);
+	p = mizMakePattern(mizNotatKind(kindCh), nr, aid);
+	p.redefNr ::= mizXmlIntAttrDef(r.x, "redefnr", 0);
+	mizXmlNextElementState(r.x);
+
+	p.constrKind ::= lConstr.first;
+	p.constrNr ::= lConstr.second;
+	p.antonymic ::= lAnt == "true";
+
+	fmt = mizInFormatEl(r);
+	mizInArgCollInto(r, p.primTypes);
+	vis = mizInIntSeq(r, "Visible");
+	fori(0, mizSeqCount(vis) - 1, \i -> { mizSeqInsert(p.visible, mizSeqValue(vis, i)); {} });
+	if (r.x.nState != MizEEnd) {
+		mizXmlAssert(r.x.nElName == "Expansion");
+		mizXmlNextElementState(r.x);
+		p.expansion ::= Some(mizInType(r));
+		mizXmlNextElementState(r.x);
+	}
+	mizAssert(errElRedundant, r.x.nState == MizEEnd);
+	mizXmlNextElementState(r.x);
+	Pair(p, fmt);
+}
+
+// ImpNotationObj.GetNotation (impobjs.pas 422)
+mizGetNotation(env : MizCorrelEnv, path : string) -> MizImpNotation {
+	content = getFileContent(path);
+	if (content == "") {
+		MizImpNotation([], [], [], []);
+	} else {
+		r = mizMakeVrfReader(mizXmlInitParsing(content), env);
+		r.mml ::= true;
+		// the .dno holds SOURCE-frame numbers: a sorted attr insert would
+		// consult the constructor table with untranslated numbers (the .the
+		// reader sets the same flag)
+		r.attrAppend ::= true;
+		mizXmlNextElementState(r.x);
+		mizXmlAssert(r.x.nElName == "Notations");
+		mizXmlNextElementState(r.x);
+		// GetConstrNames: the <Signature> of ArticleID names
+		sig = ref [];
+		if (r.x.nState == MizEStart && r.x.nElName == "Signature") {
+			mizXmlNextElementState(r.x);
+			while(\ -> r.x.nState == MizEStart, \ -> {
+				mizXmlAssert(r.x.nElName == "ArticleID");
+				sig := arrayPush(^sig, mizXmlAttr(r.x, "name"));
+				mizXmlSkipElement(r.x);
+			});
+			mizXmlNextElementState(r.x);
+		}
+		// In_Vocs: the <Vocabularies>
+		vocs = ref [];
+		if (r.x.nState == MizEStart && r.x.nElName == "Vocabularies") {
+			mizXmlNextElementState(r.x);
+			while(\ -> r.x.nState == MizEStart, \ -> {
+				mizXmlAssert(r.x.nElName == "Vocabulary");
+				mizXmlNextElementState(r.x);
+				mizXmlAssert(r.x.nElName == "ArticleID");
+				name = mizXmlAttr(r.x, "name");
+				mizXmlSkipElement(r.x);
+				cnt : Vector<int> = makeVector(91);
+				fori(0, 90, \__ -> pushVector(cnt, 0));
+				while(\ -> r.x.nState == MizEStart, \ -> {
+					mizXmlAssert(r.x.nElName == "SymbolCount");
+					k = getCharCodeAt(mizXmlAttr(r.x, "kind"), 0);
+					setVectorUnsafe(cnt, k, mizXmlIntAttr(r.x, "nr"));
+					mizXmlSkipElement(r.x);
+				});
+				vocs := arrayPush(^vocs, Pair(name, cnt));
+				mizXmlNextElementState(r.x);
+			});
+			mizXmlNextElementState(r.x);
+		}
+		patts = ref [];
+		fmts = ref [];
+		while(\ -> r.x.nState != MizEEnd, \ -> {
+			mizXmlAssert(r.x.nElName == "Pattern");
+			pf = mizInPatternWithFormat(r);
+			patts := arrayPush(^patts, pf.first);
+			fmts := arrayPush(^fmts, pf.second);
+		});
+		MizImpNotation(^sig, ^vocs, ^patts, ^fmts);
+	}
+}
+
+// ------------------------------------------------------- symbol renumbering ----
+
+// the .dno-local -> merged symbol translation (the SymbolNr build inside
+// ProcessNotation, acc_han.pas 420-470): per kind, local nr -> global nr
+MizSymbolTrans(byKind : Vector<Vector<int>>);
+
+mizSymTransValue(st : MizSymbolTrans, kind : int, nr : int) -> int {
+	v = getVectorUnsafe(st.byKind, kind);
+	if (nr >= 0 && nr < sizeVector(v)) getVectorUnsafe(v, nr)
+	else { mizRunTimeError(2100); 0; }
+}
+
+// build SymbolNr from the .dno's vocabulary list against DictBase.
+// Extends dict.dictBase for vocabularies it has never seen (the original
+// mutates the shared DictBase the same way).
+mizBuildSymbolTrans(dict : MizDict, vocs : [Pair<string, Vector<int>>]) -> MizSymbolTrans {
+	dictList : Vector<int> = makeVector(8);
+	pushVector(dictList, 0);
+	iter(vocs, \voc -> {
+		i = mizDictIndexOfStr(dict, voc.first);
+		if (i > 0) {
+			// verify: this vocabulary must span exactly its recorded interval
+			base = mizDictBaseAt(dict, i);
+			prev = mizDictBaseAt(dict, i - 1);
+			iter(gMizVocKinds, \c -> {
+				if (getVectorUnsafe(base, c) - getVectorUnsafe(prev, c)
+						!= getVectorUnsafe(voc.second, c))
+					mizRunTimeError(802);
+			});
+			pushVector(dictList, i);
+		} else {
+			// unknown vocabulary: a fresh DictBase frame after the last
+			last = mizDictBaseAt(dict, sizeVector(dict.dictBase) - 1);
+			nb = mizCopyIntVector(last);
+			iter(gMizVocKinds, \c ->
+				setVectorUnsafe(nb, c, getVectorUnsafe(nb, c)
+					+ getVectorUnsafe(voc.second, c)));
+			pushVector(dictList, sizeVector(dict.dictBase));
+			pushVector(dict.dictBase, Pair(voc.first, nb));
+		}
+	});
+	// SymbolNr: walk the intervals in .dno vocabulary order; the local
+	// numbering is cumulative over them (entry 0 of DictBase is ZEROS, so the
+	// first interval covers the built-in seeds)
+	byKind : Vector<Vector<int>> = makeVector(91);
+	fori(0, 90, \__ -> {
+		v : Vector<int> = makeVector(4);
+		pushVector(v, 0);   // SymbolNr[c].Assign(0,0)
+		pushVector(byKind, v);
+	});
+	fori(1, sizeVector(dictList) - 1, \i -> {
+		idx = getVectorUnsafe(dictList, i);
+		prev = mizDictBaseAt(dict, idx - 1);
+		base = mizDictBaseAt(dict, idx);
+		iter(gMizVocKinds, \c -> {
+			v = getVectorUnsafe(byKind, c);
+			fori(getVectorUnsafe(prev, c) + 1, getVectorUnsafe(base, c),
+				\j -> pushVector(v, j));
+		});
+	});
+	MizSymbolTrans(byKind);
+}
+
+// ------------------------------------------------------------ CollectFormat ----
+
+// CollectFormat (acc_han.pas 307): renumber the symbol through SymbolNr,
+// gate by gSymBase (a symbol beyond the article's own vocabularies yields 0),
+// and collect into the format list. Returns the format number or 0.
+mizAccCollectFormat(an : MizAccNotat, dict : MizDict, st : MizSymbolTrans,
+		fmt : MizFormat) -> int {
+	base = \c -> getVectorUnsafe(dict.symBase, c);
+	collect = \f2 : MizFormat -> {
+		n = mizLookUpFormat(an.formats, f2);
+		if (n != 0) n
+		else {
+			nn = sizeVector(an.formats.items) + 1;
+			__x = mizCollectFormat(an.formats, f2);
+			nn;
+		}
+	};
+	k = fmt.kind;
+	if (k == 82) { // 'R'
+		lNr = mizSymTransValue(st, 82, fmt.symNr);
+		if (lNr <= base(82))
+			collect(MizFormat(82, lNr, fmt.rightArgsNbr, fmt.leftArgsNbr, 0, 0))
+		else 0;
+	} else if (k == 86 || k == 85) { // 'V' 'U'
+		lNr = mizSymTransValue(st, k, fmt.symNr);
+		if (lNr <= base(k))
+			collect(MizFormat(k, lNr, fmt.rightArgsNbr, 0, 0, 0))
+		else 0;
+	} else if (k == 74) { // 'J' — the symbol lives in the 'G' space
+		lNr = mizSymTransValue(st, 71, fmt.symNr);
+		if (lNr <= base(71))
+			collect(MizFormat(74, lNr, fmt.rightArgsNbr, 0, 0, 0))
+		else 0;
+	} else if (k == 77) { // 'M'
+		lNr = mizSymTransValue(st, 77, fmt.symNr);
+		if (lNr <= base(77))
+			collect(MizFormat(77, lNr, fmt.rightArgsNbr, 0, 0, 0))
+		else 0;
+	} else if (k == 71) { // 'G'
+		lNr = mizSymTransValue(st, 71, fmt.symNr);
+		if (lNr <= base(71))
+			collect(MizFormat(71, lNr, fmt.rightArgsNbr, 0, 0, 0))
+		else 0;
+	} else if (k == 76) { // 'L' — the symbol lives in the 'G' space
+		lNr = mizSymTransValue(st, 71, fmt.symNr);
+		if (lNr <= base(71))
+			collect(MizFormat(76, lNr, fmt.rightArgsNbr, 0, 0, 0))
+		else 0;
+	} else if (k == 79) { // 'O'
+		lNr = mizSymTransValue(st, 79, fmt.symNr);
+		if (lNr <= base(79))
+			collect(MizFormat(79, lNr, fmt.rightArgsNbr, fmt.leftArgsNbr, 0, 0))
+		else 0;
+	} else if (k == 75) { // 'K'
+		lNr = mizSymTransValue(st, 75, fmt.symNr);
+		rNr = mizSymTransValue(st, 76, fmt.rightSymNr);
+		if (lNr <= base(75) && rNr <= base(76))
+			collect(MizFormat(75, lNr, fmt.rightArgsNbr, fmt.leftArgsNbr,
+				rNr, fmt.argsNbr))
+		else 0;
+	} else {
+		mizRunTimeError(2093);
+		0;
+	}
+}
+
+// --------------------------------------------------------- AccessiblePattern ----
+
+// AccessiblePattern (acc_han.pas 285). In the port the merged table holds
+// exactly the chosen constructors, so gChosen[kind].HasInDom(nr) is a bounds
+// test (see accom.flow's accessibility note).
+mizAccessiblePattern(env : MizCorrelEnv, p : MizPattern) -> bool {
+	primsOk = foldVector(p.primTypes, true, \acc, t -> acc && mizAccTyp(env, t));
+	primsOk && {
+		k = p.constrKind;
+		nr = p.constrNr;
+		inDom = \ck -> nr >= 1 && nr <= mizConstrCount(env, ck);
+		if (k == 75) inDom(coFunctor)          // 'K'
+		else if (k == 71) inDom(coAggregate)   // 'G'
+		else if (k == 85) inDom(coSelector)    // 'U'
+		else if (k == 77) nr == 0 || inDom(coMode)   // 'M': 0 = expandable
+		else if (k == 76) inDom(coStructMode)  // 'L'
+		else if (k == 82) inDom(coPredicate)   // 'R'
+		else if (k == 86) inDom(coAttribute)   // 'V'
+		else if (k == 74) inDom(coAggregate)   // 'J'
+		else true;
+	}
+}
+
+// ------------------------------------------------------------ the main pass ----
+
+mizMakeAccNotat() -> MizAccNotat {
+	notat = map(enumFromTo(1, mizNotationKindCount), \__ -> {
+		v : Vector<MizPattern> = makeVector(16);
+		v;
+	});
+	f = MizFormats(makeVector(256), makeVector(256), makeVector(16));
+	// InitFormats (acc_han.pas 44): format 1 is pre-seeded — the built-in
+	// `strict` attribute, V StrictSym 1 (builtin.pas 166: StrictSym = 1)
+	__x = mizCollectFormat(f, MizFormat(86, 1, 1, 0, 0, 0));
+	MizAccNotat(notat, f);
+}
+
+// ProcessNotation (acc_han.pas 386)
+mizProcessNotation(acc : MizAccom, dict : MizDict, an : MizAccNotat,
+		notations : [string]) -> void {
+	env = acc.env;
+	iter(notations, \art -> {
+		if (getUrlParameterDef("dbg-notat", "") == "1") println("  NOTAT " + art);
+		imp = mizGetNotation(env, mizPrelPath(acc.mmlDir, art, ".dno"));
+		if (length(imp.patterns) <= 0) {
+			println("mizar accom: error 803: no notation in " + art + ".dno");
+		} else {
+			__added = mizAccomEnsureBases(acc, imp.signature);
+			tr = \k, nr -> mizAccomTranslateIn(acc.st, imp.signature, k, nr);
+			st = mizBuildSymbolTrans(dict, imp.vocabularies);
+			accNbr = ref 0;
+			iteri(imp.patterns, \pi, p -> {
+				if (getUrlParameterDef("dbg-notat", "") == "1")
+					println("    pat " + i2s(pi) + "/" + i2s(length(imp.patterns))
+						+ " kind=" + i2s(p.kind) + " fmts=" + i2s(length(imp.formats)));
+				// TransMMLTypeList on the primaries and the expansion
+				iterVector(p.primTypes, \t -> mizAccomRenumberTyp(tr, t));
+				switch (p.expansion) {
+					Some(t): mizAccomRenumberTyp(tr, t);
+					None(): {}
+				}
+				p.formNr ::= mizAccCollectFormat(an, dict, st, imp.formats[pi]);
+				p.constrNr ::= tr(mizConstructorKind(p.constrKind), p.constrNr);
+				if (!mizAccessiblePattern(env, p)) p.formNr ::= 0
+				else {
+					expOk = switch (p.expansion) {
+						Some(t): mizAccTyp(env, t);
+						None(): true;
+					};
+					if (!expOk) p.formNr ::= 0;
+				}
+				if (p.formNr != 0) accNbr := ^accNbr + 1;
+				pushVector(an.notat[p.kind], p);
+			});
+			if (^accNbr == 0)
+				println("mizar accom: error 830: empty notations directive " + art);
+		}
+	});
+}
+
+// ---------------------------------------------------------------- writers ----
+
+// MFormatObj.Out_Format (_formats.pas 328) + StoreFormats (371): the .frm
+// bytes, XMLOutStreamObj style — ONE-SPACE indent per level
+mizFrmContent(an : MizAccNotat, dict : MizDict) -> string {
+	out : Vector<string> = makeVector(sizeVector(an.formats.items) + 8);
+	pushVector(out, "<?xml version=\"1.0\"?>\n");
+	pushVector(out, "<Formats>\n");
+	iteriVector(an.formats.items, \z, f -> {
+		attrs = " <Format kind=\"" + fromCharCode(f.kind)
+			+ "\" nr=\"" + i2s(z + 1)
+			+ "\" symbolnr=\"" + i2s(f.symNr) + "\"";
+		tail = if (f.kind == 79 || f.kind == 82) // 'O' 'R'
+			" argnr=\"" + i2s(f.leftArgsNbr + f.rightArgsNbr)
+				+ "\" leftargnr=\"" + i2s(f.leftArgsNbr) + "\""
+		else if (f.kind == 75) // 'K'
+			" argnr=\"" + i2s(f.argsNbr)
+				+ "\" rightsymbolnr=\"" + i2s(f.rightSymNr) + "\""
+		else
+			" argnr=\"" + i2s(f.rightArgsNbr) + "\"";
+		pushVector(out, attrs + tail + "/>\n");
+	});
+	// gPriority is a BinIntFunc — kept SORTED by (kind, symbolnr), so 'K' 75
+	// prints before 'L' 76 before 'O' 79 whatever the collection order was
+	sortedPrio = sortCustom(vector2array(dict.priority),
+		\p : Triple<int, int, int> -> p.first * 1000000 + p.second, true);
+	iter(sortedPrio, \p -> pushVector(out,
+		" <Priority kind=\"" + fromCharCode(p.first)
+		+ "\" symbolnr=\"" + i2s(p.second)
+		+ "\" value=\"" + i2s(p.third) + "\"/>\n"));
+	pushVector(out, "</Formats>\n");
+	mizConcatStrings(out);
+}
+
+// OutNotations (acc_han.pas 611): the .eno bytes — OutEnvFileObj style, NO
+// indentation, with the stylesheet line; relnr recounts the written patterns
+// PER KIND. The pattern element is OutVRFFileObj.Out_Pattern (iocorrel.pas
+// 2909); its types through the report writer (one cluster + the args).
+mizEnoContent(an : MizAccNotat, env : MizCorrelEnv,
+		articleId : string, mizFiles : string) -> string {
+	o = mizMakeVrfOut(env);
+	o.mmlTyp ::= true;   // env files write a Typ with its lower cluster only
+	mizVOutString(o, "<?xml version=\"1.0\"?>\n");
+	mizVOutString(o, "<?xml-stylesheet type=\"text/xml\" href=\"file://"
+		+ mizFiles + "miz.xml\"?>\n");
+	mizVOutString(o, "<Notations aid=\"" + articleId + "\" mizfiles=\""
+		+ mizQuoteEnvXML(mizFiles) + "\">\n");
+	fori(0, mizNotationKindCount - 1, \n -> {
+		j = ref 0;
+		iterVector(an.notat[n], \p -> {
+			if (p.formNr != 0) {
+				j := ^j + 1;
+				mizVOutPattern(o, p, ^j);
+			}
+		});
+	});
+	mizVOutString(o, "</Notations>\n");
+	mizVrfOutContent(o);
+}
