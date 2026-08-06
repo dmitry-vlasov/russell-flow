@@ -358,8 +358,9 @@ export {
 	// enough to undo an attempt. Far cheaper than copying the substitution,
 	// which is what the verifier's hottest loop (mizAttrCollIsSubsetOf) did
 	// per candidate: 31% of all samples over the MML.
-	mizSnapshotSubst(env : MizCorrelEnv) -> Vector<bool>;
-	mizResetNewerSubst(env : MizCorrelEnv, snap : Vector<bool>) -> void;
+	mizSnapshotSubst(env : MizCorrelEnv) -> int;
+	mizResetNewerSubst(env : MizCorrelEnv, snap : int) -> void;
+	mizResetNewerSubstUpTo(env : MizCorrelEnv, snap : int, upto : int) -> void;
 	mizCompAbsAttr(env : MizCorrelEnv, a : MizAttr, b : MizAttr) -> int;   // adjusted nr + args
 	mizCompAttr(env : MizCorrelEnv, a : MizAttr, b : MizAttr) -> int;      // + neg
 
@@ -1953,25 +1954,25 @@ mizCompAttr(env : MizCorrelEnv, a : MizAttr, b : MizAttr) -> int {
 	if (c != 0) c else mizCmpInt(a.neg, b.neg);
 }
 
-mizAttrCollSearch(env : MizCorrelEnv, coll : MizAttrColl, a : MizAttr) -> Pair<bool, int> {
-	found = ref false;
-	l = ref 0;
-	h = ref sizeVector(coll.items) - 1;
-	while(\ -> ^l <= ^h, \ -> {
-		i = (^l + ^h) / 2;
+// MSortedCollection.Search over CompAbsAttr — tail-recursive, so the search
+// allocates nothing (see mizNatSearchIdx for the reasoning and the encoding:
+// >= 0 is the hit index, < 0 means absent with insertion point -1 - r).
+mizAttrCollSearchIdx(env : MizCorrelEnv, coll : MizAttrColl, a : MizAttr,
+		l : int, h : int) -> int {
+	if (l > h) {
+		-1 - l;
+	} else {
+		i = (l + h) / 2;
 		c = mizCompAbsAttr(env, getVectorUnsafe(coll.items, i), a);
-		if (c < 0) {
-			l := i + 1;
-		} else {
-			h := i - 1;
-			if (c == 0) {
-				found := true;
-				l := i;
-				h := i - 1;
-			}
-		}
-	});
-	Pair(^found, ^l);
+		if (c < 0) mizAttrCollSearchIdx(env, coll, a, i + 1, h)
+		else if (c > 0) mizAttrCollSearchIdx(env, coll, a, l, i - 1)
+		else i;
+	}
+}
+
+mizAttrCollSearch(env : MizCorrelEnv, coll : MizAttrColl, a : MizAttr) -> Pair<bool, int> {
+	r = mizAttrCollSearchIdx(env, coll, a, 0, sizeVector(coll.items) - 1);
+	if (r >= 0) Pair(true, r) else Pair(false, -1 - r);
 }
 
 mizAttrCollInsert(env : MizCorrelEnv, coll : MizAttrColl, a : MizAttr) -> void {
@@ -1998,16 +1999,39 @@ mizAsFraenkelTrm2(t : MizTrm) -> MizFraenkelTrm { mizAsFraenkelTrm(t); }
 mizAsChoiceTrm2(t : MizTrm) -> MizChoiceTrm { mizAsChoiceTrm(t); }
 mizAsQuaTrm2(t : MizTrm) -> MizQuaTrm { mizAsQuaTrm(t); }
 
-mizSnapshotSubst(env : MizCorrelEnv) -> Vector<bool> {
-	mapVector(env.substTrm, \m -> isSome(m));
+// The snapshot is a BITMASK of the filled slots. gSubstTrm is a fixed 27
+// entries (2*MaxArgNbr + the dummy 0), so the whole set fits in one int:
+// taking it allocates nothing, and undoing touches only the slots that
+// actually changed. Both loops are tail-recursive rather than fori/mapVector
+// because this pair sits under the verifier's hottest loop — as a bool Vector
+// plus a closure-driven scan it cost 32% of all samples over the MML.
+mizSnapshotSubstFrom(v : Vector<Maybe<MizTrm>>, k : int, n : int, acc : int) -> int {
+	if (k >= n) acc
+	else mizSnapshotSubstFrom(v, k + 1, n,
+		if (isSome(getVectorUnsafe(v, k))) bitOr(acc, bitShl(1, k)) else acc);
+}
+
+mizSnapshotSubst(env : MizCorrelEnv) -> int {
+	mizSnapshotSubstFrom(env.substTrm, 1, sizeVector(env.substTrm), 0);
+}
+
+mizResetNewerFrom(v : Vector<Maybe<MizTrm>>, k : int, n : int, snap : int) -> void {
+	if (k < n) {
+		if (bitAnd(snap, bitShl(1, k)) == 0 && isSome(getVectorUnsafe(v, k))) {
+			setVectorUnsafe(v, k, None());
+		}
+		mizResetNewerFrom(v, k + 1, n, snap);
+	}
 }
 
 // reset every slot that was empty at the snapshot
-mizResetNewerSubst(env : MizCorrelEnv, snap : Vector<bool>) -> void {
-	fori(1, sizeVector(env.substTrm) - 1, \k -> {
-		if (!getVectorDef(snap, k, false)) {
-			setVectorUnsafe(env.substTrm, k, None());
-		}
-	});
+mizResetNewerSubst(env : MizCorrelEnv, snap : int) -> void {
+	mizResetNewerFrom(env.substTrm, 1, sizeVector(env.substTrm), snap);
+}
+
+// the same, over slots 1..upto-1 only — CheckArgType (correl.pas 3011) undoes
+// exactly `for lArgNr := 1 to fk-1`, not the whole substitution
+mizResetNewerSubstUpTo(env : MizCorrelEnv, snap : int, upto : int) -> void {
+	mizResetNewerFrom(env.substTrm, 1, min(upto, sizeVector(env.substTrm)), snap);
 }
 
