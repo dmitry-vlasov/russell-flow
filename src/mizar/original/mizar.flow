@@ -1,68 +1,191 @@
-// The Mizar verifier in Flow9 — entry point.
+// The Mizar verifier in Flow9 — THE entry point, and the only binary.
 // Transcription of ~/dev/system/kernel/verifier.dpr + verfinit.pas.
 //
-// Usage (via bin/mizarj):
-//   mizarj article=xboole_0 [mml=<dir>]         CheckerOnly (the default while
-//                                               the one-process gate is young):
-//                                               the checker over the .xml
-//   mizarj article=xboole_0 full=1 [out=<file>] the WHOLE CHAIN in one process
-//                                               (.miz -> parse -> MSM -> analyze
-//                                               -> check); out= also writes the
-//                                               analyzer report it produced
+//   flowc1 jar=1 mizar/original/mizar.flow     builds it
+//   bin/mizarj <args>                          runs it
 //
-// The pass structure is MSMVerifyArticle (verfinit.flow). The original's
-// default is the full chain with -c/-p/-a restricting; mizarj keeps
-// CheckerOnly as its default until the full chain replaces fullrun.sh's gate.
+// VERIFY — the default is the whole chain (.miz -> parse -> MSM -> analyze ->
+// check) in this process, exactly as MSMVerifyArticle does:
+//   article=<name>                  one article
+//   article-list=<file>             every article named in the file, in
+//                                   parallel — this IS the integration check
+//   jobs=<n>                        workers for a list (default 8)
+//   mml=<dir>                       the MML working copy
+//   ref=<dir>                       ALSO compare the analyzer report, byte for
+//                                   byte, against <dir>/<article>.xml
+//   quiet=1                         only the tally
+//   out=<file>                      write the per-article lines there
+//
+// RESTRICT, mirroring the original's -c/-p/-a (GetOptions):
+//   checker-only=1                  check an existing .xml, run no other pass
+//   parser-only=1                   stop after Transfer2Analyzer
+//   analyzer-only=1                 stop after Analyze
+//
+// DUMP AN INTERMEDIATE — nothing is written unless asked for. Every pass hands
+// its result to the next IN MEMORY; these are the only way a file appears:
+//   dump-xml=<file>                 the analyzer report
+//   dump-par=<file>                 the .par Transfer2Analyzer produced
+//
+// TEST — the component suites are in this same jar; there is no test binary:
+//   test=all | test=<suite> | test=list
+//
+// ACCOMMODATE:
+//   accom=1                         build the environment from .evl + prel/
+//                                   instead of the flat files accom wrote
 
 import runtime;
 import string;
+import math/math;
 import net/url_parameter;
 import fs/filesystem;
 import ds/vector;
+import sys/concurrent;
 import mizar/original/errhan;
 import mizar/original/verfinit;
 import mizar/original/accom;
+import mizar/original/test/test_all;
+
+// one article's outcome
+MizRunOutcome(article : string, ok : bool, line : string,
+	checked : int, accepted : int);
+
+// The report of one run, in the shape both modes print. `brief` is the
+// per-article line of a list run; the single-article mode says more.
+mizRunOutcome(article : string, r : MizVerifyRun, refDir : string,
+		ran : bool, brief : bool) -> MizRunOutcome {
+	stats = switch (r.stats) {
+		Some(s): s;
+		None(): MizPrepStats(0, 0, 0, 0, 0, makeVector(0));
+	}
+	refPath = refDir + "/" + article + ".xml";
+	xmlBad = if (refDir == "" || r.xml == "") ""
+		else if (!fileExists(refPath)) " NOREF"
+		else {
+			expected = getFileContent(refPath);
+			if (expected == r.xml) "" else {
+				n = strlen(r.xml);
+				m = strlen(expected);
+				i = ref 0;
+				while(\ -> ^i < n && ^i < m
+						&& getCharAt(r.xml, ^i) == getCharAt(expected, ^i),
+					\ -> i := ^i + 1);
+				" XMLDIFF " + i2s(^i + 1) + "/" + i2s(m);
+			}
+		};
+	ok = xmlBad == "" && r.stoppedAt == 0 && stats.failed == 0
+		&& (!ran || stats.checked == stats.accepted);
+	verdict = if (!ran) "done"
+		else "checked=" + i2s(stats.checked) + " accepted=" + i2s(stats.accepted)
+			+ (if (brief) "" else " failed=" + i2s(stats.failed)
+				+ " from-skipped=" + i2s(stats.skippedFrom)
+				+ " blocks-skipped=" + i2s(stats.skippedBlocks));
+	MizRunOutcome(article, ok,
+		article + (if (brief) (if (ok) " OK " else " FAIL ") else ": ") + verdict
+			+ xmlBad
+			+ (if (stats.failed > 0 && brief) " failed=" + i2s(stats.failed) else "")
+			+ (if (r.stoppedAt != 0) " stoppedAt=" + i2s(r.stoppedAt) else ""),
+		stats.checked, stats.accepted);
+}
+
+mizUsage() -> void {
+	println("mizarj: the Mizar verifier transcribed to Flow9");
+	println("");
+	println("  mizarj article=<name> [mml=<dir>]             verify one article");
+	println("  mizarj article-list=<file> [jobs=8]           verify many, in parallel");
+	println("  mizarj ... ref=<dir>                          also byte-compare the report");
+	println("  mizarj ... dump-xml=<file> | dump-par=<file>  write an intermediate");
+	println("  mizarj ... checker-only=1 | parser-only=1 | analyzer-only=1");
+	println("  mizarj test=all | test=<suite> | test=list    the component suites");
+	println("");
+	println("  suites: " + strGlue(mizComponentSuiteNames(), " "));
+}
 
 main() {
-	article = getUrlParameterDef("article", "");
 	mml = getUrlParameterDef("mml", "/home/dmitry/dev/math/MML-test");
-	full = getUrlParameterDef("full", "") == "1";
+	mmlDir = mml + "/mml";
 	mizFiles = getUrlParameterDef("mizfiles", "/usr/local/share/mizar/");
+	article = getUrlParameterDef("article", "");
+	listFile = getUrlParameterDef("article-list", "");
+	test = getUrlParameterDef("test", "");
+	refDir = getUrlParameterDef("ref", "");
+	quiet = getUrlParameterDef("quiet", "") == "1";
+	jobs = max(1, s2i(getUrlParameterDef("jobs", "8")));
+	checkerOnly = getUrlParameterDef("checker-only", "") == "1";
+	parserOnly = getUrlParameterDef("parser-only", "") == "1";
+	analyzerOnly = getUrlParameterDef("analyzer-only", "") == "1";
+	accom = getUrlParameterDef("accom", "") == "1";
+	ran = !parserOnly && !analyzerOnly;   // did the checker pass run
 
-	if (article == "") {
-		println("mizarj: the Mizar verifier transcribed to Flow9");
-		println("usage: mizarj article=<name> [mml=<dir>] [accom=1] [full=1 [out=<file>]]");
+	loaderOf = \a -> if (accom) mizAccomEnvLoader(mmlDir, a)
+		else mizFileEnvLoader(mmlDir, a);
+
+	if (test != "") {
+		// ---- the component suites, in this same binary ----
+		if (test == "list") {
+			println("suites: " + strGlue(mizComponentSuiteNames(), " "));
+			quit(0);
+		} else {
+			t = mizRunComponentTests(test);
+			quit(if (t.failed > 0) 1 else 0);
+		}
+	} else if (article == "" && listFile == "") {
+		mizUsage();
 		quit(1);
+	} else if (article != "") {
+		// ---- one article; the only mode that dumps intermediates ----
+		r = mizMSMVerifyArticle(mmlDir, article, mizFiles, loaderOf(article),
+			checkerOnly, parserOnly, analyzerOnly);
+		dumpXml = getUrlParameterDef("dump-xml", "");
+		if (dumpXml != "" && !setFileContentBytes(dumpXml, r.xml))
+			println("cannot write " + dumpXml);
+		dumpPar = getUrlParameterDef("dump-par", "");
+		if (dumpPar != "" && !setFileContentBytes(dumpPar, r.par))
+			println("cannot write " + dumpPar);
+		o = mizRunOutcome(article, r, refDir, ran, false);
+		println(o.line);
+		switch (r.stats) {
+			Some(s): iterVector(s.failures, \f -> println("  FAIL " + f));
+			None(): {}
+		}
+		quit(if (o.ok) 0 else 1);
 	} else {
-		mmlDir = mml + "/mml";
-		// accom=1: build the environment from the .evl + prel/ instead of
-		// from the flat files Mizar's own accom wrote
-		loader = if (getUrlParameterDef("accom", "") == "1")
-			mizAccomEnvLoader(mmlDir, article)
-			else mizFileEnvLoader(mmlDir, article);
-		if (!full && !fileExists(mmlDir + "/" + article + ".xml")) {
-			println("mizarj: no analyzer report " + mmlDir + "/" + article + ".xml");
+		// ---- a list of articles, in parallel, in ONE process ----
+		articles = filtermap(strSplit(getFileContent(listFile), "\n"), \l -> {
+			a = trim(l);
+			if (a == "") None() else Some(a);
+		});
+		if (articles == []) {
+			println("mizarj: no articles in " + listFile);
 			quit(1);
 		} else {
-			r = mizMSMVerifyArticle(mmlDir, article, mizFiles, loader,
-				!full, false, false); // CheckerOnly unless full=1
+			// The articles are independent: each builds its own MizCorrelEnv,
+			// and the port keeps no shared mutable state beyond idempotent
+			// debug-flag caches — so they run on a thread pool.
+			pool = newThreadPool(jobs);
+			results = concurrent(pool, map(articles, \a -> \ -> {
+				o = mizRunOutcome(a,
+					mizMSMVerifyArticle(mmlDir, a, mizFiles, loaderOf(a),
+						checkerOnly, parserOnly, analyzerOnly),
+					refDir, ran, true);
+				if (!quiet) println(o.line);
+				o;
+			}));
+			chk = fold(results, 0, \acc, o -> acc + o.checked);
+			acc2 = fold(results, 0, \acc, o -> acc + o.accepted);
+			bad = filter(results, \o -> !o.ok);
 			out = getUrlParameterDef("out", "");
-			if (full && out != "") {
-				if (!setFileContentBytes(out, r.xml)) println("cannot write " + out);
+			if (out != "" && !setFileContent(out,
+					strGlue(map(results, \o -> o.line), "\n") + "\n"))
+				println("cannot write " + out);
+			println("articles " + i2s(length(articles)) + ", verified "
+				+ i2s(length(articles) - length(bad)) + ", failed " + i2s(length(bad)));
+			if (ran) println("inferences " + i2s(chk) + " checked, "
+				+ i2s(acc2) + " accepted");
+			if (bad != []) {
+				println("failing articles:");
+				iter(bad, \o -> println("  " + o.line));
 			}
-			if (r.stoppedAt != 0) println("stopped at kind " + i2s(r.stoppedAt));
-			switch (r.stats) {
-				Some(stats): {
-					println(article + ": checked=" + i2s(stats.checked)
-						+ " accepted=" + i2s(stats.accepted)
-						+ " failed=" + i2s(stats.failed)
-						+ " from-skipped=" + i2s(stats.skippedFrom)
-						+ " blocks-skipped=" + i2s(stats.skippedBlocks));
-					iterVector(stats.failures, \f -> println("  FAIL " + f));
-					quit(if (stats.failed > 0) 1 else 0);
-				}
-				None(): quit(1);
-			}
+			quit(if (bad != []) 1 else 0);
 		}
 	}
 }

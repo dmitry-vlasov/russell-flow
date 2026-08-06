@@ -11,6 +11,13 @@
 - Grammar: Lingo PEG files (`.lingo`), compiled by `flowc1`
 - Scripting: `.rus` scripts compose built-in operations (read, verify, prove, translate, optimize)
 
+## Mizar verifier commands
+- Build: `flowc1 jar=1 mizar/original/mizar.flow` (from `src/`) — ONE jar, no other
+- Verify one article: `bin/mizarj article=xboole_1`
+- Verify the whole MML in one process: `bin/mizarj mem=16g article-list=$RUSSELL_MATH/MML-test/mml.lar jobs=8 ref=~/mizar_oracle/m4ref`
+- Component suites: `bin/mizarj test=all` (or `test=<suite>`, `test=list`)
+- Intermediates stay in MEMORY; `dump-xml=` / `dump-par=` are the only writers
+
 ## Commands
 - Build: `./build_java.sh`
 - Roundtrip test (CI): `bin/russellj translate/mm2ru2mm set`
@@ -64,13 +71,15 @@ our design, and a discrepancy is a question about the ORIGINAL's logic.
    Flow9 code to explain a diff.
 2. **Cite it.** Every fix commit names the `file.pas:line` it transcribes. A
    fix that cannot cite one is a guess — do not commit it.
-3. **Bucket before fixing.** Never chase byte diffs one article at a time. Run
-   `src/mizar/original/audit/bucket.sh` over the failing set first; the
-   articles cluster into a few causes.
-4. **Suspect the shared units, not the new code.** The analyzer calls 78
-   routines that were ported for the checker only and are exact on 1.4M
-   checker inferences while still being half-implemented for other inputs.
-   `src/mizar/original/audit/callees.py` lists them.
+3. **Bucket before fixing.** Never chase byte diffs one article at a time.
+   Classify the failures first — by the element the diff lands on, or by the
+   Pascal routine that writes it; they cluster into a few causes.
+4. **Suspect the shared units, not the new code.** The analyzer calls 78 of
+   the 245 routines in the shared units (correl, identify, roundcl, iocorrel,
+   schemes, ellipses). They were ported for the checker, are exact on 1.4M
+   checker inferences, and were still half-implemented for the analyzer's
+   inputs. Both defects of that class had the same shape: a Pascal `A or B`
+   with only `A` ported, and a case list with a variant omitted.
 5. **Port-only machinery is a bug source.** Caches, memos and bounds the
    original does not have (rounded-type memo, growable arrays where Pascal has
    fixed ones) diverge silently. Mark them, and turn them off when in doubt.
