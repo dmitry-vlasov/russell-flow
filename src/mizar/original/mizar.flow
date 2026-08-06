@@ -45,21 +45,46 @@ import mizar/original/verfinit;
 import mizar/original/accom;
 import mizar/original/test/test_all;
 
-// one article's outcome
+// one article's outcome. `ms` is the article's own wall time — in a list run
+// the articles share a thread pool, so these sum to more than the run's own
+// elapsed time.
 MizRunOutcome(article : string, ok : bool, line : string,
-	checked : int, accepted : int);
+	checked : int, accepted : int, ms : double,
+	// the rejected inferences, so a list run can report WHY an article failed
+	// and not merely that it did
+	failures : [string]);
+
+// "12.36 sec." / "18 min. 33 sec." / "1 h. 04 min. 09 sec."
+mizFmtTime(ms : double) -> string {
+	secs = ms / 1000.0;
+	if (secs < 60.0) {
+		// always two decimals, so a column of times lines up
+		hundredths = round(secs * 100.0);
+		i2s(hundredths / 100) + "."
+			+ (if (hundredths % 100 < 10) "0" else "") + i2s(hundredths % 100)
+			+ " sec.";
+	} else {
+		whole = round(secs);
+		h = whole / 3600;
+		m = (whole % 3600) / 60;
+		s = whole % 60;
+		pad = \n -> if (n < 10) "0" + i2s(n) else i2s(n);
+		if (h > 0) i2s(h) + " h. " + pad(m) + " min. " + pad(s) + " sec."
+		else i2s(m) + " min. " + pad(s) + " sec.";
+	}
+}
 
 // The report of one run, in the shape both modes print. `brief` is the
 // per-article line of a list run; the single-article mode says more.
 mizRunOutcome(article : string, r : MizVerifyRun, refDir : string,
-		ran : bool, brief : bool) -> MizRunOutcome {
+		ran : bool, brief : bool, ms : double) -> MizRunOutcome {
 	stats = switch (r.stats) {
 		Some(s): s;
 		None(): MizPrepStats(0, 0, 0, 0, 0, makeVector(0));
 	}
 	refPath = refDir + "/" + article + ".xml";
 	xmlBad = if (refDir == "" || r.xml == "") ""
-		else if (!fileExists(refPath)) " NOREF"
+		else if (!fileExists(refPath)) ", report: NO REFERENCE"
 		else {
 			expected = getFileContent(refPath);
 			if (expected == r.xml) "" else {
@@ -69,24 +94,31 @@ mizRunOutcome(article : string, r : MizVerifyRun, refDir : string,
 				while(\ -> ^i < n && ^i < m
 						&& getCharAt(r.xml, ^i) == getCharAt(expected, ^i),
 					\ -> i := ^i + 1);
-				" XMLDIFF " + i2s(^i + 1) + "/" + i2s(m);
+				", report: DIFFERS at byte " + i2s(^i + 1)
+					+ " (reference " + i2s(m) + " bytes, produced " + i2s(n) + ")";
 			}
 		};
 	// An article that produced NO verdict at all is NOT verified: a pass that
 	// dies leaves the default stats, and 0 == 0 would otherwise read as a pass.
 	ok = xmlBad == "" && r.stoppedAt == 0 && stats.failed == 0
 		&& (!ran || (isSome(r.stats) && stats.checked == stats.accepted));
-	verdict = if (!ran) "done"
-		else "checked=" + i2s(stats.checked) + " accepted=" + i2s(stats.accepted)
-			+ (if (brief) "" else " failed=" + i2s(stats.failed)
-				+ " from-skipped=" + i2s(stats.skippedFrom)
-				+ " blocks-skipped=" + i2s(stats.skippedBlocks));
+	// `checked` counts BY-INFERENCES (prep.flow's MizPrepStats) — one per
+	// justification the checker runs, not per proof step and not per theorem.
+	// When everything is accepted the two numbers are equal, so print one; the
+	// moment they are not, the difference is the news and both go out.
+	inferences = if (!ran) "" else
+		if (stats.accepted == stats.checked) ", inferences: " + i2s(stats.checked)
+		else ", inferences: " + i2s(stats.checked)
+			+ ", accepted: " + i2s(stats.accepted)
+			+ ", rejected: " + i2s(stats.failed);
+	detail = xmlBad
+		+ (if (r.stoppedAt != 0) ", stoppedAt: " + i2s(r.stoppedAt) else "")
+		+ (if (brief) "" else ", from-skipped: " + i2s(stats.skippedFrom)
+			+ ", blocks-skipped: " + i2s(stats.skippedBlocks));
 	MizRunOutcome(article, ok,
-		article + (if (brief) (if (ok) " OK " else " FAIL ") else ": ") + verdict
-			+ xmlBad
-			+ (if (stats.failed > 0 && brief) " failed=" + i2s(stats.failed) else "")
-			+ (if (r.stoppedAt != 0) " stoppedAt=" + i2s(r.stoppedAt) else ""),
-		stats.checked, stats.accepted);
+		"article: " + article + ", status: " + (if (ok) "OK" else "FAIL")
+			+ inferences + detail + ", time: " + mizFmtTime(ms),
+		stats.checked, stats.accepted, ms, vector2array(stats.failures));
 }
 
 mizUsage() -> void {
@@ -135,18 +167,20 @@ main() {
 		quit(1);
 	} else if (article != "") {
 		// ---- one article; the only mode that dumps intermediates ----
+		t0 = timestamp();
 		r = mizMSMVerifyArticle(mmlDir, article, mizFiles, loaderOf(article),
 			checkerOnly, parserOnly, analyzerOnly);
+		dt = timestamp() - t0;
 		dumpXml = getUrlParameterDef("dump-xml", "");
 		if (dumpXml != "" && !setFileContentBytes(dumpXml, r.xml))
 			println("cannot write " + dumpXml);
 		dumpPar = getUrlParameterDef("dump-par", "");
 		if (dumpPar != "" && !setFileContentBytes(dumpPar, r.par))
 			println("cannot write " + dumpPar);
-		o = mizRunOutcome(article, r, refDir, ran, false);
+		o = mizRunOutcome(article, r, refDir, ran, false, dt);
 		println(o.line);
 		switch (r.stats) {
-			Some(s): iterVector(s.failures, \f -> println("  FAIL " + f));
+			Some(s): iterVector(s.failures, \f -> println("  rejected inference at " + f));
 			None(): {}
 		}
 		quit(if (o.ok) 0 else 1);
@@ -163,15 +197,17 @@ main() {
 			// The articles are independent: each builds its own MizCorrelEnv,
 			// and the port keeps no shared mutable state beyond idempotent
 			// debug-flag caches — so they run on a thread pool.
+			t0 = timestamp();
 			pool = newThreadPool(jobs);
 			results = concurrent(pool, map(articles, \a -> \ -> {
-				o = mizRunOutcome(a,
-					mizMSMVerifyArticle(mmlDir, a, mizFiles, loaderOf(a),
-						checkerOnly, parserOnly, analyzerOnly),
-					refDir, ran, true);
-				if (!quiet) println(o.line);
+				ta = timestamp();
+				r = mizMSMVerifyArticle(mmlDir, a, mizFiles, loaderOf(a),
+					checkerOnly, parserOnly, analyzerOnly);
+				o = mizRunOutcome(a, r, refDir, ran, true, timestamp() - ta);
+				if (!quiet) println("   " + o.line);
 				o;
 			}));
+			total = timestamp() - t0;
 			chk = fold(results, 0, \acc, o -> acc + o.checked);
 			acc2 = fold(results, 0, \acc, o -> acc + o.accepted);
 			bad = filter(results, \o -> !o.ok);
@@ -179,13 +215,18 @@ main() {
 			if (out != "" && !setFileContent(out,
 					strGlue(map(results, \o -> o.line), "\n") + "\n"))
 				println("cannot write " + out);
-			println("articles " + i2s(length(articles)) + ", verified "
-				+ i2s(length(articles) - length(bad)) + ", failed " + i2s(length(bad)));
-			if (ran) println("inferences " + i2s(chk) + " checked, "
-				+ i2s(acc2) + " accepted");
+			println("Total articles: " + i2s(length(articles))
+				+ ", verified: " + i2s(length(articles) - length(bad))
+				+ ", failed: " + i2s(length(bad))
+				+ (if (!ran) "" else ", inferences: " + i2s(chk)
+					+ (if (acc2 == chk) "" else ", accepted: " + i2s(acc2)))
+				+ ", time: " + mizFmtTime(total));
 			if (bad != []) {
-				println("failing articles:");
-				iter(bad, \o -> println("  " + o.line));
+				println("Failed articles:");
+				iter(bad, \o -> {
+					println("   " + o.line);
+					iter(o.failures, \f -> println("      rejected inference at " + f));
+				});
 			}
 			quit(if (bad != []) 1 else 0);
 		}
