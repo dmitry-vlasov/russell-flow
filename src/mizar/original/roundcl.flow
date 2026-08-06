@@ -466,67 +466,103 @@ mizRoundUpCluster(env : MizCorrelEnv, cl : MizClusters,
 		// that attribute keeps. A LIFO stack reaches FINSEQ_1:7 (`V4({})`)
 		// before RELSET_1:2 (`V4(A1) V5(A2)`) and the type ends up with the
 		// constant arguments instead of its own (mfold_2 65:16).
-		pushJob = \nr : int -> {
-			if (!getVectorUnsafe(inJobs, nr)) {
-				setVectorUnsafe(inJobs, nr, true);
-				// keep jobStack ASCENDING, so the last element is the largest
-				pos = ref sizeVector(jobStack);
-				while(\ -> ^pos > 0 && getVectorUnsafe(jobStack, ^pos - 1) > nr,
-					\ -> pos := ^pos - 1);
-				mizVectorAtInsert(jobStack, ^pos, nr);
-			}
-		};
 		oldPos = mizInitNatFunc(32);
 		oldNeg = mizInitNatFunc(32);
 
-		countAdj = \c : MizAttrColl -> {
-			np = mizInitNatFunc(32);
-			nn = mizInitNatFunc(32);
-			iterVector(c.items, \a -> {
-				if (a.neg == 1) mizNatUp(np, mizAdjustedAttrNr(env, a))
-				else mizNatUp(nn, mizAdjustedAttrNr(env, a));
-			});
-			Pair(np, nn);
-		};
-
-		handleUsageAndFire = \oldP : MizNatFunc, oldN : MizNatFunc -> {
-			pq = countAdj(cluster);
-			doSide = \newF : MizNatFunc, oldF : MizNatFunc, neg : int -> {
-				fori(0, mizNatCount(newF) - 1, \i -> {
-					it = mizNatItem(newF, i);
-					oldVal = if (mizNatHasInDom(oldF, it.x)) mizNatValue(oldF, it.x) else -1;
-					if (oldVal < it.y) {
-						idxSet = mizCondIndexAt(cl, neg, it.x);
-						fori(0, mizNatCount(idxSet) - 1, \k -> {
-							clNr = mizNatItem(idxSet, k).x;
-							setVectorUnsafe(clFire, clNr, getVectorUnsafe(clFire, clNr) - 1);
-							if (getVectorUnsafe(clFire, clNr) <= 0) {
-								pushJob(clNr);
-							}
-						});
-					}
-				});
-			};
-			doSide(pq.first, oldP, 1);
-			doSide(pq.second, oldN, 0);
-			pq;
-		};
-
-		// clusters with empty antecedent fire immediately
+		// clusters with empty antecedent fire immediately. This one stays a
+		// `fori`: its trip count is nCond, the whole environment's conditional
+		// cluster count, so recursion here would add that many frames under an
+		// already deeply nested RoundUpCluster.
 		fori(0, nCond - 1, \j -> {
-			if (getVectorUnsafe(clFire, j) == 0) pushJob(j);
+			if (getVectorUnsafe(clFire, j) == 0) mizRucPushJob(jobStack, inJobs, j);
 		});
-		cur = ref handleUsageAndFire(oldPos, oldNeg);
+		cur = ref mizRucHandleUsageAndFire(env, cl, cluster, clFire, jobStack,
+			inJobs, oldPos, oldNeg);
+		// THE JOB LOOP STAYS A `while`: it is a WORK LIST, so its iteration
+		// count is not bounded by any structure, and java has no TCE.
 		while(\ -> cluster.consistent && sizeVector(jobStack) > 0, \ -> {
 			last = getVectorUnsafe(jobStack, sizeVector(jobStack) - 1);
 			removeVector(jobStack, sizeVector(jobStack) - 1);
 			setVectorUnsafe(inJobs, last, false);
 			if (mizTryRounding(env, mizExtListAt(cl.conditional, last), typ, cluster)) {
-				cur := handleUsageAndFire((^cur).first, (^cur).second);
+				cur := mizRucHandleUsageAndFire(env, cl, cluster, clFire,
+					jobStack, inJobs, (^cur).first, (^cur).second);
 			}
 		});
 		cl.scratchDepth ::= depth;
 	}
+}
+
+// ---- RoundUpCluster's inner routines, hoisted out of the body ----
+// They were local lambdas, so every RoundUpCluster call allocated four
+// closures (and doSide two more per HandleUsageAndFire) before doing any work.
+// The logic is unchanged; the captured state is passed explicitly.
+
+// AddJob (roundcl.pas 197): lJobs is a NatSet, so the stack is kept ASCENDING
+// and PopNatSet takes the LARGEST pending cluster number. See the note at the
+// call site — the order is semantic, not an implementation choice.
+mizRucPushJob(jobStack : Vector<int>, inJobs : Vector<bool>, nr : int) -> void {
+	if (!getVectorUnsafe(inJobs, nr)) {
+		setVectorUnsafe(inJobs, nr, true);
+		mizVectorAtInsert(jobStack,
+			mizRucInsertPos(jobStack, 0, sizeVector(jobStack), nr), nr);
+	}
+}
+
+// the original walks DOWN from the top while the element below is greater,
+// which lands on the count of elements <= nr. The stack is ascending and nr is
+// never already in it (inJobs guards that), so a binary search for the same
+// boundary gives the same index — and its depth is log2, not the stack size.
+mizRucInsertPos(jobStack : Vector<int>, lo : int, hi : int, nr : int) -> int {
+	if (lo >= hi) {
+		lo;
+	} else {
+		mid = (lo + hi) / 2;
+		if (getVectorUnsafe(jobStack, mid) < nr)
+			mizRucInsertPos(jobStack, mid + 1, hi, nr)
+		else mizRucInsertPos(jobStack, lo, mid, nr);
+	}
+}
+
+// CountAdjAttrs: occurrences per adjusted attribute number, positive and
+// negative sides apart
+mizRucCountAdj(env : MizCorrelEnv, c : MizAttrColl) -> Pair<MizNatFunc, MizNatFunc> {
+	np = mizInitNatFunc(32);
+	nn = mizInitNatFunc(32);
+	iterVector(c.items, \a -> {
+		if (a.neg == 1) mizNatUp(np, mizAdjustedAttrNr(env, a))
+		else mizNatUp(nn, mizAdjustedAttrNr(env, a));
+	});
+	Pair(np, nn);
+}
+
+mizRucDoSide(env : MizCorrelEnv, cl : MizClusters, clFire : Vector<int>,
+		jobStack : Vector<int>, inJobs : Vector<bool>, newF : MizNatFunc,
+		oldF : MizNatFunc, neg : int) -> void {
+	fori(0, mizNatCount(newF) - 1, \i -> {
+		it = mizNatItem(newF, i);
+		oldVal = if (mizNatHasInDom(oldF, it.x)) mizNatValue(oldF, it.x) else -1;
+		if (oldVal < it.y) {
+			idxSet = mizCondIndexAt(cl, neg, it.x);
+			fori(0, mizNatCount(idxSet) - 1, \k -> {
+				clNr = mizNatItem(idxSet, k).x;
+				setVectorUnsafe(clFire, clNr, getVectorUnsafe(clFire, clNr) - 1);
+				if (getVectorUnsafe(clFire, clNr) <= 0) {
+					mizRucPushJob(jobStack, inJobs, clNr);
+				}
+			});
+		}
+	});
+}
+
+mizRucHandleUsageAndFire(env : MizCorrelEnv, cl : MizClusters,
+		cluster : MizAttrColl, clFire : Vector<int>, jobStack : Vector<int>,
+		inJobs : Vector<bool>, oldP : MizNatFunc,
+		oldN : MizNatFunc) -> Pair<MizNatFunc, MizNatFunc> {
+	pq = mizRucCountAdj(env, cluster);
+	mizRucDoSide(env, cl, clFire, jobStack, inJobs, pq.first, oldP, 1);
+	mizRucDoSide(env, cl, clFire, jobStack, inJobs, pq.second, oldN, 0);
+	pq;
 }
 
 // SwapArguments (1-based positions)

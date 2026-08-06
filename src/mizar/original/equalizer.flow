@@ -2481,26 +2481,31 @@ mizANAdjustedArgs(env : MizCorrelEnv, t : MizTrm) -> Pair<int, MizTrmList> {
 }
 
 // pairwise join of argument instantiations
+// The walk is tail-recursive over the two lists: `while(\ -> c, \ -> b)`
+// allocates two closures per CALL, and this runs once per instantiated
+// argument. Depth is the argument count, which MaxArgNbr bounds.
+mizANJoinArgsLoop(eq : MizEqualizer, prim : Vector<MizTyp>, el : MizTrmList,
+		al : MizTrmList, r : MizPreInst) -> void {
+	switch (al) {
+		MizTrmElem(at, an) : {
+			switch (el) {
+				MizTrmElem(et, en): {
+					mizANJoinWith(r, mizANInstTerm(eq, prim, et, at));
+					mizANJoinArgsLoop(eq, prim, en, an, r);
+				}
+				// the class side ran out: the original keeps walking `al`
+				// with `el` standing still, which joins nothing more
+				MizTrmNil(): mizANJoinArgsLoop(eq, prim, el, an, r);
+			}
+		}
+		MizTrmNil(): {}
+	}
+}
+
 mizANJoinArgs(eq : MizEqualizer, prim : Vector<MizTyp>, el0 : MizTrmList,
 		al0 : MizTrmList) -> MizPreInst {
 	r = mizPreInstTop();
-	el = ref el0;
-	al = ref al0;
-	while(\ -> switch (^al) { MizTrmNil(): false; default: true; }, \ -> {
-		switch (^al) {
-			MizTrmElem(at, an) : {
-				switch (^el) {
-					MizTrmElem(et, en): {
-						mizANJoinWith(r, mizANInstTerm(eq, prim, et, at));
-						el := en;
-					}
-					MizTrmNil(): {}
-				}
-				al := an;
-			}
-			MizTrmNil(): {}
-		}
-	});
+	mizANJoinArgsLoop(eq, prim, el0, al0, r);
 	r;
 }
 
@@ -2532,6 +2537,25 @@ mizANInstTerm(eq : MizEqualizer, prim : Vector<MizTyp>, eTrm : MizTrm,
 		}
 	} else {
 		mizANInstTermClass(eq, prim, mizClassOf(eq, mizTrmInfoOf(eTrm)), aTrm);
+	}
+}
+
+// the class-member walk of InstantiateTermClass, tail-recursive. Depth is the
+// number of members of one equivalence class.
+mizANInstClassLoop(eq : MizEqualizer, env : MizCorrelEnv, prim : Vector<MizTyp>,
+		cur : MizTrmList, aSort : int, aNr : int, aArgs : MizTrmList,
+		r : MizPreInst) -> void {
+	switch (cur) {
+		MizTrmElem(mem, next): {
+			if (mizTrmSort(mem) == aSort) {
+				mp = mizANAdjustedArgs(env, mem);
+				if (mp.first == aNr) {
+					mizANUnionWith(r, mizANJoinArgs(eq, prim, mp.second, aArgs));
+				}
+			}
+			mizANInstClassLoop(eq, env, prim, next, aSort, aNr, aArgs, r);
+		}
+		MizTrmNil(): {}
 	}
 }
 
@@ -2584,22 +2608,8 @@ mizANInstTermClass(eq : MizEqualizer, prim : Vector<MizTyp>, enr : int,
 			println("      ITC enr=" + i2s(enr) + " aSort=" + i2s(aSort)
 				+ " aNr=" + i2s(ap.first) + " mems:" + ^mems3);
 		}
-		cur = ref mizTrmSAt(eq, enr).eqClass;
-		while(\ -> switch (^cur) { MizTrmNil(): false; default: true; }, \ -> {
-			switch (^cur) {
-				MizTrmElem(mem, next): {
-					if (mizTrmSort(mem) == aSort) {
-						mp = mizANAdjustedArgs(env, mem);
-						if (mp.first == ap.first) {
-							z = mizANJoinArgs(eq, prim, mp.second, ap.second);
-							mizANUnionWith(r, z);
-						}
-					}
-					cur := next;
-				}
-				MizTrmNil(): {}
-			}
-		});
+		mizANInstClassLoop(eq, env, prim, mizTrmSAt(eq, enr).eqClass, aSort,
+			ap.first, ap.second, r);
 		r;
 	}
 }
@@ -2611,28 +2621,38 @@ mizANInstRadixType(eq : MizEqualizer, prim : Vector<MizTyp>, enr0 : int,
 	ap = mizAdjustTyp(env, atyp);
 	rec = mizTrmSAt(eq, enr);
 	r = mizPreInstBottom();
-	stop = ref false;
-	i = ref 0;
-	while(\ -> !^stop && ^i < sizeVector(rec.xTypClass), \ -> {
-		xt : MizTyp = getVectorUnsafe(rec.xTypClass, ^i);
+	mizANInstRadixLoop(eq, env, prim, rec.xTypClass, 0, atyp.sort, ap.first,
+		ap.second, switch (ap.second) { MizTrmNil(): true; default: false; }, r);
+	r;
+}
+
+// the xTypClass scan of InstantiateRadixType, tail-recursive; depth is the
+// number of types of one class. `noArgs` is loop-invariant, so it is computed
+// once at the call.
+mizANInstRadixLoop(eq : MizEqualizer, env : MizCorrelEnv, prim : Vector<MizTyp>,
+		types : Vector<MizTyp>, i : int, aSort : int, aNr : int,
+		aArgs : MizTrmList, noArgs : bool, r : MizPreInst) -> void {
+	if (i < sizeVector(types)) {
+		xt : MizTyp = getVectorUnsafe(types, i);
 		// as in mizANInstAttr: the guard needs only the adjusted number, so
 		// do not build the Pair (and drop arguments) until it passes
-		if (xt.sort == atyp.sort && mizAdjustedModNr(env, xt) == ap.first) {
-			noArgs = switch (ap.second) { MizTrmNil(): true; default: false; };
+		if (xt.sort == aSort && mizAdjustedModNr(env, xt) == aNr) {
 			if (noArgs) {
-				// registration type takes no arguments: any match is total
+				// registration type takes no arguments: any match is total,
+				// and the original leaves the loop here
 				r.top ::= true;
 				clearVector(r.evals);
-				stop := true;
 			} else {
 				mp = mizAdjustTyp(env, xt);
-				z = mizANJoinArgs(eq, prim, mp.second, ap.second);
-				mizANUnionWith(r, z);
+				mizANUnionWith(r, mizANJoinArgs(eq, prim, mp.second, aArgs));
+				mizANInstRadixLoop(eq, env, prim, types, i + 1, aSort, aNr,
+					aArgs, noArgs, r);
 			}
+		} else {
+			mizANInstRadixLoop(eq, env, prim, types, i + 1, aSort, aNr,
+				aArgs, noArgs, r);
 		}
-		i := ^i + 1;
-	});
-	r;
+	}
 }
 
 mizANInstAttr(eq : MizEqualizer, prim : Vector<MizTyp>, enr : int,
@@ -2641,29 +2661,38 @@ mizANInstAttr(eq : MizEqualizer, prim : Vector<MizTyp>, enr : int,
 	ap = mizAdjustAttr(env, aa);
 	rec = mizTrmSAt(eq, enr);
 	r = mizPreInstBottom();
-	stop = ref false;
-	i = ref 0;
-	while(\ -> !^stop && ^i < sizeVector(rec.superCluster.items), \ -> {
-		sa : MizAttr = getVectorUnsafe(rec.superCluster.items, ^i);
+	mizANInstAttrLoop(eq, env, prim, rec.superCluster.items, 0, ap.first, aa.neg,
+		ap.second, switch (ap.second) { MizTrmNil(): true; default: false; }, r);
+	r;
+}
+
+// the super-cluster scan of InstantiateAttr, tail-recursive; depth is the
+// number of adjectives of one class. This runs per instantiation and was the
+// top of the profile together with its two siblings.
+mizANInstAttrLoop(eq : MizEqualizer, env : MizCorrelEnv, prim : Vector<MizTyp>,
+		attrs : Vector<MizAttr>, i : int, aNr : int, aNeg : int,
+		aArgs : MizTrmList, noArgs : bool, r : MizPreInst) -> void {
+	if (i < sizeVector(attrs)) {
+		sa : MizAttr = getVectorUnsafe(attrs, i);
 		// the guard needs only the ADJUSTED NUMBER; adjusting the whole
 		// attribute allocates a Pair and drops the superfluous arguments, so
-		// leave that until the guard actually passes. This loop runs over
-		// every attribute of the class's super-cluster, per instantiation.
-		if (mizAdjustedAttrNr(env, sa) == ap.first && sa.neg == aa.neg) {
-			noArgs = switch (ap.second) { MizTrmNil(): true; default: false; };
+		// leave that until the guard actually passes.
+		if (mizAdjustedAttrNr(env, sa) == aNr && sa.neg == aNeg) {
 			if (noArgs) {
+				// the original leaves the loop here
 				r.top ::= true;
 				clearVector(r.evals);
-				stop := true;
 			} else {
 				sp = mizAdjustAttr(env, sa);
-				v = mizANJoinArgs(eq, prim, sp.second, ap.second);
-				mizANUnionWith(r, v);
+				mizANUnionWith(r, mizANJoinArgs(eq, prim, sp.second, aArgs));
+				mizANInstAttrLoop(eq, env, prim, attrs, i + 1, aNr, aNeg,
+					aArgs, noArgs, r);
 			}
+		} else {
+			mizANInstAttrLoop(eq, env, prim, attrs, i + 1, aNr, aNeg,
+				aArgs, noArgs, r);
 		}
-		i := ^i + 1;
-	});
-	r;
+	}
 }
 
 mizANInstAttrs(eq : MizEqualizer, prim : Vector<MizTyp>, enr : int,
