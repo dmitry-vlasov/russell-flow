@@ -332,6 +332,91 @@ mizAccomRenumberTrm(tr : (int, int) -> int, t : MizTrm) -> void {
 	}
 }
 
+// ---------------- the re-read boundary ----------------
+//
+// The original accommodator only TRANSLATES a collection in place
+// (TransMMLCluster, inlibr.pas 162: the attr numbers are rewritten, the
+// order is kept) and writes it out; sortedness in the MERGED frame is
+// restored when the checker RE-READS the file — In_AttrColl inserts every
+// adjective by CompAbsAttr over the merged constructor table
+// (MAttrCollection.Insert / Search, correl.pas 2632/2587). Accommodating
+// in-process, that re-read must be applied explicitly to everything that
+// does not pass through produced bytes: the constructor table (.atr) and
+// the cluster registrations (.ecl). The envify walkers apply the same
+// boundary for the late phase (.eth/.esh/.eid/.erd/definientia).
+
+mizAccomResortCluster(env : MizCorrelEnv, c : MizAttrColl) -> void {
+	iterVector(c.items, \a -> mizAccomResortTrmList(env, a.args));
+	old = vector2array(c.items);
+	clearVector(c.items);
+	iter(old, \a -> mizAttrCollInsert(env, c, a));
+}
+
+mizAccomResortTyp(env : MizCorrelEnv, t : MizTyp) -> void {
+	mizAccomResortCluster(env, t.lower);
+	mizAccomResortCluster(env, t.upper);
+	mizAccomResortTrmList(env, t.modArgs);
+}
+
+mizAccomResortTrmList(env : MizCorrelEnv, l : MizTrmList) -> void {
+	switch (l) {
+		MizTrmNil(): {}
+		MizTrmElem(trm, next): {
+			mizAccomResortTrm(env, trm);
+			mizAccomResortTrmList(env, next);
+		}
+	}
+}
+
+mizAccomResortTrm(env : MizCorrelEnv, t : MizTrm) -> void {
+	switch (t) {
+		MizFuncTrm(__, __, args, __, __): mizAccomResortTrmList(env, args);
+		MizPrivFuncTrm(__, args, expn, __, __): {
+			mizAccomResortTrm(env, expn);
+			mizAccomResortTrmList(env, args);
+		}
+		MizFraenkelTrm(lambdaArgs, scope, compr, __, __, __): {
+			iterVector(lambdaArgs, \ty -> mizAccomResortTyp(env, ty));
+			mizAccomResortTrm(env, scope);
+			mizAccomResortFrm(env, compr);
+		}
+		MizQuaTrm(trmProper, typ, __, __): {
+			mizAccomResortTrm(env, trmProper);
+			mizAccomResortTyp(env, typ);
+		}
+		MizChoiceTrm(typ, __, __): mizAccomResortTyp(env, typ);
+		default: {}
+	}
+}
+
+mizAccomResortFrm(env : MizCorrelEnv, f : MizFrm) -> void {
+	switch (f) {
+		MizPredFrm(__, __, args, __): mizAccomResortTrmList(env, args);
+		MizLocPredFrm(__, args, expn, __): {
+			mizAccomResortFrm(env, expn);
+			mizAccomResortTrmList(env, args);
+		}
+		MizQualFrm(trm, typ, __): {
+			mizAccomResortTrm(env, trm);
+			mizAccomResortTyp(env, typ);
+		}
+		MizNegFrm(arg, __): mizAccomResortFrm(env, arg);
+		MizConjFrm(conjuncts, __): iterVector(conjuncts, \g -> mizAccomResortFrm(env, g));
+		MizUnivFrm(__, __, quantified, scope, __): {
+			mizAccomResortTyp(env, quantified);
+			mizAccomResortFrm(env, scope);
+		}
+		MizFlexFrm(__, lo, ro, lt, rt, expansion, __): {
+			mizAccomResortFrm(env, lo);
+			mizAccomResortFrm(env, ro);
+			mizAccomResortFrm(env, expansion);
+			mizAccomResortTrm(env, lt);
+			mizAccomResortTrm(env, rt);
+		}
+		default: {}
+	}
+}
+
 mizAccomRenumberFrm(tr : (int, int) -> int, f : MizFrm) -> void {
 	switch (f) {
 		MizPredFrm(srt, predNr, args, __): {
@@ -478,6 +563,14 @@ mizAccomOneDco(env : MizCorrelEnv, st : MizAccomState, mmlDir : string,
 					c = mizInConstructor1(r);
 					slot = mizConstrCount(env, c.kind) + 1;
 					mizAccomRenumberConstr(tr, c);
+					// the .atr re-read boundary: every attr collection sorted
+					// in the merged frame (In_AttrColl at Load_EnvConstructors)
+					iterVector(c.primaries, \t -> mizAccomResortTyp(env, t));
+					switch (c.typ) {
+						Some(t): mizAccomResortTyp(env, t);
+						None(): {}
+					}
+					iterVector(c.prefixes, \t -> mizAccomResortTyp(env, t));
 					pushed = mizPushConstr(env, c);
 					if (pushed != slot) mizRunTimeError(2804);
 				} else {
@@ -643,15 +736,26 @@ mizAccomClusters(acc : MizAccom, cl : MizClusters, evl : MizEvl) -> void {
 					None(): {}
 					Some(c): {
 						regNr := ^regNr + 1;
+						// the .dcl's SECOND cluster (the source article's rounded
+						// upper) is DISCARDED: TransMMLCluster translates the
+						// Lower alone, and the kept registration gets
+						// Upper := CopyCluster(Lower) of the TRANSLATED lower
+						// (acc_han.pas 876/911-912, 921-922, 933-934). The
+						// checker recomputes every upper against THIS article's
+						// registration set at environment round-up.
+						freshRec = \lo : MizAttrColl -> {
+							mizAccomRenumberCluster(tr, lo);
+							MizClusterRec(lo, mizCopyCluster(lo));
+						};
 						renumbered : MizAnyCluster = switch (c) {
 							MizRCluster(__, __, prims, cons, typ): {
-								mizAccomRenumberCl(tr, cons);
+								cons2 = freshRec(cons.lower);
 								iterVector(prims, \t -> mizAccomRenumberTyp(tr, t));
 								mizAccomRenumberTyp(tr, typ);
-								MizRCluster(art, ^regNr, prims, cons, typ);
+								MizRCluster(art, ^regNr, prims, cons2, typ);
 							}
 							MizFCluster(__, __, prims, cons, trm, typ): {
-								mizAccomRenumberCl(tr, cons);
+								cons2 = freshRec(cons.lower);
 								iterVector(prims, \t -> mizAccomRenumberTyp(tr, t));
 								mizAccomRenumberTrm(tr, trm);
 								switch (typ) {
@@ -659,21 +763,55 @@ mizAccomClusters(acc : MizAccom, cl : MizClusters, evl : MizEvl) -> void {
 									None(): {}
 								}
 								funNr := ^funNr + 1;
-								MizFCluster(art, ^funNr, prims, cons, trm, typ);
+								MizFCluster(art, ^funNr, prims, cons2, trm, typ);
 							}
 							MizCCluster(__, __, prims, ante, cons, typ): {
 								mizAccomRenumberCluster(tr, ante);
 								iterVector(prims, \t -> mizAccomRenumberTyp(tr, t));
 								mizAccomRenumberTyp(tr, typ);
-								mizAccomRenumberCl(tr, cons);
+								cons2 = freshRec(cons.lower);
 								condNr := ^condNr + 1;
-								MizCCluster(art, ^condNr, prims, ante, cons, typ);
+								MizCCluster(art, ^condNr, prims, ante, cons2, typ);
 							}
 						};
 						// a registration reaching a CUT-OFF article's
 						// constructor is inaccessible and dropped — but it
 						// has still consumed its number
 						if (mizAccCluster1(acc.env, renumbered)) {
+							// the .ecl re-read boundary, AFTER the
+							// accessibility gate (only accessible
+							// registrations are written): the checker reads
+							// every collection back with sorted insertion
+							// (In_AttrColl over the merged table). An
+							// inaccessible one may reference a cut-off frame
+							// slot with no table entry — resorting it would
+							// look that slot up.
+							resortT = \t : MizTyp -> mizAccomResortTyp(acc.env, t);
+							switch (renumbered) {
+								MizRCluster(__, __, prims, cons, typ): {
+									iterVector(prims, resortT);
+									resortT(typ);
+									mizAccomResortCluster(acc.env, cons.lower);
+									mizAccomResortCluster(acc.env, cons.upper);
+								}
+								MizFCluster(__, __, prims, cons, trm, typ): {
+									iterVector(prims, resortT);
+									mizAccomResortTrm(acc.env, trm);
+									switch (typ) {
+										Some(t): resortT(t);
+										None(): {}
+									}
+									mizAccomResortCluster(acc.env, cons.lower);
+									mizAccomResortCluster(acc.env, cons.upper);
+								}
+								MizCCluster(__, __, prims, ante, cons, typ): {
+									iterVector(prims, resortT);
+									resortT(typ);
+									mizAccomResortCluster(acc.env, ante);
+									mizAccomResortCluster(acc.env, cons.lower);
+									mizAccomResortCluster(acc.env, cons.upper);
+								}
+							}
 							mizInsertAnyCluster(acc.env, cl, renumbered);
 						}
 					}
@@ -1146,6 +1284,12 @@ mizEnvifyTyp(env : MizCorrelEnv, t : MizTyp) -> void {
 
 mizEnvifyCluster(env : MizCorrelEnv, c : MizAttrColl) -> void {
 	iterVector(c.items, \a -> mizEnvifyTrmList(env, a.args));
+	// the re-read boundary: In_AttrColl inserts every adjective SORTED by
+	// CompAbsAttr over the merged table (correl.pas 2632) — the nested
+	// structures are already handled by the envify walk above
+	old = vector2array(c.items);
+	clearVector(c.items);
+	iter(old, \a -> mizAttrCollInsert(env, c, a));
 }
 
 mizEnvifyTrmList(env : MizCorrelEnv, l : MizTrmList) -> void {
