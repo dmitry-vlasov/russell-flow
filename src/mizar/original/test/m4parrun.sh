@@ -6,7 +6,8 @@
 #   ./m4parrun.sh [jobs=N] [list=<mml.lar>] [out=<file>]
 set -e
 SCRIPT_DIR=$( cd "$( dirname "$0" )" && pwd -P )
-BASE_DIR=$( cd "$SCRIPT_DIR/../../.." && pwd -P )
+BASE_DIR=$( cd "$SCRIPT_DIR/../../../.." && pwd -P )
+JARS="${MIZAR_TEST_JARS:-$BASE_DIR/build/mizar-test}"
 MML="${RUSSELL_MATH:-$HOME/dev/math}/MML-test"
 REF=$HOME/mizar_oracle/m4ref
 JOBS=8; LIST="$MML/mml.lar"; OUT=$HOME/mizar_runs/m4par.txt
@@ -14,7 +15,7 @@ JOBS=8; LIST="$MML/mml.lar"; OUT=$HOME/mizar_runs/m4par.txt
 if [ "$1" = "--one" ]; then
 	a="$2"; out="$3"
 	d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
-	java -Xss128m -Xmx2g -jar "$BASE_DIR/src/mizar/original/test/test_par.jar" \
+	java -Xss128m -Xmx2g -jar "$JARS/test_par.jar" \
 		"article=$a" "mml=$MML" "out=$d/port.par" > "$d/log.txt" 2>&1 || true
 	if [ ! -s "$REF/$a.par" ]; then line="$a NOREF"
 	elif [ ! -s "$d/port.par" ]; then line="$a CRASH"
@@ -24,6 +25,9 @@ if [ "$1" = "--one" ]; then
 	exit 0
 fi
 for i in "$@"; do case $i in jobs=*) JOBS="${i#*=}";; list=*) LIST="${i#*=}";; out=*) OUT="${i#*=}";; esac; done
+# build the stage jar once, here, so the workers never race on it
+mkdir -p "$JARS"
+( cd "$BASE_DIR/src" && flowc1 "mizar/original/test/test_par.flow" "jar=$JARS/test_par.jar" > /dev/null )
 mkdir -p "$( dirname "$OUT" )"; : > "$OUT"
 awk 'NF {print $1}' "$LIST" | xargs -P "$JOBS" -I{} "$SCRIPT_DIR/m4parrun.sh" --one {} "$OUT"
 awk '{ n++; if ($2 == "OK") ok++; else bad[$1]=$0 }

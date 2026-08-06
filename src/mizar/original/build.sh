@@ -1,7 +1,14 @@
 #!/bin/bash
 # Build the Flow9 Mizar verifier (src/mizar/original).
 #   ./build.sh        — build mizar.jar (the verifier)
-#   ./build.sh test   — build + run the full integration test suite
+#   ./build.sh test   — build + run the component test suite
+#
+# EVERYTHING ELSE UNDER TEST IS IN test/ — see test/test.sh:
+#   test/test.sh              the component suites
+#   test/test.sh <unit>       one of them
+#   test/test.sh verifier     the whole MML through the whole verifier
+# and the per-stage gates (test/m3*.sh, test/m4*.sh, test/fullrun.sh) for
+# localizing a regression to one pass.
 
 set -e
 
@@ -14,7 +21,5 @@ flowc1 jar=1 mizar/original/mizar.flow
 echo "built: $SRC_DIR/mizar/original/mizar.jar"
 
 if [ "$1" = "test" ]; then
-	flowc1 jar=1 mizar/original/test/test_all.flow
-	MML="${RUSSELL_MATH:-$HOME/dev/math}/MML-test"
-	java -Xss128m -Xmx4g -jar mizar/original/test/test_all.jar "mml=$MML"
+	exec "$SCRIPT_DIR/test/test.sh"
 fi

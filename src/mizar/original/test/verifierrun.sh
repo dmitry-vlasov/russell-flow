@@ -14,7 +14,7 @@
 # RESUMABLE: articles already present in the output file are skipped.
 set -e
 SCRIPT_DIR=$( cd "$( dirname "$0" )" && pwd -P )
-BASE_DIR=$( cd "$SCRIPT_DIR/../../.." && pwd -P )
+BASE_DIR=$( cd "$SCRIPT_DIR/../../../.." && pwd -P )
 MML="${RUSSELL_MATH:-$HOME/dev/math}/MML-test"
 REF=$HOME/mizar_oracle/m4ref
 JOBS=6; TIMEOUT=600; LIST="$MML/mml.lar"; OUT=$HOME/mizar_runs/verifier.txt

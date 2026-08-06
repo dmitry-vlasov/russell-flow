@@ -3,14 +3,15 @@
 #
 # Reference: the ORIGINAL parser built with -dMDEBUG dumps every token it takes
 # from the scanner (the tap in mscanner.pas ReadToken) into <article>.inf.
-# Port:      src/mizar/original/test/test_scanner.jar prints the same shape.
+# Port:      test_scanner.flow prints the same shape (built on demand below).
 # The two streams must be identical.
 #
 #   ./m3tokrun.sh [jobs=N] [list=<file>] [out=<file>]
 set -e
 
 SCRIPT_DIR=$( cd "$( dirname "$0" )" && pwd -P )
-BASE_DIR=$( cd "$SCRIPT_DIR/../../.." && pwd -P )
+BASE_DIR=$( cd "$SCRIPT_DIR/../../../.." && pwd -P )
+JARS="${MIZAR_TEST_JARS:-$BASE_DIR/build/mizar-test}"
 MML="${RUSSELL_MATH:-$HOME/dev/math}/MML-test"
 ORACLE=$HOME/mizar_oracle/build_m3dbg/wsmparser_dbg
 JOBS=8
@@ -26,7 +27,7 @@ if [ "$1" = "--one" ]; then
 		flock "$out" -c "echo '$a NOREF' >> '$out'"; exit 0
 	fi
 	grep -a '^TOK ' "$d/$a.inf" > "$d/ref.txt" || true
-	java -Xss128m -Xmx2g -jar "$BASE_DIR/src/mizar/original/test/test_scanner.jar" \
+	java -Xss128m -Xmx2g -jar "$JARS/test_scanner.jar" \
 		"article=$a" "mml=$MML" > "$d/port.txt" 2>&1 || true
 	nref=$( wc -l < "$d/ref.txt" )
 	nport=$( grep -c '^TOK ' "$d/port.txt" || true )
@@ -49,9 +50,9 @@ esac
 done
 
 [ -x "$ORACLE" ] || { echo "no oracle parser: $ORACLE" >&2; exit 1; }
-[ -f "$BASE_DIR/src/mizar/original/test/test_scanner.jar" ] || {
-	echo "build first: flowc1 jar=1 mizar/original/test/test_scanner.flow" >&2; exit 1; }
-
+# build the stage jar once, here, so the workers never race on it
+mkdir -p "$JARS"
+( cd "$BASE_DIR/src" && flowc1 "mizar/original/test/test_scanner.flow" "jar=$JARS/test_scanner.jar" > /dev/null )
 mkdir -p "$( dirname "$OUT" )"
 : > "$OUT"
 awk 'NF {print $1}' "$LIST" | xargs -P "$JOBS" -I{} "$SCRIPT_DIR/m3tokrun.sh" --one {} "$OUT"

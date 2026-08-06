@@ -5,7 +5,8 @@
 #   ./m3msmrun.sh [jobs=N] [list=<mml.lar>] [out=<file>]
 set -e
 SCRIPT_DIR=$( cd "$( dirname "$0" )" && pwd -P )
-BASE_DIR=$( cd "$SCRIPT_DIR/../../.." && pwd -P )
+BASE_DIR=$( cd "$SCRIPT_DIR/../../../.." && pwd -P )
+JARS="${MIZAR_TEST_JARS:-$BASE_DIR/build/mizar-test}"
 MML="${RUSSELL_MATH:-$HOME/dev/math}/MML-test"
 REF=$HOME/mizar_oracle/m3ref
 JOBS=8; LIST="$MML/mml.lar"; OUT=$HOME/mizar_runs/m3parse.txt
@@ -13,7 +14,7 @@ JOBS=8; LIST="$MML/mml.lar"; OUT=$HOME/mizar_runs/m3parse.txt
 if [ "$1" = "--one" ]; then
 	a="$2"; out="$3"
 	d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
-	java -Xss128m -Xmx2g -jar "$BASE_DIR/src/mizar/original/test/test_msm.jar" \
+	java -Xss128m -Xmx2g -jar "$JARS/test_msm.jar" \
 		"article=$a" "mml=$MML" > "$d/port.msx" 2>"$d/err.txt" || true
 	if [ ! -s "$REF/$a.msx" ]; then line="$a NOREF"
 	elif cmp -s "$d/port.msx" "$REF/$a.msx"; then line="$a OK"
@@ -22,6 +23,9 @@ if [ "$1" = "--one" ]; then
 	exit 0
 fi
 for i in "$@"; do case $i in jobs=*) JOBS="${i#*=}";; list=*) LIST="${i#*=}";; out=*) OUT="${i#*=}";; esac; done
+# build the stage jar once, here, so the workers never race on it
+mkdir -p "$JARS"
+( cd "$BASE_DIR/src" && flowc1 "mizar/original/test/test_msm.flow" "jar=$JARS/test_msm.jar" > /dev/null )
 mkdir -p "$( dirname "$OUT" )"; : > "$OUT"
 awk 'NF {print $1}' "$LIST" | xargs -P "$JOBS" -I{} "$SCRIPT_DIR/m3msmrun.sh" --one {} "$OUT"
 awk '{ n++; if ($2 == "OK") ok++; else bad[$1]=$0 }

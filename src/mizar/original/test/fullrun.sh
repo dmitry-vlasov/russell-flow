@@ -21,7 +21,7 @@
 set -e
 
 SCRIPT_DIR=$( cd "$( dirname "$0" )" && pwd -P )
-BASE_DIR=$( cd "$SCRIPT_DIR/../../.." && pwd -P )   # repository root
+BASE_DIR=$( cd "$SCRIPT_DIR/../../../.." && pwd -P )   # repository root
 
 # ---- internal worker: check ONE article, append one line under a lock -------
 # (handled before the option parsing — its arguments are positional)

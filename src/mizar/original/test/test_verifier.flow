@@ -1,0 +1,133 @@
+// THE INTEGRATION TEST — the whole MML through the whole verifier, in ONE
+// PROCESS. For each article it runs the complete chain
+//     .miz --parse--> --MSM--> --Transfer2Analyzer--> --Analyze--> .xml
+//          --check--> verdict
+// (verfinit.flow, MSMVerifyArticle) and checks BOTH ends:
+//   * the analyzer report byte-for-byte against the oracle's own report in
+//     `ref=<dir>` (default ~/mizar_oracle/m4ref), when that reference exists;
+//   * the checker verdict — every inference of the article must be accepted.
+//
+// This is what fullrun.sh's own header always named as the target shape:
+// "a single executable that runs the whole MML concurrently in one process,
+// with no intermediate files". The articles are independent — each builds its
+// own MizCorrelEnv, and the port has no shared mutable state beyond
+// idempotent debug-flag caches — so they run on a thread pool.
+//
+//   ../test.sh verifier [jobs=N] [mml=<dir>] [list=<file>] [only=a,b,c]
+//
+// Parameters:
+//   jobs=N       worker threads (default 6)
+//   list=<file>  article list (default <mml>/mml/../mml.lar)
+//   only=a,b,c   just these articles — the fast smoke
+//   ref=<dir>    oracle reports (default ~/mizar_oracle/m4ref); ref=0 to skip
+//                the byte compare and check the verdict alone
+//   out=<file>   also write the per-article lines there
+//   quiet=1      only the tally
+//
+// MEMORY: one JVM holds `jobs` articles at once — run it with -Xss128m and
+// at least 2g per worker (test.sh does).
+
+import mizar/original/verfinit;
+import mizar/original/test/test_utils;
+import sys/concurrent;
+import net/url_parameter;
+import fs/filesystem;
+import ds/vector;
+import string;
+import runtime;
+
+// one article's outcome
+MizVerifyOutcome(
+	article : string,
+	ok : bool,
+	line : string,
+	checked : int,
+	accepted : int,
+);
+
+mizVerifyOne(mml : string, mizFiles : string, refDir : string,
+		article : string) -> MizVerifyOutcome {
+	r = mizMSMVerifyArticle(mml, article, mizFiles,
+		mizFileEnvLoader(mml, article), false, false, false);
+	stats = switch (r.stats) {
+		Some(s): s;
+		None(): MizPrepStats(0, 0, 1, 0, 0, makeVector(0));
+	}
+	// the report, when there is something to compare it with
+	refPath = refDir + "/" + article + ".xml";
+	xmlBad = if (refDir == "0" || !fileExists(refPath)) "" else {
+		expected = getFileContent(refPath);
+		if (expected == r.xml) "" else {
+			n = strlen(r.xml);
+			m = strlen(expected);
+			// first differing byte, for the same diagnostic the gate used to give
+			i = ref 0;
+			while(\ -> ^i < n && ^i < m && getCharAt(r.xml, ^i) == getCharAt(expected, ^i),
+				\ -> i := ^i + 1);
+			" XMLDIFF " + i2s(^i + 1) + "/" + i2s(m);
+		}
+	}
+	verdict = "checked=" + i2s(stats.checked) + " accepted=" + i2s(stats.accepted);
+	ok = xmlBad == "" && stats.failed == 0 && r.stoppedAt == 0
+		&& stats.checked == stats.accepted;
+	MizVerifyOutcome(article, ok,
+		article + (if (ok) " OK " else " FAIL ") + verdict + xmlBad
+			+ (if (stats.failed > 0) " failed=" + i2s(stats.failed) else "")
+			+ (if (r.stoppedAt != 0) " stoppedAt=" + i2s(r.stoppedAt) else ""),
+		stats.checked, stats.accepted);
+}
+
+runVerifierTest(t : MizTest) -> void {
+	mmlRoot = mizTestMml();
+	mml = mmlRoot + "/mml";
+	mizFiles = getUrlParameterDef("mizfiles", "/usr/local/share/mizar/");
+	refDir = getUrlParameterDef("ref", getUrlParameterDef("home", "/home/dmitry")
+		+ "/mizar_oracle/m4ref");
+	jobs = s2i(getUrlParameterDef("jobs", "6"));
+	quiet = getUrlParameterDef("quiet", "") == "1";
+
+	only = getUrlParameterDef("only", "");
+	articles = if (only != "") filtermap(strSplit(only, ","), \a ->
+			if (trim(a) == "") None() else Some(trim(a)))
+		else {
+			listPath = getUrlParameterDef("list", mmlRoot + "/mml.lar");
+			filtermap(strSplit(getFileContent(listPath), "\n"), \l -> {
+				a = trim(l);
+				if (a == "") None() else Some(a);
+			});
+		};
+
+	if (articles == []) {
+		println("test_verifier: no articles (list= or only=)");
+		t.failed ::= t.failed + 1;
+	} else {
+		pool = newThreadPool(max(1, jobs));
+		results = concurrent(pool, map(articles, \a -> \ -> {
+			o = mizVerifyOne(mml, mizFiles, refDir, a);
+			if (!quiet) println(o.line);
+			o;
+		}));
+		chk = fold(results, 0, \acc, o -> acc + o.checked);
+		acc2 = fold(results, 0, \acc, o -> acc + o.accepted);
+		bad = filter(results, \o -> !o.ok);
+		iter(results, \o -> mizCheck(t, "verifier." + o.article, o.ok));
+		out = getUrlParameterDef("out", "");
+		if (out != "") {
+			if (!setFileContent(out, strGlue(map(results, \o -> o.line), "\n") + "\n"))
+				println("cannot write " + out);
+		}
+		println("articles " + i2s(length(articles)) + ", verified "
+			+ i2s(length(articles) - length(bad)) + ", failed " + i2s(length(bad)));
+		println("inferences " + i2s(chk) + " checked, " + i2s(acc2) + " accepted");
+		if (bad != []) {
+			println("failing articles:");
+			iter(bad, \o -> println("  " + o.line));
+		}
+	}
+}
+
+main() {
+	t = mizMakeTest();
+	runVerifierTest(t);
+	mizTestExit(t);
+}
