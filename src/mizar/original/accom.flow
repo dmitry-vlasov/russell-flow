@@ -31,6 +31,8 @@ import mizar/original/definientia;
 import mizar/original/identify;
 import mizar/original/builtin;
 import mizar/original/prep;
+import mizar/original/iocorrel_write;
+import mizar/original/accom_dict;
 
 export {
 	// the parsed .evl: directive name -> article ids, in file order
@@ -98,6 +100,20 @@ export {
 	// set env.builtIn from prel/*.dre, exactly as the .ere would have it
 	// (acc_han.pas ProcessRequirements)
 	mizAccomRequirements(acc : MizAccom, evl : MizEvl) -> void;
+
+	// build the property registrations, exactly as the .epr would have them
+	// (acc_han.pas ProcessProperties, 1144 — over prel/*.dpr of the
+	// registrations directive). Must run after mizAccomConstructors. The
+	// items are TRANSLATED but not env-formatted: the original writes them
+	// to the .epr and the checker's read applies AfterClusters — a consumer
+	// feeding env.propertiesList must mizEnvifyTyp each type first.
+	mizAccomProperties(acc : MizAccom, evl : MizEvl) -> Vector<MizPropertyReg>;
+
+	// ProcessProperties' output file (acc_han.pas 1148/1191): the .epr
+	// bytes. An empty registrations directive ERASES the file (1150) —
+	// the content is "" and no .epr exists.
+	mizEprContent(env : MizCorrelEnv, props : Vector<MizPropertyReg>,
+		registrations : [string], articleId : string, mizFiles : string) -> string;
 
 	// internals the NOTATION pass (accom_notation.flow) builds on
 	mizAccomTranslateIn(st : MizAccomState, frame : [string], kind : int, nr : int) -> int;
@@ -1010,6 +1026,71 @@ mizAccomRequirements(acc : MizAccom, evl : MizEvl) -> void {
 			});
 		}
 	});
+}
+
+// ---------------- the properties pass (.epr) ----------------
+
+// ProcessProperties (acc_han.pas 1144): for each registrations directive
+// article read its prel/*.dpr (impobjs.pas GetProperties, 1228 — root
+// <PropertyRegistration>, then the <Signature>, then <Property> items),
+// translate into the merged frame, keep the accessible ones, in order.
+mizAccomProperties(acc : MizAccom, evl : MizEvl) -> Vector<MizPropertyReg> {
+	st = acc.st;
+	props : Vector<MizPropertyReg> = makeVector(8);
+	iter(mizEvlDirective(evl, "registrations"), \art -> {
+		path = mizPrelPath(acc.mmlDir, art, ".dpr");
+		if (fileExists(path)) {
+			r = mizMakeVrfReaderRawMML(mizXmlInitParsing(getFileContent(path)), acc.env);
+			x = r.x;
+			mizXmlNextElementState(x);
+			mizXmlAssert(x.nElName == "PropertyRegistration");
+			mizXmlNextElementState(x);
+			sig = mizReadDcoHeader(x).signature;
+			savedMerged = st.merged;
+			added = mizAccomEnsureBases(acc, sig);
+			tr = \k, nr -> mizAccomTranslateIn(st, sig, k, nr);
+			while(\ -> x.nState == MizEStart, \ -> {
+				if (x.nElName == "Property") {
+					pr = mizInPropertyReg(r);
+					// TransMMLProperty (inlibr.pas 300): the primaries always,
+					// the object only for sethood
+					iterVector(pr.primaries, \t -> mizAccomRenumberTyp(tr, t));
+					if (pr.propertyKind == sySethood) mizAccomRenumberTyp(tr, pr.obj);
+					// AccesibleProperty (inlibr.pas 814)
+					if (mizAccTypColl(acc.env, pr.primaries)
+						&& (pr.propertyKind != sySethood || mizAccTyp(acc.env, pr.obj))) {
+						pushVector(props, pr);
+					}
+				} else mizXmlSkipElement(x);
+			});
+			st.merged ::= savedMerged;
+			iter(added, \a -> {
+				st.info ::= removeFromTree(st.info, a);
+				st.baseOf ::= removeFromTree(st.baseOf, a);
+			});
+		}
+	});
+	props;
+}
+
+// OpenFileWithXSL + Out_PropertyReg per item (acc_han.pas 1148/1191-1199,
+// iocorrel.pas 2393). Env files write a Typ with its lower cluster only.
+mizEprContent(env : MizCorrelEnv, props : Vector<MizPropertyReg>,
+		registrations : [string], articleId : string, mizFiles : string) -> string {
+	if (length(registrations) == 0) ""
+	else {
+		o = mizMakeVrfOut(env);
+		o.mmlTyp ::= true;
+		mizVOutString(o, "<?xml version=\"1.0\"?>\n");
+		mizVOutString(o, "<?xml-stylesheet type=\"text/xml\" href=\"file://"
+			+ mizFiles + "miz.xml\"?>\n");
+		mizVOutString(o, "<PropertyRegistration aid=\"" + articleId
+			+ "\" mizfiles=\"" + mizQuoteEnvXML(mizFiles) + "\">\n");
+		iterVector(props, \p -> mizVOutPropertyReg(o, p.article, p.absNr,
+			p.propertyKind, p.primaries, p.obj));
+		mizVOutString(o, "</PropertyRegistration>\n");
+		mizVrfOutContent(o);
+	}
 }
 
 // ---------------- the env-format post-processing ----------------
