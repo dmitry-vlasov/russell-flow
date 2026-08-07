@@ -25,6 +25,11 @@ export {
 	ruPProveImp(hyps : [RuPForm], goal : RuPForm) -> Maybe<RuPDeriv>;
 	// Independent checker: is `d` a well-formed G3cp derivation of its end-sequent? (for unit testing).
 	ruPDerivValid(d : RuPDeriv) -> bool;
+
+	// The rule-selection order (non-branching first). Exported so a derivation
+	// CONSUMER (the Hilbert translator) can re-identify each node's principal
+	// formula exactly as the prover chose it.
+	ruPPickPrincipal(g : [RuPForm], d : [RuPForm]) -> Pair<bool, int>; // (isGamma, index)
 }
 
 ruPContains(fs : [RuPForm], f : RuPForm) -> bool { exists(fs, \x -> x == f); }
@@ -47,11 +52,49 @@ ruPOne(rule : string, g : [RuPForm], d : [RuPForm], m : Maybe<RuPDeriv>) -> Mayb
 
 ruPProveImp(hyps : [RuPForm], goal : RuPForm) -> Maybe<RuPDeriv> { ruPProveSeq(hyps, [goal]); }
 
+// Rule-selection order matters for DERIVATION SIZE (not validity): apply
+// non-branching rules first (γ: ¬ ∧ / δ: ¬ ∨ →), then the ↔ rewrites, and
+// branch (γ: ∨ → / δ: ∧) only when nothing else is decomposable — the
+// first-decomposable strategy multiplied every later decomposition into
+// each branch, and the emitted certificates paid for it.
+ruPGammaClass(f : RuPForm) -> int {
+	switch (f) {
+		RuPNot(__): 0; RuPAnd(__, __): 0;
+		RuPIff(__, __): 1;
+		RuPOr(__, __): 2; RuPImp(__, __): 2;
+		default: -1;
+	}
+}
+ruPDeltaClass(f : RuPForm) -> int {
+	switch (f) {
+		RuPNot(__): 0; RuPOr(__, __): 0; RuPImp(__, __): 0;
+		RuPIff(__, __): 1;
+		RuPAnd(__, __): 2;
+		default: -1;
+	}
+}
+// index of the lowest-class decomposable formula, else -1
+ruPFindBest(fs : [RuPForm], cls : (RuPForm) -> int) -> Pair<int, int> {
+	foldi(fs, Pair(-1, 3), \i, acc, f -> {
+		c = cls(f);
+		if (c >= 0 && c < acc.second) Pair(i, c) else acc;
+	});
+}
+
+ruPPickPrincipal(g : [RuPForm], d : [RuPForm]) -> Pair<bool, int> {
+	bg = ruPFindBest(g, ruPGammaClass);
+	bd = ruPFindBest(d, ruPDeltaClass);
+	if (bg.first >= 0 && (bd.first < 0 || bg.second <= bd.second)) Pair(true, bg.first)
+	else Pair(false, bd.first);
+}
+
 ruPProveSeq(g : [RuPForm], d : [RuPForm]) -> Maybe<RuPDeriv> {
 	if (exists(g, \f -> f == RuPFalse()) || exists(d, \f -> f == RuPTrue()) || exists(g, \f -> ruPContains(d, f)))
 		Some(RuPDAxiom(g, d))
 	else {
-		gi = ruPFindDecomp(g);
+		pick = ruPPickPrincipal(g, d);
+		gi = if (pick.first) pick.second else -1;
+		bd = Pair(if (pick.first) -1 else pick.second, 0);
 		if (gi >= 0) {
 			f = g[gi]; rest = ruPRemoveAt(g, gi);
 			switch (f) {
@@ -63,7 +106,7 @@ ruPProveSeq(g : [RuPForm], d : [RuPForm]) -> Maybe<RuPDeriv> {
 				default: None();
 			}
 		} else {
-			di = ruPFindDecomp(d);
+			di = bd.first;
 			if (di < 0) None()   // all atomic, no axiom: countermodel
 			else {
 				f = d[di]; rest = ruPRemoveAt(d, di);

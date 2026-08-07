@@ -1,0 +1,213 @@
+import mizar/miz2ru;
+
+// S4c EMISSION, pattern 1 — the deterministic completer for the A-map family.
+// A by-step whose goal follows from its context by unfolding ∪/∩/∖/∅
+// memberships is closed WITHOUT the prover:
+//   facts   = the theorem's hyps + the preceding steps (quantifier-free ones —
+//             a quantified form is an opaque atom the certificate can only use
+//             whole, so it is kept only when it IS the goal);
+//   unfolds = one foundation biconditional instance per compound membership
+//             occurring in facts/goal (elun / elin / eldif, ¬(x ∈ ∅) by noel),
+//             closed recursively — each is ONE proof step with no premises;
+//   close   = folPCert (G3cp -> Hilbert): facts + unfolds ⊢ goal decided and
+//             translated into foundation propositional steps.
+// The result splices into folProofTheoremE. A step that does not close stays
+// an open `?` — attempted/closed/skipped are reported, never hidden.
+
+export {
+	MizEmitCounts(attempted : int, closed : int, skipped : int);
+	// per original step: a closed deterministic proof, or None (stays open).
+	// maxFacts / maxSize bound the certificate attempt (skipped = over budget).
+	mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int) -> Pair<[Maybe<FolStepProof>], MizEmitCounts>;
+}
+
+mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int) -> Pair<[Maybe<FolStepProof>], MizEmitCounts> {
+	res = foldi(t.steps, Pair([], MizEmitCounts(0, 0, 0)), \i, acc : Pair<[Maybe<FolStepProof>], MizEmitCounts>, goal -> {
+		r = mizEmitStepProof(t.hyps, subrange(t.steps, 0, i), goal, maxFacts, maxSize);
+		cnt = acc.second;
+		ncnt = switch (r.first) {
+			None(): if (r.second) MizEmitCounts(cnt.attempted, cnt.closed, cnt.skipped + 1)
+				else MizEmitCounts(cnt.attempted + 1, cnt.closed, cnt.skipped);
+			Some(__): MizEmitCounts(cnt.attempted + 1, cnt.closed + 1, cnt.skipped);
+		};
+		Pair(arrayPush(acc.first, r.first), ncnt);
+	});
+	res;
+}
+
+// (proof?, skippedByBudget)
+mizEmitStepProof(hyps : [FolForm], prev : [FolForm], goal : FolForm,
+	maxFacts : int, maxSize : int) -> Pair<Maybe<FolStepProof>, bool> {
+	ctx0 = concat(
+		mapi(hyps, \j, h -> Pair(h, mizEmitHypRef(j))),
+		mapi(prev, \j, s -> Pair(s, mizEmitStepRef(j))));
+	// quantifier-free facts only; a quantified fact is kept only when it IS the
+	// goal (then it closes the step as one opaque axiom)
+	ctx = filter(ctx0, \p -> !mizEmitHasQuant(p.first) || p.first == goal);
+	// the unfold closure over facts + goal
+	insts = fold(arrayPush(map(ctx, \p -> p.first), goal), makeTree(),
+		\acc, f -> mizEmitUnfolds(f, acc));
+	instList = getTreeValues(insts);
+	atoms : ref Tree<string, FolForm> = ref makeTree();
+	ctxP0 = map(ctx, \p -> mizEmitP(atoms, p.first));
+	instP0 = map(instList, \p -> mizEmitP(atoms, p.first));
+	goalP = mizEmitP(atoms, goal);
+	// RELEVANCE: keep only facts/unfolds connected to the goal through shared
+	// atoms (fixpoint) — an unrelated earlier step only inflates the G3cp tree
+	rel = mizEmitRelevant(concat(ctxP0, instP0), goalP);
+	keepCtx = filteri(ctx, \j, __ -> containsSet(rel, j));
+	ctxP = filteri(ctxP0, \j, __ -> containsSet(rel, j));
+	nC0 = length(ctxP0);
+	instKeep = filteri(instList, \j, __ -> containsSet(rel, nC0 + j));
+	instP = filteri(instP0, \j, __ -> containsSet(rel, nC0 + j));
+	factsP = concat(ctxP, instP);
+	size = fold(factsP, mizEmitSize(goalP), \acc, f -> acc + mizEmitSize(f));
+	if (length(factsP) > maxFacts || size > maxSize) Pair(None(), true)
+	else {
+		tab = ^atoms;
+		// cap the G3cp tree and the emitted proof: a by-step certificate past a
+		// few hundred steps is a blowup, not a proof — reject, keep the step open
+		switch (folPCertBounded(factsP, goalP, \k -> lookupTreeDef(tab, k, FolPred("$false", [])),
+			5000, 600)) {
+			None(): Pair(None(), false);
+			Some(csteps): {
+				nCtx = length(keepCtx);
+				nInst = length(instKeep);
+				instSteps = map(instKeep, \p -> FolPStep(p.first, p.second, []));
+				shifted = map(csteps, \cs -> FolPStep(cs.form, cs.assertion,
+					map(cs.refs, \r -> switch (r) {
+						FolPRefStep(k): FolPRefStep(k + nInst);
+						FolPRefFact(k):
+							if (k < nCtx) FolPRefFact(k)
+							else FolPRefStep(k - nCtx);
+					})));
+				Pair(Some(FolStepProof(concat(instSteps, shifted), map(keepCtx, \p -> p.second))), false);
+			}
+		}
+	}
+}
+
+mizEmitHypRef(j : int) -> RuParseRef { RuParseHypRef(j); }
+mizEmitStepRef(j : int) -> RuParseRef { RuParseStepRef(j); }
+
+filteri(xs : [?], pred : (int, ?) -> bool) -> [?] {
+	foldi(xs, [], \i, acc, x -> if (pred(i, x)) arrayPush(acc, x) else acc);
+}
+
+// indices of the facts connected to the goal through shared atom keys
+mizEmitRelevant(facts : [RuPForm], goal : RuPForm) -> Set<int> {
+	factAtoms = map(facts, \f -> mizEmitAtomKeys(f, makeSet()));
+	seed = mizEmitAtomKeys(goal, makeSet());
+	mizEmitRelClose(factAtoms, seed, makeSet());
+}
+
+mizEmitRelClose(factAtoms : [Set<string>], seen : Set<string>, kept : Set<int>) -> Set<int> {
+	grown = foldi(factAtoms, Pair(seen, kept), \i, acc : Pair<Set<string>, Set<int>>, fa -> {
+		if (containsSet(acc.second, i)) acc
+		else if (existsSet(fa, \k -> containsSet(acc.first, k)))
+			Pair(foldSet(fa, acc.first, \s, k -> insertSet(s, k)), insertSet(acc.second, i))
+		else acc;
+	});
+	if (sizeSet(grown.second) == sizeSet(kept)) kept
+	else mizEmitRelClose(factAtoms, grown.first, grown.second);
+}
+
+mizEmitAtomKeys(f : RuPForm, acc : Set<string>) -> Set<string> {
+	switch (f) {
+		RuPAtom(k):   insertSet(acc, k);
+		RuPNot(g):    mizEmitAtomKeys(g, acc);
+		RuPAnd(l, r): mizEmitAtomKeys(r, mizEmitAtomKeys(l, acc));
+		RuPOr(l, r):  mizEmitAtomKeys(r, mizEmitAtomKeys(l, acc));
+		RuPImp(l, r): mizEmitAtomKeys(r, mizEmitAtomKeys(l, acc));
+		RuPIff(l, r): mizEmitAtomKeys(r, mizEmitAtomKeys(l, acc));
+		default: acc;
+	}
+}
+
+mizEmitHasQuant(f : FolForm) -> bool {
+	switch (f) {
+		FolQuant(__, __, __): true;
+		FolNeg(g):            mizEmitHasQuant(g);
+		FolBin(__, l, r):     mizEmitHasQuant(l) || mizEmitHasQuant(r);
+		default:              false;
+	}
+}
+
+mizEmitKey(f : FolForm) -> string { strGlue(folFormToks(f), " "); }
+
+// FolForm -> propositional skeleton; leaves (atoms, equalities, quantified
+// subforms) intern into the atom table by their rendered key
+mizEmitP(atoms : ref Tree<string, FolForm>, f : FolForm) -> RuPForm {
+	switch (f) {
+		FolNeg(g):        RuPNot(mizEmitP(atoms, g));
+		FolBin(op, l, r): {
+			pl = mizEmitP(atoms, l);
+			pr = mizEmitP(atoms, r);
+			if (op == "and") RuPAnd(pl, pr)
+			else if (op == "or") RuPOr(pl, pr)
+			else if (op == "imp") RuPImp(pl, pr)
+			else RuPIff(pl, pr);
+		}
+		FolPred(name, __): {
+			if (name == "$true") RuPTrue()
+			else if (name == "$false") RuPFalse()
+			else mizEmitAtom(atoms, f);
+		}
+		default: mizEmitAtom(atoms, f);
+	}
+}
+
+mizEmitAtom(atoms : ref Tree<string, FolForm>, f : FolForm) -> RuPForm {
+	k = mizEmitKey(f);
+	atoms := setTree(^atoms, k, f);
+	RuPAtom(k);
+}
+
+mizEmitSize(f : RuPForm) -> int {
+	switch (f) {
+		RuPNot(a):     1 + mizEmitSize(a);
+		RuPAnd(a, b):  1 + mizEmitSize(a) + mizEmitSize(b);
+		RuPOr(a, b):   1 + mizEmitSize(a) + mizEmitSize(b);
+		RuPImp(a, b):  1 + mizEmitSize(a) + mizEmitSize(b);
+		RuPIff(a, b):  1 + mizEmitSize(a) + mizEmitSize(b);
+		default: 1;
+	}
+}
+
+// collect the membership-unfold instances of one form's propositional
+// skeleton (never descend under a quantifier — those memberships carry bound
+// variables and their instances would be junk). Key -> (instance, lemma).
+mizEmitUnfolds(f : FolForm, acc : Tree<string, Pair<FolForm, string>>) -> Tree<string, Pair<FolForm, string>> {
+	switch (f) {
+		FolNeg(g):        mizEmitUnfolds(g, acc);
+		FolBin(__, l, r): mizEmitUnfolds(r, mizEmitUnfolds(l, acc));
+		FolPred(name, args):
+			if (name == "∈" && length(args) == 2) mizEmitMemGen(args[0], args[1], acc)
+			else acc;
+		default: acc;
+	}
+}
+
+mizEmitMem(x : FolTerm, s : FolTerm) -> FolForm { FolPred("∈", [x, s]); }
+
+mizEmitMemGen(x : FolTerm, s : FolTerm, acc : Tree<string, Pair<FolForm, string>>) -> Tree<string, Pair<FolForm, string>> {
+	switch (s) {
+		FolApp(op, args): {
+			if (length(args) == 2 && (op == "∪" || op == "∩" || op == "∖")) {
+				ma = mizEmitMem(x, args[0]);
+				mb = mizEmitMem(x, args[1]);
+				body = if (op == "∪") FolBin("or", ma, mb)
+					else if (op == "∩") FolBin("and", ma, mb)
+					else FolBin("and", ma, FolNeg(mb));
+				lemma = if (op == "∪") "elun" else if (op == "∩") "elin" else "eldif";
+				inst = FolBin("iff", mizEmitMem(x, s), body);
+				acc1 = setTree(acc, mizEmitKey(inst), Pair(inst, lemma));
+				mizEmitMemGen(x, args[1], mizEmitMemGen(x, args[0], acc1));
+			} else if (op == "∅" && args == []) {
+				inst = FolNeg(mizEmitMem(x, s));
+				setTree(acc, mizEmitKey(inst), Pair(inst, "noel"));
+			} else acc;
+		}
+		default: acc;
+	}
+}

@@ -3,6 +3,7 @@ import base/env;
 import base/fileinfo;
 import mizar/miz2ru;
 import mizar/deriv;
+import mizar/emit;
 import mizar/atr;
 import mizar/notation;
 import mizar/xml;
@@ -572,7 +573,10 @@ ruCommMizarToRu = RuComm(
 			RuCommArg("proofs", true, "1 = multi-step open proof skeletons (default), 0 = statements only", "1"),
 			RuCommArg("class-loci", true, "1 = Mizar loci as CLASS metavars + setness hyps (the elpr pattern; EXPERIMENTAL — the emitter stack loses ~25 zfmisc theorems until setness-from-hyps and G-form chars land), 0 = setvar loci (default)", "0"),
 			RuCommArg("from-source", true, "1 = produce every intermediate in memory from .miz + .evl + prel/", "0"),
-			RuCommArg("facts", true, "1 = run the ported checker and insert its instantiated facts as intermediate open steps on each fact-complete by-gap (default 0)", "0")
+			RuCommArg("facts", true, "1 = run the ported checker and insert its instantiated facts as intermediate open steps on each fact-complete by-gap (default 0)", "0"),
+			RuCommArg("emit", true, "1 = close by-steps deterministically (membership unfolds + the G3cp->Hilbert certificate); unclosed steps stay open (default 0)", "0"),
+			RuCommArg("emit-max-facts", true, "certificate budget: max facts per step attempt", "16"),
+			RuCommArg("emit-max-size", true, "certificate budget: max total connective count per step attempt", "200")
 		], []
 	),
 	ruRunMizarToRu
@@ -821,11 +825,28 @@ ruRunMizarToRu(unit : RuUnit) -> Maybe<RuState> {
 				// open step proving the statement when proofs=0), each carrying its Mizar ref.
 				thmsOk = filter(thms, \t -> !mizFormHasUnhandled(t.statement)
 					&& !exists(t.hyps, mizFormHasUnhandled) && !exists(t.steps, mizFormHasUnhandled));
+				emitOn = ruTaskStringArg(unit.task, "emit", "0") == "1";
+				emitMaxFacts = s2i(ruTaskStringArg(unit.task, "emit-max-facts", "16"));
+				emitMaxSize = s2i(ruTaskStringArg(unit.task, "emit-max-size", "200"));
+				emitCnt = ref MizEmitCounts(0, 0, 0);
 				articleDecls : [RuParseDecl] = map(thmsOk, \t ->
-					if (proofsOn) folProofTheoremC(t.name, t.ref, t.hyps, t.steps, t.stepRefs, classLoci)
+					if (proofsOn && emitOn) {
+						pr = mizEmitThmProofs(t, emitMaxFacts, emitMaxSize);
+						c0 = ^emitCnt; c1 = pr.second;
+						emitCnt := MizEmitCounts(c0.attempted + c1.attempted,
+							c0.closed + c1.closed, c0.skipped + c1.skipped);
+						folProofTheoremE(t.name, t.ref, t.hyps, t.steps, t.stepRefs, classLoci, pr.first);
+					}
+					else if (proofsOn) folProofTheoremC(t.name, t.ref, t.hyps, t.steps, t.stepRefs, classLoci)
 					else folProofTheoremC(t.name, t.ref, [], [t.statement],
 						// single-statement mode: the whole by-list (union over steps) guides the one gap
 						[uniq(concatA(t.stepRefs))], classLoci));
+				if (emitOn) {
+					ec = ^emitCnt;
+					env.out.println("mizar-to-ru: emit closed " + i2s(ec.closed) + " / "
+						+ i2s(ec.attempted) + " attempted steps, " + i2s(ec.skipped)
+						+ " skipped over budget");
+				}
 				// every emitted form contributes to the symbol signature.
 				sigForms = concat(envForms, concatA(map(thmsOk, \t -> arrayPush(concat(t.hyps, t.steps), t.statement))));
 				src = folArticleSource(FolSource([], ruNoFileInfo), sigForms, concat(envDecls, articleDecls), importIds, module, state.conf,

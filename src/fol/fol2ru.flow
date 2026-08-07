@@ -4,6 +4,7 @@ import base/util/fileinfo;
 import base/ids;
 import base/id_consts;
 import fol/src;
+import fol/pcert;
 
 // Emit a flat-FOL source (fol/src.flow IR) as a Russell RuParseSource: a
 // self-contained flat-FOL kernel + the article signature (one const+rule per
@@ -26,6 +27,17 @@ export {
 	// that render proof STEPS textually (the propositional certificate)
 	folFormToks(f : FolForm) -> [string];
 	folFormVars(f : FolForm) -> [string];
+
+	// A CLOSED proof for one original step: the certificate's steps, plus the
+	// mapping of its fact indices to the theorem's own references given in
+	// ORIGINAL hyp/step numbering (step refs are remapped after insertion).
+	FolStepProof(steps : [FolPStep], factRefs : [RuParseRef]);
+	// folProofTheoremC with per-step closed proofs spliced in: a step with a
+	// proof becomes its certificate steps (the last one proves the step's own
+	// statement); a step without one stays an open `?` problem. References
+	// between original steps are renumbered to the shifted indices.
+	folProofTheoremE(name : string, comment : string, hyps : [FolForm], steps : [FolForm],
+		stepRefs : [[string]], classLoci : bool, proofs : [Maybe<FolStepProof>]) -> RuParseTheorem;
 
 	// How an article's signature is emitted, parameterised by the target foundation:
 	//  - `termType`   : the sort of individual terms — "set" (flat miz_logic) or "class" (A-map miz_set).
@@ -693,6 +705,56 @@ folProofTheoremC(name : string, comment : string, hyps : [FolForm], steps : [Fol
 	RuParseTheorem(s2id(name), folComment(comment), vars, [], RuParseMeta([], -1),
 		mapi(hypsAll, \i, h -> RuParseHyp(i, folStmt(folFormToks(h)), -1)),
 		folStmt(folFormToks(goal)), RuParseProof([], [], proofSteps, -1), -1);
+}
+
+folProofTheoremE(name : string, comment : string, hyps : [FolForm], steps : [FolForm],
+	stepRefs : [[string]], classLoci : bool, proofs : [Maybe<FolStepProof>]) -> RuParseTheorem {
+	goal = if (steps == []) FolPred("$true", []) else steps[length(steps) - 1];
+	allForms = concat(hyps, steps);
+	bound = fold(allForms, makeSet(), \a, f -> folFormBoundVars(f, a));
+	ctxVars = uniq(concatA(map(concat(hyps, [goal]), folFormVars)));
+	classVars = if (!classLoci) []
+		else filter(ctxVars, \v -> !containsSet(bound, v));
+	isClass = buildSet(classVars);
+	vars = map(uniq(concatA(map(allForms, folFormVars))), \v ->
+		folVar(v, if (containsSet(isClass, v)) "class" else "setvar"));
+	hypsAll = concat(hyps, map(classVars, \v ->
+		FolPred("∈", [FolVar(v), FolApp("_V", [])])));
+	// build sequentially: a closed step expands into its certificate block, an
+	// open one stays a problem; f2f maps original step index -> final index
+	built = foldi(steps, Pair([], makeTree()), \i, acc : Pair<[RuParseStep], Tree<int, int>>, sp -> {
+		base = length(acc.first);
+		mproof = if (i < length(proofs)) proofs[i] else None();
+		switch (mproof) {
+			None(): {
+				refs = if (i < length(stepRefs)) stepRefs[i] else [];
+				tactic = if (refs == []) "" else "by(" + strGlue(refs, ", ") + ")";
+				st = RuParseStep(base, ruParseProblem, [],
+					RuParseStmt(s2id("|-"), [tp2id("wff")], folExpr(folFormToks(sp)), -1),
+					ruParseNoProof, tactic, -1);
+				Pair(arrayPush(acc.first, st), setTree(acc.second, i, base));
+			}
+			Some(pr): {
+				news = mapi(pr.steps, \j, cs -> RuParseStep(base + j, s2id(cs.assertion),
+					map(cs.refs, \r -> switch (r) {
+						FolPRefStep(k): RuParseStepRef(base + k);
+						FolPRefFact(k): {
+							orig = pr.factRefs[k];
+							switch (orig) {
+								RuParseHypRef(__): orig;
+								RuParseStepRef(s): RuParseStepRef(lookupTreeDef(acc.second, s, s));
+							}
+						}
+					}),
+					RuParseStmt(s2id("|-"), [tp2id("wff")], folExpr(folFormToks(cs.form)), -1),
+					ruParseNoProof, "", -1));
+				Pair(concat(acc.first, news), setTree(acc.second, i, base + length(news) - 1));
+			}
+		}
+	});
+	RuParseTheorem(s2id(name), folComment(comment), vars, [], RuParseMeta([], -1),
+		mapi(hypsAll, \i, h -> RuParseHyp(i, folStmt(folFormToks(h)), -1)),
+		folStmt(folFormToks(goal)), RuParseProof([], [], built.first, -1), -1);
 }
 
 folComment(text : string) -> [RuParseComment] {
