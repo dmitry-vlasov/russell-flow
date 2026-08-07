@@ -4,6 +4,9 @@ import base/fileinfo;
 import mizar/miz2ru;
 import mizar/atr;
 import mizar/notation;
+import mizar/original/prep;
+import mizar/original/accom_env;
+import mizar/original/verfinit;
 import fol/src;
 import fol/fol2ru;
 import ru/parse/exps/sources;
@@ -39,12 +42,61 @@ mizArticleDir(unit : RuUnit) -> string {
 	else roots[0] + "/MML/mml";
 }
 
-mizFile(unit : RuUnit, article : string, ext : string) -> string {
-	path = mizArticleDir(unit) + "/" + article + "." + ext;
-	if (fileExists(path)) getFileContent(path) else "";
+// Where an article's contents come from: the flat intermediate files Mizar's
+// own toolchain wrote next to the .miz (the default), or — with
+// `from-source=1` — the ported verifier producing every intermediate IN
+// MEMORY from .miz + .evl + prel/ alone. The produced bytes are the
+// env-gate-verified ones (byte-identical to the accommodated files), and the
+// .xml/.msx are the analyzer/MSM reports of the same one-process run, so the
+// two sources are interchangeable.
+MizMmlSrc(dir : string, content : (string, string) -> string);
+
+mizMakeMmlSrc(unit : RuUnit) -> MizMmlSrc {
+	dir = mizArticleDir(unit);
+	if (ruTaskStringArg(unit.task, "from-source", "0") != "1") {
+		MizMmlSrc(dir, \article, ext -> {
+			path = dir + "/" + article + "." + ext;
+			if (fileExists(path)) getFileContent(path) else "";
+		});
+	} else {
+		mizFiles = "/usr/local/share/mizar/";
+		loaders : ref Tree<string, MizEnvLoader> = ref makeTree();
+		runs : ref Tree<string, MizVerifyRun> = ref makeTree();
+		loaderOf = \a -> switch (lookupTree(^loaders, a)) {
+			Some(l): l;
+			None(): {
+				l = mizAccomEnvLoader(dir, a, mizFiles);
+				loaders := setTree(^loaders, a, l);
+				l;
+			}
+		};
+		// one parse+analyze per article (deps included), cached for the run
+		runOf = \a -> switch (lookupTree(^runs, a)) {
+			Some(r): r;
+			None(): {
+				r = mizMSMVerifyArticleEx(dir, a, mizFiles, loaderOf(a),
+					false, false, true, true);
+				runs := setTree(^runs, a, r);
+				r;
+			}
+		};
+		MizMmlSrc(dir, \article, ext ->
+			if (article == "") ""
+			else if (ext == "miz") {
+				path = dir + "/" + article + ".miz";
+				if (fileExists(path)) getFileContent(path) else "";
+			}
+			else if (ext == "xml") runOf(article).xml
+			else if (ext == "msx") runOf(article).msx
+			else loaderOf(article).envFile("." + ext));
+	}
 }
 
-mizEth(unit : RuUnit, article : string) -> string { mizFile(unit, article, "eth"); }
+mizFile(src : MizMmlSrc, article : string, ext : string) -> string {
+	src.content(article, ext);
+}
+
+mizEth(src : MizMmlSrc, article : string) -> string { mizFile(src, article, "eth"); }
 
 // The MML canonical article order (mml.lar, one aid per line) as aid -> index. This is the
 // ownership order for a contested symbol: the article that introduced a notion owns its name,
@@ -65,21 +117,21 @@ mizAidRank(order : Tree<string, int>, ctorName : string, aid : string) -> int {
 }
 
 // The full signature (constructor resolution + readable notation names) from .atr/.eno/.frm/.dcx.
-mizReadSig(unit : RuUnit, article : string) -> MizSig {
-	mizFullSig(mizFile(unit, article, "xml"), mizFile(unit, article, "atr"), mizFile(unit, article, "eno"),
-		mizFile(unit, article, "frm"), mizFile(unit, article, "dcx"));
+mizReadSig(src : MizMmlSrc, article : string) -> MizSig {
+	mizFullSig(mizFile(src, article, "xml"), mizFile(src, article, "atr"), mizFile(src, article, "eno"),
+		mizFile(src, article, "frm"), mizFile(src, article, "dcx"));
 }
 
-mizReadArticle(env : RuEnv, dir : string, article : string) -> Maybe<Pair<string, string>> {
-	if (dir == "" || article == "") {
+mizReadArticle(env : RuEnv, src : MizMmlSrc, article : string) -> Maybe<Pair<string, string>> {
+	if (src.dir == "" || article == "") {
 		env.out.error("mizar: 'article' is required (and a resolvable MML dir — pass dir= or set RUSSELL_MATH)", []);
 		None();
 	} else {
-		xmlPath = dir + "/" + article + ".xml";
-		atrPath = dir + "/" + article + ".atr";
-		if (!fileExists(xmlPath)) { env.out.error("mizar: not found: " + xmlPath, []); None(); }
-		else if (!fileExists(atrPath)) { env.out.error("mizar: not found: " + atrPath + " (verify the article first)", []); None(); }
-		else Some(Pair(getFileContent(xmlPath), getFileContent(atrPath)));
+		xml = mizFile(src, article, "xml");
+		atr = mizFile(src, article, "atr");
+		if (xml == "") { env.out.error("mizar: no .xml for " + article + " in " + src.dir, []); None(); }
+		else if (atr == "") { env.out.error("mizar: no .atr for " + article + " (verify the article first)", []); None(); }
+		else Some(Pair(xml, atr));
 	}
 }
 
@@ -88,7 +140,8 @@ ruCommMizarStmts = RuComm(
 		"mizar-stmts", "io", "translate a Mizar article's theorem statements to relativized FOL and print them", "article", false, false,
 		[
 			RuCommArg("article", false, "article name (e.g. tarski)", ""),
-			RuCommArg("dir", true, "MML analyzed-xml dir (default $RUSSELL_MATH/MML/mml)", "")
+			RuCommArg("dir", true, "MML analyzed-xml dir (default $RUSSELL_MATH/MML/mml)", ""),
+			RuCommArg("from-source", true, "1 = produce every intermediate in memory from .miz + .evl + prel/ (the ported verifier); 0 = read the flat files (default)", "0")
 		], []
 	),
 	ruRunMizarStmts
@@ -97,9 +150,10 @@ ruCommMizarStmts = RuComm(
 ruRunMizarStmts(unit : RuUnit) -> Maybe<RuState> {
 	env = ruUnitEnv(unit);
 	article = ruTaskStringArg(unit.task, "article", "");
-	switch (mizReadArticle(env, mizArticleDir(unit), article)) {
+	src = mizMakeMmlSrc(unit);
+	switch (mizReadArticle(env, src, article)) {
 		None(): None();
-		Some(p): switch (mizArticleTheorems(p.first, mizFile(unit, article, "miz"), mizReadSig(unit, article), makeTree())) {
+		Some(p): switch (mizArticleTheorems(p.first, mizFile(src, article, "miz"), mizReadSig(src, article), makeTree())) {
 			None(): { env.out.error("mizar-stmts: no <Article> root in " + article + ".xml", []); None(); }
 			Some(thms): {
 				env.out.println("mizar-stmts: " + article + " -> " + i2s(length(thms)) + " theorems");
@@ -116,7 +170,8 @@ ruCommMizarProofs = RuComm(
 		[
 			RuCommArg("article", false, "article name (e.g. xboole_1)", ""),
 			RuCommArg("dir", true, "MML analyzed-xml dir (default first import-root + /MML/mml)", ""),
-			RuCommArg("show", true, "how many multi-step proofs to print", "6")
+			RuCommArg("show", true, "how many multi-step proofs to print", "6"),
+			RuCommArg("from-source", true, "1 = produce every intermediate in memory from .miz + .evl + prel/", "0")
 		], []
 	),
 	ruRunMizarProofs
@@ -126,9 +181,10 @@ ruRunMizarProofs(unit : RuUnit) -> Maybe<RuState> {
 	env = ruUnitEnv(unit);
 	article = ruTaskStringArg(unit.task, "article", "");
 	show = s2i(ruTaskStringArg(unit.task, "show", "6"));
-	switch (mizReadArticle(env, mizArticleDir(unit), article)) {
+	src = mizMakeMmlSrc(unit);
+	switch (mizReadArticle(env, src, article)) {
 		None(): None();
-		Some(p): switch (mizArticleTheorems(p.first, mizFile(unit, article, "miz"), mizReadSig(unit, article), makeTree())) {
+		Some(p): switch (mizArticleTheorems(p.first, mizFile(src, article, "miz"), mizReadSig(src, article), makeTree())) {
 			None(): { env.out.error("mizar-proofs: no <Article> root in " + article + ".xml", []); None(); }
 			Some(thms): {
 				withProof = filter(thms, \t -> length(t.steps) > 1);
@@ -157,7 +213,8 @@ ruCommMizarToRu = RuComm(
 			RuCommArg("module", true, "module name for the generated article (default = article)", ""),
 			RuCommArg("foundation", true, "foundation module to import (miz_set = A-map class layer; miz_logic = flat set)", "miz_set"),
 			RuCommArg("proofs", true, "1 = multi-step open proof skeletons (default), 0 = statements only", "1"),
-			RuCommArg("class-loci", true, "1 = Mizar loci as CLASS metavars + setness hyps (the elpr pattern; EXPERIMENTAL — the emitter stack loses ~25 zfmisc theorems until setness-from-hyps and G-form chars land), 0 = setvar loci (default)", "0")
+			RuCommArg("class-loci", true, "1 = Mizar loci as CLASS metavars + setness hyps (the elpr pattern; EXPERIMENTAL — the emitter stack loses ~25 zfmisc theorems until setness-from-hyps and G-form chars land), 0 = setvar loci (default)", "0"),
+			RuCommArg("from-source", true, "1 = produce every intermediate in memory from .miz + .evl + prel/", "0")
 		], []
 	),
 	ruRunMizarToRu
@@ -175,11 +232,12 @@ ruRunMizarToRu(unit : RuUnit) -> Maybe<RuState> {
 	emit = if (foundation == "miz_logic") folFlatEmit() else folAmapEmit();
 	proofsOn = ruTaskStringArg(unit.task, "proofs", "1") != "0";
 	classLoci = ruTaskStringArg(unit.task, "class-loci", "0") == "1";
-	sig0 = mizReadSig(unit, article);
+	src0 = mizMakeMmlSrc(unit);
+	sig0 = mizReadSig(src0, article);
 	// Surface spellings (\+\, c=, ∪/∩/\, …) per defining article (read .xml+.msx once each).
 	aids = uniq(map(getTreeValues(sig0.table), \c -> toLowerCase(c.aid)));
-	spellCache = pairs2tree(map(aids, \a -> Pair(a, mizSpellingMap(mizFile(unit, a, "xml"), mizFile(unit, a, "msx")))));
-	spellOf = \kind, c : MizConstr -> lookupTreeDef(lookupTreeDef(spellCache, toLowerCase(c.aid), makeTree()), kind + ":" + i2s(c.nr), Pair("", 0));
+	spellCache = pairs2tree(map(aids, \a -> Pair(a, mizSpellingMap(mizFile(src0, a, "xml"), mizFile(src0, a, "msx")))));
+	spellOf = \kind, c : MizAtrConstr -> lookupTreeDef(lookupTreeDef(spellCache, toLowerCase(c.aid), makeTree()), kind + ":" + i2s(c.nr), Pair("", 0));
 	// Build the readable-name map from the .msx surface symbols (the reliable source): operators
 	// get the math symbol (∪/⊆/△/…), bracket functors an arity-disambiguated name
 	// (singleton/pair/opair), clean words themselves (union/misses/…). Fall back to the .eno-based
@@ -268,12 +326,12 @@ ruRunMizarToRu(unit : RuUnit) -> Maybe<RuState> {
 		sp = spellOf(kind, c).first;
 		if (sp == "") acc else setTree(acc, lookupTreeDef(sig.readable, key, mizConstrName(kind, c)), sp);
 	});
-	switch (mizReadArticle(env, mizArticleDir(unit), article)) {
+	switch (mizReadArticle(env, src0, article)) {
 		None(): None();
-		Some(p): switch (mizArticleTheorems(p.first, mizFile(unit, article, "miz"), sig, mizRefTable(mizEth(unit, article)))) {
+		Some(p): switch (mizArticleTheorems(p.first, mizFile(src0, article, "miz"), sig, mizRefTable(mizEth(src0, article)))) {
 			None(): { env.out.error("mizar-to-ru: no <Article> root in " + article + ".xml", []); None(); }
 			Some(thms): {
-				eth  = mizEth(unit, article);
+				eth  = mizEth(src0, article);
 				// miz_aux (hand-authored companion lemmas — partition bridges, 1-hyp
 				// elim forms) is a STANDING dependency: loaded and imported whenever
 				// <ru-root>/miz_aux.ru exists (ruMizLoadDeps no-ops when absent). The
@@ -341,14 +399,14 @@ ruRunMizarToRu(unit : RuUnit) -> Maybe<RuState> {
 						if (s.info.module == aid || endsWith(s.info.module, "/" + aid)) Some(Pair(aid, s.info.id)) else acc));
 				depIds  = map(depResolved, \pr -> pr.second);
 				importedAids = buildSet(map(depResolved, \pr -> toLowerCase(pr.first)));				importIds = concat([found_id], depIds);
-				syms = mizParseNotation(mizFile(unit, article, "eno"), mizFile(unit, article, "frm"), mizFile(unit, article, "dcx"));
+				syms = mizParseNotation(mizFile(src0, article, "eno"), mizFile(src0, article, "frm"), mizFile(src0, article, "dcx"));
 				// env theorems as commented axioms (available premises for the open steps).
 				// srcOf resolves the DEFINING article's (.miz, .xml) so each carries its surface text.
-				srcOf = \aid -> Pair(mizFile(unit, aid, "miz"), mizFile(unit, aid, "xml"));
+				srcOf = \aid -> Pair(mizFile(src0, aid, "miz"), mizFile(src0, aid, "xml"));
 				envPairs = if (eth != "") mizParseEnv(eth, sig, syms, srcOf, emitD.isReused, \a -> containsSet(importedAids, a)) else [];
 				// the article's OWN definitions (XBOOLE_0:def N) as definitional axioms — the
 				// `unfold` material the prover needs to close the by-gaps; in scope before the theorems.
-				defPairs = mizArticleDefs(p.first, mizFile(unit, article, "miz"), sig, syms, emitD.isReused);
+				defPairs = mizArticleDefs(p.first, mizFile(src0, article, "miz"), sig, syms, emitD.isReused);
 				// A form the translator could not render is JUNK — unprovable as a theorem and a
 				// potentially FALSE assumption as an env axiom. Drop it rather than emit it: that
 				// also stops the `unhandled_term_<Tag>` placeholder constant from being declared,
