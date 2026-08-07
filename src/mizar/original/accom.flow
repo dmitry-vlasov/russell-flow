@@ -57,6 +57,10 @@ export {
 		// translations are ARITHMETIC (base + own index), so a constructor may
 		// refer forward to one of its own article's later constructors
 		mutable baseOf : Tree<string, Tree<int, int>>,
+		// apply the re-read boundary (sorted attr re-insertion) while loading.
+		// true for the LIVE environment; the .atr byte writer turns it off —
+		// the file holds the PRE-re-read form (translated, source order)
+		mutable resort : bool,
 	);
 
 	MizAccom(env : MizCorrelEnv, mmlDir : string, st : MizAccomState);
@@ -119,6 +123,20 @@ export {
 	// feeding env.propertiesList must mizEnvifyTyp each type first.
 	mizAccomProperties(acc : MizAccom, evl : MizEvl) -> Vector<MizPropertyReg>;
 
+	// SaveConstructors (acc_han.pas 106): the .atr bytes — the merged
+	// constructor table in kind order V K M R L G U, relnr = the per-kind
+	// index. The file holds the PRE-re-read form, so the table is built
+	// with the resort off, in a private environment.
+	mizAtrContent(mmlDir : string, evl : MizEvl,
+		articleId : string, mizFiles : string) -> string;
+
+	// ProcessTheorems' output file (acc_han.pas 1401-1491): the .eth bytes.
+	// Needs the constructor bases already merged into acc — run after
+	// mizAccomConstructors on the SAME acc. An empty theorems directive
+	// ERASES the file (1411) — the content is "".
+	mizEthContent(acc : MizAccom, evl : MizEvl,
+		articleId : string, mizFiles : string) -> string;
+
 	// ProcessProperties' output file (acc_han.pas 1148/1191): the .epr
 	// bytes. An empty registrations directive ERASES the file (1150) —
 	// the content is "" and no .epr exists.
@@ -177,7 +195,7 @@ mizLoadEvl(path : string) -> MizEvl {
 // ---------------- the merged constructor table ----------------
 
 mizMakeAccom(env : MizCorrelEnv, mmlDir : string) -> MizAccom {
-	MizAccom(env, mmlDir, MizAccomState(makeTree(), makeTree(), makeTree()));
+	MizAccom(env, mmlDir, MizAccomState(makeTree(), makeTree(), makeTree(), true));
 }
 
 mizAccomBase(st : MizAccomState, article : string, kind : int) -> int {
@@ -565,12 +583,14 @@ mizAccomOneDco(env : MizCorrelEnv, st : MizAccomState, mmlDir : string,
 					mizAccomRenumberConstr(tr, c);
 					// the .atr re-read boundary: every attr collection sorted
 					// in the merged frame (In_AttrColl at Load_EnvConstructors)
-					iterVector(c.primaries, \t -> mizAccomResortTyp(env, t));
-					switch (c.typ) {
-						Some(t): mizAccomResortTyp(env, t);
-						None(): {}
+					if (st.resort) {
+						iterVector(c.primaries, \t -> mizAccomResortTyp(env, t));
+						switch (c.typ) {
+							Some(t): mizAccomResortTyp(env, t);
+							None(): {}
+						}
+						iterVector(c.prefixes, \t -> mizAccomResortTyp(env, t));
 					}
-					iterVector(c.prefixes, \t -> mizAccomResortTyp(env, t));
 					pushed = mizPushConstr(env, c);
 					if (pushed != slot) mizRunTimeError(2804);
 				} else {
@@ -882,6 +902,87 @@ mizAccomTheorems(acc : MizAccom, evl : MizEvl) -> Pair<Tree<int, MizFrm>, int> {
 		}
 	});
 	Pair(^out, length(order) + 1);
+}
+
+// ProcessTheorems as the .eth writer (acc_han.pas 1401-1491): per directive
+// article, translate every theorem (and its DefTheorem constructor,
+// gTrans at 1434) into the merged frame; both counters advance for dropped
+// theorems, only the ACCESSIBLE ones are written (1455); articlenr is the
+// article's token number — its position in the theorems+schemes order
+// (accdict ProcessVocabularies). The formulas are the PRE-envify form: the
+// checker's re-read applies AfterClusters, not the writer.
+mizEthContent(acc : MizAccom, evl : MizEvl,
+		articleId : string, mizFiles : string) -> string {
+	if (length(mizEvlDirective(evl, "theorems")) == 0) ""
+	else {
+		st = acc.st;
+		order = mizAccomArticleOrder(evl);
+		o = mizMakeVrfOut(acc.env);
+		o.mmlTyp ::= true;
+		// OutEnvFileObj.Transf (iocorrel.pas 1533): a reference outside the
+		// merged table — a cut-off article's constructor — writes as 0
+		o.transf ::= \k, nr ->
+			if (nr >= 1 && nr <= mizConstrCount(acc.env, k)) nr else 0;
+		mizVOutString(o, "<?xml version=\"1.0\"?>\n");
+		mizVOutString(o, "<?xml-stylesheet type=\"text/xml\" href=\"file://"
+			+ mizFiles + "miz.xml\"?>\n");
+		mizVOutString(o, "<Theorems aid=\"" + articleId
+			+ "\" mizfiles=\"" + mizQuoteEnvXML(mizFiles) + "\">\n");
+		iter(mizEvlDirective(evl, "theorems"), \art -> {
+			artNr = 1 + elemIndex(order, art, -1);
+			path = mizPrelPath(acc.mmlDir, art, ".the");
+			if (artNr > 0 && fileExists(path)) {
+				r = mizMakeVrfReaderRawMML(mizXmlInitParsing(getFileContent(path)), acc.env);
+				x = r.x;
+				mizXmlNextElementState(x);
+				mizXmlAssert(x.nElName == "Theorems");
+				mizXmlNextElementState(x);
+				sig = mizReadDcoHeader(x).signature;
+				savedMerged = st.merged;
+				added = mizAccomEnsureBases(acc, sig);
+				tr = \k, nr -> mizAccomTranslateIn(st, sig, k, nr);
+				thNr = ref 0;
+				defNr = ref 0;
+				while(\ -> x.nState == MizEStart, \ -> {
+					if (x.nElName == "Theorem") {
+						kindS = mizXmlAttr(x, "kind");
+						ckindS = mizXmlAttr(x, "constrkind");
+						cnr = mizXmlIntAttrDef(x, "constrnr", 0);
+						mizXmlNextElementState(x);
+						f = mizInFormula(r);
+						mizXmlNextElementState(x);
+						mizAccomRenumberFrm(tr, f);
+						curNr = if (kindS == "D") { defNr := ^defNr + 1; ^defNr }
+							else { thNr := ^thNr + 1; ^thNr };
+						if (mizAccFrm(acc.env, f)) {
+							mizVOutElStart(o, "Theorem");
+							mizVOutIntAttr(o, "articlenr", artNr);
+							mizVOutIntAttr(o, "nr", curNr);
+							mizVOutAttr(o, "aid", toUpperCase(art));
+							mizVOutAttr(o, "kind", kindS);
+							if (kindS == "D" && ckindS != "" && ckindS != "?") {
+								ck = mizConstructorKind(getCharCodeAt(ckindS, 0));
+								mizVOutAttr(o, "constrkind", ckindS);
+								mizVOutIntAttr(o, "constrnr", o.transf(ck, tr(ck, cnr)));
+							}
+							mizVOutAttrEnd(o);
+							mizVOutFormula(o, f);
+							mizVOutElEnd(o, "Theorem");
+						}
+					} else {
+						mizXmlSkipElement(x);
+					}
+				});
+				st.merged ::= savedMerged;
+				iter(added, \a -> {
+					st.info ::= removeFromTree(st.info, a);
+					st.baseOf ::= removeFromTree(st.baseOf, a);
+				});
+			}
+		});
+		mizVOutString(o, "</Theorems>\n");
+		mizVrfOutContent(o);
+	}
 }
 
 // ---------------- the scheme pass (.esh) ----------------
@@ -1215,6 +1316,32 @@ mizAccomProperties(acc : MizAccom, evl : MizEvl) -> Vector<MizPropertyReg> {
 		}
 	});
 	props;
+}
+
+// SaveConstructors (acc_han.pas 106-130): OutOne per kind in the order
+// V K M R L G U (coAttribute, coFunctor, coMode, coPredicate, coStructMode,
+// coAggregate, coSelector), each constructor through Out_Constructor with
+// relnr = its per-kind index; the gChosen filter is the identity.
+mizAtrContent(mmlDir : string, evl : MizEvl,
+		articleId : string, mizFiles : string) -> string {
+	env2 = mizMakeCorrelEnv();
+	acc2 = mizMakeAccom(env2, mmlDir);
+	st2 = acc2.st;
+	st2.resort ::= false;
+	mizAccomConstructors(acc2, evl);
+	o = mizMakeVrfOut(env2);
+	o.mmlTyp ::= true;
+	mizVOutString(o, "<?xml version=\"1.0\"?>\n");
+	mizVOutString(o, "<?xml-stylesheet type=\"text/xml\" href=\"file://"
+		+ mizFiles + "miz.xml\"?>\n");
+	mizVOutString(o, "<Constructors aid=\"" + articleId
+		+ "\" mizfiles=\"" + mizQuoteEnvXML(mizFiles) + "\">\n");
+	iter([coAttribute, coFunctor, coMode, coPredicate, coStructMode,
+			coAggregate, coSelector], \kind ->
+		fori(1, mizConstrCount(env2, kind), \i ->
+			mizVOutConstructor(o, mizConstr(env2, kind, i), i)));
+	mizVOutString(o, "</Constructors>\n");
+	mizVrfOutContent(o);
 }
 
 // OpenFileWithXSL + Out_Definiens(item, i+1) per kept item (acc_han.pas
