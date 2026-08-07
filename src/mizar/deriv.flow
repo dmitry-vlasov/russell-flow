@@ -52,6 +52,202 @@ export {
 	// mislead the prover into a false sense of coverage, an absent one cannot.
 	mizDerivPosFacts(derivXml : string, sig : MizSig,
 		posScope : Tree<string, Tree<int, int>>) -> Tree<string, [MizDerivFact]>;
+
+	// S4b: validate one disjunct's refutation OFFLINE, from the record alone —
+	// no prover, no checker. The claim being checked: the recorded evidence
+	// reproduces the kill of every premise-clause literal the successful
+	// attempt used. Equality of terms = same class in the record's own class
+	// table; a literal is killed when one of its recorded candidates matches
+	// (heads equal, arguments classwise equal). Returns "" when the disjunct
+	// validates, else the first failure bucket:
+	//   no-matches      — the record carries no <Matches> (not a witnessed
+	//                     Verify disjunct)
+	//   complex-literal — a premise-clause literal shape v1 does not handle
+	//   unclassified    — a term the class table cannot place
+	//   special-rule    — only special-arm candidates (element/leq/...) —
+	//                     accepted, counted apart
+	//   no-kill         — no candidate reproduces the literal's kill
+	mizDerivValidate(d : MizXml) -> string;
+}
+
+// ---- S4b: the offline replay validator ----
+
+mizDerivValidate(d : MizXml) -> string {
+	vs = mizKidsTagged(d, "Verify");
+	// <Matches> is the Verify's SIBLING (flushed after the evidence element)
+	matches = mizKidsTagged(d, "Matches");
+	// contradictory-as-normalized: the premise refutes with no instantiation
+	// and no kills — replay is pure normalization, trivially valid
+	if (matches == [] && exists(vs, \v -> mizKidsTagged(v, "Contradictory") != [])) ""
+	else if (matches == []) "no-matches"
+	else {
+		m = matches[0];
+		// class member index: canonical key (arguments as class refs) -> class nr
+		idx = fold(mizKidsTagged(d, "Class"), makeTree(), \acc, c -> {
+			nr = s2i(mizAttr(c, "nr"));
+			fold(c.kids, acc, \ac, mem -> switch (mizDerivKey(mem, ac)) {
+				None(): ac;
+				Some(k): setTree(ac, k, nr);
+			});
+		});
+		// witness substitution: FreeVar nr -> class nr (Assign var is nr - 1)
+		asg = fold(concatA(map(vs, \v -> mizKidsTagged(v, "With"))), makeTree(), \acc, w ->
+			fold(mizKidsTagged(w, "Assign"), acc, \ac, a ->
+				setTree(ac, s2i(mizAttr(a, "var")) + 1, s2i(mizAttr(a, "class")))));
+		preLits = fold(mizKidsTagged(m, "PreLit"), makeTree(), \acc, pl ->
+			setTree(acc, s2i(mizAttr(pl, "nr")), pl));
+		posBas = mizKidsTagged(d, "PosBas");
+		negBas = mizKidsTagged(d, "NegBas");
+		basAt = \as : string, atom : int -> {
+			bs = if (as == "false") posBas else negBas;
+			found = filter(bs, \b -> s2i(mizAttr(b, "nr")) == atom);
+			if (found == [] || found[0].kids == []) None() else Some(found[0].kids[0]);
+		};
+		// candidates grouped by premise-clause literal
+		byLit = fold(mizKidsTagged(m, "Cand"), makeTree(), \acc, cd -> {
+			l = s2i(mizAttr(cd, "lit"));
+			setTree(acc, l, arrayPush(lookupTreeDef(acc, l, []), cd));
+		});
+		// every literal the attempt used must have one reproducible kill
+		fold(getTreeKeys(byLit), "", \err, lit -> {
+			if (err != "") err
+			else switch (lookupTree(preLits, lit)) {
+				None(): "no-matches";
+				Some(pl): {
+					if (pl.kids == []) "complex-literal"
+					else mizDerivKill(pl.kids[0], lookupTreeDef(byLit, lit, []),
+						idx, asg, basAt);
+				}
+			}
+		});
+	}
+}
+
+// one literal: try each candidate; "" as soon as one reproduces the kill
+mizDerivKill(lit : MizXml, cands : [MizXml], idx : Tree<string, int>,
+	asg : Tree<int, int>, basAt : (string, int) -> Maybe<MizXml>) -> string {
+	litAtom = mizDerivUnwrapNot(lit);
+	fold(cands, "no-kill", \st, cd -> {
+		if (st == "" || st == "special-rule") st
+		else {
+			kind = mizAttr(cd, "kind");
+			if (kind == "posbas" || kind == "negbas") {
+				switch (basAt(mizAttr(cd, "as"), s2i(mizAttr(cd, "atom")))) {
+					None(): st;
+					Some(b): {
+						r = mizDerivAtomsMatch(litAtom, mizDerivUnwrapNot(b), idx, asg);
+						if (r == "") "" else if (st == "no-kill") r else st;
+					}
+				}
+			} else if (kind == "reflexivity" || kind == "irreflexivity") {
+				// the two arguments of the literal fall in one class
+				args = filter(litAtom.kids, \k -> k.tag != "Cluster");
+				if (length(args) != 2) st
+				else {
+					c1 = mizDerivClassify(args[0], idx, asg);
+					c2 = mizDerivClassify(args[1], idx, asg);
+					if (c1 > 0 && c1 == c2) "" else st;
+				}
+			} else {
+				// element / inclusion / empty-class / leq / ... — fixed-semantics
+				// arms; accepted apart until their own validators land
+				if (st == "no-kill") "special-rule" else st;
+			}
+		}
+	});
+}
+
+mizDerivUnwrapNot(x : MizXml) -> MizXml {
+	if (x.tag == "Not" && x.kids != []) x.kids[0] else x;
+}
+
+// heads equal + arguments pairwise in the same class
+mizDerivAtomsMatch(a : MizXml, b : MizXml, idx : Tree<string, int>,
+	asg : Tree<int, int>) -> string {
+	if (a.tag != b.tag || mizAttr(a, "kind") != mizAttr(b, "kind")
+		|| mizAttr(a, "nr") != mizAttr(b, "nr")) "no-kill"
+	else {
+		aa = filter(a.kids, \k -> k.tag != "Cluster");
+		bb = filter(b.kids, \k -> k.tag != "Cluster");
+		if (length(aa) != length(bb)) "no-kill"
+		else foldi(aa, "", \i, err, ka -> {
+			if (err != "") err
+			else {
+				c1 = mizDerivClassify(ka, idx, asg);
+				c2 = mizDerivClassify(bb[i], idx, asg);
+				if (c1 == 0 || c2 == 0) "unclassified"
+				else if (c1 == c2) "" else "no-kill";
+			}
+		});
+	}
+}
+
+// the class of a term element: EqClass refs directly, FreeVars through the
+// witness substitution, compound terms through the member-key index
+mizDerivClassify(x : MizXml, idx : Tree<string, int>, asg : Tree<int, int>) -> int {
+	if (x.tag == "EqClass") s2i(mizAttr(x, "nr"))
+	else if (x.tag == "FreeVar") lookupTreeDef(asg, s2i(mizAttr(x, "nr")), 0)
+	else switch (mizDerivKeyC(x, idx, asg)) {
+		None(): 0;
+		Some(k): lookupTreeDef(idx, k, 0);
+	}
+}
+
+// canonical key of a CLASS MEMBER: leaves by identity, argument positions by
+// the class they reference; a member with an argument that is neither a leaf
+// nor a class ref (Fraenkel bodies etc.) yields no key — that member simply
+// does not participate in classification
+mizDerivKey(x : MizXml, idx : Tree<string, int>) -> Maybe<string> {
+	if (x.tag == "EqClass") Some("@" + mizAttr(x, "nr"))
+	else if (x.tag == "Const" || x.tag == "InfConst" || x.tag == "Num"
+		|| x.tag == "Var" || x.tag == "LocusVar")
+		Some(x.tag + ":" + mizAttr(x, "nr"))
+	else if (x.tag == "Func" || x.tag == "Aggreg" || x.tag == "Selector") {
+		args = fold(x.kids, Some([]), \acc : Maybe<[string]>, k -> switch (acc) {
+			None(): None();
+			Some(ks): switch (mizDerivKey(k, idx)) {
+				None(): None();
+				Some(kk): Some(arrayPush(ks, kk));
+			}
+		});
+		switch (args) {
+			None(): None();
+			Some(ks): Some(x.tag + ":" + mizAttr(x, "kind") + ":" + mizAttr(x, "nr")
+				+ "(" + strGlue(ks, ",") + ")");
+		}
+	} else None();
+}
+
+// canonical key of a SURFACE term (a premise-literal argument): every
+// argument position resolves to its CLASS first, so surface structure and
+// member structure meet in one key space
+mizDerivKeyC(x : MizXml, idx : Tree<string, int>, asg : Tree<int, int>) -> Maybe<string> {
+	if (x.tag == "EqClass") Some("@" + mizAttr(x, "nr"))
+	else if (x.tag == "FreeVar") {
+		c = lookupTreeDef(asg, s2i(mizAttr(x, "nr")), 0);
+		if (c == 0) None() else Some("@" + i2s(c));
+	}
+	else if (x.tag == "Const" || x.tag == "InfConst" || x.tag == "Num"
+		|| x.tag == "Var" || x.tag == "LocusVar")
+		Some(x.tag + ":" + mizAttr(x, "nr"))
+	else if (x.tag == "Func" || x.tag == "Aggreg" || x.tag == "Selector") {
+		args = fold(x.kids, Some([]), \acc : Maybe<[string]>, k -> switch (acc) {
+			None(): None();
+			Some(ks): {
+				c = mizDerivClassify(k, idx, asg);
+				if (c > 0) Some(arrayPush(ks, "@" + i2s(c)))
+				else switch (mizDerivKeyC(k, idx, asg)) {
+					None(): None();
+					Some(kk): Some(arrayPush(ks, kk));
+				}
+			}
+		});
+		switch (args) {
+			None(): None();
+			Some(ks): Some(x.tag + ":" + mizAttr(x, "kind") + ":" + mizAttr(x, "nr")
+				+ "(" + strGlue(ks, ",") + ")");
+		}
+	} else None();
 }
 
 mizConstScope(thmXml : MizXml) -> Tree<int, int> {
