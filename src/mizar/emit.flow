@@ -44,10 +44,22 @@ mizEmitStepProof(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 	// quantifier-free facts only; a quantified fact is kept only when it IS the
 	// goal (then it closes the step as one opaque axiom)
 	ctx = filter(ctx0, \p -> !mizEmitHasQuant(p.first) || p.first == goal);
-	// the unfold closure over facts + goal
-	insts = fold(arrayPush(map(ctx, \p -> p.first), goal), makeTree(),
-		\acc, f -> mizEmitUnfolds(f, acc));
-	instList = getTreeValues(insts);
+	allForms = arrayPush(map(ctx, \p -> p.first), goal);
+	insts0 = fold(allForms, makeTree(), \acc, f -> mizEmitUnfolds(f, acc));
+	// LADDER: first the membership unfolds alone (small trees, small certs);
+	// only a step they cannot close pays for the ⊆/= bridge instances
+	r1 = mizEmitTry(ctx, goal, getTreeValues(insts0), maxFacts, maxSize);
+	switch (r1.first) {
+		Some(__): r1;
+		None(): if (r1.second) r1
+			else mizEmitTry(ctx, goal,
+				getTreeValues(mizEmitBridges(allForms, insts0)), maxFacts, maxSize);
+	}
+}
+
+mizEmitTry(ctx : [Pair<FolForm, RuParseRef>], goal : FolForm,
+	instList : [Pair<FolForm, string>],
+	maxFacts : int, maxSize : int) -> Pair<Maybe<FolStepProof>, bool> {
 	atoms : ref Tree<string, FolForm> = ref makeTree();
 	ctxP0 = map(ctx, \p -> mizEmitP(atoms, p.first));
 	instP0 = map(instList, \p -> mizEmitP(atoms, p.first));
@@ -189,6 +201,74 @@ mizEmitUnfolds(f : FolForm, acc : Tree<string, Pair<FolForm, string>>) -> Tree<s
 }
 
 mizEmitMem(x : FolTerm, s : FolTerm) -> FolForm { FolPred("∈", [x, s]); }
+mizEmitSs(l : FolTerm, r : FolTerm) -> FolForm { FolPred("⊆", [l, r]); }
+mizEmitTKey(t : FolTerm) -> string { mizEmitKey(FolPred("k", [t])); }
+
+// BRIDGE instances connecting the three atom families the steps mix:
+//   eqss   (A = B) ↔ (A ⊆ B ∧ B ⊆ A)         per = atom
+//   eleq2  (A = B) → (e ∈ A ↔ e ∈ B)          per = atom × element
+//   eleq1  (A = B) → (A ∈ S ↔ B ∈ S)          per = atom whose side IS an element
+//   ssel   (A ⊆ B) → (e ∈ A → e ∈ B)          per ⊆ atom (incl. eqss-derived) × element
+// plus the membership unfolds of the memberships the bridges introduce.
+// Elements = the left-hand sides of the memberships present in the step.
+mizEmitBridges(forms : [FolForm], acc0 : Tree<string, Pair<FolForm, string>>) -> Tree<string, Pair<FolForm, string>> {
+	mems : ref [Pair<FolTerm, FolTerm>] = ref [];
+	subs : ref [Pair<FolTerm, FolTerm>] = ref [];
+	eqs  : ref [Pair<FolTerm, FolTerm>] = ref [];
+	iter(forms, \f -> mizEmitHarvest(f, mems, subs, eqs));
+	elems = uniqBy(map(^mems, firstOfPair), \a, b -> mizEmitTKey(a) == mizEmitTKey(b));
+	allSubs = concat(^subs, concatA(map(^eqs, \q -> [q, Pair(q.second, q.first)])));
+	add = \acc, f, lemma -> setTree(acc, mizEmitKey(f), Pair(f, lemma));
+	acc1 = fold(^eqs, acc0, \acc, q -> {
+		eqf = FolEq(q.first, q.second);
+		a1 = add(acc, FolBin("iff", eqf, FolBin("and",
+			mizEmitSs(q.first, q.second), mizEmitSs(q.second, q.first))), "eqss");
+		a2 = fold(elems, a1, \ac, e -> add(ac,
+			FolBin("imp", eqf, FolBin("iff", mizEmitMem(e, q.first), mizEmitMem(e, q.second))), "eleq2"));
+		// an equality between ELEMENTS: bridge their memberships in every set present
+		lk = mizEmitTKey(q.first); rk = mizEmitTKey(q.second);
+		sideIsElem = exists(elems, \e -> { k = mizEmitTKey(e); k == lk || k == rk; });
+		if (!sideIsElem) a2
+		else fold(^mems, a2, \ac, m -> add(ac,
+			FolBin("imp", eqf, FolBin("iff",
+				mizEmitMem(q.first, m.second), mizEmitMem(q.second, m.second))), "eleq1"));
+	});
+	fold(allSubs, acc1, \acc, s -> fold(elems, acc, \ac, e -> {
+		a1 = add(ac, FolBin("imp", mizEmitSs(s.first, s.second),
+			FolBin("imp", mizEmitMem(e, s.first), mizEmitMem(e, s.second))), "ssel");
+		mizEmitMemGen(e, s.second, mizEmitMemGen(e, s.first, a1));
+	}));
+}
+
+mizEmitIsVar(t : FolTerm) -> bool {
+	switch (t) { FolVar(__): true; default: false; }
+}
+
+mizEmitIff(acc : Tree<string, Pair<FolForm, string>>, x : FolTerm, s : FolTerm,
+	body : FolForm, lemma : string) -> Tree<string, Pair<FolForm, string>> {
+	inst = FolBin("iff", mizEmitMem(x, s), body);
+	setTree(acc, mizEmitKey(inst), Pair(inst, lemma));
+}
+
+mizEmitHarvest(f : FolForm, mems : ref [Pair<FolTerm, FolTerm>],
+	subs : ref [Pair<FolTerm, FolTerm>], eqs : ref [Pair<FolTerm, FolTerm>]) -> void {
+	switch (f) {
+		FolNeg(g):        mizEmitHarvest(g, mems, subs, eqs);
+		FolBin(__, l, r): { mizEmitHarvest(l, mems, subs, eqs); mizEmitHarvest(r, mems, subs, eqs); }
+		FolPred(name, args): {
+			if (length(args) == 2) {
+				if (name == "∈") mems := arrayPush(^mems, Pair(args[0], args[1]))
+				else if (name == "⊆") subs := arrayPush(^subs, Pair(args[0], args[1]));
+			}
+		}
+		FolEq(l, r): eqs := arrayPush(^eqs, Pair(l, r));
+		default: {}
+	}
+}
+
+uniqBy(xs : [?], eq : (?, ?) -> bool) -> [?] {
+	fold(xs, [], \acc, x -> if (exists(acc, \y -> eq(x, y))) acc else arrayPush(acc, x));
+}
 
 mizEmitMemGen(x : FolTerm, s : FolTerm, acc : Tree<string, Pair<FolForm, string>>) -> Tree<string, Pair<FolForm, string>> {
 	switch (s) {
@@ -206,6 +286,17 @@ mizEmitMemGen(x : FolTerm, s : FolTerm, acc : Tree<string, Pair<FolForm, string>
 			} else if (op == "∅" && args == []) {
 				inst = FolNeg(mizEmitMem(x, s));
 				setTree(acc, mizEmitKey(inst), Pair(inst, "noel"));
+			} else if (mizEmitIsVar(x) && op == "singleton" && length(args) == 1) {
+				mizEmitIff(acc, x, s, FolEq(x, args[0]), "velsn");
+			} else if (mizEmitIsVar(x) && op == "pair" && length(args) == 2) {
+				mizEmitIff(acc, x, s,
+					FolBin("or", FolEq(x, args[0]), FolEq(x, args[1])), "velpr");
+			} else if (mizEmitIsVar(x) && op == "triple" && length(args) == 3) {
+				mizEmitIff(acc, x, s, FolBin("or",
+					FolBin("or", FolEq(x, args[0]), FolEq(x, args[1])),
+					FolEq(x, args[2])), "veltp");
+			} else if (mizEmitIsVar(x) && op == "𝒫" && length(args) == 1) {
+				mizEmitIff(acc, x, s, mizEmitSs(x, args[0]), "velpw");
 			} else acc;
 		}
 		default: acc;
