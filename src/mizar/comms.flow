@@ -12,6 +12,7 @@ import mizar/original/verfinit;
 import mizar/original/checker;
 import fol/src;
 import fol/fol2ru;
+import fol/pcert;
 import ru/parse/exps/sources;
 import ru/parse/load;
 import ru/cache/cache;
@@ -35,7 +36,95 @@ ruMizarCommands = [
 	ruCommMizarProofs,
 	ruCommMizarToRu,
 	ruCommMizarDerivation,
+	ruCommTestPCert,
 ];
+
+// ---- the propositional certificate's own gate: translate a battery of
+// entailments through G3cp -> Hilbert (fol/pcert) and write ONE .ru file the
+// ordinary verifier checks against the miz_set foundation ----
+
+ruCommTestPCert = RuComm(
+	RuCommInfo(
+		"test-pcert", "io", "emit the G3cp->Hilbert certificate battery as a verifiable .ru file", "", false, false,
+		[RuCommArg("out", true, "output .ru path", "pcert_test.ru")], []
+	),
+	ruRunTestPCert
+);
+
+ruRunTestPCert(unit : RuUnit) -> Maybe<RuState> {
+	env = ruUnitEnv(unit);
+	out = ruTaskStringArg(unit.task, "out", "pcert_test.ru");
+	pa = RuPAtom("A"); pb = RuPAtom("B"); pc = RuPAtom("C");
+	atom = \k : string -> {
+		v = if (k == "A") "X5" else if (k == "B") "X7" else "X9";
+		FolPred("∈", [FolVar("X2"), FolVar(v)]);
+	};
+	cases : [Pair<[RuPForm], RuPForm>] = [
+		Pair([RuPAnd(pa, pb)], RuPAnd(pb, pa)),
+		Pair([RuPOr(pa, pb), RuPNot(pa)], pb),
+		Pair([RuPImp(pa, pb), pa], pb),
+		Pair([RuPIff(pa, pb), pb], pa),
+		Pair([], RuPImp(pa, RuPImp(pb, pa))),
+		Pair([], RuPIff(RuPAnd(pa, pb), RuPAnd(pb, pa))),
+		Pair([RuPNot(RuPNot(pa))], pa),
+		Pair([pa], RuPOr(pa, pb)),
+		Pair([], RuPTrue()),
+		Pair([pa, RuPNot(pa)], pb),
+		Pair([RuPImp(pa, RuPOr(pb, pc)), pa, RuPNot(pb)], pc),
+		Pair([], RuPIff(RuPNot(RuPAnd(pa, pb)), RuPOr(RuPNot(pa), RuPNot(pb)))),
+		Pair([RuPIff(pa, RuPOr(pb, pc)), RuPNot(pb), pa], pc),
+	];
+	thms = mapi(cases, \i, cs -> switch (folPCert(cs.first, cs.second, atom)) {
+		None(): "";
+		Some(steps): ruPCertThmText("pcert" + i2s(i + 1), cs.first, cs.second, steps, atom);
+	});
+	bad = foldi(thms, [], \i, acc, t -> if (t == "") arrayPush(acc, i + 1) else acc);
+	// negative control: an invalid entailment must yield a countermodel, not a proof
+	negOk = switch (folPCert([RuPOr(pa, pb)], pa, atom)) { None(): true; Some(__): false; };
+	if (bad != [] || !negOk) {
+		env.out.error("test-pcert: no certificate for cases "
+			+ strGlue(map(bad, i2s), ",") + (if (negOk) "" else "; negative control PROVED"), []);
+		None();
+	} else {
+		text = "import mizar/miz_set;;\n\n" + concatStrings(thms);
+		if (!setFileContent(out, text)) {
+			env.out.error("test-pcert: cannot write " + out, []);
+			None();
+		} else {
+			nSteps = fold(thms, 0, \acc, t -> acc + strCountOf(t, "\tstep "));
+			env.out.println("test-pcert: " + i2s(length(cases)) + " cases, "
+				+ i2s(nSteps) + " steps -> " + out);
+			Some(unit.state);
+		}
+	}
+}
+
+ruPCertExpr(f : FolForm) -> string { strGlue(folFormToks(f), " "); }
+
+ruPCertRef(r : FolPRef) -> string {
+	switch (r) {
+		FolPRefStep(i): "step " + i2s(i + 1);
+		FolPRefFact(i): "hyp " + i2s(i + 1);
+	}
+}
+
+ruPCertThmText(name : string, facts : [RuPForm], goal : RuPForm, steps : [FolPStep],
+	atom : (string) -> FolForm) -> string {
+	forms = map(concat(facts, [goal]), \f -> folPFol(f, atom));
+	vars = sortUnique(concatA(map(forms, folFormVars)));
+	hdr = "theorem " + name
+		+ (if (vars == []) "" else " (" + strGlue(map(vars, \v -> v + " : setvar"), ", ") + ")")
+		+ " {\n";
+	hyps = concatStrings(mapi(facts, \i, f ->
+		"\thyp " + i2s(i + 1) + " : wff = |- " + ruPCertExpr(folPFol(f, atom)) + " ;;\n"));
+	sep = if (facts == []) "" else "\t----------\n";
+	prop = "\tprop : wff = |- " + ruPCertExpr(folPFol(goal, atom)) + " ;;\n";
+	body = concatStrings(mapi(steps, \i, s ->
+		"\tstep " + i2s(i + 1) + " : wff = " + s.assertion
+		+ " (" + strGlue(map(s.refs, ruPCertRef), ", ") + ") |- "
+		+ ruPCertExpr(s.form) + " ;;\n"));
+	hdr + hyps + sep + prop + "} proof {\n" + body + "}\n";
+}
 
 // ---- the completer's coverage census: run the ported checker in-process and
 // classify every derivation record by the closing family ----

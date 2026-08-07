@@ -1,0 +1,341 @@
+import ru/prover/tactics/pproof;
+import fol/src;
+
+// PHASE 2, step 2 of the Kalmár-free certificate generator (see pproof.flow):
+// translate a G3cp derivation into a forward HILBERT proof over the
+// foundation's propositional lemmas, in the FolForm dialect of the emitted
+// articles. Deterministic, no search: one fixed step pattern per G3cp rule.
+//
+// REFUTATION FORM — the shape Mizar itself reasons in: every sequent
+// Γ ⊢ Δ of the derivation is realized as the single statement
+//     |- C → F.        where C = ⋀(Γ ++ map(¬, Δ))   (left-nested ∧)
+// so every G3cp rule (left and right alike) becomes: derive the child
+// context's members from C (projections + one fixed lemma for the principal
+// formula), rebuild the child's conjunction with jca, cut with syl —
+// or, where a child assumes a formula C cannot yield (∨L cases, ∧R sides),
+// extend C by that assumption and discharge with ex / efald. The root
+// |- ⋀(facts ++ [¬goal]) → F. is discharged to |- goal by ex + con1d + fal.
+//
+// The lemma vocabulary (all present in miz_set.ru with these exact shapes):
+//   id simpl simpr syl jca ex efald mpd mpi ax-mp a1i pm2.21d
+//   notnotr pm2.45 pm2.46 simplim conax1 biimp biimpr impbi imp con3i
+//   jaod con1i con1d tru fal pm3.2i
+
+export {
+	// One emitted step: its statement, the foundation assertion it cites, and
+	// premise references in the assertion's OWN hypothesis order.
+	FolPStep(form : FolForm, assertion : string, refs : [FolPRef]);
+	FolPRef ::= FolPRefStep, FolPRefFact;
+		FolPRefStep(i : int);  // index into the emitted step list (0-based)
+		FolPRefFact(i : int);  // the caller's i-th fact, available as |- facts[i]
+
+	// A Hilbert proof of `facts |- goal`, or None when the entailment does not
+	// hold propositionally (G3cp countermodel). The last step proves |- goal.
+	// `atom` renders a RuPAtom key as the article-dialect formula.
+	folPCert(facts : [RuPForm], goal : RuPForm, atom : (string) -> FolForm) -> Maybe<[FolPStep]>;
+
+	// the same skeleton->dialect rendering the steps use (for headers/reports)
+	folPFol(f : RuPForm, atom : (string) -> FolForm) -> FolForm;
+}
+
+FolPAcc(steps : ref [FolPStep], atom : (string) -> FolForm, fail : ref bool);
+
+folPForm(a : FolPAcc, f : RuPForm) -> FolForm {
+	switch (f) {
+		RuPAtom(key):  a.atom(key);
+		RuPNot(g):     FolNeg(folPForm(a, g));
+		RuPAnd(l, r):  FolBin("and", folPForm(a, l), folPForm(a, r));
+		RuPOr(l, r):   FolBin("or",  folPForm(a, l), folPForm(a, r));
+		RuPImp(l, r):  FolBin("imp", folPForm(a, l), folPForm(a, r));
+		RuPIff(l, r):  FolBin("iff", folPForm(a, l), folPForm(a, r));
+		RuPTrue():     FolPred("$true", []);
+		RuPFalse():    FolPred("$false", []);
+	}
+}
+
+folPConj(fs : [RuPForm]) -> RuPForm {
+	if (fs == []) RuPTrue() else fold(tail(fs), fs[0], \acc, f -> RuPAnd(acc, f));
+}
+
+folPImp(a : FolPAcc, l : RuPForm, r : RuPForm) -> FolForm {
+	FolBin("imp", folPForm(a, l), folPForm(a, r));
+}
+
+folPEmit(a : FolPAcc, form : FolForm, assertion : string, refs : [FolPRef]) -> int {
+	a.steps := arrayPush(^(a.steps), FolPStep(form, assertion, refs));
+	length(^(a.steps)) - 1;
+}
+
+sref(i : int) -> FolPRef { FolPRefStep(i); }
+
+// |- ⋀ctx → ctx[i]  (ctx left-nested; O(n) simpl/simpr/syl steps)
+folPPrj(a : FolPAcc, ctx : [RuPForm], i : int) -> int {
+	n = length(ctx);
+	c = folPConj(ctx);
+	if (n == 1) folPEmit(a, folPImp(a, c, ctx[0]), "id", [])
+	else if (i == n - 1) folPEmit(a, folPImp(a, c, ctx[i]), "simpr", [])
+	else {
+		pre = subrange(ctx, 0, n - 1);
+		u = folPEmit(a, folPImp(a, c, folPConj(pre)), "simpl", []);
+		v = folPPrj(a, pre, i);
+		folPEmit(a, folPImp(a, c, ctx[i]), "syl", [sref(u), sref(v)]);
+	}
+}
+
+// |- C→x (pos), |- C→¬x (neg)  =>  |- C → F.
+folPContra(a : FolPAcc, c : RuPForm, x : RuPForm, pos : int, neg : int) -> int {
+	u = folPEmit(a, folPImp(a, c, RuPImp(x, RuPFalse())), "pm2.21d", [sref(neg)]);
+	folPEmit(a, folPImp(a, c, RuPFalse()), "mpd", [sref(pos), sref(u)]);
+}
+
+// |- ⋀base → e for one child-context member: a special derivation when listed,
+// else a projection (the member must occur in `base` — G3cp guarantees it)
+folPResolve(a : FolPAcc, base : [RuPForm], der : [Pair<RuPForm, int>], e : RuPForm) -> int {
+	found = filter(der, \p -> p.first == e);
+	if (found != []) found[0].second
+	else {
+		i = findiDef(base, \b -> b == e, -1);
+		if (i >= 0) folPPrj(a, base, i)
+		else {
+			// internal invariant break — emit a loud failure the verifier rejects
+			a.fail := true;
+			folPEmit(a, folPForm(a, e), "PCERT_UNRESOLVED", []);
+		}
+	}
+}
+
+// bridge |- ⋀base → ⋀child  +  cut with the child's refutation
+folPCut(a : FolPAcc, base : [RuPForm], child : [RuPForm], der : [Pair<RuPForm, int>], childIdx : int) -> int {
+	c = folPConj(base);
+	first = folPResolve(a, base, der, child[0]);
+	br = foldi(tail(child), Pair(first, child[0]), \i, acc, e -> {
+		ei = folPResolve(a, base, der, e);
+		nf = RuPAnd(acc.second, e);
+		Pair(folPEmit(a, folPImp(a, c, nf), "jca", [sref(acc.first), sref(ei)]), nf);
+	});
+	folPEmit(a, folPImp(a, c, RuPFalse()), "syl", [sref(br.first), sref(childIdx)]);
+}
+
+folPCtxOf(d : RuPDeriv) -> [RuPForm] {
+	switch (d) {
+		RuPDAxiom(g, dl):          concat(g, map(dl, \f -> RuPNot(f)));
+		RuPDRule(__, g, dl, __):   concat(g, map(dl, \f -> RuPNot(f)));
+	}
+}
+
+// |- (⋀base ∧ e1 ∧ …) → F. — prove the child under assumptions C cannot yield
+folPAssume(a : FolPAcc, base : [RuPForm], extras : [RuPForm], child : RuPDeriv) -> int {
+	ext = concat(base, extras);
+	ci = folPProve(a, child);
+	folPCut(a, ext, folPCtxOf(child), [], ci);
+}
+
+folPDecomposable(f : RuPForm) -> bool {
+	switch (f) { RuPAtom(__): false; RuPTrue(): false; RuPFalse(): false; default: true; }
+}
+
+// |- ⋀(Γ ++ ¬Δ) → F. for this derivation node
+folPProve(a : FolPAcc, d : RuPDeriv) -> int {
+	ctx = folPCtxOf(d);
+	c = folPConj(ctx);
+	fls : RuPForm = RuPFalse();
+	switch (d) {
+		RuPDAxiom(g, dl): {
+			fi = findiDef(g, \f -> f == fls, -1);
+			ti = findiDef(dl, \f -> f == RuPTrue(), -1);
+			if (fi >= 0) folPPrj(a, ctx, fi)
+			else if (ti >= 0) {
+				p = folPPrj(a, ctx, length(g) + ti);
+				t = folPEmit(a, folPForm(a, RuPTrue()), "tru", []);
+				ta = folPEmit(a, folPImp(a, c, RuPTrue()), "a1i", [sref(t)]);
+				folPContra(a, c, RuPTrue(), ta, p);
+			} else {
+				pi = findiDef(g, \f -> ruPCtains(dl, f), -1);
+				if (pi < 0) {
+					a.fail := true;
+					folPEmit(a, folPForm(a, fls), "PCERT_BAD_AXIOM", []);
+				} else {
+					p = g[pi];
+					j = findiDef(dl, \f -> f == p, -1);
+					pos = folPPrj(a, ctx, pi);
+					neg = folPPrj(a, ctx, length(g) + j);
+					folPContra(a, c, p, pos, neg);
+				}
+			}
+		}
+		RuPDRule(rule, g, dl, kids): {
+			gi = findiDef(g,  folPDecomposable, -1);
+			di = findiDef(dl, folPDecomposable, -1);
+			isL = endsWith(rule, "L");
+			f = if (isL) g[gi] else dl[di];
+			pos = if (isL) gi else length(g) + di;
+			if (rule == "¬L") {
+				ci = folPProve(a, kids[0]);
+				folPCut(a, ctx, folPCtxOf(kids[0]), [], ci);
+			} else if (rule == "∧L") {
+				switch (f) {
+					RuPAnd(x, y): {
+						pf = folPPrj(a, ctx, pos);
+						sa = folPEmit(a, folPImp(a, f, x), "simpl", []);
+						da = folPEmit(a, folPImp(a, c, x), "syl", [sref(pf), sref(sa)]);
+						sb = folPEmit(a, folPImp(a, f, y), "simpr", []);
+						db = folPEmit(a, folPImp(a, c, y), "syl", [sref(pf), sref(sb)]);
+						ci = folPProve(a, kids[0]);
+						folPCut(a, ctx, folPCtxOf(kids[0]), [Pair(x, da), Pair(y, db)], ci);
+					}
+					default: folPBad(a);
+				}
+			} else if (rule == "∨L") {
+				switch (f) {
+					RuPOr(x, y): {
+						p1 = folPAssume(a, ctx, [x], kids[0]);
+						e1 = folPEmit(a, folPImp(a, c, RuPImp(x, fls)), "ex", [sref(p1)]);
+						p2 = folPAssume(a, ctx, [y], kids[1]);
+						e2 = folPEmit(a, folPImp(a, c, RuPImp(y, fls)), "ex", [sref(p2)]);
+						jd = folPEmit(a, folPImp(a, c, RuPImp(f, fls)), "jaod", [sref(e1), sref(e2)]);
+						pf = folPPrj(a, ctx, pos);
+						folPEmit(a, folPImp(a, c, fls), "mpd", [sref(pf), sref(jd)]);
+					}
+					default: folPBad(a);
+				}
+			} else if (rule == "→L") {
+				switch (f) {
+					RuPImp(x, y): {
+						p1 = folPAssume(a, ctx, [RuPNot(x)], kids[0]);
+						ea = folPEmit(a, folPImp(a, c, x), "efald", [sref(p1)]);
+						p2 = folPAssume(a, ctx, [y], kids[1]);
+						eb = folPEmit(a, folPImp(a, c, RuPImp(y, fls)), "ex", [sref(p2)]);
+						pf = folPPrj(a, ctx, pos);
+						m1 = folPEmit(a, folPImp(a, c, y), "mpd", [sref(ea), sref(pf)]);
+						folPEmit(a, folPImp(a, c, fls), "mpd", [sref(m1), sref(eb)]);
+					}
+					default: folPBad(a);
+				}
+			} else if (rule == "↔L") {
+				switch (f) {
+					RuPIff(x, y): {
+						pf = folPPrj(a, ctx, pos);
+						b1 = folPEmit(a, folPImp(a, f, RuPImp(x, y)), "biimp", []);
+						s1 = folPEmit(a, folPImp(a, c, RuPImp(x, y)), "syl", [sref(pf), sref(b1)]);
+						b2 = folPEmit(a, folPImp(a, f, RuPImp(y, x)), "biimpr", []);
+						s2 = folPEmit(a, folPImp(a, c, RuPImp(y, x)), "syl", [sref(pf), sref(b2)]);
+						// pproof appends the two directions SEPARATELY to gamma
+						ci = folPProve(a, kids[0]);
+						folPCut(a, ctx, folPCtxOf(kids[0]),
+							[Pair(RuPImp(x, y), s1), Pair(RuPImp(y, x), s2)], ci);
+					}
+					default: folPBad(a);
+				}
+			} else if (rule == "¬R") {
+				switch (f) {
+					RuPNot(x): {
+						pf = folPPrj(a, ctx, pos);
+						nn = folPEmit(a, folPImp(a, RuPNot(f), x), "notnotr", []);
+						da = folPEmit(a, folPImp(a, c, x), "syl", [sref(pf), sref(nn)]);
+						ci = folPProve(a, kids[0]);
+						folPCut(a, ctx, folPCtxOf(kids[0]), [Pair(x, da)], ci);
+					}
+					default: folPBad(a);
+				}
+			} else if (rule == "∧R") {
+				switch (f) {
+					RuPAnd(x, y): {
+						p1 = folPAssume(a, ctx, [RuPNot(x)], kids[0]);
+						ea = folPEmit(a, folPImp(a, c, x), "efald", [sref(p1)]);
+						p2 = folPAssume(a, ctx, [RuPNot(y)], kids[1]);
+						eb = folPEmit(a, folPImp(a, c, y), "efald", [sref(p2)]);
+						jj = folPEmit(a, folPImp(a, c, f), "jca", [sref(ea), sref(eb)]);
+						pf = folPPrj(a, ctx, pos);
+						folPContra(a, c, f, jj, pf);
+					}
+					default: folPBad(a);
+				}
+			} else if (rule == "∨R") {
+				switch (f) {
+					RuPOr(x, y): {
+						pf = folPPrj(a, ctx, pos);
+						p45 = folPEmit(a, folPImp(a, RuPNot(f), RuPNot(x)), "pm2.45", []);
+						d1 = folPEmit(a, folPImp(a, c, RuPNot(x)), "syl", [sref(pf), sref(p45)]);
+						p46 = folPEmit(a, folPImp(a, RuPNot(f), RuPNot(y)), "pm2.46", []);
+						d2 = folPEmit(a, folPImp(a, c, RuPNot(y)), "syl", [sref(pf), sref(p46)]);
+						ci = folPProve(a, kids[0]);
+						folPCut(a, ctx, folPCtxOf(kids[0]),
+							[Pair(RuPNot(x), d1), Pair(RuPNot(y), d2)], ci);
+					}
+					default: folPBad(a);
+				}
+			} else if (rule == "→R") {
+				switch (f) {
+					RuPImp(x, y): {
+						pf = folPPrj(a, ctx, pos);
+						sl = folPEmit(a, folPImp(a, RuPNot(f), x), "simplim", []);
+						d1 = folPEmit(a, folPImp(a, c, x), "syl", [sref(pf), sref(sl)]);
+						cx = folPEmit(a, folPImp(a, RuPNot(f), RuPNot(y)), "conax1", []);
+						d2 = folPEmit(a, folPImp(a, c, RuPNot(y)), "syl", [sref(pf), sref(cx)]);
+						ci = folPProve(a, kids[0]);
+						folPCut(a, ctx, folPCtxOf(kids[0]),
+							[Pair(x, d1), Pair(RuPNot(y), d2)], ci);
+					}
+					default: folPBad(a);
+				}
+			} else if (rule == "↔R") {
+				switch (f) {
+					RuPIff(x, y): {
+						both = RuPAnd(RuPImp(x, y), RuPImp(y, x));
+						pf = folPPrj(a, ctx, pos);
+						ib = folPEmit(a, folPImp(a, RuPImp(x, y), RuPImp(RuPImp(y, x), f)), "impbi", []);
+						im = folPEmit(a, folPImp(a, both, f), "imp", [sref(ib)]);
+						c3 = folPEmit(a, folPImp(a, RuPNot(f), RuPNot(both)), "con3i", [sref(im)]);
+						dd = folPEmit(a, folPImp(a, c, RuPNot(both)), "syl", [sref(pf), sref(c3)]);
+						ci = folPProve(a, kids[0]);
+						folPCut(a, ctx, folPCtxOf(kids[0]), [Pair(RuPNot(both), dd)], ci);
+					}
+					default: folPBad(a);
+				}
+			} else folPBad(a);
+		}
+	}
+}
+
+folPBad(a : FolPAcc) -> int {
+	a.fail := true;
+	folPEmit(a, FolPred("$false", []), "PCERT_BAD_RULE", []);
+}
+
+ruPCtains(fs : [RuPForm], f : RuPForm) -> bool { exists(fs, \x -> x == f); }
+
+folPFol(f : RuPForm, atom : (string) -> FolForm) -> FolForm {
+	folPForm(FolPAcc(ref [], atom, ref false), f);
+}
+
+folPCert(facts : [RuPForm], goal : RuPForm, atom : (string) -> FolForm) -> Maybe<[FolPStep]> {
+	switch (ruPProveSeq(facts, [goal])) {
+		None(): None();
+		Some(dr): {
+			a = FolPAcc(ref [], atom, ref false);
+			rootIdx = folPProve(a, dr);
+			fls : RuPForm = RuPFalse();
+			if (facts == []) {
+				c1 = folPEmit(a, folPImp(a, RuPNot(fls), goal), "con1i", [sref(rootIdx)]);
+				fl = folPEmit(a, folPForm(a, RuPNot(fls)), "fal", []);
+				folPEmit(a, folPForm(a, goal), "ax-mp", [sref(fl), sref(c1)]);
+				{}
+			} else {
+				fc = folPConj(facts);
+				exi = folPEmit(a, folPImp(a, fc, RuPImp(RuPNot(goal), fls)), "ex", [sref(rootIdx)]);
+				cd = folPEmit(a, folPImp(a, fc, RuPImp(RuPNot(fls), goal)), "con1d", [sref(exi)]);
+				fl = folPEmit(a, folPForm(a, RuPNot(fls)), "fal", []);
+				mp = folPEmit(a, folPImp(a, fc, goal), "mpi", [sref(fl), sref(cd)]);
+				start : Pair<FolPRef, RuPForm> = Pair(FolPRefFact(0), facts[0]);
+				conj = foldi(tail(facts), start, \i, acc, f -> {
+					nf = RuPAnd(acc.second, f);
+					r : FolPRef = sref(folPEmit(a, folPForm(a, nf), "pm3.2i", [acc.first, FolPRefFact(i + 1)]));
+					Pair(r, nf);
+				});
+				folPEmit(a, folPForm(a, goal), "ax-mp", [conj.first, sref(mp)]);
+				{}
+			}
+			if (^(a.fail)) None() else Some(^(a.steps));
+		}
+	}
+}
