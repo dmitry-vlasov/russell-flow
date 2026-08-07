@@ -56,6 +56,8 @@ export {
 		mutable debug : bool,
 		derivSink : Vector<string>,          // = chk.derivation (derivation=1)
 		derivXmlSink : Vector<string>,       // = chk.derivXml (dump-derivation=)
+		mutable candLit : int,
+		candStage : Vector<string>,
 	);
 
 	// InitUnifier over a finished (unrefuted) equalizer state
@@ -168,7 +170,21 @@ mizInitUnifier(chk : MizChecker, eq : MizEqualizer) -> MizUnifier {
 	upre = mizMakePre(env); // the FreeBasic normalization state
 	MizUnifier(env, chk.idn, eq, n, el, dConst, vals, typs, supers, eTrms,
 		makeVector(8), 0, 0, makeTree(), upre, chk.debug, chk.derivation,
-		chk.derivXml);
+		chk.derivXml, -1, makeVector(0));
+}
+
+// PORT-SIDE OBSERVATION (full-replay S3): candidate MATCH events. candLit is
+// the premise-clause literal index currently under Verify (-1 = staging off);
+// each rule arm that contributes a non-empty match pushes one <Cand lit kind
+// atom> into the stage — flushed as <Matches> only for the SUCCESSFUL attempt.
+// The replayer selects the candidate consistent with the recorded substitution
+// offline. atom < 0 = the rule's fixed semantics need no index.
+mizCand(u : MizUnifier, l : MizPreInst, kind : string, atom : int) -> void {
+	if (u.candLit >= 0 && (l.top || mizPreInstCount(l) > 0)) {
+		pushVector(u.candStage, "<Cand lit=\"" + i2s(u.candLit)
+			+ "\" kind=\"" + kind + "\""
+			+ (if (atom < 0) "" else " atom=\"" + i2s(atom) + "\"") + "/>\n");
+	}
 }
 
 // one substitution in the original trace's layout: X<var>/E<class>
@@ -1396,6 +1412,7 @@ mizCompInstAsTrue(u : MizUnifier, f : MizFrm) -> MizPreInst {
 		c = mizConstr(env, coPredicate, pf.predNr);
 		if (mizHasProperty(c, syIrreflexivity)) {
 			l = mizUnifyReflexive(u, f);
+			mizCand(u, l, "irreflexivity", -1);
 			mizUniUnion(u, res, l);
 		}
 		rqBel = mizBuiltIn(env.builtIn, rqBelongsTo);
@@ -1417,6 +1434,7 @@ mizCompInstAsTrue(u : MizUnifier, f : MizFrm) -> MizPreInst {
 					if (at.attrNr == rqEmp && at.neg == 1) found := true);
 				if (^found) {
 					l = mizUniTrm(u, lRight, getVectorUnsafe(u.eTrm, k));
+					mizCand(u, l, "empty-class", k);
 					mizUniUnion(u, res, l);
 				}
 			});
@@ -1431,6 +1449,7 @@ mizCompInstAsTrue(u : MizUnifier, f : MizFrm) -> MizPreInst {
 								if (mizPreInstCount(l) != 0) {
 									l1 = mizUniTrm(u, lRight, mizTrmListNth(pm.second, 0));
 									mizUniJoin(u, l, l1);
+									mizCand(u, l, "neg-element", -1);
 									mizUniUnion(u, res, l);
 								}
 							}
@@ -1455,6 +1474,7 @@ mizCompInstAsTrue(u : MizUnifier, f : MizFrm) -> MizPreInst {
 										mizNewTrmList(mizCopyTrm(lRight), MizTrmNil()));
 									l1 = mizUniTrm(u, lTrm, mizTrmListNth(pm.second, 0));
 									mizUniJoin(u, l, l1);
+									mizCand(u, l, "neg-inclusion", -1);
 									mizUniUnion(u, res, l);
 								}
 							}
@@ -1492,6 +1512,7 @@ mizCompInstAsTrue(u : MizUnifier, f : MizFrm) -> MizPreInst {
 								iE := ^iE + 1;
 							});
 							mizUniJoin(u, l, l1);
+							mizCand(u, l, "numeric-neq", ^kE);
 							mizUniUnion(u, res, l);
 						}
 					}
@@ -1503,14 +1524,19 @@ mizCompInstAsTrue(u : MizUnifier, f : MizFrm) -> MizPreInst {
 		rqLEu = mizBuiltIn(env.builtIn, rqLessOrEqual);
 		rqDivu = mizBuiltIn(env.builtIn, rqDivides);
 		if (pa.first == rqLEu && rqLEu != 0) {
+			nLE0 = mizPreInstCount(res);
 			mizUniLETrue(u, mizTrmListNth(pa.second, 0),
 				mizTrmListNth(pa.second, 1), res);
+				if (mizPreInstCount(res) != nLE0 || res.top) mizCand(u, mizUniTop(), "leq", -1);
 		} else if (pa.first == rqDivu && rqDivu != 0) {
+			nDV0 = mizPreInstCount(res);
 			mizUniDivides(u, mizTrmListNth(pa.second, 0),
 				mizTrmListNth(pa.second, 1), res, false);
+				if (mizPreInstCount(res) != nDV0 || res.top) mizCand(u, mizUniTop(), "divides", -1);
 		}
 	} else if (srt == ikFrmAttr) {
 		l = mizUniAttrFrm(u, f, 0);
+		mizCand(u, l, "attr", -1);
 		mizUniUnion(u, res, l);
 		skipNegSweep := true;
 	} else if (srt == ikFrmQual) {
@@ -1550,6 +1576,7 @@ mizCompInstAsTrue(u : MizUnifier, f : MizFrm) -> MizPreInst {
 								+ " radices=" + (if (l1.top) "top" else i2s(mizPreInstCount(l1))));
 						}
 						mizUniJoin(u, l, l1);
+						mizCand(u, l, "neg-qual", -1);
 						mizUniUnion(u, res, l);
 					}
 				}
@@ -1579,13 +1606,14 @@ mizCompInstAsTrue(u : MizUnifier, f : MizFrm) -> MizPreInst {
 					}
 				}
 				mizUniJoin(u, l, l1);
+				mizCand(u, l, "counter-attr", k);
 				mizUniUnion(u, res, l);
 			}
 		});
 		skipNegSweep := true;
 	}
 	if (!^skipNegSweep) {
-		iterVector(eq.negBas, \nf -> {
+		iteriVector(eq.negBas, \nbIdx, nf -> {
 			l = mizUniFrm(u, f, nf);
 			if (u.debug) {
 				// per-ARGUMENT counts too: which side of the atom fails
@@ -1611,6 +1639,7 @@ mizCompInstAsTrue(u : MizUnifier, f : MizFrm) -> MizPreInst {
 				println("    AST-sweep " + mizFrm2s(nf) + " -> "
 					+ (if (l.top) "top" else i2s(mizPreInstCount(l))) + perArg);
 			}
+			mizCand(u, l, "negbas", nbIdx);
 			mizUniUnion(u, res, l);
 		});
 	}
@@ -1629,6 +1658,7 @@ mizCompInstAsFalse(u : MizUnifier, f : MizFrm) -> MizPreInst {
 		c = mizConstr(env, coPredicate, pf.predNr);
 		if (mizHasProperty(c, syReflexivity)) {
 			l = mizUnifyReflexive(u, f);
+			mizCand(u, l, "reflexivity", -1);
 			mizUniUnion(u, res, l);
 		}
 		rqBel = mizBuiltIn(env.builtIn, rqBelongsTo);
@@ -1665,6 +1695,7 @@ mizCompInstAsFalse(u : MizUnifier, f : MizFrm) -> MizPreInst {
 							}
 						});
 						mizUniJoin(u, l, l1);
+						mizCand(u, l, "element", k);
 						mizUniUnion(u, res, l);
 					}
 				}
@@ -1696,6 +1727,7 @@ mizCompInstAsFalse(u : MizUnifier, f : MizFrm) -> MizPreInst {
 						});
 					}
 					mizUniJoin(u, l, l1);
+					mizCand(u, l, "inclusion", k);
 					mizUniUnion(u, res, l);
 				}
 			});
@@ -1706,26 +1738,32 @@ mizCompInstAsFalse(u : MizUnifier, f : MizFrm) -> MizPreInst {
 			rqLEuF = mizBuiltIn(env.builtIn, rqLessOrEqual);
 			rqDivuF = mizBuiltIn(env.builtIn, rqDivides);
 			if (pa.first == rqLEuF && rqLEuF != 0) {
+				nLE0 = mizPreInstCount(res);
 				mizUniLEFalse(u, mizTrmListNth(pa.second, 0),
 					mizTrmListNth(pa.second, 1), res);
+					if (mizPreInstCount(res) != nLE0 || res.top) mizCand(u, mizUniTop(), "leq", -1);
 			} else if (pa.first == rqDivuF && rqDivuF != 0) {
+				nDV0 = mizPreInstCount(res);
 				mizUniDivides(u, mizTrmListNth(pa.second, 0),
 					mizTrmListNth(pa.second, 1), res, true);
+					if (mizPreInstCount(res) != nDV0 || res.top) mizCand(u, mizUniTop(), "divides", -1);
 			}
 		}
 		if (!^handled) {
-			iterVector(eq.posBas, \pfb -> {
+			iteriVector(eq.posBas, \pbIdx, pfb -> {
 				l = mizUniFrm(u, f, pfb);
 				if (u.debug) {
 					println("      ASF-pred vs " + mizFrm2s(pfb) + " -> "
 						+ (if (l.top) "top" else i2s(mizPreInstCount(l))));
 				}
+				mizCand(u, l, "posbas", pbIdx);
 				mizUniUnion(u, res, l);
 			});
 			handled := true;
 		}
 	} else if (srt == ikFrmAttr) {
 		l = mizUniAttrFrm(u, f, 1);
+		mizCand(u, l, "attr", -1);
 		mizUniUnion(u, res, l);
 		handled := true;
 	} else if (srt == ikFrmQual) {
@@ -1735,18 +1773,20 @@ mizCompInstAsFalse(u : MizUnifier, f : MizFrm) -> MizPreInst {
 			if (mizPreInstCount(l) != 0) {
 				l1 = mizUniEqClassTyps(u, k, qf.typ);
 				mizUniJoin(u, l, l1);
+				mizCand(u, l, "qual", k);
 				mizUniUnion(u, res, l);
 			}
 		});
 		handled := true;
 	}
 	if (!^handled) {
-		iterVector(eq.posBas, \pfb -> {
+		iteriVector(eq.posBas, \pbIdx, pfb -> {
 			l = mizUniFrm(u, f, pfb);
 			if (u.debug) {
 				println("      ASF-sweep vs " + mizFrm2s(pfb) + " -> "
 					+ (if (l.top) "top" else i2s(mizPreInstCount(l))));
 			}
+			mizCand(u, l, "posbas", pbIdx);
 			mizUniUnion(u, res, l);
 		});
 	}
@@ -1934,14 +1974,17 @@ mizVerify(u : MizUnifier, f0 : MizFrm) -> bool {
 			if (mizDerivOn() || mizDerivXmlOn()) mizVerifyEvidence(u, f0, lFrmXml, None());
 		} else {
 			ev : MizNatFunc = getVectorUnsafe(normalForm.evals, ^i);
+			if (mizDerivXmlOn()) clearVector(u.candStage);
 			colls : Vector<MizPreInst> = makeVector(4);
 			dead = ref false;
 			j = ref 0;
 			while(\ -> !^dead && ^j < mizNatCount(ev), \ -> {
 				it = mizNatItem(ev, ^j);
 				bf : MizFrm = getVectorUnsafe(pre.basic, it.x);
+				u.candLit ::= if (mizDerivXmlOn()) it.x else -1;
 				lInsts = if (it.y == 1) mizCompInstAsFalse(u, bf)
 					else mizCompInstAsTrue(u, bf);
+					u.candLit ::= -1;
 				if (u.debug) {
 					println("    LIT[" + i2s(^i) + "." + i2s(^j) + "] y="
 						+ i2s(it.y) + " " + mizFrm2s(bf) + " -> "
@@ -1975,6 +2018,11 @@ mizVerify(u : MizUnifier, f0 : MizFrm) -> bool {
 					if (mizDerivOn() || mizDerivXmlOn()) mizVerifyEvidence(u, f0, lFrmXml,
 						if (joined.top) None()
 						else Some(getVectorUnsafe(joined.evals, 0)));
+					if (mizDerivXmlOn() && sizeVector(u.candStage) > 0) {
+						pushVector(u.derivXmlSink, "<Matches>\n");
+						iterVector(u.candStage, \cs -> pushVector(u.derivXmlSink, cs));
+						pushVector(u.derivXmlSink, "</Matches>\n");
+					}
 				}
 			}
 		}
