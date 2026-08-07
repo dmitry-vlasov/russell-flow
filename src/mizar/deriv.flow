@@ -73,55 +73,109 @@ export {
 // ---- S4b: the offline replay validator ----
 
 mizDerivValidate(d : MizXml) -> string {
+	rs = mizKidsTagged(d, "Resolve");
 	vs = mizKidsTagged(d, "Verify");
 	// <Matches> is the Verify's SIBLING (flushed after the evidence element)
 	matches = mizKidsTagged(d, "Matches");
+	if (rs != []) mizDerivValidateResolve(d, rs[0])
 	// contradictory-as-normalized: the premise refutes with no instantiation
 	// and no kills — replay is pure normalization, trivially valid
-	if (matches == [] && exists(vs, \v -> mizKidsTagged(v, "Contradictory") != [])) ""
+	else if (matches == [] && exists(vs, \v -> mizKidsTagged(v, "Contradictory") != [])) ""
 	else if (matches == []) "no-matches"
 	else {
-		m = matches[0];
-		// class member index: canonical key (arguments as class refs) -> class nr
-		idx = fold(mizKidsTagged(d, "Class"), makeTree(), \acc, c -> {
-			nr = s2i(mizAttr(c, "nr"));
-			fold(c.kids, acc, \ac, mem -> switch (mizDerivKey(mem, ac)) {
-				None(): ac;
-				Some(k): setTree(ac, k, nr);
-			});
-		});
-		// witness substitution: FreeVar nr -> class nr (Assign var is nr - 1)
-		asg = fold(concatA(map(vs, \v -> mizKidsTagged(v, "With"))), makeTree(), \acc, w ->
-			fold(mizKidsTagged(w, "Assign"), acc, \ac, a ->
-				setTree(ac, s2i(mizAttr(a, "var")) + 1, s2i(mizAttr(a, "class")))));
-		preLits = fold(mizKidsTagged(m, "PreLit"), makeTree(), \acc, pl ->
-			setTree(acc, s2i(mizAttr(pl, "nr")), pl));
-		posBas = mizKidsTagged(d, "PosBas");
-		negBas = mizKidsTagged(d, "NegBas");
-		basAt = \as : string, atom : int -> {
-			bs = if (as == "false") posBas else negBas;
-			found = filter(bs, \b -> s2i(mizAttr(b, "nr")) == atom);
-			// the WRAPPER element — it carries the adjusted-head attribute
-			if (found == [] || found[0].kids == []) None() else Some(found[0]);
-		};
-		// candidates grouped by premise-clause literal
-		byLit = fold(mizKidsTagged(m, "Cand"), makeTree(), \acc, cd -> {
-			l = s2i(mizAttr(cd, "lit"));
-			setTree(acc, l, arrayPush(lookupTreeDef(acc, l, []), cd));
-		});
-		// every literal the attempt used must have one reproducible kill
-		fold(getTreeKeys(byLit), "", \err, lit -> {
-			if (err != "") err
-			else switch (lookupTree(preLits, lit)) {
+		idx = mizDerivClassIndex(d);
+		asg = mizDerivAsg(concatA(map(vs, \v -> mizKidsTagged(v, "With"))));
+		mizDerivKills(matches[0], mizDerivPreLits(matches[0]), idx, asg,
+			mizDerivBasAt(d));
+	}
+}
+
+// a code-47 RESOLUTION record: the side literals must kill like a Verify's,
+// and the complementary pair must match each other classwise
+mizDerivValidateResolve(d : MizXml, r : MizXml) -> string {
+	idx = mizDerivClassIndex(d);
+	asg = mizDerivAsg(mizKidsTagged(r, "With"));
+	preLits = mizDerivPreLits(r);
+	ms = mizKidsTagged(r, "Matches");
+	side = if (ms == []) "" else
+		mizDerivKills(ms[0], preLits, idx, asg, mizDerivBasAt(d));
+	if (side != "" && side != "special-rule") side
+	else {
+		cs = mizKidsTagged(r, "Compl");
+		if (cs == []) "no-matches"
+		else {
+			pa = lookupTree(preLits, s2i(mizAttr(cs[0], "a")));
+			pb = lookupTree(preLits, s2i(mizAttr(cs[0], "b")));
+			switch (pa) {
 				None(): "no-matches";
-				Some(pl): {
-					if (pl.kids == []) "complex-literal"
-					else mizDerivKill(pl, lookupTreeDef(byLit, lit, []),
-						idx, asg, basAt);
+				Some(aw): switch (pb) {
+					None(): "no-matches";
+					Some(bw): {
+						if (aw.kids == [] || bw.kids == []) "complex-literal"
+						else {
+							cr = mizDerivAtomsMatch(aw, mizDerivUnwrapNot(aw.kids[0]),
+								bw, mizDerivUnwrapNot(bw.kids[0]), idx, asg);
+							if (cr == "") side else cr;
+						}
+					}
 				}
 			}
-		});
+		}
 	}
+}
+
+// class member index: canonical key (arguments as class refs) -> class nr
+mizDerivClassIndex(d : MizXml) -> Tree<string, int> {
+	fold(mizKidsTagged(d, "Class"), makeTree(), \acc, c -> {
+		nr = s2i(mizAttr(c, "nr"));
+		fold(c.kids, acc, \ac, mem -> switch (mizDerivKey(mem, ac)) {
+			None(): ac;
+			Some(k): setTree(ac, k, nr);
+		});
+	});
+}
+
+// witness substitution: FreeVar nr -> class nr (Assign var is nr - 1)
+mizDerivAsg(withs : [MizXml]) -> Tree<int, int> {
+	fold(withs, makeTree(), \acc, w ->
+		fold(mizKidsTagged(w, "Assign"), acc, \ac, a ->
+			setTree(ac, s2i(mizAttr(a, "var")) + 1, s2i(mizAttr(a, "class")))));
+}
+
+mizDerivPreLits(holder : MizXml) -> Tree<int, MizXml> {
+	fold(mizKidsTagged(holder, "PreLit"), makeTree(), \acc, pl ->
+		setTree(acc, s2i(mizAttr(pl, "nr")), pl));
+}
+
+mizDerivBasAt(d : MizXml) -> (string, int) -> Maybe<MizXml> {
+	posBas = mizKidsTagged(d, "PosBas");
+	negBas = mizKidsTagged(d, "NegBas");
+	\as : string, atom : int -> {
+		bs = if (as == "false") posBas else negBas;
+		found = filter(bs, \b -> s2i(mizAttr(b, "nr")) == atom);
+		// the WRAPPER element — it carries the adjusted-head attribute
+		if (found == [] || found[0].kids == []) None() else Some(found[0]);
+	};
+}
+
+// every literal the attempt used must have one reproducible kill
+mizDerivKills(m : MizXml, preLits : Tree<int, MizXml>, idx : Tree<string, int>,
+	asg : Tree<int, int>, basAt : (string, int) -> Maybe<MizXml>) -> string {
+	byLit = fold(mizKidsTagged(m, "Cand"), makeTree(), \acc, cd -> {
+		l = s2i(mizAttr(cd, "lit"));
+		setTree(acc, l, arrayPush(lookupTreeDef(acc, l, []), cd));
+	});
+	fold(getTreeKeys(byLit), "", \err, lit -> {
+		if (err != "") err
+		else switch (lookupTree(preLits, lit)) {
+			None(): "no-matches";
+			Some(pl): {
+				if (pl.kids == []) "complex-literal"
+				else mizDerivKill(pl, lookupTreeDef(byLit, lit, []),
+					idx, asg, basAt);
+			}
+		}
+	});
 }
 
 // one literal: try each candidate; "" as soon as one reproduces the kill.
