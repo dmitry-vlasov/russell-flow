@@ -27,6 +27,7 @@ import mizar/original/identify;
 import mizar/original/numbers;
 import mizar/original/prechecker;
 import mizar/original/equalizer;
+import mizar/original/iocorrel_write;
 
 export {
 	MizChecker(
@@ -41,6 +42,12 @@ export {
 		mutable debug : bool,
 		census : MizCensus,
 		derivation : Vector<string>,         // derivation=1 narration, per inference
+		// dump-derivation=: the STRUCTURED derivation — the same records as
+		// the narration, but as XML fragments in the analyzer-report dialect
+		// (the language the translation front already parses). Per inference:
+		// <Disjunct nr of> its <Literal> formulas, the closing evidence
+		// (<Verify> premise + witness / <AttrClash>), and <Contr code>.
+		derivXml : Vector<string>,
 	);
 
 	// The refutation census — the first, verdict-shaped slice of the checker's
@@ -65,6 +72,11 @@ export {
 	// prep.flow prints and clears it per inference. The renderer is gated on
 	// the flag, so with it off the cost is one cached int test.
 	mizDerivOn() -> bool;
+	// dump-derivation=<path> switches the structured records on
+	mizDerivXmlOn() -> bool;
+	// one formula in the report dialect, serialized IMMEDIATELY (the checker
+	// mutates and reuses its formulas)
+	mizDerivFrmXml(env : MizCorrelEnv, f : MizFrm) -> string;
 
 	mizMakeChecker(env : MizCorrelEnv, idn : MizIdentify, clusters : MizClusters) -> MizChecker;
 
@@ -78,7 +90,7 @@ export {
 
 mizMakeChecker(env : MizCorrelEnv, idn : MizIdentify, clusters : MizClusters) -> MizChecker {
 	MizChecker(env, idn, clusters, mizInitIntSeq(4), \__, __ -> 0, \__ -> [], false,
-		mizMakeCensus(), makeVector(0));
+		mizMakeCensus(), makeVector(0), makeVector(0));
 }
 
 // one attribute in the derivation narration: ±V<nr>(<args>)
@@ -97,6 +109,25 @@ mizDerivOn() -> bool {
 	if (^gMizDerivOn < 0)
 		gMizDerivOn := if (getUrlParameterDef("derivation", "") == "1") 1 else 0;
 	^gMizDerivOn == 1;
+}
+
+gMizDerivXmlOn : ref int = ref -1;
+
+mizDerivXmlOn() -> bool {
+	if (^gMizDerivXmlOn < 0)
+		gMizDerivXmlOn := if (getUrlParameterDef("dump-derivation", "") != "") 1 else 0;
+	^gMizDerivXmlOn == 1;
+}
+
+mizDerivFrmXml(env : MizCorrelEnv, f : MizFrm) -> string {
+	o = mizMakeVrfOut(env);
+	mizVOutFormula(o, f);
+	mizVrfOutContent(o);
+}
+
+// minimal XML attribute escape for the SURFACE strings (&, <, >, ")
+mizDerivQuote(s : string) -> string {
+	strReplaces(s, ["&", "&amp;", "<", "&lt;", ">", "&gt;", "\"", "&quot;"]);
 }
 
 mizMakeCensus() -> MizCensus {
@@ -442,6 +473,7 @@ mizInferenceChecker(chk : MizChecker, inference : Vector<MizFrm>) -> void {
 	idn = chk.idn;
 	mizSeqClear(chk.chErrNr);
 	clearVector(chk.derivation);
+	clearVector(chk.derivXml);
 	// marks: collected constants added during THIS inference are dropped after
 	infMark = sizeVector(env.inferConstDef);
 	ttMark = mizTTCollMark(env);   // MarkTermsInTTColl (checker.pas 335)
@@ -492,6 +524,17 @@ mizInferenceChecker(chk : MizChecker, inference : Vector<MizFrm>) -> void {
 						+ " " + mizFrm2s(getVectorUnsafe(pre.basic, it.x)));
 				});
 			}
+			if (mizDerivXmlOn()) {
+				pushVector(chk.derivXml, "<Disjunct nr=\"" + i2s(di + 1)
+					+ "\" of=\"" + i2s(sizeVector(normalForm.evals)) + "\">\n");
+				fori(0, mizNatCount(eval) - 1, \z -> {
+					it = mizNatItem(eval, z);
+					pushVector(chk.derivXml, "<Literal value=\""
+						+ (if (it.y == 0) "false" else "true") + "\">\n"
+						+ mizDerivFrmXml(env, getVectorUnsafe(pre.basic, it.x))
+						+ "</Literal>\n");
+				});
+			}
 			eq = mizMakeEqualizer(env, idn, chk.clusters, pre);
 			mizEquate(eq, eval);
 			if (chk.debug) mizDumpEqClasses(eq);
@@ -508,6 +551,24 @@ mizInferenceChecker(chk : MizChecker, inference : Vector<MizFrm>) -> void {
 			}
 			if (eq.trmOvfl) anyTrmOvfl := true;
 			env.itIsChecker ::= false;
+			if (mizDerivXmlOn() && eq.contr > 0 && eq.contr < 45) {
+				fori(1, mizTrmNbr(eq), \ci -> {
+					rec = mizTrmSAt(eq, ci);
+					if (!rec.superCluster.consistent) {
+						surface = switch (rec.eqClass) {
+							MizTrmElem(t, __): mizTrm2s(t);
+							MizTrmNil(): mizTrm2s(rec.term);
+						};
+						pushVector(chk.derivXml, "<AttrClash class=\"" + i2s(ci)
+							+ "\" surface=\"" + mizDerivQuote(surface) + "\""
+							+ (switch (rec.superCluster.refutedBy) {
+								Some(pr): " a1=\"" + mizDerivQuote(mizDerivAttr2s(pr.first))
+									+ "\" a2=\"" + mizDerivQuote(mizDerivAttr2s(pr.second)) + "\"";
+								None(): "";
+							}) + "/>\n");
+					}
+				});
+			}
 			if (mizDerivOn() && eq.contr > 0 && eq.contr < 45) {
 				// the equalizer family: find the class whose supercluster was
 				// refuted and name the clashing attribute pair (the equalizer
@@ -537,6 +598,9 @@ mizInferenceChecker(chk : MizChecker, inference : Vector<MizFrm>) -> void {
 			cs.disjuncts ::= cs.disjuncts + 1;
 			if (mizDerivOn())
 				pushVector(chk.derivation, "  closed by contr " + i2s(eq.contr));
+			if (mizDerivXmlOn())
+				pushVector(chk.derivXml, "<Contr code=\"" + i2s(max(0, eq.contr))
+					+ "\"/>\n</Disjunct>\n");
 		});
 		// census: the case-split width; 0 disjuncts = the inference was
 		// settled by normalization alone
