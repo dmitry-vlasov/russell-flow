@@ -41,16 +41,130 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int) -> Pair<[Maybe<FolSt
 MizEmitDrv(form : FolForm, steps : [FolPStep], refs : [RuParseRef],
 	disjs : [Pair<string, string>]);
 
-// (proof?, skippedByBudget)
+// (proof?, skippedByBudget) — goal REDUCTION around the fact ladder:
+// peel ∀ with ax-gen, turn a ⊆/= goal into a fresh-variable ∀-matrix via
+// df-ss/dfcleq + mpbir, split an ∧ goal with pm3.2i; the matrix closes by
+// the ladder (unfolds → bridges → ∀-instances)
 mizEmitStepProof(hyps : [FolForm], prev : [FolForm], goal : FolForm,
+	maxFacts : int, maxSize : int) -> Pair<Maybe<FolStepProof>, bool> {
+	used = buildSet(concatA(map(concat(hyps, arrayPush(prev, goal)), folFormVars)));
+	fresh = ref 0;
+	mizEmitReduce(hyps, prev, goal, maxFacts, maxSize, 0, fresh, used);
+}
+
+mizEmitFresh(fresh : ref int, used : Set<string>) -> string {
+	n = "X95" + i2s(^fresh);
+	fresh := ^fresh + 1;
+	if (containsSet(used, toLowerCase(n))) mizEmitFresh(fresh, used) else n;
+}
+
+mizEmitShift(steps : [FolPStep], dS : int, dF : int) -> [FolPStep] {
+	map(steps, \cs -> FolPStep(cs.form, cs.assertion, map(cs.refs, \r -> switch (r) {
+		FolPRefStep(k): FolPRefStep(k + dS);
+		FolPRefFact(k): FolPRefFact(k + dF);
+	})));
+}
+
+mizEmitReduce(hyps : [FolForm], prev : [FolForm], goal : FolForm,
+	maxFacts : int, maxSize : int, depth : int,
+	fresh : ref int, used : Set<string>) -> Pair<Maybe<FolStepProof>, bool> {
+	direct = mizEmitLadder(hyps, prev, goal, maxFacts, maxSize);
+	switch (direct.first) {
+		Some(__): direct;
+		None(): if (depth >= 8) direct else switch (goal) {
+			FolQuant(q, vs, body): {
+				if (q != "forall" || vs == []) direct
+				else {
+					sub = mizEmitReduce(hyps, prev, body, maxFacts, maxSize, depth + 1, fresh, used);
+					switch (sub.first) {
+						None(): Pair(None(), direct.second || sub.second);
+						Some(pr): {
+							n = length(vs);
+							gen = generate(0, n, \i -> {
+								k = n - 1 - i;
+								FolPStep(FolQuant("forall", subrange(vs, k, n - k), body),
+									"ax-gen", [FolPRefStep(length(pr.steps) + i - 1)]);
+							});
+							// the first ax-gen cites the sub-proof's last step
+							gen0 = mapi(gen, \i, g -> if (i > 0) g
+								else FolPStep(g.form, g.assertion, [FolPRefStep(length(pr.steps) - 1)]));
+							Pair(Some(FolStepProof(concat(pr.steps, gen0), pr.factRefs, pr.disjs)), false);
+						}
+					}
+				}
+			}
+			FolPred(name, args): {
+				if (name != "⊆" || length(args) != 2) direct
+				else mizEmitCharGoal(hyps, prev, goal, args[0], args[1], "imp", "df-ss",
+					maxFacts, maxSize, depth, fresh, used, direct);
+			}
+			FolEq(l, r): mizEmitCharGoal(hyps, prev, goal, l, r, "iff", "dfcleq",
+				maxFacts, maxSize, depth, fresh, used, direct);
+			FolBin(op, l, r): {
+				if (op != "and") direct
+				else {
+					sa = mizEmitReduce(hyps, prev, l, maxFacts, maxSize, depth + 1, fresh, used);
+					switch (sa.first) {
+						None(): Pair(None(), direct.second || sa.second);
+						Some(pa): {
+							sb = mizEmitReduce(hyps, prev, r, maxFacts, maxSize, depth + 1, fresh, used);
+							switch (sb.first) {
+								None(): Pair(None(), direct.second || sb.second);
+								Some(pb): {
+									dS = length(pa.steps); dF = length(pa.factRefs);
+									bs = mizEmitShift(pb.steps, dS, dF);
+									jn = FolPStep(goal, "pm3.2i",
+										[FolPRefStep(dS - 1), FolPRefStep(dS + length(bs) - 1)]);
+									Pair(Some(FolStepProof(concatA([pa.steps, bs, [jn]]),
+										concat(pa.factRefs, pb.factRefs),
+										uniq(concat(pa.disjs, pb.disjs)))), false);
+								}
+							}
+						}
+					}
+				}
+			}
+			default: direct;
+		}
+	}
+}
+
+// (A ⊆ B) / (A = B) via its fresh-variable ∀-characterization + mpbir
+mizEmitCharGoal(hyps : [FolForm], prev : [FolForm], goal : FolForm,
+	a : FolTerm, b : FolTerm, op : string, lemma : string,
+	maxFacts : int, maxSize : int, depth : int,
+	fresh : ref int, used : Set<string>,
+	direct : Pair<Maybe<FolStepProof>, bool>) -> Pair<Maybe<FolStepProof>, bool> {
+	v = mizEmitFresh(fresh, used);
+	matrix = FolBin(op, mizEmitMem(FolVar(v), a), mizEmitMem(FolVar(v), b));
+	subGoal = FolQuant("forall", [v], matrix);
+	sub = mizEmitReduce(hyps, prev, subGoal, maxFacts, maxSize, depth + 1, fresh, used);
+	switch (sub.first) {
+		None(): Pair(None(), direct.second || sub.second);
+		Some(pr): {
+			inst = FolBin("iff", goal, subGoal);
+			vr = toLowerCase(v);
+			dj = filtermap(folFormVars(inst), \w -> if (w == vr) None() else Some(Pair(vr, w)));
+			n0 = length(pr.steps);
+			df = FolPStep(inst, lemma, []);
+			mp = FolPStep(goal, "mpbir", [FolPRefStep(n0 - 1), FolPRefStep(n0)]);
+			Pair(Some(FolStepProof(concatA([pr.steps, [df, mp]]),
+				pr.factRefs, uniq(concat(pr.disjs, dj)))), false);
+		}
+	}
+}
+
+mizEmitLadder(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 	maxFacts : int, maxSize : int) -> Pair<Maybe<FolStepProof>, bool> {
 	ctx0 = concat(
 		mapi(hyps, \j, h -> Pair(h, mizEmitHypRef(j))),
 		mapi(prev, \j, s -> Pair(s, mizEmitStepRef(j))));
-	// quantifier-free facts only; a quantified fact is kept only when it IS the
-	// goal (then it closes the step as one opaque axiom)
-	ctx = filter(ctx0, \p -> !mizEmitHasQuant(p.first) || p.first == goal);
-	allForms = arrayPush(map(ctx, \p -> p.first), goal);
+	// quantified facts stay as OPAQUE atoms — sharing no atoms with anything,
+	// relevance drops them unless a characterization instance (df-ss/dfcleq)
+	// links them to a ⊆/= atom, which is exactly when they are needed
+	ctx = ctx0;
+	allForms = arrayPush(map(filter(ctx, \p -> !mizEmitHasQuant(p.first)),
+		\p -> p.first), goal);
 	insts0 = fold(allForms, makeTree(), \acc, f -> mizEmitUnfolds(f, acc));
 	// LADDER: rung 1 membership unfolds alone; rung 2 adds the ⊆/= bridges;
 	// rung 3 adds ∀-INSTANCES of the quantified local facts (spv + walk)
