@@ -73,7 +73,9 @@ mizEmitReduce(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 		Some(__): direct;
 		None(): if (depth >= 8) direct else switch (goal) {
 			FolQuant(q, vs, body): {
-				if (q != "forall" || vs == []) direct
+				if (q == "exists" && vs != [])
+					mizEmitExGoal(hyps, prev, goal, vs, body, maxFacts, maxSize, depth, fresh, used, direct)
+				else if (q != "forall" || vs == []) direct
 				else {
 					sub = mizEmitReduce(hyps, prev, body, maxFacts, maxSize, depth + 1, fresh, used);
 					switch (sub.first) {
@@ -127,6 +129,68 @@ mizEmitReduce(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 			default: direct;
 		}
 	}
+}
+
+// an ∃ goal closes by ∃-INTRODUCTION at a witness: the binder itself
+// (|- ψ then 19.8a + ax-mp) or a step element y (spei, its substitution
+// hypothesis by the same congruence walk rung 3 uses). Witnesses are tried
+// in order; the first whose instance the reduction can prove wins.
+mizEmitExGoal(hyps : [FolForm], prev : [FolForm], goal : FolForm,
+	vs : [string], body : FolForm,
+	maxFacts : int, maxSize : int, depth : int,
+	fresh : ref int, used : Set<string>,
+	direct : Pair<Maybe<FolStepProof>, bool>) -> Pair<Maybe<FolStepProof>, bool> {
+	x = vs[0];
+	rest = if (length(vs) == 1) body else FolQuant("exists", tail(vs), body);
+	// candidate witnesses: the step's element variables
+	mems : ref [Pair<FolTerm, FolTerm>] = ref [];
+	subs : ref [Pair<FolTerm, FolTerm>] = ref [];
+	eqs  : ref [Pair<FolTerm, FolTerm>] = ref [];
+	iter(arrayPush(filter(concat(hyps, prev), \f -> !mizEmitHasQuant(f)), body),
+		\f -> mizEmitHarvest(f, mems, subs, eqs));
+	names = uniq(filtermap(
+		concatA(map(concatA([^mems, ^subs, ^eqs]), \p -> [p.first, p.second])),
+		\t -> switch (t) { FolVar(n): Some(n); default: None(); }));
+	cands = concat([x], filter(if (length(names) > 5) subrange(names, 0, 5) else names,
+		\n -> n != x));
+	fold(cands, direct, \acc : Pair<Maybe<FolStepProof>, bool>, y -> switch (acc.first) {
+		Some(__): acc;
+		None(): {
+			if (y == x) {
+				sub = mizEmitReduce(hyps, prev, rest, maxFacts, maxSize, depth + 1, fresh, used);
+				switch (sub.first) {
+					None(): Pair(None(), acc.second || sub.second);
+					Some(pr): {
+						n0 = length(pr.steps);
+						im = FolPStep(FolBin("imp", rest, goal), "19.8a", []);
+						mp = FolPStep(goal, "ax-mp", [FolPRefStep(n0 - 1), FolPRefStep(n0)]);
+						Pair(Some(FolStepProof(concatA([pr.steps, [im, mp]]),
+							pr.factRefs, pr.disjs)), false);
+					}
+				}
+			} else {
+				wsteps : ref [FolPStep] = ref [];
+				djr : ref [Pair<string, string>] = ref [];
+				switch (mizEmitWalk(wsteps, djr, x, y, rest)) {
+					None(): acc;
+					Some(w): {
+						sub = mizEmitReduce(hyps, prev, w.second, maxFacts, maxSize, depth + 1, fresh, used);
+						switch (sub.first) {
+							None(): Pair(None(), acc.second || sub.second);
+							Some(pr): {
+								base = length(pr.steps);
+								ws = mizEmitShift(^wsteps, base, 0);
+								sp = FolPStep(goal, "spei",
+									[FolPRefStep(base + w.first), FolPRefStep(base - 1)]);
+								Pair(Some(FolStepProof(concatA([pr.steps, ws, [sp]]),
+									pr.factRefs, uniq(concat(pr.disjs, ^djr)))), false);
+							}
+						}
+					}
+				}
+			}
+		}
+	});
 }
 
 // (A ⊆ B) / (A = B) via its fresh-variable ∀-characterization + mpbir
@@ -653,7 +717,10 @@ mizEmitBridges(forms : [FolForm], acc0 : Tree<string, Pair<FolForm, string>>) ->
 	elems = uniqBy(map(^mems, firstOfPair), \a, b -> mizEmitTKey(a) == mizEmitTKey(b));
 	allSubs = concat(^subs, concatA(map(^eqs, \q -> [q, Pair(q.second, q.first)])));
 	add = \acc, f, lemma -> setTree(acc, mizEmitKey(f), Pair(f, lemma));
-	acc1 = fold(^eqs, acc0, \acc, q -> {
+	// reflexivity per element — identity chains (velsn: x ∈ {x} needs x = x)
+	// are unreachable propositionally without it
+	accR = fold(elems, acc0, \acc, e -> add(acc, FolEq(e, e), "eqid"));
+	acc1 = fold(^eqs, accR, \acc, q -> {
 		eqf = FolEq(q.first, q.second);
 		a1 = add(acc, FolBin("iff", eqf, FolBin("and",
 			mizEmitSs(q.first, q.second), mizEmitSs(q.second, q.first))), "eqss");
