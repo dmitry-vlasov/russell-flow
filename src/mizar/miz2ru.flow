@@ -26,7 +26,11 @@ export {
 	// list (the rule of thumb: whatever the Mizar prover gets as data, we carry too).
 	// Local (label) refs and scheme refs are not included: the former are already the
 	// skeleton's own hyps/steps, the latter are out of scope.
-	MizThm(name : string, ref : string, hyps : [FolForm], steps : [FolForm], stepRefs : [[string]], statement : FolForm, unhandled : [string]);
+	// stepPos: per step, the `<By line col>` position as "line:col" ("" for a step with no
+	// By — nested Proof, scheme). The checker's derivation stamps each record with the SAME
+	// position (<Inference line col>), so this is the join key between a translated open
+	// step and the derivation records that close it.
+	MizThm(name : string, ref : string, hyps : [FolForm], steps : [FolForm], stepRefs : [[string]], stepPos : [string], statement : FolForm, unhandled : [string]);
 	mizArticleTheorems(xmlContent : string, mizSource : string, sig : MizSig, refTable : Tree<string, string>) -> Maybe<[MizThm]>;
 	// (articlenr:nr:kind) -> our assertion name, from the article's .eth environment
 	// (each <Theorem articlenr nr aid kind> row IS the resolution table).
@@ -356,8 +360,8 @@ mizArticleTheorems(xmlContent : string, mizSource : string, sig : MizSig, refTab
 // facts survive translation (Mizar checks one inference against its CITED
 // premises only; dropping local refs forced the checker to consider ALL
 // prior facts and blew the DNF — the 92%% decision-gap census).
-MizWalk(hyps : [FolForm], steps : [FolForm], refs : [[string]], unhandled : [string],
-	labels : Tree<string, string>);
+MizWalk(hyps : [FolForm], steps : [FolForm], refs : [[string]], poss : [string],
+	unhandled : [string], labels : Tree<string, string>);
 
 mizRefTable(ethContent : string) -> Tree<string, string> {
 	switch (mizParseXml(ethContent)) {
@@ -419,12 +423,22 @@ mizByRefsLoc(tbls : Pair<Tree<string, string>, Tree<string, string>>, by : MizXm
 		});
 }
 
-// attach refs to the LAST collected step (a <By> follows its <Proposition>)
-mizAttachRefs(w : MizWalk, rs : [string]) -> MizWalk {
+// attach refs + the By position to the LAST collected step (a <By> follows its
+// <Proposition>). The position attaches even when the By cites nothing (a linked-only
+// `then` step still produces a derivation record at that position).
+mizAttachRefs(w : MizWalk, rs : [string], pos : string) -> MizWalk {
 	n = length(w.refs);
-	if (rs == [] || n == 0) w
+	if (n == 0) w
 	else MizWalk(w.hyps, w.steps,
-		replace(w.refs, n - 1, concat(w.refs[n - 1], rs)), w.unhandled, w.labels);
+		(if (rs == []) w.refs else replace(w.refs, n - 1, concat(w.refs[n - 1], rs))),
+		(if (pos == "") w.poss else replace(w.poss, n - 1, pos)),
+		w.unhandled, w.labels);
+}
+
+// the `<By line col>` position as the derivation join key ("" when absent)
+mizByPos(by : MizXml) -> string {
+	l = mizAttr(by, "line");
+	if (l == "") "" else l + ":" + mizAttr(by, "col");
 }
 
 // One <JustifiedTheorem> -> a MizThm. Direct/no-proof theorem: a single open step proving
@@ -447,11 +461,13 @@ mizThmOfXml(sig : MizSig, lines : [string], aid : string, idx : int, thm : MizXm
 					None(): {
 						// a DIRECT `by`-justified theorem: the By is a kid of the
 						// JustifiedTheorem itself — its refs are the whole premise list
-						drefs = switch (mizFindFirst(thm.kids, "By")) {
+						dby = mizFindFirst(thm.kids, "By");
+						drefs = switch (dby) {
 							Some(by): mizByRefs(tbl, by);
 							None(): [];
 						};
-						Some(MizThm(name, ref, [], [statement], [drefs], statement, []));
+						dpos = switch (dby) { Some(by): mizByPos(by); None(): ""; };
+						Some(MizThm(name, ref, [], [statement], [drefs], [dpos], statement, []));
 					}
 					Some(proof): {
 						w0 = mizWalkProof(sig, proof, tbl);
@@ -464,11 +480,11 @@ mizThmOfXml(sig : MizSig, lines : [string], aid : string, idx : int, thm : MizXm
 								deep = uniq(concatA(map(mizCollectAll(proof.kids, "By"), \by -> mizByRefs(tbl, by))));
 								if (deep == []) w0
 								else MizWalk(w0.hyps, w0.steps,
-									replace(w0.refs, length(w0.refs) - 1, deep), w0.unhandled, w0.labels);
+									replace(w0.refs, length(w0.refs) - 1, deep), w0.poss, w0.unhandled, w0.labels);
 							}
 						if (w.steps == []) Some(MizThm(name, ref, [], [statement],
 							[uniq(concatA(map(mizCollectAll(proof.kids, "By"), \by -> mizByRefs(tbl, by))))],
-							statement, w.unhandled))
+							[""], statement, w.unhandled))
 						else {
 							hyps0  = map(w.hyps, mizResugar);
 							steps0 = map(w.steps, mizResugar);
@@ -481,7 +497,7 @@ mizThmOfXml(sig : MizSig, lines : [string], aid : string, idx : int, thm : MizXm
 							ctr = ref 0;
 							hyps1  = map(hyps0,  \h -> mizFreshenBound(h, avoid, ctr));
 							steps1 = map(steps0, \s -> mizFreshenBound(s, avoid, ctr));
-							Some(MizThm(name, ref, hyps1, steps1, w.refs, statement, w.unhandled));
+							Some(MizThm(name, ref, hyps1, steps1, w.refs, w.poss, statement, w.unhandled));
 						}
 					}
 				}
@@ -492,7 +508,7 @@ mizThmOfXml(sig : MizSig, lines : [string], aid : string, idx : int, thm : MizXm
 // Walk a proof skeleton: `let x:T` / `assume H` -> hypotheses (shared context); each
 // `by`-justified step (Conclusion or labeled Proposition) -> an open proof step.
 mizWalkProof(sig : MizSig, proof : MizXml, tbl : Pair<Tree<string, string>, Tree<string, string>>) -> MizWalk {
-	fold(proof.kids, MizWalk([], [], [], [], makeTree()), \w, item -> mizWalkItem(sig, w, item, tbl));
+	fold(proof.kids, MizWalk([], [], [], [], [], makeTree()), \w, item -> mizWalkItem(sig, w, item, tbl));
 }
 
 mizWalkItem(sig : MizSig, w : MizWalk, item : MizXml, tbl : Pair<Tree<string, string>, Tree<string, string>>) -> MizWalk {
@@ -505,13 +521,13 @@ mizWalkItem(sig : MizSig, w : MizWalk, item : MizXml, tbl : Pair<Tree<string, st
 			// A NON-trivial sort or an adjective (`non empty`) becomes a guard hypothesis.
 			// X still gets declared as a theorem var wherever it actually occurs in the steps.
 			gs = mizTypGuards(sig, [], typ, FolVar("X" + mizAttr(typ, "vid")));
-			MizWalk(concat(w.hyps, gs), w.steps, w.refs, w.unhandled, w.labels);
+			MizWalk(concat(w.hyps, gs), w.steps, w.refs, w.poss, w.unhandled, w.labels);
 		}
 	} else if (tag == "Assume") {
 		hs = filtermap(item.kids, \k -> if (k.tag == "Proposition" && k.kids != []) Some(mizForm(sig, [], k.kids[0])) else None());
 		labs = foldi(filter(item.kids, \k -> k.tag == "Proposition" && k.kids != []), w.labels, \i, a, k ->
 			mizPutLabel(a, k, "hyp" + i2s(length(w.hyps) + i + 1)));
-		MizWalk(concat(w.hyps, hs), w.steps, w.refs, w.unhandled, labs);
+		MizWalk(concat(w.hyps, hs), w.steps, w.refs, w.poss, w.unhandled, labs);
 	} else if (tag == "Given" || tag == "Consider") {
 		// `given x such that P` (the existential HYPOTHESIS of an iff-backward direction) and
 		// `consider x such that P` (∃-elimination): both introduce a witness variable and an
@@ -523,23 +539,23 @@ mizWalkItem(sig : MizSig, w : MizWalk, item : MizXml, tbl : Pair<Tree<string, st
 		gs = concatA(filtermap(item.kids, \k -> if (k.tag == "Typ" && mizAttr(k, "vid") != "") Some(mizTypGuards(sig, [], k, FolVar("X" + mizAttr(k, "vid")))) else None()));
 		labs = foldi(filter(item.kids, \k -> k.tag == "Proposition" && k.kids != []), w.labels, \i, a, k ->
 			mizPutLabel(a, k, "hyp" + i2s(length(w.hyps) + i + 1)));
-		MizWalk(concatA([w.hyps, hs, gs]), w.steps, w.refs, w.unhandled, labs);
+		MizWalk(concatA([w.hyps, hs, gs]), w.steps, w.refs, w.poss, w.unhandled, labs);
 	} else if (tag == "Conclusion") {
 		// a Conclusion carries its <By> as an INNER kid (Proposition + By)
 		w1 = mizAddStep(sig, w, mizFindFirst(item.kids, "Proposition"));
 		switch (mizFindFirst(item.kids, "By")) {
-			Some(by): mizAttachRefs(w1, mizByRefsLoc(tbl, by, w1.labels));
+			Some(by): mizAttachRefs(w1, mizByRefsLoc(tbl, by, w1.labels), mizByPos(by));
 			None(): w1;
 		}
 	} else if (tag == "Proposition") {
 		mizAddStep(sig, w, Some(item));
 	} else if (tag == "By") {
 		// a top-level <By> justifies the PRECEDING sibling <Proposition>
-		mizAttachRefs(w, mizByRefsLoc(tbl, item, w.labels));
+		mizAttachRefs(w, mizByRefsLoc(tbl, item, w.labels), mizByPos(item));
 	} else if (tag == "BlockThesis" || tag == "Thesis" || tag == "EndPosition") {
 		w;
 	} else {
-		MizWalk(w.hyps, w.steps, w.refs, arrayPush(w.unhandled, tag), w.labels);
+		MizWalk(w.hyps, w.steps, w.refs, w.poss, arrayPush(w.unhandled, tag), w.labels);
 	}
 }
 
@@ -548,7 +564,7 @@ mizAddStep(sig : MizSig, w : MizWalk, mprop : Maybe<MizXml>) -> MizWalk {
 		None(): w;
 		Some(prop): if (prop.kids == []) w
 			else MizWalk(w.hyps, arrayPush(w.steps, mizForm(sig, [], prop.kids[0])),
-				arrayPush(w.refs, []), w.unhandled,
+				arrayPush(w.refs, []), arrayPush(w.poss, ""), w.unhandled,
 				mizPutLabel(w.labels, prop, "step" + i2s(length(w.steps) + 1)));
 	}
 }
