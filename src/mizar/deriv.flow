@@ -28,6 +28,16 @@ export {
 	// (detectable by mizFormHasUnhandled / mizTermHasUnhandled)
 	mizDerivForm(sig : MizSig, scope : Tree<int, int>, x : MizXml) -> FolForm;
 	mizDerivTerm(sig : MizSig, scope : Tree<int, int>, x : MizXml) -> FolTerm;
+
+	// The INSTANTIATED FACT of one <Verify> record: the <Instance> formula (the
+	// premise in the checker's renumbered, quantifier-removed form) with the
+	// <With> witness terms substituted for its free variables. This is the
+	// concrete statement the completer must prove and use to close the disjunct.
+	// The numbering join: <FreeVar nr> is 1-based, <Assign var> 0-based (the
+	// checker keys its substitution by varNr - 1, mizUniEqClassAndFreeVar), so
+	// Assign var=V binds XF(V+1). None when anything fails to translate, an
+	// assign is missing (a free variable survives), or there is no <Instance>.
+	mizDerivFact(sig : MizSig, scope : Tree<int, int>, v : MizXml) -> Maybe<FolForm>;
 }
 
 mizConstScope(thmXml : MizXml) -> Tree<int, int> {
@@ -52,6 +62,97 @@ mizDerivForm(sig : MizSig, scope : Tree<int, int>, x : MizXml) -> FolForm {
 
 mizDerivTerm(sig : MizSig, scope : Tree<int, int>, x : MizXml) -> FolTerm {
 	mizTerm(sig, [], mizDerivPatch(scope, x));
+}
+
+mizDerivFact(sig : MizSig, scope : Tree<int, int>, v : MizXml) -> Maybe<FolForm> {
+	insts = mizKidsTagged(v, "Instance");
+	withs = mizKidsTagged(v, "With");
+	if (insts == [] || insts[0].kids == []) None()
+	else {
+		inst = mizDerivForm(sig, scope, insts[0].kids[0]);
+		if (mizFormHasUnhandled(inst)) None()
+		else {
+			// no <With> = contradictory as normalized: the instance IS the fact
+			sub = fold(if (withs == []) [] else mizKidsTagged(withs[0], "Assign"),
+				Some(makeTree()), \acc : Maybe<Tree<string, FolTerm>>, a -> switch (acc) {
+					None(): None();
+					Some(s): if (a.kids == []) None() else {
+						t = mizDerivTerm(sig, scope, a.kids[0]);
+						if (mizTermHasUnhandled(t)) None()
+						else Some(setTree(s, "XF" + i2s(s2i(mizAttr(a, "var")) + 1), t));
+					}
+				});
+			switch (sub) {
+				None(): None();
+				Some(s): {
+					fact = mizDerivSubstForm(inst, s);
+					// a variable the contradiction never constrained stays free —
+					// the checker did not need a value for it. The sound fact keeps
+					// it UNIVERSAL under its type guard (<FreeVarType>); without the
+					// guard the closure would claim too much.
+					surviving = uniq(filter(mizFormAllVars(fact), \n -> startsWith(n, "XF")));
+					if (surviving == []) Some(fact)
+					else mizDerivCloseFree(sig, scope, v, s, surviving, fact);
+				}
+			}
+		}
+	}
+}
+
+// Close each surviving free variable universally under its recorded type guard:
+// fact := ∀x (guard(x) → fact). The guard comes from the record's <FreeVarType>
+// (translated through the same patch + substitution as everything else). None
+// when a type is missing, fails to translate, or itself mentions another still-
+// unbound variable (a dependent type across surviving vars — out of scope here).
+mizDerivCloseFree(sig : MizSig, scope : Tree<int, int>, v : MizXml,
+	s : Tree<string, FolTerm>, surviving : [string], fact : FolForm) -> Maybe<FolForm> {
+	typs = fold(mizKidsTagged(v, "FreeVarType"), makeTree(), \acc, ft ->
+		if (ft.kids == []) acc else setTree(acc, "XF" + mizAttr(ft, "nr"), ft.kids[0]));
+	fold(surviving, Some(fact), \acc : Maybe<FolForm>, x -> switch (acc) {
+		None(): None();
+		Some(body): switch (lookupTree(typs, x)) {
+			None(): None();
+			Some(typXml): {
+				gs = map(mizTypGuards(sig, [], mizDerivPatch(scope, typXml), FolVar(x)),
+					\g -> mizDerivSubstForm(g, s));
+				bad = exists(gs, \g -> mizFormHasUnhandled(g)
+					|| exists(mizFormAllVars(g), \n -> startsWith(n, "XF") && n != x));
+				if (bad) None()
+				else Some(FolQuant("forall", [x],
+					if (gs == []) body
+					else FolBin("imp", mizDerivFoldAnd(gs), body)));
+			}
+		}
+	});
+}
+
+mizDerivFoldAnd(fs : [FolForm]) -> FolForm {
+	if (fs == []) FolPred("$true", [])
+	else if (length(fs) == 1) fs[0]
+	else FolBin("and", fs[0], mizDerivFoldAnd(tail(fs)));
+}
+
+// Substitute terms for free variables by name. The witness terms are ground
+// surface terms (constants and functors over them), so no capture can occur;
+// an inner binder of the same name (impossible in the XF namespace) would
+// shadow — handled for safety anyway.
+mizDerivSubstForm(f : FolForm, s : Tree<string, FolTerm>) -> FolForm {
+	switch (f) {
+		FolPred(n, args):  FolPred(n, map(args, \t -> mizDerivSubstTerm(t, s)));
+		FolEq(l, r):       FolEq(mizDerivSubstTerm(l, s), mizDerivSubstTerm(r, s));
+		FolNeg(g):         FolNeg(mizDerivSubstForm(g, s));
+		FolBin(op, l, r):  FolBin(op, mizDerivSubstForm(l, s), mizDerivSubstForm(r, s));
+		FolQuant(op, vs, body):
+			FolQuant(op, vs, mizDerivSubstForm(body, fold(vs, s, \acc, x -> removeFromTree(acc, x))));
+	}
+}
+
+mizDerivSubstTerm(t : FolTerm, s : Tree<string, FolTerm>) -> FolTerm {
+	switch (t) {
+		FolVar(n): lookupTreeDef(s, n, t);
+		FolAbs(x, body): FolAbs(x, mizDerivSubstForm(body, removeFromTree(s, x)));
+		FolApp(n, args): FolApp(n, map(args, \a -> mizDerivSubstTerm(a, s)));
+	}
 }
 
 // Rewrite each <Const nr vid="0"> to its scope vid, so the shared mizForm/mizTerm
