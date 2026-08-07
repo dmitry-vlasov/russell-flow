@@ -2,6 +2,7 @@ import comm;
 import base/env;
 import base/fileinfo;
 import mizar/miz2ru;
+import mizar/deriv;
 import mizar/atr;
 import mizar/notation;
 import mizar/xml;
@@ -77,9 +78,20 @@ ruRunMizarDerivation(unit : RuUnit) -> Maybe<RuState> {
 						// equals the step's <By line col>, so this joins each derivation
 						// record to the open step it closes (the completer's input pairing)
 						tsrc = mizMakeMmlSrc(unit);
+						dsig = mizReadSig(tsrc, article);
 						thms = either(mizArticleTheorems(mizFile(tsrc, article, "xml"),
-							mizFile(tsrc, article, "miz"), mizReadSig(tsrc, article),
+							mizFile(tsrc, article, "miz"), dsig,
 							mizRefTable(mizEth(tsrc, article))), []);
+						// By position -> the owning theorem's Const scope (nr -> vid):
+						// the evidence bridge recovers the record constants' identities
+						// from the theorem's own analyzed-XML subtree
+						posScope = switch (mizParseXml(mizFile(tsrc, article, "xml"))) {
+							None(): makeTree();
+							Some(ax): fold(mizCollectAll([ax], "JustifiedTheorem"), makeTree(), \acc, t -> {
+								sc = mizConstScope(t);
+								fold(mizByPositions(t), acc, \ac, p -> setTree(ac, p, sc));
+							});
+						};
 						stepPoss = fold(thms, makeSet(), \acc, t ->
 							fold(t.stepPos, acc, \ac, p -> if (p == "") ac else insertSet(ac, p)));
 						nSteps = fold(thms, 0, \acc, t -> acc + length(t.steps));
@@ -87,6 +99,16 @@ ruRunMizarDerivation(unit : RuUnit) -> Maybe<RuState> {
 							acc + length(filter(t.stepPos, \p -> p != "")));
 						matched = ref 0;
 						pureMatched = ref 0;
+						// evidence bridge counters, over the JOINED pure-verify records
+						nRec = ref 0;        // Verify records seen
+						nPremOk = ref 0;     // premise translates with no unhandled marker
+						nWitOk = ref 0;      // every witness term translates clean
+						nFullOk = ref 0;     // both — the record is completer-ready
+						nEvComplete = ref 0; // inferences with EVERY disjunct completer-ready
+						// per-assign failure split: what blocks a witness term
+						nAsg = ref 0;
+						nAsgEq = ref 0;      // references an equalizer class (EqClass/It)
+						nAsgConst = ref 0;   // a constant the theorem scope cannot map
 						// per disjunct the closing family; per inference whether
 						// EVERY disjunct is closed by the Verify family with a
 						// witness — the first completer family's addressable set
@@ -114,9 +136,44 @@ ruRunMizarDerivation(unit : RuUnit) -> Maybe<RuState> {
 							if (pure) pureVerify := ^pureVerify + 1;
 							if (ds != [] && forall(fams, \f -> ok(f) || f == "equalizer"))
 								verifyOrEq := ^verifyOrEq + 1;
-							isM = containsSet(stepPoss, mizAttr(inf, "line") + ":" + mizAttr(inf, "col"));
+							pos = mizAttr(inf, "line") + ":" + mizAttr(inf, "col");
+							isM = containsSet(stepPoss, pos);
 							if (isM) matched := ^matched + 1;
 							if (isM && pure) pureMatched := ^pureMatched + 1;
+							// the evidence bridge, on the completer's current input set:
+							// joined + pure-verify. A disjunct is completer-ready when its
+							// Verify record translates fully into the article dialect.
+							if (isM && pure) {
+								scope = lookupTreeDef(posScope, pos, makeTree());
+								dsOk = map(ds, \d -> {
+									vs = mizKidsTagged(d, "Verify");
+									oks = map(vs, \v -> {
+										nRec := ^nRec + 1;
+										pk = mizFindDef(v, "Premise").kids;
+										premOk = pk != [] &&
+											!mizFormHasUnhandled(mizDerivForm(dsig, scope, pk[0]));
+										// no <With> = contradictory as normalized: no witnesses needed
+										witOk = forall(map(mizKidsTagged(v, "With"), \wt ->
+											forall(map(mizKidsTagged(wt, "Assign"), \a -> {
+												nAsg := ^nAsg + 1;
+												hasEq = mizCollectAll(a.kids, "EqClass") != []
+													|| mizCollectAll(a.kids, "It") != [];
+												asgOk = a.kids != [] &&
+													!mizTermHasUnhandled(mizDerivTerm(dsig, scope, a.kids[0]));
+												if (hasEq) nAsgEq := ^nAsgEq + 1
+												else if (!asgOk) nAsgConst := ^nAsgConst + 1;
+												asgOk;
+											}), idfn)), idfn);
+										if (premOk) nPremOk := ^nPremOk + 1;
+										if (witOk) nWitOk := ^nWitOk + 1;
+										if (premOk && witOk) nFullOk := ^nFullOk + 1;
+										premOk && witOk;
+									});
+									exists(oks, \o -> o);
+								});
+								if (ds != [] && forall(dsOk, \o -> o))
+									nEvComplete := ^nEvComplete + 1;
+							}
 						});
 						env.out.println("mizar-derivation: " + article + " = "
 							+ i2s(length(infs)) + " inferences, " + i2s(^nDisj) + " disjuncts");
@@ -132,6 +189,15 @@ ruRunMizarDerivation(unit : RuUnit) -> Maybe<RuState> {
 							+ i2s(^matched) + " / " + i2s(length(infs)));
 						env.out.println("  pure-verify inferences joined (completer-addressable now): "
 							+ i2s(^pureMatched) + " / " + i2s(^pureVerify));
+						env.out.println("  evidence bridge over the joined set: "
+							+ i2s(^nRec) + " records, premise clean " + i2s(^nPremOk)
+							+ ", witnesses clean " + i2s(^nWitOk)
+							+ ", completer-ready " + i2s(^nFullOk));
+						env.out.println("  evidence-complete inferences (every disjunct ready): "
+							+ i2s(^nEvComplete) + " / " + i2s(^pureMatched));
+						env.out.println("  witness terms: " + i2s(^nAsg)
+							+ ", blocked by equalizer class refs " + i2s(^nAsgEq)
+							+ ", by unmapped constants " + i2s(^nAsgConst));
 						Some(unit.state);
 					}
 				}
