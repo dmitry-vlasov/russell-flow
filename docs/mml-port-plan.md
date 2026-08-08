@@ -81,8 +81,8 @@ choice are rounding error.
 - Checker derivation record (merge log, equality provenance, match
   provenance, class table, resolution): **done**, offline validator replays
   **93%** of refutations with no prover.
-- Deterministic by-step emitter (`mizar-to-ru emit=1`): closes 130/240 steps
-  on xboole_1, 93/288 on zfmisc_1, 28/128 on subset_1; 33 / 10 / 2 theorems
+- Deterministic by-step emitter (`mizar-to-ru emit=1`): closes 130/241 steps
+  on xboole_1, 91/289 on zfmisc_1, 27/130 on subset_1; 33 / 10 / 2 theorems
   fully proved, all verified by the original Metamath checker. It now proves
   and uses the checker's recorded premises (S-B, witness half).
 - Translation: all 300 articles of the dependency order translate and parse
@@ -239,6 +239,28 @@ measurement must do the same.
 *Found*: 95% of articles transitively declare everything, because environments
 are unions over whole articles. Stratification only exists at theorem level.
 *Consequence*: layers are defined per theorem statement, not per article.
+
+### 2026-08-08 — I measured from articles Russell had already REJECTED
+*Expected*: that the emitted articles verify, since `translate` runs `verify`
+and prints its verdict.
+*Found*: it prints and carries on. The article is written whatever the verdict,
+so a rejected article went to disk, through the Metamath gate, and into the
+numbers. Three xboole_1 theorems and two of zfmisc_1's did not verify, and the
+by-step counts reported for them were worthless. The Metamath gate did not
+catch it either: an unverifiable proof can still export to something the
+checker accepts, or the theorem is exported as an assumed axiom.
+*Cause of the bad proofs*: a citation must state what the cited assertion
+actually says, and the emitted shape varies — an env theorem/definition/
+registration is an AXIOM over the ∀-closed statement (an instance needs the
+prefix eliminated), while a THEOREM's proposition is whatever its skeleton left
+(∀-closed for a direct `by`, the open matrix after a `let`) and is instantiated
+by Russell when a step names it. Also, spcgv is disjointed(A x, ps x) and only
+the witness's variables were being declared, never the instance's.
+*Consequence*: `translate.rus` now ASSERTS on the verdict — open `?` steps stay
+allowed, a false verdict stops everything. THE ORDER IS: Russell verifies
+first, the Metamath checker judges second. Any measurement taken without the
+first is not a measurement. Corrected figures: 130/241, 91/289, 27/130
+by-steps and 33/116, 10/140, 2/53 theorems on xboole_1/zfmisc_1/subset_1.
 
 ### 2026-08-08 — an EXPORT defect blocks the next 5 theorems (open)
 *Expected*: proving a biconditional goal as its two implications would be a
