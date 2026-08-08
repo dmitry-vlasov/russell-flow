@@ -420,25 +420,83 @@ mizDerivFact(sig : MizSig, scope : Tree<int, int>, v : MizXml) -> Maybe<MizDeriv
 	}
 }
 
-// ∀-eliminate the premise's prefix outermost-first: binder k takes Assign
-// var=k. The translator emits one FolQuant per Mizar binder, its guard as an
-// implication antecedent INSIDE the quantifier body — instantiation keeps the
-// guard, exactly as ∀-elim does. Substitution is capture-free: witnesses are
-// ground article terms. Stopping cases per the export comment.
+// ∀-eliminate the premise at the recorded witnesses. Binder k takes Assign
+// var=k, and THE ORDER OF k IS MIZAR'S, not the leading prefix's: the checker
+// numbers a premise's free variables in RemoveExtQuantifier /
+// RemoveIntQuantifier order (unifier.pas, ported at
+// mizar/original/unifier.flow:2069), which frees a universal binder wherever it
+// stands in POSITIVE position — under a negation, in an implication's
+// consequent, inside a conjunct — and never in negative position. Walking only
+// the leading prefix stopped at the first connective and rejected the record:
+// `witness/inner-quantifier` was 150 of 264 records on xboole_1, by far the
+// largest reason the instantiated fact could not be computed.
+//
+// Mizar has only ¬ and ∧, so its two mutually recursive routines read on our
+// dialect as: positive (Ext) descends ¬ into negative, both sides of ∨, an
+// implication's CONSEQUENT and every conjunct; negative (Int) is the dual and
+// frees nothing. `iff` is left alone — it is positive and negative at once, so
+// no binder under it may be freed.
+//
+// The translator emits one FolQuant per Mizar binder with its guard as an
+// implication antecedent inside the body, so instantiation keeps the guard,
+// exactly as ∀-elim does. Substitution is capture-free: witnesses are ground
+// article terms. An assign that is never consumed still rejects the record.
 mizDerivElim(f : FolForm, asg : Tree<int, FolTerm>, k : int) -> Maybe<MizDerivFact> {
-	stop = \ -> if (exists(getTreeKeys(asg), \kk -> kk >= k)) None()
-		else Some(MizDerivFact(f, !existsQuantPrefix(f)));
+	r = mizDerivElimPos(f, asg, k);
+	if (exists(getTreeKeys(asg), \kk -> kk >= r.second)) None()
+	else Some(MizDerivFact(r.first, !existsQuantPrefix(r.first)));
+}
+
+// (instance, next binder index) in POSITIVE position — RemoveExtQuantifier
+mizDerivElimPos(f : FolForm, asg : Tree<int, FolTerm>, k : int) -> Pair<FolForm, int> {
 	switch (f) {
 		FolQuant(q, vs, body):
-			if (q != "forall" || vs == []) stop()
+			if (q != "forall" || vs == []) Pair(f, k)
 			else switch (lookupTree(asg, k)) {
-				None(): stop();
+				None(): Pair(f, k);
 				Some(t): {
 					rest = if (length(vs) == 1) body else FolQuant(q, tail(vs), body);
-					mizDerivElim(mizDerivSubstForm(rest, makeTree1(vs[0], t)), asg, k + 1);
+					mizDerivElimPos(mizDerivSubstForm(rest, makeTree1(vs[0], t)), asg, k + 1);
 				}
 			}
-		default: stop();
+		FolNeg(g): {
+			r = mizDerivElimNeg(g, asg, k);
+			Pair(FolNeg(r.first), r.second);
+		}
+		FolBin(op, l, r):
+			if (op == "imp") {
+				// ¬(l ∧ ¬r): the antecedent is negative, the consequent positive
+				a = mizDerivElimNeg(l, asg, k);
+				b = mizDerivElimPos(r, asg, a.second);
+				Pair(FolBin(op, a.first, b.first), b.second);
+			} else if (op == "and" || op == "or") {
+				a = mizDerivElimPos(l, asg, k);
+				b = mizDerivElimPos(r, asg, a.second);
+				Pair(FolBin(op, a.first, b.first), b.second);
+			} else Pair(f, k);
+		default: Pair(f, k);
+	}
+}
+
+// NEGATIVE position — RemoveIntQuantifier: a universal binder here is an
+// existential one in the refutation and stays bound
+mizDerivElimNeg(f : FolForm, asg : Tree<int, FolTerm>, k : int) -> Pair<FolForm, int> {
+	switch (f) {
+		FolNeg(g): {
+			r = mizDerivElimPos(g, asg, k);
+			Pair(FolNeg(r.first), r.second);
+		}
+		FolBin(op, l, r):
+			if (op == "imp") {
+				a = mizDerivElimPos(l, asg, k);
+				b = mizDerivElimNeg(r, asg, a.second);
+				Pair(FolBin(op, a.first, b.first), b.second);
+			} else if (op == "and" || op == "or") {
+				a = mizDerivElimNeg(l, asg, k);
+				b = mizDerivElimNeg(r, asg, a.second);
+				Pair(FolBin(op, a.first, b.first), b.second);
+			} else Pair(f, k);
+		default: Pair(f, k);
 	}
 }
 
