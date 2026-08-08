@@ -119,6 +119,13 @@ central claim is therefore untested.
 from the disjuncts, kills from `<Cand>`/basis.
 *Gate*: by-steps closed on xboole_1/zfmisc_1 from the record, against the
 current catalog-driven numbers; and the catalog must shrink, not grow.
+*State (2026-08-08)*: the WITNESS half is done — the record is joined to the
+proof by matching each recorded instance against the statements the step could
+cite (and, for the premises Mizar uses with no citation at all, against every
+environment statement with the same skeleton), and the instance is proved by
+term-instantiation + sethood + term congruence. Closures barely moved, but the
+record was measured to REPLACE the catalog's instance machinery — see the
+findings log. The case split and the kill list are still untouched.
 
 ### S-C — the type layer (unlocks ~35%)
 *Machinery*: the analyzer's type and attribute computation — mode assignment,
@@ -228,6 +235,41 @@ measurement must do the same.
 *Found*: 95% of articles transitively declare everything, because environments
 are unions over whole articles. Stratification only exists at theorem level.
 *Consequence*: layers are defined per theorem statement, not per article.
+
+### 2026-08-08 — S-B: the recorded premises do not move the by-step count
+*Expected*: the campaign's central claim — that consuming the checker's record
+instead of re-deriving each step raises the number of by-steps closed.
+*Found*: after making the record usable (the binder-order fix below took
+fact-complete inferences from 53 to 119 on xboole_1) and teaching the emitter to
+PROVE a recorded instance from its premise, the closures moved
+128 → 130 / 85 → 86 / 16 → 16 on xboole_1 / zfmisc_1 / subset_1. The recorded
+premises are largely facts the unfold ladder already had, and each extra fact
+also eats the certificate budget.
+*But*: with the catalog's own instance machinery switched OFF and only the
+record's facts offered, the counts were 129 / 86 / 16 — the record REPRODUCES
+what `mizEmitChars` + `mizEmitDerive` derive, within one closure, at a lower
+budget cost (skipped-over-budget fell 8 → 4 and 47 → 39). That is the S-B gate
+read the other way: the claim to test is not "the record closes more" but "the
+record lets the catalog shrink", and that one holds.
+*Consequence*: the remaining record content — the case split and the kill list
+— is what is still untested. Raising the certificate budget is not the way:
+maxFacts 24 did not terminate, as the earlier cost-bomb finding predicted.
+
+### 2026-08-08 — what it costs to USE a Mizar witness
+*Expected*: feeding recorded witnesses to the emitter would be plumbing.
+*Found*: three pieces of proof machinery were missing, none of them
+article-specific. Instantiating at a TERM (Mizar's witnesses are terms, the
+ladder could only instantiate at a variable) needs `spcgv`, which needs the
+witness's SETHOOD — proved bottom-up from `vex`, the foundation's own lemmas for
+reused functors, or the article's `sh_<f>` axiom — and congruence INSIDE a term,
+without which `∀A∀B (A ⊆ A ∪ B)` cannot be instantiated at all, since
+substituting A must reach into `A ∪ B`.
+Two shapes produced proofs Russell accepted and the Metamath checker rejected:
+instantiating a binder at ITSELF (spcgv's disjoint-variable condition forbids
+it) and `spi`, whose binder occurs only in its hypothesis so the export cannot
+determine it. Both now go through the implication form `sp` + ax-mp.
+*Consequence*: the Metamath gate is what catches an unsound emission; Russell's
+own verify does not. Keep it on every emitter change.
 
 ### 2026-08-08 — S-A gate: 300 / 300 articles translate and parse
 *Expected*: about half the theorems lost to naming collisions, per the earlier
