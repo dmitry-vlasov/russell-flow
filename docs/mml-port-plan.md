@@ -81,8 +81,8 @@ choice are rounding error.
 - Checker derivation record (merge log, equality provenance, match
   provenance, class table, resolution): **done**, offline validator replays
   **93%** of refutations with no prover.
-- Deterministic by-step emitter (`mizar-to-ru emit=1`): closes 130/241 steps
-  on xboole_1, 86/288 on zfmisc_1, 16/129 on subset_1; 33 / 10 / 2 theorems
+- Deterministic by-step emitter (`mizar-to-ru emit=1`): closes 130/240 steps
+  on xboole_1, 93/288 on zfmisc_1, 28/128 on subset_1; 33 / 10 / 2 theorems
   fully proved, all verified by the original Metamath checker. It now proves
   and uses the checker's recorded premises (S-B, witness half).
 - Translation: all 300 articles of the dependency order translate and parse
@@ -239,6 +239,27 @@ measurement must do the same.
 *Found*: 95% of articles transitively declare everything, because environments
 are unions over whole articles. Stratification only exists at theorem level.
 *Consequence*: layers are defined per theorem statement, not per article.
+
+### 2026-08-08 — S-B, second pass: the join was the bottleneck, not the record
+*Expected*: after the first pass, that the record simply had little to add.
+*Found*: it had plenty; the emitter could not reach it. Three fixes, each
+measured on its own:
+  * a premise is often used as a PIECE — the checker splits a definitional
+    biconditional and takes a conjunct — so the pieces are offered as match
+    candidates (biimpi/biimpri/simpl/simpr, each one Hilbert step away);
+  * statements must be INDEXED under every piece too, not just under
+    themselves: subset_1's meaning of `Element of` is the first conjunct of
+    d1_subset_1, never the whole of it;
+  * the congruence walk knew only the foundation's ∈ and ⊆, so any premise
+    about an article predicate could be matched but never eliminated — the
+    translator already emits `pr_<p>_cong<k>d` per slot, which the walk now
+    chains with bitrd exactly as the term walk chains eqtrd.
+*Result*: recorded premises proved 28 / 61 / 48 of 132 / 169 / 77, by-steps
+closed 130 / 93 / 28 (from 128 / 85 / 16). subset_1 — the S-C gate article —
+went from 16 to 28 by-steps, and zfmisc_1 from 85 to 93.
+*Consequence*: the record pays off in proportion to how well it is joined to
+the article's own statements. What remains unreachable needs TWO premises
+composed (a type plus a definition), which is where S-C's record comes in.
 
 ### 2026-08-08 — S-B: the recorded premises do not move the by-step count
 *Expected*: the campaign's central claim — that consuming the checker's record
