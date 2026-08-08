@@ -26,7 +26,10 @@ export {
 	// instead of a search.
 	mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 		recOf : (string) -> [FolForm], stmtOf : (string) -> Maybe<FolForm>,
+		bySkeleton : (string) -> [string],
 		shOf : (string) -> string) -> Pair<[Maybe<FolStepProof>], MizEmitCounts>;
+	// the index key: instantiation preserves it exactly
+	mizEmitSkeleton(f : FolForm) -> string;
 	// how many recorded facts were emitted as derived facts (a run counter, for
 	// the census line)
 	mizEmitRecUsed() -> int;
@@ -47,13 +50,17 @@ mizEmitRecReset() -> void {
 
 mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 	recOf : (string) -> [FolForm], stmtOf : (string) -> Maybe<FolForm>,
+	bySkeleton : (string) -> [string],
 	shOf : (string) -> string) -> Pair<[Maybe<FolStepProof>], MizEmitCounts> {
 	res = foldi(t.steps, Pair([], MizEmitCounts(0, 0, 0)), \i, acc : Pair<[Maybe<FolStepProof>], MizEmitCounts>, goal -> {
 		pos = if (i < length(t.stepPos)) t.stepPos[i] else "";
 		recs = if (pos == "") [] else recOf(pos);
 		cites = if (i < length(t.stepRefs)) t.stepRefs[i] else [];
 		drvs = filtermap(recs, \fact -> {
-			d = mizEmitRecFromCites(cites, fact, stmtOf, shOf);
+			// the step's own citations first, then any environment statement with
+			// the same skeleton (the premise Mizar used without citing it)
+			cands = concat(cites, bySkeleton(mizEmitSkeleton(fact)));
+			d = mizEmitRecFromCites(cands, fact, stmtOf, shOf);
 			if (isSome(d)) mizEmitRecCount := ^mizEmitRecCount + 1;
 			d;
 		});
@@ -1025,19 +1032,20 @@ mizEmitElimAt(steps : ref [FolPStep], dj : ref [Pair<string, string>],
 // fact, emitted as a derived fact proved from it.
 mizEmitRecFromCites(cites : [string], fact : FolForm,
 	stmtOf : (string) -> Maybe<FolForm>, shOf : (string) -> string) -> Maybe<MizEmitDrv> {
+	// per FACT, where the join stops: no citation statement / no citation
+	// instantiates to it / the elimination cannot be emitted
+	if (exists(cites, \c -> isSome(stmtOf(c)))) mizEmitRecCites := ^mizEmitRecCites + 1;
+	if (exists(cites, \c -> switch (stmtOf(c)) {
+		None(): false;
+		Some(st): isSome(mizEmitMatchInst(st, fact));
+	})) mizEmitRecMatch := ^mizEmitRecMatch + 1;
 	fold(cites, None(), \acc : Maybe<MizEmitDrv>, c -> switch (acc) {
 		Some(__): acc;
 		None(): switch (stmtOf(c)) {
 			None(): None();
-			Some(st): {
-				mizEmitRecCites := ^mizEmitRecCites + 1;
-				switch (mizEmitMatchInst(st, fact)) {
-					None(): None();
-					Some(ws): {
-						mizEmitRecMatch := ^mizEmitRecMatch + 1;
-						mizEmitRecordDrv(c, st, ws, shOf);
-					}
-				}
+			Some(st): switch (mizEmitMatchInst(st, fact)) {
+				None(): None();
+				Some(ws): mizEmitRecordDrv(c, st, ws, shOf);
 			}
 		}
 	});
@@ -1250,5 +1258,24 @@ mizEmitWalkTerm(steps : ref [FolPStep], x : string, t : FolTerm,
 					}
 				});
 		}
+	}
+}
+
+// The SKELETON of a statement: its connective/predicate structure with all
+// terms erased, ignoring the universal prefix. Instantiation cannot change it,
+// so two statements can only stand in the instance relation when their
+// skeletons are equal — which makes it an exact index for finding the premise a
+// recorded fact came from when the step cites nothing (Mizar applies
+// definitional expansions and requirements with no `by` reference at all, and
+// those were most of the record: 91 of 132 facts on xboole_1 had no citation
+// whose statement could be resolved).
+mizEmitSkeleton(f : FolForm) -> string {
+	switch (f) {
+		FolQuant(q, vs, b): if (q == "forall") mizEmitSkeleton(b)
+			else "E" + i2s(length(vs)) + "(" + mizEmitSkeleton(b) + ")";
+		FolPred(n, args): "P" + n + "/" + i2s(length(args));
+		FolEq(__, __): "=";
+		FolNeg(g): "~(" + mizEmitSkeleton(g) + ")";
+		FolBin(op, l, r): op + "(" + mizEmitSkeleton(l) + "," + mizEmitSkeleton(r) + ")";
 	}
 }
