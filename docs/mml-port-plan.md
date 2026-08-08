@@ -81,9 +81,13 @@ choice are rounding error.
 - Checker derivation record (merge log, equality provenance, match
   provenance, class table, resolution): **done**, offline validator replays
   **93%** of refutations with no prover.
-- Deterministic by-step emitter (`mizar-to-ru emit=1`): closes 128/242 steps
-  on xboole_1, 85/291 on zfmisc_1, 16/130 on subset_1; 33 / 10 / 2 theorems
-  fully proved, all verified by the original Metamath checker.
+- Deterministic by-step emitter (`mizar-to-ru emit=1`): closes 130/241 steps
+  on xboole_1, 86/288 on zfmisc_1, 16/129 on subset_1; 33 / 10 / 2 theorems
+  fully proved, all verified by the original Metamath checker. It now proves
+  and uses the checker's recorded premises (S-B, witness half).
+- Translation: all 300 articles of the dependency order translate and parse
+  (S-A). 3,422 of their 10,469 theorems are still dropped as unrenderable —
+  3,308 numerals, 119 choice terms, 22 flexary formulas.
 - Best result ever, by the (now retired) tactic prover: 344 theorems.
 - **Coverage of the library: about 0.5%, all of it inside the 1.2% band.**
 
