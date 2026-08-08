@@ -81,8 +81,8 @@ choice are rounding error.
 - Checker derivation record (merge log, equality provenance, match
   provenance, class table, resolution): **done**, offline validator replays
   **93%** of refutations with no prover.
-- Deterministic by-step emitter (`mizar-to-ru emit=1`): closes 136/241 steps
-  on xboole_1, 94/289 on zfmisc_1, 27/130 on subset_1; 38 / 11 / 2 theorems
+- Deterministic by-step emitter (`mizar-to-ru emit=1`): closes 155/241 steps
+  on xboole_1, 97/290 on zfmisc_1, 27/130 on subset_1; 48 / 11 / 2 theorems
   fully proved, all verified by the original Metamath checker. It now proves
   and uses the checker's recorded premises (S-B, witness half).
 - Translation: all 300 articles of the dependency order translate and parse
@@ -261,6 +261,24 @@ allowed, a false verdict stops everything. THE ORDER IS: Russell verifies
 first, the Metamath checker judges second. Any measurement taken without the
 first is not a measurement. Corrected figures: 130/241, 91/289, 27/130
 by-steps and 33/116, 10/140, 2/53 theorems on xboole_1/zfmisc_1/subset_1.
+
+### 2026-08-09 — the equality family wanted a SMALLER PROOF, not more facts
+*Expected*: the theorems that are one step short are short of premises.
+*Found*: the certificate never said which limit it hit. Made to say so, it
+reports that the ∀-matrix of `x5 ∩ (x7 ∖ x9) = (x5 ∩ x7) ∖ x9` IS decided from
+its four unfolds and then runs past 600 emitted steps. Across the three
+articles, 48 / 27 / 13 failed steps were provable and rejected only for length.
+The cost is driven by the number of BICONDITIONAL FACTS — each doubles the
+tableau — not by the three atoms underneath.
+*Consequence*: membership between compound terms is now REWRITTEN rather than
+decided. Each side goes to a normal form over `v ∈ <variable>` atoms by
+chaining the foundation's own elun/elin/eldif through orbi12i/anbi12i/notbii
+and bitri, leaving the certificate a propositional residue with no
+biconditional facts. xboole_1 136 → 155 steps and 38 → 48 theorems, zfmisc_1
+94 → 97 and 11, all Metamath-gated (48 / 11 / 2).
+*Open, with a measured price*: imported theorems are still not citable — their
+emitted shape is decided in their own article — and that costs relat_1 about 11
+by-steps (93 → 82). It is the next thing to fix.
 
 ### 2026-08-08 — a proof-only variable was exported as MANDATORY
 *Expected*: after proving an iff goal as its two implications closed five more
