@@ -18,12 +18,46 @@ export {
 	MizEmitCounts(attempted : int, closed : int, skipped : int);
 	// per original step: a closed deterministic proof, or None (stays open).
 	// maxFacts / maxSize bound the certificate attempt (skipped = over budget).
-	mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int) -> Pair<[Maybe<FolStepProof>], MizEmitCounts>;
+	// `recOf(pos)` gives the checker's RECORDED instantiated premises for the
+	// by-step at that position; `stmtOf(name)` the statement of a cited
+	// assertion. Each recorded instance is matched against the step's citations
+	// and, where one instantiates to it, enters the ladder as a derived fact
+	// PROVED from that citation — Mizar's own choice of premise and witness
+	// instead of a search.
+	mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
+		recOf : (string) -> [FolForm], stmtOf : (string) -> Maybe<FolForm>,
+		shOf : (string) -> string) -> Pair<[Maybe<FolStepProof>], MizEmitCounts>;
+	// how many recorded facts were emitted as derived facts (a run counter, for
+	// the census line)
+	mizEmitRecUsed() -> int;
+	mizEmitRecReset() -> void;
+	// (citations resolved to a statement, instances matched to one) — the two
+	// places the record-to-citation join can fail
+	mizEmitRecDiag() -> Pair<int, int>;
 }
 
-mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int) -> Pair<[Maybe<FolStepProof>], MizEmitCounts> {
+mizEmitRecCount : ref int = ref 0;
+mizEmitRecCites : ref int = ref 0;
+mizEmitRecMatch : ref int = ref 0;
+mizEmitRecDiag() -> Pair<int, int> { Pair(^mizEmitRecCites, ^mizEmitRecMatch); }
+mizEmitRecUsed() -> int { ^mizEmitRecCount; }
+mizEmitRecReset() -> void {
+	mizEmitRecCount := 0; mizEmitRecCites := 0; mizEmitRecMatch := 0;
+}
+
+mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
+	recOf : (string) -> [FolForm], stmtOf : (string) -> Maybe<FolForm>,
+	shOf : (string) -> string) -> Pair<[Maybe<FolStepProof>], MizEmitCounts> {
 	res = foldi(t.steps, Pair([], MizEmitCounts(0, 0, 0)), \i, acc : Pair<[Maybe<FolStepProof>], MizEmitCounts>, goal -> {
-		r = mizEmitStepProof(t.hyps, subrange(t.steps, 0, i), goal, maxFacts, maxSize);
+		pos = if (i < length(t.stepPos)) t.stepPos[i] else "";
+		recs = if (pos == "") [] else recOf(pos);
+		cites = if (i < length(t.stepRefs)) t.stepRefs[i] else [];
+		drvs = filtermap(recs, \fact -> {
+			d = mizEmitRecFromCites(cites, fact, stmtOf, shOf);
+			if (isSome(d)) mizEmitRecCount := ^mizEmitRecCount + 1;
+			d;
+		});
+		r = mizEmitStepProof(t.hyps, subrange(t.steps, 0, i), goal, maxFacts, maxSize, drvs);
 		cnt = acc.second;
 		ncnt = switch (r.first) {
 			None(): if (r.second) MizEmitCounts(cnt.attempted, cnt.closed, cnt.skipped + 1)
@@ -46,10 +80,12 @@ MizEmitDrv(form : FolForm, steps : [FolPStep], refs : [RuParseRef],
 // df-ss/dfcleq + mpbir, split an ∧ goal with pm3.2i; the matrix closes by
 // the ladder (unfolds → bridges → ∀-instances)
 mizEmitStepProof(hyps : [FolForm], prev : [FolForm], goal : FolForm,
-	maxFacts : int, maxSize : int) -> Pair<Maybe<FolStepProof>, bool> {
+	maxFacts : int, maxSize : int, recDrv : [MizEmitDrv]) -> Pair<Maybe<FolStepProof>, bool> {
 	used = buildSet(concatA(map(concat(hyps, arrayPush(prev, goal)), folFormVars)));
 	fresh = ref 0;
-	mizEmitReduce(hyps, prev, goal, maxFacts, maxSize, 0, fresh, used);
+	// the recorded facts are plain facts of the step once proved, so the ladder
+	// sees them as extra context — with their own proof block attached
+	mizEmitReduce(hyps, prev, goal, maxFacts, maxSize, 0, fresh, used, recDrv);
 }
 
 mizEmitFresh(fresh : ref int, used : Set<string>) -> string {
@@ -67,17 +103,17 @@ mizEmitShift(steps : [FolPStep], dS : int, dF : int) -> [FolPStep] {
 
 mizEmitReduce(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 	maxFacts : int, maxSize : int, depth : int,
-	fresh : ref int, used : Set<string>) -> Pair<Maybe<FolStepProof>, bool> {
-	direct = mizEmitLadder(hyps, prev, goal, maxFacts, maxSize);
+	fresh : ref int, used : Set<string>, recDrv : [MizEmitDrv]) -> Pair<Maybe<FolStepProof>, bool> {
+	direct = mizEmitLadder(hyps, prev, goal, maxFacts, maxSize, recDrv);
 	switch (direct.first) {
 		Some(__): direct;
 		None(): if (depth >= 8) direct else switch (goal) {
 			FolQuant(q, vs, body): {
 				if (q == "exists" && vs != [])
-					mizEmitExGoal(hyps, prev, goal, vs, body, maxFacts, maxSize, depth, fresh, used, direct)
+					mizEmitExGoal(hyps, prev, goal, vs, body, maxFacts, maxSize, depth, fresh, used, direct, recDrv)
 				else if (q != "forall" || vs == []) direct
 				else {
-					sub = mizEmitReduce(hyps, prev, body, maxFacts, maxSize, depth + 1, fresh, used);
+					sub = mizEmitReduce(hyps, prev, body, maxFacts, maxSize, depth + 1, fresh, used, recDrv);
 					switch (sub.first) {
 						None(): Pair(None(), direct.second || sub.second);
 						Some(pr): {
@@ -98,18 +134,18 @@ mizEmitReduce(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 			FolPred(name, args): {
 				if (name != "⊆" || length(args) != 2) direct
 				else mizEmitCharGoal(hyps, prev, goal, args[0], args[1], "imp", "df-ss",
-					maxFacts, maxSize, depth, fresh, used, direct);
+					maxFacts, maxSize, depth, fresh, used, direct, recDrv);
 			}
 			FolEq(l, r): mizEmitCharGoal(hyps, prev, goal, l, r, "iff", "dfcleq",
-				maxFacts, maxSize, depth, fresh, used, direct);
+				maxFacts, maxSize, depth, fresh, used, direct, recDrv);
 			FolBin(op, l, r): {
 				if (op != "and") direct
 				else {
-					sa = mizEmitReduce(hyps, prev, l, maxFacts, maxSize, depth + 1, fresh, used);
+					sa = mizEmitReduce(hyps, prev, l, maxFacts, maxSize, depth + 1, fresh, used, recDrv);
 					switch (sa.first) {
 						None(): Pair(None(), direct.second || sa.second);
 						Some(pa): {
-							sb = mizEmitReduce(hyps, prev, r, maxFacts, maxSize, depth + 1, fresh, used);
+							sb = mizEmitReduce(hyps, prev, r, maxFacts, maxSize, depth + 1, fresh, used, recDrv);
 							switch (sb.first) {
 								None(): Pair(None(), direct.second || sb.second);
 								Some(pb): {
@@ -139,7 +175,7 @@ mizEmitExGoal(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 	vs : [string], body : FolForm,
 	maxFacts : int, maxSize : int, depth : int,
 	fresh : ref int, used : Set<string>,
-	direct : Pair<Maybe<FolStepProof>, bool>) -> Pair<Maybe<FolStepProof>, bool> {
+	direct : Pair<Maybe<FolStepProof>, bool>, recDrv : [MizEmitDrv]) -> Pair<Maybe<FolStepProof>, bool> {
 	x = vs[0];
 	rest = if (length(vs) == 1) body else FolQuant("exists", tail(vs), body);
 	// candidate witnesses: the step's element variables
@@ -157,7 +193,7 @@ mizEmitExGoal(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 		Some(__): acc;
 		None(): {
 			if (y == x) {
-				sub = mizEmitReduce(hyps, prev, rest, maxFacts, maxSize, depth + 1, fresh, used);
+				sub = mizEmitReduce(hyps, prev, rest, maxFacts, maxSize, depth + 1, fresh, used, recDrv);
 				switch (sub.first) {
 					None(): Pair(None(), acc.second || sub.second);
 					Some(pr): {
@@ -174,7 +210,7 @@ mizEmitExGoal(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 				switch (mizEmitWalk(wsteps, djr, x, y, rest)) {
 					None(): acc;
 					Some(w): {
-						sub = mizEmitReduce(hyps, prev, w.second, maxFacts, maxSize, depth + 1, fresh, used);
+						sub = mizEmitReduce(hyps, prev, w.second, maxFacts, maxSize, depth + 1, fresh, used, recDrv);
 						switch (sub.first) {
 							None(): Pair(None(), acc.second || sub.second);
 							Some(pr): {
@@ -198,11 +234,11 @@ mizEmitCharGoal(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 	a : FolTerm, b : FolTerm, op : string, lemma : string,
 	maxFacts : int, maxSize : int, depth : int,
 	fresh : ref int, used : Set<string>,
-	direct : Pair<Maybe<FolStepProof>, bool>) -> Pair<Maybe<FolStepProof>, bool> {
+	direct : Pair<Maybe<FolStepProof>, bool>, recDrv : [MizEmitDrv]) -> Pair<Maybe<FolStepProof>, bool> {
 	v = mizEmitFresh(fresh, used);
 	matrix = FolBin(op, mizEmitMem(FolVar(v), a), mizEmitMem(FolVar(v), b));
 	subGoal = FolQuant("forall", [v], matrix);
-	sub = mizEmitReduce(hyps, prev, subGoal, maxFacts, maxSize, depth + 1, fresh, used);
+	sub = mizEmitReduce(hyps, prev, subGoal, maxFacts, maxSize, depth + 1, fresh, used, recDrv);
 	switch (sub.first) {
 		None(): Pair(None(), direct.second || sub.second);
 		Some(pr): {
@@ -219,7 +255,7 @@ mizEmitCharGoal(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 }
 
 mizEmitLadder(hyps : [FolForm], prev : [FolForm], goal : FolForm,
-	maxFacts : int, maxSize : int) -> Pair<Maybe<FolStepProof>, bool> {
+	maxFacts : int, maxSize : int, recDrv : [MizEmitDrv]) -> Pair<Maybe<FolStepProof>, bool> {
 	ctx0 = concat(
 		mapi(hyps, \j, h -> Pair(h, mizEmitHypRef(j))),
 		mapi(prev, \j, s -> Pair(s, mizEmitStepRef(j))));
@@ -232,16 +268,16 @@ mizEmitLadder(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 	insts0 = fold(allForms, makeTree(), \acc, f -> mizEmitUnfolds(f, acc));
 	// LADDER: rung 1 membership unfolds alone; rung 2 adds the ⊆/= bridges;
 	// rung 3 adds ∀-INSTANCES of the quantified local facts (spv + walk)
-	r1 = mizEmitTry(ctx, goal, getTreeValues(insts0), [], maxFacts, maxSize);
+	r1 = mizEmitTry(ctx, goal, getTreeValues(insts0), recDrv, maxFacts, maxSize);
 	switch (r1.first) {
 		Some(__): r1;
 		None(): if (r1.second) r1 else {
 			bridged = getTreeValues(mizEmitBridges(allForms, insts0));
-			r2 = mizEmitTry(ctx, goal, bridged, [], maxFacts, maxSize);
+			r2 = mizEmitTry(ctx, goal, bridged, recDrv, maxFacts, maxSize);
 			switch (r2.first) {
 				Some(__): r2;
 				None(): if (r2.second) r2 else {
-					drv = concat(mizEmitChars(ctx0), mizEmitDerive(ctx0, allForms));
+					drv = concatA([recDrv, mizEmitChars(ctx0), mizEmitDerive(ctx0, allForms)]);
 					if (drv == []) r2
 					else {
 						// unfolds/bridges over the instances too
@@ -498,7 +534,18 @@ mizEmitInst(fact : FolForm, factRef : RuParseRef, ws : [string]) -> Maybe<MizEmi
 // `dj` accumulates the disjointedness the used lemmas demand.
 mizEmitWalk(steps : ref [FolPStep], dj : ref [Pair<string, string>],
 	x : string, y : string, f : FolForm) -> Maybe<Pair<int, FolForm>> {
-	ante = FolEq(FolVar(x), FolVar(y));
+	mizEmitWalkT(steps, dj, x, FolVar(y), f);
+}
+
+// The same walk with a TERM on the right — |- (x = T → (f ↔ f[T/x])). Every
+// congruence lemma it cites (eleq1/sseq1/eqeq1/notbid/anbi12d/albidv/…) is
+// class-general in the foundation, so nothing but the substituted object
+// changes. This is what lets a recorded witness (a Mizar term such as X ∪ Y,
+// never a bare variable) be eliminated at all.
+mizEmitWalkT(steps : ref [FolPStep], dj : ref [Pair<string, string>],
+	x : string, t : FolTerm, f : FolForm) -> Maybe<Pair<int, FolForm>> {
+	y = t;
+	ante = FolEq(FolVar(x), t);
 	emit = \form : FolForm, lemma : string, refs : [FolPRef] -> {
 		steps := arrayPush(^steps, FolPStep(form, lemma, refs));
 		length(^steps) - 1;
@@ -515,25 +562,51 @@ mizEmitWalk(steps : ref [FolPStep], dj : ref [Pair<string, string>],
 				lem2 = if (name == "∈") "eleq2" else if (name == "⊆") "sseq2" else "";
 				if (lem1 == "") None()
 				else if (aX && !bHas) {
-					g = FolPred(name, [FolVar(y), args[1]]);
+					g = FolPred(name, [y, args[1]]);
 					Some(Pair(mkIff(f, g, lem1, []), g));
 				} else if (bX && !aHas) {
-					g = FolPred(name, [args[0], FolVar(y)]);
+					g = FolPred(name, [args[0], y]);
 					Some(Pair(mkIff(f, g, lem2, []), g));
-				} else None();
+				} else {
+					// the variable sits INSIDE a compound argument (A ⊆ A ∪ B):
+					// rewrite each side as a term, then combine with the
+					// deduction form of the predicate's congruence
+					lem12 = if (name == "∈") "eleq12d" else "sseq12d";
+					switch (mizEmitWalkTerm(steps, x, y, args[0])) {
+						None(): None();
+						Some(wa): switch (mizEmitWalkTerm(steps, x, y, args[1])) {
+							None(): None();
+							Some(wb): {
+								g = FolPred(name, [wa.second, wb.second]);
+								Some(Pair(mkIff(f, g, lem12,
+									[FolPRefStep(wa.first), FolPRefStep(wb.first)]), g));
+							}
+						}
+					}
+				}
 			}
 		}
 		FolEq(l, r): {
 			lX = l == FolVar(x); rX = r == FolVar(x);
 			if (lX && !mizEmitTermHas(x, r)) {
-				g = FolEq(FolVar(y), r);
+				g = FolEq(y, r);
 				Some(Pair(mkIff(f, g, "eqeq1", []), g));
 			} else if (rX && !mizEmitTermHas(x, l)) {
-				g = FolEq(l, FolVar(y));
+				g = FolEq(l, y);
 				Some(Pair(mkIff(f, g, "eqeq2", []), g));
-			} else None();
+			} else switch (mizEmitWalkTerm(steps, x, y, l)) {
+				None(): None();
+				Some(wl): switch (mizEmitWalkTerm(steps, x, y, r)) {
+					None(): None();
+					Some(wr): {
+						g = FolEq(wl.second, wr.second);
+						Some(Pair(mkIff(f, g, "eqeq12d",
+							[FolPRefStep(wl.first), FolPRefStep(wr.first)]), g));
+					}
+				}
+			}
 		}
-		FolNeg(g): switch (mizEmitWalk(steps, dj, x, y, g)) {
+		FolNeg(g): switch (mizEmitWalkT(steps, dj, x, y, g)) {
 			None(): None();
 			Some(w): {
 				g2 = FolNeg(w.second);
@@ -543,9 +616,9 @@ mizEmitWalk(steps : ref [FolPStep], dj : ref [Pair<string, string>],
 		FolBin(op, l, r): {
 			lemma = if (op == "and") "anbi12d" else if (op == "or") "orbi12d"
 				else if (op == "imp") "imbi12d" else "bibi12d";
-			switch (mizEmitWalk(steps, dj, x, y, l)) {
+			switch (mizEmitWalkT(steps, dj, x, y, l)) {
 				None(): None();
-				Some(wl): switch (mizEmitWalk(steps, dj, x, y, r)) {
+				Some(wl): switch (mizEmitWalkT(steps, dj, x, y, r)) {
 					None(): None();
 					Some(wr): {
 						g2 = FolBin(op, wl.second, wr.second);
@@ -555,16 +628,18 @@ mizEmitWalk(steps : ref [FolPStep], dj : ref [Pair<string, string>],
 			}
 		}
 		FolQuant(q, vs, b): {
-			if (exists(vs, \v -> v == y || v == x)) None()  // capture / shadow
-			else switch (mizEmitWalk(steps, dj, x, y, b)) {
+			// capture / shadow: the binder may be neither x nor any variable of
+			// the substituted term
+			if (exists(vs, \v -> v == x || mizEmitTermHas(v, y))) None()
+			else switch (mizEmitWalkT(steps, dj, x, y, b)) {
 				None(): None();
 				Some(w): {
 					lemma = if (q == "forall") "albidv" else "exbidv";
 					// albidv/exbidv: the binder must be disjoint from the
 					// antecedent's variables (x = y)
 					dj := fold(vs, ^dj, \ac, v ->
-						arrayPush(arrayPush(ac, Pair(toLowerCase(v), toLowerCase(x))),
-							Pair(toLowerCase(v), toLowerCase(y))));
+						fold(mizEmitTermVars(y), arrayPush(ac, Pair(toLowerCase(v), toLowerCase(x))),
+							\a2, tv -> arrayPush(a2, Pair(toLowerCase(v), toLowerCase(tv)))));
 					start : Pair<int, Pair<FolForm, FolForm>> = Pair(w.first, Pair(b, w.second));
 					p2 = foldr(vs, start, \acc, v -> {
 						a2 = FolQuant(q, [v], acc.second.first);
@@ -801,5 +876,379 @@ mizEmitMemGen(x : FolTerm, s : FolTerm, acc : Tree<string, Pair<FolForm, string>
 			} else acc;
 		}
 		default: acc;
+	}
+}
+
+// ---- S-B: eliminating a universal at a recorded WITNESS TERM ----
+// Mizar's <Assign> witnesses are terms (`X ∪ Y`), and the ladder could only
+// instantiate at a variable (spv). The foundation's spcgv does terms:
+//   spcgv:  hyp (x = A) → (φ ↔ ψ)   ⊢  (A ∈ V) → (∀x φ → ψ)
+// so an elimination is: the congruence walk for the hypothesis, the term's
+// SETHOOD for the antecedent, then two ax-mp. Sethood is proved bottom-up —
+// a variable by `vex`, a functor term by the article's own `sh_<f>` axiom
+// instantiated (recursively) at its arguments.
+
+mizEmitTermVars(t : FolTerm) -> [string] {
+	switch (t) {
+		FolVar(n):        [n];
+		FolApp(__, args): concatA(map(args, mizEmitTermVars));
+		FolAbs(__, __):   [];
+	}
+}
+
+// The FOUNDATION's own sethood lemmas for the A-map functors, with the argument
+// sethoods each one takes as hypotheses (in order). The article emits no `sh_`
+// axiom for a reused functor — the foundation already proves it.
+mizEmitFoundSethood(name : string) -> Maybe<Pair<string, [int]>> {
+	lookupTree(pairs2tree([
+		Pair("∪", Pair("unex", [0, 1])),
+		Pair("∩", Pair("inex1", [0])),
+		Pair("∖", Pair("difexi", [0])),
+		Pair("×.", Pair("xpex", [0, 1])),
+		Pair("𝒫", Pair("pwex", [0])),
+		Pair("∪.", Pair("uniex", [0])),
+		Pair("∅", Pair("0ex", [])),
+		Pair("singleton", Pair("snex", [])),
+		Pair("pair", Pair("prex", [])),
+		Pair("triple", Pair("tpex", [])),
+		Pair("opair", Pair("opex", [])),
+	]), name);
+}
+
+// steps proving |- (t ∈ _V); None when some functor on the way has no sethood
+// axiom in the article. `shOf` names the sethood axiom of a functor.
+mizEmitSethood(steps : ref [FolPStep], dj : ref [Pair<string, string>],
+	t : FolTerm, shOf : (string) -> string, depth : int) -> Maybe<int> {
+	emit = \form : FolForm, lemma : string, refs : [FolPRef] -> {
+		steps := arrayPush(^steps, FolPStep(form, lemma, refs));
+		length(^steps) - 1;
+	};
+	inV = \tt : FolTerm -> FolPred("∈", [tt, FolApp("_V", [])]);
+	if (depth > 6) None()
+	else switch (t) {
+		FolVar(__): Some(emit(inV(t), "vex", []));
+		FolAbs(__, __): None();
+		FolApp(name, args): switch (mizEmitFoundSethood(name)) {
+			Some(fs): {
+				// a foundation functor: cite its lemma with the argument
+				// sethoods it asks for
+				r = fold(fs.second, Some([]), \acc : Maybe<[FolPRef]>, j ->
+					switch (acc) {
+						None(): None();
+						Some(rs): if (j >= length(args)) None()
+							else switch (mizEmitSethood(steps, dj, args[j], shOf, depth + 1)) {
+								None(): None();
+								Some(k): Some(arrayPush(rs, FolPRefStep(k)));
+							}
+					});
+				switch (r) {
+					None(): None();
+					Some(rs): Some(emit(inV(t), fs.first, rs));
+				}
+			}
+			None(): {
+			sh = shOf(name);
+			if (sh == "") None()
+			else {
+				// the sethood axiom is ∀s0…sn ( f(s̄) ∈ _V ); instantiate it at
+				// the actual arguments, which needs their sethood in turn
+				vars = map(enumFromTo(0, length(args) - 1), \i -> "S" + i2s(i));
+				form0 = FolPred("∈", [FolApp(name, map(vars, \v -> FolVar(v))), FolApp("_V", [])]);
+				start = if (vars == []) form0 else FolQuant("forall", vars, form0);
+				i0 = emit(start, sh, []);
+				r = foldi(args, Some(Pair(start, i0)), \j, acc : Maybe<Pair<FolForm, int>>, a ->
+					switch (acc) {
+						None(): None();
+						Some(st): mizEmitElimAt(steps, dj, st.first, st.second, vars[j], a, shOf, depth + 1);
+					});
+				switch (r) {
+					None(): None();
+					Some(fin): if (fin.first == inV(t)) Some(fin.second) else None();
+				}
+			}
+			}
+		}
+	}
+}
+
+// ONE elimination: from `∀x φ` at step `srcIdx` to `φ[t/x]`, by spcgv.
+// Returns (instance, step index).
+mizEmitElimAt(steps : ref [FolPStep], dj : ref [Pair<string, string>],
+	f : FolForm, srcIdx : int, x : string, t : FolTerm,
+	shOf : (string) -> string, depth : int) -> Maybe<Pair<FolForm, int>> {
+	emit = \form : FolForm, lemma : string, refs : [FolPRef] -> {
+		steps := arrayPush(^steps, FolPStep(form, lemma, refs));
+		length(^steps) - 1;
+	};
+	switch (f) {
+		FolQuant(q, vs, body): {
+			if (q != "forall" || vs == [] || vs[0] != x) None()
+			else {
+				rest = if (length(vs) == 1) body else FolQuant(q, tail(vs), body);
+				// The IDENTITY instance needs no substitution — and must not go
+				// through spcgv, whose disjoint-variable condition forbids the
+				// witness being the binder itself (an invalid proof Russell
+				// accepts and the Metamath checker rejects). It goes through the
+				// IMPLICATION form `sp`, not `spi`: spi's binder occurs only in
+				// its hypothesis, so the Metamath export cannot determine it and
+				// emits no floating argument for it.
+				if (t == FolVar(x)) {
+					sps = emit(FolBin("imp", f, rest), "sp", []);
+					Some(Pair(rest, emit(rest, "ax-mp", [FolPRefStep(srcIdx), FolPRefStep(sps)])));
+				}
+				else switch (mizEmitWalkT(steps, dj, x, t, rest)) {
+					None(): None();
+					Some(wk): switch (mizEmitSethood(steps, dj, t, shOf, depth)) {
+						None(): None();
+						Some(shIdx): {
+							// spcgv's disjointedness: x apart from the term's variables
+							xr = toLowerCase(x);
+							dj := fold(mizEmitTermVars(t), ^dj, \ac, v ->
+								if (toLowerCase(v) == xr) ac else arrayPush(ac, Pair(xr, toLowerCase(v))));
+							inV = FolPred("∈", [t, FolApp("_V", [])]);
+							sp = emit(FolBin("imp", inV, FolBin("imp", f, wk.second)),
+								"spcgv", [FolPRefStep(wk.first)]);
+							m1 = emit(FolBin("imp", f, wk.second), "ax-mp",
+								[FolPRefStep(shIdx), FolPRefStep(sp)]);
+							m2 = emit(wk.second, "ax-mp", [FolPRefStep(srcIdx), FolPRefStep(m1)]);
+							Some(Pair(wk.second, m2));
+						}
+					}
+				}
+			}
+		}
+		default: None();
+	}
+}
+
+// The first citation of the step whose statement instantiates to the recorded
+// fact, emitted as a derived fact proved from it.
+mizEmitRecFromCites(cites : [string], fact : FolForm,
+	stmtOf : (string) -> Maybe<FolForm>, shOf : (string) -> string) -> Maybe<MizEmitDrv> {
+	fold(cites, None(), \acc : Maybe<MizEmitDrv>, c -> switch (acc) {
+		Some(__): acc;
+		None(): switch (stmtOf(c)) {
+			None(): None();
+			Some(st): {
+				mizEmitRecCites := ^mizEmitRecCites + 1;
+				switch (mizEmitMatchInst(st, fact)) {
+					None(): None();
+					Some(ws): {
+						mizEmitRecMatch := ^mizEmitRecMatch + 1;
+						mizEmitRecordDrv(c, st, ws, shOf);
+					}
+				}
+			}
+		}
+	});
+}
+
+// A RECORDED fact as a derived fact: cite the premise by name, then eliminate
+// its binders at the matched witnesses. `premName` must be an assertion of the
+// article (a cited theorem/definition) whose statement is `premise`.
+mizEmitRecordDrv(premName : string, premise : FolForm,
+	wits : [Pair<string, FolTerm>], shOf : (string) -> string) -> Maybe<MizEmitDrv> {
+	steps : ref [FolPStep] = ref [];
+	dj : ref [Pair<string, string>] = ref [];
+	i0 = {
+		steps := arrayPush(^steps, FolPStep(premise, premName, []));
+		0;
+	};
+	r = fold(wits, Some(Pair(premise, i0)), \acc : Maybe<Pair<FolForm, int>>, wp ->
+		switch (acc) {
+			None(): None();
+			Some(st): mizEmitElimAt(steps, dj, st.first, st.second, wp.first, wp.second, shOf, 0);
+		});
+	switch (r) {
+		None(): None();
+		Some(fin): if (length(^steps) <= 1) None()
+			else Some(MizEmitDrv(fin.first, ^steps, [], uniq(^dj)));
+	}
+}
+
+// ---- matching a CITED statement against a RECORDED instance ----
+// The record says WHICH premise the checker used and WHAT instance it needed,
+// but not which of the step's citations that premise is: <Premise> carries the
+// checker's NORMALIZED formula (an iff split into two implications, ∃ dualized),
+// which no longer matches the article's own axiom text. So the join runs the
+// other way — take the recorded instance, and for each citation of the step ask
+// whether its statement instantiates to it. First-order matching recovers the
+// witness terms itself, so it needs no agreement with the checker's binder
+// numbering.
+
+mizEmitSubT(t : FolTerm, sub : Tree<string, FolTerm>) -> FolTerm {
+	switch (t) {
+		FolVar(n): lookupTreeDef(sub, n, t);
+		FolApp(n, args): FolApp(n, map(args, \a -> mizEmitSubT(a, sub)));
+		FolAbs(v, b): FolAbs(v, mizEmitSubF(b, sub));
+	}
+}
+
+mizEmitSubF(f : FolForm, sub : Tree<string, FolTerm>) -> FolForm {
+	switch (f) {
+		FolPred(n, args):  FolPred(n, map(args, \a -> mizEmitSubT(a, sub)));
+		FolEq(l, r):       FolEq(mizEmitSubT(l, sub), mizEmitSubT(r, sub));
+		FolNeg(g):         FolNeg(mizEmitSubF(g, sub));
+		FolBin(op, l, r):  FolBin(op, mizEmitSubF(l, sub), mizEmitSubF(r, sub));
+		FolQuant(q, vs, b): FolQuant(q, vs, mizEmitSubF(b, fold(vs, sub,
+			\s, v -> removeFromTree(s, v))));
+	}
+}
+
+// one-sided matching: bind the pattern's metavariables so that pat[sub] == tgt
+mizEmitMatchT(pat : FolTerm, tgt : FolTerm, meta : Set<string>,
+	sub : Maybe<Tree<string, FolTerm>>) -> Maybe<Tree<string, FolTerm>> {
+	switch (sub) {
+		None(): None();
+		Some(s): switch (pat) {
+			FolVar(n): if (!containsSet(meta, n)) (if (pat == tgt) sub else None())
+				else switch (lookupTree(s, n)) {
+					None(): Some(setTree(s, n, tgt));
+					Some(old): if (old == tgt) sub else None();
+				};
+			FolApp(n, args): switch (tgt) {
+				FolApp(n2, args2): if (n != n2 || length(args) != length(args2)) None()
+					else foldi(args, sub, \i, acc, a -> mizEmitMatchT(a, args2[i], meta, acc));
+				default: None();
+			}
+			FolAbs(__, __): if (pat == tgt) sub else None();
+		}
+	}
+}
+
+mizEmitMatchF(pat : FolForm, tgt : FolForm, meta : Set<string>,
+	sub : Maybe<Tree<string, FolTerm>>) -> Maybe<Tree<string, FolTerm>> {
+	switch (sub) {
+		None(): None();
+		Some(__): switch (pat) {
+			FolPred(n, args): switch (tgt) {
+				FolPred(n2, args2): if (n != n2 || length(args) != length(args2)) None()
+					else foldi(args, sub, \i, acc, a -> mizEmitMatchT(a, args2[i], meta, acc));
+				default: None();
+			}
+			FolEq(l, r): switch (tgt) {
+				FolEq(l2, r2): mizEmitMatchT(r, r2, meta, mizEmitMatchT(l, l2, meta, sub));
+				default: None();
+			}
+			FolNeg(g): switch (tgt) {
+				FolNeg(g2): mizEmitMatchF(g, g2, meta, sub);
+				default: None();
+			}
+			FolBin(op, l, r): switch (tgt) {
+				FolBin(op2, l2, r2): if (op != op2) None()
+					else mizEmitMatchF(r, r2, meta, mizEmitMatchF(l, l2, meta, sub));
+				default: None();
+			}
+			FolQuant(q, vs, b): switch (tgt) {
+				FolQuant(q2, vs2, b2): if (q != q2 || vs != vs2) None()
+					else mizEmitMatchF(b, b2, fold(vs, meta, \m, v -> removeSet(m, v)), sub);
+				default: None();
+			}
+		}
+	}
+}
+
+mizEmitPrefixOf(f : FolForm, acc : [string]) -> Pair<[string], FolForm> {
+	switch (f) {
+		FolQuant(q, vs, b): if (q != "forall") Pair(acc, f) else mizEmitPrefixOf(b, concat(acc, vs));
+		default: Pair(acc, f);
+	}
+}
+
+// Does `cited` instantiate to `fact` by eliminating its leading universals?
+// Returns the elimination trace in binder order.
+mizEmitMatchInst(cited : FolForm, fact : FolForm) -> Maybe<[Pair<string, FolTerm>]> {
+	pre = mizEmitPrefixOf(cited, []);
+	binders = pre.first;
+	body = pre.second;
+	if (binders == []) None()
+	else switch (mizEmitMatchF(body, fact, buildSet(binders), Some(makeTree()))) {
+		None(): None();
+		Some(sub): {
+			ws = filtermap(binders, \b -> switch (lookupTree(sub, b)) {
+				None(): None();
+				Some(t): Some(Pair(b, t));
+			});
+			// every binder must be determined and the instance must come out
+			// exactly as recorded
+			if (length(ws) != length(binders)) None()
+			else if (mizEmitSubF(body, sub) != fact) None()
+			else Some(ws);
+		}
+	}
+}
+
+// ---- congruence INSIDE a term ----
+// The formula walk could only rewrite an argument that IS the variable, so a
+// premise like ∀A∀B (A ⊆ A ∪ B) could not be instantiated at all: substituting
+// A has to reach into `A ∪ B` as well. Rewriting one argument slot at a time is
+// enough, and both kinds of functor offer exactly that shape —
+//   foundation: uneq1 : (A = B) → ((A ∪ C) = (B ∪ C))
+//   article:    fn_<f>_cong1d : (a0 = b0) → (f(a0,a1) = f(b0,a1))
+// so the slots chain by eqtrd and lift to the antecedent by syl.
+mizEmitSlotCong(name : string, slot : int) -> string {
+	found = lookupTree(pairs2tree([
+		Pair("∪", ["uneq1", "uneq2"]),
+		Pair("∩", ["ineq1", "ineq2"]),
+		Pair("∖", ["difeq1", "difeq2"]),
+		Pair("△", ["symdifeq1", "symdifeq2"]),
+		Pair("×.", ["xpeq1", "xpeq2"]),
+		Pair("opair", ["opeq1", "opeq2"]),
+		Pair("pair", ["preq1", "preq2"]),
+		Pair("triple", ["tpeq1", "tpeq2", "tpeq3"]),
+		Pair("singleton", ["sneq"]),
+		Pair("𝒫", ["pweq"]),
+		Pair("∪.", ["unieq"]),
+	]), name);
+	switch (found) {
+		Some(ls): if (slot < length(ls)) ls[slot] else "";
+		None(): "fn_" + folRuleId(name) + "_cong" + i2s(slot + 1) + "d";
+	}
+}
+
+// steps proving |- (x = T → u = u[T/x]); returns (stepIdx, u[T/x])
+mizEmitWalkTerm(steps : ref [FolPStep], x : string, t : FolTerm,
+	u : FolTerm) -> Maybe<Pair<int, FolTerm>> {
+	ante = FolEq(FolVar(x), t);
+	emit = \form : FolForm, lemma : string, refs : [FolPRef] -> {
+		steps := arrayPush(^steps, FolPStep(form, lemma, refs));
+		length(^steps) - 1;
+	};
+	if (u == FolVar(x)) Some(Pair(emit(FolBin("imp", ante, FolEq(u, t)), "id", []), t))
+	else if (!mizEmitTermHas(x, u))
+		Some(Pair(emit(FolBin("imp", ante, FolEq(u, u)), "eqidd", []), u))
+	else switch (u) {
+		FolVar(__): None();
+		FolAbs(__, __): None();
+		FolApp(fn, args): {
+			start : Maybe<Pair<int, FolTerm>> =
+				Some(Pair(emit(FolBin("imp", ante, FolEq(u, u)), "eqidd", []), u));
+			foldi(args, start, \i, acc : Maybe<Pair<int, FolTerm>>, a ->
+				switch (acc) {
+					None(): None();
+					Some(st): if (!mizEmitTermHas(x, a)) acc else {
+						lem = mizEmitSlotCong(fn, i);
+						if (lem == "") None()
+						else switch (mizEmitWalkTerm(steps, x, t, a)) {
+							None(): None();
+							Some(w): {
+								cur : FolTerm = st.second;
+								curArgs = switch (cur) { FolApp(__, aa): aa; default: []; };
+								if (length(curArgs) != length(args)) None()
+								else {
+									nxt = FolApp(fn, replace(curArgs, i, w.second));
+									cg = emit(FolBin("imp", FolEq(curArgs[i], w.second),
+										FolEq(cur, nxt)), lem, []);
+									sy = emit(FolBin("imp", ante, FolEq(cur, nxt)), "syl",
+										[FolPRefStep(w.first), FolPRefStep(cg)]);
+									tr = emit(FolBin("imp", ante, FolEq(u, nxt)), "eqtrd",
+										[FolPRefStep(st.first), FolPRefStep(sy)]);
+									Some(Pair(tr, nxt));
+								}
+							}
+						}
+					}
+				});
+		}
 	}
 }
