@@ -240,6 +240,27 @@ measurement must do the same.
 are unions over whole articles. Stratification only exists at theorem level.
 *Consequence*: layers are defined per theorem statement, not per article.
 
+### 2026-08-08 — an EXPORT defect blocks the next 5 theorems (open)
+*Expected*: proving a biconditional goal as its two implications would be a
+free win — 24 of the 61 xboole_1 theorems that are ONE step short end on a bare
+equality, whose ∀-matrix is exactly such an iff, and each direction on its own
+stays well inside the tableau cap.
+*Found*: it does close them — xboole_1 33 → 38 theorems, zfmisc_1 10 → 11 — and
+the Metamath gate then fails in `t106_xboole_1`: "the hypotheses of ax-gen
+cannot be unified", with the stack holding the ∀-formula where the binder
+should be. The same theorem, with the same error, is what appears if the
+tableau cap is raised instead, so the defect is not in either change: it is in
+how a proof of that shape is EXPORTED. Both of its ax-gen steps are
+well-formed in Russell, which verifies the article.
+*Consequence*: reverted for now, gate first; the change is kept in the log as
+the next concrete task. Two facts to start from — the theorem has a hypothesis
+and the fresh matrix variable x950 is reused by two different certificates
+spliced into the same proof.
+*Also measured*: raising the tableau cap (5000/600 → 40000/3000) closes
+xboole_1 130 → 160 steps and 33 → 46 theorems, and produces a 113,000-line
+proof for a single theorem. That is the blowup the economy constraint names,
+not progress — the cap stays.
+
 ### 2026-08-08 — S-B, second pass: the join was the bottleneck, not the record
 *Expected*: after the first pass, that the record simply had little to add.
 *Found*: it had plenty; the emitter could not reach it. Three fixes, each
