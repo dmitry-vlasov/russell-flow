@@ -253,9 +253,14 @@ tableau cap is raised instead, so the defect is not in either change: it is in
 how a proof of that shape is EXPORTED. Both of its ax-gen steps are
 well-formed in Russell, which verifies the article.
 *Consequence*: reverted for now, gate first; the change is kept in the log as
-the next concrete task. Two facts to start from — the theorem has a hypothesis
-and the fresh matrix variable x950 is reused by two different certificates
-spliced into the same proof.
+the next concrete task. What the error actually says: ax-gen's hypotheses are
+(setvar x, wff ph, |- ph) and the RPN stack holds the wff where the setvar
+belongs, i.e. an object pushed earlier was never consumed — the first error is
+where the imbalance SURFACES, not where it starts. Three shapes were ruled out
+by minimal probes that export and verify cleanly: ax-gen under a hypothesis,
+ax-gen whose body is itself a ∀ over the same variable, and an unused step in
+the proof. Reproduce with the iff-split (kept in the log) on xboole_1
+t106_xboole_1, whose certificate is ~37,500 lines.
 *Also measured*: raising the tableau cap (5000/600 → 40000/3000) closes
 xboole_1 130 → 160 steps and 33 → 46 theorems, and produces a 113,000-line
 proof for a single theorem. That is the blowup the economy constraint names,
