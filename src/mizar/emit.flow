@@ -102,6 +102,7 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 			if (isSome(d)) mizEmitRecCount := ^mizEmitRecCount + 1;
 			d;
 		});
+		// `dbg-thm=<name>` traces one theorem's certificate attempts
 		mizEmitDbg := (t.name == getUrlParameterDef("dbg-thm", ""));
 		mizEmitStepLong := false;
 		r = mizEmitStepProof(t.hyps, subrange(t.steps, 0, i), goal, maxFacts, maxSize, drvs);
@@ -189,7 +190,34 @@ mizEmitReduce(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 			}
 			FolEq(l, r): mizEmitCharGoal(hyps, prev, goal, l, r, "iff", "dfcleq",
 				maxFacts, maxSize, depth, fresh, used, direct, recDrv);
-			FolBin(op, l, r): {
+			FolBin(op0, l0, r0): {
+				// membership between compound set terms: rewrite both sides to a
+				// normal form over `v ∈ <variable>` atoms and leave the
+				// certificate a pure propositional equivalence (mizEmitMemNF)
+				memR = switch (mizEmitMemPair(goal)) {
+					None(): None();
+					Some(tr): mizEmitMemRewrite(hyps, prev, goal, tr.first, tr.second,
+						(tr.third).first, (tr.third).second, maxFacts, maxSize, depth,
+						fresh, used, recDrv);
+				};
+				switch (memR) {
+					Some(__): Pair(memR, false);
+					None(): mizEmitBinGoal(hyps, prev, goal, op0, l0, r0, maxFacts, maxSize,
+						depth, fresh, used, direct, recDrv);
+				}
+			}
+			default: direct;
+		}
+	}
+}
+
+// the connective cases of the reduction, unchanged
+mizEmitBinGoal(hyps : [FolForm], prev : [FolForm], goal : FolForm,
+	op : string, l : FolForm, r : FolForm, maxFacts : int, maxSize : int,
+	depth : int, fresh : ref int, used : Set<string>,
+	direct : Pair<Maybe<FolStepProof>, bool>, recDrv : [MizEmitDrv]) -> Pair<Maybe<FolStepProof>, bool> {
+	{
+			{
 				// A BICONDITIONAL goal is proved as its two implications and joined
 				// by impbii: one monolithic certificate for `a ↔ b` is where the
 				// equality family blows the tableau cap, while each direction on
@@ -240,8 +268,6 @@ mizEmitReduce(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 					}
 				}
 			}
-			default: direct;
-		}
 	}
 }
 
@@ -1518,5 +1544,149 @@ mizEmitWalkPred(steps : ref [FolPStep], x : string, t : FolTerm, f : FolForm,
 						}
 					}
 			});
+	}
+}
+
+// ---- membership NORMAL FORM: rewrite instead of deciding ----
+// A membership equivalence `v ∈ A ↔ v ∈ B` between compound set terms is what
+// the `one step short` population is made of, and the generic certificate
+// cannot emit it economically: each unfold enters the tableau as a
+// BICONDITIONAL FACT, and the cost is driven by their number, not by the three
+// or four atoms underneath. The ∀-matrix of x5 ∩ (x7 ∖ x9) = (x5 ∩ x7) ∖ x9 is
+// decided from four unfolds and then runs past 600 emitted steps.
+//
+// So the unfolds are applied STRUCTURALLY instead: each side is rewritten to a
+// propositional combination of `v ∈ <variable>` atoms by chaining the
+// foundation's own membership lemmas (elun/elin/eldif) through orbi12i /
+// anbi12i / notbii and bitri. What is left for the certificate is a pure
+// propositional equivalence over those atoms, with no biconditional facts at
+// all — linear in the term, instead of exponential in the unfold count.
+
+// steps proving |- ((v ∈ t) ↔ NF), and NF
+mizEmitMemNF(steps : ref [FolPStep], v : FolTerm, t : FolTerm,
+	depth : int) -> Maybe<Pair<int, FolForm>> {
+	emit = \form : FolForm, lemma : string, refs : [FolPRef] -> {
+		steps := arrayPush(^steps, FolPStep(form, lemma, refs));
+		length(^steps) - 1;
+	};
+	mem = \tt : FolTerm -> FolPred("∈", [v, tt]);
+	self = \ -> Some(Pair(emit(FolBin("iff", mem(t), mem(t)), "biid", []), mem(t)));
+	if (depth > 8) self()
+	else switch (t) {
+		FolApp(op, args): {
+			if (length(args) != 2 || (op != "∪" && op != "∩" && op != "∖")) self()
+			else {
+				lemma = if (op == "∪") "elun" else if (op == "∩") "elin" else "eldif";
+				comb = if (op == "∪") "orbi12i" else "anbi12i";
+				body = \na : FolForm, nb : FolForm -> if (op == "∪") FolBin("or", na, nb)
+					else if (op == "∩") FolBin("and", na, nb)
+					else FolBin("and", na, FolNeg(nb));
+				raw = body(mem(args[0]), mem(args[1]));
+				un = emit(FolBin("iff", mem(t), raw), lemma, []);
+				switch (mizEmitMemNF(steps, v, args[0], depth + 1)) {
+					None(): None();
+					Some(wa): switch (mizEmitMemNF(steps, v, args[1], depth + 1)) {
+						None(): None();
+						Some(wb): {
+							// the difference's right side sits under a negation
+							rb = if (op != "∖") wb
+								else Pair(emit(FolBin("iff", FolNeg(mem(args[1])), FolNeg(wb.second)),
+									"notbii", [FolPRefStep(wb.first)]), FolNeg(wb.second));
+							la = if (op != "∖") wa.second else wa.second;
+							nf = if (op == "∪") FolBin("or", wa.second, rb.second)
+								else if (op == "∩") FolBin("and", wa.second, rb.second)
+								else FolBin("and", la, rb.second);
+							cb = emit(FolBin("iff", raw, nf), comb,
+								[FolPRefStep(wa.first), FolPRefStep(rb.first)]);
+							Some(Pair(emit(FolBin("iff", mem(t), nf), "bitri",
+								[FolPRefStep(un), FolPRefStep(cb)]), nf));
+						}
+					}
+				}
+			}
+		}
+		default: self();
+	}
+}
+
+// Is this goal a membership relation between two set terms, at least one of
+// them compound? Those are the ones worth rewriting.
+mizEmitMemPair(goal : FolForm) -> Maybe<Triple<string, FolTerm, Pair<FolTerm, FolTerm>>> {
+	compound = \t : FolTerm -> switch (t) {
+		FolApp(op, args): length(args) == 2 && (op == "∪" || op == "∩" || op == "∖");
+		default: false;
+	};
+	sides = \l : FolForm, r : FolForm -> switch (l) {
+		FolPred(n1, a1): switch (r) {
+			FolPred(n2, a2):
+				if (n1 != "∈" || n2 != "∈" || length(a1) != 2 || length(a2) != 2) None()
+				else if (a1[0] != a2[0]) None()
+				else if (!compound(a1[1]) && !compound(a2[1])) None()
+				else Some(Pair(a1[0], Pair(a1[1], a2[1])));
+			default: None();
+		}
+		default: None();
+	};
+	switch (goal) {
+		FolBin(op, l, r): if (op != "iff" && op != "imp") None()
+			else switch (sides(l, r)) {
+				None(): None();
+				Some(p): Some(Triple(op, p.first, p.second));
+			}
+		default: None();
+	}
+}
+
+// `v ∈ A op v ∈ B` with A or B compound: rewrite both sides to normal form and
+// let the reduction prove the propositional residue.
+mizEmitMemRewrite(hyps : [FolForm], prev : [FolForm], goal : FolForm,
+	op : string, v : FolTerm, a : FolTerm, b : FolTerm,
+	maxFacts : int, maxSize : int, depth : int,
+	fresh : ref int, used : Set<string>, recDrv : [MizEmitDrv]) -> Maybe<FolStepProof> {
+	rw : ref [FolPStep] = ref [];
+	switch (mizEmitMemNF(rw, v, a, 0)) {
+		None(): None();
+		Some(wa): switch (mizEmitMemNF(rw, v, b, 0)) {
+			None(): None();
+			Some(wb): {
+				residue = FolBin(op, wa.second, wb.second);
+				// nothing gained if the rewriting changed nothing
+				if (residue == goal) None()
+				else {
+					sub = mizEmitReduce(hyps, prev, residue, maxFacts, maxSize,
+						depth + 1, fresh, used, recDrv);
+					switch (sub.first) {
+						None(): None();
+						Some(pr): {
+							// the rewriting block sits after the residue's proof
+							base = length(pr.steps);
+							ws = mizEmitShift(^rw, base, 0);
+							iA = base + wa.first;
+							iB = base + wb.first;
+							n0 = base + length(ws);
+							join = if (op == "iff") {
+								// (A↔NA), (NA↔NB), (B↔NB) ⊢ A↔B
+								bc = FolPStep(FolBin("iff", wb.second, FolPred("∈", [v, b])),
+									"bicomi", [FolPRefStep(iB)]);
+								t1 = FolPStep(FolBin("iff", FolPred("∈", [v, a]), wb.second),
+									"bitri", [FolPRefStep(iA), FolPRefStep(base - 1)]);
+								t2 = FolPStep(goal, "bitri", [FolPRefStep(n0 + 1), FolPRefStep(n0)]);
+								[bc, t1, t2];
+							} else {
+								// (A↔NA), (NA→NB), (B↔NB) ⊢ A→B
+								s1 = FolPStep(FolBin("imp", FolPred("∈", [v, a]), wb.second),
+									"sylbi", [FolPRefStep(iA), FolPRefStep(base - 1)]);
+								bc = FolPStep(FolBin("iff", wb.second, FolPred("∈", [v, b])),
+									"bicomi", [FolPRefStep(iB)]);
+								s2 = FolPStep(goal, "sylib", [FolPRefStep(n0), FolPRefStep(n0 + 1)]);
+								[s1, bc, s2];
+							};
+							Some(FolStepProof(concatA([pr.steps, ws, join]),
+								pr.factRefs, pr.disjs));
+						}
+					}
+				}
+			}
+		}
 	}
 }
