@@ -104,6 +104,11 @@ the figure predates the in-memory pipeline and must be re-measured.
 *Artifact*: a naming rule that is total and collision-free by construction.
 *Gate*: percentage of MML articles that translate and parse, measured over a
 few hundred articles in dependency order.
+*Harness*: `scripts/analysis/mml_translate/` — `dep_order.py` (the topological
+order the articles must be translated in), `run_translate.sh N` (translate the
+first N and record status + diagnostic per article), `report.py` (status
+counts and failure buckets), `name_stability.py` (is a constructor's name a
+function of the constructor?).
 
 ### S-B — by-steps: consume the record instead of re-deriving
 *Machinery*: the checker record that already exists.
@@ -223,6 +228,83 @@ measurement must do the same.
 *Found*: 95% of articles transitively declare everything, because environments
 are unions over whole articles. Stratification only exists at theorem level.
 *Consequence*: layers are defined per theorem statement, not per article.
+
+### 2026-08-08 — S-A gate: 300 / 300 articles translate and parse
+*Expected*: about half the theorems lost to naming collisions, per the earlier
+survey.
+*Found*: after the naming work below, all 300 articles of the dependency order
+translate and verify (open steps allowed) — 15,432 theorem statements. The
+survey figure is retired: articles are not lost to collisions.
+*What IS lost*: 3,422 of 10,469 theorems inside those articles are dropped
+because the translator cannot render a construct — 3,308 numerals, 119 choice
+terms, 22 flexary formulas. That is S-E and S-F work, not a naming problem, and
+the translator now reports it per article ("NOT translated: N of M theorems —
+Num 43").
+*Method note*: a dependency-ordered census must start from an EMPTY `mizar/`
+directory. Leftover `.ru` files from a run with different naming are read as
+dependencies and produce failures that belong to no version of the code.
+
+### 2026-08-08 — the Russell name of a constructor depended on the article
+*Expected*: a constructor keeps one name across the library.
+*Found*: the contest for a notation word was decided inside the environment of
+the article being translated. The word `real` is the notation of NUMBERS'
+functor AND of XREAL_0's attribute: an article importing only the first names
+it `real`, one importing both drops the name from both and falls back to
+`k1_numbers`. So the same constructor has two names in two articles; they no
+longer link, and importing both raises "decl 'k1_numbers' is already added" —
+which is exactly how the first 300-article census died (square_1, nat_1, int_1,
+membered, xxreal_1). Measured over 200 articles: 26% of the constructors with
+a readable name were readable in one article and mechanical in another.
+Two joins were also wrong underneath it: a `.eno` <Pattern> names its
+constructor by the ENVIRONMENT index (the `.atr` `relnr`, 81..84 for TARSKI's
+functors in numbers.atr), not by the number inside its defining article, and a
+format of kind K is a LEFT BRACKET whose symbol lives under `.dcx` kind K —
+reading it as an "O" functor symbol returned an unrelated word.
+*Consequence*: the contest is decided ONCE over the whole library. Every
+article's notations are read, each word goes to the claimant whose defining
+article comes first in MML canonical order, everyone else keeps the mechanical
+name — in every article alike. The table is cached as `<mml>/russell_names.tsv`
+(word, owning constructor); build takes ~15 s, delete the file to rebuild.
+Gate unchanged: xboole_1 still emits 128/242 steps and the original Metamath
+checker still proves 33.
+
+### 2026-08-08 — one constructor, one name: the four defects behind it
+*Expected*: making the name-contest global would be the whole fix.
+*Found*: three more, each of which alone reintroduced the duplicate-declaration
+crash.
+  1. The name was attached to a table KEY, not to a constructor. One
+     constructor sits under several environment keys (a redefinition aliases
+     HIDDEN's ∈ into TARSKI's entry) and only one carries a pattern, so an
+     article used both `∈` and `r2_hidden` for one relation.
+  2. An article cannot see the notation of its OWN constructors — a
+     constructor's word lives in the `.eno` of the articles that IMPORT it.
+     So funct_1 called its attribute `v3_funct_1` while every importer called
+     it `constant_`. The name table is therefore read backwards too
+     (constructor → word), which is what finally made the name global.
+  3. An ANTONYMIC pattern spells the NEGATION (`nin` for ∈, `<>` for =).
+     Adopting it named a relation `nin` in three articles.
+  4. Sibling articles legitimately declare the same imported symbol, so an
+     identical re-declaration is now a no-op in all three loader paths
+     (`ruDeclsAddDecl`, `ruLangAddDecl`, `ruAssertionsAddDecl`); anything that
+     differs still stops the load.
+  5. Foundation words (∈/∪/⊆/…) were left OUT of the table, because it was
+     built from `.dcx` clean words and could not see bracket or operator
+     spellings. They therefore kept drifting: `newton`, whose environment also
+     holds SUBSET_1's `In` functor as a third claimant for `in`, wrote
+     membership as `r2_hidden` while `rvsum_2` wrote `∈`, and 31 of 300
+     articles failed. The table now renders the full spelling from `.frm` +
+     `.dcx` — a format with a `rightsymbolnr` is a bracket whose halves are a
+     `K` and an `L` symbol — and runs it through the same `mizSymbolName` the
+     `.msx` path uses, so operators are covered and decided globally. Bracket
+     NAMES (singleton/pair/triple/opair/×.) remain excluded by name: bracket
+     symbols are in no `.dcx` at all (`{`/`}` come with the language, not with
+     a vocabulary), so any claimant the table finds for one is a coincidence —
+     `pair` went to XTUPLE_0's `is pair` attribute and took the bracket term's
+     grammar rule.
+*Consequence*: 300 / 300. The lesson for the port: a name
+that depends
+on the reading context is not a name, and each of these defects was invisible
+until articles were translated in bulk, in dependency order.
 
 ### 2026-08-08 — the phantom import cycle
 *Expected*: "cyclic imports" meant a real cycle.

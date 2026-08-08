@@ -13,11 +13,14 @@ import math/math;
 // mechanical MPTP names. mizFullSig folds the result into MizSig.readable.
 
 export {
-	MizSymbols(dcx : Tree<string, string>, frm : Tree<int, Pair<string, int>>, eno : Tree<string, int>);
+	MizSymbols(dcx : Tree<string, string>, frm : Tree<int, MizFmt>, eno : Tree<string, int>);
+		// one .frm <Format>: the symbol kind, its number, the CLOSING bracket's
+		// number (0 = not a bracket) and the argument count
+		MizFmt(kind : string, symbolnr : int, rightsymbolnr : int, argnr : int);
 
 	mizParseNotation(enoC : string, frmC : string, dcxC : string) -> MizSymbols;
 	mizFullSig(xmlC : string, atrC : string, enoC : string, frmC : string, dcxC : string) -> MizSig;
-	mizSymbolReadable(syms : MizSymbols, constrkind : string, aid : string, constrnr : int) -> string;
+	mizSymbolReadable(syms : MizSymbols, constrkind : string, aid : string, absNr : int, relNr : int) -> string;
 	// An article's own constructors -> (surface symbol, arity), "<kind>:<nr>" -> (spelling, arity)
 	// (e.g. "K:5" -> ("\+\", 2)). Built by joining the .xml definitions to the .msx definiendum
 	// patterns by line; numbering is the article's OWN local constructor number (= def order).
@@ -28,6 +31,11 @@ export {
 	// Name for a bracket functor, disambiguated by arity ({ } 1 -> singleton, { } 2 -> pair,
 	// [ ] 2 -> opair). Russell's { } are structural, so a prefix name is used, not the bracket.
 	mizBracketName(spelling : string, arity : int) -> string;
+	// Is this one of the names mizBracketName produces? Bracket SYMBOLS are not
+	// in any article's .dcx (`{`/`}` come with the language, not with a
+	// vocabulary), so the .eno/.frm/.dcx chain can never see them and the global
+	// name table must not hand these words to some other constructor.
+	mizIsBracketName(name : string) -> bool;
 	// The Russell name for a Mizar symbol given its (spelling, arity): the math symbol for an
 	// operator (∪/⊆/…), the bracket name (singleton/pair/opair), or the clean word (union/in/…);
 	// "" when none applies (then keep the MPTP name).
@@ -38,9 +46,19 @@ mizParseNotation(enoC : string, frmC : string, dcxC : string) -> MizSymbols {
 	dcx = mizFoldTagged(dcxC, "Symbols", "Symbol", makeTree(), \acc, sym ->
 		setTree(acc, mizAttr(sym, "kind") + ":" + mizAttr(sym, "nr"), mizAttr(sym, "name")));
 	frm = mizFoldTagged(frmC, "Formats", "Format", makeTree(), \acc, fm ->
-		setTree(acc, s2i(mizAttr(fm, "nr")), Pair(mizAttr(fm, "kind"), s2i(mizAttr(fm, "symbolnr")))));
-	eno = mizFoldTagged(enoC, "Notations", "Pattern", makeTree(), \acc, p ->
-		setTree(acc, mizAttr(p, "constrkind") + ":" + mizAttr(p, "aid") + ":" + mizAttr(p, "constrnr"), s2i(mizAttr(p, "formatnr"))));
+		setTree(acc, s2i(mizAttr(fm, "nr")), MizFmt(mizAttr(fm, "kind"),
+			s2i(mizAttr(fm, "symbolnr")), s2i(mizAttr(fm, "rightsymbolnr")),
+			s2i(mizAttr(fm, "argnr")))));
+	// An ANTONYMIC pattern spells the constructor's NEGATION (`nin` for ∈, `<>`
+	// for =), so it must never supply the constructor's name — three articles
+	// ended up declaring a relation called `nin`. Of the remaining patterns the
+	// FIRST one wins: a later synonym is an alternative spelling, not a
+	// replacement, and letting it overwrite made the name depend on file order.
+	eno = mizFoldTagged(enoC, "Notations", "Pattern", makeTree(), \acc, p -> {
+		key = mizAttr(p, "constrkind") + ":" + mizAttr(p, "aid") + ":" + mizAttr(p, "constrnr");
+		if (mizAttr(p, "antonymic") == "true" || containsKeyTree(acc, key)) acc
+		else setTree(acc, key, s2i(mizAttr(p, "formatnr")));
+	});
 	MizSymbols(dcx, frm, eno);
 }
 
@@ -64,10 +82,36 @@ mizFullSig(xmlC : string, atrC : string, enoC : string, frmC : string, dcxC : st
 		Some(root): fold(mizCollectAll([root], "Constructor"), sig0.table, mizAddConstr);
 	};
 	syms = mizParseNotation(enoC, frmC, dcxC);
-	readable0 = foldTree(table, makeTree(), \key, c, acc -> {
-		kind = strSplit(key, ":")[0];
-		r = mizSymbolReadable(syms, kind, c.aid, c.nr);
+	// The table key is "<kind>:<relnr>" — the ENVIRONMENT index — and that is
+	// exactly what a .eno <Pattern> names its constructor by (`constrnr`), NOT
+	// the constructor's number inside its defining article. Looking the pattern
+	// up by the absolute nr read another constructor's notation (TARSKI's four
+	// functors are relnr 81..84 in numbers.atr) and gave a word that changed
+	// with the article.
+	byKey = foldTree(table, makeTree(), \key, c, acc -> {
+		parts = strSplit(key, ":");
+		kind = parts[0];
+		r = mizSymbolReadable(syms, kind, c.aid, c.nr, s2i(parts[1]));
 		if (r == "") acc else setTree(acc, key, r);
+	});
+	// A CONSTRUCTOR's name, not a key's. The same constructor sits under several
+	// table keys (a redefinition aliases HIDDEN's ∈ into TARSKI's entry) and only
+	// one of them carries a notation pattern; naming just that key left the other
+	// keys mechanical, so one article used both `∈` and `r2_hidden` and its
+	// importers declared the constant twice.
+	nameOfCtor = foldTree(byKey, makeTree(), \k, v, acc -> {
+		cn = switch (lookupTree(table, k)) {
+			Some(c): mizConstrName(strSplit(k, ":")[0], c);
+			None(): k;
+		};
+		if (containsKeyTree(acc, cn)) acc else setTree(acc, cn, v);
+	});
+	readable0 = foldTree(table, makeTree(), \key, c, acc -> {
+		cn = mizConstrName(strSplit(key, ":")[0], c);
+		switch (lookupTree(nameOfCtor, cn)) {
+			None(): acc;
+			Some(v): setTree(acc, key, v);
+		}
 	});
 	// Drop readable names that resolve from more than one constructor (would create
 	// duplicate Russell rule names). Count DISTINCT constructors, not table keys — a
@@ -84,23 +128,39 @@ mizFullSig(xmlC : string, atrC : string, enoC : string, frmC : string, dcxC : st
 	MizSig(table, readable);
 }
 
-mizSymbolReadable(syms : MizSymbols, constrkind : string, aid : string, constrnr : int) -> string {
+// `absNr` is the constructor's number inside its DEFINING article (the one the
+// mechanical name k<nr>_<aid> uses); `relNr` is its index in THIS article's
+// environment. The .eno patterns are keyed by the latter — the two differ from
+// the first import on — so the lookup takes relNr and only HIDDEN's unnamed
+// base modes are decided by absNr.
+mizSymbolReadable(syms : MizSymbols, constrkind : string, aid : string, absNr : int, relNr : int) -> string {
 	// HIDDEN's two base modes are the universal primitives; `set` has no .dcx notation
 	// (it's the implicit base), so name them directly.
 	if (aid == "HIDDEN" && constrkind == "M") {
-		mizReadableWord(if (constrnr == 1) "object" else if (constrnr == 2) "set" else "");
+		mizReadableWord(if (absNr == 1) "object" else if (absNr == 2) "set" else "");
 	} else
-	switch (lookupTree(syms.eno, constrkind + ":" + aid + ":" + i2s(constrnr))) {
+	switch (lookupTree(syms.eno, constrkind + ":" + aid + ":" + i2s(relNr))) {
 		None(): "";
 		Some(fnr): switch (lookupTree(syms.frm, fnr)) {
 			None(): "";
-			Some(ks): {
-				// format kind (constructor kind) -> symbol kind in .dcx: functor K -> O.
-				skind = if (ks.first == "K") "O" else ks.first;
-				mizReadableWord(lookupTreeDef(syms.dcx, skind + ":" + i2s(ks.second), ""));
-			}
+			Some(fmt): mizSymbolName(mizFormatSpelling(syms, fmt), fmt.argnr);
 		}
 	}
+}
+
+// The SPELLING a format displays. The format kind IS the symbol kind in .dcx:
+// "O" is an ordinary functor symbol, "R"/"M"/"V"/"G"/"U" their own kinds, and a
+// format carrying a rightsymbolnr is a BRACKET whose halves are a "K" and an "L"
+// symbol ("{" + "}" -> "{ }"). Reading a bracket as an "O" functor returned an
+// unrelated word, and since .dcx numbering is per article the word then changed
+// with the article. Rendering the full spelling makes this path agree with the
+// .msx one, so operators and brackets get their real names (∪, singleton) here
+// too — which is what lets the name table cover them.
+mizFormatSpelling(syms : MizSymbols, fmt : MizFmt) -> string {
+	if (fmt.rightsymbolnr > 0)
+		trim2(lookupTreeDef(syms.dcx, "K:" + i2s(fmt.symbolnr), "") + " "
+			+ lookupTreeDef(syms.dcx, "L:" + i2s(fmt.rightsymbolnr), ""), " ")
+	else lookupTreeDef(syms.dcx, fmt.kind + ":" + i2s(fmt.symbolnr), "");
 }
 
 // A symbol is adopted only if it's a clean identifier word; `set`/`wff` collide with
@@ -190,6 +250,10 @@ mizBracketName(spelling : string, arity : int) -> string {
 	else if (spelling == "[ ]" && arity == 2) "opair"       // ordered pair [ x, y ]
 	else if (spelling == "[: :]" && arity == 2) "×."        // binary cartesian [: X, Y :] → foundation cxp ( A ×. B ), infix (arity-aware: ternary/quaternary stay opaque)
 	else "";
+}
+
+mizIsBracketName(name : string) -> bool {
+	exists(["singleton", "pair", "triple", "opair", "×."], \s -> s == name);
 }
 
 mizSymbolName(spelling : string, arity : int) -> string {

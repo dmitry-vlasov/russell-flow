@@ -468,6 +468,92 @@ mizMmlOrder(unit : RuUnit) -> Tree<string, int> {
 		makeTree(), \i, acc, aid -> if (containsKeyTree(acc, toLowerCase(aid))) acc else setTree(acc, toLowerCase(aid), i));
 }
 
+// ---- S-A: the GLOBAL name-ownership table ----
+//
+// A constructor's Russell name must be a function of the CONSTRUCTOR, never of
+// the article being translated. The contest for a word is what breaks that: the
+// word `real` is the notation of NUMBERS' functor AND of XREAL_0's attribute, so
+// an article whose environment holds only the first names it `real`, while an
+// article holding both drops the name from both and falls back to the mechanical
+// `k1_numbers`. The same constructor then has two names in two articles: they no
+// longer link, and importing both raises "decl 'k1_numbers' is already added"
+// (5 of the first 300 articles in dependency order died exactly there).
+//
+// So the contest is decided over the WHOLE library, not inside one environment:
+// every article's notations are read once, each word goes to the claimant whose
+// defining article comes first in MML canonical order, and every other claimant
+// keeps its mechanical name — in every article alike. The table is cached next
+// to the MML as `russell_names.tsv` (word <TAB> owning constructor); delete the
+// file to rebuild it.
+mizGlobalOwnersPath(unit : RuUnit) -> string {
+	ruDirName(mizArticleDir(unit)) + "/russell_names.tsv";
+}
+
+mizGlobalOwners(env : RuEnv, unit : RuUnit, src : MizMmlSrc, order : Tree<string, int>) -> Tree<string, string> {
+	path = mizGlobalOwnersPath(unit);
+	if (fileExists(path))
+		fold(strSplit(getFileContent(path), "\n"), makeTree(), \acc, line -> {
+			cols = strSplit(line, "\t");
+			if (length(cols) != 2) acc else setTree(acc, cols[0], cols[1]);
+		})
+	else if (isEmptyTree(order)) makeTree()   // no mml.lar — no canonical order to decide with
+	else {
+		t = mizBuildGlobalOwners(src, order);
+		text = strGlue(map(tree2pairs(t), \p -> p.first + "\t" + p.second), "\n");
+		if (!setFileContent(path, text))
+			env.out.error("mizar-to-ru: cannot cache the name table at " + path, []);
+		t;
+	}
+}
+
+// word -> the mechanical name of the constructor that owns it, read from every
+// article's accommodated notations (.eno -> .frm -> .dcx). A constructor's word
+// lives in the .eno of the articles that USE it, not in its own, so the whole
+// library is read once.
+//
+// ★ THE JOIN. A `.eno` <Pattern> names its constructor by (aid, constrnr) — and
+// that constrnr is the ENVIRONMENT index, the `.atr` <Constructor>'s `relnr`,
+// NOT the constructor's number inside its defining article. The two differ from
+// the first import on (TARSKI's four functors are relnr 81..84 in numbers.atr),
+// so the pattern must be resolved through the SAME article's .atr to reach the
+// absolute (aid, nr) that names the constructor everywhere.
+mizBuildGlobalOwners(src : MizMmlSrc, order : Tree<string, int>) -> Tree<string, string> {
+	best = fold(map(tree2pairs(order), \p -> p.first), makeTree(), \acc, a -> {
+		syms = mizParseNotation(mizFile(src, a, "eno"), mizFile(src, a, "frm"), mizFile(src, a, "dcx"));
+		atr = mizParseAtr(mizFile(src, a, "atr"));
+		foldTree(syms.eno, acc, \key, __, ac -> {
+			parts = strSplit(key, ":");
+			if (length(parts) != 3) ac else {
+				kind = parts[0];
+				switch (lookupTree(atr.table, kind + ":" + parts[2])) {
+					None(): ac;
+					Some(c): {
+						w0 = mizSymbolReadable(syms, kind, parts[1], c.nr, s2i(parts[2]));
+						// the same final mapping the translator applies (in -> ∈, union -> ∪.)
+						m = mizOpName(w0);
+						w = if (m != "") m else w0;
+						// A BRACKET name cannot be read from .dcx (see
+						// mizIsBracketName), so a claimant found for one here is a
+						// coincidence: `pair` went to XTUPLE_0's `is pair` attribute,
+						// which then declared the wff-former over the bracket term's
+						// own grammar rule. Brackets stay with the .msx path.
+						if (w == "" || mizIsBracketName(w)) ac else {
+							cn = mizConstrName(kind, c);
+							r = mizAidRank(order, cn, toLowerCase(c.aid));
+							switch (lookupTree(ac, w)) {
+								None(): setTree(ac, w, Pair(cn, r));
+								Some(cur): if (r < cur.second || (r == cur.second && cn < cur.first))
+									setTree(ac, w, Pair(cn, r)) else ac;
+							}
+						}
+					}
+				}
+			}
+		});
+	});
+	mapTree(best, \p -> p.first);
+}
+
 // Rank a constructor by its defining article. HIDDEN's primitives (∈, =) precede every article;
 // an aid absent from mml.lar (miz_aux, a stray) ranks last so it never steals a symbol.
 mizAidRank(order : Tree<string, int>, ctorName : string, aid : string) -> int {
@@ -611,10 +697,23 @@ ruRunMizarToRu(unit : RuUnit) -> Maybe<RuState> {
 	// so it gets a trailing `_` — the same disambiguation already used for set_/object.
 	reserved = foldTree(state.ru, makeSet(), \__, s, acc ->
 		fold(s.decls, acc, \ac, d -> if (ruDeclIsAssertion(d)) insertSet(ac, id2s(d.info.id)) else ac));
+	mmlOrder = mizMmlOrder(unit);
+	globalOwners = mizGlobalOwners(env, unit, src0, mmlOrder);
+	// The table read the other way: constructor -> the word it owns. An article
+	// cannot see the notation of its OWN constructors (a constructor's word lives
+	// in the .eno of the articles that IMPORT it, never in its own), so funct_1
+	// called its attribute `v3_funct_1` while every importer called it
+	// `constant_` — and two importers then declared that constant, its
+	// congruence and its congruence axiom twice. Reading the name out of the
+	// global table gives the defining article the same name as everyone else.
+	ownerWord = foldTree(globalOwners, makeTree(), \w, cn, acc ->
+		if (containsKeyTree(acc, cn)) acc else setTree(acc, cn, w));
 	merged = foldTree(sig0.table, makeTree(), \key, c, acc -> {
 		sa = spellOf(strSplit(key, ":")[0], c);
 		fromMsx = if (sa.first == "") "" else mizSymbolName(sa.first, sa.second);
-		nm0 = if (fromMsx != "") fromMsx else lookupTreeDef(sig0.readable, key, "");
+		nm1 = lookupTreeDef(sig0.readable, key,
+			lookupTreeDef(ownerWord, mizConstrName(strSplit(key, ":")[0], c), ""));
+		nm0 = if (fromMsx != "") fromMsx else nm1;
 		// final: map a clean-word name that has a math symbol (in -> ∈, union -> ⋃) — covers the
 		// HIDDEN fallback (`in`) which has no .msx. Symbols/other words pass through unchanged.
 		nm = {
@@ -650,7 +749,6 @@ ruRunMizarToRu(unit : RuUnit) -> Maybe<RuState> {
 	// const — which two imports then declare twice ("decl 'k1_xboole_0' is already added").
 	// A symbol belongs to the article that introduced it, so rank claimants by MML canonical
 	// order (mml.lar) and let the EARLIEST win; HIDDEN is the most primitive of all.
-	mmlOrder = mizMmlOrder(unit);
 	// a mechanical name is <kind><nr>_<aid> and the AID ITSELF CONTAINS UNDERSCORES
 	// (k1_xboole_0 -> xboole_0, k10_subset_1 -> subset_1), so split at the FIRST one.
 	rankOfCtor = \cn : string -> {
@@ -662,25 +760,40 @@ ruRunMizarToRu(unit : RuUnit) -> Maybe<RuState> {
 		r = rankOfCtor(cn);
 		if (r < bp.second) Pair(cn, r) else bp;
 	});
+	// THE GLOBAL OWNER decides the contest, so the answer does not depend on
+	// which article is being translated (see mizGlobalOwners). The env-local
+	// rules below stay for words the table does not know (an operator spelling
+	// read from .msx, an article with no mml.lar rank).
 	sig = MizSig(sig0 with readable = filterTree(merged, \k, v -> {
 		all = lookupTreeDef(mcounts, v, makeSet());
-		if (sizeSet(all) == 1) true
-		else {
-			sen = lookupTreeDef(mseniors, v, makeSet());
-			cn = switch (lookupTree(sig0.table, k)) {
-				Some(c): mizConstrName(strSplit(k, ":")[0], c);
-				None(): k;
-			};
-			// One non-own claimant → it wins. Otherwise: a FOUNDATION symbol (∅/∈/⊆/𝒫/…) must
-			// still be resolved — falling back to a mechanical name there both severs the A-map
-			// and makes every user declare its own copy ("decl 'k1_xboole_0' is already added"),
-			// so the canonically-earliest article takes it. For any OTHER contested name the safe
-			// mechanical fallback stands: adopting more pretty names was MEASURED WORSE
-			// (28 OK / 1262 thms / 5 parse-fails vs 29 / 1331 / 0) — mangling is always correct,
-			// a pretty name is only ever an optimisation.
-			if (sizeSet(sen) == 1) containsSet(sen, cn)
-			else if (folAmapReused(v)) (bestOf(if (isEmptySet(sen)) all else sen)).first == cn
-			else false;
+		ctorOf = \key : string -> switch (lookupTree(sig0.table, key)) {
+			Some(c): mizConstrName(strSplit(key, ":")[0], c);
+			None(): key;
+		};
+		cn = ctorOf(k);
+		// EVERY word is decided by the table, the A-map foundation's own
+		// (∈/∪/singleton/…) included: the table now renders bracket and operator
+		// spellings just as the .msx path does, so it knows them. Excluding them
+		// left the foundation words on the environment-local rule, and `∈` then
+		// stayed HIDDEN's in one article and fell back to `r2_hidden` in another
+		// whose environment happened to hold SUBSET_1's `In` functor as a third
+		// claimant — the same theorem inlined by two such articles then clashed.
+		switch (lookupTree(globalOwners, v)) {
+			Some(owner): owner == cn;
+			None(): if (sizeSet(all) == 1) true
+			else {
+				sen = lookupTreeDef(mseniors, v, makeSet());
+				// One non-own claimant → it wins. Otherwise: a FOUNDATION symbol (∅/∈/⊆/𝒫/…) must
+				// still be resolved — falling back to a mechanical name there both severs the A-map
+				// and makes every user declare its own copy ("decl 'k1_xboole_0' is already added"),
+				// so the canonically-earliest article takes it. For any OTHER contested name the safe
+				// mechanical fallback stands: adopting more pretty names was MEASURED WORSE
+				// (28 OK / 1262 thms / 5 parse-fails vs 29 / 1331 / 0) — mangling is always correct,
+				// a pretty name is only ever an optimisation.
+				if (sizeSet(sen) == 1) containsSet(sen, cn)
+				else if (folAmapReused(v)) (bestOf(if (isEmptySet(sen)) all else sen)).first == cn
+				else false;
+			}
 		}
 	}));
 	// Signature comments: the constructor's FINAL Russell name (readable or MPTP) -> its symbol.
@@ -826,6 +939,11 @@ ruRunMizarToRu(unit : RuUnit) -> Maybe<RuState> {
 				// open step proving the statement when proofs=0), each carrying its Mizar ref.
 				thmsOk = filter(thms, \t -> !mizFormHasUnhandled(t.statement)
 					&& !exists(t.hyps, mizFormHasUnhandled) && !exists(t.steps, mizFormHasUnhandled));
+				// S-A: the loss must be VISIBLE. A dropped theorem carries a
+				// construct the translator cannot render; report how many were
+				// dropped and bucket them by the marker that caused it.
+				okNames = buildSet(map(thmsOk, \t -> t.name));
+				thmsLost = filter(thms, \t -> !containsSet(okNames, t.name));
 				emitOn = ruTaskStringArg(unit.task, "emit", "0") == "1";
 				emitMaxFacts = s2i(ruTaskStringArg(unit.task, "emit-max-facts", "16"));
 				emitMaxSize = s2i(ruTaskStringArg(unit.task, "emit-max-size", "200"));
@@ -873,6 +991,9 @@ ruRunMizarToRu(unit : RuUnit) -> Maybe<RuState> {
 						(if (depIds == []) "" else " importing " + i2s(length(depIds)) + " dependency article(s)") +
 							(if (ndropped == 0) "" else " (" + i2s(ndropped) + " decls dropped — provided by imports/foundation)") +
 							" importing '" + foundation + "'");
+					if (thmsLost != [])
+						env.out.println("mizar-to-ru: NOT translated: " + i2s(length(thmsLost))
+							+ " of " + i2s(length(thms)) + " theorems — " + mizLossBuckets(thmsLost));
 					Some(RuState(stateD with ru = setTree(stateD.ru, articleSrc1.info.id, articleSrc1)));
 				}
 			}
@@ -992,4 +1113,18 @@ ruMizDedupImported(src : RuSource, importedIds : Set<int>) -> Pair<RuSource, int
 		default:                   !containsSet(importedIds, d.info.id);
 	});
 	Pair(RuSource(src with decls = kept), length(src.decls) - length(kept));
+}
+
+// S-A loss report: "Fraenkel 12, Choice 8" — the unhandled markers of the
+// theorems the translator had to drop, most frequent first. One theorem counts
+// once per distinct marker it mentions.
+mizLossBuckets(lost : [MizThm]) -> string {
+	counts = fold(lost, makeTree(), \acc, t -> {
+		names = uniq(concatA(map(concat(t.hyps, arrayPush(t.steps, t.statement)),
+			mizFormUnhandledNames)));
+		fold(if (names == []) ["(other)"] else names, acc, \a, n ->
+			setTree(a, n, lookupTreeDef(a, n, 0) + 1));
+	});
+	items = sortCustom(tree2pairs(counts), \p -> -p.second, true);
+	strGlue(map(items, \p -> p.first + " " + i2s(p.second)), ", ");
 }
