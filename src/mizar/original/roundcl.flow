@@ -83,6 +83,16 @@ export {
 		// debug tooling only: trace the rounding of terms of this functor
 		// number (`dbg-round=<nr>`); 0 = off
 		mutable roundDbg : int,
+		// S-C: THE TYPE-DERIVATION RECORD. Mizar derives type facts silently and
+		// uses them as free premises; Russell has to prove each one, and could not
+		// even see which registration produced which adjective. Every FIRING of a
+		// registration during rounding is recorded here — the same
+		// instrument-then-replay chain the checker's derivation record follows.
+		// Off by default (`dump-rounding=` / the in-process switch), and the
+		// rounded-type MEMO is bypassed while it is on, or a firing that a cached
+		// type would have skipped goes unrecorded.
+		roundRec : Vector<string>,
+		mutable roundRecOn : bool,
 		// perf diagnosis: the current and the deepest RoundUpTrmType nesting.
 		// The original recurses here too, but its arguments are collected
 		// InfConsts, so it bottoms out at depth 1; deep nesting means the port
@@ -92,6 +102,14 @@ export {
 	);
 
 	mizClearRoundMemo(cl : MizClusters) -> void;
+	// The recorded firings of the article's rounding. The sink is a module
+	// global, as the checker's derivation switch is: the analyzer pass builds
+	// its MizClusters internally and returns only the report, so threading a
+	// record out through it would touch every caller for a debug artifact.
+	mizRoundRecord() -> [string];
+	mizRoundRecReset(on : bool) -> void;
+	// XML attribute quoting for the record's payloads
+	mizXmlQuote(s : string) -> string;
 
 	mizMakeClusters() -> MizClusters;
 	mizInsertRCluster(cl : MizClusters, r : MizRCluster) -> void;
@@ -159,7 +177,9 @@ mizMakeClusters() -> MizClusters {
 		mizNewExtList(16),
 		makeVector(64), makeVector(64), mizInitIntSeq(16), 0, 0, 0,
 		makeVector(8), makeVector(8), makeVector(8), 0, makeTree(), true,
-		s2i(getUrlParameterDef("dbg-round", "0")), 0, 0);
+		s2i(getUrlParameterDef("dbg-round", "0")),
+		makeVector(1), getUrlParameterDef("dump-rounding", "") != "" || ^mizRoundRecFlag,
+		0, 0);
 }
 
 mizWireRoundcl(env : MizCorrelEnv, cl : MizClusters) -> void {
@@ -484,7 +504,14 @@ mizRoundUpCluster(env : MizCorrelEnv, cl : MizClusters,
 			last = getVectorUnsafe(jobStack, sizeVector(jobStack) - 1);
 			removeVector(jobStack, sizeVector(jobStack) - 1);
 			setVectorUnsafe(inJobs, last, false);
-			if (mizTryRounding(env, mizExtListAt(cl.conditional, last), typ, cluster)) {
+			ccRec = if (!cl.roundRecOn && !^mizRoundRecFlag) "" else mizCluster2s(cluster);
+			ccCl = mizExtListAt(cl.conditional, last);
+			if (mizTryRounding(env, ccCl, typ, cluster)) {
+				if (cl.roundRecOn || ^mizRoundRecFlag)
+					pushVector(mizRoundRecSink, "<Round kind=\"C\" article=\"" + ccCl.article
+						+ "\" nr=\"" + i2s(ccCl.absNr) + "\" typ=\"" + mizXmlQuote(mizFullTyp2s(typ))
+						+ "\" before=\"" + mizXmlQuote(ccRec) + "\" after=\""
+						+ mizXmlQuote(mizCluster2s(cluster)) + "\"/>");
 				cur := mizRucHandleUsageAndFire(env, cl, cluster, clFire,
 					jobStack, inJobs, (^cur).first, (^cur).second);
 			}
@@ -701,6 +728,21 @@ mizRoundUpTrmTypeWithType(env : MizCorrelEnv, cl : MizClusters,
 	typ;
 }
 
+mizRoundRecSink : Vector<string> = makeVector(1024);
+mizRoundRecFlag : ref bool = ref false;
+
+mizRoundRecord() -> [string] { vector2array(mizRoundRecSink); }
+
+mizRoundRecReset(on : bool) -> void {
+	clearVector(mizRoundRecSink);
+	mizRoundRecFlag := on;
+}
+
+mizXmlQuote(s : string) -> string {
+	fold([Pair("&", "&amp;"), Pair("\"", "&quot;"), Pair("<", "&lt;"), Pair(">", "&gt;")],
+		s, \acc, p -> strReplace(acc, p.first, p.second));
+}
+
 mizClearRoundMemo(cl : MizClusters) -> void {
 	cl.roundMemo ::= makeTree();
 }
@@ -743,7 +785,8 @@ mizRoundUpTrmTypeBody(env : MizCorrelEnv, cl : MizClusters, t0 : MizTrm) -> MizT
 	srt = mizTrmSort(t);
 	if (srt == ikTrmFunctor || srt == ikTrmSelector || srt == ikTrmAggreg) {
 		key = mizTrmKey(t);
-		if (!cl.useRoundMemo || getUrlParameterDef("no-round-memo", "") == "1"
+		if (!cl.useRoundMemo || cl.roundRecOn || ^mizRoundRecFlag
+			|| getUrlParameterDef("no-round-memo", "") == "1"
 			|| key == "?" || strContains(key, "?")) {
 			mizRoundUpTrmTypeWithType(env, cl, mizCopyTrmType(env, t), t);
 		} else {
