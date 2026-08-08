@@ -24,9 +24,16 @@ export {
 	// and, where one instantiates to it, enters the ladder as a derived fact
 	// PROVED from that citation — Mizar's own choice of premise and witness
 	// instead of a search.
+	// `isAxiom(name)` says the assertion is emitted as an AXIOM — its statement
+	// is ∀-closed, so an instance of it must be derived by elimination. Anything
+	// else is emitted as a THEOREM, whose proposition is the open matrix over
+	// the theorem's own variables: Russell instantiates it when a step names it,
+	// so the instance is stated directly in one step. Getting this backwards is
+	// what made three xboole_1 theorems and two zfmisc_1 theorems unverifiable.
 	mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 		recOf : (string) -> [FolForm], stmtOf : (string) -> Maybe<FolForm>,
 		bySkeleton : (string) -> [string], expOf : (string) -> [string],
+		isAxiom : (string) -> bool,
 		shOf : (string) -> string) -> Pair<[Maybe<FolStepProof>], MizEmitCounts>;
 	// the index key: instantiation preserves it exactly
 	mizEmitSkeleton(f : FolForm) -> string;
@@ -57,6 +64,7 @@ mizEmitRecReset() -> void {
 mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 	recOf : (string) -> [FolForm], stmtOf : (string) -> Maybe<FolForm>,
 	bySkeleton : (string) -> [string], expOf : (string) -> [string],
+	isAxiom : (string) -> bool,
 	shOf : (string) -> string) -> Pair<[Maybe<FolStepProof>], MizEmitCounts> {
 	res = foldi(t.steps, Pair([], MizEmitCounts(0, 0, 0)), \i, acc : Pair<[Maybe<FolStepProof>], MizEmitCounts>, goal -> {
 		pos = if (i < length(t.stepPos)) t.stepPos[i] else "";
@@ -68,7 +76,7 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 			// the step's citations, the DEFINITIONS the checker expanded while
 			// checking it, then anything with the same skeleton
 			cands = concatA([cites, expOf(pos), bySkeleton(mizEmitSkeleton(fact))]);
-			d = mizEmitRecFromCites(cands, fact, stmtOf, shOf);
+			d = mizEmitRecFromCites(cands, fact, stmtOf, isAxiom, shOf);
 			if (isSome(d)) mizEmitRecCount := ^mizEmitRecCount + 1;
 			d;
 		});
@@ -1016,10 +1024,15 @@ mizEmitElimAt(steps : ref [FolPStep], dj : ref [Pair<string, string>],
 					Some(wk): switch (mizEmitSethood(steps, dj, t, shOf, depth)) {
 						None(): None();
 						Some(shIdx): {
-							// spcgv's disjointedness: x apart from the term's variables
+							// spcgv is disjointed(A x, ps x): the binder must be apart
+							// from the witness's variables AND from every variable of
+							// the RESULTING instance. Declaring only the witness's left
+							// `disjointed(x5 x7)` undeclared in t29_xboole_1, and
+							// Russell rejected the article.
 							xr = toLowerCase(x);
-							dj := fold(mizEmitTermVars(t), ^dj, \ac, v ->
-								if (toLowerCase(v) == xr) ac else arrayPush(ac, Pair(xr, toLowerCase(v))));
+							dj := fold(concat(mizEmitTermVars(t), folFormVars(wk.second)), ^dj,
+								\ac, v -> if (toLowerCase(v) == xr) ac
+									else arrayPush(ac, Pair(xr, toLowerCase(v))));
 							inV = FolPred("∈", [t, FolApp("_V", [])]);
 							sp = emit(FolBin("imp", inV, FolBin("imp", f, wk.second)),
 								"spcgv", [FolPRefStep(wk.first)]);
@@ -1036,10 +1049,49 @@ mizEmitElimAt(steps : ref [FolPStep], dj : ref [Pair<string, string>],
 	}
 }
 
+// A cited assertion whose statement is OPEN — an article theorem, whose prop
+// carries free variables and is implicitly universally closed — is instantiated
+// by Russell itself when the step names it, so the whole elimination is one
+// step stating the instance. Citing such a theorem with a ∀-closed form instead
+// is what made t90/t110_xboole_1 unverifiable: the step's claim could not be
+// matched against the theorem's actual proposition.
+mizEmitCiteTheorem(name : string, stmt : FolForm, fact : FolForm) -> Maybe<MizEmitDrv> {
+	// the statement may be the .eth's ∀-closed form of the same matrix, so both
+	// readings are tried: substitute the theorem's own variables, or eliminate
+	// a universal prefix. Either way the EMITTED step states the instance and
+	// names the theorem — Russell does the substitution.
+	pre = mizEmitPrefixOf(stmt, []);
+	metas = if (pre.first == []) buildSet(folFormVars(stmt)) else buildSet(pre.first);
+	if (isEmptySet(metas)) None()
+	else fold(mizEmitPieces(pre.second, [], 2), None(), \acc : Maybe<MizEmitDrv>, pc ->
+		switch (acc) {
+			Some(__): acc;
+			None(): switch (mizEmitMatchF(pc.form, fact, metas, Some(makeTree()))) {
+				None(): None();
+				Some(sub): {
+					inst = mizEmitSubF(pc.form, sub);
+					if (inst != fact) None()
+					else {
+						steps : ref [FolPStep] = ref [];
+						i0 = {
+							steps := arrayPush(^steps, FolPStep(inst, name, []));
+							0;
+						};
+						switch (mizEmitApplyOps(steps, inst, i0, [])) {
+							None(): None();
+							Some(__): Some(MizEmitDrv(inst, ^steps, [], []));
+						}
+					}
+				}
+			}
+		});
+}
+
 // The first citation of the step whose statement instantiates to the recorded
 // fact, emitted as a derived fact proved from it.
 mizEmitRecFromCites(cites : [string], fact : FolForm,
-	stmtOf : (string) -> Maybe<FolForm>, shOf : (string) -> string) -> Maybe<MizEmitDrv> {
+	stmtOf : (string) -> Maybe<FolForm>, isAxiom : (string) -> bool,
+	shOf : (string) -> string) -> Maybe<MizEmitDrv> {
 	// per FACT, where the join stops: no citation statement / no citation
 	// instantiates to it / the elimination cannot be emitted
 	if (exists(cites, \c -> isSome(stmtOf(c)))) mizEmitRecCites := ^mizEmitRecCites + 1;
@@ -1051,10 +1103,11 @@ mizEmitRecFromCites(cites : [string], fact : FolForm,
 		Some(__): acc;
 		None(): switch (stmtOf(c)) {
 			None(): None();
-			Some(st): switch (mizEmitMatchInst(st, fact)) {
-				None(): None();
-				Some(mt): mizEmitRecordDrv(c, st, mt.first, mt.second, shOf);
-			}
+			Some(st): if (!isAxiom(c)) mizEmitCiteTheorem(c, st, fact)
+				else switch (mizEmitMatchInst(st, fact)) {
+					None(): None();
+					Some(mt): mizEmitRecordDrv(c, st, mt.first, mt.second, shOf);
+				}
 		}
 	});
 }
