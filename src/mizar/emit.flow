@@ -1045,7 +1045,7 @@ mizEmitRecFromCites(cites : [string], fact : FolForm,
 			None(): None();
 			Some(st): switch (mizEmitMatchInst(st, fact)) {
 				None(): None();
-				Some(ws): mizEmitRecordDrv(c, st, ws, shOf);
+				Some(mt): mizEmitRecordDrv(c, st, mt.first, mt.second, shOf);
 			}
 		}
 	});
@@ -1055,7 +1055,8 @@ mizEmitRecFromCites(cites : [string], fact : FolForm,
 // its binders at the matched witnesses. `premName` must be an assertion of the
 // article (a cited theorem/definition) whose statement is `premise`.
 mizEmitRecordDrv(premName : string, premise : FolForm,
-	wits : [Pair<string, FolTerm>], shOf : (string) -> string) -> Maybe<MizEmitDrv> {
+	wits : [Pair<string, FolTerm>], ops : [string],
+	shOf : (string) -> string) -> Maybe<MizEmitDrv> {
 	steps : ref [FolPStep] = ref [];
 	dj : ref [Pair<string, string>] = ref [];
 	i0 = {
@@ -1069,8 +1070,11 @@ mizEmitRecordDrv(premName : string, premise : FolForm,
 		});
 	switch (r) {
 		None(): None();
-		Some(fin): if (length(^steps) <= 1) None()
-			else Some(MizEmitDrv(fin.first, ^steps, [], uniq(^dj)));
+		Some(fin): switch (mizEmitApplyOps(steps, fin.first, fin.second, ops)) {
+			None(): None();
+			Some(fin2): if (length(^steps) <= 1) None()
+				else Some(MizEmitDrv(fin2.first, ^steps, [], uniq(^dj)));
+		}
 	}
 }
 
@@ -1165,25 +1169,29 @@ mizEmitPrefixOf(f : FolForm, acc : [string]) -> Pair<[string], FolForm> {
 
 // Does `cited` instantiate to `fact` by eliminating its leading universals?
 // Returns the elimination trace in binder order.
-mizEmitMatchInst(cited : FolForm, fact : FolForm) -> Maybe<[Pair<string, FolTerm>]> {
+mizEmitMatchInst(cited : FolForm, fact : FolForm) -> Maybe<Pair<[Pair<string, FolTerm>], [string]>> {
 	pre = mizEmitPrefixOf(cited, []);
 	binders = pre.first;
 	body = pre.second;
 	if (binders == []) None()
-	else switch (mizEmitMatchF(body, fact, buildSet(binders), Some(makeTree()))) {
-		None(): None();
-		Some(sub): {
-			ws = filtermap(binders, \b -> switch (lookupTree(sub, b)) {
+	else fold(mizEmitPieces(body, [], 2), None(), \acc : Maybe<Pair<[Pair<string, FolTerm>], [string]>>, pc ->
+		switch (acc) {
+			Some(__): acc;
+			None(): switch (mizEmitMatchF(pc.form, fact, buildSet(binders), Some(makeTree()))) {
 				None(): None();
-				Some(t): Some(Pair(b, t));
-			});
-			// every binder must be determined and the instance must come out
-			// exactly as recorded
-			if (length(ws) != length(binders)) None()
-			else if (mizEmitSubF(body, sub) != fact) None()
-			else Some(ws);
-		}
-	}
+				Some(sub): {
+					ws = filtermap(binders, \b -> switch (lookupTree(sub, b)) {
+						None(): None();
+						Some(t): Some(Pair(b, t));
+					});
+					// every binder must be determined and the piece must come
+					// out exactly as recorded
+					if (length(ws) != length(binders)) None()
+					else if (mizEmitSubF(pc.form, sub) != fact) None()
+					else Some(Pair(ws, pc.ops));
+				}
+			}
+		});
 }
 
 // ---- congruence INSIDE a term ----
@@ -1278,4 +1286,62 @@ mizEmitSkeleton(f : FolForm) -> string {
 		FolNeg(g): "~(" + mizEmitSkeleton(g) + ")";
 		FolBin(op, l, r): op + "(" + mizEmitSkeleton(l) + "," + mizEmitSkeleton(r) + ")";
 	}
+}
+
+// ---- reaching the recorded fact through a DECOMPOSITION of the premise ----
+// The checker normalizes before it uses a premise, so what it records is often
+// one PIECE of the cited statement: a definitional biconditional is split into
+// its two implications, a conjunction into its conjuncts. Matching the whole
+// statement then fails even though the premise is right there. Each piece is
+// one Hilbert step away from the instantiated statement (biimpi / biimpri /
+// simpl+ax-mp / simpr+ax-mp), so the pieces are offered as match candidates and
+// the step that produced them is appended to the elimination.
+MizEmitPiece(form : FolForm, ops : [string]);
+
+mizEmitPieces(f : FolForm, ops : [string], depth : int) -> [MizEmitPiece] {
+	self = arrayPush([], MizEmitPiece(f, ops));
+	if (depth <= 0) self
+	else switch (f) {
+		FolBin(op, l, r):
+			if (op == "iff") concatA([self,
+				mizEmitPieces(FolBin("imp", l, r), arrayPush(ops, "biimpi"), depth - 1),
+				mizEmitPieces(FolBin("imp", r, l), arrayPush(ops, "biimpri"), depth - 1)])
+			else if (op == "and") concatA([self,
+				mizEmitPieces(l, arrayPush(ops, "simpl"), depth - 1),
+				mizEmitPieces(r, arrayPush(ops, "simpr"), depth - 1)])
+			else self;
+		default: self;
+	}
+}
+
+// apply the recorded decomposition to an already-instantiated statement
+mizEmitApplyOps(steps : ref [FolPStep], form : FolForm, idx : int,
+	ops : [string]) -> Maybe<Pair<FolForm, int>> {
+	emit = \fm : FolForm, lemma : string, refs : [FolPRef] -> {
+		steps := arrayPush(^steps, FolPStep(fm, lemma, refs));
+		length(^steps) - 1;
+	};
+	fold(ops, Some(Pair(form, idx)), \acc : Maybe<Pair<FolForm, int>>, op ->
+		switch (acc) {
+			None(): None();
+			Some(st): switch (st.first) {
+				FolBin(bop, l, r): {
+					if (op == "biimpi" && bop == "iff") {
+						g = FolBin("imp", l, r);
+						Some(Pair(g, emit(g, "biimpi", [FolPRefStep(st.second)])));
+					} else if (op == "biimpri" && bop == "iff") {
+						g = FolBin("imp", r, l);
+						Some(Pair(g, emit(g, "biimpri", [FolPRefStep(st.second)])));
+					} else if (op == "simpl" && bop == "and") {
+						// simpl : (φ ∧ ψ) → φ
+						im = emit(FolBin("imp", st.first, l), "simpl", []);
+						Some(Pair(l, emit(l, "ax-mp", [FolPRefStep(st.second), FolPRefStep(im)])));
+					} else if (op == "simpr" && bop == "and") {
+						im = emit(FolBin("imp", st.first, r), "simpr", []);
+						Some(Pair(r, emit(r, "ax-mp", [FolPRefStep(st.second), FolPRefStep(im)])));
+					} else None();
+				}
+				default: None();
+			}
+		});
 }
