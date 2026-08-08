@@ -81,8 +81,8 @@ choice are rounding error.
 - Checker derivation record (merge log, equality provenance, match
   provenance, class table, resolution): **done**, offline validator replays
   **93%** of refutations with no prover.
-- Deterministic by-step emitter (`mizar-to-ru emit=1`): closes 130/241 steps
-  on xboole_1, 91/289 on zfmisc_1, 27/130 on subset_1; 33 / 10 / 2 theorems
+- Deterministic by-step emitter (`mizar-to-ru emit=1`): closes 136/241 steps
+  on xboole_1, 94/289 on zfmisc_1, 27/130 on subset_1; 38 / 11 / 2 theorems
   fully proved, all verified by the original Metamath checker. It now proves
   and uses the checker's recorded premises (S-B, witness half).
 - Translation: all 300 articles of the dependency order translate and parse
@@ -262,31 +262,26 @@ first, the Metamath checker judges second. Any measurement taken without the
 first is not a measurement. Corrected figures: 130/241, 91/289, 27/130
 by-steps and 33/116, 10/140, 2/53 theorems on xboole_1/zfmisc_1/subset_1.
 
-### 2026-08-08 — an EXPORT defect blocks the next 5 theorems (open)
-*Expected*: proving a biconditional goal as its two implications would be a
-free win — 24 of the 61 xboole_1 theorems that are ONE step short end on a bare
-equality, whose ∀-matrix is exactly such an iff, and each direction on its own
-stays well inside the tableau cap.
-*Found*: it does close them — xboole_1 33 → 38 theorems, zfmisc_1 10 → 11 — and
-the Metamath gate then fails in `t106_xboole_1`: "the hypotheses of ax-gen
-cannot be unified", with the stack holding the ∀-formula where the binder
-should be. The same theorem, with the same error, is what appears if the
-tableau cap is raised instead, so the defect is not in either change: it is in
-how a proof of that shape is EXPORTED. Both of its ax-gen steps are
-well-formed in Russell, which verifies the article.
-*Consequence*: reverted for now, gate first; the change is kept in the log as
-the next concrete task. What the error actually says: ax-gen's hypotheses are
-(setvar x, wff ph, |- ph) and the RPN stack holds the wff where the setvar
-belongs, i.e. an object pushed earlier was never consumed — the first error is
-where the imbalance SURFACES, not where it starts. Three shapes were ruled out
-by minimal probes that export and verify cleanly: ax-gen under a hypothesis,
-ax-gen whose body is itself a ∀ over the same variable, and an unused step in
-the proof. Reproduce with the iff-split (kept in the log) on xboole_1
-t106_xboole_1, whose certificate is ~37,500 lines.
-*Also measured*: raising the tableau cap (5000/600 → 40000/3000) closes
-xboole_1 130 → 160 steps and 33 → 46 theorems, and produces a 113,000-line
-proof for a single theorem. That is the blowup the economy constraint names,
-not progress — the cap stays.
+### 2026-08-08 — a proof-only variable was exported as MANDATORY
+*Expected*: after proving an iff goal as its two implications closed five more
+theorems and the Metamath checker rejected the result, that the defect was in
+the export of that proof shape.
+*Found* (once the pipeline was made to stop on a failed Russell verify, and the
+export made to complain instead of skipping): a theorem declares every variable
+it uses, its proof's included, and the export took that declared list as the
+theorem's MANDATORY floating hypotheses. A variable a certificate invents then
+became mandatory, so every citation of that theorem owed an argument that no
+substitution can produce — and the push skipped it silently, shifting the whole
+RPN. The checker failed further along, on an unrelated-looking step.
+*Consequence*: mandatory now means what Metamath means — the variables the
+STATEMENT mentions; everything else declared joins the optional floatings. With
+that fixed the iff-split is sound end to end: xboole_1 136 steps / 38 theorems,
+zfmisc_1 94 / 11, enumset1 15 / 11. THE ORDER MATTERS: this was findable only
+because Russell verifies first and the export refuses to write a proof it
+cannot argue.
+*Also measured, and rejected*: raising the tableau cap (5000/600 → 40000/3000)
+closes more but produces a 113,000-line proof for a single theorem — the blowup
+the economy constraint names. The cap stays.
 
 ### 2026-08-08 — S-B, second pass: the join was the bottleneck, not the record
 *Expected*: after the first pass, that the record simply had little to add.
