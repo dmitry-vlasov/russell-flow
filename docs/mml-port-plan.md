@@ -582,3 +582,21 @@ moved: t21 now reaches `x ∈ k3(X, k4(X,A,B)) → x ∈ k3(X,A)` under both
 assumptions with 8 facts, and what it lacks is the two functor definitions at
 that step, which its expansion record does not name. That is a RECORD question
 (which definitions the checker expanded where), not a reduction question.
+
+### 2026-08-09 — offering a step the definitions of its own symbols: no
+*Expected*: the steps that still fail lack the meaning of their functors,
+because the expansion record only names definitions where the checker recorded
+an inference. So: index every definition and constructor type by the symbols it
+mentions, and let a step with no record ask for the definitions of what it is
+about.
+*Found*: it closes nothing. subset_1 29, zfmisc_1 132, relat_1 94 by-steps —
+identical, either way it is offered. Up front it also pushed 29 of subset_1's
+128 steps over the certificate's 16-fact budget and LOST 3 that had been
+closing; as a retry after a step fails it cost about 50% more wall clock for no
+gain. Reverted; what survives is the soundness guard it exposed — spcgv is
+disjointed(A x), so a witness that MENTIONS the binder (`∀x5 φ` at `𝒫 x5`) is
+not an instance, and t1_subset_1 was disproved by exactly such a step.
+*Consequence*: on these articles the binding constraint is the fact BUDGET, not
+the supply of facts. More facts per attempt is the wrong direction; what pays is
+a reduction that needs fewer of them (the deduction twins) or a selection that
+picks the right two. Do not retry this without a budget answer first.
