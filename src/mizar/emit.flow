@@ -109,8 +109,14 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 		ctxI = concat(
 			mapi(t.hyps, \j, h -> Pair(h, mizEmitHypRef(j))),
 			mapi(subrange(t.steps, 0, i), \j, sp -> Pair(sp, mizEmitStepRef(j))));
-		defDrvs = map(mizEmitDefUnfolds(expOf(pos), stepAtoms, stmtOf, shOf, 6),
-			\d -> mizEmitDischarge(d, ctxI));
+		defDrvs = map(mizEmitDefUnfolds(expOf(pos), stepAtoms, stmtOf, shOf, 6), \d -> {
+			r = mizEmitDischarge(d, ctxI);
+			if (getUrlParameterDef("dbg-guard", "") == "1" && r.form != d.form)
+				println("DISCHARGED " + strGlue(folFormToks(r.form), " "));
+			if (getUrlParameterDef("dbg-guard", "") == "1" && r.form == d.form)
+				println("GUARD-KEPT " + strGlue(folFormToks(d.form), " "));
+			r;
+		});
 		mizEmitDefNames := ^mizEmitDefNames + length(expOf(pos));
 		mizEmitDefMade := ^mizEmitDefMade + length(defDrvs);
 		drvs0 = filtermap(recs, \fact -> {
@@ -1887,10 +1893,13 @@ mizEmitDefUnfolds(named : [Pair<string, string>], stepAtoms : [FolForm],
 	names = uniq(map(named, \p -> p.first));
 	fold(names, [], \acc : [MizEmitDrv], nm ->
 		if (length(acc) >= cap) acc
-		else switch (mizEmitDefInstance(nm, lookupTreeDef(symOf, nm, ""),
-				stepAtoms, stmtOf, shOf)) {
-			None(): acc;
-			Some(d): arrayPush(acc, d);
+		else {
+			r = mizEmitDefInstance(nm, lookupTreeDef(symOf, nm, ""), stepAtoms, stmtOf, shOf);
+			if (getUrlParameterDef("dbg-sel", "") == "1")
+				println("SEL " + nm + " sym=" + lookupTreeDef(symOf, nm, "-")
+					+ " stmt=" + (if (isSome(stmtOf(nm))) "yes" else "NO")
+					+ " inst=" + (if (isSome(r)) "yes" else "no"));
+			switch (r) { None(): acc; Some(d): arrayPush(acc, d); }
 		});
 }
 
@@ -1904,10 +1913,27 @@ mizEmitDefInstance(nm : string, sym : string, stepAtoms : [FolForm],
 			binders = pre.first;
 			if (binders == []) None()
 			else {
-				hasSym = \a : FolForm -> sym == "" || mizEmitFormHasSym(a, sym);
-				pats = mizEmitRankAtoms(filter(mizEmitAtomsOf(pre.second, []), hasSym));
-				tgts = mizEmitRankAtoms(filter(stepAtoms, hasSym));
-				switch (mizEmitFirstMatch(pats, tgts, buildSet(binders), binders)) {
+				metas = buildSet(binders);
+				// A FUNCTOR definition is matched at the TERM, not at the atom: it
+				// says `f(ā) = …`, while the step says something ABOUT `f(ā)`, so
+				// the atoms never correspond. Matching the definiendum against the
+				// step's occurrence of that symbol is what fixes the binders —
+				// this is the whole reason the record carries the symbol.
+				byTerm = if (sym == "") None() else {
+					pts = mizEmitDefiendumTerms(pre.second, sym);
+					tts = uniq(concatA(map(stepAtoms, \a -> mizEmitSymTerms(a, sym))));
+					mizEmitFirstTermMatch(pts, tts, metas, binders);
+				};
+				ws0 = switch (byTerm) {
+					Some(__): byTerm;
+					None(): {
+						hasSym = \a : FolForm -> sym == "" || mizEmitFormHasSym(a, sym);
+						pats = mizEmitRankAtoms(filter(mizEmitAtomsOf(pre.second, []), hasSym));
+						tgts = mizEmitRankAtoms(filter(stepAtoms, hasSym));
+						mizEmitFirstMatch(pats, tgts, metas, binders);
+					}
+				};
+				switch (ws0) {
 					None(): None();
 					Some(ws): mizEmitRecordDrv(nm, st, ws, [], shOf);
 				}
@@ -2004,4 +2030,48 @@ mizEmitDischarge(d : MizEmitDrv, ctx : [Pair<FolForm, RuParseRef>]) -> MizEmitDr
 		mizEmitDischarged := ^mizEmitDischarged + 1;
 		MizEmitDrv(^form, ^steps, ^refs, d.disjs);
 	}
+}
+
+// the definiendum terms of a definition: the applications of `sym` in it
+mizEmitDefiendumTerms(f : FolForm, sym : string) -> [FolTerm] {
+	concatA(map(mizEmitAtomsOf(f, []), \a -> mizEmitSymTerms(a, sym)));
+}
+
+// every subterm of an atom that applies `sym`
+mizEmitSymTermsT(t : FolTerm, sym : string, acc : [FolTerm]) -> [FolTerm] {
+	switch (t) {
+		FolApp(n, args): {
+			a2 = fold(args, acc, \ac, a -> mizEmitSymTermsT(a, sym, ac));
+			if (n == sym) arrayPush(a2, t) else a2;
+		}
+		default: acc;
+	}
+}
+
+mizEmitSymTerms(f : FolForm, sym : string) -> [FolTerm] {
+	switch (f) {
+		FolPred(__, args): fold(args, [], \ac, a -> mizEmitSymTermsT(a, sym, ac));
+		FolEq(l, r):       mizEmitSymTermsT(r, sym, mizEmitSymTermsT(l, sym, []));
+		default:           [];
+	}
+}
+
+mizEmitFirstTermMatch(pats : [FolTerm], tgts : [FolTerm], metas : Set<string>,
+	binders : [string]) -> Maybe<[Pair<string, FolTerm>]> {
+	fold(pats, None(), \acc : Maybe<[Pair<string, FolTerm>]>, pat -> switch (acc) {
+		Some(__): acc;
+		None(): fold(tgts, None(), \a2 : Maybe<[Pair<string, FolTerm>]>, tt -> switch (a2) {
+			Some(__): a2;
+			None(): switch (mizEmitMatchT(pat, tt, metas, Some(makeTree()))) {
+				None(): None();
+				Some(sub): {
+					ws = filtermap(binders, \b -> switch (lookupTree(sub, b)) {
+						None(): None();
+						Some(t): Some(Pair(b, t));
+					});
+					if (length(ws) != length(binders)) None() else Some(ws);
+				}
+			}
+		});
+	});
 }
