@@ -626,3 +626,24 @@ definition's two halves offered as separate pieces, or an n-ary
 `x ∈ {a₁..aₙ} ↔ ⋁ x = aᵢ` unfold with its own lemma), not a bigger tableau. The
 means-instantiation code is reverted with the rest — it is neutral where the
 record does name definitions (relat_1 94, subset_1 29 unchanged).
+
+### 2026-08-09 — the budget bound, so I stopped throwing steps away
+*Expected*: after the last finding ("the fact budget binds"), that the answer
+was to need fewer facts.
+*Found*: half the answer. The other half was what the code DID when the budget
+bound — it skipped the attempt, and the step was never tried: 47 of zfmisc_1's
+319 steps, 9 of xboole_1's. Ranking the relevant facts (most goal atoms shared
+first, smaller first among equals) and attempting with the best two thirds of
+the budget and a third of the tree closes more AND runs faster: xboole_1 84 s
+against 103, zfmisc_1 70 against 114, relat_1 29 against 49. Nothing is skipped
+over budget in any article now.
+Two pieces pull the same way: a ∀-quantified derived fact is instantiated at
+the goal's element and replaced by the instance (dropped if it cannot be
+instantiated — to the tableau it was one opaque atom that matched nothing), and
+the checker's normalized iff is re-stated as the equivalence it means, which
+the certificate proves for itself (269 facts across four articles).
+*Consequence*: three lessons about this tableau, in order of how much they were
+worth: never abandon an attempt you can make smaller; state a fact as what it
+means, not as what the normalizer left; and a fact the tableau cannot use is
+worse than no fact. The scoreboard: xboole_1 64/116 theorems, zfmisc_1 16/140,
+enumset1 11/87, relat_1 2/175, subset_1 2/53, all Metamath-gated.
