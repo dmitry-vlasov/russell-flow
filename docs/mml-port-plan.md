@@ -262,6 +262,23 @@ first, the Metamath checker judges second. Any measurement taken without the
 first is not a measurement. Corrected figures: 130/241, 91/289, 27/130
 by-steps and 33/116, 10/140, 2/53 theorems on xboole_1/zfmisc_1/subset_1.
 
+### 2026-08-09 — S-C first consumption: right instances, not yet enough
+*Expected*: feeding the emitter the definitions the checker expanded would
+close subset_1's open steps, since those premises have no citation of their own.
+*Found*: the instances are built correctly — 70 of 151 named definitions on
+xboole_1, 143 of 242 on zfmisc_1, 39 of 92 on subset_1 — and nothing closed.
+(One prerequisite was missing first: an imported DEFINITION is emitted in its
+own article as an AXIOM, and only imported THEOREMS were indexed, so every name
+the record produced resolved to nothing.)
+*Why it is not enough*: subset_1's definitions are TYPE-GUARDED —
+`d4_subset_1 : ∀X∀A ( A is Element of 𝒫 X → (X ∖ A) = … )`. Using one means
+discharging the guard from the context and then REWRITING with the equation it
+yields. That is equality reasoning, and the certificate offered it as a
+propositional fact.
+*Consequence*: the next mechanism is guarded definitional rewriting, and the
+one after it is the cluster half of the record (which supplies the guards that
+the context does NOT already carry — the non-emptiness a registration proves).
+
 ### 2026-08-09 — the equality family wanted a SMALLER PROOF, not more facts
 *Expected*: the theorems that are one step short are short of premises.
 *Found*: the certificate never said which limit it hit. Made to say so, it
