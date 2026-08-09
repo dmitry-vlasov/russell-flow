@@ -262,6 +262,32 @@ first, the Metamath checker judges second. Any measurement taken without the
 first is not a measurement. Corrected figures: 130/241, 91/289, 27/130
 by-steps and 33/116, 10/140, 2/53 theorems on xboole_1/zfmisc_1/subset_1.
 
+### 2026-08-09 — the emitter had not COMPILED for an hour
+*Expected*: that `build_java.sh` builds, since I was reading its error lines.
+*Found*: it was dying with a StackOverflowError inside the flow typechecker,
+which my grep filtered away, so several rounds of "no change" were measured
+against a jar that predated the code. Cause: three recursive lambdas written by
+self-application (`\self, t -> … self(self, a)`), which the typechecker does
+not converge on.
+*Consequence*: they are plain top-level functions now. And the rule that
+already applies to `verify.success` applies to the build: never read a tool's
+output through a filter that can hide its failure.
+
+### 2026-08-09 — S-C: what a type guard needs, exactly
+*Expected*: matching definitions better would close subset_1's steps.
+*Found*: matching a FUNCTOR definition needs the TERM, not the atom — it says
+`f(ā) = …` while the step says something about `f(ā)` — and the record's symbol
+is what makes that exact. With it, instantiation rose (subset_1 39 → 47,
+relat_1 87 of 327) and the first type guards were discharged (relat_1 7).
+subset_1's remain, for two reasons the trace names:
+  * `element (k1_subset_1 x4) 𝒫 x4 → …` with an EMPTY context — the guard is a
+    type fact from a REGISTRATION, which is the cluster half of the record and
+    is still unconsumed;
+  * `element x28 𝒫 x4 → …` with an empty context — the guard is the goal's own
+    ANTECEDENT, and the reduction has no deduction step: an implication goal
+    goes to the certificate whole rather than assuming its antecedent.
+*Consequence*: two mechanisms, in that order. Neither is tuning.
+
 ### 2026-08-09 — S-C: the machinery is in, the SELECTION is what is missing
 *Expected*: recording the functor `equals` expansions and discharging type
 guards would close subset_1's steps.
