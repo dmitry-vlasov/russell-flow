@@ -563,3 +563,22 @@ characterization and membership rewriting, which live ABOVE the certificate.
 means lifting every combinator into deduction form (ax-gen, mpbir, impbii,
 pm3.2i, spei), i.e. the reduction returns `A → X` rather than `X` while an
 assumption is in scope. Nothing else in S-C is blocked on facts any more.
+
+### 2026-08-09 — reducing UNDER the assumption is what paid
+*Expected*: assuming the antecedent at the certificate would be enough.
+*Found*: it was worth nothing until the REDUCTION itself ran under the
+assumption. As a leaf the deduction handed the whole consequent to one
+certificate, and a `⊆` consequent wants df-ss and membership rewriting, which
+happen above it. With every combinator given its deduction twin — ax-gen ->
+alrimiv, mpbir -> sylibr, pm3.2i -> jca, impbii -> impbid, and a second
+antecedent assumed as the CONJUNCTION and re-curried with `ex` — xboole_1 went
+48 -> 55 theorems and 186 -> 194 by-steps, relat_1 89 -> 94 steps, and the
+original Metamath checker proves all 55 (zfmisc_1 11, subset_1 2, relat_1 1,
+all four databases verified clean).
+*Consequence*: the pattern to reuse — a reduction rule is only as useful as its
+deduction twin, and the twins are all single lemmas that already exist in the
+foundation. subset_1's own type-guard steps remain open, and the reason has
+moved: t21 now reaches `x ∈ k3(X, k4(X,A,B)) → x ∈ k3(X,A)` under both
+assumptions with 8 facts, and what it lacks is the two functor definitions at
+that step, which its expansion record does not name. That is a RECORD question
+(which definitions the checker expanded where), not a reduction question.
