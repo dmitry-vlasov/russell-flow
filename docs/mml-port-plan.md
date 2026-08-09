@@ -600,3 +600,29 @@ not an instance, and t1_subset_1 was disproved by exactly such a step.
 the supply of facts. More facts per attempt is the wrong direction; what pays is
 a reduction that needs fewer of them (the deduction twins) or a selection that
 picks the right two. Do not retry this without a budget answer first.
+
+### 2026-08-09 — the one-step-short buckets, and what each of them wanted
+*Method*: bucket the theorems that are ONE step short by the skeleton of the
+step that fails (47 xboole_1 + 69 zfmisc_1 + 86 relat_1). One class held 31 of
+them: an equality as the QED step.
+*Found — two one-line answers*: the membership-unfold table had no entry for
+SYMMETRIC DIFFERENCE and none for an ORDERED PAIR in a cartesian product,
+though the foundation has both lemmas (elsymdif, opelxp). t101_xboole_1's trace
+showed the reduction doing everything right and then stopping with
+`x ∈ (X △ Y)` opaque. Adding the two entries: xboole_1 55 -> 63 theorems
+(194 -> 209 steps), zfmisc_1 11 -> 16 (132 -> 139), all Metamath-gated.
+*Found — one wall*: the next bucket is enumset1's 75, every enumerated set past
+a triple. These are MEANS-definitions (`func {x1..x5} means x ∈ it iff …`), and
+they never instantiated because Mizar's `it` occurs in no definiendum term, so
+matching left it unbound. Binding it to the term the definition defines (the
+left side becomes `t = t`, discharged by eqid) makes all 104 of enumset1's
+definitions instantiate — and closes NOTHING. The instances are large and each
+is a k-way case split with k up to 8; offering them put 43 of 95 steps over the
+fact budget, and raising the budget (emf=24 ems=800) ran the JVM out of memory,
+which is the same exponential the earlier budget experiments hit.
+*Consequence*: enumset1 is not short of facts, it is short of a CHEAPER form of
+this fact. What that family needs is a normal form for k-way membership (the
+definition's two halves offered as separate pieces, or an n-ary
+`x ∈ {a₁..aₙ} ↔ ⋁ x = aᵢ` unfold with its own lemma), not a bigger tableau. The
+means-instantiation code is reverted with the rest — it is neutral where the
+record does name definitions (relat_1 94, subset_1 29 unchanged).
