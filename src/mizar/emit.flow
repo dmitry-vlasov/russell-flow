@@ -46,6 +46,8 @@ export {
 	// how many recorded facts were emitted as derived facts (a run counter, for
 	// the census line)
 	mizEmitRecUsed() -> int;
+	// derived facts re-stated as an equivalence instead of the checker's normal form
+	mizEmitCleanCount() -> int;
 	mizEmitRecReset() -> void;
 	// (citations resolved to a statement, instances matched to one) — the two
 	// places the record-to-citation join can fail
@@ -73,11 +75,13 @@ mizEmitLongSteps : ref int = ref 0;
 mizEmitDefNames : ref int = ref 0;
 mizEmitDefMade : ref int = ref 0;
 mizEmitDischarged : ref int = ref 0;
+mizEmitCleaned : ref int = ref 0;
 mizEmitFailUnprov : ref int = ref 0;
 mizEmitFailNodes : ref int = ref 0;
 mizEmitFailSteps : ref int = ref 0;
 mizEmitLongStepCount() -> int { ^mizEmitLongSteps; }
 
+mizEmitCleanCount() -> int { ^mizEmitCleaned; }
 mizEmitDefDiag() -> Triple<int, int, int> {
 	Triple(^mizEmitDefNames, ^mizEmitDefMade, ^mizEmitDischarged);
 }
@@ -90,7 +94,7 @@ mizEmitRecReset() -> void {
 	mizEmitRecCount := 0; mizEmitRecCites := 0; mizEmitRecMatch := 0;
 	mizEmitFailUnprov := 0; mizEmitFailNodes := 0; mizEmitFailSteps := 0;
 	mizEmitLongSteps := 0; mizEmitDefNames := 0; mizEmitDefMade := 0;
-	mizEmitDischarged := 0;
+	mizEmitDischarged := 0; mizEmitCleaned := 0;
 }
 
 mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
@@ -154,7 +158,10 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 					l, stmtOf, isAxiom, shOf, 2);
 			default: [];
 		}));
-		drvs = concatA([drvs0, defDrvs, guardDrvs]);
+		// every derived fact is offered in the CHEAPER of the two forms — the
+		// checker's normalized iff costs twice the connectives of the equivalence
+		// it states, and the budget is what binds
+		drvs = map(concatA([drvs0, defDrvs, guardDrvs]), mizEmitCleanIff);
 		// `dbg-thm=<name>` traces one theorem's certificate attempts
 		mizEmitDbg := (t.name == getUrlParameterDef("dbg-thm", ""));
 		mizEmitStepLong := false;
@@ -1578,6 +1585,131 @@ mizEmitRecFromCites(cites : [string], fact : FolForm,
 				}
 		}
 	});
+}
+
+// ---- THE CHECKER'S IFF, IN HALF THE SIZE ----
+// Mizar's checker normalizes `A ↔ B` to `¬(A ∧ ¬B) ∧ (¬B ∨ A)`, and every
+// definition it hands us arrives in that shape: twice the connectives of the
+// equivalence it states, with the disjuncts buried under a negated conjunction.
+// Since the fact BUDGET is what binds — raising it runs the tableau out of
+// memory — the cheaper form is worth a proof of its own. It is a propositional
+// consequence, so the certificate itself derives it, over three atoms and in a
+// handful of steps, and the STEP's tableau then sees the equivalence.
+mizEmitCleanIff(d : MizEmitDrv) -> MizEmitDrv {
+	if (getUrlParameterDef("dbg-clean", "") == "1")
+		println("CLEAN? cands=" + i2s(length(mizEmitIffCands(d.form)))
+			+ " :: " + strGlue(folFormToks(d.form), " "));
+	fold(mizEmitIffCands(d.form), d, \acc : MizEmitDrv, clean ->
+		if (acc.form != d.form) acc
+		else if (mizEmitFormSize(clean) >= mizEmitFormSize(d.form)) acc
+		else {
+			atoms : ref Tree<string, FolForm> = ref makeTree();
+			factP = mizEmitP(atoms, d.form);
+			goalP = mizEmitP(atoms, clean);
+			tab = ^atoms;
+			switch (folPCertBounded([factP], goalP,
+				\k -> lookupTreeDef(tab, k, FolPred("$false", [])), 2000, 300)) {
+				None(): {
+					if (getUrlParameterDef("dbg-clean", "") == "1")
+						println("  CLEAN-FAIL " + folPCertLastFail() + " :: "
+							+ strGlue(folFormToks(clean), " "));
+					acc;
+				}
+				Some(cs): {
+					base = length(d.steps);
+					shifted = map(cs, \c -> FolPStep(c.form, c.assertion, map(c.refs, \r -> switch (r) {
+						FolPRefStep(k): FolPRefStep(base + k);
+						FolPRefFact(__): FolPRefStep(base - 1);
+					})));
+					mizEmitCleaned := ^mizEmitCleaned + 1;
+					MizEmitDrv(clean, concat(d.steps, shifted), d.refs, d.disjs);
+				}
+			}
+		});
+}
+
+// The checker's iff is a CONJUNCTION OF TWO IMPLICATIONS, each written in
+// whatever negated form its normalization left: `A → B` beside `¬(B ∧ ¬A)`,
+// or `¬(A ∧ N)` beside `N ∨ A`. Rather than enumerate the shapes, each half is
+// read as an implication, the two candidate equivalences are formed, and the
+// CERTIFICATE decides — a guess it cannot prove is simply not offered.
+mizEmitIffCands(f : FolForm) -> [FolForm] {
+	switch (f) {
+		FolBin(op, l, r): if (op != "and") [] else {
+			i1 = mizEmitAsImp(l);
+			i2 = mizEmitAsImp(r);
+			switch (i1) {
+				None(): [];
+				Some(p1): switch (i2) {
+					None(): [];
+					Some(p2): uniq([FolBin("iff", p1.first, p1.second),
+						FolBin("iff", p2.first, p2.second)]);
+				}
+			}
+		}
+		default: [];
+	}
+}
+
+// one half, read as an implication:
+//   A → B                    as itself
+//   ¬(c₁ ∧ … ∧ ¬A)           as (c₁ ∧ …) → A     — the trailing ¬A is the conclusion
+//   ¬(A ∧ B)                 as A → ¬B
+//   A ∨ B                    as ¬A → B
+mizEmitAsImp(f : FolForm) -> Maybe<Pair<FolForm, FolForm>> {
+	switch (f) {
+		FolBin(op, l, r):
+			if (op == "imp") Some(Pair(l, r))
+			else if (op == "or") Some(Pair(mizEmitNegIn(l), r))
+			else None();
+		FolNeg(g): switch (g) {
+			FolBin(op2, __, __): if (op2 != "and") None() else {
+				cs = mizEmitConjuncts(g, []);
+				n = length(cs);
+				switch (cs[n - 1]) {
+					FolNeg(a): Some(Pair(mizEmitConj(subrange(cs, 0, n - 1)), a));
+					default: switch (g) {
+						FolBin(__, a, b): Some(Pair(a, mizEmitNegIn(b)));
+						default: None();
+					}
+				}
+			}
+			default: None();
+		}
+		default: None();
+	}
+}
+
+mizEmitConjuncts(f : FolForm, acc : [FolForm]) -> [FolForm] {
+	switch (f) {
+		FolBin(op, l, r): if (op != "and") arrayPush(acc, f)
+			else mizEmitConjuncts(r, mizEmitConjuncts(l, acc));
+		default: arrayPush(acc, f);
+	}
+}
+
+mizEmitConj(fs : [FolForm]) -> FolForm {
+	if (fs == []) FolPred("$true", [])
+	else foldi(tail(fs), fs[0], \__, acc, f -> FolBin("and", acc, f));
+}
+
+// ¬(¬p ∧ rest) -> p ∨ ¬rest, recursively; anything else keeps its negation
+mizEmitNegIn(f : FolForm) -> FolForm {
+	switch (f) {
+		FolNeg(g): g;
+		FolBin(op, l, r): if (op != "and") FolNeg(f)
+			else FolBin("or", mizEmitNegIn(l), mizEmitNegIn(r));
+		default: FolNeg(f);
+	}
+}
+
+mizEmitFormSize(f : FolForm) -> int {
+	switch (f) {
+		FolNeg(g): 1 + mizEmitFormSize(g);
+		FolBin(__, l, r): 1 + mizEmitFormSize(l) + mizEmitFormSize(r);
+		FolQuant(__, __, b): 1 + mizEmitFormSize(b);
+		default: 1;
+	}
 }
 
 // A RECORDED fact as a derived fact: cite the premise by name, then eliminate
