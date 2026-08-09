@@ -56,6 +56,8 @@ export {
 	// failed steps for which SOME attempt produced a proof that was merely too
 	// long or too big — those are an encoding problem, not a fact problem
 	mizEmitLongStepCount() -> int;
+	// (definitions the record named at emitted steps, instances built from them)
+	mizEmitDefDiag() -> Pair<int, int>;
 }
 
 mizEmitRecCount : ref int = ref 0;
@@ -68,10 +70,14 @@ mizEmitDbg : ref bool = ref false;
 // That step wants a smaller encoding, not better facts.
 mizEmitStepLong : ref bool = ref false;
 mizEmitLongSteps : ref int = ref 0;
+mizEmitDefNames : ref int = ref 0;
+mizEmitDefMade : ref int = ref 0;
 mizEmitFailUnprov : ref int = ref 0;
 mizEmitFailNodes : ref int = ref 0;
 mizEmitFailSteps : ref int = ref 0;
 mizEmitLongStepCount() -> int { ^mizEmitLongSteps; }
+
+mizEmitDefDiag() -> Pair<int, int> { Pair(^mizEmitDefNames, ^mizEmitDefMade); }
 
 mizEmitFailKinds() -> Triple<int, int, int> {
 	Triple(^mizEmitFailUnprov, ^mizEmitFailNodes, ^mizEmitFailSteps);
@@ -80,7 +86,7 @@ mizEmitRecUsed() -> int { ^mizEmitRecCount; }
 mizEmitRecReset() -> void {
 	mizEmitRecCount := 0; mizEmitRecCites := 0; mizEmitRecMatch := 0;
 	mizEmitFailUnprov := 0; mizEmitFailNodes := 0; mizEmitFailSteps := 0;
-	mizEmitLongSteps := 0;
+	mizEmitLongSteps := 0; mizEmitDefNames := 0; mizEmitDefMade := 0;
 }
 
 mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
@@ -92,7 +98,14 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 		pos = if (i < length(t.stepPos)) t.stepPos[i] else "";
 		recs = if (pos == "") [] else recOf(pos);
 		cites = if (i < length(t.stepRefs)) t.stepRefs[i] else [];
-		drvs = filtermap(recs, \fact -> {
+		// S-C: the definitions the checker expanded for THIS step, instantiated
+		// against the step's own atoms
+		stepAtoms = uniq(concatA(map(concat(t.hyps, arrayPush(subrange(t.steps, 0, i), goal)),
+			\f -> mizEmitAtomsOf(f, []))));
+		defDrvs = mizEmitDefUnfolds(expOf(pos), stepAtoms, stmtOf, shOf, 4);
+		mizEmitDefNames := ^mizEmitDefNames + length(expOf(pos));
+		mizEmitDefMade := ^mizEmitDefMade + length(defDrvs);
+		drvs0 = filtermap(recs, \fact -> {
 			// the step's own citations first, then any environment statement with
 			// the same skeleton (the premise Mizar used without citing it)
 			// the step's citations, the DEFINITIONS the checker expanded while
@@ -102,6 +115,7 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 			if (isSome(d)) mizEmitRecCount := ^mizEmitRecCount + 1;
 			d;
 		});
+		drvs = concat(drvs0, defDrvs);
 		// `dbg-thm=<name>` traces one theorem's certificate attempts
 		mizEmitDbg := (t.name == getUrlParameterDef("dbg-thm", ""));
 		mizEmitStepLong := false;
@@ -1797,4 +1811,70 @@ mizEmitCtxNF(ctx : [Pair<FolForm, RuParseRef>]) -> [MizEmitDrv] {
 			}
 		}
 	});
+}
+
+// ---- S-C: unfold the definitions the CHECKER expanded ----
+// Mizar expands a definition with no `by` reference, so a premise that came
+// from one has nothing to cite and the emitter could not build it. The
+// expansion record names them per inference (mizDerivPosExpansions), and a
+// definition's instance is determined by the step's own atoms: match the
+// definiendum against an atom that occurs in the step and every binder is
+// fixed. This is what subset_1's open steps are made of — the meaning of
+// `Element of`, of `𝒫`, of `⊆` — and no amount of propositional work reaches
+// them, because they are type-layer facts Mizar never states.
+
+// every atom (predicate application or equality) of a formula
+mizEmitAtomsOf(f : FolForm, acc : [FolForm]) -> [FolForm] {
+	switch (f) {
+		FolPred(__, __):     arrayPush(acc, f);
+		FolEq(__, __):       arrayPush(acc, f);
+		FolNeg(g):           mizEmitAtomsOf(g, acc);
+		FolBin(__, l, r):    mizEmitAtomsOf(r, mizEmitAtomsOf(l, acc));
+		FolQuant(__, __, b): mizEmitAtomsOf(b, acc);
+	}
+}
+
+// the instantiated definitions, as derived facts; at most `cap` of them
+mizEmitDefUnfolds(names : [string], stepAtoms : [FolForm],
+	stmtOf : (string) -> Maybe<FolForm>, shOf : (string) -> string,
+	cap : int) -> [MizEmitDrv] {
+	fold(names, [], \acc : [MizEmitDrv], nm ->
+		if (length(acc) >= cap) acc
+		else switch (stmtOf(nm)) {
+			None(): acc;
+			Some(st): {
+				pre = mizEmitPrefixOf(st, []);
+				binders = pre.first;
+				if (binders == []) acc
+				else {
+					metas = buildSet(binders);
+					// the first (pattern atom, step atom) pair that fixes every binder
+					found = fold(mizEmitAtomsOf(pre.second, []), None(),
+						\a1 : Maybe<[Pair<string, FolTerm>]>, pat -> switch (a1) {
+							Some(__): a1;
+							None(): fold(stepAtoms, None(),
+								\a2 : Maybe<[Pair<string, FolTerm>]>, at -> switch (a2) {
+									Some(__): a2;
+									None(): switch (mizEmitMatchF(pat, at, metas, Some(makeTree()))) {
+										None(): None();
+										Some(sub): {
+											ws = filtermap(binders, \b -> switch (lookupTree(sub, b)) {
+												None(): None();
+												Some(t): Some(Pair(b, t));
+											});
+											if (length(ws) != length(binders)) None() else Some(ws);
+										}
+									}
+								});
+						});
+					switch (found) {
+						None(): acc;
+						Some(ws): switch (mizEmitRecordDrv(nm, st, ws, [], shOf)) {
+							None(): acc;
+							Some(d): arrayPush(acc, d);
+						}
+					}
+				}
+			}
+		});
 }
