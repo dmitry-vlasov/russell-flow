@@ -262,6 +262,24 @@ first, the Metamath checker judges second. Any measurement taken without the
 first is not a measurement. Corrected figures: 130/241, 91/289, 27/130
 by-steps and 33/116, 10/140, 2/53 theorems on xboole_1/zfmisc_1/subset_1.
 
+### 2026-08-09 — S-C: the machinery is in, the SELECTION is what is missing
+*Expected*: recording the functor `equals` expansions and discharging type
+guards would close subset_1's steps.
+*Found*: both work and neither closes anything. The functor expansions are
+recorded (6,167 on subset_1, SUBSET_1 def 2/3/4 among them); a guarded
+definition whose guard is in the context is discharged by ax-mp. But the
+instances the emitter actually builds are the wrong ones — of 92 definitions
+named at subset_1's emitted steps, 39 are instantiated and 0 are guarded ones,
+because the selection matches a definition's atom against a step atom and the
+generic `A = B iff A ⊆ B ∧ B ⊆ A` matches everything. Ordering by shared
+article symbol was not enough.
+*Consequence*: the open work is the SELECTION — pick the definition by its
+definiendum, which means knowing each definition's defined symbol rather than
+guessing it from the statement. The record already names the definition; what
+it does not say is which symbol occurrence in the step it was applied to. That
+is the next thing to instrument: the expansion record should carry the TERM it
+rewrote, not only the definition's number.
+
 ### 2026-08-09 — S-C first consumption: right instances, not yet enough
 *Expected*: feeding the emitter the definitions the checker expanded would
 close subset_1's open steps, since those premises have no citation of their own.
