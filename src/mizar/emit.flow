@@ -247,8 +247,33 @@ mizEmitReduce(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 				};
 				switch (memR) {
 					Some(__): Pair(memR, false);
-					None(): mizEmitBinGoal(hyps, prev, goal, op0, l0, r0, maxFacts, maxSize,
-						depth, fresh, used, direct, recDrv);
+					None(): {
+						// THE DEDUCTION STEP. An implication goal reached the
+						// certificate whole and with nothing to reason from — for
+						// t21_subset_1, `facts=0`. Mizar reads `A → B` by assuming A,
+						// so the antecedent joins the facts and the certificate
+						// concludes `A → B` itself (folPCertAssuming). This is a leaf
+						// strategy: the consequent is not reduced further, because
+						// every combinator above would then have to be lifted into
+						// deduction form.
+						// `A → ∀x C` is `∀x (A → C)` when x is not free in A — the
+					// shape a Mizar `assume` followed by a `let` leaves. Swapping
+					// it (19.21v) puts the ∀ back on the outside, where ax-gen
+					// peels it and each antecedent is assumed in turn.
+					swapped = if (op0 != "imp") Pair(None(), false)
+						else mizEmitImpAll(hyps, prev, goal, l0, r0, maxFacts, maxSize,
+							depth, fresh, used, recDrv);
+					ded = switch (swapped.first) {
+						Some(__): swapped;
+						None(): if (op0 != "imp") Pair(None(), false)
+							else mizEmitLadderA(hyps, prev, r0, maxFacts, maxSize, recDrv, Some(l0));
+					};
+						switch (ded.first) {
+							Some(__): ded;
+							None(): mizEmitBinGoal(hyps, prev, goal, op0, l0, r0, maxFacts, maxSize,
+								depth, fresh, used, direct, recDrv);
+						}
+					}
 				}
 			}
 			default: {
@@ -282,6 +307,41 @@ mizEmitGoalNF(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 				}
 			}
 		}
+	}
+}
+
+// `A → ∀x C` from `∀x (A → C)` by 19.21v (its disjointness condition — x not
+// free in A — is exactly when the two are the same statement), so a goal that
+// alternates antecedents and binders is peeled the whole way down instead of
+// stopping at the first implication.
+mizEmitImpAll(hyps : [FolForm], prev : [FolForm], goal : FolForm,
+	a : FolForm, r : FolForm, maxFacts : int, maxSize : int, depth : int,
+	fresh : ref int, used : Set<string>, recDrv : [MizEmitDrv]) -> Pair<Maybe<FolStepProof>, bool> {
+	switch (r) {
+		FolQuant(q, vs, body): if (q != "forall" || vs == []) Pair(None(), false) else {
+			v = vs[0];
+			rest = if (length(vs) == 1) body else FolQuant("forall", tail(vs), body);
+			if (mizEmitFreeIn(v, a)) Pair(None(), false)
+			else {
+				subGoal = FolQuant("forall", [v], FolBin("imp", a, rest));
+				sub = mizEmitReduce(hyps, prev, subGoal, maxFacts, maxSize, depth + 1,
+					fresh, used, recDrv);
+				switch (sub.first) {
+					None(): Pair(None(), sub.second);
+					Some(pr): {
+						inst = FolBin("iff", subGoal, goal);
+						vr = toLowerCase(v);
+						dj = filtermap(folFormVars(a), \w -> if (w == vr) None() else Some(Pair(vr, w)));
+						n0 = length(pr.steps);
+						sw = FolPStep(inst, "19.21v", []);
+						mp = FolPStep(goal, "mpbi", [FolPRefStep(n0 - 1), FolPRefStep(n0)]);
+						Pair(Some(FolStepProof(concatA([pr.steps, [sw, mp]]),
+							pr.factRefs, uniq(concat(pr.disjs, dj)))), false);
+					}
+				}
+			}
+		}
+		default: Pair(None(), false);
 	}
 }
 
@@ -434,6 +494,17 @@ mizEmitCharGoal(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 
 mizEmitLadder(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 	maxFacts : int, maxSize : int, recDrv : [MizEmitDrv]) -> Pair<Maybe<FolStepProof>, bool> {
+	mizEmitLadderA(hyps, prev, goal, maxFacts, maxSize, recDrv, None());
+}
+
+// `asm` is the ASSUMED formula of a deduction step: it joins the facts the
+// ladder reasons from, and the certificate concludes `asm → goal` instead of
+// `goal` (folPCertAssuming). Everything else — unfolds, bridges, instances,
+// relevance — sees it as an ordinary fact, which is the point: an implication
+// goal was reaching the certificate whole, with nothing to reason from.
+mizEmitLadderA(hyps : [FolForm], prev : [FolForm], goal : FolForm,
+	maxFacts : int, maxSize : int, recDrv : [MizEmitDrv],
+	asm : Maybe<FolForm>) -> Pair<Maybe<FolStepProof>, bool> {
 	ctx0 = concat(
 		mapi(hyps, \j, h -> Pair(h, mizEmitHypRef(j))),
 		mapi(prev, \j, s -> Pair(s, mizEmitStepRef(j))));
@@ -441,17 +512,18 @@ mizEmitLadder(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 	// relevance drops them unless a characterization instance (df-ss/dfcleq)
 	// links them to a ⊆/= atom, which is exactly when they are needed
 	ctx = ctx0;
-	allForms = arrayPush(map(filter(ctx, \p -> !mizEmitHasQuant(p.first)),
-		\p -> p.first), goal);
+	allForms = concat(arrayPush(map(filter(ctx, \p -> !mizEmitHasQuant(p.first)),
+		\p -> p.first), goal),
+		switch (asm) { None(): []; Some(af): if (mizEmitHasQuant(af)) [] else [af]; });
 	insts0 = fold(allForms, makeTree(), \acc, f -> mizEmitUnfolds(f, acc));
 	// LADDER: rung 1 membership unfolds alone; rung 2 adds the ⊆/= bridges;
 	// rung 3 adds ∀-INSTANCES of the quantified local facts (spv + walk)
-	r1 = mizEmitTry(ctx, goal, getTreeValues(insts0), recDrv, maxFacts, maxSize);
+	r1 = mizEmitTry(ctx, goal, getTreeValues(insts0), recDrv, maxFacts, maxSize, asm);
 	switch (r1.first) {
 		Some(__): r1;
 		None(): if (r1.second) r1 else {
 			bridged = getTreeValues(mizEmitBridges(allForms, insts0));
-			r2 = mizEmitTry(ctx, goal, bridged, recDrv, maxFacts, maxSize);
+			r2 = mizEmitTry(ctx, goal, bridged, recDrv, maxFacts, maxSize, asm);
 			switch (r2.first) {
 				Some(__): r2;
 				None(): if (r2.second) r2 else {
@@ -463,7 +535,7 @@ mizEmitLadder(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 						all2 = concat(allForms, map(drv, \d -> d.form));
 						i2 = fold(all2, makeTree(), \acc, f -> mizEmitUnfolds(f, acc));
 						mizEmitTry(ctx, goal,
-							getTreeValues(mizEmitBridges(all2, i2)), drv, maxFacts, maxSize);
+							getTreeValues(mizEmitBridges(all2, i2)), drv, maxFacts, maxSize, asm);
 					}
 				}
 			}
@@ -473,21 +545,22 @@ mizEmitLadder(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 
 mizEmitTry(ctx : [Pair<FolForm, RuParseRef>], goal : FolForm,
 	instList : [Pair<FolForm, string>], drv : [MizEmitDrv],
-	maxFacts : int, maxSize : int) -> Pair<Maybe<FolStepProof>, bool> {
+	maxFacts : int, maxSize : int, asm : Maybe<FolForm>) -> Pair<Maybe<FolStepProof>, bool> {
 	atoms : ref Tree<string, FolForm> = ref makeTree();
 	ctxP0 = map(ctx, \p -> mizEmitP(atoms, p.first));
 	instP0 = map(instList, \p -> mizEmitP(atoms, p.first));
 	drvP0 = map(drv, \d -> mizEmitP(atoms, d.form));
 	goalP = mizEmitP(atoms, goal);
+	asmP = maybeMap(asm, \af -> mizEmitP(atoms, af));
 	r0 = mizEmitTrySel(ctx, goal, instList, drv, maxFacts, maxSize,
-		atoms, ctxP0, instP0, drvP0, goalP, 1000000);
+		atoms, ctxP0, instP0, drvP0, goalP, 1000000, asm, asmP);
 	switch (r0.first) {
 		Some(__): r0;
 		None(): if (!r0.second) r0
 			// over budget with the full relevance closure: retry with DIRECT
 			// (1-hop) relevance — most by-steps use immediately related facts
 			else mizEmitTrySel(ctx, goal, instList, drv, maxFacts, maxSize,
-				atoms, ctxP0, instP0, drvP0, goalP, 1);
+				atoms, ctxP0, instP0, drvP0, goalP, 1, asm, asmP);
 	}
 }
 
@@ -495,10 +568,16 @@ mizEmitTrySel(ctx : [Pair<FolForm, RuParseRef>], goal : FolForm,
 	instList : [Pair<FolForm, string>], drv : [MizEmitDrv],
 	maxFacts : int, maxSize : int, atoms : ref Tree<string, FolForm>,
 	ctxP0 : [RuPForm], instP0 : [RuPForm], drvP0 : [RuPForm], goalP : RuPForm,
-	hops : int) -> Pair<Maybe<FolStepProof>, bool> {
+	hops : int, asm : Maybe<FolForm>, asmP : Maybe<RuPForm>) -> Pair<Maybe<FolStepProof>, bool> {
 	// RELEVANCE: keep only facts/unfolds connected to the goal through shared
 	// atoms (`hops` rounds) — an unrelated fact only inflates the G3cp tree
-	rel = mizEmitRelevantH(concatA([ctxP0, instP0, drvP0]), goalP, hops);
+	// the ASSUMPTION goes in last so the index ranges below are untouched, and
+	// it is never dropped: without it the certificate would prove `goal`, not
+	// `asm → goal`. Relevance still runs THROUGH it, which is how a fact that
+	// only relates to the antecedent survives.
+	rel0 = mizEmitRelevantH(concatA([ctxP0, instP0, drvP0,
+		switch (asmP) { None(): []; Some(ap): [ap]; }]), goalP, hops);
+	rel = rel0;
 	keepCtx = filteri(ctx, \j, __ -> containsSet(rel, j));
 	ctxP = filteri(ctxP0, \j, __ -> containsSet(rel, j));
 	nC0 = length(ctxP0);
@@ -507,15 +586,17 @@ mizEmitTrySel(ctx : [Pair<FolForm, RuParseRef>], goal : FolForm,
 	nI0 = nC0 + length(instP0);
 	drvKeep = filteri(drv, \j, __ -> containsSet(rel, nI0 + j));
 	drvP = filteri(drvP0, \j, __ -> containsSet(rel, nI0 + j));
-	factsP = concatA([ctxP, instP, drvP]);
+	factsP = concat(concatA([ctxP, instP, drvP]),
+		switch (asmP) { None(): []; Some(ap): [ap]; });
+	assumedIdx = switch (asmP) { None(): -1; Some(__): length(factsP) - 1; };
 	size = fold(factsP, mizEmitSize(goalP), \acc, f -> acc + mizEmitSize(f));
 	if (length(factsP) > maxFacts || size > maxSize) Pair(None(), true)
 	else {
 		tab = ^atoms;
 		// cap the G3cp tree and the emitted proof: a by-step certificate past a
 		// few hundred steps is a blowup, not a proof — reject, keep the step open
-		switch (folPCertBounded(factsP, goalP, \k -> lookupTreeDef(tab, k, FolPred("$false", [])),
-			5000, 600)) {
+		switch (folPCertAssuming(factsP, goalP, \k -> lookupTreeDef(tab, k, FolPred("$false", [])),
+			5000, 600, assumedIdx)) {
 			None(): {
 				k = folPCertLastFail();
 				if (^mizEmitDbg)

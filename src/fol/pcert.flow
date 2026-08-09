@@ -40,6 +40,15 @@ export {
 	// or the emitted proof exceeds maxSteps.
 	folPCertBounded(facts : [RuPForm], goal : RuPForm, atom : (string) -> FolForm,
 		maxNodes : int, maxSteps : int) -> Maybe<[FolPStep]>;
+	// THE DEDUCTION FORM. `assumed` names one fact that is NOT available as
+	// `|- fact` — it is being ASSUMED — so the proof concludes
+	// `|- assumed → goal` instead of `|- goal`. Everything else is unchanged:
+	// the refutation already carries every fact in its context C, and only the
+	// final discharge differs (a1i/id + jca to build `A → ⋀facts`, then syl).
+	// This is what lets a by-step of the shape `A → B` reason FROM A — Mizar's
+	// own reading of it — while still emitting a Hilbert proof of `A → B`.
+	folPCertAssuming(facts : [RuPForm], goal : RuPForm, atom : (string) -> FolForm,
+		maxNodes : int, maxSteps : int, assumed : int) -> Maybe<[FolPStep]>;
 
 	// the same skeleton->dialect rendering the steps use (for headers/reports)
 	folPFol(f : RuPForm, atom : (string) -> FolForm) -> FolForm;
@@ -413,14 +422,23 @@ folPDerivNodes(d : RuPDeriv) -> int {
 // the caller's ORIGINAL ones throughout.
 folPCertBounded(facts0 : [RuPForm], goal : RuPForm, atom : (string) -> FolForm,
 	maxNodes : int, maxSteps : int) -> Maybe<[FolPStep]> {
+	folPCertAssuming(facts0, goal, atom, maxNodes, maxSteps, -1);
+}
+
+folPCertAssuming(facts0 : [RuPForm], goal : RuPForm, atom : (string) -> FolForm,
+	maxNodes : int, maxSteps : int, assumed : int) -> Maybe<[FolPStep]> {
 	all = mapi(facts0, \i, f -> Pair(f, i));
-	switch (folPDoCert(all, goal, atom, maxNodes, maxSteps)) {
+	switch (folPDoCert(all, goal, atom, maxNodes, maxSteps, assumed)) {
 		None(): None();
 		Some(p1): {
 			if (sizeSet(p1.second) >= length(all)) Some(p1.first)
 			else {
-				kept = filter(all, \pr -> containsSet(p1.second, pr.second));
-				switch (folPDoCert(kept, goal, atom, maxNodes, maxSteps)) {
+				// the ASSUMPTION is kept whether the refutation used it or not:
+				// dropping it would leave a proof of `goal`, not of `A → goal`
+				kept = filter(all, \pr -> containsSet(p1.second, pr.second) || pr.second == assumed);
+				kAss = either(findi(kept, \pr -> pr.second == assumed), -1);
+				if (assumed >= 0 && kAss < 0) Some(p1.first)
+				else switch (folPDoCert(kept, goal, atom, maxNodes, maxSteps, kAss)) {
 					Some(p2): Some(p2.first);
 					None(): Some(p1.first);
 				}
@@ -430,7 +448,7 @@ folPCertBounded(facts0 : [RuPForm], goal : RuPForm, atom : (string) -> FolForm,
 }
 
 folPDoCert(factsI : [Pair<RuPForm, int>], goal : RuPForm, atom : (string) -> FolForm,
-	maxNodes : int, maxSteps : int) -> Maybe<Pair<[FolPStep], Set<int>>> {
+	maxNodes : int, maxSteps : int, assumed : int) -> Maybe<Pair<[FolPStep], Set<int>>> {
 	facts = map(factsI, \p -> p.first);
 	switch (ruPProveSeq(facts, [goal])) {
 		None(): { folPCertFail := "unprovable"; None(); }
@@ -453,15 +471,37 @@ folPDoCert(factsI : [Pair<RuPForm, int>], goal : RuPForm, atom : (string) -> Fol
 				cd = folPEmit(a, folPImp(a, fc, RuPImp(RuPNot(fls), goal)), "con1d", [sref(exi)]);
 				fl = folPEmit(a, folPForm(a, RuPNot(fls)), "fal", []);
 				mp = folPEmit(a, folPImp(a, fc, goal), "mpi", [sref(fl), sref(cd)]);
-				start : Pair<FolPRef, RuPForm> = Pair(FolPRefFact(factsI[0].second), facts[0]);
-				conj = foldi(tail(facts), start, \i, acc, f -> {
-					nf = RuPAnd(acc.second, f);
-					r : FolPRef = sref(folPEmit(a, folPForm(a, nf), "pm3.2i",
-						[acc.first, FolPRefFact(factsI[i + 1].second)]));
-					Pair(r, nf);
-				});
-				folPEmit(a, folPForm(a, goal), "ax-mp", [conj.first, sref(mp)]);
-				{}
+				if (assumed < 0 || assumed >= length(facts)) {
+					start : Pair<FolPRef, RuPForm> = Pair(FolPRefFact(factsI[0].second), facts[0]);
+					conj = foldi(tail(facts), start, \i, acc, f -> {
+						nf = RuPAnd(acc.second, f);
+						r : FolPRef = sref(folPEmit(a, folPForm(a, nf), "pm3.2i",
+							[acc.first, FolPRefFact(factsI[i + 1].second)]));
+						Pair(r, nf);
+					});
+					folPEmit(a, folPForm(a, goal), "ax-mp", [conj.first, sref(mp)]);
+					{}
+				} else if (length(facts) == 1) {
+					// the assumption is the only fact: `mp` already proves A → goal
+					{}
+				} else {
+					// DISCHARGE UNDER THE ASSUMPTION. `mp` proves ⋀facts → goal and
+					// every fact but the assumed one is available as `|- f`, so
+					// A → f by a1i, A → A by id, the conjunction by jca in the same
+					// left-nested order, and A → goal by syl.
+					asm = facts[assumed];
+					lift = \i : int, f : RuPForm -> if (i == assumed)
+							folPEmit(a, folPImp(a, asm, f), "id", [])
+						else folPEmit(a, folPImp(a, asm, f), "a1i", [FolPRefFact(factsI[i].second)]);
+					start2 : Pair<int, RuPForm> = Pair(lift(0, facts[0]), facts[0]);
+					conj2 = foldi(tail(facts), start2, \i, acc : Pair<int, RuPForm>, f -> {
+						nf = RuPAnd(acc.second, f);
+						Pair(folPEmit(a, folPImp(a, asm, nf), "jca",
+							[sref(acc.first), sref(lift(i + 1, f))]), nf);
+					});
+					folPEmit(a, folPImp(a, asm, goal), "syl", [sref(conj2.first), sref(mp)]);
+					{}
+				}
 			}
 			usedOrig = foldSet(^(a.used), makeSet(), \s, i ->
 				if (i < length(factsI)) insertSet(s, factsI[i].second) else s);
