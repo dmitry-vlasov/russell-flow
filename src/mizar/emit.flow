@@ -109,8 +109,20 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 		ctxI = concat(
 			mapi(t.hyps, \j, h -> Pair(h, mizEmitHypRef(j))),
 			mapi(subrange(t.steps, 0, i), \j, sp -> Pair(sp, mizEmitStepRef(j))));
+		// a guard the context does not carry: try to DERIVE it from an
+		// environment statement — the constructor-type axioms are exactly the
+		// statements that say what type a functor term has
+		proveGuard = \g : FolForm -> {
+			cands = concat(cites, bySkeleton(mizEmitSkeleton(g)));
+			// an exact statement first, then the ones that state `g` under guards
+			concat(
+				switch (mizEmitRecFromCites(cands, g, stmtOf, isAxiom, shOf)) {
+					None(): []; Some(d): [d];
+				},
+				mizEmitGuardedInsts(cands, g, stmtOf, isAxiom, shOf, 6));
+		};
 		defDrvs = map(mizEmitDefUnfolds(expOf(pos), stepAtoms, stmtOf, shOf, 6), \d -> {
-			r = mizEmitDischarge(d, ctxI);
+			r = mizEmitDischarge(d, ctxI, proveGuard);
 			if (getUrlParameterDef("dbg-guard", "") == "1" && r.form != d.form)
 				println("DISCHARGED " + strGlue(folFormToks(r.form), " "));
 			if (getUrlParameterDef("dbg-guard", "") == "1" && r.form == d.form)
@@ -1252,6 +1264,42 @@ mizEmitCiteTheorem(name : string, stmt : FolForm, fact : FolForm) -> Maybe<MizEm
 		});
 }
 
+// ---- a fact that arrives UNDER ITS OWN GUARDS ----
+// A constructor-type axiom says `argGuards(L̄) → typ(f(L̄))`, so a step wanting
+// the type fact cannot match the axiom as a whole. Matching its CONCLUSION —
+// the right end of the implication spine — fixes the loci, and the instance is
+// emitted whole: the guards are then discharged by the caller (mizEmitPeel),
+// which is where a guard that is itself a type fact recurses.
+mizEmitConcl(f : FolForm) -> FolForm {
+	switch (f) {
+		FolBin(op, __, r): if (op == "imp") mizEmitConcl(r) else f;
+		default: f;
+	}
+}
+
+mizEmitGuardedInsts(cands : [string], g : FolForm,
+	stmtOf : (string) -> Maybe<FolForm>, isAxiom : (string) -> bool,
+	shOf : (string) -> string, cap : int) -> [MizEmitDrv] {
+	fold(cands, [], \acc : [MizEmitDrv], c ->
+		if (length(acc) >= cap) acc
+		else switch (stmtOf(c)) {
+			None(): acc;
+			Some(st): if (!isAxiom(c)) acc else {
+				pre = mizEmitPrefixOf(st, []);
+				binders = pre.first;
+				concl = mizEmitConcl(pre.second);
+				if (binders == [] || concl == pre.second) acc
+				else switch (mizEmitBinderWits(concl, g, buildSet(binders), binders)) {
+					None(): acc;
+					Some(ws): switch (mizEmitRecordDrv(c, st, ws, [], shOf)) {
+						None(): acc;
+						Some(d): arrayPush(acc, d);
+					}
+				}
+			}
+		});
+}
+
 // The first citation of the step whose statement instantiates to the recorded
 // fact, emitted as a derived fact proved from it.
 mizEmitRecFromCites(cites : [string], fact : FolForm,
@@ -1511,7 +1559,14 @@ mizEmitWalkTerm(steps : ref [FolPStep], x : string, t : FolTerm,
 // whose statement could be resolved).
 mizEmitPieceSkeletons(f : FolForm) -> [string] {
 	body = (mizEmitPrefixOf(f, [])).second;
-	uniq(map(mizEmitPieces(body, [], 2), \pc -> mizEmitSkeleton(pc.form)));
+	// ...and under the skeleton of what it CONCLUDES: a constructor-type axiom
+	// states its type fact under the argument guards, so the statement that
+	// gives `element (k4 …) 𝒫 X` is indexed at `imp(and(…),…)` and a search for
+	// the type fact alone would never reach it. The index only offers
+	// candidates; matching still decides.
+	concl = mizEmitConcl(body);
+	extra = if (concl == body) [] else map(mizEmitPieces(concl, [], 2), \pc -> mizEmitSkeleton(pc.form));
+	uniq(concat(map(mizEmitPieces(body, [], 2), \pc -> mizEmitSkeleton(pc.form)), extra));
 }
 
 mizEmitSkeleton(f : FolForm) -> string {
@@ -2013,23 +2068,44 @@ mizEmitFormHasSym(f : FolForm, sym : string) -> bool {
 // a hypothesis of the theorem or an earlier step, which is where a Mizar `let`
 // puts it — it is discharged here by ax-mp, and the definition's conclusion
 // becomes an ordinary fact.
-mizEmitDischarge(d : MizEmitDrv, ctx : [Pair<FolForm, RuParseRef>]) -> MizEmitDrv {
-	steps : ref [FolPStep] = ref d.steps;
-	refs : ref [RuParseRef] = ref d.refs;
-	// peel `G → C` while G is a context formula; at most a few guards
-	form = ref d.form;
+// A guard the context does NOT carry is usually not a premise at all but a
+// TYPE fact — `{}E is Element of bool E`. Mizar never states it in a proof
+// because the constructor's own type says it, and the translated article now
+// says it too (mizArticleConstrTypes), so the guard is DERIVED here from an
+// environment statement and its derivation is spliced in before the ax-mp.
+mizEmitDischarge(d : MizEmitDrv, ctx : [Pair<FolForm, RuParseRef>],
+	proveGuard : (FolForm) -> [MizEmitDrv]) -> MizEmitDrv {
+	if (d.steps == []) d else {
+		steps : ref [FolPStep] = ref d.steps;
+		refs : ref [RuParseRef] = ref d.refs;
+		disjs : ref [Pair<string, string>] = ref d.disjs;
+		fin = mizEmitPeel(steps, refs, disjs, d.form, length(d.steps) - 1, ctx, proveGuard, 2);
+		if (length(^steps) == length(d.steps)) d
+		else {
+			mizEmitDischarged := ^mizEmitDischarged + 1;
+			MizEmitDrv(fin.first, ^steps, ^refs, uniq(^disjs));
+		}
+	}
+}
+
+// Peel `G → C` off the statement proved at step `idx`, discharging each G by
+// ax-mp; returns the statement reached and the step that proves it. At most a
+// few guards — a Mizar definition carries one per locus.
+mizEmitPeel(steps : ref [FolPStep], refs : ref [RuParseRef],
+	disjs : ref [Pair<string, string>], form0 : FolForm, idx0 : int,
+	ctx : [Pair<FolForm, RuParseRef>], proveGuard : (FolForm) -> [MizEmitDrv],
+	depth : int) -> Pair<FolForm, int> {
+	form = ref form0;
+	idx = ref idx0;
 	go = ref true;
 	fori(0, 3, \__ -> if (^go) {
 		switch (^form) {
 			FolBin(op, l, r): if (op != "imp") go := false else {
-				hit = find(ctx, \p -> p.first == l);
-				switch (hit) {
+				switch (mizEmitMinor(steps, refs, disjs, l, ctx, proveGuard, depth)) {
 					None(): go := false;
-					Some(p): {
-						k = length(^refs);
-						refs := arrayPush(^refs, p.second);
-						steps := arrayPush(^steps, FolPStep(r, "ax-mp",
-							[FolPRefFact(k), FolPRefStep(length(^steps) - 1)]));
+					Some(mref): {
+						steps := arrayPush(^steps, FolPStep(r, "ax-mp", [mref, FolPRefStep(^idx)]));
+						idx := length(^steps) - 1;
 						form := r;
 					}
 				}
@@ -2037,10 +2113,60 @@ mizEmitDischarge(d : MizEmitDrv, ctx : [Pair<FolForm, RuParseRef>]) -> MizEmitDr
 			default: go := false;
 		}
 	});
-	if (length(^steps) == length(d.steps)) d
-	else {
-		mizEmitDischarged := ^mizEmitDischarged + 1;
-		MizEmitDrv(^form, ^steps, ^refs, d.disjs);
+	Pair(^form, ^idx);
+}
+
+// A reference to a proof of `g`: a context formula is cited directly, a
+// CONJUNCTION of provable guards is joined by pm3.2i (a constructor with two
+// typed arguments states its type under both), and anything else is derived
+// from an environment statement — whose own guards are peeled the same way,
+// because a functor's type holds only for arguments of the right type. On
+// failure the appended steps are rolled back, so a block never carries a
+// half-built derivation.
+mizEmitMinor(steps : ref [FolPStep], refs : ref [RuParseRef],
+	disjs : ref [Pair<string, string>], g : FolForm,
+	ctx : [Pair<FolForm, RuParseRef>], proveGuard : (FolForm) -> [MizEmitDrv],
+	depth : int) -> Maybe<FolPRef> {
+	if (getUrlParameterDef("dbg-guard", "") == "1")
+		println("GUARD-WANT d=" + i2s(depth) + " " + strGlue(folFormToks(g), " "));
+	switch (find(ctx, \p -> p.first == g)) {
+		Some(p): {
+			k = length(^refs);
+			refs := arrayPush(^refs, p.second);
+			Some(FolPRefFact(k));
+		}
+		None(): if (depth <= 0) None() else {
+			s0 = ^steps; r0 = ^refs; d0 = ^disjs;
+			roll = \ -> { steps := s0; refs := r0; disjs := d0; None(); };
+			conj = switch (g) {
+				FolBin(op, a, b): if (op == "and") Some(Pair(a, b)) else None();
+				default: None();
+			};
+			switch (conj) {
+				Some(ab): switch (mizEmitMinor(steps, refs, disjs, ab.first, ctx, proveGuard, depth - 1)) {
+					None(): roll();
+					Some(r1): switch (mizEmitMinor(steps, refs, disjs, ab.second, ctx, proveGuard, depth - 1)) {
+						None(): roll();
+						Some(r2): {
+							steps := arrayPush(^steps, FolPStep(g, "pm3.2i", [r1, r2]));
+							Some(FolPRefStep(length(^steps) - 1));
+						}
+					}
+				}
+				None(): fold(proveGuard(g), None(), \acc : Maybe<FolPRef>, drv -> switch (acc) {
+					Some(__): acc;
+					None(): if (drv.steps == []) None() else {
+						dS = length(^steps); dF = length(^refs);
+						steps := concat(^steps, mizEmitShift(drv.steps, dS, dF));
+						refs := concat(^refs, drv.refs);
+						disjs := concat(^disjs, drv.disjs);
+						p = mizEmitPeel(steps, refs, disjs, drv.form, length(^steps) - 1,
+							ctx, proveGuard, depth - 1);
+						if (p.first == g) Some(FolPRefStep(p.second)) else roll();
+					}
+				})
+			}
+		}
 	}
 }
 
