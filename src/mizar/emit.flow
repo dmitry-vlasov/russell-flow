@@ -106,7 +106,11 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 		mizEmitDbg := (t.name == getUrlParameterDef("dbg-thm", ""));
 		mizEmitStepLong := false;
 		r = mizEmitStepProof(t.hyps, subrange(t.steps, 0, i), goal, maxFacts, maxSize, drvs);
-		if (isNone(r.first) && ^mizEmitStepLong) mizEmitLongSteps := ^mizEmitLongSteps + 1;
+		if (isNone(r.first) && ^mizEmitStepLong) {
+			mizEmitLongSteps := ^mizEmitLongSteps + 1;
+			if (getUrlParameterDef("dbg-long", "") == "1")
+				println("LONG " + mizEmitSkeleton(goal) + " :: " + strGlue(folFormToks(goal), " "));
+		};
 		if (isNone(r.first) && ^mizEmitDbg)
 			println("FAILSTEP " + t.name + " goal=" + strGlue(folFormToks(goal), " ")
 				+ "  provable-but-long=" + b2s(^mizEmitStepLong));
@@ -206,7 +210,36 @@ mizEmitReduce(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 						depth, fresh, used, direct, recDrv);
 				}
 			}
-			default: direct;
+			default: {
+				// a bare membership goal in a compound term: rewrite it and prove
+				// the residue (mpbir back)
+				gr = mizEmitGoalNF(hyps, prev, goal, maxFacts, maxSize, depth, fresh, used, recDrv);
+				switch (gr) { Some(__): Pair(gr, false); None(): direct; }
+			}
+		}
+	}
+}
+
+// rewrite the GOAL to normal form, prove that, and come back with mpbir
+mizEmitGoalNF(hyps : [FolForm], prev : [FolForm], goal : FolForm,
+	maxFacts : int, maxSize : int, depth : int,
+	fresh : ref int, used : Set<string>, recDrv : [MizEmitDrv]) -> Maybe<FolStepProof> {
+	rw : ref [FolPStep] = ref [];
+	switch (mizEmitFormNF(rw, goal, 0)) {
+		None(): None();
+		Some(w): {
+			sub = mizEmitReduce(hyps, prev, w.second, maxFacts, maxSize,
+				depth + 1, fresh, used, recDrv);
+			switch (sub.first) {
+				None(): None();
+				Some(pr): {
+					base = length(pr.steps);
+					ws = mizEmitShift(^rw, base, 0);
+					fin = FolPStep(goal, "mpbir",
+						[FolPRefStep(base - 1), FolPRefStep(base + w.first)]);
+					Some(FolStepProof(concatA([pr.steps, ws, [fin]]), pr.factRefs, pr.disjs));
+				}
+			}
 		}
 	}
 }
@@ -381,7 +414,8 @@ mizEmitLadder(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 			switch (r2.first) {
 				Some(__): r2;
 				None(): if (r2.second) r2 else {
-					drv = concatA([recDrv, mizEmitChars(ctx0), mizEmitDerive(ctx0, allForms)]);
+					drv = concatA([recDrv, mizEmitCtxNF(ctx0),
+						mizEmitChars(ctx0), mizEmitDerive(ctx0, allForms)]);
 					if (drv == []) r2
 					else {
 						// unfolds/bridges over the instances too
@@ -1689,4 +1723,78 @@ mizEmitMemRewrite(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 			}
 		}
 	}
+}
+
+// ---- the same rewriting, at FORMULA level ----
+// A goal or a context fact is rewritten by replacing every membership in a
+// compound term with its normal form, carrying the equivalence through the
+// connectives (notbii / anbi12i / orbi12i / imbi12i / bibi12i). What reaches
+// the certificate then mentions only `v ∈ <variable>` atoms, whatever the
+// shape of the formula — the mem-pair case above is the special case where the
+// formula is a relation between two memberships.
+
+// steps proving |- (f ↔ NF), and NF; None when nothing would change
+mizEmitFormNF(steps : ref [FolPStep], f : FolForm, depth : int) -> Maybe<Pair<int, FolForm>> {
+	emit = \form : FolForm, lemma : string, refs : [FolPRef] -> {
+		steps := arrayPush(^steps, FolPStep(form, lemma, refs));
+		length(^steps) - 1;
+	};
+	if (depth > 8) None()
+	else switch (f) {
+		FolPred(name, args):
+			if (name != "∈" || length(args) != 2) None()
+			else switch (args[1]) {
+				FolApp(op, as2): if (length(as2) != 2 || (op != "∪" && op != "∩" && op != "∖")) None()
+					else mizEmitMemNF(steps, args[0], args[1], 0);
+				default: None();
+			}
+		FolNeg(g): switch (mizEmitFormNF(steps, g, depth + 1)) {
+			None(): None();
+			Some(w): {
+				nf = FolNeg(w.second);
+				Some(Pair(emit(FolBin("iff", f, nf), "notbii", [FolPRefStep(w.first)]), nf));
+			}
+		}
+		FolBin(op, l, r): {
+			lem = if (op == "and") "anbi12i" else if (op == "or") "orbi12i"
+				else if (op == "imp") "imbi12i" else "bibi12i";
+			wl = mizEmitFormNF(steps, l, depth + 1);
+			wr = mizEmitFormNF(steps, r, depth + 1);
+			if (isNone(wl) && isNone(wr)) None()
+			else {
+				il = switch (wl) {
+					Some(w): w;
+					None(): Pair(emit(FolBin("iff", l, l), "biid", []), l);
+				};
+				ir = switch (wr) {
+					Some(w): w;
+					None(): Pair(emit(FolBin("iff", r, r), "biid", []), r);
+				};
+				nf = FolBin(op, il.second, ir.second);
+				Some(Pair(emit(FolBin("iff", f, nf), lem,
+					[FolPRefStep(il.first), FolPRefStep(ir.first)]), nf));
+			}
+		}
+		default: None();
+	}
+}
+
+// The context facts that mention a compound membership, as DERIVED facts in
+// normal form: `F` (a hypothesis or an earlier step) gives `NF(F)` by mpbi.
+mizEmitCtxNF(ctx : [Pair<FolForm, RuParseRef>]) -> [MizEmitDrv] {
+	filtermap(ctx, \p -> {
+		steps : ref [FolPStep] = ref [];
+		switch (mizEmitFormNF(steps, p.first, 0)) {
+			None(): None();
+			Some(w): {
+				nf = w.second;
+				i = {
+					steps := arrayPush(^steps, FolPStep(nf, "mpbi",
+						[FolPRefFact(0), FolPRefStep(w.first)]));
+					length(^steps) - 1;
+				};
+				if (i < 0) None() else Some(MizEmitDrv(nf, ^steps, [p.second], []));
+			}
+		}
+	});
 }
