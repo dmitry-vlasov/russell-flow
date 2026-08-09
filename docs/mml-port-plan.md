@@ -504,3 +504,62 @@ an id mismatch. Only articles importing a sibling exposed it, which is why one
 article passed and the rest failed.
 *Consequence*: scripts pin absolute import roots; the Metamath gate now
 reaches every article.
+
+### 2026-08-09 — the emitted article was WRONG in three ways, and the counts hid it
+*Expected*: that the numbers in the plan described articles on disk.
+*Found*: the emitter prints its counts BEFORE the generated text is parsed and
+verified, so an article Russell rejected still reported by-step and theorem
+figures. subset_1 did not parse at all and zfmisc_1 was disproved; both had
+been reported as results. Three separate defects:
+  1. an OPEN step's variables were declared nowhere — the header carries only
+     statement variables and the proof block only certificate variables, and a
+     step left open belongs to neither (t47_subset_1 binds x901 in an open step
+     that no hypothesis and no conclusion mentions);
+  2. a cited theorem was stated as the PIECE of it the recorded fact came from,
+     so the step read `¬(A ∧ B)` while t56_zfmisc_1 proves `¬(A∧B) ∧ ¬(C∧D)`;
+  3. an emitted theorem stated LESS than the Mizar theorem: its prop is the
+     last skeleton step, and a walk that misses the closing inference ends
+     short — t40_xboole_1 came out as ONE inclusion of `(X ∪ Y) ∖ Y = X ∖ Y`,
+     which is true, verifies, and is not XBOOLE_1:40. zfmisc_1 then cited it
+     with the equation and Russell disproved zfmisc_1.
+*Consequence*: the third is the one to remember — a theorem that states less
+than it should still verifies, so only its CITERS can detect it, one article
+later. The emitted prop is now the statement (appended as an open step when the
+skeleton falls short) whenever the skeleton has no let/assume hypotheses.
+Corrected figures, every article Russell-verified: xboole_1 186/268 by-steps
+48/116 theorems, zfmisc_1 132/318 11/140, subset_1 29/128 2/53, enumset1 18/95
+11/87, relat_1 89/405 1/175.
+
+### 2026-08-09 — a constructor has a TYPE, and the article did not say so
+*Expected*: the type guards were unreachable because the record's cluster half
+was unconsumed.
+*Found*: one half of every Mizar definition was never translated at all.
+`func {}E -> Subset of E equals {}` states an equation AND a type; the article
+had `k1_subset_1 E = ∅` and nothing anywhere said `{}E is Element of bool E`.
+That type fact is what the checker uses without citing it, and it is the guard
+of every type-conditioned definition. It is now emitted per constructor as
+`∀L̄ ( argGuards(L̄) → typGuards(resultTyp, f(L̄)) )` — the FCluster shape with
+the constructor's own type — and the discharge derives a guard it cannot find
+in the context, joining a conjunction of guards with pm3.2i and recursing when
+a guard is itself a type fact. A guarded statement is also indexed by what it
+CONCLUDES, since the axiom giving `element (k4 …) 𝒫 X` lives under
+`imp(and(…),…)`.
+*Consequence*: the facts are correct and present; they closed one more step.
+Of subset_1's five guard requests exactly one is a constructor type. The other
+four are the GOAL'S OWN ANTECEDENT.
+
+### 2026-08-09 — the deduction step works and closes nothing
+*Expected*: assuming the antecedent would unlock the type-guarded definitions.
+*Found*: it fires and it is neutral — all seven gate articles closed exactly
+the same steps as before. The certificate can now be told that one fact is
+ASSUMED and concludes `A → goal` instead of `goal` (the refutation is
+unchanged; only the final discharge differs: a1i/id, jca, syl), and
+`A → ∀x C` is swapped to `∀x (A → C)` by 19.21v so the peel reaches every
+antecedent under the binders. What blocks the payoff is composition: the
+deduction is a LEAF — once the antecedent is assumed the consequent goes to ONE
+certificate — and t21_subset_1's consequent is a `⊆` goal wanting the df-ss
+characterization and membership rewriting, which live ABOVE the certificate.
+*Consequence*: the next piece is named exactly. Reducing UNDER an assumption
+means lifting every combinator into deduction form (ax-gen, mpbir, impbii,
+pm3.2i, spei), i.e. the reduction returns `A → X` rather than `X` while an
+assumption is in scope. Nothing else in S-C is blocked on facts any more.
