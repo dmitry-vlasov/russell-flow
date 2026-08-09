@@ -142,7 +142,19 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 			if (isSome(d)) mizEmitRecCount := ^mizEmitRecCount + 1;
 			d;
 		});
-		drvs = concat(drvs0, defDrvs);
+		// A guard that could NOT be discharged is still worth stating. Under a
+		// deduction step the antecedents live in the CERTIFICATE's context, not
+		// in ctx, so the discharge cannot reach them — but the statement that
+		// would have discharged the guard (`argGuards → element (f ā) T`) is an
+		// ordinary fact with a self-contained proof, and the certificate chains
+		// it with the assumption itself.
+		guardDrvs = concatA(map(defDrvs, \d -> switch (d.form) {
+			FolBin(op, l, __): if (op != "imp" || isSome(find(ctxI, \p -> p.first == l))) []
+				else mizEmitGuardedInsts(concat(cites, bySkeleton(mizEmitSkeleton(l))),
+					l, stmtOf, isAxiom, shOf, 2);
+			default: [];
+		}));
+		drvs = concatA([drvs0, defDrvs, guardDrvs]);
 		// `dbg-thm=<name>` traces one theorem's certificate attempts
 		mizEmitDbg := (t.name == getUrlParameterDef("dbg-thm", ""));
 		mizEmitStepLong := false;
@@ -266,7 +278,8 @@ mizEmitReduce(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 					ded = switch (swapped.first) {
 						Some(__): swapped;
 						None(): if (op0 != "imp") Pair(None(), false)
-							else mizEmitLadderA(hyps, prev, r0, maxFacts, maxSize, recDrv, Some(l0));
+							else mizEmitReduceA(hyps, prev, l0, r0, maxFacts, maxSize,
+								depth, fresh, used, recDrv);
 					};
 						switch (ded.first) {
 							Some(__): ded;
@@ -282,6 +295,139 @@ mizEmitReduce(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 				gr = mizEmitGoalNF(hyps, prev, goal, maxFacts, maxSize, depth, fresh, used, recDrv);
 				switch (gr) { Some(__): Pair(gr, false); None(): direct; }
 			}
+		}
+	}
+}
+
+// ---- THE REDUCTION UNDER AN ASSUMPTION ----
+// The same reduction as mizEmitReduce, but every proof it returns ends on
+// `asm → goal` instead of `goal`, so the antecedent of an implication step
+// stays available all the way down instead of only at the certificate. Each
+// combinator has its deduction twin, and they are all one lemma:
+//   ax-gen  -> alrimiv     (the binder must not occur in the assumption)
+//   mpbir   -> sylibr      (⊆/= characterizations, goal and membership NF)
+//   pm3.2i  -> jca
+//   impbii  -> impbid
+//   nested antecedent: assume the CONJUNCTION and re-curry with `ex`
+// A leaf goes to folPCertAssuming, which is the same certificate with one
+// fact named as the assumption.
+mizEmitReduceA(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolForm,
+	maxFacts : int, maxSize : int, depth : int,
+	fresh : ref int, used : Set<string>, recDrv : [MizEmitDrv]) -> Pair<Maybe<FolStepProof>, bool> {
+	direct = mizEmitLadderA(hyps, prev, goal, maxFacts, maxSize, recDrv, Some(asm));
+	switch (direct.first) {
+		Some(__): direct;
+		None(): if (depth >= 8) direct else {
+			// (sub-proof of `asm → g`, then one lemma) — the shared shape
+			lift = \g : FolForm, mk : (int) -> [FolPStep] -> {
+				sub = mizEmitReduceA(hyps, prev, asm, g, maxFacts, maxSize, depth + 1,
+					fresh, used, recDrv);
+				switch (sub.first) {
+					None(): Pair(None(), direct.second || sub.second);
+					Some(pr): Pair(Some(FolStepProof(concat(pr.steps, mk(length(pr.steps) - 1)),
+						pr.factRefs, pr.disjs)), false);
+				}
+			};
+			switch (goal) {
+				FolQuant(q, vs, body): if (q != "forall" || vs == []) direct
+					else if (exists(vs, \v -> mizEmitFreeIn(v, asm))) direct
+					else {
+						// one alrimiv per binder, innermost first — the same ladder
+						// ax-gen builds, with the assumption carried along
+						n = length(vs);
+						r = lift(body, \last -> generate(0, n, \i -> {
+							k = n - 1 - i;
+							FolPStep(FolBin("imp", asm, FolQuant("forall", subrange(vs, k, n - k), body)),
+								"alrimiv", [FolPRefStep(last + i)]);
+						}));
+						// alrimiv is disjointed(ph x): the binder must not meet the
+						// assumption's variables
+						dj = concatA(map(vs, \v -> {
+							vr = toLowerCase(v);
+							filtermap(folFormVars(asm), \w -> if (w == vr) None() else Some(Pair(vr, w)));
+						}));
+						switch (r.first) {
+							None(): r;
+							Some(pr): Pair(Some(FolStepProof(pr.steps, pr.factRefs,
+								uniq(concat(pr.disjs, dj)))), false);
+						}
+					}
+				FolPred(name, args): if (name != "⊆" || length(args) != 2) direct
+					else mizEmitCharGoalA(hyps, prev, asm, goal, args[0], args[1], "imp", "df-ss",
+						maxFacts, maxSize, depth, fresh, used, direct, recDrv);
+				FolEq(l, r): mizEmitCharGoalA(hyps, prev, asm, goal, l, r, "iff", "dfcleq",
+					maxFacts, maxSize, depth, fresh, used, direct, recDrv);
+				FolBin(op, l, r): {
+					if (op == "imp") {
+						// a second antecedent: assume the CONJUNCTION, then re-curry
+						both = FolBin("and", asm, l);
+						sub = mizEmitReduceA(hyps, prev, both, r, maxFacts, maxSize, depth + 1,
+							fresh, used, recDrv);
+						switch (sub.first) {
+							None(): Pair(None(), direct.second || sub.second);
+							Some(pr): Pair(Some(FolStepProof(arrayPush(pr.steps,
+								FolPStep(FolBin("imp", asm, goal), "ex",
+									[FolPRefStep(length(pr.steps) - 1)])),
+								pr.factRefs, pr.disjs)), false);
+						}
+					} else if (op == "and" || op == "iff") {
+						la = if (op == "and") l else FolBin("imp", l, r);
+						ra = if (op == "and") r else FolBin("imp", r, l);
+						sa = mizEmitReduceA(hyps, prev, asm, la, maxFacts, maxSize, depth + 1,
+							fresh, used, recDrv);
+						switch (sa.first) {
+							None(): Pair(None(), direct.second || sa.second);
+							Some(pa): {
+								sb = mizEmitReduceA(hyps, prev, asm, ra, maxFacts, maxSize, depth + 1,
+									fresh, used, recDrv);
+								switch (sb.first) {
+									None(): Pair(None(), direct.second || sb.second);
+									Some(pb): {
+										dS = length(pa.steps); dF = length(pa.factRefs);
+										bs = mizEmitShift(pb.steps, dS, dF);
+										jn = FolPStep(FolBin("imp", asm, goal),
+											if (op == "and") "jca" else "impbid",
+											[FolPRefStep(dS - 1), FolPRefStep(dS + length(bs) - 1)]);
+										Pair(Some(FolStepProof(concatA([pa.steps, bs, [jn]]),
+											concat(pa.factRefs, pb.factRefs),
+											uniq(concat(pa.disjs, pb.disjs)))), false);
+									}
+								}
+							}
+						}
+					} else direct;
+				}
+				default: direct;
+			}
+		}
+	}
+}
+
+// (A ⊆ B) / (A = B) under an assumption: the same fresh-variable matrix, closed
+// by sylibr — mpbir's deduction twin — instead of mpbir
+mizEmitCharGoalA(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolForm,
+	a : FolTerm, b : FolTerm, op : string, lemma : string,
+	maxFacts : int, maxSize : int, depth : int,
+	fresh : ref int, used : Set<string>,
+	direct : Pair<Maybe<FolStepProof>, bool>, recDrv : [MizEmitDrv]) -> Pair<Maybe<FolStepProof>, bool> {
+	v = mizEmitFresh(fresh, used);
+	matrix = FolBin(op, mizEmitMem(FolVar(v), a), mizEmitMem(FolVar(v), b));
+	subGoal = FolQuant("forall", [v], matrix);
+	sub = mizEmitReduceA(hyps, prev, asm, subGoal, maxFacts, maxSize, depth + 1,
+		fresh, used, recDrv);
+	switch (sub.first) {
+		None(): Pair(None(), direct.second || sub.second);
+		Some(pr): {
+			inst = FolBin("iff", goal, subGoal);
+			vr = toLowerCase(v);
+			dj = filtermap(uniq(concat(folFormVars(inst), folFormVars(asm))),
+				\w -> if (w == vr) None() else Some(Pair(vr, w)));
+			n0 = length(pr.steps);
+			df = FolPStep(inst, lemma, []);
+			sy = FolPStep(FolBin("imp", asm, goal), "sylibr",
+				[FolPRefStep(n0 - 1), FolPRefStep(n0)]);
+			Pair(Some(FolStepProof(concatA([pr.steps, [df, sy]]),
+				pr.factRefs, uniq(concat(pr.disjs, dj)))), false);
 		}
 	}
 }
