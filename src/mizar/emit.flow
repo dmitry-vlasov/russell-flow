@@ -68,6 +68,10 @@ mizEmitRecMatch : ref int = ref 0;
 mizEmitRecDiag() -> Pair<int, int> { Pair(^mizEmitRecCites, ^mizEmitRecMatch); }
 
 mizEmitDbg : ref bool = ref false;
+// the article's sethood lookup, needed deep inside the reduction: a means-
+// definition is instantiated at an element the REDUCTION invented (the ⊆/=
+// characterization's fresh variable), which the caller cannot know
+mizEmitShOfRef : ref ((string) -> string) = ref (\__ -> "");
 // per STEP: did some certificate attempt find a proof that was only too LONG?
 // That step wants a smaller encoding, not better facts.
 mizEmitStepLong : ref bool = ref false;
@@ -125,6 +129,7 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 				},
 				mizEmitGuardedInsts(cands, g, stmtOf, isAxiom, shOf, 6));
 		};
+		mizEmitShOfRef := shOf;
 		defDrvs = map(mizEmitDefUnfolds(expOf(pos), stepAtoms, stmtOf, shOf, 6), \d -> {
 			r = mizEmitDischarge(d, ctxI, proveGuard);
 			if (getUrlParameterDef("dbg-guard", "") == "1" && r.form != d.form)
@@ -680,7 +685,8 @@ mizEmitLadderA(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 			switch (r2.first) {
 				Some(__): r2;
 				None(): if (r2.second) r2 else {
-					drv = concatA([recDrv, mizEmitCtxNF(ctx0),
+					drv = concatA([mizEmitDrvInsts(recDrv, [goal], ^mizEmitShOfRef),
+						mizEmitCtxNF(ctx0),
 						mizEmitChars(ctx0), mizEmitDerive(ctx0, allForms)]);
 					if (drv == []) r2
 					else {
@@ -694,6 +700,43 @@ mizEmitLadderA(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 			}
 		}
 	}
+}
+
+// A DERIVED fact that is universally quantified is as opaque to the certificate
+// as a context one, and for the same reason: it shares no atom with anything
+// until it is instantiated. A means-definition unfolds to exactly such a fact
+// (`∀x (x ∈ f(ā) ↔ φ)`), so it is instantiated at the elements of the GOAL, by
+// the same elimination the context facts use, and REPLACED by its instances —
+// keeping the ∀ form as well only spends the budget.
+mizEmitDrvInsts(drvs : [MizEmitDrv], goalForms : [FolForm],
+	shOf : (string) -> string) -> [MizEmitDrv] {
+	mems : ref [Pair<FolTerm, FolTerm>] = ref [];
+	subs : ref [Pair<FolTerm, FolTerm>] = ref [];
+	eqs  : ref [Pair<FolTerm, FolTerm>] = ref [];
+	iter(goalForms, \f -> mizEmitHarvest(f, mems, subs, eqs));
+	elems0 = uniqBy(map(^mems, firstOfPair), \a, b -> mizEmitTKey(a) == mizEmitTKey(b));
+	// ONE element: the goal's first. A definition instantiated at every element
+	// in sight put 25 facts in front of a 16-fact budget, and the relevance
+	// filter cannot tell them apart — they all mention the goal's atoms.
+	elems = if (length(elems0) > 1) subrange(elems0, 0, 1) else elems0;
+	concatA(map(drvs, \d -> switch (d.form) {
+		FolQuant(q, vs, __): if (q != "forall" || length(vs) != 1 || d.steps == []) [d]
+			else {
+				got = filtermap(elems, \e -> {
+					steps : ref [FolPStep] = ref d.steps;
+					dj : ref [Pair<string, string>] = ref d.disjs;
+					switch (mizEmitElimAt(steps, dj, d.form, length(d.steps) - 1, vs[0], e, shOf, 0)) {
+						None(): None();
+						Some(fin): Some(mizEmitCleanIff(MizEmitDrv(fin.first, ^steps, d.refs, uniq(^dj))));
+					}
+				});
+				// a ∀-fact that could not be instantiated is DROPPED, not kept: to
+				// the tableau it is one opaque atom that matches nothing, and its
+				// size is what pushed 43 of enumset1's 95 steps over the budget
+				got;
+			}
+		default: [d];
+	}));
 }
 
 mizEmitTry(ctx : [Pair<FolForm, RuParseRef>], goal : FolForm,
@@ -723,14 +766,23 @@ mizEmitTrySel(ctx : [Pair<FolForm, RuParseRef>], goal : FolForm,
 	ctxP0 : [RuPForm], instP0 : [RuPForm], drvP0 : [RuPForm], goalP : RuPForm,
 	hops : int, asm : Maybe<FolForm>, asmP : Maybe<RuPForm>) -> Pair<Maybe<FolStepProof>, bool> {
 	// RELEVANCE: keep only facts/unfolds connected to the goal through shared
-	// atoms (`hops` rounds) — an unrelated fact only inflates the G3cp tree
-	// the ASSUMPTION goes in last so the index ranges below are untouched, and
+	// atoms (`hops` rounds) — an unrelated fact only inflates the G3cp tree.
+	// The ASSUMPTION goes in last so the index ranges below are untouched, and
 	// it is never dropped: without it the certificate would prove `goal`, not
 	// `asm → goal`. Relevance still runs THROUGH it, which is how a fact that
 	// only relates to the antecedent survives.
-	rel0 = mizEmitRelevantH(concatA([ctxP0, instP0, drvP0,
-		switch (asmP) { None(): []; Some(ap): [ap]; }]), goalP, hops);
-	rel = rel0;
+	mizEmitTrySelR(ctx, goal, instList, drv, maxFacts, maxSize, atoms,
+		ctxP0, instP0, drvP0, goalP, asm, asmP,
+		mizEmitRelevantH(concatA([ctxP0, instP0, drvP0,
+			switch (asmP) { None(): []; Some(ap): [ap]; }]), goalP, hops));
+}
+
+mizEmitTrySelR(ctx : [Pair<FolForm, RuParseRef>], goal : FolForm,
+	instList : [Pair<FolForm, string>], drv : [MizEmitDrv],
+	maxFacts : int, maxSize : int, atoms : ref Tree<string, FolForm>,
+	ctxP0 : [RuPForm], instP0 : [RuPForm], drvP0 : [RuPForm], goalP : RuPForm,
+	asm : Maybe<FolForm>, asmP : Maybe<RuPForm>,
+	rel : Set<int>) -> Pair<Maybe<FolStepProof>, bool> {
 	keepCtx = filteri(ctx, \j, __ -> containsSet(rel, j));
 	ctxP = filteri(ctxP0, \j, __ -> containsSet(rel, j));
 	nC0 = length(ctxP0);
@@ -743,13 +795,43 @@ mizEmitTrySel(ctx : [Pair<FolForm, RuParseRef>], goal : FolForm,
 		switch (asmP) { None(): []; Some(ap): [ap]; });
 	assumedIdx = switch (asmP) { None(): -1; Some(__): length(factsP) - 1; };
 	size = fold(factsP, mizEmitSize(goalP), \acc, f -> acc + mizEmitSize(f));
-	if (length(factsP) > maxFacts || size > maxSize) Pair(None(), true)
+	// OVER BUDGET IS NOT A REASON TO GIVE UP. Relevance keeps every fact that
+	// shares an atom with the goal, and on a step with many unfolds that is 25
+	// facts against a budget of 16 — the attempt was then skipped, and the step
+	// counted as never tried. Rank instead: most goal atoms shared first,
+	// smaller first among equals, and attempt with the best `maxFacts` of them.
+	// The ranking is deterministic and does no search; losing a needed fact only
+	// costs an attempt that was not being made at all.
+	if (length(factsP) > maxFacts || size > maxSize) {
+		if (getUrlParameterDef("dbg-budget", "") == "1")
+			println("OVER facts=" + i2s(length(factsP)) + " size=" + i2s(size)
+				+ " goal=" + strGlue(folFormToks(goal), " "));
+		if (length(factsP) <= maxFacts) Pair(None(), true)
+		else {
+			gk = mizEmitAtomKeys(goalP, makeSet());
+			all = concatA([ctxP0, instP0, drvP0]);
+			scored = sortCustom(filter(mapi(all, \j, f -> Pair(j, f)),
+					\pr -> containsSet(rel, pr.first)),
+				\pr -> -(1000 * sizeSet(intersectSets(mizEmitAtomKeys(pr.second, makeSet()), gk))
+					- mizEmitSize(pr.second)), true);
+			// a RANKED attempt is a second chance, not a bigger one: with the full
+			// budget it ran the k-way splits of enumset1 past ten minutes, so it
+			// gets two thirds of the facts and a third of the tree
+			cap = maxFacts * 2 / 3;
+			kept = fold(if (length(scored) > cap) subrange(scored, 0, cap) else scored,
+				makeSet(), \ac, pr -> insertSet(ac, pr.first));
+			if (sizeSet(kept) == sizeSet(rel)) Pair(None(), true)
+			else mizEmitTrySelR(ctx, goal, instList, drv, cap, maxSize, atoms,
+				ctxP0, instP0, drvP0, goalP, asm, asmP, kept);
+		}
+	}
 	else {
 		tab = ^atoms;
 		// cap the G3cp tree and the emitted proof: a by-step certificate past a
 		// few hundred steps is a blowup, not a proof — reject, keep the step open
+		nodeCap = if (length(factsP) > maxFacts * 2 / 3) 5000 else 1500;
 		switch (folPCertAssuming(factsP, goalP, \k -> lookupTreeDef(tab, k, FolPred("$false", [])),
-			5000, 600, assumedIdx)) {
+			nodeCap, 600, assumedIdx)) {
 			None(): {
 				k = folPCertLastFail();
 				if (^mizEmitDbg)
@@ -2015,6 +2097,14 @@ mizEmitApplyOps(steps : ref [FolPStep], form : FolForm, idx : int,
 						// simpl : (φ ∧ ψ) → φ
 						im = emit(FolBin("imp", st.first, l), "simpl", []);
 						Some(Pair(l, emit(l, "ax-mp", [FolPRefStep(st.second), FolPRefStep(im)])));
+					} else if (op == "eqidmp") {
+						// a MEANS-definition instantiated at the term it defines reads
+						// `(t = t) ↔ B`; eqid discharges the left side and mpbi leaves B
+						eqOk = switch (l) { FolEq(a, b): a == b; default: false; };
+						if (!eqOk) None() else {
+							e = emit(l, "eqid", []);
+							Some(Pair(r, emit(r, "mpbi", [FolPRefStep(e), FolPRefStep(st.second)])));
+						}
 					} else if (op == "simpr" && bop == "and") {
 						im = emit(FolBin("imp", st.first, r), "simpr", []);
 						Some(Pair(r, emit(r, "ax-mp", [FolPRefStep(st.second), FolPRefStep(im)])));
@@ -2378,22 +2468,84 @@ mizEmitDefInstance(nm : string, sym : string, stepAtoms : [FolForm],
 					tts = uniq(concatA(map(stepAtoms, \a -> mizEmitSymTerms(a, sym))));
 					mizEmitFirstTermMatch(pts, tts, metas, binders);
 				};
-				ws0 = switch (byTerm) {
-					Some(__): byTerm;
-					None(): {
-						hasSym = \a : FolForm -> sym == "" || mizEmitFormHasSym(a, sym);
-						pats = mizEmitRankAtoms(filter(mizEmitAtomsOf(pre.second, []), hasSym));
-						tgts = mizEmitRankAtoms(filter(stepAtoms, hasSym));
-						mizEmitFirstMatch(pats, tgts, metas, binders);
+				// A MEANS-definition (`func f(ā) -> set means x ∈ it iff …`) reads
+				// `(v = f(L̄)) ↔ ∀x (x ∈ v ↔ φ)`, and `v` — Mizar's `it` — occurs in no
+				// definiendum term, so matching left it unbound and the definition
+				// was skipped entirely. It is the TERM THE DEFINITION DEFINES: bound
+				// to f(ā) the left side becomes `t = t`, which eqid discharges (the
+				// `eqidmp` op). Every enumerated set past a triple is defined so.
+				means = mizEmitMeansVar(pre.second, sym, metas);
+				byMeans = switch (means) {
+					None(): None();
+					Some(mv): {
+						pts = mizEmitDefiendumTerms(pre.second, sym);
+						tts = uniq(concatA(map(stepAtoms, \a -> mizEmitSymTerms(a, sym))));
+						rest = filter(binders, \b -> b != mv);
+						switch (mizEmitFirstTermMatchAt(pts, tts, metas, rest)) {
+							None(): None();
+							Some(pr): Some(arrayPush(pr.first, Pair(mv, pr.second)));
+						}
 					}
 				};
+				ws0 = switch (byTerm) {
+					Some(__): byTerm;
+					None(): switch (byMeans) {
+						Some(__): byMeans;
+						None(): {
+							hasSym = \a : FolForm -> sym == "" || mizEmitFormHasSym(a, sym);
+							pats = mizEmitRankAtoms(filter(mizEmitAtomsOf(pre.second, []), hasSym));
+							tgts = mizEmitRankAtoms(filter(stepAtoms, hasSym));
+							mizEmitFirstMatch(pats, tgts, metas, binders);
+						}
+					}
+				};
+				ops = if (isNone(byTerm) && isSome(byMeans)) ["eqidmp"] else [];
 				switch (ws0) {
 					None(): None();
-					Some(ws): mizEmitRecordDrv(nm, st, ws, [], shOf);
+					Some(ws): mizEmitRecordDrv(nm, st, ws, ops, shOf);
 				}
 			}
 		}
 	}
+}
+
+// Mizar's `it`: the binder the definition equates to the definiendum term and
+// that occurs in no argument of it. `(v = f(L̄)) ↔ …` — v is that binder.
+mizEmitMeansVar(body : FolForm, sym : string, metas : Set<string>) -> Maybe<string> {
+	if (sym == "") None() else fold(mizEmitAtomsOf(body, []), None(), \acc : Maybe<string>, a ->
+		switch (acc) {
+			Some(__): acc;
+			None(): switch (a) {
+				FolEq(l, r): {
+					v = switch (l) { FolVar(n): if (containsSet(metas, n)) n else ""; default: ""; };
+					if (v == "" || !mizEmitTermHasSym(r, sym) || mizEmitTermHas(v, r)) None() else Some(v);
+				}
+				default: None();
+			}
+		});
+}
+
+// the first (pattern, target) term pair fixing every binder in `binders`, with
+// the target kept — the means case needs it as the witness for `it`
+mizEmitFirstTermMatchAt(pats : [FolTerm], tgts : [FolTerm], metas : Set<string>,
+	binders : [string]) -> Maybe<Pair<[Pair<string, FolTerm>], FolTerm>> {
+	fold(pats, None(), \acc : Maybe<Pair<[Pair<string, FolTerm>], FolTerm>>, pat -> switch (acc) {
+		Some(__): acc;
+		None(): fold(tgts, None(), \a2 : Maybe<Pair<[Pair<string, FolTerm>], FolTerm>>, tt ->
+			switch (a2) {
+				Some(__): a2;
+				None(): switch (mizEmitMatchT(pat, tt, metas, Some(makeTree()))) {
+					None(): None();
+					Some(sub): {
+						ws = filtermap(binders, \b -> switch (lookupTree(sub, b)) {
+							None(): None();
+							Some(t): Some(Pair(b, t));
+						});
+						if (length(ws) != length(binders)) None() else Some(Pair(ws, tt));
+					}
+				}
+			});
+	});
 }
 
 // definiendum-like atoms first
