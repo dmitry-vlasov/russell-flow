@@ -57,7 +57,7 @@ export {
 	// long or too big — those are an encoding problem, not a fact problem
 	mizEmitLongStepCount() -> int;
 	// (definitions the record named at emitted steps, instances built from them)
-	mizEmitDefDiag() -> Pair<int, int>;
+	mizEmitDefDiag() -> Triple<int, int, int>;
 }
 
 mizEmitRecCount : ref int = ref 0;
@@ -72,12 +72,15 @@ mizEmitStepLong : ref bool = ref false;
 mizEmitLongSteps : ref int = ref 0;
 mizEmitDefNames : ref int = ref 0;
 mizEmitDefMade : ref int = ref 0;
+mizEmitDischarged : ref int = ref 0;
 mizEmitFailUnprov : ref int = ref 0;
 mizEmitFailNodes : ref int = ref 0;
 mizEmitFailSteps : ref int = ref 0;
 mizEmitLongStepCount() -> int { ^mizEmitLongSteps; }
 
-mizEmitDefDiag() -> Pair<int, int> { Pair(^mizEmitDefNames, ^mizEmitDefMade); }
+mizEmitDefDiag() -> Triple<int, int, int> {
+	Triple(^mizEmitDefNames, ^mizEmitDefMade, ^mizEmitDischarged);
+}
 
 mizEmitFailKinds() -> Triple<int, int, int> {
 	Triple(^mizEmitFailUnprov, ^mizEmitFailNodes, ^mizEmitFailSteps);
@@ -87,6 +90,7 @@ mizEmitRecReset() -> void {
 	mizEmitRecCount := 0; mizEmitRecCites := 0; mizEmitRecMatch := 0;
 	mizEmitFailUnprov := 0; mizEmitFailNodes := 0; mizEmitFailSteps := 0;
 	mizEmitLongSteps := 0; mizEmitDefNames := 0; mizEmitDefMade := 0;
+	mizEmitDischarged := 0;
 }
 
 mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
@@ -102,7 +106,11 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 		// against the step's own atoms
 		stepAtoms = uniq(concatA(map(concat(t.hyps, arrayPush(subrange(t.steps, 0, i), goal)),
 			\f -> mizEmitAtomsOf(f, []))));
-		defDrvs = mizEmitDefUnfolds(expOf(pos), stepAtoms, stmtOf, shOf, 4);
+		ctxI = concat(
+			mapi(t.hyps, \j, h -> Pair(h, mizEmitHypRef(j))),
+			mapi(subrange(t.steps, 0, i), \j, sp -> Pair(sp, mizEmitStepRef(j))));
+		defDrvs = map(mizEmitDefUnfolds(expOf(pos), stepAtoms, stmtOf, shOf, 4),
+			\d -> mizEmitDischarge(d, ctxI));
 		mizEmitDefNames := ^mizEmitDefNames + length(expOf(pos));
 		mizEmitDefMade := ^mizEmitDefMade + length(defDrvs);
 		drvs0 = filtermap(recs, \fact -> {
@@ -1823,6 +1831,28 @@ mizEmitCtxNF(ctx : [Pair<FolForm, RuParseRef>]) -> [MizEmitDrv] {
 // `Element of`, of `𝒫`, of `⊆` — and no amount of propositional work reaches
 // them, because they are type-layer facts Mizar never states.
 
+// Does this atom mention a symbol the ARTICLE defines, rather than only the
+// foundation's ∈ / ⊆ / = and its operations? A definition's DEFINIENDUM does,
+// and matching on it picks the instance the step is actually about — matching
+// on any atom instead let `A = B iff A ⊆ B ∧ B ⊆ A` match everything and
+// crowd out the type-guarded definitions.
+mizEmitIsArticleSym(nm : string) -> bool {
+	!folAmapReused(nm) && nm != "∈" && nm != "⊆" && nm != "=" && nm != "_V";
+}
+
+mizEmitAtomHasArticleSym(f : FolForm) -> bool {
+	symT = \self, t : FolTerm -> switch (t) {
+		FolVar(__): false;
+		FolAbs(__, __): false;
+		FolApp(n, args): mizEmitIsArticleSym(n) || exists(args, \a -> self(self, a));
+	};
+	switch (f) {
+		FolPred(n, args): mizEmitIsArticleSym(n) || exists(args, \a -> symT(symT, a));
+		FolEq(l, r): symT(symT, l) || symT(symT, r);
+		default: false;
+	}
+}
+
 // every atom (predicate application or equality) of a formula
 mizEmitAtomsOf(f : FolForm, acc : [FolForm]) -> [FolForm] {
 	switch (f) {
@@ -1835,9 +1865,38 @@ mizEmitAtomsOf(f : FolForm, acc : [FolForm]) -> [FolForm] {
 }
 
 // the instantiated definitions, as derived facts; at most `cap` of them
-mizEmitDefUnfolds(names : [string], stepAtoms : [FolForm],
+mizEmitDefUnfolds(names0 : [string], stepAtoms : [FolForm],
 	stmtOf : (string) -> Maybe<FolForm>, shOf : (string) -> string,
 	cap : int) -> [MizEmitDrv] {
+	// A definition is about the step when they share an ARTICLE symbol — that
+	// is its definiendum occurring here. Those come first: without the order,
+	// `A = B iff A ⊆ B ∧ B ⊆ A` matches every step and fills the budget before
+	// the type-guarded definitions are ever tried.
+	syms = \f : FolForm -> {
+		out : ref Set<string> = ref makeSet();
+		symT = \self, t : FolTerm -> switch (t) {
+			FolApp(n, args): {
+				if (mizEmitIsArticleSym(n)) out := insertSet(^out, n);
+				iter(args, \a -> self(self, a));
+			}
+			default: {}
+		};
+		iter(mizEmitAtomsOf(f, []), \a -> switch (a) {
+			FolPred(n, args): {
+				if (mizEmitIsArticleSym(n)) out := insertSet(^out, n);
+				iter(args, \x -> symT(symT, x));
+			}
+			FolEq(l, r): { symT(symT, l); symT(symT, r); }
+			default: {}
+		});
+		^out;
+	};
+	stepSyms = fold(stepAtoms, makeSet(), \acc, a -> mergeSets(acc, syms(a)));
+	shares = \nm : string -> switch (stmtOf(nm)) {
+		None(): false;
+		Some(st): existsSet(syms(st), \x -> containsSet(stepSyms, x));
+	};
+	names = concat(filter(names0, shares), filter(names0, \n -> !shares(n)));
 	fold(names, [], \acc : [MizEmitDrv], nm ->
 		if (length(acc) >= cap) acc
 		else switch (stmtOf(nm)) {
@@ -1848,11 +1907,19 @@ mizEmitDefUnfolds(names : [string], stepAtoms : [FolForm],
 				if (binders == []) acc
 				else {
 					metas = buildSet(binders);
-					// the first (pattern atom, step atom) pair that fixes every binder
-					found = fold(mizEmitAtomsOf(pre.second, []), None(),
+					// the first (pattern atom, step atom) pair that fixes every
+					// binder, definiendum-like atoms first on both sides
+					patAtoms = {
+						all = mizEmitAtomsOf(pre.second, []);
+						concat(filter(all, mizEmitAtomHasArticleSym),
+							filter(all, \a -> !mizEmitAtomHasArticleSym(a)));
+					};
+					stepAtoms2 = concat(filter(stepAtoms, mizEmitAtomHasArticleSym),
+						filter(stepAtoms, \a -> !mizEmitAtomHasArticleSym(a)));
+					found = fold(patAtoms, None(),
 						\a1 : Maybe<[Pair<string, FolTerm>]>, pat -> switch (a1) {
 							Some(__): a1;
-							None(): fold(stepAtoms, None(),
+							None(): fold(stepAtoms2, None(),
 								\a2 : Maybe<[Pair<string, FolTerm>]>, at -> switch (a2) {
 									Some(__): a2;
 									None(): switch (mizEmitMatchF(pat, at, metas, Some(makeTree()))) {
@@ -1877,4 +1944,44 @@ mizEmitDefUnfolds(names : [string], stepAtoms : [FolForm],
 				}
 			}
 		});
+}
+
+// ---- discharging a TYPE GUARD ----
+// A Mizar definition on a soft type is stated under its guard:
+//   d4_subset_1 : ∀X ∀A ( A is Element of 𝒫 X → (X ∖ A) = … )
+// so its instance arrives as `G → C` and the certificate can do nothing with
+// it: what the step needs is C, and the equality bridges only harvest an
+// equation that stands on its own. When the guard is already in the context —
+// a hypothesis of the theorem or an earlier step, which is where a Mizar `let`
+// puts it — it is discharged here by ax-mp, and the definition's conclusion
+// becomes an ordinary fact.
+mizEmitDischarge(d : MizEmitDrv, ctx : [Pair<FolForm, RuParseRef>]) -> MizEmitDrv {
+	steps : ref [FolPStep] = ref d.steps;
+	refs : ref [RuParseRef] = ref d.refs;
+	// peel `G → C` while G is a context formula; at most a few guards
+	form = ref d.form;
+	go = ref true;
+	fori(0, 3, \__ -> if (^go) {
+		switch (^form) {
+			FolBin(op, l, r): if (op != "imp") go := false else {
+				hit = find(ctx, \p -> p.first == l);
+				switch (hit) {
+					None(): go := false;
+					Some(p): {
+						k = length(^refs);
+						refs := arrayPush(^refs, p.second);
+						steps := arrayPush(^steps, FolPStep(r, "ax-mp",
+							[FolPRefFact(k), FolPRefStep(length(^steps) - 1)]));
+						form := r;
+					}
+				}
+			}
+			default: go := false;
+		}
+	});
+	if (length(^steps) == length(d.steps)) d
+	else {
+		mizEmitDischarged := ^mizEmitDischarged + 1;
+		MizEmitDrv(^form, ^steps, ^refs, d.disjs);
+	}
 }
