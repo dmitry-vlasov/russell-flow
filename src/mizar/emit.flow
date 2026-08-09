@@ -32,7 +32,7 @@ export {
 	// what made three xboole_1 theorems and two zfmisc_1 theorems unverifiable.
 	mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 		recOf : (string) -> [FolForm], stmtOf : (string) -> Maybe<FolForm>,
-		bySkeleton : (string) -> [string], expOf : (string) -> [string],
+		bySkeleton : (string) -> [string], expOf : (string) -> [Pair<string, string>],
 		isAxiom : (string) -> bool,
 		shOf : (string) -> string) -> Pair<[Maybe<FolStepProof>], MizEmitCounts>;
 	// the index key: instantiation preserves it exactly
@@ -95,7 +95,7 @@ mizEmitRecReset() -> void {
 
 mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 	recOf : (string) -> [FolForm], stmtOf : (string) -> Maybe<FolForm>,
-	bySkeleton : (string) -> [string], expOf : (string) -> [string],
+	bySkeleton : (string) -> [string], expOf : (string) -> [Pair<string, string>],
 	isAxiom : (string) -> bool,
 	shOf : (string) -> string) -> Pair<[Maybe<FolStepProof>], MizEmitCounts> {
 	res = foldi(t.steps, Pair([], MizEmitCounts(0, 0, 0)), \i, acc : Pair<[Maybe<FolStepProof>], MizEmitCounts>, goal -> {
@@ -109,7 +109,7 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 		ctxI = concat(
 			mapi(t.hyps, \j, h -> Pair(h, mizEmitHypRef(j))),
 			mapi(subrange(t.steps, 0, i), \j, sp -> Pair(sp, mizEmitStepRef(j))));
-		defDrvs = map(mizEmitDefUnfolds(expOf(pos), stepAtoms, stmtOf, shOf, 4),
+		defDrvs = map(mizEmitDefUnfolds(expOf(pos), stepAtoms, stmtOf, shOf, 6),
 			\d -> mizEmitDischarge(d, ctxI));
 		mizEmitDefNames := ^mizEmitDefNames + length(expOf(pos));
 		mizEmitDefMade := ^mizEmitDefMade + length(defDrvs);
@@ -118,7 +118,8 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 			// the same skeleton (the premise Mizar used without citing it)
 			// the step's citations, the DEFINITIONS the checker expanded while
 			// checking it, then anything with the same skeleton
-			cands = concatA([cites, expOf(pos), bySkeleton(mizEmitSkeleton(fact))]);
+			cands = concatA([cites, map(expOf(pos), \p -> p.first),
+				bySkeleton(mizEmitSkeleton(fact))]);
 			d = mizEmitRecFromCites(cands, fact, stmtOf, isAxiom, shOf);
 			if (isSome(d)) mizEmitRecCount := ^mizEmitRecCount + 1;
 			d;
@@ -1346,7 +1347,13 @@ mizEmitMatchF(pat : FolForm, tgt : FolForm, meta : Set<string>,
 				default: None();
 			}
 			FolEq(l, r): switch (tgt) {
-				FolEq(l2, r2): mizEmitMatchT(r, r2, meta, mizEmitMatchT(l, l2, meta, sub));
+				// equality is symmetric, and a definition states `f(ā) = …` while
+				// a step may write `… = f(ā)`; try both orientations
+				FolEq(l2, r2): {
+					d = mizEmitMatchT(r, r2, meta, mizEmitMatchT(l, l2, meta, sub));
+					if (isSome(d)) d
+					else mizEmitMatchT(r, l2, meta, mizEmitMatchT(l, r2, meta, sub));
+				}
 				default: None();
 			}
 			FolNeg(g): switch (tgt) {
@@ -1840,15 +1847,18 @@ mizEmitIsArticleSym(nm : string) -> bool {
 	!folAmapReused(nm) && nm != "∈" && nm != "⊆" && nm != "=" && nm != "_V";
 }
 
-mizEmitAtomHasArticleSym(f : FolForm) -> bool {
-	symT = \self, t : FolTerm -> switch (t) {
+mizEmitTermHasArticleSym(t : FolTerm) -> bool {
+	switch (t) {
 		FolVar(__): false;
 		FolAbs(__, __): false;
-		FolApp(n, args): mizEmitIsArticleSym(n) || exists(args, \a -> self(self, a));
-	};
+		FolApp(n, args): mizEmitIsArticleSym(n) || exists(args, mizEmitTermHasArticleSym);
+	}
+}
+
+mizEmitAtomHasArticleSym(f : FolForm) -> bool {
 	switch (f) {
-		FolPred(n, args): mizEmitIsArticleSym(n) || exists(args, \a -> symT(symT, a));
-		FolEq(l, r): symT(symT, l) || symT(symT, r);
+		FolPred(n, args): mizEmitIsArticleSym(n) || exists(args, mizEmitTermHasArticleSym);
+		FolEq(l, r): mizEmitTermHasArticleSym(l) || mizEmitTermHasArticleSym(r);
 		default: false;
 	}
 }
@@ -1865,85 +1875,95 @@ mizEmitAtomsOf(f : FolForm, acc : [FolForm]) -> [FolForm] {
 }
 
 // the instantiated definitions, as derived facts; at most `cap` of them
-mizEmitDefUnfolds(names0 : [string], stepAtoms : [FolForm],
+mizEmitDefUnfolds(named : [Pair<string, string>], stepAtoms : [FolForm],
 	stmtOf : (string) -> Maybe<FolForm>, shOf : (string) -> string,
 	cap : int) -> [MizEmitDrv] {
-	// A definition is about the step when they share an ARTICLE symbol — that
-	// is its definiendum occurring here. Those come first: without the order,
-	// `A = B iff A ⊆ B ∧ B ⊆ A` matches every step and fills the budget before
-	// the type-guarded definitions are ever tried.
-	syms = \f : FolForm -> {
-		out : ref Set<string> = ref makeSet();
-		symT = \self, t : FolTerm -> switch (t) {
-			FolApp(n, args): {
-				if (mizEmitIsArticleSym(n)) out := insertSet(^out, n);
-				iter(args, \a -> self(self, a));
-			}
-			default: {}
-		};
-		iter(mizEmitAtomsOf(f, []), \a -> switch (a) {
-			FolPred(n, args): {
-				if (mizEmitIsArticleSym(n)) out := insertSet(^out, n);
-				iter(args, \x -> symT(symT, x));
-			}
-			FolEq(l, r): { symT(symT, l); symT(symT, r); }
-			default: {}
-		});
-		^out;
-	};
-	stepSyms = fold(stepAtoms, makeSet(), \acc, a -> mergeSets(acc, syms(a)));
-	shares = \nm : string -> switch (stmtOf(nm)) {
-		None(): false;
-		Some(st): existsSet(syms(st), \x -> containsSet(stepSyms, x));
-	};
-	names = concat(filter(names0, shares), filter(names0, \n -> !shares(n)));
+	// THE SYMBOL DECIDES. The record says which definition fired and, for a
+	// functor's `equals` definition, on which symbol — so the instance is the
+	// one whose definiendum is that symbol, matched at the step's occurrence of
+	// it. Selection by "some atom matches" let the generic
+	// `A = B iff A ⊆ B ∧ B ⊆ A` take every slot.
+	symOf = pairs2tree(named);
+	names = uniq(map(named, \p -> p.first));
 	fold(names, [], \acc : [MizEmitDrv], nm ->
 		if (length(acc) >= cap) acc
-		else switch (stmtOf(nm)) {
+		else switch (mizEmitDefInstance(nm, lookupTreeDef(symOf, nm, ""),
+				stepAtoms, stmtOf, shOf)) {
 			None(): acc;
-			Some(st): {
-				pre = mizEmitPrefixOf(st, []);
-				binders = pre.first;
-				if (binders == []) acc
-				else {
-					metas = buildSet(binders);
-					// the first (pattern atom, step atom) pair that fixes every
-					// binder, definiendum-like atoms first on both sides
-					patAtoms = {
-						all = mizEmitAtomsOf(pre.second, []);
-						concat(filter(all, mizEmitAtomHasArticleSym),
-							filter(all, \a -> !mizEmitAtomHasArticleSym(a)));
-					};
-					stepAtoms2 = concat(filter(stepAtoms, mizEmitAtomHasArticleSym),
-						filter(stepAtoms, \a -> !mizEmitAtomHasArticleSym(a)));
-					found = fold(patAtoms, None(),
-						\a1 : Maybe<[Pair<string, FolTerm>]>, pat -> switch (a1) {
-							Some(__): a1;
-							None(): fold(stepAtoms2, None(),
-								\a2 : Maybe<[Pair<string, FolTerm>]>, at -> switch (a2) {
-									Some(__): a2;
-									None(): switch (mizEmitMatchF(pat, at, metas, Some(makeTree()))) {
-										None(): None();
-										Some(sub): {
-											ws = filtermap(binders, \b -> switch (lookupTree(sub, b)) {
-												None(): None();
-												Some(t): Some(Pair(b, t));
-											});
-											if (length(ws) != length(binders)) None() else Some(ws);
-										}
-									}
-								});
-						});
-					switch (found) {
-						None(): acc;
-						Some(ws): switch (mizEmitRecordDrv(nm, st, ws, [], shOf)) {
-							None(): acc;
-							Some(d): arrayPush(acc, d);
-						}
-					}
+			Some(d): arrayPush(acc, d);
+		});
+}
+
+// one definition, instantiated at the step's occurrence of its symbol
+mizEmitDefInstance(nm : string, sym : string, stepAtoms : [FolForm],
+	stmtOf : (string) -> Maybe<FolForm>, shOf : (string) -> string) -> Maybe<MizEmitDrv> {
+	switch (stmtOf(nm)) {
+		None(): None();
+		Some(st): {
+			pre = mizEmitPrefixOf(st, []);
+			binders = pre.first;
+			if (binders == []) None()
+			else {
+				hasSym = \a : FolForm -> sym == "" || mizEmitFormHasSym(a, sym);
+				pats = mizEmitRankAtoms(filter(mizEmitAtomsOf(pre.second, []), hasSym));
+				tgts = mizEmitRankAtoms(filter(stepAtoms, hasSym));
+				switch (mizEmitFirstMatch(pats, tgts, buildSet(binders), binders)) {
+					None(): None();
+					Some(ws): mizEmitRecordDrv(nm, st, ws, [], shOf);
 				}
 			}
+		}
+	}
+}
+
+// definiendum-like atoms first
+mizEmitRankAtoms(as : [FolForm]) -> [FolForm] {
+	concat(filter(as, mizEmitAtomHasArticleSym),
+		filter(as, \a -> !mizEmitAtomHasArticleSym(a)));
+}
+
+// the first (pattern, target) pair that fixes every binder
+mizEmitFirstMatch(pats : [FolForm], tgts : [FolForm], metas : Set<string>,
+	binders : [string]) -> Maybe<[Pair<string, FolTerm>]> {
+	fold(pats, None(), \acc : Maybe<[Pair<string, FolTerm>]>, pat -> switch (acc) {
+		Some(__): acc;
+		None(): fold(tgts, None(), \a2 : Maybe<[Pair<string, FolTerm>]>, at -> switch (a2) {
+			Some(__): a2;
+			None(): mizEmitBinderWits(pat, at, metas, binders);
 		});
+	});
+}
+
+mizEmitBinderWits(pat : FolForm, at : FolForm, metas : Set<string>,
+	binders : [string]) -> Maybe<[Pair<string, FolTerm>]> {
+	switch (mizEmitMatchF(pat, at, metas, Some(makeTree()))) {
+		None(): None();
+		Some(sub): {
+			ws = filtermap(binders, \b -> switch (lookupTree(sub, b)) {
+				None(): None();
+				Some(t): Some(Pair(b, t));
+			});
+			if (length(ws) != length(binders)) None() else Some(ws);
+		}
+	}
+}
+
+// does a formula mention this symbol, in predicate or functor position?
+mizEmitTermHasSym(t : FolTerm, sym : string) -> bool {
+	switch (t) {
+		FolApp(n, args): n == sym || exists(args, \a -> mizEmitTermHasSym(a, sym));
+		default: false;
+	}
+}
+
+mizEmitFormHasSym(f : FolForm, sym : string) -> bool {
+	switch (f) {
+		FolPred(n, args): n == sym || exists(args, \a -> mizEmitTermHasSym(a, sym));
+		FolEq(l, r):      mizEmitTermHasSym(l, sym) || mizEmitTermHasSym(r, sym);
+		FolNeg(g):        mizEmitFormHasSym(g, sym);
+		FolBin(__, l, r): mizEmitFormHasSym(l, sym) || mizEmitFormHasSym(r, sym);
+		FolQuant(__, __, b): mizEmitFormHasSym(b, sym);
+	}
 }
 
 // ---- discharging a TYPE GUARD ----
