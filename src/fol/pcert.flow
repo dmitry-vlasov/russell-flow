@@ -71,7 +71,12 @@ FolPAcc(steps : ref [FolPStep], atom : (string) -> FolForm, fail : ref bool,
 // idx < 0 marks a LAZY root projection of ctx element -(idx+1): it is emitted
 // on first use and its ROOT-FACT index recorded — pass 2 rebuilds the
 // certificate over the used facts only, so unused facts never enter C.
-FolPDer(idx : int, depth : int, form : RuPForm, roots : Set<int>);
+// fact >= 0 marks a STATIC FACT leaf: the formula is available as `|- f`
+// (the caller's fact `fact`), so `C → f` is ONE a1i step at any context —
+// facts never join the conjunction C, which stays the dynamic branch stack.
+// This is what took the emitted text from steps × (facts + branches) down to
+// steps × branches: 73% of all steps were fact-projection lift chains.
+FolPDer(idx : int, depth : int, form : RuPForm, roots : Set<int>, fact : int);
 
 folPForm(a : FolPAcc, f : RuPForm) -> FolForm {
 	switch (f) {
@@ -180,19 +185,30 @@ folPGet(a : FolPAcc, ctx : [RuPForm], der : Tree<string, FolPDer>, f : RuPForm) 
 			folPEmit(a, folPForm(a, f), "PCERT_UNRESOLVED", []);
 		}
 		Some(e): {
-			idx = if (e.idx >= 0) e.idx
-				else folPPrj(a, subrange(ctx, 0, e.depth), -e.idx - 1);
-			if (e.depth == length(ctx)) idx
+			if (e.fact >= 0)
+				// a static fact: `|- f` exists, so `C → f` is one a1i at THIS
+				// context — no projection, no lift; the global step memo dedups
+				// repeats within one branch context
+				folPEmit(a, folPImp(a, folPConj(ctx), f), "a1i", [FolPRefFact(e.fact)])
 			else {
-				br = folPDown(a, ctx, e.depth);
-				folPEmit(a, folPImp(a, folPConj(ctx), f), "syl", [sref(br), sref(idx)]);
+				idx = if (e.idx >= 0) e.idx
+					else folPPrj(a, subrange(ctx, 0, e.depth), -e.idx - 1);
+				if (e.depth == length(ctx)) idx
+				else {
+					br = folPDown(a, ctx, e.depth);
+					folPEmit(a, folPImp(a, folPConj(ctx), f), "syl", [sref(br), sref(idx)]);
+				}
 			}
 		}
 	}
 }
 
 folPAdd(der : Tree<string, FolPDer>, f : RuPForm, idx : int, depth : int, roots : Set<int>) -> Tree<string, FolPDer> {
-	setTree(der, folPKeyP(f), FolPDer(idx, depth, f, roots));
+	setTree(der, folPKeyP(f), FolPDer(idx, depth, f, roots, -1));
+}
+
+folPAddFact(der : Tree<string, FolPDer>, f : RuPForm, origIdx : int, pos : int) -> Tree<string, FolPDer> {
+	setTree(der, folPKeyP(f), FolPDer(0, 0, f, makeSet1(pos), origIdx));
 }
 
 // provenance of a cached formula: which root facts it descends from
@@ -454,54 +470,35 @@ folPDoCert(factsI : [Pair<RuPForm, int>], goal : RuPForm, atom : (string) -> Fol
 		None(): { folPCertFail := "unprovable"; None(); }
 		Some(dr): if (folPDerivNodes(dr) > maxNodes) { folPCertFail := "nodes"; None(); } else {
 			a = FolPAcc(ref [], atom, ref false, ref makeTree(), ref makeSet());
-			ctx0 = arrayPush(facts, RuPNot(goal));
-			der0 = foldi(ctx0, makeTree(), \i, acc, f ->
+			// THE CONTEXT IS THE DYNAMIC PART ONLY: the assumption (if any) and
+			// ¬goal — the facts stay OUT of the conjunction and enter each branch
+			// as one a1i over their `|- f` reference. The statements then scale
+			// with the branch stack, not with the fact count, and the whole
+			// closing pm3.2i/jca conjunction assembly disappears.
+			hasAsm = assumed >= 0 && assumed < length(facts);
+			ctx0 = concat(if (hasAsm) [facts[assumed]] else [], [RuPNot(goal)]);
+			derC = foldi(ctx0, makeTree(), \i, acc, f ->
 				folPAdd(acc, f, -(i + 1), length(ctx0),
-					if (i < length(factsI)) makeSet1(i) else makeSet()));
+					if (hasAsm && i == 0) makeSet1(assumed) else makeSet()));
+			der0 = foldi(facts, derC, \i, acc, f ->
+				if (hasAsm && i == assumed) acc
+				else folPAddFact(acc, f, factsI[i].second, i));
 			rootIdx = folPProve(a, dr, ctx0, der0);
 			fls : RuPForm = RuPFalse();
-			if (facts == []) {
+			if (!hasAsm) {
+				// ctx0 = [¬goal]: |- ¬goal → F. closes by con1i + fal + ax-mp
 				c1 = folPEmit(a, folPImp(a, RuPNot(fls), goal), "con1i", [sref(rootIdx)]);
 				fl = folPEmit(a, folPForm(a, RuPNot(fls)), "fal", []);
 				folPEmit(a, folPForm(a, goal), "ax-mp", [sref(fl), sref(c1)]);
 				{}
 			} else {
-				fc = folPConj(facts);
-				exi = folPEmit(a, folPImp(a, fc, RuPImp(RuPNot(goal), fls)), "ex", [sref(rootIdx)]);
-				cd = folPEmit(a, folPImp(a, fc, RuPImp(RuPNot(fls), goal)), "con1d", [sref(exi)]);
+				// ctx0 = [asm, ¬goal]: |- (asm ∧ ¬goal) → F. curries to asm → goal
+				asm = facts[assumed];
+				exi = folPEmit(a, folPImp(a, asm, RuPImp(RuPNot(goal), fls)), "ex", [sref(rootIdx)]);
+				cd = folPEmit(a, folPImp(a, asm, RuPImp(RuPNot(fls), goal)), "con1d", [sref(exi)]);
 				fl = folPEmit(a, folPForm(a, RuPNot(fls)), "fal", []);
-				mp = folPEmit(a, folPImp(a, fc, goal), "mpi", [sref(fl), sref(cd)]);
-				if (assumed < 0 || assumed >= length(facts)) {
-					start : Pair<FolPRef, RuPForm> = Pair(FolPRefFact(factsI[0].second), facts[0]);
-					conj = foldi(tail(facts), start, \i, acc, f -> {
-						nf = RuPAnd(acc.second, f);
-						r : FolPRef = sref(folPEmit(a, folPForm(a, nf), "pm3.2i",
-							[acc.first, FolPRefFact(factsI[i + 1].second)]));
-						Pair(r, nf);
-					});
-					folPEmit(a, folPForm(a, goal), "ax-mp", [conj.first, sref(mp)]);
-					{}
-				} else if (length(facts) == 1) {
-					// the assumption is the only fact: `mp` already proves A → goal
-					{}
-				} else {
-					// DISCHARGE UNDER THE ASSUMPTION. `mp` proves ⋀facts → goal and
-					// every fact but the assumed one is available as `|- f`, so
-					// A → f by a1i, A → A by id, the conjunction by jca in the same
-					// left-nested order, and A → goal by syl.
-					asm = facts[assumed];
-					lift = \i : int, f : RuPForm -> if (i == assumed)
-							folPEmit(a, folPImp(a, asm, f), "id", [])
-						else folPEmit(a, folPImp(a, asm, f), "a1i", [FolPRefFact(factsI[i].second)]);
-					start2 : Pair<int, RuPForm> = Pair(lift(0, facts[0]), facts[0]);
-					conj2 = foldi(tail(facts), start2, \i, acc : Pair<int, RuPForm>, f -> {
-						nf = RuPAnd(acc.second, f);
-						Pair(folPEmit(a, folPImp(a, asm, nf), "jca",
-							[sref(acc.first), sref(lift(i + 1, f))]), nf);
-					});
-					folPEmit(a, folPImp(a, asm, goal), "syl", [sref(conj2.first), sref(mp)]);
-					{}
-				}
+				folPEmit(a, folPImp(a, asm, goal), "mpi", [sref(fl), sref(cd)]);
+				{}
 			}
 			usedOrig = foldSet(^(a.used), makeSet(), \s, i ->
 				if (i < length(factsI)) insertSet(s, factsI[i].second) else s);

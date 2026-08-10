@@ -885,3 +885,31 @@ Proofless dependency loading (read-ru proofless=1 exists; mizar-to-ru's
 ruMizLoadDeps loads with proofs) would unblock the translate chain but NOT
 the to_mm gate, which rightly reads dependency proofs — so compression is
 the real gate, not loading.
+
+### 2026-08-10 — the dynamic context: certificates stop restating their facts
+*Built*: the G3cp→Hilbert translator's context conjunction now holds only the
+DYNAMIC part — the assumption (if any) and ¬goal, extended by branch pushes.
+The facts stay out of C entirely: a fact enters a branch as ONE a1i step over
+its `|- f` reference, cached per branch context by the existing step memo,
+and the closing pm3.2i/jca conjunction assembly disappears (the discharge is
+con1i or ex+con1d+mpi over a one- or two-element context). Statements now
+scale with the branch stack, not the fact count. FolPDer grew a `fact` field;
+everything else in the translation is unchanged, including the two-pass
+used-fact rebuild. The test-pcert battery emits 370 steps where the old form
+needed 1426, and verifies against miz_set.
+*Measured — the parked 2400-cap prize collected*: the certificate step cap
+goes 600 → 2400, and the full 8-article chain now survives it end to end
+(zfmisc_1.ru peaks at 88 MB, down from 229 MB; mem=16g for the emit and
+to_mm runs). Verify green everywhere, Metamath gate green with proved ==
+closed on every article:
+  theorems fully closed: xboole_0 5/8, xboole_1 82/116, enumset1 11/87,
+  zfmisc_1 23/140, subset_1 5/53, relat_1 3/175 (t8 in), tarski 1/3
+  — THE GATE SET GOES 110 → 130;
+  by-steps: xboole_1 235/277, zfmisc_1 184/366, relat_1 110/411,
+  subset_1 37/132, xtuple_0 51/133, xboole_0 17/20.
+*Consequence*: the eigenvariable wall is now fully paid — t8_relat_1 closes
+end-to-end and is verified by the original checker. Emitted mass is still
+the scaling concern (88 MB peak; the census's next target is the branch-
+stack lifts and cross-step sharing), but it no longer blocks the pipeline.
+The relat_1 imp(v1_relat_1, …) family (~38 theorems) is now unblocked for
+the same machinery; enumset1 stays behind the foundation enum lemmas.
