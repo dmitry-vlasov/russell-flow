@@ -1667,6 +1667,11 @@ mizEmitTrySelR(ctx : [Pair<FolForm, RuParseRef>], goal : FolForm,
 	factsP = concat(concatA([ctxP, instP, drvP]),
 		switch (asmP) { None(): []; Some(ap): [ap]; });
 	assumedIdx = switch (asmP) { None(): -1; Some(__): length(factsP) - 1; };
+	// the ASSUMPTION is mandatory and never dropped, so it must not count
+	// against `maxFacts`: counting it made every ranked retry of a deduction
+	// step over-budget by its own assumption (kept = cap, factsP = cap + 1),
+	// and the retry recursed cap 10 → 6 → 4 → … → 0 without ever attempting
+	nAsm = switch (asmP) { None(): 0; Some(__): 1; };
 	size = fold(factsP, mizEmitSize(goalP), \acc, f -> acc + mizEmitSize(f));
 	// OVER BUDGET IS NOT A REASON TO GIVE UP. Relevance keeps every fact that
 	// shares an atom with the goal, and on a step with many unfolds that is 25
@@ -1675,24 +1680,32 @@ mizEmitTrySelR(ctx : [Pair<FolForm, RuParseRef>], goal : FolForm,
 	// smaller first among equals, and attempt with the best `maxFacts` of them.
 	// The ranking is deterministic and does no search; losing a needed fact only
 	// costs an attempt that was not being made at all.
-	if (length(factsP) > maxFacts || size > maxSize) {
+	if (length(factsP) - nAsm > maxFacts || size > maxSize) {
 		if (getUrlParameterDef("dbg-budget", "") == "1")
 			println("OVER facts=" + i2s(length(factsP)) + " size=" + i2s(size)
 				+ " goal=" + strGlue(folFormToks(goal), " "));
-		if (length(factsP) <= maxFacts) Pair(None(), true)
+		if (length(factsP) - nAsm <= maxFacts) Pair(None(), true)
 		else {
-			gk = mizEmitAtomKeys(goalP, makeSet());
+			// rank against the GOAL AND ASSUMPTION atoms: the certificate proves
+			// `asm → goal`, so a fact whose atoms live in the assumption (the
+			// opelxp unfold of a strengthened conjunct) is as load-bearing as a
+			// goal-atom one — under goal-only ranking it could never win a slot
+			gk = mizEmitAtomKeys(goalP,
+				switch (asmP) { None(): makeSet(); Some(ap): mizEmitAtomKeys(ap, makeSet()); });
 			all = concatA([ctxP0, instP0, drvP0]);
-			scored = sortCustom(filter(mapi(all, \j, f -> Pair(j, f)),
-					\pr -> containsSet(rel, pr.first)),
-				\pr -> -(1000 * sizeSet(intersectSets(mizEmitAtomKeys(pr.second, makeSet()), gk))
-					- mizEmitSize(pr.second)), true);
+			cands = filter(mapi(all, \j, f -> Pair(j, f)),
+				\pr -> containsSet(rel, pr.first));
+			catoms = map(cands, \pr -> mizEmitAtomKeys(pr.second, makeSet()));
 			// a RANKED attempt is a second chance, not a bigger one: with the full
 			// budget it ran the k-way splits of enumset1 past ten minutes, so it
 			// gets two thirds of the facts and a third of the tree
 			cap = maxFacts * 2 / 3;
-			kept = fold(if (length(scored) > cap) subrange(scored, 0, cap) else scored,
-				makeSet(), \ac, pr -> insertSet(ac, pr.first));
+			// GREEDY FRONTIER, not a one-shot sort: each kept fact's atoms join
+			// the scoring set before the next pick. The unfold instances form
+			// CHAINS (eleq1 introduces the membership elin defines, whose parts
+			// opelxp defines) and a fixed scoring set always broke the chain at
+			// its second link — the small def-instance junk outranked it
+			kept = mizEmitGreedyKeep(cands, catoms, gk, cap, makeSet());
 			if (sizeSet(kept) == sizeSet(rel)) Pair(None(), true)
 			else mizEmitTrySelR(ctx, goal, instList, drv, cap, maxSize, atoms,
 				ctxP0, instP0, drvP0, goalP, asm, asmP, kept);
@@ -1717,7 +1730,23 @@ mizEmitTrySelR(ctx : [Pair<FolForm, RuParseRef>], goal : FolForm,
 				if (k == "unprovable") mizEmitFailUnprov := ^mizEmitFailUnprov + 1
 				else if (k == "nodes") { mizEmitFailNodes := ^mizEmitFailNodes + 1; mizEmitStepLong := true; }
 				else if (k == "steps") { mizEmitFailSteps := ^mizEmitFailSteps + 1; mizEmitStepLong := true; };
-				Pair(None(), false);
+				// a blowup is a fact-COUNT symptom, not a verdict: the needed core
+				// is picked EARLY by the greedy frontier, so retry with the top
+				// half of the current set (deterministic descending ladder)
+				n2 = length(factsP) - nAsm;
+				if ((k == "steps" || k == "nodes") && n2 > 3) {
+					gk2 = mizEmitAtomKeys(goalP,
+						switch (asmP) { None(): makeSet(); Some(ap): mizEmitAtomKeys(ap, makeSet()); });
+					all2 = concatA([ctxP0, instP0, drvP0]);
+					cands2 = filter(mapi(all2, \j, f -> Pair(j, f)),
+						\pr -> containsSet(rel, pr.first));
+					catoms2 = map(cands2, \pr -> mizEmitAtomKeys(pr.second, makeSet()));
+					kept2 = mizEmitGreedyKeep(cands2, catoms2, gk2, n2 / 2, makeSet());
+					if (sizeSet(kept2) >= sizeSet(rel)) Pair(None(), false)
+					else mizEmitTrySelR(ctx, goal, instList, drv, maxFacts, maxSize, atoms,
+						ctxP0, instP0, drvP0, goalP, asm, asmP, kept2);
+				}
+				else Pair(None(), false);
 			}
 			Some(csteps): {
 				nCtx = length(keepCtx);
@@ -2058,6 +2087,24 @@ filteri(xs : [?], pred : (int, ?) -> bool) -> [?] {
 
 // indices of the facts connected to the goal through shared atom keys,
 // within `hops` closure rounds (a large hops = the full fixpoint)
+mizEmitGreedyKeep(cands : [Pair<int, RuPForm>], catoms : [Set<string>],
+	gk : Set<string>, cap : int, chosen : Set<int>) -> Set<int> {
+	if (cap <= 0) chosen
+	else {
+		best = foldi(cands, Pair(-1, 0), \i, acc : Pair<int, int>, pr -> {
+			if (containsSet(chosen, pr.first)) acc
+			else {
+				sc = 1000 * sizeSet(intersectSets(catoms[i], gk)) - mizEmitSize(pr.second);
+				if (acc.first < 0 || sc > acc.second) Pair(i, sc) else acc;
+			}
+		});
+		if (best.first < 0) chosen
+		else mizEmitGreedyKeep(cands, catoms,
+			foldSet(catoms[best.first], gk, \s, k -> insertSet(s, k)),
+			cap - 1, insertSet(chosen, cands[best.first].first));
+	}
+}
+
 mizEmitRelevantH(facts : [RuPForm], goal : RuPForm, hops : int) -> Set<int> {
 	factAtoms = map(facts, \f -> mizEmitAtomKeys(f, makeSet()));
 	seed = mizEmitAtomKeys(goal, makeSet());

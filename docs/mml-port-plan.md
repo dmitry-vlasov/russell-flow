@@ -820,3 +820,41 @@ distance on this theorem. Suspects, in order: the memGen recursion from the
 eleq1-introduced membership stops before the product term; the pair's
 FolApp name differs where that particular recursion runs; the relevance cut.
 All articles unchanged and verified; nothing regressed.
+
+### 2026-08-10 — the "one opelxp instance" was three defects in fact selection
+*Found*: the instance was GENERATED all along (a memGen trace proved it) and
+lost downstream, behind three stacked defects:
+  1. THE RANKED-RETRY DEATH SPIRAL. The assumption is mandatory and never
+     dropped, but it COUNTED against `maxFacts` — so the over-budget retry of
+     a deduction step always had kept = cap, facts = cap + 1, re-entered the
+     over-budget branch, and recursed 10 → 6 → 4 → … → 0 without ever
+     attempting a certificate. Every assumption-carrying attempt was silently
+     falling through to the order-dependent 1-hop pass, which kept the elin
+     that links opelxp to the goal but not opelxp itself.
+  2. GOAL-ONLY RANKING. A fact whose atoms live in the ASSUMPTION (the
+     opelxp unfold of a strengthened conjunct) could never win a slot. The
+     rank now scores against goal ∪ assumption atoms, and the cut is a
+     GREEDY FRONTIER: each kept fact's atoms join the scoring set before the
+     next pick, so an unfold chain (eleq1 introduces the membership elin
+     defines, whose parts opelxp defines) is kept whole. This is the answer
+     to the 08-10 "what the ranked cut cannot see" entry: not a different
+     static signal, but a rank that grows with what it keeps.
+  3. BLOWUP AS VERDICT. A steps/nodes overflow now retries once with the top
+     half of the greedy set (deterministic descending ladder), and pcert
+     distinguishes a translator failure (PCERT_*) from a genuine length
+     overflow — they were both reported "steps", which hid one behind a cap.
+*Measured* (A/B, 8 articles dep order, pristine restore between rounds, all
+verify green, MM gate green with proved == closed): by-steps 149 → 156
+zfmisc_1, 212 → 223 xboole_1, 30 → 33 subset_1, 97 → 104 relat_1, 11 → 12
+xboole_0; theorems fully closed 100 → 110 on the gate set (xboole_1 66 → 72,
+zfmisc_1 17 → 19, subset_1 2 → 4). ZERO losses anywhere — the greedy frontier
+does not repeat the hop-distance experiment's zfmisc_1 regression.
+*t8_relat_1 itself*: closes end-to-end ONLY at a 2400-step certificate cap
+(the strengthened assumption is a deep conjunction and every frame lift pays
+it). At 2400 the gate gains more (xboole_1 80, xboole_0 5 theorems) but the
+emitted mass explodes 4× (xboole_1.ru 38 MB → 172 MB) and READING it as a
+dependency kills the next article's run — the cap stays 600, and t8 is
+parked behind the named backlog item: certificate size, shared sub-lemmas
+per theorem. The eigenvariable chain itself is DONE and proved working —
+candidate, QNF, strengthening, elimination all hold on the trace; size is
+the only wall left.
