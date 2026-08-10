@@ -330,6 +330,161 @@ mizEmitExElim(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 		});
 }
 
+// `asm → A` for a conjunct A of a left-nested assumption, by simpl/simpr/syl;
+// the identity case is `id`. Returns the index of the step proving it.
+mizEmitProjTo(steps : ref [FolPStep], asm : FolForm, tgt : FolForm) -> Maybe<int> {
+	emit = \form : FolForm, lemma : string, refs : [FolPRef] -> {
+		steps := arrayPush(^steps, FolPStep(form, lemma, refs));
+		length(^steps) - 1;
+	};
+	if (asm == tgt) Some(emit(FolBin("imp", asm, asm), "id", []))
+	else switch (asm) {
+		FolBin(op, l, r): if (op != "and") None()
+			else if (r == tgt) Some(emit(FolBin("imp", asm, r), "simpr", []))
+			else if (l == tgt) Some(emit(FolBin("imp", asm, l), "simpl", []))
+			else {
+				s1 = emit(FolBin("imp", asm, l), "simpl", []);
+				switch (mizEmitProjTo(steps, l, tgt)) {
+					None(): None();
+					Some(s2): Some(emit(FolBin("imp", asm, tgt), "syl",
+						[FolPRefStep(s1), FolPRefStep(s2)]));
+				}
+			}
+		default: None();
+	}
+}
+
+// ∃-elimination under the assumption: prove `(asm ∧ ψ) → goal`, curry (ex),
+// exlimdv per binder — its disjointness (binder apart from asm AND goal) is
+// the no-escape rule — then supply `∃ā ψ`: a context fact by mpi, a derived
+// one whose proof stands alone by mpi on its block, and one whose antecedent
+// is a CONJUNCT of the assumption by projection + syl + mpd.
+mizEmitExElimA(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolForm,
+	maxFacts : int, maxSize : int, depth : int, fresh : ref int, used : Set<string>,
+	recDrv : [MizEmitDrv], failed : Pair<Maybe<FolStepProof>, bool>) -> Pair<Maybe<FolStepProof>, bool> {
+	ctx = concat(
+		mapi(hyps, \j, h -> Pair(h, mizEmitHypRef(j))),
+		mapi(prev, \j, sp -> Pair(sp, mizEmitStepRef(j))));
+	insts = mizEmitDrvInsts(recDrv,
+		concat(map(ctx, \p -> p.first), [asm, goal]), ^mizEmitShOfRef);
+	// candidates: (∃ form, how to supply it: Left = ctx ref, Right = (block, refs,
+	// disjs, antecedent conjunct or None for an outright block))
+	ctxCands = filtermap(ctx, \p -> switch (p.first) {
+		FolQuant(q, __, __): if (q == "exists") Some(MizExCand(p.first, Some(p.second), [], [], [])) else None();
+		default: None();
+	});
+	drvCands = filtermap(insts, \d -> if (d.steps == []) None() else switch (d.form) {
+		FolQuant(q, __, __): if (q == "exists")
+			Some(MizExCand(d.form, None(), d.steps, d.refs, d.disjs)) else None();
+		FolBin(op, a, c): {
+			isEx = switch (c) { FolQuant(q2, __, __): q2 == "exists"; default: false; };
+			// the antecedent must be reachable: a context fact (ax-mp now) or a
+			// conjunct of the assumption (projection later) — encode the latter by
+			// keeping the implication whole and remembering `a`
+			if (op != "imp" || !isEx) None()
+			else switch (find(ctx, \p -> p.first == a)) {
+				Some(pa): {
+					k = length(d.refs);
+					mp = FolPStep(c, "ax-mp", [FolPRefFact(k), FolPRefStep(length(d.steps) - 1)]);
+					Some(MizExCand(c, None(), arrayPush(d.steps, mp),
+						arrayPush(d.refs, pa.second), d.disjs));
+				}
+				None(): {
+					pr : ref [FolPStep] = ref [];
+					switch (mizEmitProjTo(pr, asm, a)) {
+						None(): None();
+						Some(__): Some(MizExCand(d.form, None(), d.steps, d.refs, d.disjs));
+					}
+				}
+			}
+		}
+		default: None();
+	});
+	fold(concat(ctxCands, drvCands), failed, \acc : Pair<Maybe<FolStepProof>, bool>, cand -> switch (acc.first) {
+		Some(__): acc;
+		None(): {
+			// the ∃ this candidate yields (an imp-shaped one is peeled below)
+			exf = switch (cand.form) {
+				FolBin(__, __, c2): c2;
+				default: cand.form;
+			};
+			switch (exf) {
+				FolQuant(q, vs, body): {
+					bad = \v : string -> mizEmitFreeIn(v, goal) || mizEmitFreeIn(v, asm)
+						|| exists(map(ctx, \p -> p.first), \f -> mizEmitFreeIn(v, f));
+					if (q != "exists" || vs == [] || exists(vs, bad)) acc
+					else {
+						sub = mizEmitReduceA0(hyps, prev, FolBin("and", asm, body), goal,
+							maxFacts, maxSize, depth + 2, fresh, used, recDrv);
+						switch (sub.first) {
+							None(): acc;
+							Some(pr): {
+								steps : ref [FolPStep] = ref pr.steps;
+								refs : ref [RuParseRef] = ref pr.factRefs;
+								emit = \form : FolForm, lemma : string, rs : [FolPRef] -> {
+									steps := arrayPush(^steps, FolPStep(form, lemma, rs));
+									length(^steps) - 1;
+								};
+								cur = emit(FolBin("imp", asm, FolBin("imp", body, goal)), "ex",
+									[FolPRefStep(length(pr.steps) - 1)]);
+								n = length(vs);
+								exl = fold(enumFromTo(1, n), cur, \st, i -> {
+									k2 = n - i;
+									emit(FolBin("imp", asm, FolBin("imp",
+										FolQuant("exists", subrange(vs, k2, n - k2), body), goal)),
+										"exlimdv", [FolPRefStep(st)]);
+								});
+								dj = concatA(map(vs, \v -> {
+									vr = toLowerCase(v);
+									filtermap(uniq(concat(folFormVars(goal), folFormVars(asm))),
+										\w -> if (w == vr) None() else Some(Pair(vr, w)));
+								}));
+								fin = switch (cand.ref) {
+									Some(r): {
+										k = length(^refs);
+										refs := arrayPush(^refs, r);
+										Some(emit(FolBin("imp", asm, goal), "mpi",
+											[FolPRefFact(k), FolPRefStep(exl)]));
+									}
+									None(): {
+										base = length(^steps);
+										kf = length(^refs);
+										steps := concat(^steps, mizEmitShift(cand.steps, base, kf));
+										refs := concat(^refs, cand.refs);
+										blockLast = length(^steps) - 1;
+										if (cand.form == exf)
+											// the block proves ∃ā ψ outright
+											Some(emit(FolBin("imp", asm, goal), "mpi",
+												[FolPRefStep(blockLast), FolPRefStep(exl)]))
+										else switch (cand.form) {
+											FolBin(__, a2, __): switch (mizEmitProjTo(steps, asm, a2)) {
+												None(): None();
+												Some(pj): {
+													sy = emit(FolBin("imp", asm, exf), "syl",
+														[FolPRefStep(pj), FolPRefStep(blockLast)]);
+													Some(emit(FolBin("imp", asm, goal), "mpd",
+														[FolPRefStep(sy), FolPRefStep(exl)]));
+												}
+											}
+											default: None();
+										}
+									}
+								};
+								switch (fin) {
+									None(): acc;
+									Some(__): Pair(Some(FolStepProof(^steps, ^refs,
+										uniq(concatA([pr.disjs, dj, cand.disjs])))), false);
+								}
+							}
+						}
+					}
+				}
+				default: acc;
+			}
+		}
+	});
+}
+
 mizEmitFresh(fresh : ref int, used : Set<string>) -> string {
 	n = "X95" + i2s(^fresh);
 	fresh := ^fresh + 1;
@@ -445,6 +600,21 @@ mizEmitReduce(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 // A leaf goes to folPCertAssuming, which is the same certificate with one
 // fact named as the assumption.
 mizEmitReduceA(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolForm,
+	maxFacts : int, maxSize : int, depth : int,
+	fresh : ref int, used : Set<string>, recDrv : [MizEmitDrv]) -> Pair<Maybe<FolStepProof>, bool> {
+	r = mizEmitReduceA0(hyps, prev, asm, goal, maxFacts, maxSize, depth, fresh, used, recDrv);
+	switch (r.first) {
+		Some(__): r;
+		// ∃-elimination UNDER the assumption — where the relation family's facts
+		// actually live (`∀X (X is Relation → …)` puts both the relation-hood and
+		// the element antecedent inside this reduction). exlimdv is exlimiv's
+		// deduction twin, one more row of the twin table.
+		None(): if (depth >= 6) r
+			else mizEmitExElimA(hyps, prev, asm, goal, maxFacts, maxSize, depth, fresh, used, recDrv, r);
+	}
+}
+
+mizEmitReduceA0(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolForm,
 	maxFacts : int, maxSize : int, depth : int,
 	fresh : ref int, used : Set<string>, recDrv : [MizEmitDrv]) -> Pair<Maybe<FolStepProof>, bool> {
 	direct = mizEmitLadderA(hyps, prev, goal, maxFacts, maxSize, recDrv, Some(asm));
