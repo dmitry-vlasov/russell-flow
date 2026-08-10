@@ -206,7 +206,67 @@ mizEmitStepProof(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 	fresh = ref 0;
 	// the recorded facts are plain facts of the step once proved, so the ladder
 	// sees them as extra context — with their own proof block attached
-	mizEmitReduce(hyps, prev, goal, maxFacts, maxSize, 0, fresh, used, recDrv);
+	r = mizEmitReduce(hyps, prev, goal, maxFacts, maxSize, 0, fresh, used, recDrv);
+	switch (r.first) {
+		Some(__): r;
+		None(): mizEmitExElim(hyps, prev, goal, maxFacts, maxSize, fresh, used, recDrv, r);
+	}
+}
+
+// ---- USING an existential fact ----
+// A hypothesis `∃x φ(x)` was an opaque atom: the certificate cannot open a
+// quantifier, so the fact contributed nothing (a Mizar `consider` leaves both
+// the ∃ and its witnessed instance in scope, but a `∃` that arrives ALONE —
+// most often from a cited theorem — was dead weight). Mizar's own reading is
+// ∃-elimination: name the witness, reason from φ(name), and the name must not
+// escape into the conclusion. That is one lemma here: the deduction reduction
+// proves `φ(x) → goal` with the binder as the temporary name, exlimiv turns it
+// into `∃x φ(x) → goal` (its disjointness condition — x not in the goal — is
+// exactly the no-escape rule), and ax-mp closes with the hypothesis. Tried for
+// each ∃ hypothesis in turn; the binder must not occur free anywhere else.
+mizEmitExElim(hyps : [FolForm], prev : [FolForm], goal : FolForm,
+	maxFacts : int, maxSize : int, fresh : ref int, used : Set<string>,
+	recDrv : [MizEmitDrv], failed : Pair<Maybe<FolStepProof>, bool>) -> Pair<Maybe<FolStepProof>, bool> {
+	ctx = concat(
+		mapi(hyps, \j, h -> Pair(h, mizEmitHypRef(j))),
+		mapi(prev, \j, sp -> Pair(sp, mizEmitStepRef(j))));
+	others = \skip : int -> mapi(ctx, \j, p -> if (j == skip) goal else p.first);
+	fold(mapi(ctx, \j, p -> Pair(j, p)), failed, \acc : Pair<Maybe<FolStepProof>, bool>, jp ->
+		switch (acc.first) {
+			Some(__): acc;
+			None(): switch (jp.second.first) {
+				FolQuant(q, vs, body): {
+					v = if (length(vs) == 1) vs[0] else "";
+					if (q != "exists" || v == "" || mizEmitFreeIn(v, goal)
+						|| exists(others(jp.first), \f -> mizEmitFreeIn(v, f))) acc
+					else {
+						sub = mizEmitReduceA(hyps, prev, body, goal, maxFacts, maxSize,
+							1, fresh, used, recDrv);
+						switch (sub.first) {
+							// a failed ∃-attempt keeps the step's ORIGINAL status: this
+							// is a last resort, and its budget overruns should not turn
+							// an attempted step into a "skipped" one
+							None(): acc;
+							Some(pr): {
+								n0 = length(pr.steps);
+								vr = toLowerCase(v);
+								dj = filtermap(folFormVars(goal),
+									\w -> if (w == vr) None() else Some(Pair(vr, w)));
+								ex = FolPStep(FolBin("imp", jp.second.first, goal),
+									"exlimiv", [FolPRefStep(n0 - 1)]);
+								k = length(pr.factRefs);
+								mp = FolPStep(goal, "ax-mp",
+									[FolPRefFact(k), FolPRefStep(n0)]);
+								Pair(Some(FolStepProof(concatA([pr.steps, [ex, mp]]),
+									arrayPush(pr.factRefs, jp.second.second),
+									uniq(concat(pr.disjs, dj)))), false);
+							}
+						}
+					}
+				}
+				default: acc;
+			}
+		});
 }
 
 mizEmitFresh(fresh : ref int, used : Set<string>) -> string {
