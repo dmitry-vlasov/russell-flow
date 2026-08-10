@@ -707,3 +707,21 @@ instantiated at an element → its ∃ consequent eliminated (the piece built
 here) → the witnessed equation `x = ⟨a,b⟩` used to REWRITE the goal's atoms
 (the congruence walk exists). The next slice is wiring these three existing
 pieces into one reduction case for `x ∈ X` facts where X is a relation.
+
+### 2026-08-10 — ∃-elimination generalized; the wall wants the deduction twin
+*Built*: many-binder elimination (an exlimiv chain, innermost first) and
+DERIVED existential candidates — a definition instance `x ∈ X → ∃ā ψ` whose
+antecedent is a context fact yields the ∃ by one ax-mp, then eliminates.
+*Measured*: all five gate articles exactly unchanged. The trace on
+t8_relat_1 names the reason precisely: the theorem is `∀X (X is Relation →
+…)`, so the relation-hood assumption AND the element antecedent both live
+INSIDE the deduction reduction, and the elimination fires only at top level,
+where neither fact exists yet.
+*Consequence*: the next slice is single and named — ∃-elimination UNDER an
+assumption, discharged by exlimdv (`(φ → (ψ → χ)) ⊢ (φ → (∃x ψ → χ))`, in
+the foundation), the deduction twin of exlimiv. It slots into mizEmitReduceA
+the way jca/alrimiv/sylibr did into their cases; the candidate machinery
+(context + derived ∃, multi-binder chains) is already built and waiting.
+Note the pattern now repeated three times: every reduction rule's deduction
+twin is ONE existing foundation lemma. The twin table so far: ax-gen→alrimiv,
+mpbir→sylibr, pm3.2i→jca, impbii→impbid, exlimiv→exlimdv.
