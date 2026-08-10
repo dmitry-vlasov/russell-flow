@@ -743,3 +743,23 @@ what distinguishes it from the measured dead end (definitions of every
 symbol the step mentions, which blew the budget and closed nothing). It
 needs the defs-by-symbol index restored, consumed only inside the
 ∃-elimination. The twin table stands at six rows and has not missed yet.
+
+### 2026-08-10 — the full first-link design, traced to the lemma level
+Before implementing, the whole t8_relat_1 chain was walked by hand against
+the existing machinery. The candidate the ∃-elimination needs has the shape
+  d1_relat_1 at X:   P ↔ ∀x (B(x) → ∃a∃b ψ)      P = v1_relat_1 X
+with P a conjunct of the assumption and B(e) another conjunct (e = the
+element the reduction introduced). The assembly, all under `asm`:
+  1. the instance block (standalone axiom instance, mizEmitDefInstance with
+     sym = the HEAD PREDICATE of the assumption's atom — restore the
+     defs-by-symbol index, consumed only here);
+  2. biimpi → `P → ∀x(B → ∃ψ)`; projTo(asm, P) + syl → `asm → ∀x(B → ∃ψ)`;
+  3. the ∀ eliminated at e UNDER asm: mizEmitElimAt already builds the
+     needed implication `∀x φ → φ[e]` as its intermediate step (m1) — it
+     needs a variant that RETURNS that implication instead of consuming a
+     source fact; then syl → `asm → (B(e) → ∃ψ[e])`;
+  4. projTo(asm, B(e)) + mpd → `asm → ∃ψ[e]`;
+  5. the existing exlimdv elimination consumes it (mpd at the end).
+Every lemma is already in the foundation; steps 1, 2, 4, 5 exist as code.
+The ONE new piece is the ElimAt variant in step 3 (implication out, no
+source), plus the index restore. Nothing else in the chain is new.
