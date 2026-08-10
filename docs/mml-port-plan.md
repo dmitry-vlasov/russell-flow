@@ -782,3 +782,23 @@ Next slice: STRENGTHEN THE ASSUMPTION — derive these consequences first and
 run the sub-proof from `asm ∧ ⟨a,b⟩∈X ∧ a∈proj1X ∧ b∈proj2X`. That is an
 assembly job over existing parts (the walk, spcegv, projTo, mpbi are all in
 place); no new lemma and no new machinery family is required.
+
+### 2026-08-10 — strengthening works; the index looks in the wrong place
+*Built*: the sub-proof of the elimination chain runs from a STRENGTHENED
+assumption. Round 1 (equation into membership: eleq1+syl+mpbid) fires on
+t8_relat_1 — `⟨a,b⟩ ∈ X` is derived and handed over. Round 2 (membership by
+an ∃-bodied definition + the ∃-goal machinery) is built and finds nothing.
+*Found*: the reason is the INDEX, not the machinery. proj1's definition is
+d12_xtuple_0 — an imported article's means-definition — and the .eth
+environment carries only what the article's proofs CITE. A definition the
+checker expands silently is absent, so defs-by-symbol, built from the
+environment, sees only the two relat_1 definitions that mention proj1.
+Also fixed on the way: the normalizer emits nested single-binder ∃, which
+must be flattened before elimination (round 1 was blocked on exactly this).
+*Consequence*: ONE job left on this wall, and it is mechanical: build
+defs-by-symbol from the DEPENDENCY ARTICLES' own definition tables
+(mizArticleDefs over each imported article's XML with that article's sig,
+cached per dep), not from the .eth. Every consumer downstream is in place
+and traced working. Note the session's recurring shape: each "wall" turned
+into a chain of ordinary defects, and every defect was found by a trace that
+names its exact point — never by speculation.
