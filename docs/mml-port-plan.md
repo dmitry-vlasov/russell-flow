@@ -966,3 +966,31 @@ let/assume/consider skeleton inside the proof (the deduction-reduction
 machinery that now exists is exactly what proves such shapes). Then the
 cite channel can return, matching against emitted text only. Merge-log
 replay stays queued behind it.
+
+### 2026-08-10 — THE HONESTY GATE: every emitted theorem states its Mizar theorem
+*Built*: the hypothetical emission `hyps ⊢ last-step` passes only when the
+hyps are the statement's own antecedents and the last step is its matrix;
+a dishonest shape (census: 270 of ~630 hypothetical theorems across the
+gate set — 101 in relat_1 alone) falls back to the single-step form: no
+hyps, one open step stating the ∀-closed Mizar statement, the proof's
+whole citation set as its premise pool. Honest, citable, and exactly the
+shape the deduction reduction proves.
+*Measured* (8 articles, verify green, MM green with proved == closed):
+  the headline count moves 132 → 112, and that is a CORRECTION, not a
+  loss — 55 of the old 132 were proof FRAGMENTS bearing Mizar ref names
+  (subset_1's five and xtuple_0's two were ALL fragments; their honest
+  count is zero). Against the honest baseline of 77, the fallback +
+  reduction RE-CLOSED 35 theorems as their real ∀-closed statements:
+  xboole_1 47 → 73 (26 of its 35 fragments re-close through the same
+  machinery that closed t8), zfmisc_1 15 → 18, relat_1 1 → 6, xboole_0
+  2 → 3. relat_1 also now emits 179 theorems (4 previously dropped for
+  Choice markers in their PROOFS return — the statement-only form does
+  not carry them).
+*Consequence*: the scoreboard is honest for the first time since the
+hypothetical form was introduced, and every closed theorem is citable by
+dependents at its true statement. The "one step short" metric is now
+diluted (a single-step open theorem is trivially one short) — read
+by-steps instead. NEXT: the single-step ∀-closed theorems are exactly the
+reduction's workload — the eigenvariable chain, merge-log replay, and the
+per-piece skeletons (thus-chains as ∧-splits) are the three levers over
+the 167 open relat_1 statements.
