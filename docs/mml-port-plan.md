@@ -802,3 +802,21 @@ cached per dep), not from the .eth. Every consumer downstream is in place
 and traced working. Note the session's recurring shape: each "wall" turned
 into a chain of ordinary defects, and every defect was found by a trace that
 names its exact point — never by speculation.
+
+### 2026-08-10 — the strengthener derives everything; one unfold short
+*Built*: the defs-by-symbol index reads the dependency articles' own
+definition tables. Seven defects on the way, each named by a trace: names
+carried by constructor identity (a dep's .eno gives mechanical names); inline
+constructors merged from the dep XML; the STATIC reuse check for the dep
+parse (emitD's counts every loaded import symbol as provided); the DEFINES
+filter and round 2 accept the normalizer's ∧-of-implications beside the iff;
+filter before capping; ∃-witnesses from inside terms; the eleq1 bridge
+unfolds the memberships it introduces.
+*State*: STRENGTHEN on t8_relat_1 derives the exact predicted list —
+`⟨a,b⟩∈X ; a∈proj1 X ; b∈proj2 X` — and the sub-proof fact dump (dbg-facts)
+shows every instance present EXCEPT the opelxp unfold of
+`⟨a,b⟩ ∈ (proj1 X ×. proj2 X)`. That one instance is the whole remaining
+distance on this theorem. Suspects, in order: the memGen recursion from the
+eleq1-introduced membership stops before the product term; the pair's
+FolApp name differs where that particular recursion runs; the relevance cut.
+All articles unchanged and verified; nothing regressed.
