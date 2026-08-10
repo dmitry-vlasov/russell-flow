@@ -994,3 +994,29 @@ by-steps instead. NEXT: the single-step ∀-closed theorems are exactly the
 reduction's workload — the eigenvariable chain, merge-log replay, and the
 per-piece skeletons (thus-chains as ∧-splits) are the three levers over
 the 167 open relat_1 statements.
+
+### 2026-08-10 — the cite rung: citations return, soundly, and relat_1 doubles
+*Built*: the cited-statements channel returns as RUNG 4 of the ladder,
+rebuilt on the honesty gate with every defect from the reverted attempt
+fixed by name:
+  - TRUST: only own-article theorems (their table entry IS the emitted
+    ∀-closed statement now) and env axioms are citable — an imported
+    theorem's .eth text may differ from its emitted shape;
+  - CAPTURE: a witness must be the binder itself (spi) or a name foreign
+    to the statement — and BOTH comparisons are case-normalized (the AST
+    binder is "X5", the rendered free var "x5"; the mismatch sent identity
+    instantiations into spv and violated its own disjointedness);
+  - SCOPE: instances only at the goal's/assumption's free variables, two
+    per citation — instantiating at every variable of every form put 77
+    candidates against a 10-slot ranked cut and cost t2_xboole_0;
+  - ORDER: a separate rung, fired only when rung 3 without citations
+    fails — as ordinary candidates the citations crowded working sets.
+*Measured* (8 articles, verify green, MM green, proved == closed):
+  relat_1 6 → 10 theorems, zfmisc_1 18 → 19, all floors held.
+  THE HONEST GATE SET GOES 112 → 117.
+*Consequence*: the theorem-shape fix is now PAYING — the citation economy
+works across an article's own theorems. The remaining relat_1 tail wants
+imported citations (blocked on the .eth-vs-emitted text mismatch — the
+next translation slice is emitting dependency articles' theorems in the
+same honest shape, which makes their loaded text THE text) and the
+merge-log replay for the equalizer-closed equational steps.

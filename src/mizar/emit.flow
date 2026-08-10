@@ -84,6 +84,11 @@ mizEmitShOfRef : ref ((string) -> string) = ref (\__ -> "");
 // was the measured budget-blowing dead end.
 mizEmitStmtOfRef : ref ((string) -> Maybe<FolForm>) = ref (\__ -> None());
 mizEmitDefsOfSymRef : ref ((string) -> [string]) = ref (\__ -> []);
+// the current step's CITED statements (name, statement): a step with no
+// record facts previously got NOTHING from its by-list — the citations only
+// served the record matcher. Rung 3 instantiates these at the stage's free
+// variables like any other ∀-fact (cite-rooted chain, mizEmitInstCite).
+mizEmitCiteStmtsRef : ref [Pair<string, FolForm>] = ref [];
 // per STEP: did some certificate attempt find a proof that was only too LONG?
 // That step wants a smaller encoding, not better facts.
 mizEmitStepLong : ref bool = ref false;
@@ -144,6 +149,23 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 		};
 		mizEmitShOfRef := shOf;
 		mizEmitStmtOfRef := stmtOf;
+		// only names whose TABLE TEXT is the emitted text may be stated as cite
+		// facts: an own-article theorem's entry IS its emitted prop (since the
+		// honesty gate, the ∀-closed Mizar statement), and an env axiom is
+		// emitted ∀-closed as stated. An IMPORTED theorem's entry is the .eth
+		// statement while its emitted shape was decided in its own article —
+		// citing t27_xtuple_0 by the .eth text made Russell DISPROVE relat_1.
+		artOf = \nm : string -> {
+			u = strIndexOf(nm, "_");
+			if (u < 0) nm else strRight(nm, u + 1);
+		};
+		ownArt = artOf(t.name);
+		mizEmitCiteStmtsRef := filtermap(cites, \c ->
+			if (!isAxiom(c) && artOf(c) != ownArt) None()
+			else switch (stmtOf(c)) {
+				None(): None();
+				Some(st): Some(Pair(c, st));
+			});
 		defDrvs = map(mizEmitDefUnfolds(expOf(pos), stepAtoms, stmtOf, shOf, 6), \d -> {
 			r = mizEmitDischarge(d, ctxI, proveGuard);
 			if (getUrlParameterDef("dbg-guard", "") == "1" && r.form != d.form)
@@ -1579,19 +1601,69 @@ mizEmitLadderA(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 					gDefs1 = uniqBy(map(gDefs0, mizEmitCleanIff),
 						\d2, d3 -> mizEmitKey(d2.form) == mizEmitKey(d3.form));
 					gDefs = if (length(gDefs1) > 6) subrange(gDefs1, 0, 6) else gDefs1;
+					// THE STEP'S CITED STATEMENTS, instantiated at this stage's free
+					// variables: a step with no record facts got nothing from its
+					// by-list, and the ∀-closed citation was invisible to relevance.
+					// The stage where the theorem's ∀ has been peeled is exactly
+					// where the citation's binder has something to bind to.
+					// the GOAL'S free variables only: instantiating the citations at
+					// every variable of every form put 77 candidates against a
+					// 10-slot ranked cut and crowded out t2_xboole_0's needed facts
+					fvs0 = uniq(concat(folFormVars(goal),
+						switch (asm) { None(): []; Some(af): folFormVars(af); }));
+					fvs = if (length(fvs0) > 4) subrange(fvs0, 0, 4) else fvs0;
+					citeDrvs0 = concatA(map(^mizEmitCiteStmtsRef, \pc ->
+						if (!mizEmitIsForall(pc.second)) {
+							if (folFormVars(pc.second) != []) [] else
+								[MizEmitDrv(pc.second, [FolPStep(pc.second, pc.first, [])], [], [])];
+						} else {
+							nbc = mizEmitPrefixLen(pc.second);
+							tuples = if (nbc == 1) map(fvs, \e -> [e])
+								else if (nbc == 2) concatA(map(fvs, \e1 -> map(fvs, \e2 -> [e1, e2])))
+								else [];
+							// CAPTURE GUARD: a witness must be the binder itself
+							// (spi) or a name FOREIGN to the statement — putting one
+							// binder's name under another's ∀ was the albidv/spv
+							// disjointedness violation the verifier caught
+							// variable names differ in CASE between the statement's AST
+							// (binders "X7") and the rendered free vars ("x7") — the
+							// guard must compare lowercased or it passes everything
+							sVars = buildSet(map(mizFormAllVars(pc.second), toLowerCase));
+							tpsOk = filter(tuples, \tp -> foldi(tp, true, \bi, ok, y -> {
+								ok && (toLowerCase(mizEmitBinderAt(pc.second, bi)) == toLowerCase(y)
+									|| !containsSet(sVars, toLowerCase(y)));
+							}));
+							tps = if (length(tpsOk) > 2) subrange(tpsOk, 0, 2) else tpsOk;
+							filtermap(tps, \tp -> mizEmitInstCite(pc.first, pc.second, tp));
+						}));
+					citeDrvs1 = uniqBy(citeDrvs0, \d2, d3 -> mizEmitKey(d2.form) == mizEmitKey(d3.form));
+					citeDrvs = if (length(citeDrvs1) > 12) subrange(citeDrvs1, 0, 12) else citeDrvs1;
 					drv = concatA([mizEmitDrvInsts(recDrv,
 						arrayPush([goal], switch (asm) { None(): goal; Some(af): af; }),
 						^mizEmitShOfRef),
 						gDefs,
 						mizEmitCtxNF(ctx0),
 						mizEmitChars(ctx0), mizEmitDerive(ctx0, allForms)]);
-					if (drv == []) r2
+					r3 = if (drv == []) r2
 					else {
 						// unfolds/bridges over the instances too
 						all2 = concat(allForms, map(drv, \d -> d.form));
 						i2 = fold(all2, makeTree(), \acc, f -> mizEmitUnfolds(f, acc));
 						mizEmitTry(ctx, goal,
 							getTreeValues(mizEmitBridges(all2, i2)), drv, maxFacts, maxSize, asm);
+					};
+					switch (r3.first) {
+						Some(__): r3;
+						// RUNG 4 — the CITED statements join only when everything
+						// without them failed: as ordinary candidates they crowded
+						// the ranked cut and cost a closing theorem (t2_xboole_0)
+						None(): if (citeDrvs == []) r3 else {
+							drv4 = concat(drv, citeDrvs);
+							all4 = concat(allForms, map(drv4, \d -> d.form));
+							i4 = fold(all4, makeTree(), \acc, f -> mizEmitUnfolds(f, acc));
+							mizEmitTry(ctx, goal,
+								getTreeValues(mizEmitBridges(all4, i4)), drv4, maxFacts, maxSize, asm);
+						}
 					}
 				}
 			}
@@ -1969,12 +2041,34 @@ mizEmitPrefixLen(f : FolForm) -> int {
 mizEmitInst(fact : FolForm, factRef : RuParseRef, ws : [string]) -> Maybe<MizEmitDrv> {
 	steps : ref [FolPStep] = ref [];
 	dj : ref [Pair<string, string>] = ref [];
+	r = mizEmitInstChain(steps, dj, Pair(fact, FolPRefFact(0)), ws);
+	switch (r) {
+		None(): None();
+		Some(fin): if (^steps == []) None()
+			else Some(MizEmitDrv(fin.first, ^steps, [factRef], uniq(^dj)));
+	}
+}
+
+// the same ∀-elimination chain rooted at a CITED assertion: step 0 states the
+// citation's whole statement and names it (Russell does the substitution for
+// an open-matrix theorem; a ∀-closed one is peeled here like a context fact)
+mizEmitInstCite(name : string, stmt : FolForm, ws : [string]) -> Maybe<MizEmitDrv> {
+	steps : ref [FolPStep] = ref [FolPStep(stmt, name, [])];
+	dj : ref [Pair<string, string>] = ref [];
+	r = mizEmitInstChain(steps, dj, Pair(stmt, FolPRefStep(0)), ws);
+	switch (r) {
+		None(): None();
+		Some(fin): Some(MizEmitDrv(fin.first, ^steps, [], uniq(^dj)));
+	}
+}
+
+mizEmitInstChain(steps : ref [FolPStep], dj : ref [Pair<string, string>],
+	start : Pair<FolForm, FolPRef>, ws : [string]) -> Maybe<Pair<FolForm, FolPRef>> {
 	emit = \form : FolForm, lemma : string, refs : [FolPRef] -> {
 		steps := arrayPush(^steps, FolPStep(form, lemma, refs));
 		length(^steps) - 1;
 	};
-	start : Pair<FolForm, FolPRef> = Pair(fact, FolPRefFact(0));
-	r = fold(ws, Some(start), \acc : Maybe<Pair<FolForm, FolPRef>>, y ->
+	fold(ws, Some(start), \acc : Maybe<Pair<FolForm, FolPRef>>, y ->
 		switch (acc) {
 			None(): None();
 			Some(st): switch (st.first) {
@@ -1983,7 +2077,11 @@ mizEmitInst(fact : FolForm, factRef : RuParseRef, ws : [string]) -> Maybe<MizEmi
 					else {
 						x = vs[0];
 						rest = if (length(vs) == 1) body else FolQuant(q, tail(vs), body);
-						if (y == x) {
+						// the AST binder ("X5") and a rendered free-var name ("x5")
+						// are the SAME variable — compare lowercased, or the identity
+						// instantiation falls into spv and violates its own
+						// disjointedness (the t95_xboole_1 disproof)
+						if (toLowerCase(y) == toLowerCase(x)) {
 							i = emit(rest, "spi", [st.second]);
 							Some(Pair(rest, FolPRefStep(i)));
 						} else switch (mizEmitWalk(steps, dj, x, y, rest)) {
@@ -2004,11 +2102,6 @@ mizEmitInst(fact : FolForm, factRef : RuParseRef, ws : [string]) -> Maybe<MizEmi
 				default: None();
 			}
 		});
-	switch (r) {
-		None(): None();
-		Some(fin): if (^steps == []) None()
-			else Some(MizEmitDrv(fin.first, ^steps, [factRef], uniq(^dj)));
-	}
 }
 
 // steps proving |- (x = y → (f ↔ f[y/x])); returns (stepIdx, f[y/x]).
@@ -3899,4 +3992,14 @@ mizEmitFirstTermMatch(pats : [FolTerm], tgts : [FolTerm], metas : Set<string>,
 			}
 		});
 	});
+}
+
+// the i-th ∀-binder of a prefix (nested single- or multi-binder nodes), or ""
+mizEmitBinderAt(f : FolForm, i : int) -> string {
+	switch (f) {
+		FolQuant(q, vs, b): if (q != "forall") "" else {
+			if (i < length(vs)) vs[i] else mizEmitBinderAt(b, i - length(vs));
+		}
+		default: "";
+	}
 }
