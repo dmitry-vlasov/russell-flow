@@ -608,6 +608,170 @@ mizEmitExChain(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolForm
 	});
 }
 
+// collect a nested single-binder ∃ prefix into one binder list
+mizEmitExFlatten(f : FolForm) -> Pair<[string], FolForm> {
+	switch (f) {
+		FolQuant(q, vs, b): if (q != "exists") Pair([], f) else {
+			inner = mizEmitExFlatten(b);
+			Pair(concat(vs, inner.first), inner.second);
+		}
+		default: Pair([], f);
+	}
+}
+
+// ---- STRENGTHENING THE ASSUMPTION ----
+// The chain's sub-proof runs from `asm ∧ x = ⟨a,b⟩`, but what it NEEDS are
+// consequences of that: `⟨a,b⟩ ∈ X` (the equation moved into the membership)
+// and `a ∈ proj1 X` (a definition with an ∃ body, introduced at the other
+// component). Both are derivable under the assumption with machinery that
+// exists — but they arise inside the tableau, where no ∃ step can happen. So
+// they are derived FIRST, each as `asmB → c`, and the sub-proof runs from the
+// strengthened conjunction. Appends proofs to the shared refs; returns the
+// consequences with the step index proving each.
+mizEmitStrengthen(hyps : [FolForm], prev : [FolForm], asmB : FolForm, goal : FolForm,
+	maxFacts : int, maxSize : int, depth : int, fresh : ref int, used : Set<string>,
+	recDrv : [MizEmitDrv], steps : ref [FolPStep], refs : ref [RuParseRef],
+	dj : ref [Pair<string, string>], shOf : (string) -> string) -> [Pair<FolForm, int>] {
+	emit = \form : FolForm, lemma : string, rs : [FolPRef] -> {
+		steps := arrayPush(^steps, FolPStep(form, lemma, rs));
+		length(^steps) - 1;
+	};
+	conjs = mizEmitConjuncts(asmB, []);
+	// round 1 — the equation moved into the membership: conjuncts `x = t` and
+	// `x ∈ T` give `t ∈ T` by eleq1 + syl + mpbid
+	r1 = concatA(map(conjs, \c -> switch (c) {
+		FolEq(l, t): switch (l) {
+			FolVar(__): filtermap(conjs, \c2 -> switch (c2) {
+				FolPred(nm, args): if (nm != "∈" || length(args) != 2 || args[0] != l) None()
+					else {
+						tgt = mizEmitMem(t, args[1]);
+						el = emit(FolBin("imp", c, FolBin("iff", c2, tgt)), "eleq1", []);
+						switch (mizEmitProjTo(steps, asmB, c)) {
+							None(): None();
+							Some(p1): {
+								s1 = emit(FolBin("imp", asmB, FolBin("iff", c2, tgt)), "syl",
+									[FolPRefStep(p1), FolPRefStep(el)]);
+								switch (mizEmitProjTo(steps, asmB, c2)) {
+									None(): None();
+									Some(p2): Some(Pair(tgt, emit(FolBin("imp", asmB, tgt), "mpbid",
+										[FolPRefStep(p2), FolPRefStep(s1)])));
+								}
+							}
+						}
+					}
+				default: None();
+			});
+			default: [];
+		}
+		default: [];
+	}));
+	if (^mizEmitDbg)
+		println("    STR r1=" + i2s(length(r1)) + " conjs="
+			+ strGlue(map(conjs, \c2 -> strGlue(folFormToks(c2), " ")), " | "));
+	// round 2 — membership by an ∃-bodied definition: for a goal-term symbol f
+	// with normalized instance `∀z (z ∈ f(ā) ↔ ∃y ψ)`, and an element a of the
+	// assumption, prove `a ∈ f(ā)`: instance at a, biimpri, and the ∃ proved
+	// under the round-1-strengthened assumption by the ∃-goal machinery
+	asm1 = fold(r1, asmB, \ac, pr -> FolBin("and", ac, pr.first));
+	// asmB → asm1 (id + jca over the round-1 consequences)
+	asm1idx = if (r1 == []) -1 else {
+		i0 = emit(FolBin("imp", asmB, asmB), "id", []);
+		(fold(r1, Pair(i0, asmB), \ac : Pair<int, FolForm>, pr -> {
+			nf = FolBin("and", ac.second, pr.first);
+			Pair(emit(FolBin("imp", asmB, nf), "jca",
+				[FolPRefStep(ac.first), FolPRefStep(pr.second)]), nf);
+		})).first;
+	};
+	stmtOf = ^mizEmitStmtOfRef;
+	defsOf = ^mizEmitDefsOfSymRef;
+	gAtoms = uniq(concatA(map([goal, asm1], \gf -> mizEmitAtomsOf(gf, []))));
+	gSyms = uniq(concatA(map(mizEmitAtomsOf(goal, []), mizFormSymbols)));
+	// the index maps a symbol to every statement MENTIONING it; keep only an
+	// instance that DEFINES it — `∀z (z ∈ sy(…) ↔ …)` after normalization
+	defines = \d2 : MizEmitDrv, sy : string -> switch (d2.form) {
+		FolQuant(q4, vs4, b4): if (q4 != "forall" || length(vs4) != 1) false else switch (b4) {
+			FolBin(op4, l4, __): if (op4 != "iff") false else switch (l4) {
+				FolPred(nm4, args4): nm4 == "∈" && length(args4) == 2
+					&& mizEmitTermHasSym(args4[1], sy);
+				default: false;
+			}
+			default: false;
+		}
+		default: false;
+	};
+	defs = concatA(map(gSyms, \sy -> {
+		ds = defsOf(sy);
+		raw = filtermap(if (length(ds) > 3) subrange(ds, 0, 3) else ds,
+			\nm2 -> maybeMap(mizEmitDefInstance(nm2, sy, gAtoms, stmtOf, shOf), mizEmitCleanIff));
+		if (^mizEmitDbg)
+			println("    STR-DEF " + sy + " ds=" + strGlue(if (length(ds) > 3) subrange(ds, 0, 3) else ds, ",")
+				+ " inst=" + strGlue(map(raw, \d2 -> strGlue(folFormToks(d2.form), " ")), " | "));
+		filter(raw, \d2 -> defines(d2, sy));
+	}));
+	elems = uniq(filtermap(concatA(map(conjs, \c -> folFormVars(c))), \v -> Some(v)));
+	if (^mizEmitDbg)
+		println("    STR syms=" + strGlue(gSyms, ",") + " defs=" + i2s(length(defs))
+			+ " forms=" + strGlue(map(defs,
+				\d2 -> strGlue(folFormToks(d2.form), " ")), " | "));
+	r2 = concatA(map(defs, \d -> if (d.steps == []) [] else switch (d.form) {
+		FolQuant(q0, vs0, b0): if (q0 != "forall" || length(vs0) != 1) [] else {
+			z = vs0[0];
+			filtermap(if (length(elems) > 3) subrange(elems, 0, 3) else elems, \a -> {
+				s0 = ^steps; r0 = ^refs; d0 = ^dj;
+				roll = \ -> { steps := s0; refs := r0; dj := d0; None(); };
+				// the instance `a ∈ f ↔ ∃y ψ(a)`, standalone
+				base = length(^steps);
+				kf = length(^refs);
+				steps := concat(^steps, mizEmitShift(d.steps, base, kf));
+				refs := concat(^refs, d.refs);
+				dj := concat(^dj, d.disjs);
+				blockLast = length(^steps) - 1;
+				switch (mizEmitInstImp(steps, dj, d.form, z, FolVar(a), shOf, 0)) {
+					None(): roll();
+					Some(im): {
+						inst = emit(im.second, "ax-mp", [FolPRefStep(blockLast), FolPRefStep(im.first)]);
+						switch (im.second) {
+							FolBin(opI, memF, exF): {
+								okEx = switch (exF) { FolQuant(qE, __, __): qE == "exists"; default: false; };
+								if (opI != "iff" || !okEx) roll() else {
+									bi = emit(FolBin("imp", exF, memF), "biimpri", [FolPRefStep(inst)]);
+									// the ∃ proved under the strengthened assumption
+									sub = switch (exF) {
+										FolQuant(__, vsE, bE): mizEmitExGoalA(hyps, prev, asm1, exF,
+											vsE, bE, maxFacts, maxSize, depth + 2, fresh, used,
+											Pair(None(), false), recDrv);
+										default: Pair(None(), false);
+									};
+									switch (sub.first) {
+										None(): roll();
+										Some(pe): {
+											b2 = length(^steps);
+											k2 = length(^refs);
+											steps := concat(^steps, mizEmitShift(pe.steps, b2, k2));
+											refs := concat(^refs, pe.factRefs);
+											dj := concat(^dj, pe.disjs);
+											exIdx = length(^steps) - 1;   // asm1 → ∃yψ(a)
+											// back to asmB: syl through asmB → asm1
+											exB = if (asm1idx < 0) exIdx
+												else emit(FolBin("imp", asmB, exF), "syl",
+													[FolPRefStep(asm1idx), FolPRefStep(exIdx)]);
+											Some(Pair(memF, emit(FolBin("imp", asmB, memF), "syl",
+												[FolPRefStep(exB), FolPRefStep(bi)])));
+										}
+									}
+								}
+							}
+							default: roll();
+						}
+					}
+				}
+			});
+		}
+		default: [];
+	}));
+	concat(r1, if (length(r2) > 3) subrange(r2, 0, 3) else r2);
+}
+
 // cand's block proves `P → qq` standalone (qq = ∀v (B → ∃ψ)); under asm:
 // projTo(P)+syl, the instance implication + syl, projTo(B[e])+mpd, then the
 // exlimdv discharge of the sub-proof
@@ -633,16 +797,18 @@ mizEmitExChainAt(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolFo
 			switch (inst) {
 				FolBin(op3, be, exe): {
 					conjs2 = mizEmitConjuncts(asm, []);
-					vsOk = switch (exe) {
-						FolQuant(q3, vs3, __): q3 == "exists" && vs3 != []
-							&& !exists(vs3, \w -> mizEmitFreeIn(w, goal) || mizEmitFreeIn(w, asm)
-								|| exists(hyps, \hf -> mizEmitFreeIn(w, hf))
-								|| exists(prev, \pf -> mizEmitFreeIn(w, pf)));
-						default: false;
-					};
+					// the normalizer peels one binder at a time, so `∃a∃b E` arrives as
+					// nested single-binder nodes — flatten to get every binder
+					flat = mizEmitExFlatten(exe);
+					vs3 = flat.first;
+					body3 = flat.second;
+					vsOk = vs3 != []
+						&& !exists(vs3, \w -> mizEmitFreeIn(w, goal) || mizEmitFreeIn(w, asm)
+							|| exists(hyps, \hf -> mizEmitFreeIn(w, hf))
+							|| exists(prev, \pf -> mizEmitFreeIn(w, pf)));
 					if (op3 != "imp" || !vsOk || !exists(conjs2, \c -> c == be)) dbgf("shape-or-conjunct")
-					else switch (exe) {
-						FolQuant(__, vs3, body3): {
+					else {
+						{
 							// the GOAL's own operators (proj1, proj2, …) get their
 							// definitions too — same index, same QNF, capped; without
 							// them the sub-proof cannot know what the goal's terms mean
@@ -658,11 +824,57 @@ mizEmitExChainAt(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolFo
 							}));
 							extra = map(if (length(extra0) > 3) subrange(extra0, 0, 3) else extra0,
 								mizEmitCleanIff);
-							sub = mizEmitReduceA0(hyps, prev, FolBin("and", asm, body3), goal,
+							asmB = FolBin("and", asm, body3);
+							plain = mizEmitReduceA0(hyps, prev, asmB, goal,
 								maxFacts, maxSize, depth + 2, fresh, used, concat(recDrv, extra));
-							switch (sub.first) {
+							// the sub-proof, possibly from the STRENGTHENED assumption:
+							// (proof, index of the step proving asmB → goal)
+							prep : Maybe<Pair<FolStepProof, int>> = switch (plain.first) {
+								Some(pr0): Some(Pair(pr0, length(pr0.steps) - 1));
+								None(): {
+									st2 : ref [FolPStep] = ref [];
+									rf2 : ref [RuParseRef] = ref [];
+									dj2 : ref [Pair<string, string>] = ref [];
+									exs = mizEmitStrengthen(hyps, prev, asmB, goal, maxFacts, maxSize,
+										depth, fresh, used, concat(recDrv, extra), st2, rf2, dj2, shOf);
+									if (^mizEmitDbg)
+										println("  STRENGTHEN n=" + i2s(length(exs)) + " :: "
+											+ strGlue(map(exs, \c2 -> strGlue(folFormToks(c2.first), " ")), " ; "));
+									if (exs == []) None() else {
+										asmS = fold(exs, asmB, \ac, c2 -> FolBin("and", ac, c2.first));
+										subS = mizEmitReduceA0(hyps, prev, asmS, goal,
+											maxFacts, maxSize, depth + 2, fresh, used, concat(recDrv, extra));
+										switch (subS.first) {
+											None(): None();
+											Some(ps): {
+												base = length(ps.steps);
+												kf = length(ps.factRefs);
+												stA : ref [FolPStep] = ref concat(ps.steps,
+													mizEmitShift(^st2, base, kf));
+												em2 = \form : FolForm, lemma : string, rs : [FolPRef] -> {
+													stA := arrayPush(^stA, FolPStep(form, lemma, rs));
+													length(^stA) - 1;
+												};
+												// asmB → asmS (id + jca over the consequences), then syl
+												i0 = em2(FolBin("imp", asmB, asmB), "id", []);
+												ci = (fold(exs, Pair(i0, asmB), \ac : Pair<int, FolForm>, c2 -> {
+													nf2 = FolBin("and", ac.second, c2.first);
+													Pair(em2(FolBin("imp", asmB, nf2), "jca",
+														[FolPRefStep(ac.first), FolPRefStep(c2.second + base)]), nf2);
+												})).first;
+												gi = em2(FolBin("imp", asmB, goal), "syl",
+													[FolPRefStep(ci), FolPRefStep(base - 1)]);
+												Some(Pair(FolStepProof(^stA, concat(ps.factRefs, ^rf2),
+													uniq(concat(ps.disjs, ^dj2))), gi));
+											}
+										}
+									}
+								}
+							};
+							switch (prep) {
 								None(): dbgf("subproof");
-								Some(pr): {
+								Some(pg): {
+									pr = pg.first;
 									steps : ref [FolPStep] = ref pr.steps;
 									refs : ref [RuParseRef] = ref pr.factRefs;
 									dj : ref [Pair<string, string>] = ref pr.disjs;
@@ -671,7 +883,7 @@ mizEmitExChainAt(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolFo
 										length(^steps) - 1;
 									};
 									cur = emit(FolBin("imp", asm, FolBin("imp", body3, goal)), "ex",
-										[FolPRefStep(length(pr.steps) - 1)]);
+										[FolPRefStep(pg.second)]);
 									n = length(vs3);
 									exl = fold(enumFromTo(1, n), cur, \st, i -> {
 										k2 = n - i;
@@ -718,7 +930,6 @@ mizEmitExChainAt(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolFo
 								}
 							}
 						}
-						default: failed;
 					}
 				}
 				default: failed;
@@ -726,7 +937,6 @@ mizEmitExChainAt(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolFo
 		}
 	}
 }
-
 mizEmitFresh(fresh : ref int, used : Set<string>) -> string {
 	n = "X95" + i2s(^fresh);
 	fresh := ^fresh + 1;
