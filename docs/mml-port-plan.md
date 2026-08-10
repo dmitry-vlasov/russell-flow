@@ -1020,3 +1020,22 @@ imported citations (blocked on the .eth-vs-emitted text mismatch — the
 next translation slice is emitting dependency articles' theorems in the
 same honest shape, which makes their loaded text THE text) and the
 merge-log replay for the equalizer-closed equational steps.
+
+### 2026-08-10 — the honest baseline regenerated end to end
+*Done*: the whole gate chain re-translated in dependency order with the
+honesty-gate jar — every stored article skeleton now carries honest
+theorem shapes (t20_relat_1 states RELAT_1:20). Backup:
+`~/dev/math/mizar-honest-baseline-20260810.tar.gz`. The emit gate on the
+new baseline reproduces 117 exactly (verify green, MM spot-checks green,
+proved == closed) — no .eth-vs-emitted render mismatch exists: the
+constructor-identity naming makes the two texts equal for single-step
+theorems, so IMPORTED single-step theorems are now citable through the
+existing isAxiomName dispatch with no code change.
+*Observed*: no imported-citation gains yet — the remaining open steps
+fail on EVIDENCE (the equalizer's equation chains), not on citability.
+t21_relat_1 has its citation (t20, honest, instantiable) and still needs
+the ∪-congruence + commutativity chain the merge log records.
+*Consequence*: the citability infrastructure is complete and sound; the
+frontier is now purely the MERGE-LOG REPLAY (equation chains into
+eqtr/congruence-walk bridges) plus the enumset1 foundation lemmas. Both
+were named before; nothing else is in front of them.
