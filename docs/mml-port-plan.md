@@ -938,3 +938,27 @@ named next unit: REPLAY THE MERGE LOG — translate a disjunct's equation
 chain (each merge cites its `=` premise) into eqtr/eqeq/congruence bridges,
 the S4c catalog's "eqmixed tail". The record already carries everything
 (gated 1497/1497 since S2); only the emitter-side consumer is missing.
+
+### 2026-08-10 — cited statements as facts; where t21's class is actually blocked
+*Built*: a step's CITED statements now become rung-3 derived facts — a
+cite-rooted ∀-elimination chain (mizEmitInstCite: step 0 states the whole
+statement and names the assertion, then the same spi/spv walk as a context
+fact), instantiated at the reduction stage's free variables. Previously a
+step with no record facts got NOTHING from its by-list — the citations
+served only the record matcher.
+*Measured*: exactly neutral on the whole gate set (all counts identical,
+verify + MM green). The reason is the finding, not the machinery:
+*Found — the imp(v1_relat_1, =) class is DOUBLY blocked*, t21 traced to both
+walls: (a) its position has no record facts — the Equalizer family, the
+merge-log replay unit; and (b) its one citation t20_relat_1 is UNCITABLE:
+the translated theorem carries its Mizar proof's assume/consider context as
+HYPOTHESES (hyp 2 mentions a proof-local eigenvariable), so the
+hypothesis-free citation policy rightly excludes it, and stmtOf returns
+nothing. The Mizar-side citation refers to the ∀-closed STATEMENT, which
+the emitted shape does not state. The two named units, in dependency order:
+  1. THEOREM SHAPE: a theorem's exportable emitted form must be its
+     ∀-closed Mizar statement, with the let/assume/consider skeleton INSIDE
+     the proof — a miz2ru structural change (the diffuse-proof translation
+     currently leaks proof context into hypotheses);
+  2. MERGE-LOG REPLAY: the Equalizer's equation-chain evidence into
+     eqtr/congruence-walk bridges (record side done since S1/S2).
