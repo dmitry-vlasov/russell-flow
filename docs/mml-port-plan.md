@@ -672,3 +672,22 @@ zfmisc_1 17/140, subset_1 30/132 by-steps, all Metamath-gated.
 size of the prize: eigenvariable ∃-elimination (relat_1 + zfmisc_1's t83/t86/
 t127 class), foundation enum lemmas (enumset1), numerals (S-E, out of scope
 here). The scoreboard: 96 -> 98 theorems Metamath-proved on the gate set.
+
+### 2026-08-10 — what the ranked cut cannot see
+*Expected*: t74_xboole_1's class (a `consider` witness in the hyps, goal a
+negated equality) closes once the facts are right — everything needed exists.
+*Found*: the dbg-facts trace shows the ranked cut keeping two degenerate
+`A ↔ A` bridge instances — small, all goal atoms — while cutting the elin
+unfold the proof needs, which shares NO atom with the goal directly (it
+connects through a bridge, two hops out). Filtering the degenerate instances
+is free and done. Re-ranking by closure wave (hop distance) fixes t74's class
+in principle but LOSES 9 zfmisc_1 by-steps; combining wave with atom count
+still loses 5. The two signals disagree about which steps they save, and the
+atom count wins on net, so it stays.
+*Consequence*: a static rank cannot know that a fact two hops out is
+load-bearing. That knowledge exists — it is the proof structure the
+certificate discovers when it succeeds — so the honest next form is either a
+RETRY that swaps the cut when the first attempt fails on `unprovable` (cost:
+one more certificate call per failed step), or the eigenvariable reduction,
+which shrinks these problems below the budget instead of selecting harder.
+Both belong to the same frontier item; the backlog stays at three.
