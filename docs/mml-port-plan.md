@@ -858,3 +858,30 @@ parked behind the named backlog item: certificate size, shared sub-lemmas
 per theorem. The eigenvariable chain itself is DONE and proved working —
 candidate, QNF, strengthening, elimination all hold on the trace; size is
 the only wall left.
+
+### 2026-08-10 — the ascending fact ladder, and where the mass actually is
+*Built*: attempts now go SMALL FIRST — greedy-4 and greedy-8 before the full
+relevance set — so a big context is paid only when a small one cannot close
+the step. A failed small attempt is cheap (its G3cp tree is bounded by its
+own fact count).
+*Measured at cap 600* (full 8-article round, verify + MM green, proved ==
+closed): zfmisc_1 by-steps 156 → 162, everything else exactly held; emitted
+mass DOWN — xboole_1 41.7 → 37.4 MB, relat_1 26.1 → 23.8 MB.
+*Measured at cap 2400 with the ladder* (the parked prize, re-checked): the
+counts are the best ever seen — xboole_1 82/116 theorems, xboole_0 5/8,
+zfmisc_1 23/140, by-steps 235/17/184 — but the mass still explodes (zfmisc_1
+229 MB) and the NEXT article's dependency read dies even at mem=16g. Memory
+cannot buy it: the flood is not oversized fact sets (the ladder fixed those)
+but the genuinely-long certificates themselves.
+*Census of the 155 MB xboole_1*: 80,230 proof steps; syl 27.5k + mpd 11.9k +
+simpr 9.7k + simpl 9.7k = 73% of ALL steps are the natural-deduction
+context-lift machinery, each restating the full context conjunction — the
+text is steps × context, quadratic in practice. Top theorems ~4.8k steps.
+*Consequence*: the 2400-cap prize (+12 theorems on xboole_1+xboole_0 alone,
++4 more on zfmisc_1) is measured and waiting behind ONE named item:
+certificate text compression — the lift chains are the target (share them as
+named sub-lemmas, or a discharge shape that does not restate the context).
+Proofless dependency loading (read-ru proofless=1 exists; mizar-to-ru's
+ruMizLoadDeps loads with proofs) would unblock the translate chain but NOT
+the to_mm gate, which rightly reads dependency proofs — so compression is
+the real gate, not loading.
