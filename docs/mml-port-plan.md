@@ -939,26 +939,30 @@ chain (each merge cites its `=` premise) into eqtr/eqeq/congruence bridges,
 the S4c catalog's "eqmixed tail". The record already carries everything
 (gated 1497/1497 since S2); only the emitter-side consumer is missing.
 
-### 2026-08-10 — cited statements as facts; where t21's class is actually blocked
-*Built*: a step's CITED statements now become rung-3 derived facts — a
-cite-rooted ∀-elimination chain (mizEmitInstCite: step 0 states the whole
-statement and names the assertion, then the same spi/spv walk as a context
-fact), instantiated at the reduction stage's free variables. Previously a
-step with no record facts got NOTHING from its by-list — the citations
-served only the record matcher.
-*Measured*: exactly neutral on the whole gate set (all counts identical,
-verify + MM green). The reason is the finding, not the machinery:
-*Found — the imp(v1_relat_1, =) class is DOUBLY blocked*, t21 traced to both
-walls: (a) its position has no record facts — the Equalizer family, the
-merge-log replay unit; and (b) its one citation t20_relat_1 is UNCITABLE:
-the translated theorem carries its Mizar proof's assume/consider context as
-HYPOTHESES (hyp 2 mentions a proof-local eigenvariable), so the
-hypothesis-free citation policy rightly excludes it, and stmtOf returns
-nothing. The Mizar-side citation refers to the ∀-closed STATEMENT, which
-the emitted shape does not state. The two named units, in dependency order:
-  1. THEOREM SHAPE: a theorem's exportable emitted form must be its
-     ∀-closed Mizar statement, with the let/assume/consider skeleton INSIDE
-     the proof — a miz2ru structural change (the diffuse-proof translation
-     currently leaks proof context into hypotheses);
-  2. MERGE-LOG REPLAY: the Equalizer's equation-chain evidence into
-     eqtr/congruence-walk bridges (record side done since S1/S2).
+### 2026-08-10 — the stale-jar scar; the cite experiment reverted; 101/175 dishonest shapes
+*The scar, recorded so it cannot repeat*: a debug print referencing an
+unexported name made `build_java.sh` FAIL SILENTLY in the middle of the
+session — the jar on disk stayed one edit behind, and one commit
+(6012b34b, "cited statements as rung-3 facts") was gated on a jar that did
+not contain its code. The honest re-gate on a from-source build showed the
+change DISPROVED theorems (a cite step stated t27_xtuple_0's .eth ∀-closed
+statement while the emitted t27 states one inclusion) and had
+variable-capture defects in its instantiation chain (albidv/spv
+disjointedness violations). REVERTED; the census helpers and the build fix
+stay. 92911010's gate was re-validated exactly (132 theorems, all counts
+reproduced, verify green) on a strict build. RULE: check the builder's exit
+code, never its last line.
+*The census* (dbg-shape=1): relat_1 has 101 of 175 theorems whose
+hypothetical emission is DISHONEST — hyps that are not the statement's own
+antecedents (nested-block let/assume leaked to theorem level) or a last
+step that is not the statement's matrix. t20_relat_1 states `x46 ∈ proj1
+x26` under four proof-local hyps where RELAT_1:20 should stand. Cross-
+article citation of such theorems is impossible by construction, and the
+verifier rightly disproves any attempt to cite them by their .eth text.
+*Consequence*: the THEOREM-SHAPE unit is confirmed as the gate to the
+imp(v1_relat_1,…) family and to cross-article citability generally:
+theorems must be emitted stating their ∀-closed Mizar statement, with the
+let/assume/consider skeleton inside the proof (the deduction-reduction
+machinery that now exists is exactly what proves such shapes). Then the
+cite channel can return, matching against emitted text only. Merge-log
+replay stays queued behind it.
