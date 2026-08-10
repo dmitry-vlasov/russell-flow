@@ -763,3 +763,22 @@ element the reduction introduced). The assembly, all under `asm`:
 Every lemma is already in the foundation; steps 1, 2, 4, 5 exist as code.
 The ONE new piece is the ElimAt variant in step 3 (implication out, no
 source), plus the index restore. Nothing else in the chain is new.
+
+### 2026-08-10 — the chain passes every link; one sub-proof left
+*Built*: QNF applied to every derived fact; ∃ goals under an assumption
+(mizEmitExGoalA: 19.8a + syl for the binder witness, walk + spcegv + vex +
+syl for a term witness); goal-operator definitions and assumption-element
+instantiation reaching the chain's sub-proof.
+*Measured*: everything unchanged, verify green, and the CHAIN-FAIL diagnostic
+puts t8_relat_1's failure at exactly one point: the final sub-proof
+`(asm ∧ x = ⟨a,b⟩) → x ∈ (X ∩ (proj1 X ×. proj2 X))`. Every earlier link —
+candidate, QNF, shaping, element match, instance implication, projections —
+holds.
+*Consequence*: the sub-proof needs `⟨a,b⟩ ∈ X` (eleq1 + mpbi under asm) and
+`a ∈ proj1 X` / `b ∈ proj2 X` (normalized projection definition + spcegv at
+the other component) — each derivable UNDER the assumption with machinery
+that now exists, but arising inside the tableau where no ∃ step can happen.
+Next slice: STRENGTHEN THE ASSUMPTION — derive these consequences first and
+run the sub-proof from `asm ∧ ⟨a,b⟩∈X ∧ a∈proj1X ∧ b∈proj2X`. That is an
+assembly job over existing parts (the walk, spcegv, projTo, mpbi are all in
+place); no new lemma and no new machinery family is required.
