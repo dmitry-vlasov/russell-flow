@@ -688,20 +688,28 @@ mizEmitStrengthen(hyps : [FolForm], prev : [FolForm], asmB : FolForm, goal : Fol
 	gSyms = uniq(concatA(map(mizEmitAtomsOf(goal, []), mizFormSymbols)));
 	// the index maps a symbol to every statement MENTIONING it; keep only an
 	// instance that DEFINES it — `∀z (z ∈ sy(…) ↔ …)` after normalization
+	memOf = \f5 : FolForm, sy : string -> switch (f5) {
+		FolPred(nm4, args4): nm4 == "∈" && length(args4) == 2
+			&& mizEmitTermHasSym(args4[1], sy);
+		default: false;
+	};
 	defines = \d2 : MizEmitDrv, sy : string -> switch (d2.form) {
 		FolQuant(q4, vs4, b4): if (q4 != "forall" || length(vs4) != 1) false else switch (b4) {
-			FolBin(op4, l4, __): if (op4 != "iff") false else switch (l4) {
-				FolPred(nm4, args4): nm4 == "∈" && length(args4) == 2
-					&& mizEmitTermHasSym(args4[1], sy);
-				default: false;
-			}
+			// `z∈f ↔ …` or the normalizer's `(z∈f → E) ∧ (E → z∈f)`
+			FolBin(op4, l4, r4): if (op4 == "iff") memOf(l4, sy)
+				else if (op4 == "and") switch (r4) {
+					FolBin(op5, __, m5): op5 == "imp" && memOf(m5, sy);
+					default: false;
+				} else false;
 			default: false;
 		}
 		default: false;
 	};
 	defs = concatA(map(gSyms, \sy -> {
 		ds = defsOf(sy);
-		raw = filtermap(if (length(ds) > 3) subrange(ds, 0, 3) else ds,
+		// instantiate up to six and let the DEFINES filter choose — the entry
+		// that defines a symbol can sit behind several that merely mention it
+		raw = filtermap(if (length(ds) > 6) subrange(ds, 0, 6) else ds,
 			\nm2 -> maybeMap(mizEmitDefInstance(nm2, sy, gAtoms, stmtOf, shOf), mizEmitCleanIff));
 		if (^mizEmitDbg)
 			println("    STR-DEF " + sy + " ds=" + strGlue(if (length(ds) > 3) subrange(ds, 0, 3) else ds, ",")
@@ -716,7 +724,7 @@ mizEmitStrengthen(hyps : [FolForm], prev : [FolForm], asmB : FolForm, goal : Fol
 	r2 = concatA(map(defs, \d -> if (d.steps == []) [] else switch (d.form) {
 		FolQuant(q0, vs0, b0): if (q0 != "forall" || length(vs0) != 1) [] else {
 			z = vs0[0];
-			filtermap(if (length(elems) > 3) subrange(elems, 0, 3) else elems, \a -> {
+			filtermap(if (length(elems) > 4) subrange(elems, 0, 4) else elems, \a -> {
 				s0 = ^steps; r0 = ^refs; d0 = ^dj;
 				roll = \ -> { steps := s0; refs := r0; dj := d0; None(); };
 				// the instance `a ∈ f ↔ ∃y ψ(a)`, standalone
@@ -730,11 +738,30 @@ mizEmitStrengthen(hyps : [FolForm], prev : [FolForm], asmB : FolForm, goal : Fol
 					None(): roll();
 					Some(im): {
 						inst = emit(im.second, "ax-mp", [FolPRefStep(blockLast), FolPRefStep(im.first)]);
-						switch (im.second) {
-							FolBin(opI, memF, exF): {
+						// the instance is `a∈f ↔ ∃yψ` (biimpri) or the normalizer's
+						// `(a∈f → E) ∧ (∃yψ → a∈f)` (the second conjunct, by simpr)
+						dir = switch (im.second) {
+							FolBin(opI, l5, r5): if (opI == "iff") Some(Triple(l5, r5, true))
+								else if (opI == "and") switch (r5) {
+									FolBin(op6, e6, m6): if (op6 == "imp") Some(Triple(m6, e6, false)) else None();
+									default: None();
+								} else None();
+							default: None();
+						};
+						switch (dir) {
+							Some(tr5): {
+								memF = tr5.first;
+								exF = tr5.second;
 								okEx = switch (exF) { FolQuant(qE, __, __): qE == "exists"; default: false; };
-								if (opI != "iff" || !okEx) roll() else {
-									bi = emit(FolBin("imp", exF, memF), "biimpri", [FolPRefStep(inst)]);
+								memOk = switch (memF) { FolPred(nm5, __): nm5 == "∈"; default: false; };
+								if (!okEx || !memOk) roll() else {
+									bi = if (tr5.third)
+											emit(FolBin("imp", exF, memF), "biimpri", [FolPRefStep(inst)])
+										else switch (mizEmitApplyOps(steps, im.second, inst, ["simpr"])) {
+											None(): -1;
+											Some(pr6): pr6.second;
+										};
+									if (bi < 0) roll() else {
 									// the ∃ proved under the strengthened assumption
 									sub = switch (exF) {
 										FolQuant(__, vsE, bE): mizEmitExGoalA(hyps, prev, asm1, exF,
@@ -760,8 +787,9 @@ mizEmitStrengthen(hyps : [FolForm], prev : [FolForm], asmB : FolForm, goal : Fol
 										}
 									}
 								}
+								}
 							}
-							default: roll();
+							None(): roll();
 						}
 					}
 				}
@@ -1178,10 +1206,12 @@ mizEmitExGoalA(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolForm
 	eqs  : ref [Pair<FolTerm, FolTerm>] = ref [];
 	iter(arrayPush(filter(concatA([hyps, prev, [asm]]), \f -> !mizEmitHasQuant(f)), body),
 		\f -> mizEmitHarvest(f, mems, subs, eqs));
-	names = uniq(filtermap(
+	// every variable of the harvested terms — a witness often sits INSIDE a
+	// term (the b of `⟨a,b⟩ ∈ X`), where a top-level scan never looks
+	names = uniq(concatA(map(
 		concatA(map(concatA([^mems, ^subs, ^eqs]), \p -> [p.first, p.second])),
-		\t -> switch (t) { FolVar(n): Some(n); default: None(); }));
-	cands = concat([x], filter(if (length(names) > 5) subrange(names, 0, 5) else names,
+		mizEmitTermVars)));
+	cands = concat([x], filter(if (length(names) > 6) subrange(names, 0, 6) else names,
 		\n -> n != x));
 	fold(cands, direct, \acc : Pair<Maybe<FolStepProof>, bool>, y -> switch (acc.first) {
 		Some(__): acc;
@@ -2152,13 +2182,19 @@ mizEmitBridges(forms : [FolForm], acc0 : Tree<string, Pair<FolForm, string>>) ->
 			mizEmitSs(q.first, q.second), mizEmitSs(q.second, q.first))), "eqss");
 		a2 = fold(elems, a1, \ac, e -> add(ac,
 			FolBin("imp", eqf, FolBin("iff", mizEmitMem(e, q.first), mizEmitMem(e, q.second))), "eleq2"));
-		// an equality between ELEMENTS: bridge their memberships in every set present
+		// an equality between ELEMENTS: bridge their memberships in every set
+		// present — and UNFOLD the memberships the bridge introduces: the eleq1
+		// instance states `⟨a,b⟩ ∈ (X ∩ P)`, and without its elin/opelxp unfolds
+		// the new atom is as opaque as the old one (t8_relat_1's sub-proof had
+		// every fact and still failed on exactly this)
 		lk = mizEmitTKey(q.first); rk = mizEmitTKey(q.second);
 		sideIsElem = exists(elems, \e -> { k = mizEmitTKey(e); k == lk || k == rk; });
 		if (!sideIsElem) a2
-		else fold(^mems, a2, \ac, m -> add(ac,
-			FolBin("imp", eqf, FolBin("iff",
-				mizEmitMem(q.first, m.second), mizEmitMem(q.second, m.second))), "eleq1"));
+		else fold(^mems, a2, \ac, m -> {
+			a3 = add(ac, FolBin("imp", eqf, FolBin("iff",
+				mizEmitMem(q.first, m.second), mizEmitMem(q.second, m.second))), "eleq1");
+			mizEmitMemGen(q.second, m.second, mizEmitMemGen(q.first, m.second, a3));
+		});
 	});
 	fold(allSubs, acc1, \acc, s -> fold(elems, acc, \ac, e -> {
 		a1 = add(ac, FolBin("imp", mizEmitSs(s.first, s.second),
