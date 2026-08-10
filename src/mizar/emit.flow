@@ -224,21 +224,62 @@ mizEmitStepProof(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 // into `∃x φ(x) → goal` (its disjointness condition — x not in the goal — is
 // exactly the no-escape rule), and ax-mp closes with the hypothesis. Tried for
 // each ∃ hypothesis in turn; the binder must not occur free anywhere else.
+// one candidate existential: its formula, and how it is obtained — a context
+// fact is cited by `ref`; a derived one carries its own proof block whose last
+// step proves `form` (refs index the block's OWN factRefs extension)
+MizExCand(form : FolForm, ref : Maybe<RuParseRef>, steps : [FolPStep],
+	refs : [RuParseRef], disjs : [Pair<string, string>]);
+
 mizEmitExElim(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 	maxFacts : int, maxSize : int, fresh : ref int, used : Set<string>,
 	recDrv : [MizEmitDrv], failed : Pair<Maybe<FolStepProof>, bool>) -> Pair<Maybe<FolStepProof>, bool> {
 	ctx = concat(
 		mapi(hyps, \j, h -> Pair(h, mizEmitHypRef(j))),
 		mapi(prev, \j, sp -> Pair(sp, mizEmitStepRef(j))));
-	others = \skip : int -> mapi(ctx, \j, p -> if (j == skip) goal else p.first);
-	fold(mapi(ctx, \j, p -> Pair(j, p)), failed, \acc : Pair<Maybe<FolStepProof>, bool>, jp ->
+	ctxCands = map(ctx, \p -> MizExCand(p.first, Some(p.second), [], [], []));
+	// ...and the ∃-facts one modus ponens away: a definition instance often
+	// reads `x ∈ X → ∃ā ψ` (every element of a relation is a pair) with its
+	// antecedent already a context fact — so the existential is DERIVED first,
+	// splicing the instance's own proof block and one ax-mp
+	insts = mizEmitDrvInsts(recDrv,
+		arrayPush(map(ctx, \p -> p.first), goal), ^mizEmitShOfRef);
+	drvCands = filtermap(insts, \d -> if (d.steps == []) None() else switch (d.form) {
+		FolQuant(q, __, __): if (q == "exists")
+			Some(MizExCand(d.form, None(), d.steps, d.refs, d.disjs)) else None();
+		FolBin(op, a, c): {
+			isEx = switch (c) {
+				FolQuant(q2, __, __): q2 == "exists";
+				default: false;
+			};
+			if (op != "imp" || !isEx) None()
+			else switch (find(ctx, \p -> p.first == a)) {
+				None(): None();
+				Some(pa): {
+					k = length(d.refs);
+					mp = FolPStep(c, "ax-mp",
+						[FolPRefFact(k), FolPRefStep(length(d.steps) - 1)]);
+					Some(MizExCand(c, None(), arrayPush(d.steps, mp),
+						arrayPush(d.refs, pa.second), d.disjs));
+				}
+			}
+		}
+		default: None();
+	});
+	if (^mizEmitDbg && (ctxCands != [] || drvCands != []))
+		println("  EXELIM ctx=" + i2s(length(filter(ctxCands, \c -> switch (c.form) {
+				FolQuant(q, __, __): q == "exists"; default: false; })))
+			+ " drv=" + i2s(length(drvCands)) + " insts=" + i2s(length(insts))
+			+ " :: " + strGlue(folFormToks(goal), " "));
+	othersOf = \cand : MizExCand -> concat(
+		filtermap(ctx, \p -> if (p.first == cand.form) None() else Some(p.first)), [goal]);
+	fold(concat(ctxCands, drvCands), failed, \acc : Pair<Maybe<FolStepProof>, bool>, cand ->
 		switch (acc.first) {
 			Some(__): acc;
-			None(): switch (jp.second.first) {
+			None(): switch (cand.form) {
 				FolQuant(q, vs, body): {
-					v = if (length(vs) == 1) vs[0] else "";
-					if (q != "exists" || v == "" || mizEmitFreeIn(v, goal)
-						|| exists(others(jp.first), \f -> mizEmitFreeIn(v, f))) acc
+					if (q != "exists" || vs == []
+						|| exists(vs, \v -> mizEmitFreeIn(v, goal))
+						|| exists(vs, \v -> exists(othersOf(cand), \f -> mizEmitFreeIn(v, f)))) acc
 					else {
 						sub = mizEmitReduceA(hyps, prev, body, goal, maxFacts, maxSize,
 							1, fresh, used, recDrv);
@@ -248,18 +289,38 @@ mizEmitExElim(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 							// an attempted step into a "skipped" one
 							None(): acc;
 							Some(pr): {
-								n0 = length(pr.steps);
-								vr = toLowerCase(v);
-								dj = filtermap(folFormVars(goal),
-									\w -> if (w == vr) None() else Some(Pair(vr, w)));
-								ex = FolPStep(FolBin("imp", jp.second.first, goal),
-									"exlimiv", [FolPRefStep(n0 - 1)]);
-								k = length(pr.factRefs);
-								mp = FolPStep(goal, "ax-mp",
-									[FolPRefFact(k), FolPRefStep(n0)]);
-								Pair(Some(FolStepProof(concatA([pr.steps, [ex, mp]]),
-									arrayPush(pr.factRefs, jp.second.second),
-									uniq(concat(pr.disjs, dj)))), false);
+								dj = concatA(map(vs, \v -> {
+									vr = toLowerCase(v);
+									filtermap(folFormVars(goal),
+										\w -> if (w == vr) None() else Some(Pair(vr, w)));
+								}));
+								// exlimiv per binder, innermost first: (ψ → goal) →
+								// (∃b ψ → goal) → (∃a ∃b ψ → goal)
+								n = length(vs);
+								exs = generate(0, n, \i -> {
+									k2 = n - 1 - i;
+									FolPStep(FolBin("imp",
+										FolQuant("exists", subrange(vs, k2, n - k2), body), goal),
+										"exlimiv", [FolPRefStep(length(pr.steps) + i - 1)]);
+								});
+								exs0 = mapi(exs, \i, e -> if (i > 0) e
+									else FolPStep(e.form, e.assertion, [FolPRefStep(length(pr.steps) - 1)]));
+								// the ∃ fact itself: cited (context) or derived (block)
+								n1 = length(pr.steps) + n;
+								kf = length(pr.factRefs);
+								last = switch (cand.ref) {
+									Some(r): Pair([FolPStep(goal, "ax-mp",
+										[FolPRefFact(kf), FolPRefStep(n1 - 1)])], [r]);
+									None(): {
+										bs = mizEmitShift(cand.steps, n1, kf);
+										Pair(arrayPush(bs, FolPStep(goal, "ax-mp",
+											[FolPRefStep(n1 + length(bs) - 1), FolPRefStep(n1 - 1)])),
+											cand.refs);
+									}
+								};
+								Pair(Some(FolStepProof(concatA([pr.steps, exs0, last.first]),
+									concat(pr.factRefs, last.second),
+									uniq(concatA([pr.disjs, dj, cand.disjs])))), false);
 							}
 						}
 					}
