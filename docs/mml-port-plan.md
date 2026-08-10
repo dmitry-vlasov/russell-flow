@@ -647,3 +647,28 @@ worth: never abandon an attempt you can make smaller; state a fact as what it
 means, not as what the normalizer left; and a fact the tableau cannot use is
 worse than no fact. The scoreboard: xboole_1 64/116 theorems, zfmisc_1 16/140,
 enumset1 11/87, relat_1 2/175, subset_1 2/53, all Metamath-gated.
+
+### 2026-08-10 — the contradiction goal, and where the remaining walls are
+*Found — one cheap defect*: the QED step of a Mizar proof by contradiction
+states `¬ ⊤`, which has no atoms, so the relevance filter kept NO facts and the
+refutation ran empty-handed. Keeping all facts when the goal is atomless (the
+ranking still caps the count) closed 8 such theorems: xboole_1 66/116,
+zfmisc_1 17/140, subset_1 30/132 by-steps, all Metamath-gated.
+*Found — where the three walls actually are, each checked this round*:
+  1. the CLUSTER RECORD is thin: 46 <Round> per article, conditional clusters
+     only, attributed to no inference (rounding runs during analysis, outside
+     the checker window); F-cluster firings are not recorded at all. The
+     "consume the cluster half" plan step dissolves into the constructor-type
+     axioms that already exist. If a firing is ever needed per-step, the
+     RECORDING side must be extended first (roundcl.flow, the FIRED branch).
+  2. enumset1 (75 theorems) = the foundation regeneration with enum4-8
+     membership lemmas; nothing inside the emitter reaches it.
+  3. relat_1's imp(v1_relat_1, …) family (~38 theorems) = ∃-elimination with
+     eigenvariables: the reduction is correct down to the membership matrix
+     and then needs `every element of a relation is a pair` APPLIED, which no
+     propositional certificate can do. This is the single biggest lever left
+     in the gate set, and it is a reduction feature, not a fact feature.
+*Consequence*: the S-C backlog is now exactly three named items, ordered by
+size of the prize: eigenvariable ∃-elimination (relat_1 + zfmisc_1's t83/t86/
+t127 class), foundation enum lemmas (enumset1), numerals (S-E, out of scope
+here). The scoreboard: 96 -> 98 theorems Metamath-proved on the gate set.
