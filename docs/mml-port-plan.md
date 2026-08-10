@@ -725,3 +725,21 @@ the way jca/alrimiv/sylibr did into their cases; the candidate machinery
 Note the pattern now repeated three times: every reduction rule's deduction
 twin is ONE existing foundation lemma. The twin table so far: ax-gen→alrimiv,
 mpbir→sylibr, pm3.2i→jca, impbii→impbid, exlimiv→exlimdv.
+
+### 2026-08-10 — exlimdv lands; the chain fails at its FIRST link, not the middle
+*Built*: ∃-elimination under the assumption, inside the deduction reduction:
+`(asm ∧ ψ) → goal`, curry (ex), exlimdv per binder, and the existential
+supplied by mpi (context fact / standalone block) or by projection + syl +
+mpd when its antecedent is a conjunct of the assumption.
+*Measured*: everything exactly unchanged, and the t8_relat_1 fact dump names
+the cause: NO definition instance of v1_relat_1 reaches the step. The record
+never names d1_relat_1 there — the checker gets relation-hood through the
+TYPE channel (analyzer rounding), which is not attributed per inference. The
+middle of the chain is built and idle; the first link is missing.
+*Consequence*: the next move is to offer the definition OF THE ASSUMPTION'S
+HEAD PREDICATE — asm `v1_relat_1 X` selects d1_relat_1 instantiated at X.
+This selection is by the head symbol of a fact IN SCOPE, which is exactly
+what distinguishes it from the measured dead end (definitions of every
+symbol the step mentions, which blew the budget and closed nothing). It
+needs the defs-by-symbol index restored, consumed only inside the
+∃-elimination. The twin table stands at six rows and has not missed yet.
