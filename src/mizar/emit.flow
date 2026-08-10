@@ -619,8 +619,12 @@ mizEmitExChainAt(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolFo
 	// learn the instantiated shapes on a scratch pad first
 	scr : ref [FolPStep] = ref [];
 	scrD : ref [Pair<string, string>] = ref [];
+	dbgf = \where : string -> {
+		if (^mizEmitDbg) println("  CHAIN-FAIL " + where + " e=" + strGlue(folFormToks(FolEq(e, e)), " "));
+		failed;
+	};
 	switch (mizEmitInstImp(scr, scrD, qq, v, e, shOf, 0)) {
-		None(): failed;
+		None(): dbgf("instimp");
 		Some(im0): {
 			inst = switch ((^scr)[im0.first].form) {
 				FolBin(__, __, r): r;   // (∀v(B→∃ψ)) → (B[e] → ∃ψ[e])
@@ -636,13 +640,28 @@ mizEmitExChainAt(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolFo
 								|| exists(prev, \pf -> mizEmitFreeIn(w, pf)));
 						default: false;
 					};
-					if (op3 != "imp" || !vsOk || !exists(conjs2, \c -> c == be)) failed
+					if (op3 != "imp" || !vsOk || !exists(conjs2, \c -> c == be)) dbgf("shape-or-conjunct")
 					else switch (exe) {
 						FolQuant(__, vs3, body3): {
+							// the GOAL's own operators (proj1, proj2, …) get their
+							// definitions too — same index, same QNF, capped; without
+							// them the sub-proof cannot know what the goal's terms mean
+							stmtOf = ^mizEmitStmtOfRef;
+							defsOf = ^mizEmitDefsOfSymRef;
+							gAtoms = uniq(concatA(map([goal, asm, FolBin("and", asm, body3)],
+								\gf -> mizEmitAtomsOf(gf, []))));
+							gSyms = uniq(concatA(map(gAtoms, mizFormSymbols)));
+							extra0 = concatA(map(gSyms, \sy -> {
+								ds = defsOf(sy);
+								filtermap(if (length(ds) > 1) subrange(ds, 0, 1) else ds,
+									\nm2 -> mizEmitDefInstance(nm2, sy, gAtoms, stmtOf, shOf));
+							}));
+							extra = map(if (length(extra0) > 3) subrange(extra0, 0, 3) else extra0,
+								mizEmitCleanIff);
 							sub = mizEmitReduceA0(hyps, prev, FolBin("and", asm, body3), goal,
-								maxFacts, maxSize, depth + 2, fresh, used, recDrv);
+								maxFacts, maxSize, depth + 2, fresh, used, concat(recDrv, extra));
 							switch (sub.first) {
-								None(): failed;
+								None(): dbgf("subproof");
 								Some(pr): {
 									steps : ref [FolPStep] = ref pr.steps;
 									refs : ref [RuParseRef] = ref pr.factRefs;
@@ -855,7 +874,10 @@ mizEmitReduceA0(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolFor
 				}
 			};
 			switch (goal) {
-				FolQuant(q, vs, body): if (q != "forall" || vs == []) direct
+				FolQuant(q, vs, body): if (q == "exists" && vs != [])
+					mizEmitExGoalA(hyps, prev, asm, goal, vs, body, maxFacts, maxSize,
+						depth, fresh, used, direct, recDrv)
+				else if (q != "forall" || vs == []) direct
 					else if (exists(vs, \v -> mizEmitFreeIn(v, asm))) direct
 					else {
 						// one alrimiv per binder, innermost first — the same ladder
@@ -927,6 +949,87 @@ mizEmitReduceA0(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolFor
 			}
 		}
 	}
+}
+
+// An ∃ GOAL under the assumption — mizEmitExGoal's deduction twin. The binder
+// itself as witness needs 19.8a + syl; a term witness w needs the congruence
+// walk, spcegv (whose disjointness is the same no-capture rule), the witness's
+// sethood, and syl — the same three pieces the plain ∃-introduction uses,
+// with the final ax-mp replaced by syl through the assumption.
+mizEmitExGoalA(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolForm,
+	vs : [string], body : FolForm,
+	maxFacts : int, maxSize : int, depth : int,
+	fresh : ref int, used : Set<string>,
+	direct : Pair<Maybe<FolStepProof>, bool>, recDrv : [MizEmitDrv]) -> Pair<Maybe<FolStepProof>, bool> {
+	x = vs[0];
+	rest = if (length(vs) == 1) body else FolQuant("exists", tail(vs), body);
+	mems : ref [Pair<FolTerm, FolTerm>] = ref [];
+	subs : ref [Pair<FolTerm, FolTerm>] = ref [];
+	eqs  : ref [Pair<FolTerm, FolTerm>] = ref [];
+	iter(arrayPush(filter(concatA([hyps, prev, [asm]]), \f -> !mizEmitHasQuant(f)), body),
+		\f -> mizEmitHarvest(f, mems, subs, eqs));
+	names = uniq(filtermap(
+		concatA(map(concatA([^mems, ^subs, ^eqs]), \p -> [p.first, p.second])),
+		\t -> switch (t) { FolVar(n): Some(n); default: None(); }));
+	cands = concat([x], filter(if (length(names) > 5) subrange(names, 0, 5) else names,
+		\n -> n != x));
+	fold(cands, direct, \acc : Pair<Maybe<FolStepProof>, bool>, y -> switch (acc.first) {
+		Some(__): acc;
+		None(): {
+			if (y == x) {
+				sub = mizEmitReduceA(hyps, prev, asm, rest, maxFacts, maxSize, depth + 1,
+					fresh, used, recDrv);
+				switch (sub.first) {
+					None(): acc;
+					Some(pr): {
+						n0 = length(pr.steps);
+						im = FolPStep(FolBin("imp", rest, goal), "19.8a", []);
+						sy = FolPStep(FolBin("imp", asm, goal), "syl",
+							[FolPRefStep(n0 - 1), FolPRefStep(n0)]);
+						Pair(Some(FolStepProof(concatA([pr.steps, [im, sy]]),
+							pr.factRefs, pr.disjs)), false);
+					}
+				}
+			} else {
+				wsteps : ref [FolPStep] = ref [];
+				djr : ref [Pair<string, string>] = ref [];
+				switch (mizEmitWalkT(wsteps, djr, x, FolVar(y), rest)) {
+					None(): acc;
+					Some(w): {
+						sub = mizEmitReduceA(hyps, prev, asm, w.second, maxFacts, maxSize,
+							depth + 1, fresh, used, recDrv);
+						switch (sub.first) {
+							None(): acc;
+							Some(pr): {
+								base = length(pr.steps);
+								ws = mizEmitShift(^wsteps, base, 0);
+								steps : ref [FolPStep] = ref concat(pr.steps, ws);
+								emit = \form : FolForm, lemma : string, rs : [FolPRef] -> {
+									steps := arrayPush(^steps, FolPStep(form, lemma, rs));
+									length(^steps) - 1;
+								};
+								// spcegv is disjointed(A x, ps x)
+								xr = toLowerCase(x);
+								dj2 = fold(arrayPush(folFormVars(w.second), y), ^djr,
+									\ac, v -> if (toLowerCase(v) == xr) ac
+										else arrayPush(ac, Pair(xr, toLowerCase(v))));
+								inV = FolPred("∈", [FolVar(y), FolApp("_V", [])]);
+								sg = emit(FolBin("imp", inV, FolBin("imp", w.second, goal)),
+									"spcegv", [FolPRefStep(base + w.first)]);
+								vx = emit(inV, "vex", []);
+								m1 = emit(FolBin("imp", w.second, goal), "ax-mp",
+									[FolPRefStep(vx), FolPRefStep(sg)]);
+								sy = emit(FolBin("imp", asm, goal), "syl",
+									[FolPRefStep(base - 1), FolPRefStep(m1)]);
+								Pair(Some(FolStepProof(^steps, pr.factRefs,
+									uniq(concat(pr.disjs, dj2)))), false);
+							}
+						}
+					}
+				}
+			}
+		}
+	});
 }
 
 // (A ⊆ B) / (A = B) under an assumption: the same fresh-variable matrix, closed
@@ -1199,7 +1302,9 @@ mizEmitLadderA(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 			switch (r2.first) {
 				Some(__): r2;
 				None(): if (r2.second) r2 else {
-					drv = concatA([mizEmitDrvInsts(recDrv, [goal], ^mizEmitShOfRef),
+					drv = concatA([mizEmitDrvInsts(recDrv,
+						arrayPush([goal], switch (asm) { None(): goal; Some(af): af; }),
+						^mizEmitShOfRef),
 						mizEmitCtxNF(ctx0),
 						mizEmitChars(ctx0), mizEmitDerive(ctx0, allForms)]);
 					if (drv == []) r2
@@ -2220,7 +2325,28 @@ mizEmitRecFromCites(cites : [string], fact : FolForm,
 // memory — the cheaper form is worth a proof of its own. It is a propositional
 // consequence, so the certificate itself derives it, over three atoms and in a
 // handful of steps, and the STEP's tableau then sees the equivalence.
-mizEmitCleanIff(d : MizEmitDrv) -> MizEmitDrv {
+mizEmitCleanIff(d0 : MizEmitDrv) -> MizEmitDrv {
+	// FIRST the quantifier normalizer: a definition arrives with its
+	// quantifiers buried under negations (the checker has only ¬ ∧ ∀), and no
+	// propositional conversion can reach through them. QNF proves `f ↔ f'`
+	// and mpbi re-states the fact; the propositional cleanup then runs on f'.
+	d = if (d0.steps == []) d0 else {
+		st : ref [FolPStep] = ref d0.steps;
+		blockLast = length(^st) - 1;
+		switch (mizEmitQNF(st, d0.form, 0)) {
+			None(): d0;
+			Some(w): if (w.second == d0.form) d0 else {
+				st := arrayPush(^st, FolPStep(w.second, "mpbi",
+					[FolPRefStep(blockLast), FolPRefStep(w.first)]));
+				mizEmitCleaned := ^mizEmitCleaned + 1;
+				MizEmitDrv(w.second, ^st, d0.refs, d0.disjs);
+			}
+		}
+	};
+	mizEmitCleanIff0(d);
+}
+
+mizEmitCleanIff0(d : MizEmitDrv) -> MizEmitDrv {
 	if (getUrlParameterDef("dbg-clean", "") == "1")
 		println("CLEAN? cands=" + i2s(length(mizEmitIffCands(d.form)))
 			+ " :: " + strGlue(folFormToks(d.form), " "));
