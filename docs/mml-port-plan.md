@@ -691,3 +691,19 @@ RETRY that swaps the cut when the first attempt fails on `unprovable` (cost:
 one more certificate call per failed step), or the eigenvariable reduction,
 which shrinks these problems below the budget instead of selecting harder.
 Both belong to the same frontier item; the backlog stays at three.
+
+### 2026-08-10 — ∃-elimination, first slice: the hypothesis case
+*Built*: a `∃x φ(x)` HYPOTHESIS is now usable. The deduction reduction proves
+`φ(x) → goal` with the binder as the temporary name, exlimiv turns it into
+`∃x φ → goal` (its disjointness condition is the no-escape rule), ax-mp
+closes. Tried last, per ∃ hypothesis; a failed attempt keeps the step's
+original status (its overruns must not re-label an attempted step "skipped" —
+the first version did, and the counts moved without any closure changing).
+*Measured*: relat_1 95 -> 97 by-steps, all else exactly unchanged, gates
+green. Modest as expected: a `consider` step's witnessed instance was already
+in scope, so only the lone-∃ steps gain.
+*Consequence*: the eigenvariable wall now lacks only the CHAIN: definition
+instantiated at an element → its ∃ consequent eliminated (the piece built
+here) → the witnessed equation `x = ⟨a,b⟩` used to REWRITE the goal's atoms
+(the congruence walk exists). The next slice is wiring these three existing
+pieces into one reduction case for `x ∈ X` facts where X is a relation.
