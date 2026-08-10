@@ -913,3 +913,28 @@ the scaling concern (88 MB peak; the census's next target is the branch-
 stack lifts and cross-step sharing), but it no longer blocks the pipeline.
 The relat_1 imp(v1_relat_1, …) family (~38 theorems) is now unblocked for
 the same machinery; enumset1 stays behind the foundation enum lemmas.
+
+### 2026-08-10 — goal-operator definitions in the ladder; the eq-family's trail found
+*Built*, tracing t21_relat_1 (`field X = field (X~)` by t20): two widenings,
+both places where a selection looked only at the surface of the step:
+  1. rung 3 now offers the GOAL'S OWN OPERATOR DEFINITIONS (field,
+     k2_relat_1, …) as derived instances — they existed only inside the
+     ∃-chain path; and a definition instantiates at EVERY occurrence term
+     (capped 3), not the first match — t21 needs `field` defined at both
+     `field X` and `field (X~)`;
+  2. mizEmitDerive's instantiation candidates are the step's FREE VARIABLES,
+     not only variables standing as a WHOLE side of an atom — an equational
+     step between compound terms has no bare-variable side at all.
+*Measured* (8 articles, verify + MM green, proved == closed): xtuple_0 0 → 2
+theorems (its FIRST closures), subset_1 +1 by-step, relat_1 +1; everything
+else exactly held. THE GATE SET GOES 130 → 132.
+*Found — where the imp(v1_relat_1, =) family actually is* (12+9+6+ theorems,
+the largest one-step-short bucket): t21's QED position has NO record facts at
+all. These equational steps are closed by the checker's EQUALIZER — their
+evidence is the MERGE LOG (S1/S2: equations, congruence closure, ConstEq/
+DefEq provenance), and mizDerivPosFacts extracts only the Verify family's
+premise instances. The 11-of-76 citation match rate is the same story. The
+named next unit: REPLAY THE MERGE LOG — translate a disjunct's equation
+chain (each merge cites its `=` premise) into eqtr/eqeq/congruence bridges,
+the S4c catalog's "eqmixed tail". The record already carries everything
+(gated 1497/1497 since S2); only the emitter-side consumer is missing.
