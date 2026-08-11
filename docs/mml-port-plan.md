@@ -1039,3 +1039,29 @@ the ∪-congruence + commutativity chain the merge log records.
 frontier is now purely the MERGE-LOG REPLAY (equation chains into
 eqtr/congruence-walk bridges) plus the enumset1 foundation lemmas. Both
 were named before; nothing else is in front of them.
+
+### 2026-08-11 — the def-instance chain unblocked; the flat certificate's limit named
+*Built*, tracing t21_relat_1 one layer deeper (each defect by its own
+diagnostic print, on a strictly-checked build):
+  1. THE BINDER-COLLISION TRAP at the rung-3 definition site — d6's locus
+     renders as the theorem's own x26, so every compound witness "contains
+     the binder" and every compound instance was refused (GDEF-DECLINE
+     named it). Fix = alpha-rename the statement's bound variables before
+     matching, the documented remedy at every other application site.
+     mizFreshenBound exported for it.
+  2. GUARD DERIVATION at the rungs: a guarded instance (`Relation (X~) →
+     field (X~) = …`) is inert until its guard is a fact, and the guard's
+     source — a cluster registration — is cited by nobody. The rungs now
+     derive guards by skeleton, exactly as the top-level channel does.
+  3. A greedy-16 rung between greedy-8 and the ranked cut.
+*Measured*: the whole gate set exactly held (117, verify green, MM
+spot-checks green) — infrastructure, not yet coverage.
+*The limit, stated honestly*: t21's chain is now fully GENERATED — both
+definition instances, the ct4 guard bridge, t20's citation instance — and
+still does not close: ~14 exact facts must survive a 16-slot cut against
+~40 candidates, and flat selection at this density is the wrong tool. This
+is the boundary of the pile-of-facts certificate. Mizar's own answer is
+the EQUALIZER: the merge log hands over the exact equations and their
+order, no selection involved. The next unit is unchanged — MERGE-LOG
+REPLAY — and now it is known to be necessary, not merely queued: no
+selection tuning can substitute for it on the equational family.

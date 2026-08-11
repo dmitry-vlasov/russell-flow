@@ -89,6 +89,12 @@ mizEmitDefsOfSymRef : ref ((string) -> [string]) = ref (\__ -> []);
 // served the record matcher. Rung 3 instantiates these at the stage's free
 // variables like any other ∀-fact (cite-rooted chain, mizEmitInstCite).
 mizEmitCiteStmtsRef : ref [Pair<string, FolForm>] = ref [];
+// same-skeleton statement lookup + the axiom-shape dispatch, for deriving a
+// def instance's GUARD inside the reduction: the checker uses cluster
+// registrations WITHOUT citation, so the by-list can never supply
+// `Relation X → Relation (X~)` — the constructor-type axioms can
+mizEmitBySkelRef : ref ((string) -> [string]) = ref (\__ -> []);
+mizEmitIsAxiomRef : ref ((string) -> bool) = ref (\__ -> false);
 // per STEP: did some certificate attempt find a proof that was only too LONG?
 // That step wants a smaller encoding, not better facts.
 mizEmitStepLong : ref bool = ref false;
@@ -149,6 +155,8 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 		};
 		mizEmitShOfRef := shOf;
 		mizEmitStmtOfRef := stmtOf;
+		mizEmitBySkelRef := bySkeleton;
+		mizEmitIsAxiomRef := isAxiom;
 		// only names whose TABLE TEXT is the emitted text may be stated as cite
 		// facts: an own-article theorem's entry IS its emitted prop (since the
 		// honesty gate, the ∀-closed Mizar statement), and an env axiom is
@@ -1574,11 +1582,23 @@ mizEmitLadderA(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 					// was measured a dead end before the greedy/ascending selection
 					// existed ("defs of every symbol blew the budget"); the caps
 					// mirror the ∃-chain's (one def per symbol, three total).
-					stmtOfG = ^mizEmitStmtOfRef;
+					stmtOfG0 = ^mizEmitStmtOfRef;
 					defsOfG = ^mizEmitDefsOfSymRef;
 					gAtomsG = uniq(concatA(map(
 						arrayPush([goal], switch (asm) { None(): goal; Some(af): af; }),
 						\gf -> mizEmitAtomsOf(gf, []))));
+					// THE BINDER-COLLISION TRAP, at this application site as at every
+					// other: a definition's locus renders as the same id as the
+					// theorem's variable (d6's X26), so a witness containing x26
+					// reads as "binder in witness" and every compound instance is
+					// refused. Alpha-rename the statement's bound variables away
+					// from everything the step mentions before matching.
+					avoidG = ref buildSet(concatA(map(gAtomsG, mizFormAllVars)));
+					ctrG = ref 0;
+					stmtOfG = \nm5 : string -> switch (stmtOfG0(nm5)) {
+						None(): None();
+						Some(st5): Some(mizFreshenBound(st5, avoidG, ctrG));
+					};
 					gSymsG = uniq(concatA(map(gAtomsG, mizFormSymbols)));
 					gDefs0 = concatA(map(gSymsG, \sy -> {
 						ds = defsOfG(sy);
@@ -1638,10 +1658,20 @@ mizEmitLadderA(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 						}));
 					citeDrvs1 = uniqBy(citeDrvs0, \d2, d3 -> mizEmitKey(d2.form) == mizEmitKey(d3.form));
 					citeDrvs = if (length(citeDrvs1) > 12) subrange(citeDrvs1, 0, 12) else citeDrvs1;
+					// a GUARDED instance (`Relation (X~) → field (X~) = …`) is inert
+					// until its guard is a fact, and the guard's source — a cluster
+					// registration / constructor-type axiom — is cited by NOBODY:
+					// derive it by skeleton, exactly as the top-level channel does
+					gdOf = \ds4 : [MizEmitDrv] -> concatA(map(ds4, \d4 -> switch (d4.form) {
+						FolBin(op4, l4, __): if (op4 != "imp") [] else
+							mizEmitGuardedInsts((^mizEmitBySkelRef)(mizEmitSkeleton(l4)),
+								l4, stmtOfG, ^mizEmitIsAxiomRef, ^mizEmitShOfRef, 2);
+						default: [];
+					}));
 					drv = concatA([mizEmitDrvInsts(recDrv,
 						arrayPush([goal], switch (asm) { None(): goal; Some(af): af; }),
 						^mizEmitShOfRef),
-						gDefs,
+						gDefs, gdOf(gDefs),
 						mizEmitCtxNF(ctx0),
 						mizEmitChars(ctx0), mizEmitDerive(ctx0, allForms)]);
 					r3 = if (drv == []) r2
@@ -1658,7 +1688,7 @@ mizEmitLadderA(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 						// without them failed: as ordinary candidates they crowded
 						// the ranked cut and cost a closing theorem (t2_xboole_0)
 						None(): if (citeDrvs == []) r3 else {
-							drv4 = concat(drv, citeDrvs);
+							drv4 = concatA([drv, citeDrvs, gdOf(citeDrvs)]);
 							all4 = concat(allForms, map(drv4, \d -> d.form));
 							i4 = fold(all4, makeTree(), \acc, f -> mizEmitUnfolds(f, acc));
 							mizEmitTry(ctx, goal,
@@ -1768,7 +1798,7 @@ mizEmitTrySel(ctx : [Pair<FolForm, RuParseRef>], goal : FolForm,
 	allF = concatA([ctxP0, instP0, drvP0]);
 	cands = filter(mapi(allF, \j, f -> Pair(j, f)), \pr -> containsSet(rel, pr.first));
 	catoms = map(cands, \pr -> mizEmitAtomKeys(pr.second, makeSet()));
-	rAsc = fold([4, 8], None(), \acc : Maybe<Pair<Maybe<FolStepProof>, bool>>, k ->
+	rAsc = fold([4, 8, 16], None(), \acc : Maybe<Pair<Maybe<FolStepProof>, bool>>, k ->
 		switch (acc) {
 			Some(__): acc;
 			None(): if (length(cands) <= k) None()
@@ -2634,11 +2664,20 @@ mizEmitInstImp(steps : ref [FolPStep], dj : ref [Pair<string, string>],
 				// disjointed(A x), so instantiating x5 at `𝒫 x5` is not an instance
 				// of anything. Russell caught it on t1_subset_1 the moment
 				// definitions began to be matched at any term of the step.
-				else if (mizEmitTermHas(x, t)) None()
+				else if (mizEmitTermHas(x, t)) {
+					if (^mizEmitDbg) println("  INSTIMP-DECLINE binder-in-witness " + x);
+					None();
+				}
 				else switch (mizEmitWalkT(steps, dj, x, t, rest)) {
-					None(): None();
+					None(): {
+						if (^mizEmitDbg) println("  INSTIMP-DECLINE walk " + x);
+						None();
+					}
 					Some(wk): switch (mizEmitSethood(steps, dj, t, shOf, depth)) {
-						None(): None();
+						None(): {
+							if (^mizEmitDbg) println("  INSTIMP-DECLINE sethood " + x);
+							None();
+						}
 						Some(shIdx): {
 							// spcgv is disjointed(A x, ps x): the binder must be apart
 							// from the witness's variables AND from every variable of
