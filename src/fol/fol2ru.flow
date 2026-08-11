@@ -762,41 +762,68 @@ folProofTheoremE(name : string, comment : string, hyps : [FolForm], steps : [Fol
 	disjs = map(filter(disjPairs, isStmtPair), mkDisj);
 	proofDisjs = map(filter(disjPairs, \d -> !isStmtPair(d)), mkDisj);
 	// build sequentially: a closed step expands into its certificate block, an
-	// open one stays a problem; f2f maps original step index -> final index
-	built = foldi(steps, Pair([], makeTree()), \i, acc : Pair<[RuParseStep], Tree<int, int>>, sp -> {
-		base = length(acc.first);
+	// open one stays a problem; f2f maps original step index -> final index.
+	// CROSS-BLOCK STEP DEDUP: the by-step certificates of one theorem repeat
+	// the same leaf instances (unfolds, sp/spcgv chains, def instances) and
+	// the same lift steps block after block — a step identical in assertion,
+	// resolved references and statement IS the same derivation, so later
+	// blocks cite the first occurrence instead of restating it. This is what
+	// bounds the emitted mass (and the Metamath export, which inlines every
+	// step) once the case-split families close.
+	outSteps : ref [RuParseStep] = ref [];
+	memo : ref Tree<string, int> = ref makeTree();
+	built = foldi(steps, makeTree(), \i, f2f : Tree<int, int>, sp -> {
 		mproof = if (i < length(proofs)) proofs[i] else None();
 		switch (mproof) {
 			None(): {
 				refs = if (i < length(stepRefs)) stepRefs[i] else [];
 				tactic = if (refs == []) "" else "by(" + strGlue(refs, ", ") + ")";
-				st = RuParseStep(base, ruParseProblem, [],
+				idx = length(^outSteps);
+				outSteps := arrayPush(^outSteps, RuParseStep(idx, ruParseProblem, [],
 					RuParseStmt(s2id("|-"), [tp2id("wff")], folExpr(folFormToks(sp)), -1),
-					ruParseNoProof, tactic, -1);
-				Pair(arrayPush(acc.first, st), setTree(acc.second, i, base));
+					ruParseNoProof, tactic, -1));
+				setTree(f2f, i, idx);
 			}
 			Some(pr): {
-				news = mapi(pr.steps, \j, cs -> RuParseStep(base + j, s2id(cs.assertion),
-					map(cs.refs, \r -> switch (r) {
-						FolPRefStep(k): RuParseStepRef(base + k);
+				local = foldi(pr.steps, makeTree(), \j, loc : Tree<int, int>, cs -> {
+					refsR = map(cs.refs, \r -> switch (r) {
+						FolPRefStep(k): RuParseStepRef(lookupTreeDef(loc, k, k));
 						FolPRefFact(k): {
 							orig = pr.factRefs[k];
 							switch (orig) {
 								RuParseHypRef(__): orig;
-								RuParseStepRef(s): RuParseStepRef(lookupTreeDef(acc.second, s, s));
+								RuParseStepRef(s): RuParseStepRef(lookupTreeDef(f2f, s, s));
 							}
 						}
-					}),
-					RuParseStmt(s2id("|-"), [tp2id("wff")], folExpr(folFormToks(cs.form)), -1),
-					ruParseNoProof, "", -1));
-				Pair(concat(acc.first, news), setTree(acc.second, i, base + length(news) - 1));
+					});
+					toks = folFormToks(cs.form);
+					key = cs.assertion + "|" + strGlue(map(refsR, \r -> switch (r) {
+						RuParseHypRef(h): "h" + i2s(h);
+						RuParseStepRef(s): "s" + i2s(s);
+					}), ",") + "|" + strGlue(toks, " ");
+					switch (lookupTree(^memo, key)) {
+						Some(idx): setTree(loc, j, idx);
+						None(): {
+							idx = length(^outSteps);
+							outSteps := arrayPush(^outSteps, RuParseStep(idx, s2id(cs.assertion),
+								refsR,
+								RuParseStmt(s2id("|-"), [tp2id("wff")], folExpr(toks), -1),
+								ruParseNoProof, "", -1));
+							memo := setTree(^memo, key, idx);
+							setTree(loc, j, idx);
+						}
+					}
+				});
+				setTree(f2f, i, lookupTreeDef(local, length(pr.steps) - 1, length(^outSteps) - 1));
 			}
 		}
 	});
 	RuParseTheorem(s2id(name), folComment(comment), vars, disjs, RuParseMeta([], -1),
 		mapi(hypsAll, \i, h -> RuParseHyp(i, folStmt(folFormToks(h)), -1)),
 		folStmt(folFormToks(goal)),
-		RuParseProof(proofVars, proofDisjs, built.first, -1), -1);
+		RuParseProof(proofVars, proofDisjs,
+			// `built` (the f2f map) is complete here; the fold has filled outSteps
+			if (sizeTree(built) < 0) [] else ^outSteps, -1), -1);
 }
 
 folComment(text : string) -> [RuParseComment] {
