@@ -1751,7 +1751,17 @@ mizEmitLadderA(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 						gDefs, gdOf(gDefs),
 						mizEmitCtxNF(ctx0),
 						mizEmitChars(ctx0), mizEmitDerive(ctx0, allForms)]);
-					r3 = if (drv == []) r2
+					// MERGE-LOG REPLAY: an equation goal gets its chain BUILT — a
+					// proof-producing congruence closure over the candidate
+					// equations — not selected: the flat cut is structurally too
+					// small for the equalizer family (t21_relat_1, measured 4x)
+					chainR = switch (goal) {
+						FolEq(__, __): mizEmitEqChain(ctx0, goal, asm,
+							concatA([drv, citeDrvs, gdOf(citeDrvs)]));
+						default: None();
+					};
+					r3 = if (isSome(chainR)) Pair(chainR, false)
+					else if (drv == []) r2
 					else {
 						// unfolds/bridges over the instances too
 						all2 = concat(allForms, map(drv, \d -> d.form));
@@ -3318,6 +3328,545 @@ mizEmitWalkTerm(steps : ref [FolPStep], x : string, t : FolTerm,
 					}
 				});
 		}
+	}
+}
+
+// ---- MERGE-LOG REPLAY: the equation-chain builder ----
+// When the goal (after reduction, possibly under an assumption) is an
+// EQUATION, the flat certificate is the wrong tool: t21_relat_1's chain needs
+// ~14 exact facts against a 16-slot cut over ~40 candidates, and no static
+// rank can pick them (measured 4x). But the equalizer already computed the
+// chain — its facts are the candidate pool the channels built. So build the
+// chain OURSELVES: a small proof-producing congruence closure over the
+// candidate equations (commutativity of the symmetric foundation ops and slot
+// congruence supply the edges the merge log leaves implicit), then emit the
+// extracted path as eqtrd/eqcomd/syl steps. Deterministic, no selection cut.
+//
+// A candidate's payload is a bare equation or a SINGLY-guarded one
+// (`g → l = r`); the guard is discharged through the same pool — `g` is the
+// assumption itself, an unconditional candidate, or reachable from one by a
+// chain of candidate implications (the ct-guard shape `Relation X →
+// Relation (X~)`).
+
+// where a candidate's proof lives: drv >= 0 an index into the drv pool
+// (its steps spliced on first use), else fact >= 0 a context index
+// (referenced, never restated)
+MizEqCand(form : FolForm, drv : int, fact : int);
+// one edge over the term universe: kind 0 = candidate equation (cand = its
+// index), 1 = commutativity, 2 = congruence — round > 0, and its argument
+// equalities are provable using edges of strictly earlier rounds only (the
+// termination measure of the extraction)
+MizEqEdge(a : int, b : int, round : int, kind : int, cand : int);
+MizEqChainEnv(
+	ph : Maybe<FolForm>, phKey : string,
+	cands : [MizEqCand],
+	drvs : [MizEmitDrv],
+	ctx : [Pair<FolForm, RuParseRef>],
+	provable : Set<string>,
+	uni : Tree<string, int>,
+	terms : [FolTerm],
+	edges : [MizEqEdge],
+	adj : Tree<int, [int]>,
+	steps : ref [FolPStep],
+	frefs : ref [RuParseRef],
+	djs : ref [Pair<string, string>],
+	candH : ref Tree<int, FolPRef>,
+	guardH : ref Tree<string, FolPRef>,
+	eqH : ref Tree<string, FolPRef>);
+
+mizEqcCommLemma(fn : string) -> string {
+	if (fn == "∪") "uncom" else if (fn == "∩") "incom"
+	else if (fn == "△") "symdifcom" else if (fn == "pair") "prcom" else "";
+}
+
+// the candidate's equation payload with its (at most one) guard
+mizEqcPayload(f : FolForm) -> Maybe<Pair<FolForm, Maybe<FolForm>>> {
+	switch (f) {
+		FolEq(__, __): Some(Pair(f, None()));
+		FolBin(op, g, r): if (op != "imp") None() else switch (r) {
+			FolEq(__, __): Some(Pair(r, Some(g)));
+			default: None();
+		}
+		default: None();
+	}
+}
+
+mizEqcAddTerm(uni : ref Tree<string, int>, terms : ref [FolTerm], t : FolTerm) -> int {
+	k = mizEmitTKey(t);
+	switch (lookupTree(^uni, k)) {
+		Some(i): i;
+		None(): {
+			switch (t) {
+				FolApp(__, args): iter(args, \a -> { mizEqcAddTerm(uni, terms, a); {} });
+				default: {};
+			}
+			i = length(^terms);
+			terms := arrayPush(^terms, t);
+			uni := setTree(^uni, k, i);
+			i;
+		}
+	}
+}
+
+mizEqcFind(uf : ref Tree<int, int>, i : int) -> int {
+	p = lookupTreeDef(^uf, i, i);
+	if (p == i) i else mizEqcFind(uf, p);
+}
+
+// congruence rounds to a fixpoint: same head, argument classes equal, every
+// differing slot's congruence lemma available
+mizEqcCongRounds(terms : [FolTerm], uni : Tree<string, int>,
+	uf : ref Tree<int, int>, edges : ref [MizEqEdge], round : int) -> void {
+	if (round <= 8) {
+		buckets = foldi(terms, makeTree(), \i, acc, t -> switch (t) {
+			FolApp(fn, args): {
+				k = fn + "/" + i2s(length(args));
+				setTree(acc, k, arrayPush(lookupTreeDef(acc, k, []), i));
+			}
+			default: acc;
+		});
+		added = foldTree(buckets, false, \__, is, acc0 -> fold(is, acc0, \acc1, i ->
+			fold(is, acc1, \acc, j ->
+				if (j <= i || mizEqcFind(uf, i) == mizEqcFind(uf, j)) acc
+				else switch (terms[i]) {
+					FolApp(fn, ai): switch (terms[j]) {
+						FolApp(__, aj): {
+							ok = foldi(ai, true, \s, o, a -> o && {
+								if (a == aj[s]) true
+								else if (mizEmitSlotCong(fn, s) == "") false
+								else {
+									ka = lookupTreeDef(uni, mizEmitTKey(a), -1);
+									kb = lookupTreeDef(uni, mizEmitTKey(aj[s]), -1);
+									ka >= 0 && kb >= 0 && mizEqcFind(uf, ka) == mizEqcFind(uf, kb);
+								}
+							});
+							if (!ok) acc
+							else {
+								// the round is the edge COUNT at creation: the argument
+								// classes were joined by edges already present, so the
+								// extraction bound `index < mine` is exactly what holds
+								// (a per-pass round let a cong edge depend on a
+								// same-pass merge the extraction then refused)
+								edges := arrayPush(^edges,
+									MizEqEdge(i, j, length(^edges) + 1, 2, -1));
+								uf := setTree(^uf, mizEqcFind(uf, i), mizEqcFind(uf, j));
+								true;
+							}
+						}
+						default: acc;
+					}
+					default: acc;
+				})));
+		if (added) mizEqcCongRounds(terms, uni, uf, edges, round + 1);
+	}
+}
+
+mizEqcEmit(env : MizEqChainEnv, form : FolForm, lemma : string, refs : [FolPRef]) -> FolPRef {
+	env.steps := arrayPush(^(env.steps), FolPStep(form, lemma, refs));
+	FolPRefStep(length(^(env.steps)) - 1);
+}
+
+mizEqcMkD(env : MizEqChainEnv, f : FolForm) -> FolForm {
+	switch (env.ph) { None(): f; Some(p): FolBin("imp", p, f); }
+}
+
+// the handle proving the candidate's own form: a context reference, or the
+// derived block spliced once (local refs shifted exactly as the certificate
+// splices them)
+mizEqcCandH(env : MizEqChainEnv, ci : int) -> FolPRef {
+	switch (lookupTree(^(env.candH), ci)) {
+		Some(h): h;
+		None(): {
+			c = env.cands[ci];
+			h = if (c.fact >= 0) {
+				env.frefs := arrayPush(^(env.frefs), env.ctx[c.fact].second);
+				FolPRefFact(length(^(env.frefs)) - 1);
+			} else {
+				d = env.drvs[c.drv];
+				base = length(^(env.steps));
+				refBase = length(^(env.frefs));
+				iter(d.steps, \cs -> {
+					env.steps := arrayPush(^(env.steps), FolPStep(cs.form, cs.assertion,
+						map(cs.refs, \rr -> switch (rr) {
+							FolPRefStep(k): FolPRefStep(base + k);
+							FolPRefFact(k): FolPRefFact(refBase + k);
+						})));
+				});
+				env.frefs := concat(^(env.frefs), d.refs);
+				env.djs := concat(^(env.djs), d.disjs);
+				FolPRefStep(length(^(env.steps)) - 1);
+			}
+			env.candH := setTree(^(env.candH), ci, h);
+			h;
+		}
+	}
+}
+
+// discharge a guard: a step proving `ph → g` (deduction mode) / `g`
+// (inference mode), through the candidate pool
+mizEqcProveG(env : MizEqChainEnv, g : FolForm, depth : int) -> Maybe<FolPRef> {
+	gk = mizEmitKey(g);
+	switch (lookupTree(^(env.guardH), gk)) {
+		Some(h): Some(h);
+		None(): if (depth <= 0) None() else {
+			r = if (isSome(env.ph) && gk == env.phKey)
+				Some(mizEqcEmit(env, mizEqcMkD(env, g), "id", []))
+			else {
+				direct = foldi(env.cands, None(), \ci, ac : Maybe<FolPRef>, c ->
+					if (isSome(ac) || mizEmitKey(c.form) != gk) ac
+					else {
+						h = mizEqcCandH(env, ci);
+						switch (env.ph) {
+							None(): Some(h);
+							Some(__): Some(mizEqcEmit(env, mizEqcMkD(env, g), "a1i", [h]));
+						}
+					});
+				switch (direct) {
+					Some(__): direct;
+					None(): foldi(env.cands, None(), \ci, ac : Maybe<FolPRef>, c ->
+						if (isSome(ac)) ac
+						else switch (c.form) {
+							FolBin(op, g2, g3): if (op != "imp" || mizEmitKey(g3) != gk) ac
+								else if (isSome(env.ph) && mizEmitKey(g2) == env.phKey)
+									Some(mizEqcCandH(env, ci))
+								else switch (mizEqcProveG(env, g2, depth - 1)) {
+									None(): ac;
+									Some(hg): {
+										hc = mizEqcCandH(env, ci);
+										switch (env.ph) {
+											None(): Some(mizEqcEmit(env, g, "ax-mp", [hg, hc]));
+											Some(__): Some(mizEqcEmit(env, mizEqcMkD(env, g), "syl", [hg, hc]));
+										}
+									}
+								}
+							default: ac;
+						});
+				}
+			}
+			switch (r) {
+				None(): None();
+				Some(h): { env.guardH := setTree(^(env.guardH), gk, h); r; }
+			}
+		}
+	}
+}
+
+// a step proving mkD(T(from) = T(to)) across one edge
+mizEqcEdgeStep(env : MizEqChainEnv, e : MizEqEdge, from : int) -> Maybe<FolPRef> {
+	to = if (e.a == from) e.b else e.a;
+	tf = env.terms[from];
+	tt = env.terms[to];
+	if (e.kind == 0) {
+		c = env.cands[e.cand];
+		switch (mizEqcPayload(c.form)) {
+			None(): None();
+			Some(pl): {
+				eq = pl.first;
+				natural = switch (eq) {
+					FolEq(l, __): mizEmitTKey(l) == mizEmitTKey(tf);
+					default: false;
+				};
+				base : Maybe<FolPRef> = switch (pl.second) {
+					None(): switch (env.ph) {
+						None(): Some(mizEqcCandH(env, e.cand));
+						Some(__): Some(mizEqcEmit(env, mizEqcMkD(env, eq), "a1i",
+							[mizEqcCandH(env, e.cand)]));
+					}
+					Some(g): if (isSome(env.ph) && mizEmitKey(g) == env.phKey)
+						Some(mizEqcCandH(env, e.cand))
+					else switch (mizEqcProveG(env, g, 6)) {
+						None(): None();
+						Some(hg): {
+							hc = mizEqcCandH(env, e.cand);
+							switch (env.ph) {
+								None(): Some(mizEqcEmit(env, eq, "ax-mp", [hg, hc]));
+								Some(__): Some(mizEqcEmit(env, mizEqcMkD(env, eq), "syl", [hg, hc]));
+							}
+						}
+					}
+				};
+				switch (base) {
+					None(): None();
+					Some(h): if (natural) Some(h)
+						else Some(mizEqcEmit(env, mizEqcMkD(env, FolEq(tf, tt)),
+							if (isSome(env.ph)) "eqcomd" else "eqcomi", [h]));
+				}
+			}
+		}
+	} else if (e.kind == 1) {
+		// commutativity holds in the requested direction directly
+		h = mizEqcEmit(env, FolEq(tf, tt), switch (tf) {
+			FolApp(fn, __): mizEqcCommLemma(fn);
+			default: "";
+		}, []);
+		switch (env.ph) {
+			None(): Some(h);
+			Some(__): Some(mizEqcEmit(env, mizEqcMkD(env, FolEq(tf, tt)), "a1i", [h]));
+		}
+	} else {
+		// congruence: rewrite each differing slot in turn, chaining by eqtrd/eqtri
+		switch (tf) {
+			FolApp(fn, af): switch (tt) {
+				FolApp(__, at_): {
+					r = foldi(af, Some(Pair(tf, None())),
+						\i, acc : Maybe<Pair<FolTerm, Maybe<FolPRef>>>, a -> switch (acc) {
+						None(): None();
+						Some(st): if (a == at_[i]) acc else {
+							cur = st.first;
+							curArgs = switch (cur) { FolApp(__, aa): aa; default: []; };
+							ua = mizEqcTermIdx(env, a);
+							ub = mizEqcTermIdx(env, at_[i]);
+							if (ua < 0 || ub < 0 || length(curArgs) != length(af)) None()
+							else switch (mizEqcProveEq(env, ua, ub, e.round)) {
+								None(): None();
+								Some(argH): {
+									lem = mizEmitSlotCong(fn, i);
+									nxt = FolApp(fn, replace(curArgs, i, at_[i]));
+									cg = mizEqcEmit(env, FolBin("imp", FolEq(curArgs[i], at_[i]),
+										FolEq(cur, nxt)), lem, []);
+									stepH = switch (env.ph) {
+										None(): mizEqcEmit(env, FolEq(cur, nxt), "ax-mp", [argH, cg]);
+										Some(__): mizEqcEmit(env, mizEqcMkD(env, FolEq(cur, nxt)), "syl", [argH, cg]);
+									};
+									comb = switch (st.second) {
+										None(): stepH;
+										Some(prevH): mizEqcEmit(env, mizEqcMkD(env, FolEq(tf, nxt)),
+											if (isSome(env.ph)) "eqtrd" else "eqtri", [prevH, stepH]);
+									};
+									Some(Pair(nxt, Some(comb)));
+								}
+							}
+						}
+					});
+					switch (r) {
+						None(): None();
+						Some(fin): fin.second;
+					}
+				}
+				default: None();
+			}
+			default: None();
+		}
+	}
+}
+
+mizEqcTermIdx(env : MizEqChainEnv, t : FolTerm) -> int {
+	lookupTreeDef(env.uni, mizEmitTKey(t), -1);
+}
+
+mizEqcGuardFix(cands : [MizEqCand], s : Set<string>) -> Set<string> {
+	s2 = fold(cands, s, \ac, c -> switch (c.form) {
+		FolBin(op, g, f): if (op != "imp") ac
+			else if (containsSet(ac, mizEmitKey(g))) insertSet(ac, mizEmitKey(f))
+			else ac;
+		default: ac;
+	});
+	if (sizeSet(s2) == sizeSet(s)) s else mizEqcGuardFix(cands, s2);
+}
+
+// BFS over edges of round < maxR; returns the path as (edge index, from-term)
+mizEqcPath(env : MizEqChainEnv, u : int, v : int, maxR : int) -> Maybe<[Pair<int, int>]> {
+	bfs = \queue0 : [int], visited0 : Tree<int, Pair<int, int>> -> {
+		// tail-recursive worklist via fold-until: implemented with a bounded loop
+		state : ref Pair<[int], Tree<int, Pair<int, int>>> = ref Pair(queue0, visited0);
+		found : ref bool = ref (u == v);
+		iter(enumFromTo(0, length(env.terms) * 4), \__ -> {
+			q = ^state;
+			if (!^found && q.first != []) {
+				cur = q.first[0];
+				rest = tail(q.first);
+				nq = fold(lookupTreeDef(env.adj, cur, []), Pair(rest, q.second),
+					\acc : Pair<[int], Tree<int, Pair<int, int>>>, ei -> {
+					e = env.edges[ei];
+					if (e.round >= maxR) acc else {
+						nxt = if (e.a == cur) e.b else e.a;
+						if (containsKeyTree(acc.second, nxt) || nxt == u) acc
+						else {
+							if (nxt == v) found := true;
+							Pair(arrayPush(acc.first, nxt), setTree(acc.second, nxt, Pair(cur, ei)));
+						}
+					}
+				});
+				state := nq;
+			}
+		});
+		if (!^found) None() else Some((^state).second);
+	};
+	if (u == v) Some([])
+	else switch (bfs([u], makeTree())) {
+		None(): None();
+		Some(vis): {
+			// reconstruct backwards from v
+			path : ref [Pair<int, int>] = ref [];
+			cur : ref int = ref v;
+			ok : ref bool = ref true;
+			iter(enumFromTo(0, length(env.terms)), \__ -> {
+				if (^ok && ^cur != u) {
+					switch (lookupTree(vis, ^cur)) {
+						None(): ok := false;
+						Some(pv): {
+							path := arrayPush(^path, Pair(pv.second, pv.first));
+							cur := pv.first;
+						}
+					}
+				}
+			});
+			if (!^ok) None() else Some(reverseA(^path));
+		}
+	}
+}
+
+// the memoized proof of mkD(T(u) = T(v)); cong edges recurse with their round
+// as the new bound
+mizEqcProveEq(env : MizEqChainEnv, u : int, v : int, maxR : int) -> Maybe<FolPRef> {
+	mk = i2s(u) + ":" + i2s(v);
+	switch (lookupTree(^(env.eqH), mk)) {
+		Some(h): Some(h);
+		None(): {
+			r = if (u == v)
+				Some(switch (env.ph) {
+					None(): mizEqcEmit(env, FolEq(env.terms[u], env.terms[u]), "eqid", []);
+					Some(__): mizEqcEmit(env, mizEqcMkD(env,
+						FolEq(env.terms[u], env.terms[u])), "eqidd", []);
+				})
+			else switch (mizEqcPath(env, u, v, maxR)) {
+				None(): None();
+				Some(path): {
+					// a FAILED edge must abort the whole chain: re-seeding on the
+					// next success silently drops the unproven prefix (the
+					// t6_enumset1 disproof — the verifier caught exactly that)
+					r2 = fold(path, Some(None()),
+						\acc : Maybe<Maybe<FolPRef>>, pe -> switch (acc) {
+						None(): None();
+						Some(prev): {
+							e = env.edges[pe.first];
+							from = pe.second;
+							to = if (e.a == from) e.b else e.a;
+							switch (mizEqcEdgeStep(env, e, from)) {
+								None(): None();
+								Some(h1): switch (prev) {
+									None(): Some(Some(h1));
+									Some(h0): Some(Some(mizEqcEmit(env,
+										mizEqcMkD(env, FolEq(env.terms[u], env.terms[to])),
+										if (isSome(env.ph)) "eqtrd" else "eqtri", [h0, h1])));
+								}
+							}
+						}
+					});
+					switch (r2) { None(): None(); Some(mh): mh; }
+				}
+			}
+			switch (r) {
+				None(): None();
+				Some(h): { env.eqH := setTree(^(env.eqH), mk, h); r; }
+			}
+		}
+	}
+}
+
+mizEmitEqChain(ctx : [Pair<FolForm, RuParseRef>], goal : FolForm,
+	asm : Maybe<FolForm>, drvs : [MizEmitDrv]) -> Maybe<FolStepProof> {
+	switch (goal) {
+		FolEq(gl, gr): if (gl == gr) None() else {
+			phKey = switch (asm) { None(): ""; Some(af): mizEmitKey(af); };
+			cands = concat(
+				mapi(ctx, \j, p -> MizEqCand(p.first, -1, j)),
+				mapi(drvs, \j, d -> MizEqCand(d.form, j, -1)));
+			// forms reachable as guards: the assumption, every candidate form,
+			// and the closure over singly-guarded candidate implications
+			seed0 = fold(cands, if (phKey == "") makeSet() else makeSet1(phKey),
+				\ac, c -> insertSet(ac, mizEmitKey(c.form)));
+			provable = mizEqcGuardFix(cands, seed0);
+			// edges from candidate payloads whose guard is dischargeable
+			payloads = filtermap(mapi(cands, \ci, c -> Pair(ci, mizEqcPayload(c.form))),
+				\pr -> switch (pr.second) {
+					None(): None();
+					Some(pl): switch (pl.second) {
+						None(): Some(Pair(pr.first, pl.first));
+						Some(g): if (containsSet(provable, mizEmitKey(g)))
+							Some(Pair(pr.first, pl.first)) else None();
+					}
+				});
+			if (payloads == []) None() else {
+				uni : ref Tree<string, int> = ref makeTree();
+				terms0 : ref [FolTerm] = ref [];
+				gi = mizEqcAddTerm(uni, terms0, gl);
+				gj = mizEqcAddTerm(uni, terms0, gr);
+				peIdx = map(payloads, \pl -> switch (pl.second) {
+					FolEq(l, r): Pair(mizEqcAddTerm(uni, terms0, l), mizEqcAddTerm(uni, terms0, r));
+					default: Pair(-1, -1);
+				});
+				// commutative twins join the universe: the equalizer bakes ∪/∩
+				// commutativity into its classes with no log entry
+				twins = foldi(^terms0, [], \i, ac, t -> switch (t) {
+					FolApp(fn, args): if (length(args) == 2 && mizEqcCommLemma(fn) != "")
+						arrayPush(ac, Pair(i, FolApp(fn, [args[1], args[0]])))
+						else ac;
+					default: ac;
+				});
+				commEdges = fold(twins, [], \ac, tw ->
+					arrayPush(ac, Pair(tw.first, mizEqcAddTerm(uni, terms0, tw.second))));
+				terms = ^terms0;
+				uf : ref Tree<int, int> = ref makeTree();
+				edges : ref [MizEqEdge] = ref [];
+				iteri(peIdx, \k, pr -> if (pr.first >= 0) {
+					edges := arrayPush(^edges, MizEqEdge(pr.first, pr.second, 0, 0,
+						payloads[k].first));
+					uf := setTree(^uf, mizEqcFind(uf, pr.first), mizEqcFind(uf, pr.second));
+				});
+				iter(commEdges, \pr -> if (pr.first != pr.second) {
+					edges := arrayPush(^edges, MizEqEdge(pr.first, pr.second, 0, 1, -1));
+					uf := setTree(^uf, mizEqcFind(uf, pr.first), mizEqcFind(uf, pr.second));
+				});
+				mizEqcCongRounds(terms, ^uni, uf, edges, 1);
+				if (mizEqcFind(uf, gi) != mizEqcFind(uf, gj)) {
+					if (^mizEmitDbg) {
+						println("  EQCHAIN no-join terms=" + i2s(length(terms))
+							+ " edges=" + i2s(length(^edges)));
+						iter(^edges, \e9 -> println("    E" + i2s(e9.kind)
+							+ " " + strGlue(folFormToks(FolEq(terms[e9.a], terms[e9.b])), " ")));
+						iter(payloads, \pl9 -> println("    P "
+							+ strGlue(folFormToks(pl9.second), " ")));
+					}
+					None();
+				} else {
+					adj = foldi(^edges, makeTree(), \ei, ac, e ->
+						setTree(setTree(ac, e.a, arrayPush(lookupTreeDef(ac, e.a, []), ei)),
+							e.b, arrayPush(lookupTreeDef(ac, e.b, []), ei)));
+					env = MizEqChainEnv(asm, phKey, cands, drvs, ctx, provable,
+						^uni, terms, ^edges, adj,
+						ref [], ref [], ref [], ref makeTree(), ref makeTree(), ref makeTree());
+					switch (mizEqcProveEq(env, gi, gj, 1000000000)) {
+						None(): {
+							if (^mizEmitDbg) println("  EQCHAIN extract-fail");
+							None();
+						}
+						Some(h): {
+							// the ladder contract: the LAST step proves the conclusion
+							lastOk = switch (h) {
+								FolPRefStep(k): k == length(^(env.steps)) - 1;
+								FolPRefFact(__): false;
+							};
+							if (!lastOk) None()
+							else {
+								if (^mizEmitDbg) {
+									println("  EQCHAIN ok steps=" + i2s(length(^(env.steps))));
+									iteri(^(env.steps), \si9, s9 ->
+										println("    S" + i2s(si9) + " " + s9.assertion + " ["
+											+ strGlue(map(s9.refs, \r9 -> switch (r9) {
+												FolPRefStep(k9): "s" + i2s(k9);
+												FolPRefFact(k9): "f" + i2s(k9);
+											}), ",") + "] "
+											+ strGlue(folFormToks(s9.form), " ")));
+								}
+								Some(FolStepProof(^(env.steps), ^(env.frefs), uniq(^(env.djs))));
+							}
+						}
+					}
+				}
+			}
+		}
+		default: None();
 	}
 }
 
