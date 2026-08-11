@@ -1143,3 +1143,31 @@ THE HONEST GATE SET GOES 126 → 144. t21_relat_1 closes end to end.
 declared on the citing theorem); symdifex + "△" sethood (xb1's three
 displaced borderliners); subset_1 = the S-C type layer; chain extensions
 only if traces ask (⊆-goals via the closure, multi-guard payloads).
+
+### 2026-08-11 (later) — three units on top of the chain builder; 144 → 158
+
+*Neutral, sound, committed @8995bb80*: citation disjointedness now maps a
+compound-substituted group member to ALL its variables (Metamath's DV
+semantics, the spv path's own rule) instead of declining; symdifex (△
+sethood) authored in miz_aux.ru and added to the emitter's sethood table.
+Both gated neutral at 144 — the enumset1 declines and xboole_1's three
+displaced borderliners were not the binding constraint.
+
+*The enum wall fell to a ROUTING fix, not a foundation regen
+(@21d47df5)*: the goal-def channel had been building the d2..d6_enumset1
+means instances all along — but only the record channel's facts went
+through the drv ∀-elimination. A means instance keeps its inner
+∀x characterization, and as one opaque atom relevance dropped it unseen.
+Routing the def instances through the same elimination (instantiated at
+the goal's element) closes t4/t5/t7/t8 and the k2/k3 family:
+enumset1 34 → 48, every other floor held, verify + MM green,
+proved == closed = 158.
+★ THE LESSON: before regenerating a foundation, check whether the fact
+is already GENERATED and merely dropped between channels — the whole
+"enum4-8 regen campaign" prize was one plumbing defect. (What remains
+open in enumset1 — t41/t49/t50/t61-65, the k5/k6 identities and
+permutation family — may want the wider lemmas still, or deeper chains.)
+★ THE COST, recorded honestly: enumset1's emit+verify now runs ~10 min
+(was 40 s); the k-way case-split certificates are heavy. Budgets were
+not raised. CERTIFICATE SHARING across steps is the named follow-up
+before this scales to more enum-citing articles.
