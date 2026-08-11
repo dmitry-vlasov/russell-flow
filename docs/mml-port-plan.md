@@ -1197,3 +1197,30 @@ operators need the INSTANTIATED definition iff (gDefsI has it) consulted
 as an unfold rule in the membership-NF table. That one unit should
 replace the heaviest certificates outright — the 10-minute enumset1 run
 and the half-gigabyte export are its measured prize.
+
+### 2026-08-11 (night) — the membership NF opens up; 158 → 170; TWO USER DIRECTIVES
+
+*Done (@91aae30d, verify + MM green, proved == closed)*: mizEmitMemNF
+unfolds △ (elsymdif, structural), the var-element leaves (velsn / velpr /
+veltp / velpw), and ARTICLE operators through their own definition — the
+instantiated def iff spliced as a proof block and cited like a lemma;
+mizEmitMemPair admits these as compound, so the mem-rewrite route now
+fires on the enum matrices. xboole_1 70 → 73 (the displaced △
+borderliners return), enumset1 48 → 54, zfmisc_1 23 → 26 — gate set 170.
+Emitted mass unchanged: the residue still case-splits in G3cp.
+
+*USER DIRECTIVE 1 — proofs must cite, not trace.* The 3-orders size gap
+against the old tactic prover is structural: the tactic composed
+CITATIONS of a 10k-lemma library (the library carries the mass); the
+certificate is a decision-procedure TRACE over ~20 propositional lemmas.
+Direction set: the record/replay stays the PLANNER, but closing becomes
+citation — match residues against existing library lemmas before
+refuting, and name recurring residue shapes as foundation lemmas. The
+eq-chain builder is the model (small eqtrd/uncom chains). This
+supersedes trace-compression as the size campaign.
+
+*USER DIRECTIVE 2 — parallelize the gates.* to_mm is per-article
+independent (own out= dirs mandatory — shared dirs race on the
+foundation .mm files): concurrency 3 at mem=16g fits 64 GB and roughly
+halves a round. The emit phase stays sequential (dependency chain);
+per-theorem parallelism inside one article is the next lever.
