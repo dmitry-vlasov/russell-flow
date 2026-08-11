@@ -106,6 +106,9 @@ mizEmitSeedKeysRef : ref Set<string> = ref makeSet();
 // through its substitution and carry them — or decline when a group member
 // is substituted by a non-variable (the citation would be illegal)
 mizEmitThmDisjsRef : ref Tree<string, [[string]]> = ref makeTree();
+// disjointedness pairs collected by the membership-NF rewriting (the def
+// unfold's ∀-elimination demands them); harvested by the rewrite's consumers
+mizEmitNFDjRef : ref [Pair<string, string>] = ref [];
 // per STEP: did some certificate attempt find a proof that was only too LONG?
 // That step wants a smaller encoding, not better facts.
 mizEmitStepLong : ref bool = ref false;
@@ -269,6 +272,7 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 			});
 		// `dbg-thm=<name>` traces one theorem's certificate attempts
 		mizEmitDbg := (t.name == getUrlParameterDef("dbg-thm", ""));
+		mizEmitNFDjRef := [];
 		mizEmitStepLong := false;
 		if (^mizEmitDbg)
 			println("  DRVS " + i2s(length(drvs)) + " (rec " + i2s(length(drvs0))
@@ -1399,6 +1403,7 @@ mizEmitGoalNF(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 	maxFacts : int, maxSize : int, depth : int,
 	fresh : ref int, used : Set<string>, recDrv : [MizEmitDrv]) -> Maybe<FolStepProof> {
 	rw : ref [FolPStep] = ref [];
+	djBase = length(^mizEmitNFDjRef);
 	switch (mizEmitFormNF(rw, goal, 0)) {
 		None(): None();
 		Some(w): {
@@ -1411,7 +1416,9 @@ mizEmitGoalNF(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 					ws = mizEmitShift(^rw, base, 0);
 					fin = FolPStep(goal, "mpbir",
 						[FolPRefStep(base - 1), FolPRefStep(base + w.first)]);
-					Some(FolStepProof(concatA([pr.steps, ws, [fin]]), pr.factRefs, pr.disjs));
+					ndj = length(^mizEmitNFDjRef) - djBase;
+					Some(FolStepProof(concatA([pr.steps, ws, [fin]]), pr.factRefs,
+						uniq(concat(pr.disjs, subrange(^mizEmitNFDjRef, djBase, ndj)))));
 				}
 			}
 		}
@@ -4077,7 +4084,49 @@ mizEmitMemNF(steps : ref [FolPStep], v : FolTerm, t : FolTerm,
 	if (depth > 8) self()
 	else switch (t) {
 		FolApp(op, args): {
-			if (length(args) != 2 || (op != "∪" && op != "∩" && op != "∖")) self()
+			if (length(args) == 2 && op == "△") {
+				// symmetric difference: x ∈ A△B ↔ ¬(x∈A ↔ x∈B), then normalize
+				// both memberships and carry the ¬↔ through bibi12i/notbii
+				raw = FolNeg(FolBin("iff", mem(args[0]), mem(args[1])));
+				un = emit(FolBin("iff", mem(t), raw), "elsymdif", []);
+				switch (mizEmitMemNF(steps, v, args[0], depth + 1)) {
+					None(): None();
+					Some(wa): switch (mizEmitMemNF(steps, v, args[1], depth + 1)) {
+						None(): None();
+						Some(wb): {
+							inner = FolBin("iff", wa.second, wb.second);
+							b1 = emit(FolBin("iff", FolBin("iff", mem(args[0]), mem(args[1])), inner),
+								"bibi12i", [FolPRefStep(wa.first), FolPRefStep(wb.first)]);
+							nf = FolNeg(inner);
+							b2 = emit(FolBin("iff", raw, nf), "notbii", [FolPRefStep(b1)]);
+							Some(Pair(emit(FolBin("iff", mem(t), nf), "bitri",
+								[FolPRefStep(un), FolPRefStep(b2)]), nf));
+						}
+					}
+				}
+			}
+			else if (mizEmitIsVar(v) && op == "singleton" && length(args) == 1) {
+				nf = FolEq(v, args[0]);
+				Some(Pair(emit(FolBin("iff", mem(t), nf), "velsn", []), nf));
+			}
+			else if (mizEmitIsVar(v) && op == "pair" && length(args) == 2) {
+				nf = FolBin("or", FolEq(v, args[0]), FolEq(v, args[1]));
+				Some(Pair(emit(FolBin("iff", mem(t), nf), "velpr", []), nf));
+			}
+			else if (mizEmitIsVar(v) && op == "triple" && length(args) == 3) {
+				nf = FolBin("or", FolBin("or", FolEq(v, args[0]), FolEq(v, args[1])),
+					FolEq(v, args[2]));
+				Some(Pair(emit(FolBin("iff", mem(t), nf), "veltp", []), nf));
+			}
+			else if (mizEmitIsVar(v) && op == "𝒫" && length(args) == 1) {
+				nf = mizEmitSs(v, args[0]);
+				Some(Pair(emit(FolBin("iff", mem(t), nf), "velpw", []), nf));
+			}
+			else if (length(args) != 2 || (op != "∪" && op != "∩" && op != "∖"))
+				switch (mizEmitMemNFDef(steps, v, t)) {
+					Some(w): Some(w);
+					None(): self();
+				}
 			else {
 				lemma = if (op == "∪") "elun" else if (op == "∩") "elin" else "eldif";
 				comb = if (op == "∪") "orbi12i" else "anbi12i";
@@ -4112,11 +4161,96 @@ mizEmitMemNF(steps : ref [FolPStep], v : FolTerm, t : FolTerm,
 	}
 }
 
+// unfold `v ∈ f(ā)` through the ARTICLE's own definition of f: the
+// instantiated definition iff — built exactly as the ladder's gDefsI channel
+// builds it (DefInstance steered at the term, CleanIff, ∀-eliminated at the
+// member) — is spliced as a proof block and its conclusion cited like a
+// foundation lemma. This is what turns the k-way enum matrices from a
+// case-split refutation into a linear biconditional chain. Only an
+// UNGUARDED, fact-ref-free instance qualifies; the elimination's
+// disjointedness lands in mizEmitNFDjRef for the rewrite's consumer.
+mizEmitMemNFDef(steps : ref [FolPStep], v : FolTerm, t : FolTerm) -> Maybe<Pair<int, FolForm>> {
+	memF = FolPred("∈", [v, t]);
+	switch (t) {
+		FolApp(f, __): if (!mizEmitIsArticleSym(f)) None() else {
+			ds0 = (^mizEmitDefsOfSymRef)(f);
+			ds = if (length(ds0) > 1) subrange(ds0, 0, 1) else ds0;
+			if (ds == []) None() else {
+				avoid = ref buildSet(concat(mizEmitTermVars(t), mizEmitTermVars(v)));
+				ctr = ref 0;
+				stmtOfL = \nm9 : string -> switch ((^mizEmitStmtOfRef)(nm9)) {
+					None(): None();
+					Some(st9): Some(mizFreshenBound(st9, avoid, ctr));
+				};
+				fold(ds, None(), \ac : Maybe<Pair<int, FolForm>>, nm -> switch (ac) {
+					Some(__): ac;
+					None(): switch (mizEmitDefInstance(nm, f, [FolPred("$dt", [t])],
+							stmtOfL, ^mizEmitShOfRef)) {
+						None(): None();
+						Some(d0): {
+							d = mizEmitCleanIff(d0);
+							if (d.refs != [] || d.steps == []) None()
+							else switch (d.form) {
+								FolQuant(q, vs, __): if (q != "forall" || length(vs) != 1) None()
+								else {
+									st2 : ref [FolPStep] = ref d.steps;
+									dj2 : ref [Pair<string, string>] = ref d.disjs;
+									switch (mizEmitElimAt(st2, dj2, d.form, length(d.steps) - 1,
+											vs[0], v, ^mizEmitShOfRef, 0)) {
+										None(): None();
+										Some(fin): switch (fin.first) {
+											FolBin(op2, l2, r2): if (op2 != "iff") None()
+											else if (l2 != memF && r2 != memF) None()
+											else if (exists(^st2, \cs -> exists(cs.refs, \rr ->
+													switch (rr) { FolPRefFact(__): true; default: false; })))
+												// a fact reference would dangle in the splice —
+												// cannot happen for an axiom-rooted drv, checked anyway
+												None()
+											else {
+												// splice the block; its refs are all local steps
+												base = length(^steps);
+												iter(^st2, \cs -> {
+													steps := arrayPush(^steps, FolPStep(cs.form, cs.assertion,
+														map(cs.refs, \rr -> switch (rr) {
+															FolPRefStep(k): FolPRefStep(base + k);
+															FolPRefFact(k): rr;
+														})));
+												});
+												mizEmitNFDjRef := concat(^mizEmitNFDjRef, ^dj2);
+												at = base + fin.second;
+												if (l2 == memF) Some(Pair(at, r2))
+												else {
+													steps := arrayPush(^steps,
+														FolPStep(FolBin("iff", memF, l2), "bicomi",
+															[FolPRefStep(at)]));
+													Some(Pair(length(^steps) - 1, l2));
+												}
+											}
+											default: None();
+										}
+									}
+								}
+								default: None();
+							}
+						}
+					}
+				});
+			}
+		}
+		default: None();
+	}
+}
+
 // Is this goal a membership relation between two set terms, at least one of
 // them compound? Those are the ones worth rewriting.
 mizEmitMemPair(goal : FolForm) -> Maybe<Triple<string, FolTerm, Pair<FolTerm, FolTerm>>> {
 	compound = \t : FolTerm -> switch (t) {
-		FolApp(op, args): length(args) == 2 && (op == "∪" || op == "∩" || op == "∖");
+		FolApp(op, args):
+			(length(args) == 2 && (op == "∪" || op == "∩" || op == "∖" || op == "△"))
+			|| op == "singleton" || op == "pair" || op == "triple" || op == "𝒫"
+			// an article operator with its own definition unfolds through the
+			// instantiated def iff (the enum family's k2..k6)
+			|| (mizEmitIsArticleSym(op) && (^mizEmitDefsOfSymRef)(op) != []);
 		default: false;
 	};
 	sides = \l : FolForm, r : FolForm -> switch (l) {
@@ -4147,6 +4281,7 @@ mizEmitMemRewrite(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 	maxFacts : int, maxSize : int, depth : int,
 	fresh : ref int, used : Set<string>, recDrv : [MizEmitDrv]) -> Maybe<FolStepProof> {
 	rw : ref [FolPStep] = ref [];
+	djBase = length(^mizEmitNFDjRef);
 	switch (mizEmitMemNF(rw, v, a, 0)) {
 		None(): None();
 		Some(wa): switch (mizEmitMemNF(rw, v, b, 0)) {
@@ -4184,8 +4319,10 @@ mizEmitMemRewrite(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 								s2 = FolPStep(goal, "sylib", [FolPRefStep(n0), FolPRefStep(n0 + 1)]);
 								[s1, bc, s2];
 							};
+							ndj = length(^mizEmitNFDjRef) - djBase;
 							Some(FolStepProof(concatA([pr.steps, ws, join]),
-								pr.factRefs, pr.disjs));
+								pr.factRefs, uniq(concat(pr.disjs,
+									subrange(^mizEmitNFDjRef, djBase, ndj)))));
 						}
 					}
 				}
@@ -4351,6 +4488,7 @@ mizEmitFormNF(steps : ref [FolPStep], f : FolForm, depth : int) -> Maybe<Pair<in
 mizEmitCtxNF(ctx : [Pair<FolForm, RuParseRef>]) -> [MizEmitDrv] {
 	filtermap(ctx, \p -> {
 		steps : ref [FolPStep] = ref [];
+		djBase = length(^mizEmitNFDjRef);
 		switch (mizEmitFormNF(steps, p.first, 0)) {
 			None(): None();
 			Some(w): {
@@ -4360,7 +4498,9 @@ mizEmitCtxNF(ctx : [Pair<FolForm, RuParseRef>]) -> [MizEmitDrv] {
 						[FolPRefFact(0), FolPRefStep(w.first)]));
 					length(^steps) - 1;
 				};
-				if (i < 0) None() else Some(MizEmitDrv(nf, ^steps, [p.second], []));
+				ndj = length(^mizEmitNFDjRef) - djBase;
+				if (i < 0) None() else Some(MizEmitDrv(nf, ^steps, [p.second],
+					uniq(subrange(^mizEmitNFDjRef, djBase, ndj))));
 			}
 		}
 	});
