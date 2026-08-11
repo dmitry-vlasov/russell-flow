@@ -33,6 +33,7 @@ export {
 	mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 		recOf : (string) -> [FolForm], stmtOf : (string) -> Maybe<FolForm>,
 		bySkeleton : (string) -> [string], expOf : (string) -> [Pair<string, string>],
+		eqOf : (string) -> [FolForm],
 		isAxiom : (string) -> bool,
 		shOf : (string) -> string) -> Pair<[Maybe<FolStepProof>], MizEmitCounts>;
 	// the index key: instantiation preserves it exactly
@@ -54,6 +55,8 @@ export {
 	// derived facts re-stated as an equivalence instead of the checker's normal form
 	mizEmitCleanCount() -> int;
 	mizEmitRecReset() -> void;
+	// register a built theorem's declared disjointedness groups (var names)
+	mizEmitSetThmDisjs(name : string, groups : [[string]]) -> void;
 	// (citations resolved to a statement, instances matched to one) — the two
 	// places the record-to-citation join can fail
 	mizEmitRecDiag() -> Pair<int, int>;
@@ -95,6 +98,14 @@ mizEmitCiteStmtsRef : ref [Pair<string, FolForm>] = ref [];
 // `Relation X → Relation (X~)` — the constructor-type axioms can
 mizEmitBySkelRef : ref ((string) -> [string]) = ref (\__ -> []);
 mizEmitIsAxiomRef : ref ((string) -> bool) = ref (\__ -> false);
+// the current step's merge-log seed: atom keys (both orientations) of the
+// premise equations the equalizer consumed at this position
+mizEmitSeedKeysRef : ref Set<string> = ref makeSet();
+// declared disjointedness groups of the article's ALREADY-BUILT theorems
+// (rendered var names): a citation of an open-matrix theorem must map these
+// through its substitution and carry them — or decline when a group member
+// is substituted by a non-variable (the citation would be illegal)
+mizEmitThmDisjsRef : ref Tree<string, [[string]]> = ref makeTree();
 // per STEP: did some certificate attempt find a proof that was only too LONG?
 // That step wants a smaller encoding, not better facts.
 mizEmitStepLong : ref bool = ref false;
@@ -123,11 +134,13 @@ mizEmitRecReset() -> void {
 	mizEmitFailUnprov := 0; mizEmitFailNodes := 0; mizEmitFailSteps := 0;
 	mizEmitLongSteps := 0; mizEmitDefNames := 0; mizEmitDefMade := 0;
 	mizEmitDischarged := 0; mizEmitCleaned := 0;
+	mizEmitThmDisjsRef := makeTree();
 }
 
 mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 	recOf : (string) -> [FolForm], stmtOf : (string) -> Maybe<FolForm>,
 	bySkeleton : (string) -> [string], expOf : (string) -> [Pair<string, string>],
+	eqOf : (string) -> [FolForm],
 	isAxiom : (string) -> bool,
 	shOf : (string) -> string) -> Pair<[Maybe<FolStepProof>], MizEmitCounts> {
 	res = foldi(t.steps, Pair([], MizEmitCounts(0, 0, 0)), \i, acc : Pair<[Maybe<FolStepProof>], MizEmitCounts>, goal -> {
@@ -157,6 +170,20 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 		mizEmitStmtOfRef := stmtOf;
 		mizEmitBySkelRef := bySkeleton;
 		mizEmitIsAxiomRef := isAxiom;
+		// THE MERGE-LOG SEED: the premise equations the equalizer consumed at
+		// this position, in both orientations, as atom KEYS — they join the
+		// relevance closure's seed and the greedy's scoring set, so the facts
+		// the checker itself used outrank everything else from the start
+		seedEqs = eqOf(pos);
+		mizEmitSeedKeysRef := fold(seedEqs, makeSet(), \ac9, f9 -> switch (f9) {
+			FolEq(l9, r9): insertSet(insertSet(ac9, mizEmitKey(f9)),
+				mizEmitKey(FolEq(r9, l9)));
+			default: ac9;
+		});
+		if (^mizEmitDbg || t.name == getUrlParameterDef("dbg-thm", ""))
+			if (seedEqs != [])
+				println("  SEED-EQS " + i2s(length(seedEqs)) + " :: "
+					+ strGlue(map(seedEqs, \f9 -> strGlue(folFormToks(f9), " ")), " ; "));
 		// only names whose TABLE TEXT is the emitted text may be stated as cite
 		// facts: an own-article theorem's entry IS its emitted prop (since the
 		// honesty gate, the ∀-closed Mizar statement), and an env axiom is
@@ -193,9 +220,16 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 				bySkeleton(mizEmitSkeleton(fact))]);
 			d = mizEmitRecFromCites(cands, fact, stmtOf, isAxiom, shOf);
 			if (isSome(d)) mizEmitRecCount := ^mizEmitRecCount + 1;
-			if (isNone(d) && t.name == getUrlParameterDef("dbg-thm", ""))
+			if (isNone(d) && t.name == getUrlParameterDef("dbg-thm", "")) {
 				println("  REC-UNMATCHED cands=" + strGlue(cands, ",")
 					+ " fact=" + strGlue(folFormToks(fact), " "));
+				iter(subrange(cands, 0, 2), \c9 -> switch (stmtOf(c9)) {
+					None(): println("    CAND " + c9 + " no-stmt");
+					Some(st9): println("    CAND " + c9 + " axiom=" + b2s(isAxiom(c9))
+						+ " match=" + b2s(isSome(mizEmitMatchInst(st9, fact)))
+						+ " stmt=" + strGlue(folFormToks(st9), " "));
+				});
+			}
 			d;
 		});
 		// A guard that could NOT be discharged is still worth stating. Under a
@@ -213,10 +247,34 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 		// every derived fact is offered in the CHEAPER of the two forms — the
 		// checker's normalized iff costs twice the connectives of the equivalence
 		// it states, and the budget is what binds
-		drvs = map(concatA([drvs0, defDrvs, guardDrvs]), mizEmitCleanIff);
+		// a derived instance whose equation atom IS the step's own goal equation
+		// is CIRCULAR — the def channel emitted the goal's eqss as an "expansion"
+		// and its bridges crowded the cut while proving nothing
+		goalEqKeys = fold(mizEmitEqAtoms(goal, []), makeSet(), \ac8, e8 -> switch (e8) {
+			FolEq(l8, r8): insertSet(insertSet(ac8, mizEmitKey(e8)), mizEmitKey(FolEq(r8, l8)));
+			default: ac8;
+		});
+		defDrvs1 = filter(defDrvs, \d8 -> !exists(mizEmitEqAtoms(d8.form, []),
+			\e8 -> containsSet(goalEqKeys, mizEmitKey(e8))));
+		drvs = map(concatA([drvs0, defDrvs1, guardDrvs]), mizEmitCleanIff);
+		// the RECORD'S OWN equations seed the scoring too: the checker-attested
+		// instances (a cited theorem's `proj2 X = proj1 (X~)`, an expanded
+		// definition's equation) are as authoritative as the merge log's direct
+		// literals, and their bridges must outrank the ⊆-junk in the cut
+		mizEmitSeedKeysRef := fold(concatA(map(drvs, \d9 -> mizEmitEqAtoms(d9.form, []))),
+			^mizEmitSeedKeysRef, \ac9, e9 -> switch (e9) {
+				FolEq(l9, r9): insertSet(insertSet(ac9, mizEmitKey(e9)),
+					mizEmitKey(FolEq(r9, l9)));
+				default: ac9;
+			});
 		// `dbg-thm=<name>` traces one theorem's certificate attempts
 		mizEmitDbg := (t.name == getUrlParameterDef("dbg-thm", ""));
 		mizEmitStepLong := false;
+		if (^mizEmitDbg)
+			println("  DRVS " + i2s(length(drvs)) + " (rec " + i2s(length(drvs0))
+				+ " def " + i2s(length(defDrvs)) + " guard " + i2s(length(guardDrvs))
+				+ ") pos=" + pos + " recs=" + i2s(length(recs))
+				+ " :: " + strGlue(map(drvs, \d9 -> strGlue(folFormToks(d9.form), " ")), " ;; "));
 		r = mizEmitStepProof(t.hyps, subrange(t.steps, 0, i), goal, maxFacts, maxSize, drvs);
 		if (isNone(r.first) && ^mizEmitStepLong) {
 			mizEmitLongSteps := ^mizEmitLongSteps + 1;
@@ -1571,7 +1629,26 @@ mizEmitLadderA(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 		Some(__): r1;
 		None(): if (r1.second) r1 else {
 			bridged = getTreeValues(mizEmitBridges(allForms, insts0));
-			r2 = mizEmitTry(ctx, goal, bridged, recDrv, maxFacts, maxSize, asm);
+			r20 = mizEmitTry(ctx, goal, bridged, recDrv, maxFacts, maxSize, asm);
+			// RUNG 2R — THE RECORD WHOLESALE: when the checker's record supplies
+			// facts for this step, attempt with THAT pool and its own bridges
+			// and unfolds before any speculative candidate joins. The record IS
+			// the selection — three rounds of score tuning could not assemble a
+			// chain the checker had already written down.
+			r2 = switch (r20.first) {
+				Some(__): r20;
+				None(): {
+					drvR = mizEmitDrvInsts(recDrv,
+						arrayPush([goal], switch (asm) { None(): goal; Some(af): af; }),
+						^mizEmitShOfRef);
+					if (drvR == []) r20 else {
+						allR = concat(allForms, map(drvR, \d -> d.form));
+						iR = fold(allR, makeTree(), \acc, f -> mizEmitUnfolds(f, acc));
+						mizEmitTry(ctx, goal,
+							getTreeValues(mizEmitBridges(allR, iR)), drvR, maxFacts, maxSize, asm);
+					}
+				}
+			};
 			switch (r2.first) {
 				Some(__): r2;
 				None(): if (r2.second) r2 else {
@@ -1783,9 +1860,14 @@ mizEmitTrySel(ctx : [Pair<FolForm, RuParseRef>], goal : FolForm,
 	// the FACTS there; keep them all and let the ranking cap the count.
 	all = concatA([ctxP0, instP0, drvP0,
 		switch (asmP) { None(): []; Some(ap): [ap]; }]);
+	// the merge-log seed keys extend the closure's SEED: a fact stating an
+	// equation the checker consumed is relevant by decree, not by reachability
+	gseed = foldSet(^mizEmitSeedKeysRef, mizEmitAtomKeys(goalP, makeSet()),
+		\s9, k9 -> insertSet(s9, k9));
 	rel = if (isEmptySet(mizEmitAtomKeys(goalP, makeSet())))
 			buildSet(enumFromTo(0, length(all) - 1))
-		else mizEmitRelevantH(all, goalP, hops);
+		else mizEmitRelClose(map(all, \f9 -> mizEmitAtomKeys(f9, makeSet())),
+			gseed, makeSet(), hops);
 	// ASCENDING FACT LADDER: a small sufficient set gives a small proof — and
 	// the emitted TEXT scales with context × steps, so a step closed from the
 	// full relevance set when a 4-fact core sufficed is what quadrupled the
@@ -1793,8 +1875,10 @@ mizEmitTrySel(ctx : [Pair<FolForm, RuParseRef>], goal : FolForm,
 	// the ranked/descending machinery behind it) is only paid when a small
 	// context cannot close the step. A failed small attempt is cheap: its
 	// G3cp tree is bounded by its own fact count.
-	gk0 = mizEmitAtomKeys(goalP,
-		switch (asmP) { None(): makeSet(); Some(ap): mizEmitAtomKeys(ap, makeSet()); });
+	gk0 = foldSet(^mizEmitSeedKeysRef,
+		mizEmitAtomKeys(goalP,
+			switch (asmP) { None(): makeSet(); Some(ap): mizEmitAtomKeys(ap, makeSet()); }),
+		\s9, k9 -> insertSet(s9, k9));
 	allF = concatA([ctxP0, instP0, drvP0]);
 	cands = filter(mapi(allF, \j, f -> Pair(j, f)), \pr -> containsSet(rel, pr.first));
 	catoms = map(cands, \pr -> mizEmitAtomKeys(pr.second, makeSet()));
@@ -1856,8 +1940,10 @@ mizEmitTrySelR(ctx : [Pair<FolForm, RuParseRef>], goal : FolForm,
 			// `asm → goal`, so a fact whose atoms live in the assumption (the
 			// opelxp unfold of a strengthened conjunct) is as load-bearing as a
 			// goal-atom one — under goal-only ranking it could never win a slot
-			gk = mizEmitAtomKeys(goalP,
-				switch (asmP) { None(): makeSet(); Some(ap): mizEmitAtomKeys(ap, makeSet()); });
+			gk = foldSet(^mizEmitSeedKeysRef,
+				mizEmitAtomKeys(goalP,
+					switch (asmP) { None(): makeSet(); Some(ap): mizEmitAtomKeys(ap, makeSet()); }),
+				\s9, k9 -> insertSet(s9, k9));
 			all = concatA([ctxP0, instP0, drvP0]);
 			cands = filter(mapi(all, \j, f -> Pair(j, f)),
 				\pr -> containsSet(rel, pr.first));
@@ -2088,7 +2174,15 @@ mizEmitInstCite(name : string, stmt : FolForm, ws : [string]) -> Maybe<MizEmitDr
 	r = mizEmitInstChain(steps, dj, Pair(stmt, FolPRefStep(0)), ws);
 	switch (r) {
 		None(): None();
-		Some(fin): Some(MizEmitDrv(fin.first, ^steps, [], uniq(^dj)));
+		Some(fin): switch (mizEmitMapThmDisjs(name, \g7 -> {
+				fold(enumFromTo(0, length(ws) - 1), None(), \ac7 : Maybe<FolTerm>, i7 ->
+					if (isSome(ac7)) ac7
+					else if (toLowerCase(mizEmitBinderAt(stmt, i7)) == toLowerCase(g7))
+						Some(FolVar(ws[i7])) else None());
+			})) {
+			None(): None();
+			Some(dps7): Some(MizEmitDrv(fin.first, ^steps, [], uniq(concat(^dj, dps7))));
+		}
 	}
 }
 
@@ -2598,7 +2692,10 @@ mizEmitSethood(steps : ref [FolPStep], dj : ref [Pair<string, string>],
 				}
 			}
 			None(): {
-			sh = shOf(name);
+			// a FOUNDATION operator absent from the table has no sh_ axiom to
+			// cite — guessing one emitted `sh_symdiff` and Russell disproved
+			// the article; decline and the instance simply does not build
+			sh = if (folAmapReusedTerm(name)) "" else shOf(name);
 			if (sh == "") None()
 			else {
 				// the sethood axiom is ∀s0…sn ( f(s̄) ∈ _V ); instantiate it at
@@ -2659,7 +2756,10 @@ mizEmitInstImp(steps : ref [FolPStep], dj : ref [Pair<string, string>],
 				// IMPLICATION form `sp`, not `spi`: spi's binder occurs only in
 				// its hypothesis, so the Metamath export cannot determine it and
 				// emits no floating argument for it.
-				if (t == FolVar(x)) Some(Pair(emit(FolBin("imp", f, rest), "sp", []), rest))
+				if (switch (t) {
+					FolVar(vn): toLowerCase(vn) == toLowerCase(x);
+					default: false;
+				}) Some(Pair(emit(FolBin("imp", f, rest), "sp", []), rest))
 				// ...and a witness that MENTIONS the binder is no better: spcgv is
 				// disjointed(A x), so instantiating x5 at `𝒫 x5` is not an instance
 				// of anything. Russell caught it on t1_subset_1 the moment
@@ -2736,15 +2836,48 @@ mizEmitCiteTheorem(name : string, stmt : FolForm, fact : FolForm) -> Maybe<MizEm
 						\v -> !containsSet(metas, v) || isSome(lookupTree(sub, v)));
 					if (inst != fact || !complete) None()
 					else {
-						steps : ref [FolPStep] = ref [];
-						i0 = {
-							steps := arrayPush(^steps, FolPStep(whole, name, []));
-							0;
-						};
-						switch (mizEmitApplyOps(steps, whole, i0, pc.ops)) {
+						// the cited theorem's declared disjointedness maps through
+						// the substitution: every group member must land on a
+						// VARIABLE, pairwise distinct — else the citation is
+						// illegal and the instance declines (t58_enumset1 cited a
+						// theorem declaring disjointed(x2 x3 x4) and the citing
+						// theorem inherited nothing)
+						groups = lookupTreeDef(^mizEmitThmDisjsRef, name, []);
+						mdis : Maybe<[Pair<string, string>]> = fold(groups, Some([]),
+							\ac7 : Maybe<[Pair<string, string>]>, grp -> switch (ac7) {
+								None(): None();
+								Some(ps7): {
+									vs7 = map(grp, \g7 -> switch (lookupTree(sub, g7)) {
+										None(): Some(toLowerCase(g7));
+										Some(tv): switch (tv) {
+											FolVar(vn7): Some(toLowerCase(vn7));
+											default: None();
+										}
+									});
+									if (exists(vs7, isNone)) None()
+									else {
+										names7 = map(vs7, \m7 -> either(m7, ""));
+										if (length(uniq(names7)) != length(names7)) None()
+										else Some(concat(ps7, concatA(mapi(names7, \i7, a7 ->
+											map(subrange(names7, i7 + 1, length(names7) - i7 - 1),
+												\b7 -> Pair(a7, b7))))));
+									}
+								}
+							});
+						switch (mdis) {
 							None(): None();
-							Some(fin): if (fin.first != fact) None()
-								else Some(MizEmitDrv(fact, ^steps, [], []));
+							Some(dps): {
+								steps : ref [FolPStep] = ref [];
+								i0 = {
+									steps := arrayPush(^steps, FolPStep(whole, name, []));
+									0;
+								};
+								switch (mizEmitApplyOps(steps, whole, i0, pc.ops)) {
+									None(): None();
+									Some(fin): if (fin.first != fact) None()
+										else Some(MizEmitDrv(fact, ^steps, [], dps));
+								}
+							}
 						}
 					}
 				}
@@ -2981,7 +3114,12 @@ mizEmitRecordDrv(premName : string, premise : FolForm,
 		Some(fin): switch (mizEmitApplyOps(steps, fin.first, fin.second, ops)) {
 			None(): None();
 			Some(fin2): if (length(^steps) <= 1) None()
-				else Some(MizEmitDrv(fin2.first, ^steps, [], uniq(^dj)));
+				else switch (mizEmitMapThmDisjs(premName, \g7 ->
+						maybeMap(find(wits, \wp7 -> toLowerCase(wp7.first) == toLowerCase(g7)),
+							\wp7 -> wp7.second))) {
+					None(): None();
+					Some(dps7): Some(MizEmitDrv(fin2.first, ^steps, [], uniq(concat(^dj, dps7))));
+				}
 		}
 	}
 }
@@ -3235,6 +3373,15 @@ mizEmitPieces(f : FolForm, ops : [string], depth : int) -> [MizEmitPiece] {
 			else if (op == "and") concatA([self,
 				mizEmitPieces(l, arrayPush(ops, "simpl"), depth - 1),
 				mizEmitPieces(r, arrayPush(ops, "simpr"), depth - 1)])
+			// a conjunction UNDER an antecedent splits by the deduction-form
+			// projections: the checker splits `v1 X → (eq ∧ eq)` into two
+			// guarded premises, and the record's fact is one of them
+			else if (op == "imp") switch (r) {
+				FolBin(op2, a2, b2): if (op2 != "and") self else concatA([self,
+					mizEmitPieces(FolBin("imp", l, a2), arrayPush(ops, "simpld"), depth - 1),
+					mizEmitPieces(FolBin("imp", l, b2), arrayPush(ops, "simprd"), depth - 1)]);
+				default: self;
+			}
 			else self;
 		default: self;
 	}
@@ -3273,6 +3420,15 @@ mizEmitApplyOps(steps : ref [FolPStep], form : FolForm, idx : int,
 					} else if (op == "simpr" && bop == "and") {
 						im = emit(FolBin("imp", st.first, r), "simpr", []);
 						Some(Pair(r, emit(r, "ax-mp", [FolPRefStep(st.second), FolPRefStep(im)])));
+					} else if ((op == "simpld" || op == "simprd") && bop == "imp") {
+						// deduction-form projection: |- (g → (a ∧ b)) ⊢ |- (g → a/b)
+						switch (r) {
+							FolBin(rop, ra, rb): if (rop != "and") None() else {
+								g = FolBin("imp", l, if (op == "simpld") ra else rb);
+								Some(Pair(g, emit(g, op, [FolPRefStep(st.second)])));
+							}
+							default: None();
+						}
 					} else None();
 				}
 				default: None();
@@ -4041,4 +4197,47 @@ mizEmitBinderAt(f : FolForm, i : int) -> string {
 		}
 		default: "";
 	}
+}
+
+// every FolEq node of a form's propositional skeleton (never under a
+// quantifier — those equations carry bound variables)
+mizEmitEqAtoms(f : FolForm, acc : [FolForm]) -> [FolForm] {
+	switch (f) {
+		FolEq(__, __): arrayPush(acc, f);
+		FolNeg(g): mizEmitEqAtoms(g, acc);
+		FolBin(__, l, r): mizEmitEqAtoms(r, mizEmitEqAtoms(l, acc));
+		default: acc;
+	}
+}
+
+mizEmitSetThmDisjs(name : string, groups : [[string]]) -> void {
+	mizEmitThmDisjsRef := setTree(^mizEmitThmDisjsRef, name, groups);
+}
+
+// map a cited assertion's declared disjointedness groups through the
+// instantiation: every group member must land on a VARIABLE (an unmapped
+// member keeps its own name), pairwise distinct — else the citation is
+// illegal at this instance and the caller declines
+mizEmitMapThmDisjs(name : string, wsub : (string) -> Maybe<FolTerm>) -> Maybe<[Pair<string, string>]> {
+	fold(lookupTreeDef(^mizEmitThmDisjsRef, name, []), Some([]),
+		\ac7 : Maybe<[Pair<string, string>]>, grp -> switch (ac7) {
+			None(): None();
+			Some(ps7): {
+				vs7 = map(grp, \g7 -> switch (wsub(g7)) {
+					None(): Some(toLowerCase(g7));
+					Some(tv): switch (tv) {
+						FolVar(vn7): Some(toLowerCase(vn7));
+						default: None();
+					}
+				});
+				if (exists(vs7, isNone)) None()
+				else {
+					names7 = map(vs7, \m7 -> either(m7, ""));
+					if (length(uniq(names7)) != length(names7)) None()
+					else Some(concat(ps7, concatA(mapi(names7, \i7, a7 ->
+						map(subrange(names7, i7 + 1, length(names7) - i7 - 1),
+							\b7 -> Pair(a7, b7))))));
+				}
+			}
+		});
 }

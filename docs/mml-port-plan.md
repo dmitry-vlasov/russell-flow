@@ -1065,3 +1065,40 @@ the EQUALIZER: the merge log hands over the exact equations and their
 order, no selection involved. The next unit is unchanged — MERGE-LOG
 REPLAY — and now it is known to be necessary, not merely queued: no
 selection tuning can substitute for it on the equational family.
+
+### 2026-08-11 — the record channel opened wide: 117 → 126
+*Built*, one chain of defects at a time, each named by its own diagnostic:
+  1. WHOLE-PROOF POSITIONS: both single-step fallbacks (dishonest shape,
+     no-steps walk — t21's IterEquality class) carried pos = "" and got
+     NOTHING from the record; they now carry every inference position of
+     their proof comma-joined, and the record lookups split and union.
+     Citation-proved facts on relat_1 alone went 11 → 68.
+  2. MERGE-LOG SEEDS (mizDerivPosEqs): the <Equation basic=j> provenance
+     resolved to its disjunct's <Literal> formula, per position — the
+     checker's own "which equalities matter here"; they and the record
+     instances' equation atoms seed the relevance closure and the greedy.
+  3. PIECES UNDER AN ANTECEDENT (simpld/simprd): the checker splits
+     `v1 X → (eq ∧ eq)` into guarded premises; the citation matcher and
+     the op applier now reach them. Plus the sp identity case compared
+     case-insensitively (the AST binder "X26" vs the rendered "x26").
+  4. THE RECORD WHOLESALE (rung 2R): when the record supplies facts, an
+     attempt runs on THAT pool and its own bridges before any speculative
+     candidate joins; plus the circular filter (a derived instance whose
+     equation IS the step's own goal equation proves nothing and crowded
+     the cut).
+  5. TWO SOUNDNESS GUARDS the verifier demanded: a foundation operator
+     absent from the sethood table DECLINES (guessing sh_symdiff disproved
+     xboole_1); and a citation of an assertion with declared
+     disjointedness maps the requirement through its substitution — or
+     declines (t58_enumset1's inherited-restrictions rejection) — via a
+     registry of built theorems' disjointedness groups.
+*Measured* (8 articles, verify green, MM green, proved == closed):
+  enumset1 11 → 22 (the record finally reaches its enum steps),
+  zfmisc_1 19 → 20, xboole_1 73 → 70 (the widened def instances displace
+  three borderliners — a real cost, recorded), others held.
+  THE HONEST GATE SET GOES 117 → 126.
+*Open*: t21_relat_1's chain now has its record equations as facts and
+still wants d6@X~ + ct4 + two eluns together — the full merge-log REPLAY
+(chain emission, not seeding) remains the equational family's answer.
+enumset1's remaining 9 declined-citation theorems want instance-level
+disjointedness declared on the CITING theorem instead of declining.
