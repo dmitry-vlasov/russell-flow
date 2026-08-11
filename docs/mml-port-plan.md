@@ -1102,3 +1102,44 @@ still wants d6@X~ + ct4 + two eluns together — the full merge-log REPLAY
 (chain emission, not seeding) remains the equational family's answer.
 enumset1's remaining 9 declined-citation theorems want instance-level
 disjointedness declared on the CITING theorem instead of declining.
+
+### 2026-08-11 — MERGE-LOG REPLAY: the equation-chain builder; 126 → 144
+
+*What*: an equation goal's proof is now BUILT, not selected
+(`mizEmitEqChain`, emit.flow, hooked at ladder rung 3). A proof-producing
+congruence closure runs over the candidate equations the channels already
+generate — record instances, def instances, cite instances, guard
+bridges, context equations. Commutativity twins (uncom / incom /
+symdifcom / prcom) and slot congruence supply the edges the equalizer
+bakes into its classes with no merge-log entry; extraction emits
+eqtrd / eqcomd / syl chains, with guards discharged through the same pool
+(id / a1i / syl, depth 6). Deterministic — the 16-slot ranked cut that
+structurally could not hold t21_relat_1's ~14-fact chain is bypassed
+entirely for the equational family.
+
+*The unlocking fix beside it*: `bySkeletonAt` returned [] for any
+skeleton shared by more than 32 statements — and the guard channel needs
+exactly the crowded ones (`X is Relation` names half of relat_1's env).
+It now falls back to the AXIOM subset (cap 96); matching still decides.
+That is what let `Relation (X~)` derive from ct4 and unlock d6@(X~).
+
+*Two soundness scars, both caught by the verifier as disproofs
+(t6/t14_enumset1), both general*:
+  1. in the chain's path fold, `acc == None` meant both "first edge" and
+     "an earlier edge failed" — after a mid-path failure the next success
+     re-seeded the chain and silently dropped the unproven prefix. A
+     failed edge must abort the whole chain.
+  2. a congruence edge's extraction bound must be the edge COUNT at
+     creation, not the closure pass number: two edges of one pass may
+     depend on each other's merges, and the pass-number bound refused at
+     extraction what the closure had legitimately used.
+
+*Measured* (8 articles dep order, verify green, MM green,
+proved == closed): tarski 1, xboole_0 3, xboole_1 70, enumset1 22 → 34,
+zfmisc_1 20 → 23, subset_1 0, xtuple_0 0, relat_1 10 → 13.
+THE HONEST GATE SET GOES 126 → 144. t21_relat_1 closes end to end.
+
+*Open next*: enumset1's 9 declined citations (instance disjointedness
+declared on the citing theorem); symdifex + "△" sethood (xb1's three
+displaced borderliners); subset_1 = the S-C type layer; chain extensions
+only if traces ask (⊆-goals via the closure, multi-guard payloads).
