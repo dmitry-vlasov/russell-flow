@@ -1171,3 +1171,29 @@ permutation family — may want the wider lemmas still, or deeper chains.)
 (was 40 s); the k-way case-split certificates are heavy. Budgets were
 not raised. CERTIFICATE SHARING across steps is the named follow-up
 before this scales to more enum-citing articles.
+
+### 2026-08-11 (evening) — the size census: sharing is NOT the lever
+
+*Done (@252162bd, gated exact at 158)*: cross-block certificate step
+dedup in folProofTheoremE — identical (assertion, resolved refs,
+statement) steps across one theorem's by-step blocks collapse to the
+first occurrence.
+
+*The census that matters*: enumset1's emitted mass is 97 MB / 76k steps;
+63% is syl / mpd / simpl / simpr — INTRA-certificate context lifting,
+every form mentioning its own certificate's context. Cross-block sharing
+therefore recovers only ~7% of steps (76k → 70k) and ~1.5% of text; the
+536 MB Metamath export does not move at all. So the case-split family's
+mass will not fall to sharing at any granularity above the certificate.
+
+*The named next form (design, not yet built)*: prove the k-way
+membership matrix `x ∈ k(n)(ā) ↔ x ∈ <compound>` as a BICONDITIONAL
+CHAIN instead of a G3cp refutation — both sides normalize to ∨-trees
+over the same `x = aᵢ` atoms, and ∨-tree equality modulo assoc/comm is
+a bitri / orbi12i / orass / orcom walk: linear in the tree, no case
+explosion, no context to restate. mizEmitMemRewrite already proves this
+shape for the foundation operators (elun/elin/eldif route); the enum
+operators need the INSTANTIATED definition iff (gDefsI has it) consulted
+as an unfold rule in the membership-NF table. That one unit should
+replace the heaviest certificates outright — the 10-minute enumset1 run
+and the half-gigabyte export are its measured prize.
