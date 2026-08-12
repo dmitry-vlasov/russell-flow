@@ -1306,3 +1306,23 @@ equation form never appears as a step goal. The next size unit is a
 DNF residue canonicalizer next to the ∨-tree walk (andir/andi + orbi
 congruence, insertion-sorted like mizEmitOrCanon), which would also
 serve xboole_1's t88/t25 class.
+
+### 2026-08-12 (later) — THE DNF WALK: the pointwise family closes by citation
+
+*Done (@9137245d, verify + MM green, all closures held at 190)*: three
+pieces, one family. mizEmitDnfCanon extends the ∨-walk's insertion sort
+to ∧/∨ trees (canonical form = right-nested key-sorted ∨ of right-nested
+key-sorted ∧; andir/andi distribution, anass/ancom/an12/anidm, ioran —
+the ∨-level machinery reused unchanged with whole conjunctions as
+leaves). opelxp joins the membership normal form (an explicit pair in a
+product opens into the component memberships). mizEmitIffNFWalk at the
+reduction entry normalizes BOTH sides of any iff goal and joins them by
+the walks; a miss falls through to the old path untouched.
+
+*Measured*: zfmisc_1.ru 58 → 36.5 MB (t97/t99/t102 collapse),
+xboole_1.ru 41 → 30 MB, relat_1's MM export 193 → 166 MB. The remaining
+heavy pair — zfmisc t120 (8 MB) and t57 (7 MB) — is a CASE-ANALYSIS
+shape (a disjunction with an equation limb, `x∈A ∨ x∈A ∨ A = A∖{x,y}`),
+not a pointwise iff; it needs either the proof-by-cases route or an
+equation-under-disjunction treatment, and is the natural next census
+read.
