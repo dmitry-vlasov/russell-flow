@@ -30,8 +30,12 @@ export {
 	// the theorem's own variables: Russell instantiates it when a step names it,
 	// so the instance is stated directly in one step. Getting this backwards is
 	// what made three xboole_1 theorems and two zfmisc_1 theorems unverifiable.
+	// `hypStmtOf(name)` resolves an own-article theorem emitted WITH hypotheses
+	// to (proposition, hypotheses): such a theorem is citable only through the
+	// hyp-cite channel, which supplies one reference per substituted hypothesis.
 	mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 		recOf : (string) -> [FolForm], stmtOf : (string) -> Maybe<FolForm>,
+		hypStmtOf : (string) -> Maybe<Pair<FolForm, [FolForm]>>,
 		bySkeleton : (string) -> [string], expOf : (string) -> [Pair<string, string>],
 		eqOf : (string) -> [FolForm],
 		isAxiom : (string) -> bool,
@@ -68,6 +72,10 @@ export {
 	mizEmitLongStepCount() -> int;
 	// (definitions the record named at emitted steps, instances built from them)
 	mizEmitDefDiag() -> Triple<int, int, int>;
+	// (ladder stages that saw a hypothetical-citation candidate, instances built)
+	mizEmitHypCiteDiag() -> Pair<int, int>;
+	// why hypothetical-citation attempts declined, bucketed (a census string)
+	mizEmitHypWhy() -> string;
 }
 
 mizEmitRecCount : ref int = ref 0;
@@ -92,6 +100,10 @@ mizEmitDefsOfSymRef : ref ((string) -> [string]) = ref (\__ -> []);
 // served the record matcher. Rung 3 instantiates these at the stage's free
 // variables like any other ∀-fact (cite-rooted chain, mizEmitInstCite).
 mizEmitCiteStmtsRef : ref [Pair<string, FolForm>] = ref [];
+// the current step's cited HYPOTHETICAL statements (name, (prop, hyps)): a
+// theorem emitted with hypotheses is cited by stating an instance of its
+// proposition and supplying one reference per substituted hypothesis
+mizEmitCiteHypsRef : ref [Pair<string, Pair<FolForm, [FolForm]>>] = ref [];
 // same-skeleton statement lookup + the axiom-shape dispatch, for deriving a
 // def instance's GUARD inside the reduction: the checker uses cluster
 // registrations WITHOUT citation, so the by-list can never supply
@@ -130,6 +142,17 @@ mizEmitDefDiag() -> Triple<int, int, int> {
 mizEmitFailKinds() -> Triple<int, int, int> {
 	Triple(^mizEmitFailUnprov, ^mizEmitFailNodes, ^mizEmitFailSteps);
 }
+mizEmitHypCands : ref int = ref 0;
+mizEmitHypMade : ref int = ref 0;
+mizEmitHypCiteDiag() -> Pair<int, int> { Pair(^mizEmitHypCands, ^mizEmitHypMade); }
+mizEmitHypWhyRef : ref Tree<string, int> = ref makeTree();
+mizEmitCurThmRef : ref string = ref "";
+mizEmitHypBump(k : string) -> void {
+	mizEmitHypWhyRef := setTree(^mizEmitHypWhyRef, k, lookupTreeDef(^mizEmitHypWhyRef, k, 0) + 1);
+}
+mizEmitHypWhy() -> string {
+	strGlue(map(tree2pairs(^mizEmitHypWhyRef), \p -> p.first + "=" + i2s(p.second)), " ");
+}
 mizEmitRecUsed() -> int { ^mizEmitRecCount; }
 mizEmitSetDefsOfSym(fn : (string) -> [string]) -> void { mizEmitDefsOfSymRef := fn; }
 mizEmitRecReset() -> void {
@@ -137,11 +160,14 @@ mizEmitRecReset() -> void {
 	mizEmitFailUnprov := 0; mizEmitFailNodes := 0; mizEmitFailSteps := 0;
 	mizEmitLongSteps := 0; mizEmitDefNames := 0; mizEmitDefMade := 0;
 	mizEmitDischarged := 0; mizEmitCleaned := 0;
+	mizEmitHypCands := 0; mizEmitHypMade := 0;
+	mizEmitHypWhyRef := makeTree();
 	mizEmitThmDisjsRef := makeTree();
 }
 
 mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 	recOf : (string) -> [FolForm], stmtOf : (string) -> Maybe<FolForm>,
+	hypStmtOf : (string) -> Maybe<Pair<FolForm, [FolForm]>>,
 	bySkeleton : (string) -> [string], expOf : (string) -> [Pair<string, string>],
 	eqOf : (string) -> [FolForm],
 	isAxiom : (string) -> bool,
@@ -204,6 +230,13 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 				None(): None();
 				Some(st): Some(Pair(c, st));
 			});
+		// cited theorems emitted WITH hypotheses (own-article only — the table
+		// is built from this article's theorems): the hyp-cite channel proves
+		// each substituted hypothesis and supplies the references
+		mizEmitCiteHypsRef := filtermap(cites, \c -> switch (hypStmtOf(c)) {
+			None(): None();
+			Some(ph): Some(Pair(c, ph));
+		});
 		defDrvs = map(mizEmitDefUnfolds(expOf(pos), stepAtoms, stmtOf, shOf, 6), \d -> {
 			r = mizEmitDischarge(d, ctxI, proveGuard);
 			if (getUrlParameterDef("dbg-guard", "") == "1" && r.form != d.form)
@@ -272,6 +305,7 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 			});
 		// `dbg-thm=<name>` traces one theorem's certificate attempts
 		mizEmitDbg := (t.name == getUrlParameterDef("dbg-thm", ""));
+		mizEmitCurThmRef := t.name;
 		mizEmitNFDjRef := [];
 		mizEmitStepLong := false;
 		if (^mizEmitDbg)
@@ -1835,7 +1869,61 @@ mizEmitLadderA(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 								mizEmitInstCiteT(pc.first, pc.second, tp, ^mizEmitShOfRef));
 							concat(varDrvs, termDrvs);
 						}));
-					citeDrvs1 = uniqBy(citeDrvs0, \d2, d3 -> mizEmitKey(d2.form) == mizEmitKey(d3.form));
+					// HYPOTHETICAL CITATION: a theorem emitted with hypotheses is
+					// cited by stating an instance of its proposition; one
+					// reference per substituted hypothesis, discharged from ctx
+					// FACTS (never the assumption), or as t ⊆ t (ssid) / t = t
+					// (eqid). t51_relat_1's hyps = a v1 ctx fact + ssid.
+					if (^mizEmitCiteHypsRef != []) {
+						mizEmitHypCands := ^mizEmitHypCands + 1;
+						if (ctx0 != []) mizEmitHypBump("cand-ctx@" + ^mizEmitCurThmRef);
+					}
+					hypDrvs0 = concatA(map(^mizEmitCiteHypsRef, \ph -> {
+						prop9 = ph.second.first;
+						hs9 = ph.second.second;
+						pvs9 = uniq(folFormVars(prop9));
+						if (pvs9 == []) { mizEmitHypBump("no-free-vars"); []; }
+						else {
+							// substitutions COMPUTED from the hypotheses (ctx matches
+							// + ssid/eqid side-binding); statement variables the
+							// hypotheses leave unbound are filled from the goal pool
+							comps8 = uniqBy(concat(mizEmitCompTerms(goal),
+									switch (asm) { None(): []; Some(af8): mizEmitCompTerms(af8); }),
+								\a2, b2 -> mizEmitTKey(a2) == mizEmitTKey(b2));
+							pool9 : [FolTerm] = concat(map(fvs, \v9 -> FolVar(v9)),
+								if (length(comps8) > 6) subrange(comps8, 0, 6) else comps8);
+							subs9 = mizEmitHypCiteSubs(hs9, pvs9, ctx0);
+							if (subs9 == []) mizEmitHypBump("no-sub-computed");
+							if (^mizEmitDbg)
+								println("  HYPSUBS " + ph.first
+									+ " pvs=" + strGlue(pvs9, ",")
+									+ " subs=" + i2s(length(subs9))
+									+ " hyps: " + strGlue(map(hs9,
+										\h9 -> strGlue(folFormToks(h9), " ")), " ; ")
+									+ " || ctx=" + i2s(length(ctx0)) + " :: "
+									+ strGlue(map(ctx0, \p9 ->
+										strGlue(folFormToks(p9.first), " ")), " ; "));
+							tps0 = concatA(map(subs9, \s9 -> {
+								miss9 = filter(pvs9, \v9 -> !containsKeyTree(s9, v9));
+								if (miss9 == []) [map(pvs9, \v9 ->
+									lookupTreeDef(s9, v9, FolVar(v9)))]
+								else if (length(miss9) > 1) { mizEmitHypBump("unbound-gt-1"); []; }
+								else map(pool9, \w9 -> map(pvs9, \v9 ->
+									if (v9 == miss9[0]) w9
+									else lookupTreeDef(s9, v9, FolVar(v9))));
+							}));
+							tps9 = if (length(tps0) > 24) subrange(tps0, 0, 24) else tps0;
+							filtermap(tps9, \tp ->
+								mizEmitInstCiteH(ph.first, prop9, hs9, pvs9, tp, ctx0));
+						}
+					}));
+					mizEmitHypMade := ^mizEmitHypMade + length(hypDrvs0);
+					if (^mizEmitDbg && ^mizEmitCiteHypsRef != [])
+						println("  CITE-HYP cands=" + i2s(length(^mizEmitCiteHypsRef))
+							+ " made=" + i2s(length(hypDrvs0))
+							+ " :: " + strGlue(map(hypDrvs0, \d9 -> strGlue(folFormToks(d9.form), " ")), " ;; "));
+					citeDrvs1 = uniqBy(concat(citeDrvs0, hypDrvs0),
+						\d2, d3 -> mizEmitKey(d2.form) == mizEmitKey(d3.form));
 					citeDrvs = if (length(citeDrvs1) > 12) subrange(citeDrvs1, 0, 12) else citeDrvs1;
 					// a GUARDED instance (`Relation (X~) → field (X~) = …`) is inert
 					// until its guard is a fact, and the guard's source — a cluster
@@ -2353,6 +2441,153 @@ mizEmitInstCiteT(name : string, stmt : FolForm, ws : [FolTerm],
 			})) {
 			None(): None();
 			Some(dps7): Some(MizEmitDrv(fin.first, ^steps, [], uniq(concat(^dj, dps7))));
+		}
+	}
+}
+
+// The hyp-citation's substitution is COMPUTED from the hypotheses, never
+// enumerated: each hypothesis either matches a ctx fact (binding statement
+// variables), or — for a ⊆/= hypothesis with one side already determined —
+// binds its other side so the instance discharges by ssid/eqid (σ(x7) :=
+// proj1 x26 is the shape that pays on t51_relat_1). Statement variables the
+// hypotheses leave unbound are filled from the goal pool afterwards.
+mizEmitHypCiteSubs(hyps : [FolForm], pvs : [string],
+	ctxI : [Pair<FolForm, RuParseRef>]) -> [Tree<string, FolTerm>] {
+	metas0 = buildSet(pvs);
+	key9 = \s : Tree<string, FolTerm> -> strGlue(map(tree2pairs(s),
+		\p -> p.first + ":" + mizEmitTKey(p.second)), "|");
+	empty9 : Tree<string, FolTerm> = makeTree();
+	fold(hyps, [empty9], \acc : [Tree<string, FolTerm>], h ->
+		uniqBy(concatA(map(acc, \s -> {
+			unbound = fold(pvs, makeSet(), \a9, v9 ->
+				if (containsKeyTree(s, v9)) a9 else insertSet(a9, v9));
+			// a side is DETERMINED when substitution leaves no unbound
+			// statement variable in it (a bound one may land on a citing-side
+			// var of the same name — that is a constant here)
+			ground9 = \t : FolTerm -> {
+				tS = mizEmitSubT(t, s);
+				Pair(tS, forall(mizEmitTermVars(tS), \v9 -> !containsSet(unbound, v9)));
+			};
+			bindEq = \l : FolTerm, r : FolTerm -> {
+				lG = ground9(l); rG = ground9(r);
+				if (lG.second)
+					switch (mizEmitMatchT(r, lG.first, metas0, Some(s))) {
+						None(): []; Some(s2): [s2];
+					}
+				else if (rG.second)
+					switch (mizEmitMatchT(l, rG.first, metas0, Some(s))) {
+						None(): []; Some(s2): [s2];
+					}
+				else [];
+			};
+			ctxOpts = filtermap(ctxI, \p ->
+				switch (mizEmitMatchF(h, p.first, metas0, Some(s))) {
+					None(): None(); Some(s2): Some(s2);
+				});
+			selfOpts = switch (h) {
+				FolPred(nm9, as9): if (nm9 == "⊆" && length(as9) == 2)
+					bindEq(as9[0], as9[1]) else [];
+				FolEq(l9, r9): bindEq(l9, r9);
+				default: [];
+			};
+			if (^mizEmitDbg)
+				println("    HYPSUB-H rawvars=" + strGlue(mizFormAllVars(h), ",")
+					+ " metas=" + strGlue(pvs, ",")
+					+ " ctxOpts=" + i2s(length(ctxOpts))
+					+ " selfOpts=" + i2s(length(selfOpts))
+					+ " s={" + key9(s) + "}"
+					+ " ctxraw: " + strGlue(map(ctxI,
+						\p9 -> strGlue(mizFormAllVars(p9.first), ",")), " ; "));
+			concat(ctxOpts, selfOpts);
+		})), \a, b -> key9(a) == key9(b)));
+}
+
+// HYPOTHETICAL CITATION: a theorem emitted WITH hypotheses is cited by
+// stating an instance of its proposition (Russell substitutes when the step
+// names the theorem) and supplying one reference per substituted hypothesis.
+// Discharge kinds, in order: a ctx FACT with the hypothesis's key (never the
+// assumption — under deduction the reference cannot reach it), `t ⊆ t` by
+// ssid, `t = t` by eqid; any other hypothesis declines the citation.
+// `pvs` are the proposition's free variables, `ws` the witness per variable.
+mizEmitInstCiteH(name : string, prop : FolForm, hyps : [FolForm],
+	pvs : [string], ws : [FolTerm],
+	ctxI : [Pair<FolForm, RuParseRef>]) -> Maybe<MizEmitDrv> {
+	// Unlike the spv/spcgv elimination chains, this citation is one stated
+	// instance Russell matches against the open proposition — first-order
+	// matching is unique, so a witness may share a FREE variable's name.
+	// Only a collision with a BOUND variable is capture (the substitution
+	// would change the instance's meaning and the verifier refuses it).
+	freeL = buildSet(map(concat(pvs, concatA(map(hyps, folFormVars))), toLowerCase));
+	boundL = fold(map(concat(mizFormAllVars(prop),
+		concatA(map(hyps, mizFormAllVars))), toLowerCase), makeSet(),
+		\ac9, v9 -> if (containsSet(freeL, v9)) ac9 else insertSet(ac9, v9));
+	// a hypothesis variable outside the proposition's own is unconstrained by
+	// the stated instance — decline
+	hypVarsIn = forall(uniq(concatA(map(hyps, folFormVars))), \v -> contains(pvs, v));
+	noCapture = forall(ws, \w -> forall(mizEmitTermVars(w),
+		\v -> !containsSet(boundL, toLowerCase(v))));
+	ok = length(pvs) == length(ws) && hypVarsIn && noCapture;
+	if (!ok) {
+		mizEmitHypBump(if (!hypVarsIn) "hyp-var-outside-prop"
+			else if (!noCapture) "capture" else "arity-mismatch");
+		None();
+	}
+	else {
+		sub = pairs2tree(mapi(pvs, \i, v -> Pair(v, ws[i])));
+		inst = mizEmitSubF(prop, sub);
+		steps : ref [FolPStep] = ref [];
+		refs : ref [RuParseRef] = ref [];
+		hrefs : Maybe<[FolPRef]> = fold(hyps, Some([]),
+			\acc : Maybe<[FolPRef]>, h0 -> switch (acc) {
+				None(): None();
+				Some(rs): {
+					h = mizEmitSubF(h0, sub);
+					hk = mizEmitKey(h);
+					switch (find(ctxI, \p -> mizEmitKey(p.first) == hk)) {
+						Some(p): {
+							refs := arrayPush(^refs, p.second);
+							Some(arrayPush(rs, FolPRefFact(length(^refs) - 1)));
+						}
+						None(): {
+							lem = switch (h) {
+								FolPred(pn9, as9): if (pn9 == "⊆" && length(as9) == 2
+									&& mizEmitTKey(as9[0]) == mizEmitTKey(as9[1])) "ssid" else "";
+								FolEq(l9, r9): if (mizEmitTKey(l9) == mizEmitTKey(r9)) "eqid" else "";
+								default: "";
+							};
+							if (lem == "") {
+								mizEmitHypBump("undis" + (if (ctxI == []) "-emptyctx" else "")
+									+ ":" + mizEmitSkeleton(h));
+								if (^mizEmitDbg && ctxI != [])
+									println("    HYP-UNDIS " + name
+										+ " hyp: " + strGlue(folFormToks(h), " ")
+										+ " || ctx: " + strGlue(map(ctxI,
+											\p9 -> strGlue(folFormToks(p9.first), " ")), " ; "));
+								None();
+							}
+							else {
+								steps := arrayPush(^steps, FolPStep(h, lem, []));
+								Some(arrayPush(rs, FolPRefStep(length(^steps) - 1)));
+							}
+						}
+					}
+				}
+			});
+		switch (hrefs) {
+			None(): None();
+			Some(rs): switch (mizEmitMapThmDisjs(name, \g7 -> {
+					gl = toLowerCase(g7);
+					foldi(pvs, None(), \i7, ac7 : Maybe<FolTerm>, v7 ->
+						if (isSome(ac7)) ac7
+						else if (toLowerCase(v7) == gl) Some(ws[i7]) else None());
+				})) {
+				None(): { mizEmitHypBump("disjs-decline"); None(); }
+				Some(dps): {
+					mizEmitHypBump("built");
+					steps := arrayPush(^steps, FolPStep(inst, name, rs));
+					Some(MizEmitDrv(inst, ^steps, ^refs, uniq(dps)));
+				}
+			}
 		}
 	}
 }

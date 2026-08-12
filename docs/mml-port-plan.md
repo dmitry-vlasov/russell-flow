@@ -1456,3 +1456,52 @@ Standing instruction: every plan and implementation decision is to be
 made with the tactic destination in mind — prefer machinery that can be
 called goal-wise later (the emit.flow completer already qualifies), and
 never present a prover-free pipeline as the project's end state.
+
+### 2026-08-12 (late) — HYPOTHETICAL CITATION BUILT: neutral at 194; the two walls named
+
+*Done (@HEAD, verify green on the whole 8-article chain, closures exactly
+1/3/75/65/27/0/0/23 = 194)*: blocker (b) is implemented end to end —
+`mizEmitInstCiteH` (emit.flow) cites a theorem emitted WITH hypotheses by
+stating an instance of its proposition and supplying one reference per
+substituted hypothesis (ctx fact by key / `t ⊆ t` by ssid / `t = t` by
+eqid); own-article table `hypThmTbl` (comms.flow), free variables
+normalized to rendered names; declared disjointedness mapped through the
+substitution. The substitution is COMPUTED, never enumerated
+(`mizEmitHypCiteSubs`): each hypothesis either matches a ctx fact
+(binding statement variables) or — for a ⊆/= hypothesis with one side
+determined — binds its other side so it discharges by ssid/eqid
+(σ(x7) := proj1 x26 on t51). Blind tuple enumeration was measured dead
+first: cap 8 starved the compound witnesses, cap 64 still built 0.
+
+*Two transcription traps burned again (both already in the scar list)*:
+(1) `folFormVars` LOWERCASES through the renderer — as rename-map keys
+its output silently no-ops (added `mizFormFreeVars`, raw AST names);
+(2) a hypothesis carries AST-case binders ("X26") while the prop's
+rendered vars are "x26" — the table entries are now normalized once.
+
+*Why it is NEUTRAL (both walls measured, article census in the gate
+logs)*: (a) POPULATION — only steps citing an OWN-ARTICLE hypothetical
+theorem can fire at all, and on the gate set that is relat_1 (130
+stages, 100 instances built), xtuple_0 (75/21), zfmisc_1 (21/0),
+nothing else; most of those stages are whole-∀ fallbacks where the
+theorem's antecedent lives in the certificate's ASSUMPTION, and a
+citation reference can never reach it — a Russell citation needs |-
+refs, and there is no meta-level deduction to curry a hypothesis away.
+(b) RESIDUE — where instances DO fire (t56/t187_relat_1: the t51
+instance at the computed witness is built and offered), the step still
+fails on the d8_relat_1 composition-membership matrix (∃-bodied
+definition at compound k3 terms, GDEF-DECLINE) — the known relat_1
+∃-wall, orthogonal to citation.
+
+*The structural question this leaves (for the user)*: the 49 relat_1
+theorems emitted in hypothetical form are uncitable exactly where they
+are needed most (under deduction). Emitting them ∀-CLOSED with
+implications instead of hypotheses would make the NORMAL citation
+channels serve them everywhere (the certificate chains implications
+propositionally) — but that reopens the theorem-shape unit for every
+hypothetical theorem and its citers. Worth deciding before more
+citation machinery.
+
+Diagnostics added (census + dbg-thm gated): `hypothetical citations:`
+census line with decline buckets (no-sub-computed / undis:skeleton /
+disjs-decline / cand-ctx@thm), HYPSUBS / HYPSUB-H / HYP-UNDIS traces.
