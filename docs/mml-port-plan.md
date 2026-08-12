@@ -1343,3 +1343,19 @@ theorem above 1 MB left in it.
 are added when a census names a shape; the matching and bridge machinery
 is shape-independent. The day's arc: 181 → 191 theorems; zfmisc_1.ru
 58 → 18.3 MB, xboole_1.ru 41 → 30 MB, relat_1.ru 26.7 → 2.2 MB.
+
+### 2026-08-12 (evening) — ABSORPTION + IFF-OPENING: xboole_1 30 → 18.3 MB
+
+*Done (@HEAD, verify + MM green, proved == closed = 191, floors held)*:
+the xboole_1 census named two DNF-walk gaps and both closed. ABSORPTION:
+mizEmitOrPrune drops a conjunct whose atom set strictly contains
+another's and bridges the pruned tree by two implication proofs (orc/olc
+injections, simpl/simpr/jca projections onto the absorber, jaoi folds,
+impbii) — t25's lattice identity collapses. IFF-OPENING: dfbi3 opens a
+biconditional into its two-case DNF, xor3 turns a negated one first —
+the shape the △ membership unfold leaves (t102 collapses). The join
+retries pruned forms when the raw DNFs differ; step cap 1200.
+
+*Remaining xboole_1 tail*: t32 (2.5 MB, `X∖Y = Y∖X ⊢ X = Y`) and
+~1 MB friends — hypothesis-driven reasoning, not identities; a
+different family for a later read.
