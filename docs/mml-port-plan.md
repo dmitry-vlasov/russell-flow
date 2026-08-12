@@ -1253,3 +1253,37 @@ enumset1 65/87, zfmisc 26/140, subset_1 0/53, xtuple_0 0/46, relat_1
 13/179). Next: the same citation treatment for the remaining heavy
 families (relat_1's export is still 600+ MB — its certificates are the
 next census target), then the S-C type layer for subset_1.
+
+### 2026-08-12 — THE SUBSET CLOSURE: relat_1's mass falls, 181 → 189
+
+*The census (@c866ad19)*: three relat_1 theorems (t8/t68/t94) carried
+89% of the article's 26.7 MB — each a ~2,780-step G3cp refutation whose
+content is a small ⊆-chain (`X ⊆ proj1 X ×. proj2 X`, ×.-monotonicity,
+intersection absorption). 64% of all steps were syl/mpd/simpl/simpr
+context lifts.
+
+*Done*: mizEmitSsChain — a directed subset closure next to the eq-chain.
+Edges: the candidate pool's ⊆ atoms (through conjunction PIECES and one
+guard), the structural inclusions (inss1/inss2/difss/ssun1/ssun2), and
+the equation closure (piece-buried equations join as kind-3 edges).
+Composition sstri/sseqtri/eqsstri on a BFS over eq-classes;
+introduction ssin/unss on the compound side; an equation goal is
+antisymmetry (eqssi). Full deduction twins (d-forms, jca, sylib, a1i
+lifts); the ASSUMPTION's conjuncts are piece sources; and
+mizEqcProveG projects a guard that is a conjunct of the assumption
+(id + simpld/simprd) — the plain chain closed t94/t68 but the ONELEFT
+imp(v1_relat_1,…) family's guards are asm conjuncts, and eq/ss edges
+never materialized until the guard machinery saw them (relat_1 14 → 20
+came from THAT one fix, not from more edges).
+
+*Measured, all Metamath-gated (proved == closed = 189)*: xboole_1
+73 → 74, relat_1 13 → 20, all other floors held. relat_1.ru 26.7 MB →
+2.2 MB; its MM export 600+ MB → 193 MB — the residual mass is the
+DEPENDENCY articles' certificates (zfmisc_1.ru 58 MB, xboole_1.ru
+41 MB), which are now the census target.
+
+*Standing*: honest gate set 189 (tarski 1/3, xb0 3/8, xb1 74/116,
+enumset1 65/87, zfmisc 26/140, subset_1 0/53, xtuple_0 0/46, relat_1
+20/179). Next: census zfmisc_1/xboole_1 the same way (their heavy
+certificates hold the remaining export mass); the relat_1 open set
+(155 one-step-short) for what the chain still lacks; then S-C.
