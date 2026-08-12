@@ -1,8 +1,39 @@
 # Porting the MML — the general plan
 
-The goal is the whole Mizar Mathematical Library in Russell, with real proofs
-that the original Metamath checker verifies. This document fixes the method,
-the order of work, the metrics, and a running log of what actually happened.
+## 0. The ultimate goal, and what this plan is inside it
+
+**(User-set 2026-08-12.)** The final destination of the Mizar port is not a
+translated corpus — it is Mizar's proving machinery made USABLE inside
+Russell: a compositional `by_mizar(assertion_1, assertion_2, …)` tactic
+that closes a goal wherever the Mizar foundations are imported. Made
+compositional, it can then be altered and extended with abilities the
+original Mizar does not have. The same scheme is intended to extend to
+other proof assistants (lean4, coq): extract the theory structure with
+proof gaps attributed to tactics, run the prover, close the gaps — with
+the ultimate aim of embedding the power of the modern proof assistants
+into Russell and COMBINING them in one proof.
+
+**The present campaign's place in that:** it answers the first, blocking
+question — is the Mizar translation feasible at all, with acceptable
+proof sizes? Everything it builds is a component of the tactic-to-be:
+the ported checker is the decision core, the record→proof machinery in
+emit.flow is the completer, the foundation + A-map is the theory bridge.
+What the tactic adds later — the GOAL-WISE invocation (a Russell goal +
+cited premises translated back into the checker's input structures, run
+in memory) — is deliberately deferred; do not start it until the
+feasibility question is settled.
+
+Terminology note, after a costly misunderstanding: in this project
+"replay" means TACTIC-side template replay (a given tree guiding PVT
+expansion). The derivation-driven emission below is called the RECORD
+route, and it does not exclude the prover from the project's future.
+
+---
+
+The near goal is the whole Mizar Mathematical Library in Russell, with real
+proofs that the original Metamath checker verifies. This document fixes the
+method, the order of work, the metrics, and a running log of what actually
+happened.
 
 ---
 
@@ -1407,3 +1438,21 @@ their proofs) — the recorded next lever. to_mm already runs 3-wide.
 (hyps = own antecedents) are outside the citable table; citing one
 means proving each substituted hypothesis (ctx fact / ssid / eqid) as
 refs. The remaining v1→eq/⊆ family members that still fail want it.
+
+### 2026-08-12 (end of day) — THE GOAL CORRECTED; prioritization fixed
+
+The 2026-08-07 "full replay" decision was a MISUNDERSTANDING, discovered
+and resolved today: the user read "replay" in this project's established
+tactics sense (template-guided PVT expansion) and did not notice the
+"no tactic battery at all" clause; the intent was never to exclude the
+prover from the port. The actual goal is the compositional `by_mizar`
+tactic (section 0 above; memory: by-mizar-tactic-goal). Prioritization
+as set by the user:
+1. FIRST: settle feasibility — the Mizar translation with acceptable
+   proof sizes. The current roadmap (S-B units, size campaign, S-C)
+   continues unchanged as this feasibility test.
+2. LATER: the goal-wise invocation (by_mizar v0). Not to be pushed now.
+Standing instruction: every plan and implementation decision is to be
+made with the tactic destination in mind — prefer machinery that can be
+called goal-wise later (the emit.flow completer already qualifies), and
+never present a prover-free pipeline as the project's end state.
