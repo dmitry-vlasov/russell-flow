@@ -1505,3 +1505,44 @@ citation machinery.
 Diagnostics added (census + dbg-thm gated): `hypothetical citations:`
 census line with decline buckets (no-sub-computed / undis:skeleton /
 disjs-decline / cand-ctx@thm), HYPSUBS / HYPSUB-H / HYP-UNDIS traces.
+
+### 2026-08-12 (night) — IMPLICATION FORM: 194 → 195; rule-form theorems retired
+
+*The user's analysis drove this unit*: a rule with premises applies by
+direct substitution (no quantifier peeling) but its premises need
+PROOFS, which an assumption is not; the free-variable implication form
+loses nothing at application time and works under assumptions too; the
+internal conversion implication → rule is trivial while the reverse is
+the deduction meta-theorem. So the implication form is the SOURCE form.
+
+*Done (verify + MM green, proved == closed = 195: tarski 2/3, xb0 3/8,
+xb1 75/116, enumset1 65/87, zfmisc 27/140, subset_1 0/53, xtuple_0
+0/46, relat_1 23/179)*: theorems previously emitted as rules with
+premises now state `antecedents → matrix` over free variables (Mizar's
+sentence without the ∀ prefix); every skeleton step carries the same
+antecedent prefix, so the last step IS the statement (miz2ru.flow, the
+honest-hypothetical branch). hypThmTbl and the hyp-cite channel are now
+idle on the gate set (kept: general machinery, MML-wide articles may
+still produce rule forms via the `closed` branch).
+
+*The reshape cost 4 theorems on first cut (t16/t68/t94_relat_1,
+t2_xboole_0 — all reshaped, diffed by closed-list A/B against the old
+jar) and each named a missing DEDUCTION TWIN; both were built and the
+twin table grows two rows*:
+ 1. ∀-ASSUMPTION INSTANTIATION (asmDrvs in mizEmitLadderA): a
+    quantified antecedent was one opaque atom; its instances now arrive
+    as implications `asm → φ(t)` (mizEmitInstImp: sp / spcgv+sethood),
+    witnesses = stage free variables + goal compound subterms. This
+    also closed t2_tarski (extensionality) — never closed before.
+ 2. MULTI-GUARD PIECE DISCHARGE (mizSscWalk / mizSscPieceH): the
+    subset-chain's piece walk peeled ONE guard; a rule-form record fact
+    keeps TWO under an assumption (`proj2⊆ → (proj1⊆ → ∪⊆)` on t16).
+    The walk now stacks provable guards and the discharge loops —
+    first from the plain candidate (syl / ax-mp), later ones from the
+    wrapped result (mpd / ax-mp). This also restored t68/t94 BELOW the
+    size cap: the chain builds the short structural proofs where the
+    tableau's had blown past 600 steps.
+
+*A/B protocol note*: closed-theorem LISTS (not counts) decided this —
+extractor over the emitted articles (open step marker `= ?`), old jar
+from git for the baseline run. Counts alone would have hidden a swap.
