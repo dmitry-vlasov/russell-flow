@@ -1772,8 +1772,19 @@ mizEmitLadderA(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 					// equations — not selected: the flat cut is structurally too
 					// small for the equalizer family (t21_relat_1, measured 4x)
 					chainR = switch (goal) {
-						FolEq(__, __): mizEmitEqChain(ctx0, goal, asm,
-							concatA([drv, citeDrvs, gdOf(citeDrvs)]));
+						FolEq(__, __): {
+							drvC = concatA([drv, citeDrvs, gdOf(citeDrvs)]);
+							r9 = mizEmitEqChain(ctx0, goal, asm, drvC);
+							switch (r9) {
+								Some(__): r9;
+								// antisymmetry: the two inclusion chains (eqssi)
+								None(): mizEmitSsChain(ctx0, goal, asm, drvC);
+							}
+						}
+						FolPred(gn9, ga9): if (gn9 == "⊆" && length(ga9) == 2)
+							mizEmitSsChain(ctx0, goal, asm,
+								concatA([drv, citeDrvs, gdOf(citeDrvs)]))
+							else None();
 						default: None();
 					};
 					r3 = if (isSome(chainR)) Pair(chainR, false)
@@ -3385,6 +3396,11 @@ MizEqCand(form : FolForm, drv : int, fact : int);
 // equalities are provable using edges of strictly earlier rounds only (the
 // termination measure of the extraction)
 MizEqEdge(a : int, b : int, round : int, kind : int, cand : int);
+// a ⊆/= atom reached INSIDE a candidate: through at most one guard (discharged
+// via the pool) and a simpl/simpr piece path — the subset closure's edges live
+// in conjunctions the payload reader cannot see (a previous step concludes
+// `(A ⊆ B) ∧ (C = D)` as one fact)
+MizSsPiece(cand : int, guard : Maybe<FolForm>, ops : [string]);
 MizEqChainEnv(
 	ph : Maybe<FolForm>, phKey : string,
 	cands : [MizEqCand],
@@ -3400,7 +3416,10 @@ MizEqChainEnv(
 	djs : ref [Pair<string, string>],
 	candH : ref Tree<int, FolPRef>,
 	guardH : ref Tree<string, FolPRef>,
-	eqH : ref Tree<string, FolPRef>);
+	eqH : ref Tree<string, FolPRef>,
+	// piece-derived equations for kind-3 edges (index = the edge's cand field);
+	// empty for the plain equation chain
+	pieces : [MizSsPiece]);
 
 mizEqcCommLemma(fn : string) -> string {
 	if (fn == "∪") "uncom" else if (fn == "∩") "incom"
@@ -3530,14 +3549,62 @@ mizEqcCandH(env : MizEqChainEnv, ci : int) -> FolPRef {
 	}
 }
 
+// the simpld/simprd path to a CONJUNCT of a form (the assumption is often a
+// conjunction — `(v1 X ∧ A ⊆ B) → goal` — and its conjuncts are the guards
+// the candidates ask for)
+mizEqcConjPath(f : FolForm, gk : string, ops : [string], depth : int) -> Maybe<[string]> {
+	if (mizEmitKey(f) == gk) Some(ops)
+	else if (depth <= 0) None()
+	else switch (f) {
+		FolBin(op, l, r): if (op != "and") None()
+			else switch (mizEqcConjPath(l, gk, arrayPush(ops, "simpld"), depth - 1)) {
+				Some(p): Some(p);
+				None(): mizEqcConjPath(r, gk, arrayPush(ops, "simprd"), depth - 1);
+			}
+		default: None();
+	}
+}
+
+mizEqcConjKeys(f : FolForm, depth : int) -> [string] {
+	self = [mizEmitKey(f)];
+	if (depth <= 0) self
+	else switch (f) {
+		FolBin(op, l, r): if (op != "and") self
+			else concat(self, concat(mizEqcConjKeys(l, depth - 1),
+				mizEqcConjKeys(r, depth - 1)));
+		default: self;
+	}
+}
+
 // discharge a guard: a step proving `ph → g` (deduction mode) / `g`
-// (inference mode), through the candidate pool
+// (inference mode), through the candidate pool; in deduction mode a guard
+// that is a CONJUNCT of the assumption is projected out (id + simpld/simprd)
 mizEqcProveG(env : MizEqChainEnv, g : FolForm, depth : int) -> Maybe<FolPRef> {
 	gk = mizEmitKey(g);
 	switch (lookupTree(^(env.guardH), gk)) {
 		Some(h): Some(h);
 		None(): if (depth <= 0) None() else {
-			r = if (isSome(env.ph) && gk == env.phKey)
+			conjR = switch (env.ph) {
+				None(): None();
+				Some(af): if (gk == env.phKey) None()
+					else switch (mizEqcConjPath(af, gk, [], 2)) {
+						None(): None();
+						Some(ops): {
+							h0 = mizEqcEmit(env, mizEqcMkD(env, af), "id", []);
+							fin = fold(ops, Pair(af, h0), \st, op -> switch (st.first) {
+								FolBin(__, l9, r9): {
+									side = if (op == "simpld") l9 else r9;
+									Pair(side, mizEqcEmit(env, mizEqcMkD(env, side), op,
+										[st.second]));
+								}
+								default: st;
+							});
+							if (fin.first == g) Some(fin.second) else None();
+						}
+					}
+			};
+			r = if (isSome(conjR)) conjR
+			else if (isSome(env.ph) && gk == env.phKey)
 				Some(mizEqcEmit(env, mizEqcMkD(env, g), "id", []))
 			else {
 				direct = foldi(env.cands, None(), \ci, ac : Maybe<FolPRef>, c ->
@@ -3630,6 +3697,21 @@ mizEqcEdgeStep(env : MizEqChainEnv, e : MizEqEdge, from : int) -> Maybe<FolPRef>
 		switch (env.ph) {
 			None(): Some(h);
 			Some(__): Some(mizEqcEmit(env, mizEqcMkD(env, FolEq(tf, tt)), "a1i", [h]));
+		}
+	} else if (e.kind == 3) {
+		// a piece-derived equation (inside a conjunction, under a guard):
+		// discharged on demand, re-oriented by eqcomi/eqcomd when the path
+		// runs it backwards. Only the subset chain's env carries these.
+		switch (mizSscPieceH(env, env.pieces[e.cand])) {
+			None(): None();
+			Some(pp): switch (pp.first) {
+				FolEq(l3, __): {
+					if (mizEmitTKey(l3) == mizEmitTKey(tf)) Some(pp.second)
+					else Some(mizEqcEmit(env, mizEqcMkD(env, FolEq(tf, tt)),
+						if (isSome(env.ph)) "eqcomd" else "eqcomi", [pp.second]));
+				}
+				default: None();
+			}
 		}
 	} else {
 		// congruence: rewrite each differing slot in turn, chaining by eqtrd/eqtri
@@ -3800,10 +3882,14 @@ mizEmitEqChain(ctx : [Pair<FolForm, RuParseRef>], goal : FolForm,
 			cands = concat(
 				mapi(ctx, \j, p -> MizEqCand(p.first, -1, j)),
 				mapi(drvs, \j, d -> MizEqCand(d.form, j, -1)));
-			// forms reachable as guards: the assumption, every candidate form,
-			// and the closure over singly-guarded candidate implications
-			seed0 = fold(cands, if (phKey == "") makeSet() else makeSet1(phKey),
-				\ac, c -> insertSet(ac, mizEmitKey(c.form)));
+			// forms reachable as guards: the assumption AND ITS CONJUNCTS,
+			// every candidate form, and the closure over singly-guarded
+			// candidate implications
+			seedA = switch (asm) {
+				None(): makeSet();
+				Some(af): buildSet(mizEqcConjKeys(af, 2));
+			};
+			seed0 = fold(cands, seedA, \ac, c -> insertSet(ac, mizEmitKey(c.form)));
 			provable = mizEqcGuardFix(cands, seed0);
 			// edges from candidate payloads whose guard is dischargeable
 			payloads = filtermap(mapi(cands, \ci, c -> Pair(ci, mizEqcPayload(c.form))),
@@ -3863,7 +3949,7 @@ mizEmitEqChain(ctx : [Pair<FolForm, RuParseRef>], goal : FolForm,
 							e.b, arrayPush(lookupTreeDef(ac, e.b, []), ei)));
 					env = MizEqChainEnv(asm, phKey, cands, drvs, ctx, provable,
 						^uni, terms, ^edges, adj,
-						ref [], ref [], ref [], ref makeTree(), ref makeTree(), ref makeTree());
+						ref [], ref [], ref [], ref makeTree(), ref makeTree(), ref makeTree(), []);
 					switch (mizEqcProveEq(env, gi, gj, 1000000000)) {
 						None(): {
 							if (^mizEmitDbg) println("  EQCHAIN extract-fail");
@@ -3895,6 +3981,546 @@ mizEmitEqChain(ctx : [Pair<FolForm, RuParseRef>], goal : FolForm,
 			}
 		}
 		default: None();
+	}
+}
+
+// ---- THE SUBSET CLOSURE: ⊆ and = goals as citation chains ----
+// relat_1's three heaviest certificates (t8/t68/t94, 89% of the article's
+// emitted mass) refute a ~15-fact residue whose mathematical content is a
+// small ⊆-chain: `X ⊆ proj1 X ×. proj2 X`, monotonicity of ×., intersection
+// absorption. The flat certificate restates the branch context in every
+// lift step; the chain CITES the foundation instead: composition by
+// sstri/sseqtri/eqsstri over a directed graph whose edges are the candidate
+// pool's ⊆ atoms (through conjunction pieces and one guard), the structural
+// inclusions (inss1/inss2/difss/ssun1/ssun2), and the equation closure the
+// eq-chain already maintains (an eq edge bridges two ⊆ hops). Introduction
+// on the compound side is ssin (∩ on the right) / unss (∪ on the left), and
+// an equation goal is antisymmetry (eqssi) of two chains. Plain mode only —
+// under an assumption the chain declines (the deduction twins are mechanical
+// but unpaid until a trace asks for them).
+
+// one directed ⊆ edge over the term universe: kind 0 = a candidate atom
+// (atom = its index), kind 1 = a structural inclusion cited directly
+MizSsEdge(a : int, b : int, kind : int, atom : int, lemma : string);
+MizSsAtom(from : FolTerm, to : FolTerm, piece : MizSsPiece);
+MizSsEnv(eq : MizEqChainEnv,
+	atoms : [MizSsAtom],
+	edges : [MizSsEdge],
+	adj : Tree<int, [int]>,          // edge indices by CLASS root of the source
+	classOf : Tree<int, int>,        // term index -> union-find root
+	members : Tree<int, [int]>,      // class root -> term indices
+	atomH : ref Tree<int, FolPRef>,
+	ssH : ref Tree<string, FolPRef>,
+	busy : ref Set<string>);
+
+// the ⊆ / piece-eq atoms reachable inside one candidate form: through at most
+// one top-level guard (must be dischargeable) and a simpl/simpr piece path.
+// A bare or top-guarded equation is NOT collected — the payload reader
+// already turns those into edges; only equations under a piece path are new.
+mizSscWalk(f : FolForm, guard : Maybe<FolForm>, ops : [string], depth : int,
+	provable : Set<string>) -> [Triple<FolForm, Maybe<FolForm>, [string]>] {
+	switch (f) {
+		FolPred(n, args): if (n == "⊆" && length(args) == 2)
+			[Triple(f, guard, ops)] else [];
+		FolEq(__, __): if (ops == []) [] else [Triple(f, guard, ops)];
+		FolBin(op, l, r):
+			if (op == "and" && depth > 0)
+				concat(mizSscWalk(l, guard, arrayPush(ops, "simpl"), depth - 1, provable),
+					mizSscWalk(r, guard, arrayPush(ops, "simpr"), depth - 1, provable))
+			else if (op == "imp" && isNone(guard) && ops == []
+					&& containsSet(provable, mizEmitKey(l)))
+				mizSscWalk(r, Some(l), ops, depth, provable)
+			else [];
+		default: [];
+	}
+}
+
+// discharge a piece: the candidate's own handle (the ASSUMPTION itself when
+// cand < 0), the guard through the pool, then the simpl/simpr path — returns
+// the reached PLAIN form and the step proving it (mkD-wrapped in deduction
+// mode: the handle proves `ph → form` and the path steps are the d-twins)
+mizSscPieceH(env : MizEqChainEnv, p : MizSsPiece) -> Maybe<Pair<FolForm, FolPRef>> {
+	base : Maybe<Pair<FolForm, FolPRef>> = if (p.cand < 0) {
+		// the assumption as a piece source (deduction mode only)
+		switch (env.ph) {
+			None(): None();
+			Some(af): Some(Pair(af, mizEqcEmit(env, mizEqcMkD(env, af), "id", [])));
+		}
+	} else {
+		c = env.cands[p.cand];
+		switch (p.guard) {
+			None(): switch (env.ph) {
+				None(): Some(Pair(c.form, mizEqcCandH(env, p.cand)));
+				Some(__): Some(Pair(c.form, mizEqcEmit(env, mizEqcMkD(env, c.form),
+					"a1i", [mizEqcCandH(env, p.cand)])));
+			}
+			Some(g): {
+				body = switch (c.form) {
+					FolBin(op9, __, r9): r9;
+					default: c.form;
+				};
+				if (isSome(env.ph) && mizEmitKey(g) == env.phKey)
+					// the candidate IS `ph → body`
+					Some(Pair(body, mizEqcCandH(env, p.cand)))
+				else switch (mizEqcProveG(env, g, 6)) {
+					None(): None();
+					Some(hg): {
+						hc = mizEqcCandH(env, p.cand);
+						switch (env.ph) {
+							None(): Some(Pair(body, mizEqcEmit(env, body, "ax-mp", [hg, hc])));
+							Some(__): Some(Pair(body, mizEqcEmit(env, mizEqcMkD(env, body),
+								"syl", [hg, hc])));
+						}
+					}
+				}
+			}
+		}
+	};
+	fold(p.ops, base, \acc : Maybe<Pair<FolForm, FolPRef>>, op ->
+		switch (acc) {
+			None(): None();
+			Some(st): switch (st.first) {
+				FolBin(bop, l, r): if (bop != "and") None()
+					else {
+						side = if (op == "simpl") l else r;
+						switch (env.ph) {
+							None(): {
+								im = mizEqcEmit(env, FolBin("imp", st.first, side), op, []);
+								Some(Pair(side, mizEqcEmit(env, side, "ax-mp", [st.second, im])));
+							}
+							Some(__): Some(Pair(side, mizEqcEmit(env, mizEqcMkD(env, side),
+								op + "d", [st.second])));
+						}
+					}
+				default: None();
+			}
+		});
+}
+
+mizSscSsF(env : MizEqChainEnv, a : int, b : int) -> FolForm {
+	FolPred("⊆", [env.terms[a], env.terms[b]]);
+}
+
+mizSscCls(senv : MizSsEnv, i : int) -> int {
+	lookupTreeDef(senv.classOf, i, i);
+}
+
+// a step proving |- T(e.a) ⊆ T(e.b) (mkD-wrapped in deduction mode) for one edge
+mizSscEdgeH(senv : MizSsEnv, e : MizSsEdge) -> Maybe<FolPRef> {
+	env = senv.eq;
+	if (e.kind == 1) {
+		h0 = mizEqcEmit(env, mizSscSsF(env, e.a, e.b), e.lemma, []);
+		switch (env.ph) {
+			None(): Some(h0);
+			Some(__): Some(mizEqcEmit(env, mizEqcMkD(env, mizSscSsF(env, e.a, e.b)),
+				"a1i", [h0]));
+		}
+	}
+	else switch (lookupTree(^(senv.atomH), e.atom)) {
+		Some(h): Some(h);
+		None(): switch (mizSscPieceH(env, senv.atoms[e.atom].piece)) {
+			None(): None();
+			Some(pr): {
+				senv.atomH := setTree(^(senv.atomH), e.atom, pr.second);
+				Some(pr.second);
+			}
+		}
+	}
+}
+
+// BFS over the class graph; returns the edge-index path in order
+mizSscPath(senv : MizSsEnv, cu : int, cv : int) -> Maybe<[int]> {
+	state : ref Pair<[int], Tree<int, Pair<int, int>>> = ref Pair([cu], makeTree());
+	found : ref bool = ref false;
+	iter(enumFromTo(0, length(senv.eq.terms) * 4), \__ -> {
+		q = ^state;
+		if (!^found && q.first != []) {
+			cur = q.first[0];
+			rest = tail(q.first);
+			nq = fold(lookupTreeDef(senv.adj, cur, []), Pair(rest, q.second),
+				\acc : Pair<[int], Tree<int, Pair<int, int>>>, ei -> {
+				e = senv.edges[ei];
+				nxt = mizSscCls(senv, e.b);
+				if (containsKeyTree(acc.second, nxt) || nxt == cu) acc
+				else {
+					if (nxt == cv) found := true;
+					Pair(arrayPush(acc.first, nxt), setTree(acc.second, nxt, Pair(cur, ei)));
+				}
+			});
+			state := nq;
+		}
+	});
+	if (!^found) None() else {
+		path : ref [int] = ref [];
+		cur : ref int = ref cv;
+		ok : ref bool = ref true;
+		iter(enumFromTo(0, length(senv.eq.terms)), \__ -> {
+			if (^ok && ^cur != cu) {
+				switch (lookupTree((^state).second, ^cur)) {
+					None(): ok := false;
+					Some(pv): {
+						path := arrayPush(^path, pv.second);
+						cur := pv.first;
+					}
+				}
+			}
+		});
+		if (!^ok) None() else Some(reverseA(^path));
+	}
+}
+
+// fold the path into one chain `T(u) ⊆ T(v)`: eq bridges by sseqtri/eqsstri
+// (their d-twins under an assumption), composition by sstri/sstrd; a failed
+// edge or bridge ABORTS (the eq-chain's law)
+mizSscExtract(senv : MizSsEnv, u : int, v : int, path : [int]) -> Maybe<FolPRef> {
+	env = senv.eq;
+	big = 1000000000;
+	d = isSome(env.ph);
+	emitD = \f : FolForm, lem : string, refs : [FolPRef] ->
+		mizEqcEmit(env, mizEqcMkD(env, f), if (d) lem + "d" else lem + "i", refs);
+	fin = fold(path, Some(Pair(None(), u)),
+		\acc : Maybe<Pair<Maybe<FolPRef>, int>>, ei -> switch (acc) {
+		None(): None();
+		Some(st): {
+			e = senv.edges[ei];
+			switch (mizSscEdgeH(senv, e)) {
+				None(): None();
+				Some(hE): {
+					cur = st.second;
+					switch (st.first) {
+						None():
+							if (cur == e.a) Some(Pair(Some(hE), e.b))
+							else switch (mizEqcProveEq(env, cur, e.a, big)) {
+								None(): None();
+								Some(he): Some(Pair(Some(emitD(
+									mizSscSsF(env, cur, e.b), "eqsstr", [he, hE])), e.b));
+							}
+						Some(h0): {
+							h1 = if (cur == e.a) Some(h0)
+								else switch (mizEqcProveEq(env, cur, e.a, big)) {
+									None(): None();
+									Some(he): Some(emitD(
+										mizSscSsF(env, u, e.a), "sseqtr", [h0, he]));
+								};
+							switch (h1) {
+								None(): None();
+								Some(h2): Some(Pair(Some(emitD(
+									mizSscSsF(env, u, e.b), "sstr", [h2, hE])), e.b));
+							}
+						}
+					}
+				}
+			}
+		}
+	});
+	switch (fin) {
+		None(): None();
+		Some(st): {
+			cur = st.second;
+			switch (st.first) {
+				None(): None();
+				Some(h0): if (cur == v) Some(h0)
+					else switch (mizEqcProveEq(env, cur, v, big)) {
+						None(): None();
+						Some(he): Some(emitD(mizSscSsF(env, u, v), "sseqtr", [h0, he]));
+					}
+			}
+		}
+	}
+}
+
+// introduction on the compound side: `u ⊆ (A ∩ B)` from both conjunct chains
+// (ssin), `(A ∪ B) ⊆ v` from both disjunct chains (unss); the compound may
+// sit anywhere in the endpoint's eq class, bridged back by sseqtri/eqsstri
+mizSscIntro(senv : MizSsEnv, u : int, v : int, depth : int) -> Maybe<FolPRef> {
+	env = senv.eq;
+	big = 1000000000;
+	d = isSome(env.ph);
+	emitD = \f : FolForm, lem : string, refs : [FolPRef] ->
+		mizEqcEmit(env, mizEqcMkD(env, f), if (d) lem + "d" else lem + "i", refs);
+	// the conjunction of the two chains: pm3.2i, or jca under the assumption;
+	// the ssin/unss instance stays PLAIN and joins by sylib in deduction mode
+	conj2 = \fa : FolForm, fb : FolForm, ha : FolPRef, hb : FolPRef, fm : FolForm, lem : string -> {
+		cj = mizEqcEmit(env, mizEqcMkD(env, FolBin("and", fa, fb)),
+			if (d) "jca" else "pm3.2i", [ha, hb]);
+		bi = mizEqcEmit(env, FolBin("iff", FolBin("and", fa, fb), fm), lem, []);
+		mizEqcEmit(env, mizEqcMkD(env, fm), if (d) "sylib" else "mpbi", [cj, bi]);
+	};
+	tIdx = \t : FolTerm -> lookupTreeDef(env.uni, mizEmitTKey(t), -1);
+	mvs0 = lookupTreeDef(senv.members, mizSscCls(senv, v), []);
+	mvs = if (length(mvs0) > 8) subrange(mvs0, 0, 8) else mvs0;
+	viaIn = fold(mvs, None(), \acc : Maybe<FolPRef>, m -> switch (acc) {
+		Some(__): acc;
+		None(): switch (env.terms[m]) {
+			FolApp(fn, args): if (fn != "∩" || length(args) != 2) None() else {
+				ia = tIdx(args[0]);
+				ib = tIdx(args[1]);
+				if (ia < 0 || ib < 0) None()
+				else switch (mizSscProve(senv, u, ia, depth - 1)) {
+					None(): None();
+					Some(ha): switch (mizSscProve(senv, u, ib, depth - 1)) {
+						None(): None();
+						Some(hb): {
+							hm = conj2(mizSscSsF(env, u, ia), mizSscSsF(env, u, ib),
+								ha, hb, mizSscSsF(env, u, m), "ssin");
+							if (m == v) Some(hm)
+							else switch (mizEqcProveEq(env, m, v, big)) {
+								None(): None();
+								Some(he): Some(emitD(mizSscSsF(env, u, v), "sseqtr", [hm, he]));
+							}
+						}
+					}
+				}
+			}
+			default: None();
+		}
+	});
+	switch (viaIn) {
+		Some(__): viaIn;
+		None(): {
+			mus0 = lookupTreeDef(senv.members, mizSscCls(senv, u), []);
+			mus = if (length(mus0) > 8) subrange(mus0, 0, 8) else mus0;
+			fold(mus, None(), \acc : Maybe<FolPRef>, m -> switch (acc) {
+				Some(__): acc;
+				None(): switch (env.terms[m]) {
+					FolApp(fn, args): if (fn != "∪" || length(args) != 2) None() else {
+						ia = tIdx(args[0]);
+						ib = tIdx(args[1]);
+						if (ia < 0 || ib < 0) None()
+						else switch (mizSscProve(senv, ia, v, depth - 1)) {
+							None(): None();
+							Some(ha): switch (mizSscProve(senv, ib, v, depth - 1)) {
+								None(): None();
+								Some(hb): {
+									hm = conj2(mizSscSsF(env, ia, v), mizSscSsF(env, ib, v),
+										ha, hb, mizSscSsF(env, m, v), "unss");
+									if (m == u) Some(hm)
+									else switch (mizEqcProveEq(env, u, m, big)) {
+										None(): None();
+										Some(he): Some(emitD(mizSscSsF(env, u, v), "eqsstr", [he, hm]));
+									}
+								}
+							}
+						}
+					}
+					default: None();
+				}
+			});
+		}
+	}
+}
+
+// the memoized chain `T(u) ⊆ T(v)`: same class = ssid (+ eq bridge), else a
+// BFS path over the class graph, else introduction on the compound side
+mizSscProve(senv : MizSsEnv, u : int, v : int, depth : int) -> Maybe<FolPRef> {
+	env = senv.eq;
+	big = 1000000000;
+	key = i2s(u) + ":" + i2s(v);
+	switch (lookupTree(^(senv.ssH), key)) {
+		Some(h): Some(h);
+		None(): if (depth <= 0 || containsSet(^(senv.busy), key)) None() else {
+			senv.busy := insertSet(^(senv.busy), key);
+			d = isSome(env.ph);
+			mkId = \ -> {
+				h9 = mizEqcEmit(env, mizSscSsF(env, u, u), "ssid", []);
+				if (!d) h9
+				else mizEqcEmit(env, mizEqcMkD(env, mizSscSsF(env, u, u)), "a1i", [h9]);
+			};
+			r = if (mizSscCls(senv, u) == mizSscCls(senv, v)) {
+				if (u == v) Some(mkId())
+				else switch (mizEqcProveEq(env, u, v, big)) {
+					None(): None();
+					Some(he): {
+						h0 = mkId();
+						Some(mizEqcEmit(env, mizEqcMkD(env, mizSscSsF(env, u, v)),
+							if (d) "sseqtrd" else "sseqtri", [h0, he]));
+					}
+				}
+			} else {
+				viaPath = switch (mizSscPath(senv, mizSscCls(senv, u), mizSscCls(senv, v))) {
+					None(): None();
+					Some(path): mizSscExtract(senv, u, v, path);
+				};
+				switch (viaPath) {
+					Some(__): viaPath;
+					None(): mizSscIntro(senv, u, v, depth);
+				}
+			};
+			senv.busy := removeSet(^(senv.busy), key);
+			switch (r) {
+				None(): None();
+				Some(h): { senv.ssH := setTree(^(senv.ssH), key, h); r; }
+			}
+		}
+	}
+}
+
+mizEmitSsChain(ctx : [Pair<FolForm, RuParseRef>], goal : FolForm,
+	asm : Maybe<FolForm>, drvs : [MizEmitDrv]) -> Maybe<FolStepProof> {
+	gp : Maybe<Triple<FolTerm, FolTerm, bool>> = switch (goal) {
+		FolEq(gl, gr): Some(Triple(gl, gr, true));
+		FolPred(gn, ga): if (gn == "⊆" && length(ga) == 2)
+			Some(Triple(ga[0], ga[1], false)) else None();
+		default: None();
+	};
+	switch (gp) {
+		None(): None();
+		Some(g3): if (g3.first == g3.second) None() else {
+			phKey = switch (asm) { None(): ""; Some(af): mizEmitKey(af); };
+			cands = concat(
+				mapi(ctx, \j, p -> MizEqCand(p.first, -1, j)),
+				mapi(drvs, \j, d -> MizEqCand(d.form, j, -1)));
+			seedA = switch (asm) {
+				None(): makeSet();
+				Some(af): buildSet(mizEqcConjKeys(af, 2));
+			};
+			seed0 = fold(cands, seedA, \ac, c -> insertSet(ac, mizEmitKey(c.form)));
+			provable = mizEqcGuardFix(cands, seed0);
+			// equation payloads exactly as the eq-chain reads them
+			payloads = filtermap(mapi(cands, \ci, c -> Pair(ci, mizEqcPayload(c.form))),
+				\pr -> switch (pr.second) {
+					None(): None();
+					Some(pl): switch (pl.second) {
+						None(): Some(Pair(pr.first, pl.first));
+						Some(g): if (containsSet(provable, mizEmitKey(g)))
+							Some(Pair(pr.first, pl.first)) else None();
+					}
+				});
+			// the pieces: ⊆ atoms and buried equations — from the candidates,
+			// and from the ASSUMPTION's own conjuncts (pseudo-candidate -1)
+			walked = concat(
+				concatA(mapi(cands, \ci, c ->
+					map(mizSscWalk(c.form, None(), [], 2, provable),
+						\t3 -> Pair(ci, t3)))),
+				switch (asm) {
+					None(): [];
+					Some(af): map(mizSscWalk(af, None(), [], 2, provable),
+						\t3 -> Pair(-1, t3));
+				});
+			ssAtoms = filtermap(walked, \w -> switch (w.second.first) {
+				FolPred(__, aa): Some(MizSsAtom(aa[0], aa[1],
+					MizSsPiece(w.first, w.second.second, w.second.third)));
+				default: None();
+			});
+			eqPieces = filtermap(walked, \w -> switch (w.second.first) {
+				FolEq(el, er): Some(Triple(el, er,
+					MizSsPiece(w.first, w.second.second, w.second.third)));
+				default: None();
+			});
+			if (payloads == [] && ssAtoms == [] && eqPieces == []) None()
+			else {
+				uni : ref Tree<string, int> = ref makeTree();
+				terms0 : ref [FolTerm] = ref [];
+				gi = mizEqcAddTerm(uni, terms0, g3.first);
+				gj = mizEqcAddTerm(uni, terms0, g3.second);
+				peIdx = map(payloads, \pl -> switch (pl.second) {
+					FolEq(l, r): Pair(mizEqcAddTerm(uni, terms0, l),
+						mizEqcAddTerm(uni, terms0, r));
+					default: Pair(-1, -1);
+				});
+				epIdx = map(eqPieces, \ep -> Pair(mizEqcAddTerm(uni, terms0, ep.first),
+					mizEqcAddTerm(uni, terms0, ep.second)));
+				ssIdx = map(ssAtoms, \a -> Pair(mizEqcAddTerm(uni, terms0, a.from),
+					mizEqcAddTerm(uni, terms0, a.to)));
+				twins = foldi(^terms0, [], \i, ac, t -> switch (t) {
+					FolApp(fn, args): if (length(args) == 2 && mizEqcCommLemma(fn) != "")
+						arrayPush(ac, Pair(i, FolApp(fn, [args[1], args[0]])))
+						else ac;
+					default: ac;
+				});
+				commEdges = fold(twins, [], \ac, tw ->
+					arrayPush(ac, Pair(tw.first, mizEqcAddTerm(uni, terms0, tw.second))));
+				terms = ^terms0;
+				uf : ref Tree<int, int> = ref makeTree();
+				edges : ref [MizEqEdge] = ref [];
+				iteri(peIdx, \k, pr -> if (pr.first >= 0) {
+					edges := arrayPush(^edges, MizEqEdge(pr.first, pr.second, 0, 0,
+						payloads[k].first));
+					uf := setTree(^uf, mizEqcFind(uf, pr.first), mizEqcFind(uf, pr.second));
+				});
+				iteri(epIdx, \k, pr -> {
+					edges := arrayPush(^edges, MizEqEdge(pr.first, pr.second, 0, 3, k));
+					uf := setTree(^uf, mizEqcFind(uf, pr.first), mizEqcFind(uf, pr.second));
+				});
+				iter(commEdges, \pr -> if (pr.first != pr.second) {
+					edges := arrayPush(^edges, MizEqEdge(pr.first, pr.second, 0, 1, -1));
+					uf := setTree(^uf, mizEqcFind(uf, pr.first), mizEqcFind(uf, pr.second));
+				});
+				mizEqcCongRounds(terms, ^uni, uf, edges, 1);
+				adjEq = foldi(^edges, makeTree(), \ei, ac, e ->
+					setTree(setTree(ac, e.a, arrayPush(lookupTreeDef(ac, e.a, []), ei)),
+						e.b, arrayPush(lookupTreeDef(ac, e.b, []), ei)));
+				env = MizEqChainEnv(asm, phKey, cands, drvs, ctx, provable,
+					^uni, terms, ^edges, adjEq,
+					ref [], ref [], ref [], ref makeTree(), ref makeTree(), ref makeTree(),
+					map(eqPieces, \ep -> ep.third));
+				// the ⊆ edges: candidate atoms, then the structural inclusions of
+				// every compound term in the universe
+				tIdx = \t : FolTerm -> lookupTreeDef(^uni, mizEmitTKey(t), -1);
+				ssEdges0 = mapi(ssIdx, \k, pr ->
+					MizSsEdge(pr.first, pr.second, 0, k, ""));
+				ssEdges = foldi(terms, ssEdges0, \i, ac, t -> switch (t) {
+					FolApp(fn, args): if (length(args) != 2) ac
+						else {
+							ia = tIdx(args[0]);
+							ib = tIdx(args[1]);
+							if (fn == "∩" && ia >= 0 && ib >= 0)
+								arrayPush(arrayPush(ac, MizSsEdge(i, ia, 1, -1, "inss1")),
+									MizSsEdge(i, ib, 1, -1, "inss2"))
+							else if (fn == "∖" && ia >= 0)
+								arrayPush(ac, MizSsEdge(i, ia, 1, -1, "difss"))
+							else if (fn == "∪" && ia >= 0 && ib >= 0)
+								arrayPush(arrayPush(ac, MizSsEdge(ia, i, 1, -1, "ssun1")),
+									MizSsEdge(ib, i, 1, -1, "ssun2"))
+							else ac;
+						}
+					default: ac;
+				});
+				classOf = foldi(terms, makeTree(), \i, ac, __ ->
+					setTree(ac, i, mizEqcFind(uf, i)));
+				members = foldi(terms, makeTree(), \i, ac, __ -> {
+					rt = mizEqcFind(uf, i);
+					setTree(ac, rt, arrayPush(lookupTreeDef(ac, rt, []), i));
+				});
+				adjSs = foldi(ssEdges, makeTree(), \ei, ac, e -> {
+					rt = mizEqcFind(uf, e.a);
+					setTree(ac, rt, arrayPush(lookupTreeDef(ac, rt, []), ei));
+				});
+				senv = MizSsEnv(env, ssAtoms, ssEdges, adjSs, classOf, members,
+					ref makeTree(), ref makeTree(), ref makeSet());
+				r = if (g3.third) {
+					switch (mizSscProve(senv, gi, gj, 5)) {
+						None(): None();
+						Some(h1): switch (mizSscProve(senv, gj, gi, 5)) {
+							None(): None();
+							Some(h2): Some(mizEqcEmit(env, mizEqcMkD(env, goal),
+								if (isSome(asm)) "eqssd" else "eqssi", [h1, h2]));
+						}
+					}
+				} else mizSscProve(senv, gi, gj, 5);
+				switch (r) {
+					None(): {
+						if (^mizEmitDbg) println("  SSCHAIN fail terms=" + i2s(length(terms))
+							+ " ss=" + i2s(length(ssEdges)) + " eq=" + i2s(length(^edges))
+							+ " :: " + strGlue(folFormToks(goal), " "));
+						None();
+					}
+					Some(h): {
+						lastOk = switch (h) {
+							FolPRefStep(k): k == length(^(env.steps)) - 1
+								&& (^(env.steps))[k].form == mizEqcMkD(env, goal);
+							FolPRefFact(__): false;
+						};
+						if (!lastOk) None()
+						else {
+							if (^mizEmitDbg)
+								println("  SSCHAIN ok steps=" + i2s(length(^(env.steps))));
+							Some(FolStepProof(^(env.steps), ^(env.frefs), uniq(^(env.djs))));
+						}
+					}
+				}
+			}
+		}
 	}
 }
 
