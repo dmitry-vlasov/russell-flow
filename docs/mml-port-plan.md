@@ -1326,3 +1326,20 @@ shape (a disjunction with an equation limb, `x∈A ∨ x∈A ∨ A = A∖{x,y}`)
 not a pointwise iff; it needs either the proof-by-cases route or an
 equation-under-disjunction treatment, and is the natural next census
 read.
+
+### 2026-08-12 (later) — THE CHARACTERIZATION TABLE: 190 → 191; zfmisc under 1 MB/theorem
+
+*Done (@985420d8, verify + MM green, proved == closed = 191)*:
+mizEmitFoundIffGoal — a by-step goal is matched against a small table of
+foundation characterization lemmas in Fol form (disj3, dfss2, ssequn1,
+disjdif), directly and through the orientation bridges (bicomi for the
+iff, eqcom per equation limb, bibi12i + mpbi to reassemble; a1i lift
+under an assumption). The `(X∖{a,b} = X) ↔ (X∩{a,b} = ∅)` steps of
+t120/t57_zfmisc_1 — 4,300-step flat proofs, 15 MB together — are now
+four-citation proofs. xboole_1 74 → 75; zfmisc_1.ru 36.5 → 18.3 MB, no
+theorem above 1 MB left in it.
+
+*The table is the seed of the general residue-vs-library matcher*: rows
+are added when a census names a shape; the matching and bridge machinery
+is shape-independent. The day's arc: 181 → 191 theorems; zfmisc_1.ru
+58 → 18.3 MB, xboole_1.ru 41 → 30 MB, relat_1.ru 26.7 → 2.2 MB.
