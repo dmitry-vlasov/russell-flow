@@ -1359,3 +1359,26 @@ retries pruned forms when the raw DNFs differ; step cap 1200.
 *Remaining xboole_1 tail*: t32 (2.5 MB, `X∖Y = Y∖X ⊢ X = Y`) and
 ~1 MB friends — hypothesis-driven reasoning, not identities; a
 different family for a later read.
+
+### 2026-08-12 (late) — relat_1's ONELEFT buckets read; the two blockers NAMED
+
+*The census*: 30× `v1 X → (eq)`, 18× `v1 X → (⊆)` — 48 theorems, the
+whole top of relat_1's open set. One trace (t52: `id(proj1 X) ∘ X = X`)
+names the exact blockers, verified by hand against t50/t51:
+
+1. COMPOUND-WITNESS CITATION: t52 needs t50 at `x7 := proj1 x26`. The
+   cite channel instantiates only at the goal's plain variables
+   (spi/spv); a compound witness needs the spcgv/sethood route —
+   mizEmitElimAt already does it, chained from a step citing the
+   ∀-closed statement (the sethood-axiom instantiation is the model).
+   Witness pool = the goal/asm's compound subterms, capped.
+2. HYPOTHETICAL CITATION: t51 is emitted in honest hypothetical form
+   (hyps `v1 X`, `proj1 X ⊆ x7`) and is EXCLUDED from the citable
+   statement table (stmtTbl filters hyps == []). Citing it means
+   providing refs proving each substituted hypothesis — here the
+   context's own `v1 x26` and `proj1 x26 ⊆ proj1 x26` (ssid). The
+   discharge kinds needed: a context fact, the assumption/its conjunct,
+   ssid/eqid trivials.
+
+Both are general (every article's guarded families look like this);
+together they unblock the 48. This is the next session's first unit.
