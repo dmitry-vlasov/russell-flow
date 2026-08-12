@@ -1224,3 +1224,32 @@ independent (own out= dirs mandatory — shared dirs race on the
 foundation .mm files): concurrency 3 at mem=16g fits 64 GB and roughly
 halves a round. The emit phase stays sequential (dependency chain);
 per-theorem parallelism inside one article is the next lever.
+
+### 2026-08-12 — THE ∨-TREE WALK: the citation completer's first unit; 170 → 181
+
+*Done (@d2c2855e, verify + MM green, proved == closed)*: k-way membership
+residues close by CANONICAL FORM, not refutation. mizEmitOrCanon proves
+`f ↔ C` (right-nested, key-sorted, deduplicated ∨) as an insertion sort of
+foundation citations — orass/orcom/or12/oridm lifted by orbi1i/orbi2i,
+glued by bitri, with the checker's dialect opened on the way (imor, ianor,
+notnotb). The eliminated def instance becomes `mem ↔ C` by a fixed
+assembly over both checker pair-shapes (simpl/simpr + pm2.53 +
+sylib/sylbi + impbii) — CleanIff's capped internal certificate is out of
+that path. Membership pairs rewrite FIRST in the reduction.
+
+*Measured on enumset1*: 54 → 65 theorems; 88 MB → 6.8 MB; 64,651 →
+17,608 steps; 11 min → 28 s. The permutation family (t61–t74) closes in
+~100-step citation chains instead of 5,250-step case splits. THIS is the
+trace-vs-citation gap closing exactly as the directive predicted.
+
+*Two scars*: notnotb is stated `φ ↔ ¬¬φ` — orientation matters, the
+verifier caught 32 disproofs from the flipped citation; and a DETACHED
+dbg probe overwrote the gate's freshly emitted article minutes later, so
+the MM gate read a stale file (proved=54 vs closed=65, caught by the
+proved==closed law) — "one writer at a time" applies to probes too.
+
+*Standing*: honest gate set 181 (tarski 1/3, xb0 3/8, xb1 73/116,
+enumset1 65/87, zfmisc 26/140, subset_1 0/53, xtuple_0 0/46, relat_1
+13/179). Next: the same citation treatment for the remaining heavy
+families (relat_1's export is still 600+ MB — its certificates are the
+next census target), then the S-C type layer for subset_1.
