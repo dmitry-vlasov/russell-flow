@@ -5627,6 +5627,9 @@ mizEmitDnfCanon(steps : ref [FolPStep], f : FolForm) -> Pair<int, FolForm> {
 				[FolPRefStep(base), FolPRefStep(m.first)]), m.second);
 		}
 		else if (op == "imp") via(FolBin("or", FolNeg(l), r), "imor")
+		// a biconditional opens into its two-case DNF
+		else if (op == "iff") via(FolBin("or", FolBin("and", l, r),
+			FolBin("and", FolNeg(l), FolNeg(r))), "dfbi3")
 		else Pair(emit(FolBin("iff", f, f), "biid", []), f);
 		FolNeg(g): switch (g) {
 			FolNeg(h): {
@@ -5637,10 +5640,172 @@ mizEmitDnfCanon(steps : ref [FolPStep], f : FolForm) -> Pair<int, FolForm> {
 					via(FolBin("or", FolNeg(gl), FolNeg(gr)), "ianor")
 				else if (opg == "or")
 					via(FolBin("and", FolNeg(gl), FolNeg(gr)), "ioran")
+				// ¬(φ↔ψ) becomes (φ↔¬ψ), which the iff case then opens
+				else if (opg == "iff")
+					via(FolBin("iff", gl, FolNeg(gr)), "xor3")
 				else Pair(emit(FolBin("iff", f, f), "biid", []), f);
 			default: Pair(emit(FolBin("iff", f, f), "biid", []), f);
 		}
 		default: Pair(emit(FolBin("iff", f, f), "biid", []), f);
+	}
+}
+
+// ---- ABSORPTION on the joined DNFs ----
+// A lattice identity's two sides reach DNFs equal only modulo absorption
+// ((X∪Y)∩(Y∪Z)∩(Z∪X) keeps an a∧b∧c conjunct that a∧b absorbs —
+// t25_xboole_1). A conjunct whose atom set strictly CONTAINS another's is
+// dropped, and the pruned tree is bridged by two implication proofs:
+// each disjunct injects (orc/olc chain) or projects to its absorber first
+// (simpl/simpr/jca), folded by jaoi, closed by impbii.
+
+mizEmitOrLeavesL(f : FolForm) -> [FolForm] {
+	switch (f) {
+		FolBin(op, l, r): if (op == "or") concat([l], mizEmitOrLeavesL(r)) else [f];
+		default: [f];
+	}
+}
+
+mizEmitAndKeysL(f : FolForm) -> Set<string> {
+	switch (f) {
+		FolBin(op, l, r): if (op == "and")
+			mergeSets(makeSet1(mizEmitKey(l)), mizEmitAndKeysL(r))
+			else makeSet1(mizEmitKey(f));
+		default: makeSet1(mizEmitKey(f));
+	}
+}
+
+// |- x → lf, lf one of x's ∧-leaves
+mizEmitImpLeaf(steps : ref [FolPStep], x : FolForm, lf : FolForm) -> int {
+	emit = \form : FolForm, lemma : string, refs : [FolPRef] -> {
+		steps := arrayPush(^steps, FolPStep(form, lemma, refs));
+		length(^steps) - 1;
+	};
+	if (mizEmitKey(x) == mizEmitKey(lf)) emit(FolBin("imp", x, x), "id", [])
+	else switch (x) {
+		FolBin(op, x1, xr): if (op != "and") emit(FolBin("imp", x, lf), "id", [])
+			else if (mizEmitKey(x1) == mizEmitKey(lf))
+				emit(FolBin("imp", x, x1), "simpl", [])
+			else {
+				s = emit(FolBin("imp", x, xr), "simpr", []);
+				h = mizEmitImpLeaf(steps, xr, lf);
+				emit(FolBin("imp", x, lf), "syl", [FolPRefStep(s), FolPRefStep(h)]);
+			}
+		default: emit(FolBin("imp", x, lf), "id", []);
+	}
+}
+
+// |- x → y, every ∧-leaf of y an ∧-leaf of x
+mizEmitImpProj(steps : ref [FolPStep], x : FolForm, y : FolForm) -> int {
+	emit = \form : FolForm, lemma : string, refs : [FolPRef] -> {
+		steps := arrayPush(^steps, FolPStep(form, lemma, refs));
+		length(^steps) - 1;
+	};
+	switch (y) {
+		FolBin(op, y1, yr): if (op != "and") mizEmitImpLeaf(steps, x, y)
+			else {
+				a = mizEmitImpLeaf(steps, x, y1);
+				b = mizEmitImpProj(steps, x, yr);
+				emit(FolBin("imp", x, y), "jca", [FolPRefStep(a), FolPRefStep(b)]);
+			}
+		default: mizEmitImpLeaf(steps, x, y);
+	}
+}
+
+// |- d → t, d a disjunct of the right-nested ∨-tree t
+mizEmitImpInj(steps : ref [FolPStep], d : FolForm, t : FolForm) -> int {
+	emit = \form : FolForm, lemma : string, refs : [FolPRef] -> {
+		steps := arrayPush(^steps, FolPStep(form, lemma, refs));
+		length(^steps) - 1;
+	};
+	if (mizEmitKey(t) == mizEmitKey(d)) emit(FolBin("imp", d, d), "id", [])
+	else switch (t) {
+		FolBin(op, t1, tr): if (op != "or") emit(FolBin("imp", d, t), "id", [])
+			else if (mizEmitKey(t1) == mizEmitKey(d))
+				emit(FolBin("imp", d, t), "orc", [])
+			else {
+				h = mizEmitImpInj(steps, d, tr);
+				o = emit(FolBin("imp", tr, t), "olc", []);
+				emit(FolBin("imp", d, t), "syl", [FolPRefStep(h), FolPRefStep(o)]);
+			}
+		default: emit(FolBin("imp", d, t), "id", []);
+	}
+}
+
+// |- t ↔ t' with absorbed conjuncts dropped; None when nothing absorbs
+mizEmitOrPrune(steps : ref [FolPStep], t : FolForm) -> Maybe<Pair<int, FolForm>> {
+	emit = \form : FolForm, lemma : string, refs : [FolPRef] -> {
+		steps := arrayPush(^steps, FolPStep(form, lemma, refs));
+		length(^steps) - 1;
+	};
+	leaves = mizEmitOrLeavesL(t);
+	if (length(leaves) < 2) None()
+	else {
+		keySets = map(leaves, mizEmitAndKeysL);
+		strictSub = \si : Set<string>, sj : Set<string> ->
+			sizeSet(si) < sizeSet(sj)
+			&& foldSet(si, true, \ok, k -> ok && containsSet(sj, k));
+		absorber = mapi(leaves, \i, __ ->
+			foldi(leaves, -1, \j, ac, __2 ->
+				if (ac >= 0 || j == i) ac
+				else if (strictSub(keySets[j], keySets[i])) j else ac));
+		kept = foldi(leaves, [], \i, ac, lf -> if (absorber[i] < 0) arrayPush(ac, lf) else ac);
+		if (length(kept) == length(leaves)) None()
+		else {
+			t2 = fold(reverseA(subrange(kept, 0, length(kept) - 1)),
+				kept[length(kept) - 1], \ac, lf -> FolBin("or", lf, ac));
+			fwd = mizEmitOrPruneFwd(steps, t, t2, leaves, keySets, absorber);
+			bwd = mizEmitOrPruneBwd(steps, t2, t);
+			Some(Pair(emit(FolBin("iff", t, t2), "impbii",
+				[FolPRefStep(fwd), FolPRefStep(bwd)]), t2));
+		}
+	}
+}
+
+// |- d → t2, absorbed disjuncts projected to their absorber first
+mizEmitOrPruneLeaf(steps : ref [FolPStep], d : FolForm, t2 : FolForm,
+	leaves : [FolForm], absorber : [int]) -> int {
+	i = fold(mapi(leaves, \k, lf -> Pair(k, lf)), -1, \ac, pr ->
+		if (ac >= 0) ac
+		else if (mizEmitKey(pr.second) == mizEmitKey(d)) pr.first else ac);
+	if (i < 0 || absorber[i] < 0) mizEmitImpInj(steps, d, t2)
+	else {
+		p = mizEmitImpProj(steps, d, leaves[absorber[i]]);
+		j = mizEmitImpInj(steps, leaves[absorber[i]], t2);
+		steps := arrayPush(^steps, FolPStep(FolBin("imp", d, t2), "syl",
+			[FolPRefStep(p), FolPRefStep(j)]));
+		length(^steps) - 1;
+	}
+}
+
+// |- t → t2 over t's ∨-structure (jaoi fold)
+mizEmitOrPruneFwd(steps : ref [FolPStep], t : FolForm, t2 : FolForm,
+	leaves : [FolForm], keySets : [Set<string>], absorber : [int]) -> int {
+	switch (t) {
+		FolBin(op, f1, fr): if (op != "or")
+				mizEmitOrPruneLeaf(steps, t, t2, leaves, absorber)
+			else {
+				h1 = mizEmitOrPruneLeaf(steps, f1, t2, leaves, absorber);
+				h2 = mizEmitOrPruneFwd(steps, fr, t2, leaves, keySets, absorber);
+				steps := arrayPush(^steps, FolPStep(FolBin("imp", t, t2), "jaoi",
+					[FolPRefStep(h1), FolPRefStep(h2)]));
+				length(^steps) - 1;
+			}
+		default: mizEmitOrPruneLeaf(steps, t, t2, leaves, absorber);
+	}
+}
+
+// |- t2 → t: every kept disjunct injects back
+mizEmitOrPruneBwd(steps : ref [FolPStep], t2 : FolForm, t : FolForm) -> int {
+	switch (t2) {
+		FolBin(op, f1, fr): if (op != "or") mizEmitImpInj(steps, t2, t)
+			else {
+				h1 = mizEmitImpInj(steps, f1, t);
+				h2 = mizEmitOrPruneBwd(steps, fr, t);
+				steps := arrayPush(^steps, FolPStep(FolBin("imp", t2, t), "jaoi",
+					[FolPRefStep(h1), FolPRefStep(h2)]));
+				length(^steps) - 1;
+			}
+		default: mizEmitImpInj(steps, t2, t);
 	}
 }
 
@@ -5655,9 +5820,22 @@ mizEmitDnfIff(a : FolForm, b : FolForm) -> Maybe<FolStepProof> {
 	if (!shaped(a) && !shaped(b)) None()
 	else {
 		st2 : ref [FolPStep] = ref [];
-		ca = mizEmitDnfCanon(st2, a);
-		cb = mizEmitDnfCanon(st2, b);
-		if (ca.second != cb.second || length(^st2) > 600) None()
+		ca0 = mizEmitDnfCanon(st2, a);
+		cb0 = mizEmitDnfCanon(st2, b);
+		// unequal DNFs may still meet after ABSORPTION pruning
+		pruned = \c0 : Pair<int, FolForm>, src : FolForm ->
+			if (ca0.second == cb0.second) c0
+			else switch (mizEmitOrPrune(st2, c0.second)) {
+				None(): c0;
+				Some(pr): {
+					st2 := arrayPush(^st2, FolPStep(FolBin("iff", src, pr.second), "bitri",
+						[FolPRefStep(c0.first), FolPRefStep(pr.first)]));
+					Pair(length(^st2) - 1, pr.second);
+				}
+			};
+		ca = pruned(ca0, a);
+		cb = pruned(cb0, b);
+		if (ca.second != cb.second || length(^st2) > 1200) None()
 		else {
 			bc = {
 				st2 := arrayPush(^st2, FolPStep(FolBin("iff", ca.second, b), "bicomi",
