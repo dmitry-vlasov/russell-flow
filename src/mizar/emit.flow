@@ -1083,12 +1083,16 @@ mizEmitReduce(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 	// forbids. The rewrite route is linear (unfold chains + the ∨-tree walk),
 	// and its residue still reaches the full reduction — the ladder included —
 	// whenever the walk alone cannot close it.
-	memFirst = if (depth >= 8) None() else switch (mizEmitMemPair(goal)) {
+	memFirst0 = if (depth >= 8) None() else switch (mizEmitMemPair(goal)) {
 		None(): None();
 		Some(tr): mizEmitMemRewrite(hyps, prev, goal, tr.first, tr.second,
 			(tr.third).first, (tr.third).second, maxFacts, maxSize, depth,
 			fresh, used, recDrv);
 	};
+	// a general IFF between membership combinations (the pointwise pair
+	// family): NF both sides, join by the walks
+	memFirst = if (isSome(memFirst0) || depth >= 8) memFirst0
+		else mizEmitIffNFWalk(goal);
 	if (isSome(memFirst)) Pair(memFirst, false) else {
 	direct = mizEmitLadder(hyps, prev, goal, maxFacts, maxSize, recDrv);
 	switch (direct.first) {
@@ -1396,6 +1400,72 @@ mizEmitCharGoalA(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolFo
 			Pair(Some(FolStepProof(concatA([pr.steps, [df, sy]]),
 				pr.factRefs, uniq(concat(pr.disjs, dj)))), false);
 		}
+	}
+}
+
+// an IFF goal whose sides normalize into the same canonical ∨/DNF form
+// closes by citation alone: NF both sides (membership leaves opened,
+// opelxp included), then the ∨-walk / DNF walk joins the normal forms —
+// this is the pointwise pair-membership family (`⟨a,b⟩ ∈ (X∪Y)×.Z ↔ …`)
+// that used to case-split in the flat proof
+mizEmitIffNFWalk(goal : FolForm) -> Maybe<FolStepProof> {
+	switch (goal) {
+		FolBin(op, l, r): if (op != "iff") None() else {
+			rw : ref [FolPStep] = ref [];
+			djBase = length(^mizEmitNFDjRef);
+			emitRw = \form : FolForm, lemma : string, refs : [FolPRef] -> {
+				rw := arrayPush(^rw, FolPStep(form, lemma, refs));
+				length(^rw) - 1;
+			};
+			wl0 = mizEmitFormNF(rw, l, 0);
+			wr0 = mizEmitFormNF(rw, r, 0);
+			if (isNone(wl0) && isNone(wr0)) {
+				// no membership to open — the walk may still join the sides
+				switch (mizEmitOrIff(l, r)) {
+					Some(w9): Some(w9);
+					None(): mizEmitDnfIff(l, r);
+				}
+			} else {
+				wl = switch (wl0) {
+					Some(w): w;
+					None(): Pair(emitRw(FolBin("iff", l, l), "biid", []), l);
+				};
+				wr = switch (wr0) {
+					Some(w): w;
+					None(): Pair(emitRw(FolBin("iff", r, r), "biid", []), r);
+				};
+				walk = if (wl.second == wr.second)
+						Some(FolStepProof([FolPStep(FolBin("iff", wl.second, wr.second),
+							"biid", [])], [], []))
+					else switch (mizEmitOrIff(wl.second, wr.second)) {
+						Some(w9): Some(w9);
+						None(): mizEmitDnfIff(wl.second, wr.second);
+					};
+				switch (walk) {
+					None(): None();
+					Some(wp): {
+						// walk steps first (last = NL↔NR), then the rewriting
+						// block, then the three-way join to L↔R
+						n = length(wp.steps);
+						ws = mizEmitShift(^rw, n, 0);
+						iL = n + wl.first;
+						iR = n + wr.first;
+						n0 = n + length(ws);
+						j1 = FolPStep(FolBin("iff", l, wr.second), "bitri",
+							[FolPRefStep(iL), FolPRefStep(n - 1)]);
+						j2 = FolPStep(FolBin("iff", wr.second, r), "bicomi",
+							[FolPRefStep(iR)]);
+						j3 = FolPStep(goal, "bitri",
+							[FolPRefStep(n0), FolPRefStep(n0 + 1)]);
+						ndj = length(^mizEmitNFDjRef) - djBase;
+						Some(FolStepProof(concatA([wp.steps, ws, [j1, j2, j3]]),
+							wp.factRefs,
+							uniq(concat(wp.disjs, subrange(^mizEmitNFDjRef, djBase, ndj)))));
+					}
+				}
+			}
+		}
+		default: None();
 	}
 }
 
@@ -4890,6 +4960,34 @@ mizEmitMemNF(steps : ref [FolPStep], v : FolTerm, t : FolTerm,
 				nf = mizEmitSs(v, args[0]);
 				Some(Pair(emit(FolBin("iff", mem(t), nf), "velpw", []), nf));
 			}
+			else if (op == "×." && length(args) == 2 && switch (v) {
+				FolApp(vf, va): vf == "opair" && length(va) == 2;
+				default: false;
+			}) {
+				// an explicit pair in a product: opelxp, then normalize both
+				// component memberships (each with its own element)
+				switch (v) {
+					FolApp(__, va): {
+						raw = FolBin("and", FolPred("∈", [va[0], args[0]]),
+							FolPred("∈", [va[1], args[1]]));
+						un = emit(FolBin("iff", mem(t), raw), "opelxp", []);
+						switch (mizEmitMemNF(steps, va[0], args[0], depth + 1)) {
+							None(): None();
+							Some(wa): switch (mizEmitMemNF(steps, va[1], args[1], depth + 1)) {
+								None(): None();
+								Some(wb): {
+									nf = FolBin("and", wa.second, wb.second);
+									cb = emit(FolBin("iff", raw, nf), "anbi12i",
+										[FolPRefStep(wa.first), FolPRefStep(wb.first)]);
+									Some(Pair(emit(FolBin("iff", mem(t), nf), "bitri",
+										[FolPRefStep(un), FolPRefStep(cb)]), nf));
+								}
+							}
+						}
+					}
+					default: None();
+				}
+			}
 			else if (length(args) != 2 || (op != "∪" && op != "∩" && op != "∖"))
 				switch (mizEmitMemNFDef(steps, v, t)) {
 					Some(w): Some(w);
@@ -5240,6 +5338,218 @@ mizEmitOrIns(steps : ref [FolPStep], x : FolForm, c : FolForm) -> Pair<int, FolF
 	}
 }
 
+// ---- the DNF WALK: ∧/∨ residues by the same citation style ----
+// The pointwise pair-membership steps (zfmisc_1's ×.-distribution family)
+// leave residues like `(p ∨ q) ∧ r ↔ (p ∧ r) ∨ (q ∧ r)` — ∧/∨ DISTRIBUTIONS,
+// which the ∨-walk cannot see and G3cp case-splits. The same insertion-sort
+// idea extends: canonical form = right-nested key-sorted ∨ of right-nested
+// key-sorted ∧, reached by andir/andi (distribution), anass/ancom/an12/anidm
+// (the ∧-sort), ioran (¬ over ∨), each move one foundation citation. The
+// ∨-level machinery (OrMerge/OrIns) is reused unchanged — a whole conjunction
+// is just a leaf under its key.
+
+mizEmitIsAnd(f : FolForm) -> bool {
+	switch (f) {
+		FolBin(op, __, __): op == "and";
+		default: false;
+	}
+}
+
+// |- (x ∧ c) ↔ M, x a non-∧ leaf, c canonical ∧-form: insert at sorted place
+mizEmitAndIns(steps : ref [FolPStep], x : FolForm, c : FolForm) -> Pair<int, FolForm> {
+	emit = \form : FolForm, lemma : string, refs : [FolPRef] -> {
+		steps := arrayPush(^steps, FolPStep(form, lemma, refs));
+		length(^steps) - 1;
+	};
+	kx = mizEmitKey(x);
+	f0 = FolBin("and", x, c);
+	if (!mizEmitIsAnd(c)) {
+		kc = mizEmitKey(c);
+		if (kx == kc) Pair(emit(FolBin("iff", f0, x), "anidm", []), x)
+		else if (kx < kc) Pair(emit(FolBin("iff", f0, f0), "biid", []), f0)
+		else {
+			g = FolBin("and", c, x);
+			Pair(emit(FolBin("iff", f0, g), "ancom", []), g);
+		}
+	} else switch (c) {
+		FolBin(__, h, t): {
+			kh = mizEmitKey(h);
+			if (kx == kh) {
+				// x ∧ (x ∧ t) ↔ (x ∧ x) ∧ t ↔ x ∧ t
+				g1 = FolBin("and", FolBin("and", x, x), t);
+				sa = emit(FolBin("iff", g1, f0), "anass", []);
+				sb = emit(FolBin("iff", f0, g1), "bicomi", [FolPRefStep(sa)]);
+				so = emit(FolBin("iff", FolBin("and", x, x), x), "anidm", []);
+				g2 = FolBin("and", x, t);
+				sc = emit(FolBin("iff", g1, g2), "anbi1i", [FolPRefStep(so)]);
+				Pair(emit(FolBin("iff", f0, g2), "bitri",
+					[FolPRefStep(sb), FolPRefStep(sc)]), g2);
+			} else if (kx < kh)
+				Pair(emit(FolBin("iff", f0, f0), "biid", []), f0)
+			else {
+				g1 = FolBin("and", h, FolBin("and", x, t));
+				s1 = emit(FolBin("iff", f0, g1), "an12", []);
+				m = mizEmitAndIns(steps, x, t);
+				g2 = FolBin("and", h, m.second);
+				s2 = emit(FolBin("iff", g1, g2), "anbi2i", [FolPRefStep(m.first)]);
+				Pair(emit(FolBin("iff", f0, g2), "bitri",
+					[FolPRefStep(s1), FolPRefStep(s2)]), g2);
+			}
+		}
+		default: Pair(emit(FolBin("iff", f0, f0), "biid", []), f0);
+	}
+}
+
+// |- (a ∧ b) ↔ M, both canonical ∧-forms
+mizEmitAndMerge(steps : ref [FolPStep], a : FolForm, b : FolForm) -> Pair<int, FolForm> {
+	emit = \form : FolForm, lemma : string, refs : [FolPRef] -> {
+		steps := arrayPush(^steps, FolPStep(form, lemma, refs));
+		length(^steps) - 1;
+	};
+	if (!mizEmitIsAnd(a)) mizEmitAndIns(steps, a, b)
+	else switch (a) {
+		FolBin(__, a1, a2): {
+			f0 = FolBin("and", a, b);
+			g1 = FolBin("and", a1, FolBin("and", a2, b));
+			s1 = emit(FolBin("iff", f0, g1), "anass", []);
+			m2 = mizEmitAndMerge(steps, a2, b);
+			g2 = FolBin("and", a1, m2.second);
+			s2 = emit(FolBin("iff", g1, g2), "anbi2i", [FolPRefStep(m2.first)]);
+			s12 = emit(FolBin("iff", f0, g2), "bitri",
+				[FolPRefStep(s1), FolPRefStep(s2)]);
+			m3 = mizEmitAndIns(steps, a1, m2.second);
+			Pair(emit(FolBin("iff", f0, m3.second), "bitri",
+				[FolPRefStep(s12), FolPRefStep(m3.first)]), m3.second);
+		}
+		default: mizEmitAndIns(steps, a, b);
+	}
+}
+
+// |- (a ∧ b) ↔ D, a and b already canonical DNFs: distribute ∧ over the
+// ∨-structure (andir left, andi right), then merge conjunctions
+mizEmitDnfDistrib(steps : ref [FolPStep], a : FolForm, b : FolForm) -> Pair<int, FolForm> {
+	emit = \form : FolForm, lemma : string, refs : [FolPRef] -> {
+		steps := arrayPush(^steps, FolPStep(form, lemma, refs));
+		length(^steps) - 1;
+	};
+	f0 = FolBin("and", a, b);
+	if (mizEmitIsOr(a)) switch (a) {
+		FolBin(__, a1, a2): {
+			g1 = FolBin("or", FolBin("and", a1, b), FolBin("and", a2, b));
+			s1 = emit(FolBin("iff", f0, g1), "andir", []);
+			d1 = mizEmitDnfDistrib(steps, a1, b);
+			d2 = mizEmitDnfDistrib(steps, a2, b);
+			g2 = FolBin("or", d1.second, d2.second);
+			s2 = emit(FolBin("iff", g1, g2), "orbi12i",
+				[FolPRefStep(d1.first), FolPRefStep(d2.first)]);
+			m = mizEmitOrMerge(steps, d1.second, d2.second);
+			s12 = emit(FolBin("iff", f0, g2), "bitri",
+				[FolPRefStep(s1), FolPRefStep(s2)]);
+			Pair(emit(FolBin("iff", f0, m.second), "bitri",
+				[FolPRefStep(s12), FolPRefStep(m.first)]), m.second);
+		}
+		default: mizEmitAndMerge(steps, a, b);
+	}
+	else if (mizEmitIsOr(b)) switch (b) {
+		FolBin(__, b1, b2): {
+			g1 = FolBin("or", FolBin("and", a, b1), FolBin("and", a, b2));
+			s1 = emit(FolBin("iff", f0, g1), "andi", []);
+			d1 = mizEmitDnfDistrib(steps, a, b1);
+			d2 = mizEmitDnfDistrib(steps, a, b2);
+			g2 = FolBin("or", d1.second, d2.second);
+			s2 = emit(FolBin("iff", g1, g2), "orbi12i",
+				[FolPRefStep(d1.first), FolPRefStep(d2.first)]);
+			m = mizEmitOrMerge(steps, d1.second, d2.second);
+			s12 = emit(FolBin("iff", f0, g2), "bitri",
+				[FolPRefStep(s1), FolPRefStep(s2)]);
+			Pair(emit(FolBin("iff", f0, m.second), "bitri",
+				[FolPRefStep(s12), FolPRefStep(m.first)]), m.second);
+		}
+		default: mizEmitAndMerge(steps, a, b);
+	}
+	else mizEmitAndMerge(steps, a, b);
+}
+
+// |- f ↔ D, D the canonical DNF; the ∨-walk's dialect openers plus ioran
+mizEmitDnfCanon(steps : ref [FolPStep], f : FolForm) -> Pair<int, FolForm> {
+	emit = \form : FolForm, lemma : string, refs : [FolPRef] -> {
+		steps := arrayPush(^steps, FolPStep(form, lemma, refs));
+		length(^steps) - 1;
+	};
+	viaAt = \g : FolForm, s1 : int -> {
+		w = mizEmitDnfCanon(steps, g);
+		if (w.second == g) Pair(s1, g)
+		else Pair(emit(FolBin("iff", f, w.second), "bitri",
+			[FolPRefStep(s1), FolPRefStep(w.first)]), w.second);
+	};
+	via = \g : FolForm, lemma : string ->
+		viaAt(g, emit(FolBin("iff", f, g), lemma, []));
+	switch (f) {
+		FolBin(op, l, r): if (op == "or") {
+			wl = mizEmitDnfCanon(steps, l);
+			wr = mizEmitDnfCanon(steps, r);
+			mid = FolBin("or", wl.second, wr.second);
+			base = emit(FolBin("iff", f, mid), "orbi12i",
+				[FolPRefStep(wl.first), FolPRefStep(wr.first)]);
+			m = mizEmitOrMerge(steps, wl.second, wr.second);
+			Pair(emit(FolBin("iff", f, m.second), "bitri",
+				[FolPRefStep(base), FolPRefStep(m.first)]), m.second);
+		}
+		else if (op == "and") {
+			wl = mizEmitDnfCanon(steps, l);
+			wr = mizEmitDnfCanon(steps, r);
+			mid = FolBin("and", wl.second, wr.second);
+			base = emit(FolBin("iff", f, mid), "anbi12i",
+				[FolPRefStep(wl.first), FolPRefStep(wr.first)]);
+			m = mizEmitDnfDistrib(steps, wl.second, wr.second);
+			Pair(emit(FolBin("iff", f, m.second), "bitri",
+				[FolPRefStep(base), FolPRefStep(m.first)]), m.second);
+		}
+		else if (op == "imp") via(FolBin("or", FolNeg(l), r), "imor")
+		else Pair(emit(FolBin("iff", f, f), "biid", []), f);
+		FolNeg(g): switch (g) {
+			FolNeg(h): {
+				nb = emit(FolBin("iff", h, f), "notnotb", []);
+				viaAt(h, emit(FolBin("iff", f, h), "bicomi", [FolPRefStep(nb)]));
+			}
+			FolBin(opg, gl, gr): if (opg == "and")
+					via(FolBin("or", FolNeg(gl), FolNeg(gr)), "ianor")
+				else if (opg == "or")
+					via(FolBin("and", FolNeg(gl), FolNeg(gr)), "ioran")
+				else Pair(emit(FolBin("iff", f, f), "biid", []), f);
+			default: Pair(emit(FolBin("iff", f, f), "biid", []), f);
+		}
+		default: Pair(emit(FolBin("iff", f, f), "biid", []), f);
+	}
+}
+
+// the residue closed by the DNF walk: |- (A ↔ B) when both sides reach the
+// same canonical DNF; own buffer, discarded on a miss
+mizEmitDnfIff(a : FolForm, b : FolForm) -> Maybe<FolStepProof> {
+	shaped = \f : FolForm -> switch (f) {
+		FolBin(__, __, __): true;
+		FolNeg(__): true;
+		default: false;
+	};
+	if (!shaped(a) && !shaped(b)) None()
+	else {
+		st2 : ref [FolPStep] = ref [];
+		ca = mizEmitDnfCanon(st2, a);
+		cb = mizEmitDnfCanon(st2, b);
+		if (ca.second != cb.second || length(^st2) > 600) None()
+		else {
+			bc = {
+				st2 := arrayPush(^st2, FolPStep(FolBin("iff", ca.second, b), "bicomi",
+					[FolPRefStep(cb.first)]));
+				length(^st2) - 1;
+			};
+			st2 := arrayPush(^st2, FolPStep(FolBin("iff", a, b), "bitri",
+				[FolPRefStep(ca.first), FolPRefStep(bc)]));
+			Some(FolStepProof(^st2, [], []));
+		}
+	}
+}
+
 // the residue closed by the walk alone: |- (A ↔ B) when both canonicalize to
 // the same form; own buffer, discarded when the walk does not apply
 mizEmitOrIff(a : FolForm, b : FolForm) -> Maybe<FolStepProof> {
@@ -5314,8 +5624,13 @@ mizEmitMemRewrite(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 				else {
 					// the ∨-tree walk first: a residue whose sides canonicalize to
 					// the same disjunction closes by citation alone, no refutation
+					// the ∨-walk first, then the DNF walk — the ∧/∨ distribution
+					// residues the pointwise pair-membership steps leave
 					walk = if (op != "iff") None()
-						else mizEmitOrIff(wa.second, wb.second);
+						else switch (mizEmitOrIff(wa.second, wb.second)) {
+							Some(w9): Some(w9);
+							None(): mizEmitDnfIff(wa.second, wb.second);
+						};
 					if (^mizEmitDbg && getUrlParameterDef("dbg-orwalk", "") == "1")
 						println("  ORWALK " + (if (isSome(walk)) "ok" else "miss")
 							+ " A=" + strGlue(folFormToks(wa.second), " ")
@@ -5480,8 +5795,14 @@ mizEmitFormNF(steps : ref [FolPStep], f : FolForm, depth : int) -> Maybe<Pair<in
 		FolPred(name, args):
 			if (name != "∈" || length(args) != 2) None()
 			else switch (args[1]) {
-				FolApp(op, as2): if (length(as2) != 2 || (op != "∪" && op != "∩" && op != "∖")) None()
-					else mizEmitMemNF(steps, args[0], args[1], 0);
+				FolApp(op, as2): if (length(as2) == 2 && (op == "∪" || op == "∩" || op == "∖"))
+						mizEmitMemNF(steps, args[0], args[1], 0)
+					// an explicit pair in a product opens by opelxp
+					else if (op == "×." && length(as2) == 2 && switch (args[0]) {
+						FolApp(vf, va): vf == "opair" && length(va) == 2;
+						default: false;
+					}) mizEmitMemNF(steps, args[0], args[1], 0)
+					else None();
 				default: None();
 			}
 		FolNeg(g): switch (mizEmitFormNF(steps, g, depth + 1)) {
