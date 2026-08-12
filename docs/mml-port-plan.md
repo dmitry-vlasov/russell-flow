@@ -1287,3 +1287,22 @@ enumset1 65/87, zfmisc 26/140, subset_1 0/53, xtuple_0 0/46, relat_1
 20/179). Next: census zfmisc_1/xboole_1 the same way (their heavy
 certificates hold the remaining export mass); the relat_1 open set
 (155 one-step-short) for what the chain still lacks; then S-C.
+
+### 2026-08-12 (later) — FOUNDATION REWRITE TWINS; 189 → 190; the pointwise lesson
+
+*Done (@417b7c70, verify + MM green, proved == closed = 190)*:
+mizEqcRewriteTwins — the foundation's distribution/absorption identities
+(xpundir family, difundir family, indi/indir/undi/undir, the ∅ and
+idempotence rows; every row the miz_set statement verbatim) join both
+chain builders as the commutativity twins do: matching term → twin term
++ kind-4 edge citing the lemma. zfmisc_1 26 → 27, floors held.
+
+*THE LESSON that redirects the size campaign*: zfmisc_1's heavy
+certificates (t120/t99/t97/t57 — 29 of its 58 MB) do NOT pass through
+the equation chain. Their Mizar proofs are POINTWISE: the by-steps are
+pair-membership matrices (`⟨a,b⟩ ∈ (X∪Y)×.Z ↔ …`) whose residue after
+the membership NF is an ∧/∨ DISTRIBUTION, and that closes in G3cp — the
+equation form never appears as a step goal. The next size unit is a
+DNF residue canonicalizer next to the ∨-tree walk (andir/andi + orbi
+congruence, insertion-sorted like mizEmitOrCanon), which would also
+serve xboole_1's t88/t25 class.
