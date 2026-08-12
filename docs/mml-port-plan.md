@@ -1382,3 +1382,28 @@ names the exact blockers, verified by hand against t50/t51:
 
 Both are general (every article's guarded families look like this);
 together they unblock the 48. This is the next session's first unit.
+
+### 2026-08-12 (night) — TERM-WITNESS CITATION: blocker (a) paid; 191 → 194
+
+*Done (@HEAD, verify + MM green, proved == closed = 194)*:
+mizEmitInstCiteT — a cited ∀-closed theorem is eliminated binder by
+binder through the spcgv + sethood chain at TERM witnesses drawn from
+the goal/assumption's compound subterms (t50 @ `x7 := proj1 x26`), the
+theorem's declared disjointedness mapped through the witnesses. Tuples:
+compound subterms (cap 3) × free variables, at least one compound
+element, cap 6 per citation; the plain-variable route unchanged.
+relat_1 20 → 23, all floors held.
+
+*Emit-gate parallelism, asked and answered*: within the 8-article gate
+set the import graph is a TOTAL CHAIN (tarski → xboole_0 → xboole_1 →
+enumset1 → xtuple_0 → zfmisc_1 → subset_1 → relat_1) — each article
+reads its dependencies' freshly emitted files, so no two can run
+together; article-level parallelism only pays at MML scale where levels
+are wide. The lever for the gate set is PER-THEOREM parallelism inside
+one article's emit (theorems need earlier theorems' statements, not
+their proofs) — the recorded next lever. to_mm already runs 3-wide.
+
+*Blocker (b) — hypothetical citation — remains*: t51-shaped theorems
+(hyps = own antecedents) are outside the citable table; citing one
+means proving each substituted hypothesis (ctx fact / ssid / eqid) as
+refs. The remaining v1→eq/⊆ family members that still fail want it.
