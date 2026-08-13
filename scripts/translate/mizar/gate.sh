@@ -42,8 +42,8 @@ MATH="${RUSSELL_MATH:-$HOME/dev/math}"
 BASELINE="$MATH/mizar-honest-baseline-20260810.tar.gz"
 # the emit chain, in dependency order — pass 1 MUST follow it
 ARTS="tarski xboole_0 xboole_1 enumset1 zfmisc_1 subset_1 xtuple_0 relat_1"
-# the articles with closed theorems to check; the other two have none yet
-MM_ARTS="tarski xboole_0 xboole_1 enumset1 zfmisc_1 relat_1"
+# the articles with closed theorems to check; xtuple_0 has none yet
+MM_ARTS="tarski xboole_0 xboole_1 enumset1 zfmisc_1 subset_1 relat_1"
 PHASE=all
 WIDTH=4
 MM_WIDTH=2
@@ -144,6 +144,13 @@ if [ "$PHASE" = all ] || [ "$PHASE" = mm ]; then
 		v=$( grep -h "MM_VERIFY" "$OUT/mm_$a.log" )
 		printf "  %-10s %s\n" "$a" "${v:-MM_VERIFY MISSING}"
 		echo "$v" | grep -q "success=true" || bad=1
+		# a read-ru syntax error silently DROPS a span of declarations and the
+		# export can still report success (caught 2026-08-13 on fn_×.3) — a
+		# partially-read source is a corrupted measurement, so it is RED
+		if grep -q "Syntax error" "$OUT/mm_$a.log"; then
+			echo "    ^ SYNTAX ERROR in read-ru — partial source, verdict void" >&2
+			bad=1
+		fi
 	done
 	[ $bad -eq 0 ] && echo "GATE GREEN" || { echo "GATE RED"; exit 1; }
 fi
