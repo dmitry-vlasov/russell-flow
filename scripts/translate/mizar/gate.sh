@@ -143,7 +143,13 @@ if [ "$PHASE" = all ] || [ "$PHASE" = mm ]; then
 	T3=$(date +%s)
 	running=0
 	for a in $MM_ARTS; do
-		( bin/russellj no-server=1 mem=16g translate/mizar/to_mm module=$a \
+		# a leftover database from an earlier round makes verify-mm bless a
+		# STALE export when write-mm silently produces nothing (caught
+		# 2026-08-13: relat_1's read failed, write-mm ran 0 s, and the
+		# verdict came from the previous session's file) — delete first,
+		# so a failed export is a MISSING file, which verify-mm reports
+		( rm -f /tmp/mizar_mm_$a/${a}_root.mm
+		  bin/russellj no-server=1 mem=16g translate/mizar/to_mm module=$a \
 			math="$MATH" out=/tmp/mizar_mm_$a > "$OUT/mm_$a.log" 2>&1 ) &
 		running=$((running+1))
 		if [ $running -ge $MM_WIDTH ]; then wait -n; running=$((running-1)); fi

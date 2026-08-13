@@ -784,17 +784,64 @@ mizAddStep(sig : MizSig, w : MizWalk, mprop : Maybe<MizXml>) -> MizWalk {
 // var collides with the free witness var. Russell accepts a var that is only-bound OR
 // only-free, but silently DROPS a hyp whose var is both bound (in one form) and free (in
 // another). Freshening the bound occurrence removes the collision without changing meaning.
+// ONE fresh name per bound NAME. A per-scope rename splits a reused binder
+// (d8's `∀x19 … ∃x19`) into two names, and a var→two-vars map is no
+// substitution — a step re-stating such a statement can never cite it
+// (the t39_relat_1 disproof, 2026-08-13). The per-scope walk is kept only
+// for the rare form where a name is bound AND free at once (the
+// given/consider collision this function was written for).
 mizFreshenBound(f : FolForm, avoid : ref Set<string>, ctr : ref int) -> FolForm {
+	frees = buildSet(mizFormFreeVars(f));
+	bnd = uniq(mizBoundNames(f, []));
+	if (exists(bnd, \v -> containsSet(frees, v))) mizFreshenScoped(f, avoid, ctr)
+	else {
+		ren = fold(bnd, makeTree(), \acc, v -> setTree(acc, v, mizFreshVar(avoid, ctr)));
+		if (sizeTree(ren) == 0) f else mizRenameAll(f, ren);
+	}
+}
+
+mizFreshenScoped(f : FolForm, avoid : ref Set<string>, ctr : ref int) -> FolForm {
 	switch (f) {
 		FolPred(__, __):  f;
 		FolEq(__, __):    f;
-		FolNeg(g):        FolNeg(mizFreshenBound(g, avoid, ctr));
-		FolBin(op, l, r): FolBin(op, mizFreshenBound(l, avoid, ctr), mizFreshenBound(r, avoid, ctr));
+		FolNeg(g):        FolNeg(mizFreshenScoped(g, avoid, ctr));
+		FolBin(op, l, r): FolBin(op, mizFreshenScoped(l, avoid, ctr), mizFreshenScoped(r, avoid, ctr));
 		FolQuant(op, vars, body): {
 			ren     = fold(vars, makeTree(), \acc, v -> setTree(acc, v, mizFreshVar(avoid, ctr)));
 			newvars = map(vars, \v -> lookupTreeDef(ren, v, v));
-			FolQuant(op, newvars, mizFreshenBound(mizRenameFree(body, ren), avoid, ctr));
+			FolQuant(op, newvars, mizFreshenScoped(mizRenameFree(body, ren), avoid, ctr));
 		}
+	}
+}
+
+mizBoundNames(f : FolForm, acc : [string]) -> [string] {
+	switch (f) {
+		FolPred(__, __): acc;
+		FolEq(__, __): acc;
+		FolNeg(g): mizBoundNames(g, acc);
+		FolBin(__, l, r): mizBoundNames(r, mizBoundNames(l, acc));
+		FolQuant(__, vs, b): mizBoundNames(b, concat(acc, vs));
+	}
+}
+
+// rename EVERY occurrence, binder lists included — only sound when the
+// renamed names are not free in the form (mizFreshenBound checks)
+mizRenameAll(f : FolForm, ren : Tree<string, string>) -> FolForm {
+	switch (f) {
+		FolPred(n, args): FolPred(n, map(args, \t -> mizRenameTermAll(t, ren)));
+		FolEq(l, r): FolEq(mizRenameTermAll(l, ren), mizRenameTermAll(r, ren));
+		FolNeg(g): FolNeg(mizRenameAll(g, ren));
+		FolBin(op, l, r): FolBin(op, mizRenameAll(l, ren), mizRenameAll(r, ren));
+		FolQuant(op, vs, b): FolQuant(op, map(vs, \v -> lookupTreeDef(ren, v, v)),
+			mizRenameAll(b, ren));
+	}
+}
+
+mizRenameTermAll(t : FolTerm, ren : Tree<string, string>) -> FolTerm {
+	switch (t) {
+		FolVar(nm): FolVar(lookupTreeDef(ren, nm, nm));
+		FolAbs(v, body): FolAbs(lookupTreeDef(ren, v, v), mizRenameAll(body, ren));
+		FolApp(nm, args): FolApp(nm, map(args, \a -> mizRenameTermAll(a, ren)));
 	}
 }
 
