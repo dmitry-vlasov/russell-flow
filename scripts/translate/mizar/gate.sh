@@ -103,10 +103,16 @@ if [ "$PHASE" = all ] || [ "$PHASE" = emit ]; then
 	wait
 	T2=$(date +%s); echo "pass 2 (proofs) done in $((T2-T1))s at width $WIDTH"
 
-	# every article must have finished before anything is moved into place
+	# every article must have finished before anything is moved into place.
+	# "written" alone is NOT enough: an article whose emitted text fails to
+	# parse still writes, still prints its closed count, and its verify
+	# reports vacuous true (caught 2026-08-13: a prefix-rendered ≠ broke the
+	# parse and 5 "closed" theorems were text that never loaded)
 	for a in $ARTS; do
 		grep -q "phase (a) written" "$OUT/p2_$a.log" \
 			|| { echo "PASS2 FAIL at $a" >&2; exit 1; }
+		grep -q "failed to parse" "$OUT/p2_$a.log" \
+			&& { echo "PASS2 PARSE FAIL at $a" >&2; exit 1; }
 	done
 	total=0
 	for a in $ARTS; do
@@ -126,6 +132,11 @@ if [ "$PHASE" = all ] || [ "$PHASE" = emit ]; then
 			"$MATH/mizar/$a.ru"
 	done | sort > "$OUT/closed.txt"
 	echo "closed list: $OUT/closed.txt ($(wc -l < "$OUT/closed.txt") theorems)"
+	# the reported total and the marker-extracted list must agree — they
+	# diverge exactly when an article's emitted text is not what its counts
+	# claim (the 2026-08-13 parse-failure round: total 200, list 195)
+	lc=$( wc -l < "$OUT/closed.txt" )
+	[ "$lc" -eq "$total" ] || { echo "EMIT COUNT $total != LIST $lc — RED" >&2; exit 1; }
 fi
 
 if [ "$PHASE" = all ] || [ "$PHASE" = mm ]; then
@@ -149,6 +160,16 @@ if [ "$PHASE" = all ] || [ "$PHASE" = mm ]; then
 		# partially-read source is a corrupted measurement, so it is RED
 		if grep -q "Syntax error" "$OUT/mm_$a.log"; then
 			echo "    ^ SYNTAX ERROR in read-ru — partial source, verdict void" >&2
+			bad=1
+		fi
+		# THE GATE LAW: proved must equal the emit phase's closed count —
+		# success=true with proved < closed means closed theorems never
+		# reached Metamath (same 2026-08-13 defect: the article's text did
+		# not parse, so its "closed" theorems were never exported)
+		n=$( grep -c "^$a " "$OUT/closed.txt" 2>/dev/null )
+		p=$( echo "$v" | sed -n "s/.*proved($a)=\([0-9]*\).*/\1/p" )
+		if [ -n "$p" ] && [ "${n:-0}" != "$p" ]; then
+			echo "    ^ proved=$p != closed=${n:-0} — MISMATCH, verdict void" >&2
 			bad=1
 		fi
 	done

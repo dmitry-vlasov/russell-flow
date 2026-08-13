@@ -937,7 +937,77 @@ mizEmitStrengthen(hyps : [FolForm], prev : [FolForm], asmB : FolForm, goal : Fol
 		}
 		default: [];
 	}));
-	concat(r1, if (length(r2) > 3) subrange(r2, 0, 3) else r2);
+	// round 3 — the ELEMENT BRIDGE (the type layer's membership twin): an asm
+	// conjunct `element A Y` is Mizar's silent type fact, and its meaning is
+	// membership. The element definition arrives in the pool as the record
+	// instance `(Y = ∅) ∨ ((element A Y) ↔ (A ∈ Y))`; when Y is a power class
+	// the empty case is refuted by the foundation (pwne0 + neii), the
+	// disjunction is eliminated (orel1 + ax-mp), and the membership follows
+	// under the assumption by mpbid. A variable member then gets the subset
+	// twin `A ⊆ t` by velpw — the fact subset_1's guards actually need.
+	empty0 = FolApp("∅", []);
+	r3 = concatA(map(conjs, \c -> switch (c) {
+		FolPred(nmE, argsE): if (nmE != "element" || length(argsE) != 2) [] else {
+			aE = argsE[0];
+			yE = argsE[1];
+			switch (yE) {
+				FolApp(fnY, argsY): if (fnY != "𝒫" || length(argsY) != 1) [] else {
+					tY = argsY[0];
+					memE = FolPred("∈", [aE, yE]);
+					iffE = FolBin("iff", c, memE);
+					orE = FolBin("or", FolEq(yE, empty0), iffE);
+					d1 = find(recDrv, \d -> d.steps != [] && d.form == orE);
+					switch (d1) {
+						None(): [];
+						Some(dd): {
+							base = length(^steps);
+							kf = length(^refs);
+							steps := concat(^steps, mizEmitShift(dd.steps, base, kf));
+							refs := concat(^refs, dd.refs);
+							dj := concat(^dj, dd.disjs);
+							d1idx = length(^steps) - 1;               // |- (Y=∅) ∨ (elem ↔ mem)
+							neS = emit(FolPred("≠", [yE, empty0]), "pwne0", []);
+							ngS = emit(FolNeg(FolEq(yE, empty0)), "neii", [FolPRefStep(neS)]);
+							o1 = emit(FolBin("imp", FolNeg(FolEq(yE, empty0)),
+								FolBin("imp", orE, iffE)), "orel1", []);
+							o2 = emit(FolBin("imp", orE, iffE), "ax-mp",
+								[FolPRefStep(ngS), FolPRefStep(o1)]);
+							iffS = emit(iffE, "ax-mp", [FolPRefStep(d1idx), FolPRefStep(o2)]);
+							switch (mizEmitProjTo(steps, asmB, c)) {
+								None(): [];
+								Some(pc): {
+									la = emit(FolBin("imp", asmB, iffE), "a1i", [FolPRefStep(iffS)]);
+									m1 = emit(FolBin("imp", asmB, memE), "mpbid",
+										[FolPRefStep(pc), FolPRefStep(la)]);
+									// the subset twin: a VARIABLE member of a power class
+									// (velpw is x∈𝒫A ↔ x⊆A with x,A disjoint — the member
+									// must not occur in the power class's argument)
+									sub = switch (aE) {
+										FolVar(av): if (mizEmitFreeIn(av, FolEq(tY, tY))) [] else {
+											ssE = mizEmitSs(aE, tY);
+											v1 = emit(FolBin("iff", memE, ssE), "velpw", []);
+											lv = emit(FolBin("imp", asmB, FolBin("iff", memE, ssE)),
+												"a1i", [FolPRefStep(v1)]);
+											[Pair(ssE, emit(FolBin("imp", asmB, ssE), "mpbid",
+												[FolPRefStep(m1), FolPRefStep(lv)]))];
+										}
+										default: [];
+									};
+									concat([Pair(memE, m1)], sub);
+								}
+							}
+						}
+					}
+				}
+				default: [];
+			}
+		}
+		default: [];
+	}));
+	if (^mizEmitDbg && r3 != [])
+		println("    STR r3(element)=" + i2s(length(r3)) + " :: "
+			+ strGlue(map(r3, \pr -> strGlue(folFormToks(pr.first), " ")), " | "));
+	concatA([r1, if (length(r2) > 3) subrange(r2, 0, 3) else r2, r3]);
 }
 
 // cand's block proves `P → qq` standalone (qq = ∀v (B → ∃ψ)); under asm:
@@ -4099,6 +4169,72 @@ mizEqcConjKeys(f : FolForm, depth : int) -> [string] {
 // discharge a guard: a step proving `ph → g` (deduction mode) / `g`
 // (inference mode), through the candidate pool; in deduction mode a guard
 // that is a CONJUNCT of the assumption is projected out (id + simpld/simprd)
+// the ELEMENT BRIDGE as a guard rule: a goal `A ∈ 𝒫 t` or `A ⊆ t` is proved
+// from an assumption conjunct `element A 𝒫 t` through the element
+// definition's record instance `(𝒫 t = ∅) ∨ ((element A 𝒫 t) ↔ (A ∈ 𝒫 t))`
+// (a pool candidate): pwne0 + neii refute the empty case, orel1 + ax-mp
+// eliminate the disjunction, mpbid lands the membership under the
+// assumption, and velpw adds the subset form (A a variable not occurring in
+// t — velpw's disjointedness). This is the meaning Mizar's `Element of` type
+// carries silently — the first type-layer fact the chains consume.
+mizEqcElemBridge(env : MizEqChainEnv, g : FolForm, depth : int) -> Maybe<FolPRef> {
+	if (isNone(env.ph)) None() else {
+		empty0 = FolApp("∅", []);
+		// (member, the power class's argument, goal-is-subset)
+		req = switch (g) {
+			FolPred(nmS, argsS):
+				if (nmS == "⊆" && length(argsS) == 2) Some(Triple(argsS[0], argsS[1], true))
+				else if (nmS == "∈" && length(argsS) == 2) switch (argsS[1]) {
+					FolApp(fp, ap): if (fp == "𝒫" && length(ap) == 1)
+						Some(Triple(argsS[0], ap[0], false)) else None();
+					default: None();
+				} else None();
+			default: None();
+		};
+		switch (req) {
+			None(): None();
+			Some(t3): {
+				aE = t3.first;
+				tY = t3.second;
+				yE = FolApp("𝒫", [tY]);
+				cE = FolPred("element", [aE, yE]);
+				memE = FolPred("∈", [aE, yE]);
+				iffE = FolBin("iff", cE, memE);
+				orE = FolBin("or", FolEq(yE, empty0), iffE);
+				okVar = switch (aE) {
+					FolVar(av): !t3.third || !mizEmitFreeIn(av, FolEq(tY, tY));
+					default: false;
+				};
+				ci = foldi(env.cands, -1, \i, ac, c ->
+					if (ac >= 0) ac else if (c.form == orE) i else -1);
+				if (!okVar || ci < 0) None()
+				else switch (mizEqcProveG(env, cE, depth - 1)) {
+					None(): None();
+					Some(hC): {
+						d1h = mizEqcCandH(env, ci);
+						ngS = mizEqcEmit(env, FolNeg(FolEq(yE, empty0)), "neii",
+							[mizEqcEmit(env, FolPred("≠", [yE, empty0]), "pwne0", [])]);
+						o2 = mizEqcEmit(env, FolBin("imp", orE, iffE), "ax-mp",
+							[ngS, mizEqcEmit(env, FolBin("imp", FolNeg(FolEq(yE, empty0)),
+								FolBin("imp", orE, iffE)), "orel1", [])]);
+						iffS = mizEqcEmit(env, iffE, "ax-mp", [d1h, o2]);
+						m1 = mizEqcEmit(env, mizEqcMkD(env, memE), "mpbid",
+							[hC, mizEqcEmit(env, mizEqcMkD(env, iffE), "a1i", [iffS])]);
+						if (!t3.third) Some(m1)
+						else {
+							ssE = mizEmitSs(aE, tY);
+							v1 = mizEqcEmit(env, FolBin("iff", memE, ssE), "velpw", []);
+							Some(mizEqcEmit(env, mizEqcMkD(env, ssE), "mpbid",
+								[m1, mizEqcEmit(env, mizEqcMkD(env, FolBin("iff", memE, ssE)),
+									"a1i", [v1])]));
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
 mizEqcProveG(env : MizEqChainEnv, g : FolForm, depth : int) -> Maybe<FolPRef> {
 	gk = mizEmitKey(g);
 	switch (lookupTree(^(env.guardH), gk)) {
@@ -4158,9 +4294,13 @@ mizEqcProveG(env : MizEqChainEnv, g : FolForm, depth : int) -> Maybe<FolPRef> {
 						});
 				}
 			}
-			switch (r) {
+			r2 = switch (r) {
+				None(): mizEqcElemBridge(env, g, depth);
+				Some(__): r;
+			};
+			switch (r2) {
 				None(): None();
-				Some(h): { env.guardH := setTree(^(env.guardH), gk, h); r; }
+				Some(h): { env.guardH := setTree(^(env.guardH), gk, h); r2; }
 			}
 		}
 	}
@@ -4307,6 +4447,42 @@ mizEqcTermIdx(env : MizEqChainEnv, t : FolTerm) -> int {
 	lookupTreeDef(env.uni, mizEmitTKey(t), -1);
 }
 
+// the keys the ELEMENT BRIDGE (mizEqcElemBridge) can prove, added to the
+// guard seed BEFORE the fixpoint: for an assumption conjunct
+// `element A 𝒫 t` whose element-definition or-instance is in the pool, the
+// membership `A ∈ 𝒫 t` and (variable member, velpw's disjointedness) the
+// subset `A ⊆ t`. Mirrors the bridge's own precondition exactly — an
+// admitted edge whose guard the bridge then cannot prove would abort the
+// path extraction.
+mizEqcElemSeedKeys(asm : Maybe<FolForm>, cands : [MizEqCand]) -> [string] {
+	c1 = \f2 : FolForm -> switch (f2) {
+		FolBin(op2, l2, r2): if (op2 == "and") [l2, r2] else [f2];
+		default: [f2];
+	};
+	conjs = switch (asm) {
+		None(): [];
+		Some(af): concatA(map(c1(af), c1));
+	};
+	concatA(map(conjs, \f -> switch (f) {
+		FolPred(nmE, argsE): if (nmE != "element" || length(argsE) != 2) [] else
+			switch (argsE[1]) {
+				FolApp(fp, ap): if (fp != "𝒫" || length(ap) != 1) [] else {
+					memE = FolPred("∈", argsE);
+					orE = FolBin("or", FolEq(argsE[1], FolApp("∅", [])),
+						FolBin("iff", f, memE));
+					if (!exists(cands, \c -> c.form == orE)) [] else
+						concat([mizEmitKey(memE)], switch (argsE[0]) {
+							FolVar(av): if (mizEmitFreeIn(av, FolEq(ap[0], ap[0]))) []
+								else [mizEmitKey(FolPred("⊆", [argsE[0], ap[0]]))];
+							default: [];
+						});
+				}
+				default: [];
+			}
+		default: [];
+	}));
+}
+
 mizEqcGuardFix(cands : [MizEqCand], s : Set<string>) -> Set<string> {
 	s2 = fold(cands, s, \ac, c -> switch (c.form) {
 		FolBin(op, g, f): if (op != "imp") ac
@@ -4433,7 +4609,8 @@ mizEmitEqChain(ctx : [Pair<FolForm, RuParseRef>], goal : FolForm,
 				Some(af): buildSet(mizEqcConjKeys(af, 2));
 			};
 			seed0 = fold(cands, seedA, \ac, c -> insertSet(ac, mizEmitKey(c.form)));
-			provable = mizEqcGuardFix(cands, seed0);
+			seedE = fold(mizEqcElemSeedKeys(asm, cands), seed0, insertSet);
+			provable = mizEqcGuardFix(cands, seedE);
 			// edges from candidate payloads whose guard is dischargeable
 			payloads = filtermap(mapi(cands, \ci, c -> Pair(ci, mizEqcPayload(c.form))),
 				\pr -> switch (pr.second) {
@@ -4952,7 +5129,8 @@ mizEmitSsChain(ctx : [Pair<FolForm, RuParseRef>], goal : FolForm,
 				Some(af): buildSet(mizEqcConjKeys(af, 2));
 			};
 			seed0 = fold(cands, seedA, \ac, c -> insertSet(ac, mizEmitKey(c.form)));
-			provable = mizEqcGuardFix(cands, seed0);
+			seedE = fold(mizEqcElemSeedKeys(asm, cands), seed0, insertSet);
+			provable = mizEqcGuardFix(cands, seedE);
 			// equation payloads exactly as the eq-chain reads them
 			payloads = filtermap(mapi(cands, \ci, c -> Pair(ci, mizEqcPayload(c.form))),
 				\pr -> switch (pr.second) {
