@@ -50,6 +50,10 @@ MM_WIDTH=2
 # NOT under /tmp: that is a 31 GB tmpfs, i.e. RAM. A round writes ~4 GB of
 # working copies, and putting them in RAM competes with the exports that
 # already peak at 17 GB — one more reason the OOM killer fired.
+# ★ THE SAME MISTAKE SURVIVED IN THE METAMATH HALF until 2026-08-14: the
+# exports were written to /tmp/mizar_mm_<article>, i.e. into RAM, ~800 MB a
+# round that never came back. They go under $OUT now. A dispatch round died
+# of oom-kill inside its own scope with 14 GB sitting in tmpfs.
 OUT="$HOME/mizar_runs/gate"
 
 for i in "$@"; do
@@ -154,9 +158,9 @@ if [ "$PHASE" = all ] || [ "$PHASE" = mm ]; then
 		# 2026-08-13: relat_1's read failed, write-mm ran 0 s, and the
 		# verdict came from the previous session's file) — delete first,
 		# so a failed export is a MISSING file, which verify-mm reports
-		( rm -f /tmp/mizar_mm_$a/${a}_root.mm
+		( rm -f "$OUT/mm_out_$a/${a}_root.mm"
 		  bin/russellj no-server=1 mem=16g translate/mizar/to_mm module=$a \
-			math="$MATH" out=/tmp/mizar_mm_$a > "$OUT/mm_$a.log" 2>&1 ) &
+			math="$MATH" out="$OUT/mm_out_$a" > "$OUT/mm_$a.log" 2>&1 ) &
 		running=$((running+1))
 		if [ $running -ge $MM_WIDTH ]; then wait -n; running=$((running-1)); fi
 	done
