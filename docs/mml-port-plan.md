@@ -1598,3 +1598,53 @@ exception (snelpwi).
 dependency order, then the ORIGINAL Metamath checker on 7 databases,
 all success=true, proved == closed) with no theorem lost in either
 direction — the closed LISTS were diffed, not the counts.
+
+### 2026-08-14 (session 3, later) — THE TACTIC-vs-MIZAR COMPARISON, measured
+
+*Prompted by the user's question — "aren't you making ad-hoc parts of the
+prover, why not use the established engine?"* The answer had to be a
+measurement, and the first one I ran was WRONG and is recorded here as the
+trap it is: a `prove_gaps` run I read as "the prover over the emitted
+article's open steps" had in fact read the EMITTED article (16,578
+gap-steps = every step of it, not the 31 open ones) and never verified,
+because `math=` does NOT reach these scripts' path resolution —
+`RUSSELL_MATH` decides. Pin the environment (`env RUSSELL_MATH=<dir>
+bin/russellj …`) or you measure `~/dev/math`, which after a gate holds the
+emitted articles. (The baseline tarball also lacks miz_aux.ru and
+xregular.ru — copy them in before proving.)
+
+*The honest run*: `def-close`, `tl=5s`, from the honest skeleton baseline,
+each article verified and exported to Metamath exactly as the gate does it.
+Theorems fully proved, tactic vs the Mizar emitter:
+
+| article | def-close | emitter |
+|---|---|---|
+| tarski | 0 / 3 | 2 / 3 |
+| xboole_0 | 4 / 8 | 3 / 8 |
+| xboole_1 | **89** / 116 | 87 / 116 |
+| enumset1 | 8 / 87 | **65** / 87 |
+| xtuple_0 | 0 / 46 | 1 / 46 |
+| relat_1 | 0 / 179 | **27** / 179 |
+
+★ THE VERDICT: the general tactic keeps up only on xboole_1 — flat,
+type-free, membership-level — and collapses everywhere else. It is not a
+substitute for the transcribed decision procedure, which is what the plan
+has always said; now it is measured rather than assumed.
+
+★ TWO THINGS WORTH KEEPING:
+ 1. 89 vs 87 on xboole_1 are NOT the same theorems. The union is bigger
+    than either, which is an argument for the composition the user
+    specified — `by_mizar` as ONE tactic among others — not for replacing
+    anything.
+ 2. What IS ad hoc in the emitter is the STORAGE of the library rows: a
+    hand-typed table of ~40 statements. The library is loaded (miz_set is
+    in `stateD.ru`) and Russell already has a tested matcher over loaded
+    assertions. NEXT UNIT, specified: read every hypothesis-free
+    foundation theorem's prop out of the loaded math, convert RuExp →
+    FolForm (the inverse of the folRule table in fol2ru.flow: wn/wi/wb/wa/
+    wo/wal/wex + the term constructors), index by canonical skeleton, and
+    let mizEmitFoundIffGoal look up that index instead of folding a
+    literal list. The bridges (guarded detachment, equivalence halves,
+    denied conjunction) stay as they are — they consume rows, whatever
+    the source. That deletes the hand list and reaches all ~9,300
+    statements instead of the 40 I typed.
