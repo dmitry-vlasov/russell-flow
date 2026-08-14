@@ -71,6 +71,12 @@ if [ "$PHASE" = all ] || [ "$PHASE" = emit ]; then
 	# place, so a round must never build on the previous round's output
 	[ -f "$BASELINE" ] || { echo "no baseline: $BASELINE" >&2; exit 1; }
 	tar -xzf "$BASELINE" -C "$MATH" || { echo "RESTORE FAILED" >&2; exit 1; }
+	# the parse cache survives jar changes and served OLD-jar parses of the
+	# dependency articles (2026-08-14: subset_1's zfmisc load failed on
+	# stale-named cached expressions, fell back to INLINING 145 zfmisc
+	# statements, and relat_1's merge then had duplicate labels + a failing
+	# read) — a round must start cache-cold
+	rm -rf "$MATH/mizar/.cache"
 
 	for a in $ARTS; do
 		bin/russellj no-server=1 mem=8g translate/mizar/translate \
