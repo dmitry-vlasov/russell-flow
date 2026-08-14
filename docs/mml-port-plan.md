@@ -1617,19 +1617,31 @@ xregular.ru — copy them in before proving.)
 each article verified and exported to Metamath exactly as the gate does it.
 Theorems fully proved, tactic vs the Mizar emitter:
 
-| article | def-close | emitter |
-|---|---|---|
-| tarski | 0 / 3 | 2 / 3 |
-| xboole_0 | 4 / 8 | 3 / 8 |
-| xboole_1 | **89** / 116 | 87 / 116 |
-| enumset1 | 8 / 87 | **65** / 87 |
-| xtuple_0 | 0 / 46 | 1 / 46 |
-| relat_1 | 0 / 179 | **27** / 179 |
+| article | def-close | emitter | both | union |
+|---|---|---|---|---|
+| tarski | 0 / 3 | **2** | 0 | 2 |
+| xboole_0 | **4** / 8 | 3 | 3 | 4 |
+| xboole_1 | **89** / 116 | 87 | 75 | **101** |
+| enumset1 | 8 / 87 | **65** | 8 | 65 |
+| zfmisc_1 | **48** / 140 | 45 | 28 | **65** |
+| subset_1 | 0 / 53 | **7** | 0 | 7 |
+| xtuple_0 | 0 / 46 | **1** | 0 | 1 |
+| relat_1 | 0 / 179 | **27** | 0 | 27 |
+| total | 149 | 237 | 114 | **272** |
 
-★ THE VERDICT: the general tactic keeps up only on xboole_1 — flat,
-type-free, membership-level — and collapses everywhere else. It is not a
-substitute for the transcribed decision procedure, which is what the plan
-has always said; now it is measured rather than assumed.
+★ THE VERDICT, and it is sharper than "the tactic is weaker": the two are
+GOOD AT DIFFERENT ARTICLES. On the flat set-theory articles (xboole_0,
+xboole_1, zfmisc_1) def-close is slightly AHEAD of the Mizar route; where
+enumerated sets, soft types and relations start (enumset1, subset_1,
+xtuple_0, relat_1) it proves 8, 0, 0, 0 against 65, 7, 1, 27 — it does not
+reach that mathematics at all. And even where the counts are close the
+THEOREMS DIFFER: on xboole_1 the two share only 75 of 87/89, on zfmisc_1
+only 28 of 45/48.
+★ SO THE COMPOSITION IS WORTH 272 vs 237 TODAY — +35 theorems, xboole_1
+101/116 and zfmisc_1 65/140 — which is exactly the by_mizar-as-one-tactic
+design the user has specified, now with a number attached. (The union is
+a paper union of two separately gated runs, so it is what composing them
+should yield, not yet a pipeline result.)
 
 ★ TWO THINGS WORTH KEEPING:
  1. 89 vs 87 on xboole_1 are NOT the same theorems. The union is bigger
