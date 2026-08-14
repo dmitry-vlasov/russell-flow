@@ -67,3 +67,65 @@ the port in this form is not viable and we say so instead of grinding.
 No new bespoke closers in the emitter. The library-row table, the chains
 and the bridges stay as they are (they already work by citation), but they
 stop growing case by case.
+
+---
+
+## THE CENSUS — measured on the whole MML, 2026-08-14
+
+`bin/mizarj article-list=mml.lar jobs=8 census=1`, 1,497 articles, all
+verified, 21 minutes. **1,389,675 inferences, 2,203,810 disjuncts.**
+
+### The closing rule
+
+| code | disjuncts | share | cumulative | rule |
+|---|---|---|---|---|
+| 45 | 1,520,083 | 68.98% | 68.98% | one universal premise instantiated |
+| 19 | 163,072 | 7.40% | 76.37% | reflexivity over one class |
+| 20 | 75,537 | 3.43% | 79.80% | complementary literal pair |
+| 2 | 72,390 | 3.28% | 83.09% | attribute clash at typing |
+| 21 | 63,463 | 2.88% | 85.97% | type membership visible in the class |
+| 1 | 52,622 | 2.39% | 88.35% | attribute clash at typing |
+| 47 | 48,519 | 2.20% | 90.56% | two universal premises unified |
+| 11 | 38,542 | 1.75% | 92.31% | attribute clash at cluster rounding |
+| 43 | 21,235 | 0.96% | 93.27% | type membership refuted |
+| 49 | 20,956 | 0.95% | 94.22% | Fraenkel membership |
+| 40 | 18,802 | 0.85% | 95.07% | type membership refuted |
+
+★ **SEVEN codes close 90.6% of the library's disjuncts. Eleven close 95%.**
+The distribution is steep — this is the "go" answer the criterion asked for.
+
+### By family, which is how the lemmas group
+
+| family | codes | share |
+|---|---|---|
+| universal instantiation | 45, 47 | **71.2%** |
+| equality and propositional | 19, 20, 25 | **11.2%** |
+| soft types — attributes and clusters | 1, 2, 6, 8, 9, 10, 11, 21, 40, 41, 43 | **13.9%** |
+| Fraenkel membership | 48, 49 | 1.8% |
+| arithmetic and order | 26, 31, 32, 33, 50 | 1.5% |
+
+### The case split is narrow
+
+Split width, disjuncts per inference: **1,029,631 of 1,389,675 inferences
+(74%) have exactly ONE disjunct**, and 38,115 more are settled by
+normalization alone. So 77% of steps need no case analysis at all — which
+is the other half of the size problem, and it says the explosion we see is
+ours, not Mizar's.
+
+## What the census decides
+
+1. **Universal instantiation is the whole head of the distribution** and the
+   emitter already implements it (∀-elimination at the recorded witnesses,
+   sethood-discharged). So the failures we hit are NOT in the closing rules.
+   They are in what surrounds them: the premise assembly (definitional
+   expansion of atoms), the equality classes, and the type layer.
+2. **The soft-type family is 13.9% in ONE coherent mechanism** — attributes,
+   adjectives, cluster rounding — and it is not implemented at all. It is
+   the largest missing block and the next unit, exactly as the roadmap's
+   stage S-C said, but now with a number.
+3. **Equality is 11.2%** and the eq-chain builder already covers part of it.
+4. Fraenkel, arithmetic and order together are 3.3% — correctly last.
+
+So the order of work is: the type layer (13.9%), then the equality
+completion (11.2%), then Fraenkel (1.8%). Nothing else is worth touching
+until those are done.
