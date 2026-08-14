@@ -843,9 +843,119 @@ mizEmitExElimA(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolForm
 	});
 	switch (r1.first) {
 		Some(__): r1;
-		None(): mizEmitExChain(hyps, prev, asm, goal, maxFacts, maxSize, depth,
-			fresh, used, recDrv, ctx, r1);
+		None(): {
+			r2 = mizEmitExChain(hyps, prev, asm, goal, maxFacts, maxSize, depth,
+				fresh, used, recDrv, ctx, r1);
+			switch (r2.first) {
+				Some(__): r2;
+				None(): mizEmitExSupplyA(hyps, prev, asm, goal, maxFacts, maxSize,
+					depth, fresh, used, recDrv, r2);
+			}
+		}
 	}
+}
+
+// ---- GOAL SUPPLY THROUGH AN ∃-IMPLICATION ----
+// The pair-matrix BACKWARD half `∃z ψ → ⟨u,v⟩ ∈ f(…)` is membership INTO a
+// defined term (Mizar's `then [x,y] in R (#) S`): prove the ∃ under the
+// assumption — the witness is COMPUTED by the one-hole match — splice the
+// implication, and reach the goal directly or across ONE equation bridge
+// `(eq) → (goal ↔ C)` whose eq the assumption projects (mpbird).
+mizEmitExSupplyA(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolForm,
+	maxFacts : int, maxSize : int, depth : int, fresh : ref int, used : Set<string>,
+	recDrv : [MizEmitDrv], failed : Pair<Maybe<FolStepProof>, bool>) -> Pair<Maybe<FolStepProof>, bool> {
+	dbgS = ^mizEmitDbg && getUrlParameterDef("dbg-exelim", "") == "1";
+	// candidate implications: ∃-shaped antecedent, consequent linked to the
+	// goal — equal to it, or bridged by an eq-bridge fact of the pool
+	cands = filtermap(recDrv, \d -> if (d.steps == []) None() else switch (d.form) {
+		FolBin(op9, e9, c9): if (op9 != "imp") None() else switch (e9) {
+			FolQuant(q9, __, __): if (q9 != "exists") None()
+				else if (c9 == goal) Some(Pair(d, None()))
+				else switch (find(recDrv, \b -> b.steps != [] && switch (b.form) {
+					FolBin(opB, __, iffB): opB == "imp" && switch (iffB) {
+						FolBin(opI, gl, cc): opI == "iff" && gl == goal && cc == c9;
+						default: false;
+					};
+					default: false;
+				})) {
+					Some(br): Some(Pair(d, Some(br)));
+					None(): None();
+				};
+			default: None();
+		};
+		default: None();
+	});
+	capped = if (length(cands) > 3) subrange(cands, 0, 3) else cands;
+	if (dbgS && capped != [])
+		println("  EXSUP n=" + i2s(length(capped)) + " :: "
+			+ strGlue(map(capped, \p9 -> strGlue(folFormToks(p9.first.form), " ")), " | "));
+	fold(capped, failed, \acc : Pair<Maybe<FolStepProof>, bool>, cand -> switch (acc.first) {
+		Some(__): acc;
+		None(): switch (cand.first.form) {
+			FolBin(__, exE, cC): switch (exE) {
+				FolQuant(__, vsE, bodyE): {
+					// the witness-substituted body's own pair memberships key
+					// the DIAGONAL matrix instances (`⟨u,u⟩ ∈ id T`) the
+					// sub-proof needs and the caller's producer never saw
+					pmxS = mizEmitPairMatrixDrvs(bodyE, recDrv, ^mizEmitShOfRef);
+					sub = mizEmitExGoalA(hyps, prev, asm, exE, vsE, bodyE,
+						maxFacts, maxSize, depth + 1, fresh, used,
+						Pair(None(), false), concat(recDrv, pmxS));
+					switch (sub.first) {
+						None(): acc;
+						Some(pr): {
+							steps : ref [FolPStep] = ref pr.steps;
+							refs : ref [RuParseRef] = ref pr.factRefs;
+							dj : ref [Pair<string, string>] = ref pr.disjs;
+							exIdx = length(pr.steps) - 1;   // asm → ∃ψ
+							emit = \form : FolForm, lemma : string, rs : [FolPRef] -> {
+								steps := arrayPush(^steps, FolPStep(form, lemma, rs));
+								length(^steps) - 1;
+							};
+							b0 = length(^steps);
+							k0 = length(^refs);
+							steps := concat(^steps, mizEmitShift(cand.first.steps, b0, k0));
+							refs := concat(^refs, cand.first.refs);
+							dj := concat(^dj, cand.first.disjs);
+							bC = length(^steps) - 1;        // |- ∃ψ → C
+							c1 = emit(FolBin("imp", asm, cC), "syl",
+								[FolPRefStep(exIdx), FolPRefStep(bC)]);
+							switch (cand.second) {
+								None(): {
+									if (dbgS) println("  EXSUP ok direct");
+									Pair(Some(FolStepProof(^steps, ^refs, uniq(^dj))), false);
+								}
+								Some(br): switch (br.form) {
+									FolBin(__, eqF, iffF): {
+										switch (mizEmitProjTo(steps, asm, eqF)) {
+											None(): acc;
+											Some(pe): {
+												b1 = length(^steps);
+												k1 = length(^refs);
+												steps := concat(^steps, mizEmitShift(br.steps, b1, k1));
+												refs := concat(^refs, br.refs);
+												dj := concat(^dj, br.disjs);
+												bB = length(^steps) - 1;   // |- eq → (goal ↔ C)
+												s2 = emit(FolBin("imp", asm, iffF), "syl",
+													[FolPRefStep(pe), FolPRefStep(bB)]);
+												fin = emit(FolBin("imp", asm, goal), "mpbird",
+													[FolPRefStep(c1), FolPRefStep(s2)]);
+												if (dbgS) println("  EXSUP ok bridged");
+												Pair(Some(FolStepProof(^steps, ^refs, uniq(^dj))), false);
+											}
+										}
+									}
+									default: acc;
+								}
+							}
+						}
+					}
+				}
+				default: acc;
+			}
+			default: acc;
+		}
+	});
 }
 
 // ---- THE FIRST LINK: the assumed atom's own definition ----
@@ -1711,6 +1821,56 @@ mizEmitReduceA0(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolFor
 	}
 }
 
+// reflexive equations (`t = t`) occurring as atoms of the pool's facts,
+// discharged by eqid — the tableau holds `=` atoms as opaque, so a matrix
+// instance guarded by `u = u` is unusable without this
+mizEmitEqidDrvs(pool : [MizEmitDrv]) -> [MizEmitDrv] {
+	eqs = uniq(filtermap(concatA(map(pool, \d -> mizEmitAtomsOf(d.form, []))),
+		\a -> switch (a) {
+			FolEq(l9, r9): if (l9 == r9) Some(a) else None();
+			default: None();
+		}));
+	map(if (length(eqs) > 4) subrange(eqs, 0, 4) else eqs,
+		\e -> MizEmitDrv(e, [FolPStep(e, "eqid", [])], [], []));
+}
+
+// one-hole structural match: does `tgt` equal `pat` with the variable `x`
+// replaced by ONE consistent term? Returns that term. Every other variable
+// must match verbatim — they are fixed at this stage.
+mizEmitMatchHole(pat : FolForm, tgt : FolForm, x : string) -> Maybe<FolTerm> {
+	hole : ref Maybe<FolTerm> = ref None();
+	ok = switch (pat) {
+		FolPred(n1, a1): switch (tgt) {
+			FolPred(n2, a2): n1 == n2 && length(a1) == length(a2)
+				&& forall(mapi(a1, \i, p9 -> Pair(p9, a2[i])),
+					\pr9 -> mizEmitMatchHoleT(pr9.first, pr9.second, x, hole));
+			default: false;
+		};
+		FolEq(l1, r1): switch (tgt) {
+			FolEq(l2, r2): mizEmitMatchHoleT(l1, l2, x, hole)
+				&& mizEmitMatchHoleT(r1, r2, x, hole);
+			default: false;
+		};
+		default: false;
+	};
+	if (ok) ^hole else None();
+}
+mizEmitMatchHoleT(p : FolTerm, t : FolTerm, x : string, hole : ref Maybe<FolTerm>) -> bool {
+	switch (p) {
+		FolVar(v): if (v != x) p == t else switch (^hole) {
+			None(): { hole := Some(t); true; }
+			Some(t0): t0 == t;
+		};
+		FolApp(n1, a1): switch (t) {
+			FolApp(n2, a2): n1 == n2 && length(a1) == length(a2)
+				&& forall(mapi(a1, \i, p9 -> Pair(p9, a2[i])),
+					\pr9 -> mizEmitMatchHoleT(pr9.first, pr9.second, x, hole));
+			default: false;
+		};
+		default: p == t;
+	}
+}
+
 // An ∃ GOAL under the assumption — mizEmitExGoal's deduction twin. The binder
 // itself as witness needs 19.8a + syl; a term witness w needs the congruence
 // walk, spcegv (whose disjointness is the same no-capture rule), the witness's
@@ -1733,8 +1893,34 @@ mizEmitExGoalA(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolForm
 	names = uniq(concatA(map(
 		concatA(map(concatA([^mems, ^subs, ^eqs]), \p -> [p.first, p.second])),
 		mizEmitTermVars)));
-	cands = concat([x], filter(if (length(names) > 6) subrange(names, 0, 6) else names,
-		\n -> n != x));
+	// COMPUTED witnesses first: match each body atom containing the binder
+	// against the context's quantifier-free atoms with the binder as the one
+	// hole — the witness of `∃z (⟨a,z⟩∈R ∧ ⟨z,b⟩∈S)` is COMPUTED from the
+	// membership the context already states, never guessed (a blind witness
+	// pool tried `⟨x26,x12⟩ ∈ x26`-shaped nonsense and burned a full
+	// reduction per miss — the t52 diagnosis)
+	ctxQF = filter(concatA([hyps, prev, mizEmitConjuncts(asm, [])]),
+		\f -> !mizEmitHasQuant(f));
+	bodyAtoms = filter(mizEmitAtomsOf(body, []), \a2 -> mizEmitFreeIn(x, a2));
+	ctxAtoms = uniq(concatA(map(ctxQF, \f -> mizEmitAtomsOf(f, []))));
+	scoreW = \t9 : FolTerm -> length(filter(bodyAtoms, \pa ->
+		exists(ctxAtoms, \fa -> mizEmitMatchHole(pa, fa, x) == Some(t9))));
+	computed0 = filtermap(
+		uniq(concatA(map(bodyAtoms, \pa ->
+			filtermap(ctxAtoms, \fa -> mizEmitMatchHole(pa, fa, x))))),
+		\t9 -> switch (t9) {
+			FolVar(v9): if (v9 != x) Some(v9) else None();
+			default: None();
+		});
+	computedR = mergeSort(computed0, \a9, b9 -> scoreW(FolVar(b9)) - scoreW(FolVar(a9)));
+	computed = if (length(computedR) > 3) subrange(computedR, 0, 3) else computedR;
+	if (^mizEmitDbg && getUrlParameterDef("dbg-exelim", "") == "1" && computed != [])
+		println("  EXGW computed= " + strGlue(computed, ",")
+			+ " body= " + strGlue(folFormToks(body), " "));
+	blindCap = if (computed == []) 6 else 3;
+	blind = filter(if (length(names) > blindCap) subrange(names, 0, blindCap) else names,
+		\n -> n != x && !contains(computed, n));
+	cands = concat(computed, concat([x], blind));
 	fold(cands, direct, \acc : Pair<Maybe<FolStepProof>, bool>, y -> switch (acc.first) {
 		Some(__): acc;
 		None(): {
@@ -1758,8 +1944,14 @@ mizEmitExGoalA(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolForm
 				switch (mizEmitWalkT(wsteps, djr, x, FolVar(y), rest)) {
 					None(): acc;
 					Some(w): {
+						// the SUBSTITUTED body's pair memberships key the
+						// matrix instances the sub-proof needs — the diagonal
+						// `⟨u,u⟩ ∈ id T` only exists after substitution; its
+						// `u = u` sides are discharged by eqid facts
+						pmxW = mizEmitPairMatrixDrvs(w.second, recDrv, ^mizEmitShOfRef);
+						eqdW = mizEmitEqidDrvs(concat(pmxW, recDrv));
 						sub = mizEmitReduceA(hyps, prev, asm, w.second, maxFacts, maxSize,
-							depth + 1, fresh, used, recDrv);
+							depth + 1, fresh, used, concatA([recDrv, pmxW, eqdW]));
 						switch (sub.first) {
 							None(): acc;
 							Some(pr): {
