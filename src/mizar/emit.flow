@@ -54,6 +54,7 @@ export {
 	// comms installs the defs-by-symbol lookup (definitions + constructor types
 	// indexed by the symbols they mention, imported ones included)
 	mizEmitSetDefsOfSym(fn : (string) -> [string]) -> void;
+	mizEmitSetRegsOfSym(fn : (string) -> [string]) -> void;
 	// the ARTICLE symbols a form mentions (not the foundation's ∈ / ⊆ / = …)
 	mizFormSymbols(f : FolForm) -> [string];
 	// derived facts re-stated as an equivalence instead of the checker's normal form
@@ -95,6 +96,13 @@ mizEmitShOfRef : ref ((string) -> string) = ref (\__ -> "");
 // was the measured budget-blowing dead end.
 mizEmitStmtOfRef : ref ((string) -> Maybe<FolForm>) = ref (\__ -> None());
 mizEmitDefsOfSymRef : ref ((string) -> [string]) = ref (\__ -> []);
+// THE TYPE LAYER's supply: the cluster REGISTRATIONS indexed by the functor
+// they speak about. A registration is what gives a term its attributes ("the
+// powerset of anything is non empty"), the checker applies them WITHOUT
+// citation — the type record's F half names them per firing — and the
+// translator already emits them as citable axioms (fc<N>_<article>). Indexed
+// by functor because that is how a step meets them: it mentions the term.
+mizEmitRegsOfSymRef : ref ((string) -> [string]) = ref (\__ -> []);
 // the current step's CITED statements (name, statement): a step with no
 // record facts previously got NOTHING from its by-list — the citations only
 // served the record matcher. Rung 3 instantiates these at the stage's free
@@ -163,6 +171,7 @@ mizEmitHypWhy() -> string {
 }
 mizEmitRecUsed() -> int { ^mizEmitRecCount; }
 mizEmitSetDefsOfSym(fn : (string) -> [string]) -> void { mizEmitDefsOfSymRef := fn; }
+mizEmitSetRegsOfSym(fn : (string) -> [string]) -> void { mizEmitRegsOfSymRef := fn; }
 mizEmitRecReset() -> void {
 	mizEmitRecCount := 0; mizEmitRecCites := 0; mizEmitRecMatch := 0;
 	mizEmitFailUnprov := 0; mizEmitFailNodes := 0; mizEmitFailSteps := 0;
@@ -2798,7 +2807,14 @@ mizEmitLadderA(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 						println("  CITE-HYP cands=" + i2s(length(^mizEmitCiteHypsRef))
 							+ " made=" + i2s(length(hypDrvs0))
 							+ " :: " + strGlue(map(hypDrvs0, \d9 -> strGlue(folFormToks(d9.form), " ")), " ;; "));
-					citeDrvs1 = uniqBy(concat(citeDrvs0, hypDrvs0),
+					// the TYPE LAYER's own channel: the registrations that type the step's
+					// terms, instantiated where they fire. Cited by nobody, so nothing else
+					// can supply them.
+					regDrvs = mizEmitRegDrvs(goal, asm, ^mizEmitStmtOfRef, ^mizEmitShOfRef);
+					if (^mizEmitDbg && regDrvs != [])
+						println("  REG " + i2s(length(regDrvs)) + " :: "
+							+ strGlue(map(regDrvs, \d9 -> strGlue(folFormToks(d9.form), " ")), " ; "));
+					citeDrvs1 = uniqBy(concatA([citeDrvs0, hypDrvs0, regDrvs]),
 						\d2, d3 -> mizEmitKey(d2.form) == mizEmitKey(d3.form));
 					citeDrvs = if (length(citeDrvs1) > 12) subrange(citeDrvs1, 0, 12) else citeDrvs1;
 					// a GUARDED instance (`Relation (X~) → field (X~) = …`) is inert
@@ -3368,6 +3384,73 @@ mizEmitInstCite(name : string, stmt : FolForm, ws : [string]) -> Maybe<MizEmitDr
 			Some(dps7): Some(MizEmitDrv(fin.first, ^steps, [], uniq(concat(^dj, dps7))));
 		}
 	}
+}
+
+// ---- THE TYPE LAYER: REGISTRATIONS INSTANTIATED AT THE STEP'S OWN TERMS ----
+// A cluster registration says what attributes a term shape carries — "the
+// powerset of anything is non empty" (fc1_zfmisc_1), "a singleton is non
+// empty" (fc2_xboole_0). The checker applies them with NO citation (the type
+// record's F half is the only thing that names them), so the by-list can
+// never supply the type guard a discharge is looking for, and the emitter's
+// type family has been closing nothing.
+//
+// The supply is mechanical once the registrations are indexed by the functor
+// they speak about: take each compound subterm the step mentions, look up the
+// registrations for its head, MATCH the registration's own term against it to
+// recover the witnesses, and instantiate. The instantiation is the existing
+// spcgv+sethood chain — a type fact is an instance of an axiom the article
+// already states, not a new proof shape.
+mizEmitRegTermsOf(stmt : FolForm, f : string, arity : int) -> [FolTerm] {
+	// the registration's own occurrences of the functor, as patterns over its
+	// binders (the pattern whose match against a concrete term gives the
+	// witness tuple)
+	filter(mizEmitCompTerms(mizEmitMatrixOfQ(stmt)), \t -> switch (t) {
+		FolApp(nm, args): nm == f && length(args) == arity;
+		default: false;
+	});
+}
+
+// the ∀-prefix stripped, for reading the statement's term shapes
+mizEmitMatrixOfQ(f : FolForm) -> FolForm {
+	switch (f) {
+		FolQuant(q, __, body): if (q != "forall") f else mizEmitMatrixOfQ(body);
+		default: f;
+	}
+}
+
+mizEmitRegDrvs(goal : FolForm, asm : Maybe<FolForm>,
+	stmtOf : (string) -> Maybe<FolForm>, shOf : (string) -> string) -> [MizEmitDrv] {
+	terms = uniqBy(concat(mizEmitCompTerms(goal),
+			switch (asm) { None(): []; Some(af): mizEmitCompTerms(af); }),
+		\a, b -> mizEmitTKey(a) == mizEmitTKey(b));
+	// the step's own terms, biggest cut first — a registration fires on the
+	// term as written, so there is nothing to search for
+	ts = if (length(terms) > 8) subrange(terms, 0, 8) else terms;
+	concatA(map(ts, \t -> switch (t) {
+		FolApp(fn, args): concatA(map((^mizEmitRegsOfSymRef)(fn), \nm ->
+			switch (stmtOf(nm)) {
+				None(): [];
+				Some(st): {
+					n = mizEmitPrefixLen(st);
+					if (n == 0 || n > 3) [] else {
+						binders = map(enumFromTo(0, n - 1), \i -> mizEmitBinderAt(st, i));
+						metas = buildSet(binders);
+						// the witness tuple is READ OFF the match, never guessed
+						pats = mizEmitRegTermsOf(st, fn, length(args));
+						subs = filtermap(pats, \pt ->
+							switch (mizEmitMatchT(pt, t, metas, Some(makeTree()))) {
+								None(): None();
+								Some(sub): if (mizEmitSubT(pt, sub) != t) None()
+									else if (exists(binders, \b -> !containsKeyTree(sub, b))) None()
+									else Some(map(binders, \b -> lookupTreeDef(sub, b, FolVar(b))));
+							});
+						filtermap(if (length(subs) > 2) subrange(subs, 0, 2) else subs,
+							\ws -> mizEmitInstCiteT(nm, st, ws, shOf));
+					}
+				}
+			}));
+		default: [];
+	}));
 }
 
 // the same citation instantiated at TERM witnesses (a goal subterm such as
