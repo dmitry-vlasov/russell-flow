@@ -703,10 +703,33 @@ mizEmitPairMatrixDrvs(asm : FolForm, pool : [MizEmitDrv],
 			}
 		default: [];
 	}));
-	if (^mizEmitDbg && getUrlParameterDef("dbg-exelim", "") == "1" && r != [])
-		println("  PMX n=" + i2s(length(r)) + " :: "
-			+ strGlue(map(r, \d3 -> strGlue(folFormToks(d3.form), " ")), " | "));
-	r;
+	// pre-discharge REFLEXIVE guards: a half `g → ((t=t) → C)` (d10's
+	// diagonal instance) forces the tableau through the opaque `t=t` atom
+	// and an eqid fact two hops from the goal — offer `g → C` directly
+	rr = concat(r, concatA(map(r, \d3 -> switch (d3.form) {
+		FolBin(op8, g8, c8): if (op8 != "imp") [] else switch (c8) {
+			FolBin(op7, e7, c7): if (op7 != "imp") [] else switch (e7) {
+				FolEq(l7, r7): if (l7 != r7) [] else {
+					st3 : ref [FolPStep] = ref d3.steps;
+					em3 = \f3 : FolForm, lm3 : string, rs3 : [FolPRef] -> {
+						st3 := arrayPush(^st3, FolPStep(f3, lm3, rs3));
+						length(^st3) - 1;
+					};
+					e3 = em3(e7, "eqid", []);
+					f3 = em3(FolBin("imp", g8, c7), "mpi",
+						[FolPRefStep(e3), FolPRefStep(length(d3.steps) - 1)]);
+					[MizEmitDrv(FolBin("imp", g8, c7), ^st3, d3.refs, d3.disjs)];
+				}
+				default: [];
+			};
+			default: [];
+		};
+		default: [];
+	})));
+	if (^mizEmitDbg && getUrlParameterDef("dbg-exelim", "") == "1" && rr != [])
+		println("  PMX n=" + i2s(length(rr)) + " :: "
+			+ strGlue(map(rr, \d3 -> strGlue(folFormToks(d3.form), " ")), " | "));
+	rr;
 }
 
 // `g → M[u,v]` from a pool block proving `g → ∀a∀b M`: the two instance
@@ -2005,8 +2028,39 @@ mizEmitExGoalA(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolForm
 						// `u = u` sides are discharged by eqid facts
 						pmxW = mizEmitPairMatrixDrvs(w.second, recDrv, ^mizEmitShOfRef);
 						eqdW = mizEmitEqidDrvs(concat(pmxW, recDrv));
-						sub = mizEmitReduceA(hyps, prev, asm, w.second, maxFacts, maxSize,
-							depth + 1, fresh, used, concatA([recDrv, pmxW, eqdW]));
+						poolW = concatA([recDrv, pmxW, eqdW]);
+						// a CONJUNCTIVE witness body splits: two small
+						// certificates joined by jca, instead of one whose
+						// tableau blows the node cap on the pooled facts
+						// (t65's 6-step proof was reachable and the whole-∧
+						// attempt still died on `nodes`); the ∧-split of the
+						// reduction is depth-gated at this point
+						sub = switch (w.second) {
+							FolBin(opW, wA, wB): if (opW != "and")
+									mizEmitReduceA(hyps, prev, asm, w.second, maxFacts, maxSize,
+										depth + 1, fresh, used, poolW)
+								else switch (mizEmitReduceA(hyps, prev, asm, wA, maxFacts, maxSize,
+										depth + 1, fresh, used, poolW).first) {
+									None(): Pair(None(), false);
+									Some(pA): switch (mizEmitReduceA(hyps, prev, asm, wB,
+											maxFacts, maxSize, depth + 1, fresh, used, poolW).first) {
+										None(): Pair(None(), false);
+										Some(pB): {
+											bJ = length(pA.steps);
+											kJ = length(pA.factRefs);
+											stJ = concatA([pA.steps, mizEmitShift(pB.steps, bJ, kJ),
+												[FolPStep(FolBin("imp", asm, w.second), "jca",
+													[FolPRefStep(bJ - 1),
+													 FolPRefStep(bJ + length(pB.steps) - 1)])]]);
+											Pair(Some(FolStepProof(stJ,
+												concat(pA.factRefs, pB.factRefs),
+												uniq(concat(pA.disjs, pB.disjs)))), false);
+										}
+									}
+								};
+							default: mizEmitReduceA(hyps, prev, asm, w.second, maxFacts, maxSize,
+								depth + 1, fresh, used, poolW);
+						};
 						switch (sub.first) {
 							None(): acc;
 							Some(pr): {
@@ -7493,11 +7547,164 @@ mizEmitDefInstance(nm : string, sym : string, stepAtoms : [FolForm],
 				};
 				ops = if (isNone(byTerm) && isSome(byMeans)) ["eqidmp"] else [];
 				switch (ws0) {
-					None(): None();
+					// the plain prefix walk failed — a GUARD-INTERLEAVED
+					// definition (`∀R (rel R → ∀X ∀it (rel it → (eq ↔ M)))`,
+					// d11_relat_1's shape) keeps its inner loci out of the
+					// matchable set; retry with the generalized walk
+					None(): mizEmitDefInstanceG(nm, sym, stepAtoms, st, binders, shOf);
 					Some(ws): mizEmitRecordDrv(nm, st, ws, ops, shOf);
 				}
 			}
 		}
+	}
+}
+
+// ---- GUARD-INTERLEAVED INSTANCING ----
+// A definition whose loci sit behind nested type guards:
+//   ∀R (rel R → ∀X ∀it (rel it → (eq ↔ ∀∀matrix)))
+// The generalized walk collects binders THROUGH the guards, stopping at
+// the iff core so the matrix binders stay quantified; the assembly
+// eliminates each binder UNDER the guards (instance implication composed
+// by syl / syl6), and a reflexive means-equation is discharged by
+// eqid + mpbi/mpbii (two guards first curried together by `imp`).
+mizEmitDefInstanceG(nm : string, sym : string, stepAtoms : [FolForm],
+	st : FolForm, plainBinders : [string], shOf : (string) -> string) -> Maybe<MizEmitDrv> {
+	gp = mizEmitPrefixGm(st, [], 0);
+	if (length(gp.first) <= length(plainBinders) || gp.second > 2) None()
+	else {
+		metas = buildSet(gp.first);
+		pts = mizEmitDefiendumTerms(gp.third, sym);
+		tts = uniq(concatA(map(stepAtoms, \a -> mizEmitSymTerms(a, sym))));
+		byTerm = mizEmitFirstTermMatch(pts, tts, metas, gp.first);
+		ws0 = switch (byTerm) {
+			Some(__): byTerm;
+			None(): switch (mizEmitMeansVar(gp.third, sym, metas)) {
+				None(): None();
+				Some(mv): {
+					rest = filter(gp.first, \b -> b != mv);
+					switch (mizEmitFirstTermMatchAt(pts, tts, metas, rest)) {
+						None(): None();
+						Some(pr): Some(arrayPush(pr.first, Pair(mv, pr.second)));
+					}
+				}
+			}
+		};
+		switch (ws0) {
+			None(): None();
+			Some(ws): mizEmitRecordDrvG(nm, st, ws, shOf);
+		}
+	}
+}
+
+// binders and guard count through the interleaved prefix; the iff core
+// (and anything else) stops the walk
+mizEmitPrefixGm(f : FolForm, accV : [string], guards : int) -> Triple<[string], int, FolForm> {
+	switch (f) {
+		FolQuant(q, vs, b): if (q == "forall") mizEmitPrefixGm(b, concat(accV, vs), guards)
+			else Triple(accV, guards, f);
+		FolBin(op, l, r): if (op == "imp") mizEmitPrefixGm(r, accV, guards + 1)
+			else Triple(accV, guards, f);
+		default: Triple(accV, guards, f);
+	}
+}
+
+mizEmitRecordDrvG(premName : string, premise : FolForm,
+	wits : [Pair<string, FolTerm>], shOf : (string) -> string) -> Maybe<MizEmitDrv> {
+	steps : ref [FolPStep] = ref [FolPStep(premise, premName, [])];
+	dj : ref [Pair<string, string>] = ref [];
+	wt = pairs2tree(wits);
+	switch (mizEmitElimUnder(steps, dj, premise, 0, [], wt, shOf)) {
+		None(): None();
+		Some(fin): if (length(^steps) <= 1) None()
+			else switch (mizEmitMapThmDisjs(premName, \g7 ->
+					maybeMap(find(wits, \wp7 -> toLowerCase(wp7.first) == toLowerCase(g7)),
+						\wp7 -> wp7.second))) {
+				None(): None();
+				Some(dps7): Some(MizEmitDrv(fin.first, ^steps, [], uniq(concat(^dj, dps7))));
+			}
+	}
+}
+
+// eliminate the current position's ∀-binders at their witnesses, under the
+// accumulated guards; a guard is entered only while an eliminable binder
+// remains behind it
+mizEmitElimUnder(steps : ref [FolPStep], dj : ref [Pair<string, string>],
+	form : FolForm, idx : int, guards : [FolForm], wt : Tree<string, FolTerm>,
+	shOf : (string) -> string) -> Maybe<Pair<FolForm, int>> {
+	emit = \f9 : FolForm, lemma : string, rs : [FolPRef] -> {
+		steps := arrayPush(^steps, FolPStep(f9, lemma, rs));
+		length(^steps) - 1;
+	};
+	reattach = \c : FolForm -> foldr(guards, c, \acc, g -> FolBin("imp", g, acc));
+	switch (form) {
+		FolQuant(q, vs, b): if (q != "forall") Some(Pair(reattach(form), idx)) else {
+			v = vs[0];
+			switch (lookupTree(wt, v)) {
+				None(): Some(Pair(reattach(form), idx));
+				Some(w): switch (mizEmitInstImp(steps, dj, form, v, w, shOf, 0)) {
+					None(): None();
+					Some(im): {
+						ni = if (guards == [])
+								emit(im.second, "ax-mp",
+									[FolPRefStep(idx), FolPRefStep(im.first)])
+							else if (length(guards) == 1)
+								emit(FolBin("imp", guards[0], im.second), "syl",
+									[FolPRefStep(idx), FolPRefStep(im.first)])
+							else
+								emit(FolBin("imp", guards[0], FolBin("imp", guards[1], im.second)),
+									"syl6", [FolPRefStep(idx), FolPRefStep(im.first)]);
+						mizEmitElimUnder(steps, dj, im.second, ni, guards, wt, shOf);
+					}
+				}
+			}
+		}
+		FolBin(op, l, r): if (op == "imp" && length(guards) < 2
+				&& (mizEmitNeedsElim(r, wt) || mizEmitIsReflIff(r)))
+				mizEmitElimUnder(steps, dj, r, idx, arrayPush(guards, l), wt, shOf)
+			else if (op == "iff") switch (l) {
+				FolEq(el, er): if (el != er) Some(Pair(reattach(form), idx)) else {
+					// the means-equation became `t = t` — discharge it here so
+					// the instance's core is the matrix itself
+					e = emit(l, "eqid", []);
+					fin = if (guards == [])
+							emit(r, "mpbi", [FolPRefStep(e), FolPRefStep(idx)])
+						else if (length(guards) == 1)
+							emit(FolBin("imp", guards[0], r), "mpbii",
+								[FolPRefStep(e), FolPRefStep(idx)])
+						else {
+							gg = FolBin("and", guards[0], guards[1]);
+							c = emit(FolBin("imp", gg, form), "imp", [FolPRefStep(idx)]);
+							emit(FolBin("imp", gg, r), "mpbii",
+								[FolPRefStep(e), FolPRefStep(c)]);
+						};
+					Some(Pair((^steps)[fin].form, fin));
+				}
+				default: Some(Pair(reattach(form), idx));
+			}
+			else Some(Pair(reattach(form), idx));
+		default: Some(Pair(reattach(form), idx));
+	}
+}
+
+// the walk must still ENTER a final guard whose consequent is the
+// reflexive-equation core — nothing behind it needs elimination, but the
+// equation is discharged there
+mizEmitIsReflIff(f : FolForm) -> bool {
+	switch (f) {
+		FolBin(op2, l2, __): op2 == "iff" && switch (l2) {
+			FolEq(a2, b2): a2 == b2;
+			default: false;
+		};
+		default: false;
+	}
+}
+
+mizEmitNeedsElim(f : FolForm, wt : Tree<string, FolTerm>) -> bool {
+	switch (f) {
+		FolQuant(q, vs, b): q == "forall"
+			&& (exists(vs, \v -> containsKeyTree(wt, v)) || mizEmitNeedsElim(b, wt));
+		FolBin(op, __, r): op == "imp" && mizEmitNeedsElim(r, wt);
+		default: false;
 	}
 }
 
