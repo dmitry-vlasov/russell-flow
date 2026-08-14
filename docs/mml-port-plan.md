@@ -1546,3 +1546,55 @@ twin table grows two rows*:
 *A/B protocol note*: closed-theorem LISTS (not counts) decided this —
 extractor over the emitted articles (open step marker `= ?`), old jar
 from git for the baseline run. Counts alone would have hidden a swap.
+
+### 2026-08-14 (session 3) — CITE THE LIBRARY, part 3: 211 → 231
+
+*The method is now mechanical and it keeps paying*: census the OPEN goals
+straight out of the emitted `.ru` (`= ?` steps), canonicalise each one
+(variables renamed in order of first appearance), and look it up in
+miz_set by its STATEMENT. Every hit is a library lemma the flat search
+was re-deriving; the fix is one table row, copied verbatim.
+
+*Round 1 (@bc6d7f82, gate 211 → 221, zfmisc_1 31 → 41)*: fourteen rows —
+uni0, uniun, inxp, pwuni, uniin, elssuni, uniss, sspw, xpss1, xpss2,
+xpss12 unguarded; pwidg, unisng, snssg, uniprg guarded. Two placement
+gaps went with them:
+ * the tables were selected BY GOAL SHAPE — an inclusion goal saw only
+   the subset chain, an equivalence goal never saw the guarded rows.
+   Which table applies is a property of the ROW, so both are tried at
+   every shape now (foundTbl in the by-step dispatch);
+ * a one-guard row had no detachment lemma (only mp2an/mp3an were
+   wired): a single guard is vex at a setvar and detaches with ax-mp.
+   A guarded equivalence is also read backwards (bicomi).
+
+*Round 2 (gate 221 → 231, xboole_1 75 → 84, zfmisc_1 41 → 42)*: ★ THE
+NEGATION NORMAL FORM BRIDGE. The checker writes a by-step goal as a
+DENIED CONJUNCTION `¬ (A₁ ∧ (A₂ ∧ … ∧ ¬ C))`, never as the implication
+`(A₁ ∧ … ∧ Aₙ) → C` the library states — that spelling alone hid every
+implication row from the table, and the whole transitivity family was
+being re-derived. mizEmitFoundNegGoal matches the row against the
+IMPLICATION and walks the proof back to the goal's spelling: iman (the
+last conjunct is negated) or imnan (it is not), then one anass per extra
+conjunct, lifted under the negation by notbii and transported by mpbi.
+With it, the inclusion / proper-inclusion rows fire: sstr, unss, ssin,
+psstr, psssstr, sspsstr, ssnpss, pssn2lp, npss0, pssss, dfpss3, sspss.
+An implication goal is also matched as an equivalence row's HALF in the
+unguarded table (biimpi / biimpri), which is how unss and ssin apply.
+
+*Round 3 (gate 231 → 237, xboole_1 84 → 87, zfmisc_1 42 → 45)*: the nine
+rows the census still named — unss12, ss2in, ssdisj, snelpwi, xpsspw,
+xpid11, difxp, difsnid, ssdifsn.
+
+*★ THE SEAM IS NOW EMPTY, and that is the finding to act on*: after round
+3 the matcher run with a commutativity-insensitive key (arguments of
+∪ ∩ △ = ↔ ∧ ∨ sorted) reports ZERO further hits — no exact match, no
+commuted one. More library rows will not move this gate set. relat_1's 166 open goals and xtuple_0's 69 match NOTHING in the
+library: they speak of article constructors (proj1, restriction,
+composition), so they are the A-map / type-layer work, not row work.
+subset_1's 52 are the `element X 𝒫 Y` type layer (S-C) with one
+exception (snelpwi).
+
+*Gate protocol note*: both rounds ran the full gate (8 articles in
+dependency order, then the ORIGINAL Metamath checker on 7 databases,
+all success=true, proved == closed) with no theorem lost in either
+direction — the closed LISTS were diffed, not the counts.
