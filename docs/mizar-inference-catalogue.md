@@ -129,3 +129,39 @@ ours, not Mizar's.
 So the order of work is: the type layer (13.9%), then the equality
 completion (11.2%), then Fraenkel (1.8%). Nothing else is worth touching
 until those are done.
+
+## Type layer, step 1: the record (done, 2026-08-14)
+
+The type family (13.9% of all disjuncts) could not be emitted because the
+record was 6% complete: `RoundUpCluster` wrote its conditional firings
+(`<Round kind="C">`), while the FUNCTOR registrations — the ones that give a
+term its attributes in the first place — were a debug print. Both halves are
+now recorded, and the term is serialized structurally, in the dialect
+`deriv.flow` already parses:
+
+    <Round kind="F" article="ZFMISC_1" nr="1" trm="K1(A1)" typ="..."
+           before="-V1 ()" after="-V1 ()V2 ()">
+      <Func kind="K" nr="1"><LocusVar nr="1"/></Func>
+    </Round>
+
+subset_1: 46 lines -> 725. The verifier is unchanged (recording is off unless
+asked for; 25 articles re-verified).
+
+Two findings that decide how the emitter consumes it:
+
+1. **The registrations are already citable.** The translator emits them as
+   `fc<N>_<article>` / `rc<N>_<article>` axioms (e.g. `fc2_xboole_0`:
+   `∀l1 ¬({l1} = ∅)`), so the record's `article`/`nr` join them directly. A
+   type fact is therefore an INSTANCE of an existing axiom — the same
+   ∀-elimination the emitter already performs — not a new proof shape.
+2. **The firings are mostly on concrete terms, not on patterns.** Of
+   subset_1's 706 F firings: 448 ground, 180 with a constant, 27 with a
+   variable, and only 24 on locus patterns. So the record names the actual
+   terms of the article and can be consumed as a table: term -> the
+   registration that gave it its attributes.
+
+★ NEXT (the emitter half): for each recorded firing at a by-step's terms,
+offer `fc<N>_<article>` instantiated at the term's arguments as a fact, and
+index those facts by the attribute they conclude — the type guards the
+discharge currently fails to find. The gate is subset_1 (7/53 today) and
+relat_1 (27/179).
