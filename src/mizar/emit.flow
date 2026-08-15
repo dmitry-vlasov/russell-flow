@@ -2826,7 +2826,11 @@ mizEmitLadderA(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 					// every step doubled the emit time for two theorems — the whole point
 					// of the record's codes is that a channel need not fire everywhere
 					regDrvs = if (!mizEmitStepIsTyped()) []
-						else mizEmitRegDrvs(goal, asm, ^mizEmitStmtOfRef, ^mizEmitShOfRef);
+						else concat(
+							mizEmitRegDrvs(goal, asm, ^mizEmitStmtOfRef, ^mizEmitShOfRef),
+							// ...and the MEANING of the step's Mizar types, which the checker
+							// uses without citing it
+							mizEmitTypeIffDrvs(goal, asm, ^mizEmitStmtOfRef, ^mizEmitShOfRef));
 					if (^mizEmitDbg && regDrvs != [])
 						println("  REG " + i2s(length(regDrvs)) + " :: "
 							+ strGlue(map(regDrvs, \d9 -> strGlue(folFormToks(d9.form), " ")), " ; "));
@@ -2922,7 +2926,10 @@ mizEmitLadderA(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 								}
 							}
 						}
-						FolPred(gn9, ga9): if (gn9 == "⊆" && length(ga9) == 2)
+						FolPred(gn9, ga9): if (gn9 == "element")
+							// a Mizar TYPE goal has its own fixed shape (no search)
+							mizEmitTypeGoal(goal, asm, ^mizEmitStmtOfRef, ^mizEmitShOfRef)
+							else if (gn9 == "⊆" && length(ga9) == 2)
 							// an inclusion goal may ALSO be a library row (pwuni, uniin,
 							// xpss1): the chain runs first, the table catches what no
 							// chain of the offered edges can join
@@ -3399,6 +3406,148 @@ mizEmitInstCite(name : string, stmt : FolForm, ws : [string]) -> Maybe<MizEmitDr
 			None(): None();
 			Some(dps7): Some(MizEmitDrv(fin.first, ^steps, [], uniq(concat(^dj, dps7))));
 		}
+	}
+}
+
+// ---- THE TYPE LAYER: THE MEANING OF A MIZAR TYPE, BY CITATION ----
+// `element t D` is Mizar's "t is an Element of D". Its meaning is stated by
+// the article's own mode definition — for SUBSET_1 that is
+//   ∀D ∀t ( ( D = ∅ ∨ ( element t D ↔ t ∈ D ) ) ∧ ( D = ∅ → … ) )
+// — and the checker uses it with NO citation, so the by-list never supplies
+// it and every `element` goal has been going to the flat search unarmed.
+//
+// The bridge is a FIXED shape, not a search: instantiate the definition at
+// (D, t), take the left conjunct, kill the `D = ∅` disjunct from the type's
+// non-emptiness, and what remains is `element t D ↔ t ∈ D`. Non-emptiness of
+// a powerset is `∅ ∈ 𝒫 Y` (0elpw) through n0i. The membership that remains
+// is ordinary set theory, which the library rows already state.
+mizEmitTypeIffDrvs(goal : FolForm, asm : Maybe<FolForm>,
+	stmtOf : (string) -> Maybe<FolForm>, shOf : (string) -> string) -> [MizEmitDrv] {
+	empty0 = FolApp("∅", []);
+	atoms = uniqBy(concat(mizEmitAtomsOf(goal, []),
+			switch (asm) { None(): []; Some(af): mizEmitAtomsOf(af, []); }),
+		\a, b -> mizEmitKey(a) == mizEmitKey(b));
+	defs = (^mizEmitDefsOfSymRef)("element");
+	if (defs == []) [] else concatA(map(atoms, \at -> switch (at) {
+		FolPred(nm, args): if (nm != "element" || length(args) != 2) [] else {
+			tE = args[0];
+			dE = args[1];
+			memE = FolPred("∈", [tE, dE]);
+			iffE = FolBin("iff", at, memE);
+			orE = FolBin("or", FolEq(dE, empty0), iffE);
+			// the non-emptiness of the type. 𝒫 Y always has ∅ in it; any other
+			// shape declines rather than guess (the checker knows it from the
+			// registrations, and that is a later slice)
+			nonEmpty = switch (dE) {
+				FolApp(fp, ap): if (fp != "𝒫" || length(ap) != 1) None()
+					else Some(Pair(FolPred("∈", [empty0, dE]), "0elpw"));
+				default: None();
+			};
+			switch (nonEmpty) {
+				None(): [];
+				// THE INSTANCE IS MATCHED, NOT ELIMINATED AT WITNESSES. The mode
+				// definition binds `∀ x5 ∀ xd2`, and the article's own free
+				// variable is called x5 too — eliminating the binder at `𝒫 x5`
+				// is then a capture and spcgv's disjointedness condition
+				// (rightly) refuses it. mizEmitDefInstance matches the
+				// definition's own atom against the step's instead, which is how
+				// every other definitional channel here survives the collision.
+				// ...and the definition's BOUND VARIABLES are renamed away from
+				// everything the step mentions first. SUBSET_1's mode definition
+				// binds `x5`, the article's own free variable is `x5`, and the
+				// match then reads as a capture and is refused — the same trap
+				// the rung-3 channel hit, with the same fix (mizFreshenBound).
+				Some(ne): {
+					avoid = ref buildSet(concatA(map(atoms, mizFormAllVars)));
+					ctr = ref 0;
+					stmtF = \nm5 : string -> switch (stmtOf(nm5)) {
+						None(): None();
+						Some(st5): Some(mizFreshenBound(st5, avoid, ctr));
+					};
+					concatA(map(defs, \dn ->
+					switch (mizEmitDefInstance(dn, "element", [at], stmtF, shOf)) {
+						None(): { if (^mizEmitDbg) println("  TYPEIFF " + dn + " no-instance"); []; }
+						Some(d0): {
+								// the instance must be the definition's own shape:
+								// `(D = ∅ ∨ (element t D ↔ t ∈ D)) ∧ …`
+								ok = switch (d0.form) {
+									FolBin(op1, l1, __): op1 == "and" && l1 == orE;
+									default: false;
+								};
+								if (!ok) {
+									if (^mizEmitDbg) println("  TYPEIFF " + dn + " shape :: "
+										+ strGlue(folFormToks(d0.form), " ")
+										+ "  WANT left = " + strGlue(folFormToks(orE), " "));
+									[];
+								} else {
+									n0 = length(d0.steps);
+									// simpl is a THEOREM here — `(φ ∧ ψ) → φ` — not a
+									// one-premise rule, so the conjunct comes off by
+									// citing it and detaching (the verifier caught the
+									// rule reading at once)
+									steps = concat(d0.steps, [
+										FolPStep(FolBin("imp", d0.form, orE), "simpl", []),
+										FolPStep(orE, "ax-mp",
+											[FolPRefStep(n0 - 1), FolPRefStep(n0)]),
+										FolPStep(ne.first, ne.second, []),
+										FolPStep(FolBin("imp", ne.first,
+											FolNeg(FolEq(dE, empty0))), "n0i", []),
+										FolPStep(FolNeg(FolEq(dE, empty0)), "ax-mp",
+											[FolPRefStep(n0 + 2), FolPRefStep(n0 + 3)]),
+										FolPStep(FolBin("imp", FolNeg(FolEq(dE, empty0)),
+											FolBin("imp", orE, iffE)), "orel1", []),
+										FolPStep(FolBin("imp", orE, iffE), "ax-mp",
+											[FolPRefStep(n0 + 4), FolPRefStep(n0 + 5)]),
+										FolPStep(iffE, "ax-mp",
+											[FolPRefStep(n0 + 1), FolPRefStep(n0 + 6)])]);
+									[MizEmitDrv(iffE, steps, d0.refs, d0.disjs)];
+								}
+							}
+					}));
+				}
+			}
+		}
+		default: [];
+	}));
+}
+
+// THE TYPE GOAL, CLOSED OUTRIGHT. `element t 𝒫 Y` is Mizar for "t is a
+// Subset of Y". When the goal IS that — no assumption, and t is ∅, which the
+// library says is in every powerset (0elpw) — the whole proof is fixed: the
+// meaning bridge from mizEmitTypeIffDrvs, the membership by citation, mpbir.
+// Nothing searches. Other shapes decline rather than guess; they need the
+// step's own antecedent, which is the next slice.
+mizEmitTypeGoal(goal : FolForm, asm : Maybe<FolForm>,
+	stmtOf : (string) -> Maybe<FolForm>, shOf : (string) -> string) -> Maybe<FolStepProof> {
+	switch (goal) {
+		FolPred(nm, args): if (nm != "element" || length(args) != 2 || isSome(asm)) None()
+			else {
+				tE = args[0];
+				dE = args[1];
+				isEmpty = switch (tE) {
+					FolApp(ft, at2): ft == "∅" && at2 == [];
+					default: false;
+				};
+				isPw = switch (dE) {
+					FolApp(fp, ap): fp == "𝒫" && length(ap) == 1;
+					default: false;
+				};
+				if (!isEmpty || !isPw) None() else {
+					memE = FolPred("∈", [tE, dE]);
+					drvs = mizEmitTypeIffDrvs(goal, asm, stmtOf, shOf);
+					if (^mizEmitDbg) println("  TYPEGOAL bridge drvs=" + i2s(length(drvs))
+						+ " defs=" + strGlue((^mizEmitDefsOfSymRef)("element"), ","));
+					if (drvs == []) None() else {
+						d0 = drvs[0];
+						n0 = length(d0.steps);
+						steps = concat(d0.steps, [
+							FolPStep(memE, "0elpw", []),
+							FolPStep(goal, "mpbir", [FolPRefStep(n0), FolPRefStep(n0 - 1)])]);
+						Some(FolStepProof(steps, d0.refs, d0.disjs));
+					}
+				}
+			}
+		default: None();
 	}
 }
 
