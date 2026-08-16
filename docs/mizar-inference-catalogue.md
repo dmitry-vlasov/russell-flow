@@ -338,3 +338,55 @@ not a renaming one.
 Also in this unit: the failing-step diagnostic now prints the step's
 hypotheses and prior steps, the recorded witnesses, the kill pairing and the
 closing code, so a failing step can be read against what the proof had in hand.
+
+## Why the recorded instance is not there: the three buckets (2026-08-16)
+
+With the binder declines gone, the honest coverage question is what a failing
+step still lacks. Measured per failing step whose record HAS the checker's
+refutation, does the recorded INSTANCE appear among the facts offered?
+
+    subset_1   49 failing steps, 31 with a refutation, 26 miss their instance
+    relat_1   169 failing steps, 64 with a refutation, 64 miss their instance
+
+So the blocker is no longer the propositional endgame — it is that the
+instance is never built. Bucketed by cause (per instance, not per step):
+
+    subset_1   9 premise did not translate · 0 no candidate · 37 no match · 2 other
+    relat_1    0 premise did not translate · 34 no candidate · 128 no match · 2 other
+
+★ "NO MATCH" IS THE BUCKET, and reading one case named two causes, both in the
+matcher and neither in the mathematics.
+
+ 1. THE UNIVERSALS BEHIND A GUARD. The checker instantiates every universal of
+    its premise, including those an implication hides — `t2_subset_1` is
+    `∀A∀B ( B is Subset of A → ∀C ( C is Subset of A → … ) )` and comes back
+    instantiated at C with both guards standing. Only the leading prefix was
+    eliminable. The walk through the guards already existed for guard-interleaved
+    DEFINITIONS (mizEmitPrefixGm + mizEmitRecordDrvG, which eliminates each binder
+    under the guards by syl/syl6); it was simply never offered to the record's own
+    join. It is now, with the matching side (`mizEmitPrefixGe`/`mizEmitStripGm`)
+    mirroring the assembly's own descent rule — a guard is entered only while an
+    eliminable binder remains behind it, at most two. The plain walk descends
+    through EVERY implication, which on `… → ( ∀xd4 φ → B ⊆ C )` counts a third
+    guard and gives up.
+
+ 2. ★ A BOUND VARIABLE'S NAME IS NOT PART OF THE STATEMENT. The instance keeps
+    the binders it did not eliminate under the CHECKER's names (`∀ xd4 …`) while
+    our statement carries ours (`∀ xq4 …`), and `mizEmitMatchF` required
+    `vs == vs2`. Every instance with a quantifier left in it was rejected on the
+    spelling. The target's binders are now renamed to the pattern's — a renaming,
+    refused if one of the pattern's names occurs free in the target's body — and
+    the final equality is alpha-tolerant for the same reason.
+
+MEASURED: no match 37 → 24 (subset_1) and 128 → 120 (relat_1); instances not
+offered 26 → 26 and 64 → 62. FULL GATE GREEN at 244 with the closed list
+IDENTICAL to the previous round — not one theorem moved, in either direction,
+and relat_1's emit time went 5m02 → 4m49.
+
+★ THE HONEST READING: this is a coverage and correctness fix that pays nothing
+yet. More of Mizar's own instances are now built, and the steps that receive
+them still do not close — which is the same lesson the fact budget keeps
+teaching, and it says the next question is not "how do we build more of the
+record" but "what does the step do with the record once it has it". The
+remaining no-match cases (24 and 120) are the next thing to read, and the
+34 relat_1 instances with NO candidate statement are a separate, simpler gap.
