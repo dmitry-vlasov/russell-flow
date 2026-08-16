@@ -437,3 +437,42 @@ instances introduce produced nothing at all, because the definition the leaf
 needs is named by no citation and its `element` skeleton finds no statement the
 generic instantiator can bind. Selection by skeleton at a leaf is a lottery, and
 this is the third measurement to say so.
+
+## The type layer's first rule: Element-of propagation (2026-08-16)
+
+The leaf that three measurements had pointed at needed one thing, and it was a
+RULE, not a fact: from `X is Element of 𝒫A` and `v ∈ X`, conclude
+`v is Element of A`. Mizar's type system carries it silently — the checker
+never states it, so it appears in no record, in no citation, and under no
+skeleton — which is why every route that searched for a statement failed.
+
+It cannot be a foundation lemma either: `element` is the ARTICLE's own
+definition (d1_subset_1), not a foundation symbol. So it is DERIVED, as a
+self-contained fact, from the same definition the checker expands:
+
+    ( 𝒫A = ∅ ) ∨ ( X is Element of 𝒫A ↔ X ∈ 𝒫A )      the definition at 𝒫A
+    ( A  = ∅ ) ∨ ( v is Element of A  ↔ v ∈ A  )      the definition at A
+
+The powerset case dies by pwne0 + neii + orel1; the second dies by ne0i under
+the membership itself (df-ne, orel1, mpi). Between them: biimpi, elpwi, ssel.
+The result is
+
+    ( X is Element of 𝒫A ) → ( ( v ∈ X ) → ( v is Element of A ) )
+
+which the tableau chains with the typed hypothesis it already has — and with
+the eigenvariable instance from the previous unit, which is what states that
+hypothesis about `v` in the first place. Both definition instances are found by
+the ordinary statement join (mizEmitRecFromCites over the skeleton index), so
+nothing here is named by hand.
+
+★ MEASURED, FULL GATE GREEN, all 7 Metamath databases verified, proved ==
+closed: 244 → 246, subset_1 9 → 11 theorems (17 → 19 by-steps), every other
+article unchanged. The closed list was diffed: +t2_subset_1, +t3_subset_1, and
+nothing lost. Emit time 385s → 382s.
+
+★ WHAT THIS SAYS ABOUT THE PLAN: the type layer is not a supply problem. Three
+sessions of work on getting more of the CHECKER's record into the step paid
+nothing, because what the typed steps lack is a rule Mizar never records. The
+next ones are the same shape and can be read off the same leaf: `Element of A`
+from a registration's non-emptiness, `Subset of A` composed with ⊆, and the
+`Element of 𝒫A` ↔ `Subset of A` identification.

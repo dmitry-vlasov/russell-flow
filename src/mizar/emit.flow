@@ -2474,7 +2474,9 @@ mizEmitCharGoalA(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolFo
 	subGoal = FolQuant("forall", [v], matrix);
 	sub = mizEmitReduceA(hyps, prev, asm, subGoal, maxFacts, maxSize, depth + 1,
 		fresh, used, concat(recDrv,
-			mizEmitEigenInsts(concatA([[asm], mizEmitConjuncts(asm, []), hyps, prev]), v)));
+			concat(
+				mizEmitEigenInsts(concatA([[asm], mizEmitConjuncts(asm, []), hyps, prev]), v),
+				mizEmitElemTypeFacts(concatA([mizEmitConjuncts(asm, []), hyps, prev]), v))));
 	switch (sub.first) {
 		None(): Pair(None(), direct.second || sub.second);
 		Some(pr): {
@@ -2773,6 +2775,113 @@ mizEmitEigenInsts(fs : [FolForm], v : string) -> [MizEmitDrv] {
 	insts;
 }
 
+// ---- MIZAR'S ELEMENT-OF TYPE PROPAGATION ----
+// From `X is Element of 𝒫A` and `v ∈ X` it follows that `v is Element of A`.
+// Mizar's type system carries this silently: the checker never states it, so it
+// is in no record and in no citation, and every subset-goal leaf that has to
+// use a typed hypothesis at its eigenvariable stops here (t2_subset_1 and its
+// family). It cannot be a foundation lemma — `element` is the ARTICLE's own
+// definition — so it is derived as a fact, once per (X, A) pair, from the same
+// definition the checker expands:
+//   (𝒫A = ∅) ∨ ( X is Element of 𝒫A ↔ X ∈ 𝒫A )   at 𝒫A
+//   (A  = ∅) ∨ ( v is Element of A  ↔ v ∈ A  )   at A
+// The powerset case dies by pwne0; the second one dies by ne0i, under the
+// membership itself. The result is the self-contained implication
+//   ( X is Element of 𝒫A ) → ( ( v ∈ X ) → ( v is Element of A ) )
+// so the tableau chains it with the typed hypothesis it already has.
+mizEmitElemDefInst(a : FolTerm, x : FolTerm) -> Maybe<MizEmitDrv> {
+	el = FolPred("element", [x, a]);
+	mem = FolPred("∈", [x, a]);
+	want = FolBin("or", FolEq(a, FolApp("∅", [])), FolBin("iff", el, mem));
+	mizEmitRecFromCites((^mizEmitBySkelRef)(mizEmitSkeleton(want)), want,
+		^mizEmitStmtOfRef, ^mizEmitIsAxiomRef, ^mizEmitShOfRef);
+}
+
+mizEmitElemTypeFacts(ctx : [FolForm], v : string) -> [MizEmitDrv] {
+	empty = FolApp("∅", []);
+	vt = FolVar(v);
+	// the typed context facts: `X is Element of 𝒫A`
+	pairs = filtermap(uniq(ctx), \f -> switch (f) {
+		FolPred(nm, args): if (nm != "element" || length(args) != 2) None()
+			else switch (args[1]) {
+				FolApp(fn, fa): if (fn != "𝒫" || length(fa) != 1) None()
+					else Some(Pair(args[0], fa[0]));
+				default: None();
+			}
+		default: None();
+	});
+	filtermap(subrange(pairs, 0, 2), \pr -> {
+		xT = pr.first;
+		aT = pr.second;
+		pw = FolApp("𝒫", [aT]);
+		switch (mizEmitElemDefInst(pw, xT)) {
+			None(): None();
+			Some(d1): switch (mizEmitElemDefInst(aT, vt)) {
+				None(): None();
+				Some(d2): {
+					steps : ref [FolPStep] = ref d1.steps;
+					emit = \form : FolForm, lemma : string, refs : [FolPRef] -> {
+						steps := arrayPush(^steps, FolPStep(form, lemma, refs));
+						length(^steps) - 1;
+					};
+					if (d1.steps == [] || d2.steps == [] || d1.refs != [] || d2.refs != []) None()
+					else {
+						i1 = length(d1.steps) - 1;             // the disjunction at 𝒫A
+						eX = FolPred("element", [xT, pw]);
+						mX = FolPred("∈", [xT, pw]);
+						ss = FolPred("⊆", [xT, aT]);
+						mvX = FolPred("∈", [vt, xT]);
+						mvA = FolPred("∈", [vt, aT]);
+						eV = FolPred("element", [vt, aT]);
+						iffX = FolBin("iff", eX, mX);
+						pwE = FolEq(pw, empty);
+						aE = FolEq(aT, empty);
+						// the powerset is never empty
+						ne = emit(FolPred("≠", [pw, empty]), "pwne0", []);
+						nn = emit(FolNeg(pwE), "neii", [FolPRefStep(ne)]);
+						or1 = emit(FolBin("imp", FolNeg(pwE),
+							FolBin("imp", (^steps)[i1].form, iffX)), "orel1", []);
+						or1b = emit(FolBin("imp", (^steps)[i1].form, iffX), "ax-mp",
+							[FolPRefStep(nn), FolPRefStep(or1)]);
+						ifX = emit(iffX, "ax-mp", [FolPRefStep(i1), FolPRefStep(or1b)]);
+						im1 = emit(FolBin("imp", eX, mX), "biimpi", [FolPRefStep(ifX)]);
+						pwi = emit(FolBin("imp", mX, ss), "elpwi", []);
+						im2 = emit(FolBin("imp", eX, ss), "syl",
+							[FolPRefStep(im1), FolPRefStep(pwi)]);
+						sel = emit(FolBin("imp", ss, FolBin("imp", mvX, mvA)), "ssel", []);
+						im3 = emit(FolBin("imp", eX, FolBin("imp", mvX, mvA)), "syl",
+							[FolPRefStep(im2), FolPRefStep(sel)]);
+						// the second definition instance, its block appended
+						base = length(^steps);
+						steps := concat(^steps, mizEmitShift(d2.steps, base, 0));
+						i2 = length(^steps) - 1;               // the disjunction at A
+						iffV = FolBin("iff", eV, mvA);
+						n0 = emit(FolBin("imp", mvA, FolPred("≠", [aT, empty])), "ne0i", []);
+						dn = emit(FolBin("iff", FolPred("≠", [aT, empty]), FolNeg(aE)), "df-ne", []);
+						dn1 = emit(FolBin("imp", FolPred("≠", [aT, empty]), FolNeg(aE)),
+							"biimpi", [FolPRefStep(dn)]);
+						n1 = emit(FolBin("imp", mvA, FolNeg(aE)), "syl",
+							[FolPRefStep(n0), FolPRefStep(dn1)]);
+						or2 = emit(FolBin("imp", FolNeg(aE),
+							FolBin("imp", (^steps)[i2].form, iffV)), "orel1", []);
+						or2b = emit(FolBin("imp", mvA, FolBin("imp", (^steps)[i2].form, iffV)),
+							"syl", [FolPRefStep(n1), FolPRefStep(or2)]);
+						or2c = emit(FolBin("imp", mvA, iffV), "mpi",
+							[FolPRefStep(i2), FolPRefStep(or2b)]);
+						bp = emit(FolBin("imp", mvA, FolBin("imp", mvA, eV)), "biimprd",
+							[FolPRefStep(or2c)]);
+						mv = emit(FolBin("imp", mvA, eV), "pm2.43i", [FolPRefStep(bp)]);
+						fin = FolBin("imp", eX, FolBin("imp", mvX, eV));
+						fi = emit(fin, "syl6", [FolPRefStep(im3), FolPRefStep(mv)]);
+						if (fi < 0) None()
+						else Some(MizEmitDrv(fin, ^steps, [], uniq(concat(d1.disjs, d2.disjs))));
+					}
+				}
+			}
+		}
+	});
+}
+
 mizEmitCharGoal(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 	a : FolTerm, b : FolTerm, op : string, lemma : string,
 	maxFacts : int, maxSize : int, depth : int,
@@ -2782,7 +2891,8 @@ mizEmitCharGoal(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 	matrix = FolBin(op, mizEmitMem(FolVar(v), a), mizEmitMem(FolVar(v), b));
 	subGoal = FolQuant("forall", [v], matrix);
 	sub = mizEmitReduce(hyps, prev, subGoal, maxFacts, maxSize, depth + 1, fresh, used,
-		concat(recDrv, mizEmitEigenInsts(concat(hyps, prev), v)));
+		concatA([recDrv, mizEmitEigenInsts(concat(hyps, prev), v),
+			mizEmitElemTypeFacts(concat(hyps, prev), v)]));
 	switch (sub.first) {
 		None(): Pair(None(), direct.second || sub.second);
 		Some(pr): {
