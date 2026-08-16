@@ -201,3 +201,42 @@ clause with a proof.
 What this rules out, on evidence rather than opinion: any further work on
 selecting, ranking or supplying facts. The fact side is solved; the normal
 form is not.
+
+## Why the two normal forms do not meet (2026-08-16)
+
+Measured on subset_1's failing steps, over the 464 clause literals the record
+carries for them:
+
+    0    share an atom with the step's goal
+    346  carry a symbol the goal never mentions
+    118  share symbols but no atom
+
+So Mizar's clause is not a rearrangement of our negated goal. It is the goal
+after the checker's own PreCheck: `ExpandAtomicAsTrue` replaces every atom
+whose predicate/attribute/functor has an expandable definition by its
+definiens, and `RemoveIntQuantifier` replaces inner quantifiers by fresh
+CONSTANTS. By the time the clause exists, the goal's own vocabulary is gone.
+
+★ THIS IS THE ANSWER TO THE THREE STALLED DESIGNS. Our tableau reasons in the
+article's vocabulary; the checker reasons in the expanded, skolemized one.
+Every fact we hand it is stated in the wrong language, which is why supplying
+Mizar's own premise changed nothing, why fact selection never mattered, and
+why the failing goal shapes are flat while Mizar's rules are steep.
+
+★ AND IT NAMES THE PIPELINE, in Mizar's own order (prechecker.pas 1087):
+  1. expand the goal's atoms by the definitions the checker used — RECORDED,
+     as <Expand article nr> (164 of them in subset_1), and a definition's
+     expansion is an iff, i.e. a citation;
+  2. skolemize the inner quantifiers — the eigenvariable machinery the
+     emitter already has in part (exlimiv / exlimdv chains);
+  3. the clause literals now exist in our proof, and the recorded kills apply
+     verbatim.
+Nothing in that chain is invented; every stage is Mizar's, and stages 1 and 3
+are already in the record.
+
+CAVEAT on the measurement: record atoms come through mizDerivForm and goal
+atoms through miz2ru, so a naming difference between the two dialects could
+inflate the "foreign" count. The 0 is what matters and it is too clean to be
+naming alone — but the first thing the next unit should do is print one
+failing step's goal and clause side by side and confirm the vocabulary gap is
+expansion, not spelling.
