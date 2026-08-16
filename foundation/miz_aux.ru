@@ -327,3 +327,170 @@ theorem symdifex (A : class, B : class) {
 	step 5 : wff = eleq1i (step 4) |- ( ( ( A △ B ) ∈ _V ) ↔ ( ( ( A ∖ B ) ∪ ( B ∖ A ) ) ∈ _V ) ) ;;
 	step 6 : wff = mpbir (step 3, step 5) |- ( ( A △ B ) ∈ _V ) ;;
 }
+
+/* ------------------------------------------------------------------------
+   MIZAR'S SOFT TYPE LAYER: `Element of`.
+
+   Mizar gives every term a TYPE, and the checker uses what a type means
+   without ever stating it — the information is in no citation and in no
+   record. This is the mode `Element of B`, as SUBSET_1:def 1 defines it:
+   for a non-empty B its elements are the members of B, and the empty type
+   has the empty set as its only element. The article's own definition is
+   dropped in favour of this one (the symbol is foundation-provided), so
+   every article that speaks of Elements shares these lemmas instead of
+   re-deriving them inside each proof.
+   ------------------------------------------------------------------------ */
+
+constant {
+	symbol element ;;
+	ascii Element ;;
+}
+
+rule pr_element (a0 : class, a1 : class) {
+	term : wff = ( element a0 a1 ) ;;
+}
+
+/* SUBSET_1:def 1  ::  x is Element of B */
+
+definition df-elt (A : class, B : class) {
+	defiendum : wff = ( element A B ) ;;
+	definiens : wff = ( ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) ∨ ( ( B = ∅ ) ∧ ( A = ∅ ) ) ) ;;
+	-------------
+	prop : wff = |- ( defiendum ↔ definiens ) ;;
+}
+
+/* The non-empty half of the mode, in the shape the checker's record states
+   it: either the type is empty, or being an Element is being a member. */
+
+theorem eltor (A : class, B : class) {
+	prop : wff = |- ( ( B = ∅ ) ∨ ( ( element A B ) ↔ ( A ∈ B ) ) ) ;;
+} proof {
+	step 1 : wff = id () |- ( ¬ ( B = ∅ ) → ¬ ( B = ∅ ) ) ;;
+	step 2 : wff = intnanrd (step 1) |- ( ¬ ( B = ∅ ) → ¬ ( ( B = ∅ ) ∧ ( A = ∅ ) ) ) ;;
+	step 3 : wff = pm2.21d (step 2) |- ( ¬ ( B = ∅ ) → ( ( ( B = ∅ ) ∧ ( A = ∅ ) ) → ( A ∈ B ) ) ) ;;
+	step 4 : wff = simpr () |- ( ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) → ( A ∈ B ) ) ;;
+	step 5 : wff = a1i (step 4) |- ( ¬ ( B = ∅ ) → ( ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) → ( A ∈ B ) ) ) ;;
+	step 6 : wff = jaod (step 5, step 3) |- ( ¬ ( B = ∅ ) → ( ( ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) ∨ ( ( B = ∅ ) ∧ ( A = ∅ ) ) ) → ( A ∈ B ) ) ) ;;
+	step 7 : wff = pm3.2 () |- ( ¬ ( B = ∅ ) → ( ( A ∈ B ) → ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) ) ) ;;
+	step 8 : wff = orc () |- ( ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) → ( ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) ∨ ( ( B = ∅ ) ∧ ( A = ∅ ) ) ) ) ;;
+	step 9 : wff = syl6 (step 7, step 8) |- ( ¬ ( B = ∅ ) → ( ( A ∈ B ) → ( ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) ∨ ( ( B = ∅ ) ∧ ( A = ∅ ) ) ) ) ) ;;
+	step 10 : wff = impbid (step 6, step 9) |- ( ¬ ( B = ∅ ) → ( ( ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) ∨ ( ( B = ∅ ) ∧ ( A = ∅ ) ) ) ↔ ( A ∈ B ) ) ) ;;
+	step 11 : wff = df-elt () |- ( ( element A B ) ↔ ( ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) ∨ ( ( B = ∅ ) ∧ ( A = ∅ ) ) ) ) ;;
+	step 12 : wff = a1i (step 11) |- ( ¬ ( B = ∅ ) → ( ( element A B ) ↔ ( ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) ∨ ( ( B = ∅ ) ∧ ( A = ∅ ) ) ) ) ) ;;
+	step 13 : wff = bitrd (step 12, step 10) |- ( ¬ ( B = ∅ ) → ( ( element A B ) ↔ ( A ∈ B ) ) ) ;;
+	step 14 : wff = df-or () |- ( ( ( B = ∅ ) ∨ ( ( element A B ) ↔ ( A ∈ B ) ) ) ↔ ( ¬ ( B = ∅ ) → ( ( element A B ) ↔ ( A ∈ B ) ) ) ) ;;
+	step 15 : wff = mpbir (step 13, step 14) |- ( ( B = ∅ ) ∨ ( ( element A B ) ↔ ( A ∈ B ) ) ) ;;
+}
+
+/* The empty half: the empty type's only element is the empty set. */
+
+theorem elt0 (A : class, B : class) {
+	prop : wff = |- ( ( B = ∅ ) → ( ( element A B ) ↔ ( A = ∅ ) ) ) ;;
+} proof {
+	step 1 : wff = notnot () |- ( ( B = ∅ ) → ¬ ¬ ( B = ∅ ) ) ;;
+	step 2 : wff = intnanrd (step 1) |- ( ( B = ∅ ) → ¬ ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) ) ;;
+	step 3 : wff = pm2.21d (step 2) |- ( ( B = ∅ ) → ( ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) → ( A = ∅ ) ) ) ;;
+	step 4 : wff = simpr () |- ( ( ( B = ∅ ) ∧ ( A = ∅ ) ) → ( A = ∅ ) ) ;;
+	step 5 : wff = a1i (step 4) |- ( ( B = ∅ ) → ( ( ( B = ∅ ) ∧ ( A = ∅ ) ) → ( A = ∅ ) ) ) ;;
+	step 6 : wff = jaod (step 3, step 5) |- ( ( B = ∅ ) → ( ( ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) ∨ ( ( B = ∅ ) ∧ ( A = ∅ ) ) ) → ( A = ∅ ) ) ) ;;
+	step 7 : wff = pm3.2 () |- ( ( B = ∅ ) → ( ( A = ∅ ) → ( ( B = ∅ ) ∧ ( A = ∅ ) ) ) ) ;;
+	step 8 : wff = olc () |- ( ( ( B = ∅ ) ∧ ( A = ∅ ) ) → ( ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) ∨ ( ( B = ∅ ) ∧ ( A = ∅ ) ) ) ) ;;
+	step 9 : wff = syl6 (step 7, step 8) |- ( ( B = ∅ ) → ( ( A = ∅ ) → ( ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) ∨ ( ( B = ∅ ) ∧ ( A = ∅ ) ) ) ) ) ;;
+	step 10 : wff = impbid (step 6, step 9) |- ( ( B = ∅ ) → ( ( ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) ∨ ( ( B = ∅ ) ∧ ( A = ∅ ) ) ) ↔ ( A = ∅ ) ) ) ;;
+	step 11 : wff = df-elt () |- ( ( element A B ) ↔ ( ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) ∨ ( ( B = ∅ ) ∧ ( A = ∅ ) ) ) ) ;;
+	step 12 : wff = a1i (step 11) |- ( ( B = ∅ ) → ( ( element A B ) ↔ ( ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) ∨ ( ( B = ∅ ) ∧ ( A = ∅ ) ) ) ) ) ;;
+	step 13 : wff = bitrd (step 12, step 10) |- ( ( B = ∅ ) → ( ( element A B ) ↔ ( A = ∅ ) ) ) ;;
+}
+
+/* A member of a type is an Element of it: membership makes the type
+   non-empty, so the empty case cannot arise. */
+
+theorem elti (A : class, B : class) {
+	prop : wff = |- ( ( A ∈ B ) → ( element A B ) ) ;;
+} proof {
+	step 1 : wff = ne0i () |- ( ( A ∈ B ) → ( B ≠ ∅ ) ) ;;
+	step 2 : wff = df-ne () |- ( ( B ≠ ∅ ) ↔ ¬ ( B = ∅ ) ) ;;
+	step 3 : wff = biimpi (step 2) |- ( ( B ≠ ∅ ) → ¬ ( B = ∅ ) ) ;;
+	step 4 : wff = syl (step 1, step 3) |- ( ( A ∈ B ) → ¬ ( B = ∅ ) ) ;;
+	step 5 : wff = id () |- ( ( A ∈ B ) → ( A ∈ B ) ) ;;
+	step 6 : wff = jca (step 4, step 5) |- ( ( A ∈ B ) → ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) ) ;;
+	step 7 : wff = orc () |- ( ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) → ( ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) ∨ ( ( B = ∅ ) ∧ ( A = ∅ ) ) ) ) ;;
+	step 8 : wff = syl (step 6, step 7) |- ( ( A ∈ B ) → ( ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) ∨ ( ( B = ∅ ) ∧ ( A = ∅ ) ) ) ) ;;
+	step 9 : wff = df-elt () |- ( ( element A B ) ↔ ( ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) ∨ ( ( B = ∅ ) ∧ ( A = ∅ ) ) ) ) ;;
+	step 10 : wff = biimpri (step 9) |- ( ( ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) ∨ ( ( B = ∅ ) ∧ ( A = ∅ ) ) ) → ( element A B ) ) ;;
+	step 11 : wff = syl (step 8, step 10) |- ( ( A ∈ B ) → ( element A B ) ) ;;
+}
+
+/* An Element of a power set is a subset: a power set is never empty, so the
+   membership half of the mode always applies, and membership in a power set
+   IS inclusion. */
+
+theorem eltpwi (A : class, B : class) {
+	prop : wff = |- ( ( element A 𝒫 B ) → ( A ⊆ B ) ) ;;
+} proof {
+	step 1 : wff = eltor () |- ( ( 𝒫 B = ∅ ) ∨ ( ( element A 𝒫 B ) ↔ ( A ∈ 𝒫 B ) ) ) ;;
+	step 2 : wff = pwne0 () |- ( 𝒫 B ≠ ∅ ) ;;
+	step 3 : wff = neii (step 2) |- ¬ ( 𝒫 B = ∅ ) ;;
+	step 4 : wff = orel1 () |- ( ¬ ( 𝒫 B = ∅ ) → ( ( ( 𝒫 B = ∅ ) ∨ ( ( element A 𝒫 B ) ↔ ( A ∈ 𝒫 B ) ) ) → ( ( element A 𝒫 B ) ↔ ( A ∈ 𝒫 B ) ) ) ) ;;
+	step 5 : wff = ax-mp (step 3, step 4) |- ( ( ( 𝒫 B = ∅ ) ∨ ( ( element A 𝒫 B ) ↔ ( A ∈ 𝒫 B ) ) ) → ( ( element A 𝒫 B ) ↔ ( A ∈ 𝒫 B ) ) ) ;;
+	step 6 : wff = ax-mp (step 1, step 5) |- ( ( element A 𝒫 B ) ↔ ( A ∈ 𝒫 B ) ) ;;
+	step 7 : wff = biimpi (step 6) |- ( ( element A 𝒫 B ) → ( A ∈ 𝒫 B ) ) ;;
+	step 8 : wff = elpwi () |- ( ( A ∈ 𝒫 B ) → ( A ⊆ B ) ) ;;
+	step 9 : wff = syl (step 7, step 8) |- ( ( element A 𝒫 B ) → ( A ⊆ B ) ) ;;
+}
+
+/* ★ THE TYPE RULE the emitter needs: a member of a Subset of B is itself an
+   Element of B. This is what Mizar's type system supplies silently at every
+   step that reasons about the elements of a Subset. */
+
+theorem eltss (A : class, B : class, C : class) {
+	prop : wff = |- ( ( element A 𝒫 B ) → ( ( C ∈ A ) → ( element C B ) ) ) ;;
+} proof {
+	step 1 : wff = eltpwi () |- ( ( element A 𝒫 B ) → ( A ⊆ B ) ) ;;
+	step 2 : wff = ssel () |- ( ( A ⊆ B ) → ( ( C ∈ A ) → ( C ∈ B ) ) ) ;;
+	step 3 : wff = syl (step 1, step 2) |- ( ( element A 𝒫 B ) → ( ( C ∈ A ) → ( C ∈ B ) ) ) ;;
+	step 4 : wff = elti () |- ( ( C ∈ B ) → ( element C B ) ) ;;
+	step 5 : wff = syl6 (step 3, step 4) |- ( ( element A 𝒫 B ) → ( ( C ∈ A ) → ( element C B ) ) ) ;;
+}
+
+/* The mode's equality congruences, under the names the emitter cites for a
+   predicate's argument slots. The article no longer declares the predicate,
+   so the foundation owes them. */
+
+theorem pr_element_cong1d (A : class, B : class, C : class) {
+	prop : wff = |- ( ( A = B ) → ( ( element A C ) ↔ ( element B C ) ) ) ;;
+} proof {
+	step 1 : wff = eleq1 () |- ( ( A = B ) → ( ( A ∈ C ) ↔ ( B ∈ C ) ) ) ;;
+	step 2 : wff = anbi2d (step 1) |- ( ( A = B ) → ( ( ¬ ( C = ∅ ) ∧ ( A ∈ C ) ) ↔ ( ¬ ( C = ∅ ) ∧ ( B ∈ C ) ) ) ) ;;
+	step 3 : wff = eqeq1 () |- ( ( A = B ) → ( ( A = ∅ ) ↔ ( B = ∅ ) ) ) ;;
+	step 4 : wff = anbi2d (step 3) |- ( ( A = B ) → ( ( ( C = ∅ ) ∧ ( A = ∅ ) ) ↔ ( ( C = ∅ ) ∧ ( B = ∅ ) ) ) ) ;;
+	step 5 : wff = orbi12d (step 2, step 4) |- ( ( A = B ) → ( ( ( ¬ ( C = ∅ ) ∧ ( A ∈ C ) ) ∨ ( ( C = ∅ ) ∧ ( A = ∅ ) ) ) ↔ ( ( ¬ ( C = ∅ ) ∧ ( B ∈ C ) ) ∨ ( ( C = ∅ ) ∧ ( B = ∅ ) ) ) ) ) ;;
+	step 6 : wff = df-elt () |- ( ( element A C ) ↔ ( ( ¬ ( C = ∅ ) ∧ ( A ∈ C ) ) ∨ ( ( C = ∅ ) ∧ ( A = ∅ ) ) ) ) ;;
+	step 7 : wff = df-elt () |- ( ( element B C ) ↔ ( ( ¬ ( C = ∅ ) ∧ ( B ∈ C ) ) ∨ ( ( C = ∅ ) ∧ ( B = ∅ ) ) ) ) ;;
+	step 8 : wff = 3bitr4g (step 5, step 6, step 7) |- ( ( A = B ) → ( ( element A C ) ↔ ( element B C ) ) ) ;;
+}
+
+theorem pr_element_cong2d (A : class, B : class, C : class) {
+	prop : wff = |- ( ( A = B ) → ( ( element C A ) ↔ ( element C B ) ) ) ;;
+} proof {
+	step 1 : wff = eleq2 () |- ( ( A = B ) → ( ( C ∈ A ) ↔ ( C ∈ B ) ) ) ;;
+	step 2 : wff = eqeq1 () |- ( ( A = B ) → ( ( A = ∅ ) ↔ ( B = ∅ ) ) ) ;;
+	step 3 : wff = notbid (step 2) |- ( ( A = B ) → ( ¬ ( A = ∅ ) ↔ ¬ ( B = ∅ ) ) ) ;;
+	step 4 : wff = anbi12d (step 3, step 1) |- ( ( A = B ) → ( ( ¬ ( A = ∅ ) ∧ ( C ∈ A ) ) ↔ ( ¬ ( B = ∅ ) ∧ ( C ∈ B ) ) ) ) ;;
+	step 5 : wff = anbi1d (step 2) |- ( ( A = B ) → ( ( ( A = ∅ ) ∧ ( C = ∅ ) ) ↔ ( ( B = ∅ ) ∧ ( C = ∅ ) ) ) ) ;;
+	step 6 : wff = orbi12d (step 4, step 5) |- ( ( A = B ) → ( ( ( ¬ ( A = ∅ ) ∧ ( C ∈ A ) ) ∨ ( ( A = ∅ ) ∧ ( C = ∅ ) ) ) ↔ ( ( ¬ ( B = ∅ ) ∧ ( C ∈ B ) ) ∨ ( ( B = ∅ ) ∧ ( C = ∅ ) ) ) ) ) ;;
+	step 7 : wff = df-elt () |- ( ( element C A ) ↔ ( ( ¬ ( A = ∅ ) ∧ ( C ∈ A ) ) ∨ ( ( A = ∅ ) ∧ ( C = ∅ ) ) ) ) ;;
+	step 8 : wff = df-elt () |- ( ( element C B ) ↔ ( ( ¬ ( B = ∅ ) ∧ ( C ∈ B ) ) ∨ ( ( B = ∅ ) ∧ ( C = ∅ ) ) ) ) ;;
+	step 9 : wff = 3bitr4g (step 6, step 7, step 8) |- ( ( A = B ) → ( ( element C A ) ↔ ( element C B ) ) ) ;;
+}
+
+/* The empty set is an Element of every power set — Mizar's own registration
+   for the empty Subset, which the type layer now states once. */
+
+theorem elt0pw (B : class) {
+	prop : wff = |- ( element ∅ 𝒫 B ) ;;
+} proof {
+	step 1 : wff = 0elpw () |- ( ∅ ∈ 𝒫 B ) ;;
+	step 2 : wff = elti () |- ( ( ∅ ∈ 𝒫 B ) → ( element ∅ 𝒫 B ) ) ;;
+	step 3 : wff = ax-mp (step 1, step 2) |- ( element ∅ 𝒫 B ) ;;
+}

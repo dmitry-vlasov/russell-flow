@@ -476,3 +476,55 @@ nothing, because what the typed steps lack is a rule Mizar never records. The
 next ones are the same shape and can be read off the same leaf: `Element of A`
 from a registration's non-emptiness, `Subset of A` composed with ⊆, and the
 `Element of 𝒫A` ↔ `Subset of A` identification.
+
+## The soft type layer, in the foundation (2026-08-16)
+
+The previous unit derived Mizar's Element-of propagation inside the emitter, as
+a nine-step construction written out at every site that needed it. That is
+backwards, and this project already has the rule: a general lemma belongs in the
+foundation. The type layer now lives in `foundation/miz_aux.ru`.
+
+WHAT THE FOUNDATION NOW OWNS. The mode `Element of B` is a foundation predicate,
+defined as SUBSET_1:def 1 defines it — for a non-empty B the elements are the
+members of B, and the empty type has ∅ as its only element:
+
+    df-elt   ( element A B ) ↔ ( ( ¬ ( B = ∅ ) ∧ ( A ∈ B ) ) ∨ ( ( B = ∅ ) ∧ ( A = ∅ ) ) )
+
+and what the type MEANS is proved once, from that definition:
+
+    eltor    ( B = ∅ ) ∨ ( ( element A B ) ↔ ( A ∈ B ) )      the record's own shape
+    elt0     ( B = ∅ ) → ( ( element A B ) ↔ ( A = ∅ ) )
+    elti     ( A ∈ B ) → ( element A B )
+    eltpwi   ( element A 𝒫 B ) → ( A ⊆ B )
+    eltss    ( element A 𝒫 B ) → ( ( C ∈ A ) → ( element C B ) )
+    elt0pw   ( element ∅ 𝒫 B )
+    pr_element_cong1d / cong2d — the mode's equality congruences
+
+All eight verify. The article stops declaring and defining the mode (it is in
+the foundation's reused list), so every article shares one definition instead of
+re-deriving the same facts inside each proof, and the emitter's job is a
+CITATION: the lemmas are foundation rows, matched goal-side by the row table and
+fact-side by `mizEmitFoundFact` when the record names a premise the foundation
+already proves.
+
+THREE WIRING DEFECTS THIS EXPOSED, each caught by the gate's own checks:
+ * a foundation-provided symbol was still declared by the article (two
+   `constant element` blocks) — a constant is now skipped when the foundation
+   provides the symbol in EITHER role;
+ * ★ the dependency-reuse check read a bare CONSTANT name as "this symbol is
+   provided", which suppressed BOTH roles. `element` is the foundation's
+   predicate AND subset_1's own functor (`Element of X` as a term), so the
+   article stopped declaring the functor rule and its own registrations no
+   longer parsed. The check now asks for the ROLE's rule name (`pr_<sym>` /
+   `fn_<sym>`);
+ * the mode's congruence axioms were the article's, and the article no longer
+   emits them — they are foundation theorems now, under the names the emitter
+   cites.
+Also: a type goal used to go to its own channel and stop there; it falls back to
+the row table now, which is how `element ∅ 𝒫 B` closes by citing elt0pw.
+
+MEASURED: FULL GATE GREEN at 246, all 7 Metamath databases verified, and the
+closed list is IDENTICAL to the round before the move. So this is parity, not
+progress — the point is where the knowledge now sits: adding the next type rule
+(Element-of from a registration, Subset composed with ⊆) is a lemma in
+`miz_aux.ru` plus one row, not another construction inside the emitter.
