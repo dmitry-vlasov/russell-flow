@@ -390,3 +390,50 @@ teaching, and it says the next question is not "how do we build more of the
 record" but "what does the step do with the record once it has it". The
 remaining no-match cases (24 and 120) are the next thing to read, and the
 34 relat_1 instances with NO candidate statement are a separate, simpler gap.
+
+## The eigenvariable's own instances (2026-08-16)
+
+Reading t2_subset_1 to its leaf: the ⊆-goal reduction introduces a fresh
+variable and reaches `x951 ∈ x29` under the step's antecedents, and the only
+fact there was the Element-of definition at the by-step's OWN element `x7`.
+The step's universal hypothesis
+`∀x7 ( x7 is Element of A → ( x7 ∈ X → x7 ∈ Y ) )` sat over that leaf as one
+opaque atom — exactly what the ∀-fact law forbids ("instantiate it at the
+goal's element, or drop it"). The facts are built at the by-step level, where
+the eigenvariable does not exist yet.
+
+That fresh variable is Mizar's skolem constant for the step and the checker
+instantiates its premises at it. `mizEmitEigenInsts` does the same: at the
+⊆ / = reduction, every universal hypothesis (and every conjunct of the
+assumption) is offered as the instance implication `∀x φ → φ[v]`, which is a
+self-contained fact with its own spcgv+sethood proof — so the tableau detaches
+the instance from the hypothesis itself and nothing has to be threaded through
+the reduction.
+
+The leaf now reads
+
+    F0 ( ∀ x7 ( ( element x7 x4 ) → ( ( x7 ∈ x28 ) → ( x7 ∈ x29 ) ) )
+         → ( ( element x951 x4 ) → ( ( x951 ∈ x28 ) → ( x951 ∈ x29 ) ) ) )
+
+GATE GREEN at 244, closed list identical, emit 361s → 385s. So it pays nothing
+on its own, and it is committed for what it makes possible: every eigenvariable
+proof needs its premises stated about the eigenvariable, and the type rule the
+same leaf still waits for is stated about it too.
+
+WHAT THE SAME LEAF STILL LACKS, and it is one rule, not a fact: from
+`X is Element of 𝒫A` and `v ∈ X`, conclude `v is Element of A`. That is Mizar's
+Element-of type propagation, carried silently by the type system, and it is
+four existing lemmas (the Element-of definition at 𝒫A and at A, elpwi, ssel,
+and non-emptiness from a member). It cannot be a foundation lemma — `element`
+is the article's own definition, not a foundation symbol — so it is either a
+derived rule at the eigen seam or an auxiliary lemma the emitter proves once
+per article and cites.
+
+MEASURED DEAD END from the same session, recorded so it is not retried: giving
+the leaf the statements the SKELETON index offers for the eigenvariable's atoms
+builds instances, and the wrong ones — for this leaf the `∈` skeleton returned
+`( { x951 } ∪ x28 ) ⊆ x28 → x951 ∈ x28`. Narrowing it to the atoms the eigen
+instances introduce produced nothing at all, because the definition the leaf
+needs is named by no citation and its `element` skeleton finds no statement the
+generic instantiator can bind. Selection by skeleton at a leaf is a lottery, and
+this is the third measurement to say so.
