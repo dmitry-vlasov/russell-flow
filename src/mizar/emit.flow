@@ -1,4 +1,4 @@
-import mizar/miz2ru;
+import mizar/deriv;   // the recorded refutation (MizDerivClause) is transcribed here
 
 // S4c EMISSION, pattern 1 — the deterministic completer for the A-map family.
 // A by-step whose goal follows from its context by unfolding ∪/∩/∖/∅
@@ -38,6 +38,7 @@ export {
 		hypStmtOf : (string) -> Maybe<Pair<FolForm, [FolForm]>>,
 		bySkeleton : (string) -> [string], expOf : (string) -> [Pair<string, string>],
 		eqOf : (string) -> [FolForm], codesOf : (string) -> [int],
+		clausesOf : (string) -> [MizDerivClause],
 		isAxiom : (string) -> bool,
 		shOf : (string) -> string) -> Pair<[Maybe<FolStepProof>], MizEmitCounts>;
 	// the index key: instantiation preserves it exactly
@@ -71,6 +72,8 @@ export {
 	// failed steps for which SOME attempt produced a proof that was merely too
 	// long or too big — those are an encoding problem, not a fact problem
 	mizEmitLongStepCount() -> int;
+	// (failing steps, of which the record HAS the checker's refutation)
+	mizEmitClauseCoverage() -> Pair<int, int>;
 	// (definitions the record named at emitted steps, instances built from them)
 	mizEmitDefDiag() -> Triple<int, int, int>;
 	// (ladder stages that saw a hypothetical-citation candidate, instances built)
@@ -109,6 +112,9 @@ mizEmitRegsOfSymRef : ref ((string) -> [string]) = ref (\__ -> []);
 // The type family is codes 1,2,6,8,9,10,11 (attribute clash) and 21,40,41,43
 // (type membership); see the census in docs/mizar-inference-catalogue.md.
 mizEmitStepCodesRef : ref [int] = ref [];
+// the RECORDED REFUTATION of this step, when the checker closed it with a
+// single disjunct: clause, premise instance, and the kill pairing
+mizEmitStepClausesRef : ref [MizDerivClause] = ref [];
 mizEmitTypeCodes() -> [int] { [1, 2, 6, 8, 9, 10, 11, 21, 40, 41, 43]; }
 mizEmitStepIsTyped() -> bool {
 	exists(^mizEmitStepCodesRef, \c -> exists(mizEmitTypeCodes(), \t -> t == c));
@@ -143,6 +149,9 @@ mizEmitNFDjRef : ref [Pair<string, string>] = ref [];
 // That step wants a smaller encoding, not better facts.
 mizEmitStepLong : ref bool = ref false;
 mizEmitLongSteps : ref int = ref 0;
+// coverage counters for the recorded-refutation route
+mizEmitFailSteps2 : ref int = ref 0;
+mizEmitFailWithClause : ref int = ref 0;
 mizEmitDefNames : ref int = ref 0;
 mizEmitDefMade : ref int = ref 0;
 mizEmitDischarged : ref int = ref 0;
@@ -151,6 +160,7 @@ mizEmitFailUnprov : ref int = ref 0;
 mizEmitFailNodes : ref int = ref 0;
 mizEmitFailSteps : ref int = ref 0;
 mizEmitLongStepCount() -> int { ^mizEmitLongSteps; }
+mizEmitClauseCoverage() -> Pair<int, int> { Pair(^mizEmitFailSteps2, ^mizEmitFailWithClause); }
 
 mizEmitCleanCount() -> int { ^mizEmitCleaned; }
 mizEmitDefDiag() -> Triple<int, int, int> {
@@ -186,6 +196,7 @@ mizEmitRecReset() -> void {
 	mizEmitRecCount := 0; mizEmitRecCites := 0; mizEmitRecMatch := 0;
 	mizEmitFailUnprov := 0; mizEmitFailNodes := 0; mizEmitFailSteps := 0;
 	mizEmitLongSteps := 0; mizEmitDefNames := 0; mizEmitDefMade := 0;
+	mizEmitFailSteps2 := 0; mizEmitFailWithClause := 0;
 	mizEmitDischarged := 0; mizEmitCleaned := 0;
 	mizEmitHypCands := 0; mizEmitHypMade := 0;
 	mizEmitHypWhyRef := makeTree();
@@ -197,6 +208,7 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 	hypStmtOf : (string) -> Maybe<Pair<FolForm, [FolForm]>>,
 	bySkeleton : (string) -> [string], expOf : (string) -> [Pair<string, string>],
 	eqOf : (string) -> [FolForm], codesOf : (string) -> [int],
+	clausesOf : (string) -> [MizDerivClause],
 	isAxiom : (string) -> bool,
 	shOf : (string) -> string) -> Pair<[Maybe<FolStepProof>], MizEmitCounts> {
 	// the work budget is PER THEOREM: reset here, cap from emit-work= (0 = off)
@@ -204,7 +216,13 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 	mizEmitWorkCapRef := s2i(getUrlParameterDef("emit-work", "512"));
 	res = foldi(t.steps, Pair([], MizEmitCounts(0, 0, 0)), \i, acc : Pair<[Maybe<FolStepProof>], MizEmitCounts>, goal -> {
 		pos = if (i < length(t.stepPos)) t.stepPos[i] else "";
-		recs = if (pos == "") [] else recOf(pos);
+		// THE CHECKER'S OWN PREMISES. recOf keeps only FULLY instantiated
+		// record facts; the recorded refutation keeps the rest — the instance
+		// Mizar actually refuted with, whether or not every binder was assigned.
+		// Adding it is not a heuristic: it is the premise the checker used.
+		recs0 = if (pos == "") [] else recOf(pos);
+		recs = uniqBy(concat(recs0, map(clausesOf(pos), \c -> c.instance)),
+			\a9, b9 -> mizEmitKey(a9) == mizEmitKey(b9));
 		cites = if (i < length(t.stepRefs)) t.stepRefs[i] else [];
 		// S-C: the definitions the checker expanded for THIS step, instantiated
 		// against the step's own atoms
@@ -227,6 +245,7 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 		};
 		// the rules the checker closed THIS step with (record dispatch)
 		mizEmitStepCodesRef := codesOf(pos);
+		mizEmitStepClausesRef := clausesOf(pos);
 		mizEmitShOfRef := shOf;
 		mizEmitStmtOfRef := stmtOf;
 		mizEmitBySkelRef := bySkeleton;
@@ -354,6 +373,13 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 		if (isNone(r.first) && ^mizEmitDbg)
 			println("FAILSTEP " + t.name + " goal=" + strGlue(folFormToks(goal), " ")
 				+ "  provable-but-long=" + b2s(^mizEmitStepLong));
+		// THE TRANSCRIPTION'S COVERAGE, measured per failing step: does the
+		// checker's own refutation of this step exist in the record at all?
+		if (isNone(r.first)) {
+			mizEmitFailSteps2 := ^mizEmitFailSteps2 + 1;
+			if (^mizEmitStepClausesRef != [])
+				mizEmitFailWithClause := ^mizEmitFailWithClause + 1;
+		}
 		cnt = acc.second;
 		ncnt = switch (r.first) {
 			None(): if (r.second) MizEmitCounts(cnt.attempted, cnt.closed, cnt.skipped + 1)

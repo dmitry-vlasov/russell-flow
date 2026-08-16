@@ -165,3 +165,39 @@ offer `fc<N>_<article>` instantiated at the term's arguments as a fact, and
 index those facts by the attribute they conclude — the type guards the
 discharge currently fails to find. The gate is subset_1 (7/53 today) and
 relat_1 (27/179).
+
+## The transcription, step 1 (2026-08-16): the record is not a fact supply
+
+Measured on subset_1: **50 failing steps, and 32 of them (64%) have the
+checker's own refutation in the record** — a single disjunct, the clause, the
+universal premise, its instance, and the `<PreLit anr=>` pairing that says
+which clause atom each instance literal kills. Exactly the single-disjunct
+code-45 share.
+
+★ AND SUPPLYING THAT INSTANCE AS A FACT CHANGES NOTHING. `recOf` had been
+dropping any record instance that was not fully instantiated; the clause
+record keeps them, they were added to the step's fact pool, and subset_1
+stayed at 8/53 with the same 50 failures. Rung 2R already tried the record's
+facts wholesale before that.
+
+So the blocker is NOT premise selection — Mizar's own premise is present and
+the proof still is not found. What differs is the PROPOSITIONAL ENDGAME: the
+checker refuted its clause, and our tableau works on its own normal form of
+¬goal, in which the recorded kill pairing does not exist. The two normalizers
+do not agree, so the instance cannot be used the way Mizar used it.
+
+★ THE CONSEQUENCE FOR THE PLAN: transcription has to include the
+normalization. The proof to emit is
+  1. assume ¬goal;
+  2. derive the clause literals L1..Ln from it — Mizar's normal form, proved,
+     not re-derived by search (mizEmitQNF is the proof-producing normalizer
+     that exists);
+  3. derive the instance from the premise at the recorded witnesses;
+  4. kill literal by literal in the recorded order, closing by the code.
+Steps 3 and 4 are already data (mizDerivPosClauses). Step 2 is the missing
+piece and it is the whole difficulty: our ¬goal must be brought to Mizar's
+clause with a proof.
+
+What this rules out, on evidence rather than opinion: any further work on
+selecting, ranking or supplying facts. The fact side is solved; the normal
+form is not.
