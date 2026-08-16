@@ -460,6 +460,40 @@ mizDerivPosExpansions(derivXml : string, sig : MizSig) -> Tree<string, [Pair<str
 	}
 }
 
+// ---- RESOLVING THE CHECKER'S EQUIVALENCE CLASSES ----
+// The record refers to terms by their equalizer CLASS (<EqClass nr>), and
+// deriv.flow translated those to an unhandled marker — its own header called
+// it a future slice. It is what made the recorded clause unreadable: the
+// literals that come from the goal arrived as class references, so they
+// shared nothing with anything, and the "two normal forms have no atoms in
+// common" measurement was mostly this.
+// The record does carry the classes: <Class nr> lists its members, and a
+// member with no class reference inside it IS a surface term. Members may
+// reference other classes, so resolution repeats under a fuel bound.
+mizDerivHasEqClass(x : MizXml) -> bool {
+	x.tag == "EqClass" || exists(x.kids, mizDerivHasEqClass);
+}
+
+mizDerivClassReps(d : MizXml) -> Tree<int, MizXml> {
+	fold(mizKidsTagged(d, "Class"), makeTree(), \acc, c -> {
+		nr = s2i(mizAttr(c, "nr"));
+		ground = filter(c.kids, \m -> !mizDerivHasEqClass(m));
+		if (ground != []) setTree(acc, nr, ground[0])
+		else if (c.kids != []) setTree(acc, nr, c.kids[0])
+		else acc;
+	});
+}
+
+mizDerivResolveEq(x : MizXml, reps : Tree<int, MizXml>, fuel : int) -> MizXml {
+	if (fuel <= 0) x
+	else if (x.tag == "EqClass")
+		switch (lookupTree(reps, s2i(mizAttr(x, "nr")))) {
+			None(): x;
+			Some(r): mizDerivResolveEq(r, reps, fuel - 1);
+		}
+	else MizXml(x.tag, x.attrs, map(x.kids, \k -> mizDerivResolveEq(k, reps, fuel)));
+}
+
 // per By position, the recorded refutation of a SINGLE-disjunct inference —
 // the shape 74% of the library's inferences have, and 64% of subset_1's close
 // by one universal premise (code 45). Clause, instance and kill pairing come
@@ -475,6 +509,9 @@ mizDerivPosClauses(derivXml : string, sig : MizSig,
 			if (mizAttr(inf, "accepted") != "true" || length(ds) != 1) acc
 			else {
 				d = ds[0];
+				// every class reference resolved to a surface term first
+				reps = mizDerivClassReps(d);
+				rf = \x9 : MizXml -> mizDerivForm(sig, scope, mizDerivResolveEq(x9, reps, 8));
 				codes = filtermap(mizKidsTagged(d, "Contr"), \c -> {
 					v = mizAttr(c, "code");
 					if (v == "") None() else Some(s2i(v));
@@ -483,11 +520,11 @@ mizDerivPosClauses(derivXml : string, sig : MizSig,
 					filtermap(mizKidsTagged(d, "PosBas"), \b ->
 						if (b.kids == []) None()
 						else Some(Pair(s2i(mizAttr(b, "nr")),
-							mizDerivForm(sig, scope, b.kids[0])))),
+							rf(b.kids[0])))),
 					filtermap(mizKidsTagged(d, "NegBas"), \b ->
 						if (b.kids == []) None()
 						else Some(Pair(s2i(mizAttr(b, "nr")),
-							FolNeg(mizDerivForm(sig, scope, b.kids[0]))))));
+							FolNeg(rf(b.kids[0]))))));
 				vs = mizKidsTagged(d, "Verify");
 				ms = mizKidsTagged(d, "Matches");
 				if (codes == [] || vs == [] || ms == []) acc
@@ -497,7 +534,7 @@ mizDerivPosClauses(derivXml : string, sig : MizSig,
 						kills = filtermap(mizKidsTagged(ms[0], "PreLit"), \pl ->
 							if (pl.kids == []) None()
 							else Some(Pair(s2i(mizAttr(pl, "anr")),
-								mizDerivForm(sig, scope, pl.kids[0]))));
+								rf(pl.kids[0]))));
 						if (kills == []) acc
 						else setTree(acc, pos, arrayPush(lookupTreeDef(acc, pos, []),
 							MizDerivClause(lits, df.fact, df.premise, df.wits,

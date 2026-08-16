@@ -234,6 +234,35 @@ why the failing goal shapes are flat while Mizar's rules are steep.
 Nothing in that chain is invented; every stage is Mizar's, and stages 1 and 3
 are already in the record.
 
+★ CORRECTION (same day, and this is why the caveat was written): the
+measurement was mostly an artifact. The record refers to terms by their
+equalizer CLASS (<EqClass nr>) and deriv.flow translated those to an unhandled
+marker — its own header called that a future slice. The goal's own literals
+therefore arrived as markers and shared nothing with anything.
+
+The classes ARE in the record: <Class nr> lists its members, and a member with
+no class reference inside it is a surface term. mizDerivClassReps picks that
+representative and mizDerivResolveEq rewrites the references before
+translation (fuel-bounded, since members may reference other classes).
+
+With that, the recorded refutation reads end to end:
+
+    lit[2]    ( x43 ∈ x4 )
+    lit[0]  ¬ ( element x43 x4 )
+    instance: ( ( x4 = ∅ ) ∨ ( ( element x43 x4 ) ↔ ( x43 ∈ x4 ) ) )
+    premise:  ∀ xd1 ∀ xd2 ( ( xd1 = ∅ ) ∨ ( ( element xd2 xd1 ) ↔ ( xd2 ∈ xd1 ) ) )
+
+and the counts become 52 sharing a goal atom, 25 with a foreign symbol, 387
+neither — the 387 being the expanded DEFINITIONS the checker adds as extra
+literals, which share symbols with the goal but no atoms, exactly as they
+should.
+
+So the honest picture is NOT "the article's vocabulary is gone". It is: the
+clause = the goal's literals after skolemization (x43 is the checker's fresh
+constant) PLUS the definitional expansions as further literals. The
+transcription therefore needs the skolem constants introduced as eigenvariables
+and the expansions cited — both of which have machinery already.
+
 CAVEAT on the measurement: record atoms come through mizDerivForm and goal
 atoms through miz2ru, so a naming difference between the two dialects could
 inflate the "foreign" count. The 0 is what matters and it is too clean to be
