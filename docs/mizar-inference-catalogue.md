@@ -528,3 +528,60 @@ closed list is IDENTICAL to the round before the move. So this is parity, not
 progress — the point is where the knowledge now sits: adding the next type rule
 (Element-of from a registration, Subset composed with ⊆) is a lemma in
 `miz_aux.ru` plus one row, not another construction inside the emitter.
+
+## The replay: what it is worth, and the three pieces it still needs (2026-08-16)
+
+★ THE MEASUREMENT THAT SIZES THE WHOLE CAMPAIGN. A theorem closes only when
+every step closes, so the question is not how many failing STEPS carry the
+checker's refutation but how they fall across theorems. Per article, theorems
+one step short and how many of those single failing steps are covered:
+
+    subset_1    37 one step short, 30 covered   (81%)
+    relat_1    141 one step short, 63 covered   (45%)
+    zfmisc_1    85 one step short, 32 covered   (38%)
+
+★ 125 theorems on these three articles are ONE recorded refutation away. That
+is the prize for replaying the record, against 246 closed today in total, and
+it is the first honest number this campaign has had for it.
+
+WHAT REPLAY MEANS, from the record of t4_subset_1 read end to end:
+
+    goal      ∀X∀A ( A is Subset of X → ¬ ( A ≠ ∅ ∧ ∀x ( x is Element of X → x ∉ A ) ) )
+    clause    ( x7 ∈ x28 ) · ¬ ( x7 ∈ x4 ) · ¬ ( x28 = x4 ) · the universal premise
+    instance  ( element x28 𝒫 x4 ) → ( ( x7 ∈ x28 ) → ( x7 ∈ x4 ) )
+    wits      xd1 := x4 · xd2 := x28 · xd3 := x7
+    code      45
+
+`x7` is the checker's own constant for the witness that a non-empty set has.
+So the replay is: assume the denied thesis, name that witness, instantiate the
+premise at it, and close by the recorded kills.
+
+THREE PIECES BUILT AND GATED HERE, each verified as the trace demanded it:
+ * `eltmem` — the premise itself. `( element A 𝒫 B ) → ( ( C ∈ A ) → ( C ∈ B ) )`
+   is a foundation lemma now, so the recorded instance is BUILT (it was not
+   before: the article states no such theorem, and the checker cites none).
+ * `nempex` — `¬ ( A = ∅ ) → ∃x ( x ∈ A )`, from n0. This is where the
+   checker's fresh constant comes from, and the ∃-elimination cannot name a
+   witness without the existential. NOTE it must stay OUT of the iff
+   normalizer, which rewrites it to the ∀-contrapositive — the one form the
+   elimination cannot use.
+ * ★ A DENIED GOAL IS PROVED BY ASSUMING IT. Mizar states most theses as denied
+   conjunctions and the reduction had no rule for them: the goal went to the
+   ladder whole, so the step's own premises were never in hand. Now the body is
+   assumed and a contradiction derived (`pm2.65i` over the deduction
+   reduction's `body → ¬ ⊤`), with the old goal-rewrite route kept as fallback.
+
+MEASURED: gate GREEN at 246, all 7 databases verified, closed list identical.
+So the three pieces are in place and pay NOTHING yet, and the reason is precise
+rather than mysterious: each is a link, and nothing yet CHAINS them in the
+recorded order. On t4 the facts now present are the premise instance, the
+existential, and the assumption — and closing still asks the search to find a
+five-link chain (detach the existential, name the witness, instantiate the
+premise at it, type it, contradict the assumption at it) that the record
+already spells out.
+
+★ THE NEXT UNIT, AND IT IS THE CAMPAIGN'S: an ASSEMBLY that walks the recorded
+refutation instead of offering its parts to a search. Per single-disjunct step:
+introduce the witnesses the record names (the ∃-facts are now derivable), build
+the instance at the recorded terms (done), then discharge the kill pairing in
+the recorded order. Every input exists; what is missing is the walk.

@@ -88,6 +88,9 @@ export {
 	// those instances bucketed: [premise did not translate, no candidate
 	// statement, a candidate but no match, matched yet not built]
 	mizEmitNoInstKinds() -> [int];
+	// [one-step-short theorems, of them with the checker's refutation recorded,
+	// theorems whose every failing step has one]
+	mizEmitReplayCoverage() -> [int];
 	// the binder names those declines were on, most frequent first
 	mizEmitInstDeclNamesTop() -> string;
 	// (definitions the record named at emitted steps, instances built from them)
@@ -174,6 +177,14 @@ mizEmitInstDeclWalk : ref int = ref 0;
 mizEmitInstDeclSeth : ref int = ref 0;
 // failing steps whose RECORDED instance never became one of the offered facts
 mizEmitClauseNoInst : ref int = ref 0;
+// per-theorem: failing steps, and how many of them carry a full refutation
+mizEmitThmFail : ref int = ref 0;
+mizEmitThmFailRec : ref int = ref 0;
+// theorems ONE STEP short, and those whose single failing step is covered
+mizEmitOneShort : ref int = ref 0;
+mizEmitOneShortRec : ref int = ref 0;
+// theorems whose EVERY failing step is covered (the replay's ceiling)
+mizEmitAllCovered : ref int = ref 0;
 mizEmitNoInstVerum : ref int = ref 0;
 mizEmitNoInstNoCand : ref int = ref 0;
 mizEmitNoInstNoMatch : ref int = ref 0;
@@ -194,6 +205,11 @@ mizEmitLitKinds() -> [int] { [^mizEmitLitShared, ^mizEmitLitForeign, ^mizEmitLit
 mizEmitInstDeclines() -> int { ^mizEmitInstDeclBinder; }
 mizEmitInstDeclWalkSeth() -> Pair<int, int> { Pair(^mizEmitInstDeclWalk, ^mizEmitInstDeclSeth); }
 mizEmitClauseNoInstCount() -> int { ^mizEmitClauseNoInst; }
+// [one-step-short theorems, of them covered by a refutation, theorems with
+// every failing step covered]
+mizEmitReplayCoverage() -> [int] {
+	[^mizEmitOneShort, ^mizEmitOneShortRec, ^mizEmitAllCovered];
+}
 mizEmitNoInstKinds() -> [int] { [^mizEmitNoInstVerum, ^mizEmitNoInstNoCand,
 	^mizEmitNoInstNoMatch, ^mizEmitNoInstOther]; }
 mizEmitInstDeclNamesTop() -> string {
@@ -239,6 +255,7 @@ mizEmitRecReset() -> void {
 	mizEmitLitShared := 0; mizEmitLitForeign := 0; mizEmitLitOther := 0;
 	mizEmitInstDeclBinder := 0; mizEmitInstDeclNames := makeTree();
 	mizEmitInstDeclWalk := 0; mizEmitInstDeclSeth := 0; mizEmitClauseNoInst := 0;
+	mizEmitOneShort := 0; mizEmitOneShortRec := 0; mizEmitAllCovered := 0;
 	mizEmitNoInstVerum := 0; mizEmitNoInstNoCand := 0;
 	mizEmitNoInstNoMatch := 0; mizEmitNoInstOther := 0;
 	mizEmitDischarged := 0; mizEmitCleaned := 0;
@@ -258,6 +275,8 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 	// the work budget is PER THEOREM: reset here, cap from emit-work= (0 = off)
 	mizEmitWorkRef := 0;
 	mizEmitWorkCapRef := s2i(getUrlParameterDef("emit-work", "512"));
+	mizEmitThmFail := 0;
+	mizEmitThmFailRec := 0;
 	res = foldi(t.steps, Pair([], MizEmitCounts(0, 0, 0)), \i, acc : Pair<[Maybe<FolStepProof>], MizEmitCounts>, goal -> {
 		pos = if (i < length(t.stepPos)) t.stepPos[i] else "";
 		// THE CHECKER'S OWN PREMISES. recOf keeps only FULLY instantiated
@@ -265,6 +284,10 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 		// Mizar actually refuted with, whether or not every binder was assigned.
 		// Adding it is not a heuristic: it is the premise the checker used.
 		recs0 = if (pos == "") [] else recOf(pos);
+		// The clause's LITERALS were offered here too and closed nothing: they
+		// speak of the checker's fresh constants, so they are not facts that can
+		// be derived on their own — the constant has to be introduced first, and
+		// that is what mizEmitNempEx does for the case the record shows.
 		recs = uniqBy(concat(recs0, map(clausesOf(pos), \c -> c.instance)),
 			\a9, b9 -> mizEmitKey(a9) == mizEmitKey(b9));
 		cites = if (i < length(t.stepRefs)) t.stepRefs[i] else [];
@@ -387,7 +410,13 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 		});
 		defDrvs1 = filter(defDrvs, \d8 -> !exists(mizEmitEqAtoms(d8.form, []),
 			\e8 -> containsSet(goalEqKeys, mizEmitKey(e8))));
-		drvs = map(concatA([drvs0, defDrvs1, guardDrvs]), mizEmitCleanIff);
+		// the existential a non-empty premise gives — the checker's fresh constant
+		// has to exist here before the recorded clause can be used
+		nempDrvs = mizEmitNempEx(concat(t.hyps, arrayPush(subrange(t.steps, 0, i), goal)));
+		// nempDrvs stays OUT of the normalizer: it turns `¬(A = ∅) → ∃x (x ∈ A)`
+		// into the ∀-contrapositive, which is the one form the ∃-elimination
+		// cannot use — and an eigenvariable is the whole point of the fact.
+		drvs = concat(map(concatA([drvs0, defDrvs1, guardDrvs]), mizEmitCleanIff), nempDrvs);
 		// the RECORD'S OWN equations seed the scoring too: the checker-attested
 		// instances (a cited theorem's `proj2 X = proj1 (X~)`, an expanded
 		// definition's equation) are as authoritative as the merge log's direct
@@ -420,6 +449,8 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 		// THE TRANSCRIPTION'S COVERAGE, measured per failing step: does the
 		// checker's own refutation of this step exist in the record at all?
 		if (isNone(r.first)) {
+			mizEmitThmFail := ^mizEmitThmFail + 1;
+			if (^mizEmitStepClausesRef != []) mizEmitThmFailRec := ^mizEmitThmFailRec + 1;
 			mizEmitFailSteps2 := ^mizEmitFailSteps2 + 1;
 			if (^mizEmitStepClausesRef != []) {
 				mizEmitFailWithClause := ^mizEmitFailWithClause + 1;
@@ -519,6 +550,15 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 		};
 		Pair(arrayPush(acc.first, r.first), ncnt);
 	});
+	// THE REPLAY'S CEILING, per theorem: a theorem closes only when EVERY step
+	// closes, so what decides the prize is not how many steps carry the
+	// checker's refutation but how they fall across theorems
+	if (^mizEmitThmFail == 1) {
+		mizEmitOneShort := ^mizEmitOneShort + 1;
+		if (^mizEmitThmFailRec == 1) mizEmitOneShortRec := ^mizEmitOneShortRec + 1;
+	};
+	if (^mizEmitThmFail > 0 && ^mizEmitThmFail == ^mizEmitThmFailRec)
+		mizEmitAllCovered := ^mizEmitAllCovered + 1;
 	res;
 }
 
@@ -1905,6 +1945,38 @@ mizEmitReduce(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 				else mizEmitCharGoal(hyps, prev, goal, args[0], args[1], "imp", "df-ss",
 					maxFacts, maxSize, depth, fresh, used, direct, recDrv);
 			}
+			// ★ A DENIED GOAL IS PROVED BY ASSUMING IT. Mizar states most of its
+			// theses as denied conjunctions (`¬ ( A ∧ … ∧ ¬ C )`), and the checker
+			// proves one the only way there is: it assumes the body and derives a
+			// contradiction. The reduction had no such rule — a negated goal went
+			// to the ladder whole — so the step's own premises were never in hand.
+			// The deduction reduction already proves `asm → X`; with X the false
+			// constant, pm2.65i turns `body → ¬ ⊤` and `body → ⊤` into `¬ body`.
+			FolNeg(body): {
+				sub = mizEmitReduceA(hyps, prev, body, FolNeg(FolPred("$true", [])),
+					maxFacts, maxSize, depth + 1, fresh, used, recDrv);
+				switch (sub.first) {
+					None(): {
+						// the old route: rewrite the goal and prove the residue
+						gr = mizEmitGoalNF(hyps, prev, goal, maxFacts, maxSize, depth,
+							fresh, used, recDrv);
+						switch (gr) {
+							Some(__): Pair(gr, false);
+							None(): Pair(None(), direct.second || sub.second);
+						}
+					}
+					Some(pr): {
+						n0 = length(pr.steps);
+						tr = FolPStep(FolPred("$true", []), "tru", []);
+						a1 = FolPStep(FolBin("imp", body, FolPred("$true", [])), "a1i",
+							[FolPRefStep(n0)]);
+						fin = FolPStep(goal, "pm2.65i",
+							[FolPRefStep(n0 + 1), FolPRefStep(n0 - 1)]);
+						Pair(Some(FolStepProof(concat(pr.steps, [tr, a1, fin]),
+							pr.factRefs, pr.disjs)), false);
+					}
+				}
+			}
 			FolEq(l, r): mizEmitCharGoal(hyps, prev, goal, l, r, "iff", "dfcleq",
 				maxFacts, maxSize, depth, fresh, used, direct, recDrv);
 			FolBin(op0, l0, r0): {
@@ -1936,12 +2008,6 @@ mizEmitReduce(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 					None(): mizEmitBinGoal(hyps, prev, goal, op0, l0, r0, maxFacts, maxSize,
 						depth, fresh, used, direct, recDrv);
 				}
-			}
-			default: {
-				// a bare membership goal in a compound term: rewrite it and prove
-				// the residue (mpbir back)
-				gr = mizEmitGoalNF(hyps, prev, goal, maxFacts, maxSize, depth, fresh, used, recDrv);
-				switch (gr) { Some(__): Pair(gr, false); None(): direct; }
 			}
 		}
 	}
@@ -2474,9 +2540,10 @@ mizEmitCharGoalA(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolFo
 	subGoal = FolQuant("forall", [v], matrix);
 	sub = mizEmitReduceA(hyps, prev, asm, subGoal, maxFacts, maxSize, depth + 1,
 		fresh, used, concat(recDrv,
-			concat(
+			concatA([
 				mizEmitEigenInsts(concatA([[asm], mizEmitConjuncts(asm, []), hyps, prev]), v),
-				mizEmitElemTypeFacts(concatA([mizEmitConjuncts(asm, []), hyps, prev]), v))));
+				mizEmitElemTypeFacts(concatA([mizEmitConjuncts(asm, []), hyps, prev]), v),
+				mizEmitNempEx(concatA([mizEmitConjuncts(asm, []), hyps, prev]))])));
 	switch (sub.first) {
 		None(): Pair(None(), direct.second || sub.second);
 		Some(pr): {
@@ -2773,6 +2840,32 @@ mizEmitEigenInsts(fs : [FolForm], v : string) -> [MizEmitDrv] {
 		}
 	});
 	insts;
+}
+
+// ---- WHERE THE CHECKER'S FRESH CONSTANT COMES FROM ----
+// Negating a Mizar `for x holds …` leaves an existential and the checker names
+// its witness; the clause then speaks about that name. Our proof cannot use the
+// clause until the same witness exists here, and the ∃-elimination that names
+// one needs the EXISTENTIAL first. In the shape the record shows (t4_subset_1's
+// family) it comes from a non-emptiness the step already has: a set that is not
+// empty has a member (miz_aux nempex, from n0). Offered as a fact, the existing
+// elimination introduces the eigenvariable and the recorded premise applies to
+// it.
+mizEmitNempEx(ctx : [FolForm]) -> [MizEmitDrv] {
+	empty = FolApp("∅", []);
+	nonEmpty = filtermap(uniq(ctx), \f -> switch (f) {
+		FolNeg(g): switch (g) {
+			FolEq(l, r): if (r == empty) Some(l) else if (l == empty) Some(r) else None();
+			default: None();
+		}
+		default: None();
+	});
+	map(subrange(nonEmpty, 0, 2), \t -> {
+		v = "Xn1";
+		form = FolBin("imp", FolNeg(FolEq(t, empty)),
+			FolQuant("exists", [v], FolPred("∈", [FolVar(v), t])));
+		MizEmitDrv(form, [FolPStep(form, "nempex", [])], [], []);
+	});
 }
 
 // ---- MIZAR'S SOFT TYPE LAYER, AS FOUNDATION LEMMAS ----
@@ -6877,6 +6970,9 @@ mizEmitFoundIffTable() -> [Pair<string, FolForm>] {
 		//   eltpwi    ( element A 𝒫 B ) → ( A ⊆ B )
 		Pair("eltpwi", FolBin("imp", FolPred("element", [va, FolApp("𝒫", [vb])]),
 			FolPred("⊆", [va, vb]))),
+		//   eltmem    ( element A 𝒫 B ) → ( ( C ∈ A ) → ( C ∈ B ) )
+		Pair("eltmem", FolBin("imp", FolPred("element", [va, FolApp("𝒫", [vb])]),
+			FolBin("imp", FolPred("∈", [vc, va]), FolPred("∈", [vc, vb])))),
 		//   eltss     ( element A 𝒫 B ) → ( ( C ∈ A ) → ( element C B ) )
 		Pair("eltss", FolBin("imp", FolPred("element", [va, FolApp("𝒫", [vb])]),
 			FolBin("imp", FolPred("∈", [vc, va]), FolPred("element", [vc, vb])))),

@@ -494,3 +494,29 @@ theorem elt0pw (B : class) {
 	step 2 : wff = elti () |- ( ( ∅ ∈ 𝒫 B ) → ( element ∅ 𝒫 B ) ) ;;
 	step 3 : wff = ax-mp (step 1, step 2) |- ( element ∅ 𝒫 B ) ;;
 }
+
+/* A member of a Subset of B is a member of B — the type's other half, the one
+   the checker uses whenever it reasons about the elements of a Subset. */
+
+theorem eltmem (A : class, B : class, C : class) {
+	prop : wff = |- ( ( element A 𝒫 B ) → ( ( C ∈ A ) → ( C ∈ B ) ) ) ;;
+} proof {
+	step 1 : wff = eltpwi () |- ( ( element A 𝒫 B ) → ( A ⊆ B ) ) ;;
+	step 2 : wff = ssel () |- ( ( A ⊆ B ) → ( ( C ∈ A ) → ( C ∈ B ) ) ) ;;
+	step 3 : wff = syl (step 1, step 2) |- ( ( element A 𝒫 B ) → ( ( C ∈ A ) → ( C ∈ B ) ) ) ;;
+}
+
+/* A non-empty set HAS a member. This is where the checker's fresh constant
+   comes from: negating a Mizar `for x holds …` leaves an existential, and the
+   checker names its witness. The emitter needs the existential itself before
+   its elimination can name one. */
+
+theorem nempex (A : class, x : setvar) disjointed(A x) {
+	prop : wff = |- ( ¬ ( A = ∅ ) → ∃ x ( x ∈ A ) ) ;;
+} proof {
+	step 1 : wff = df-ne () |- ( ( A ≠ ∅ ) ↔ ¬ ( A = ∅ ) ) ;;
+	step 2 : wff = biimpri (step 1) |- ( ¬ ( A = ∅ ) → ( A ≠ ∅ ) ) ;;
+	step 3 : wff = n0 () |- ( ( A ≠ ∅ ) ↔ ∃ x ( x ∈ A ) ) ;;
+	step 4 : wff = biimpi (step 3) |- ( ( A ≠ ∅ ) → ∃ x ( x ∈ A ) ) ;;
+	step 5 : wff = syl (step 2, step 4) |- ( ¬ ( A = ∅ ) → ∃ x ( x ∈ A ) ) ;;
+}
