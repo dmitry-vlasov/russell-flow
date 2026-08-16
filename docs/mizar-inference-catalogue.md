@@ -269,3 +269,72 @@ inflate the "foreign" count. The 0 is what matters and it is too clean to be
 naming alone — but the first thing the next unit should do is print one
 failing step's goal and clause side by side and confirm the vocabulary gap is
 expansion, not spelling.
+
+## Binders apart: the instantiation that was never attempted (2026-08-16)
+
+The unit the previous entry asked for — print one failing step's goal and its
+recorded clause side by side — and the answer it gave was not the one the
+measurement predicted.
+
+`t41_subset_1`, with the step's own context now printed next to the record:
+
+    ctx-step[0] ( ( x7 ∈ x5 ) → ( { x7 } ⊆ x5 ) )
+    ctx-step[1] ( ( x7 ∈ x5 ) → ( { x7 } ∈ 𝒫 x5 ) )
+    goal        ( ( x7 ∈ x5 ) → ( element { x7 } 𝒫 x5 ) )
+    instance    ( ( 𝒫 x5 = ∅ ) ∨ ( ( element { x7 } 𝒫 x5 ) ↔ ( { x7 } ∈ 𝒫 x5 ) ) )
+    premise     ∀ xd1 ∀ xd2 ( ( xd1 = ∅ ) ∨ ( ( element xd2 xd1 ) ↔ ( xd2 ∈ xd1 ) ) )
+    wit Xd1 := 𝒫 x5 ; wit Xd2 := { x7 } ; code 45
+
+Nothing here is a vocabulary gap: the context has the membership fact, the
+premise is the Element-of definition, and the instance closes the step. The
+trace one line above says why it failed anyway:
+
+    INSTIMP-DECLINE binder-in-witness X5
+    REC-UNMATCHED cands=d1_subset_1 … match=true
+      CAND d1_subset_1 stmt=∀ x5 ∀ xd2 ( ( x5 = ∅ ) ∨ … )
+
+The definition's own bound variable is called `x5`, the step's free variable is
+called `x5`, and the witness is `𝒫 x5`. `spcgv` is `disjointed(A x)`, so the
+instantiation is refused — correctly, on the spelling, and for two variables
+that have nothing to do with each other. The emitter counted **786 such
+declines on subset_1 and 761 on xboole_1**.
+
+★ THE FIX IS A RENAMING, AND ITS PLACE IS THE FETCH. An assertion's variables
+are metavariables, so a statement with its bound variables renamed is a
+substitution instance of the same assertion: the citation stays valid and the
+emitted articles stay byte-identical. `folBindersApart` renames every bound
+variable into a reserved pool (`Xq<k>`) and `stmtOfAt` applies it to every
+statement handed to the emitter. Declines on subset_1: 786 → 0.
+
+TWO RULES THE FIRST VERSION BROKE, both caught by Russell's own verify on
+relat_1 before the Metamath half ran:
+ * ONE FRESH NAME PER DISTINCT VARIABLE, not per binder occurrence. A statement
+   may bind the same variable twice (`d12_xtuple_0`: `∀ x12 … ∃ x12 …`).
+   Renaming the two occurrences apart is no longer a substitution instance —
+   Russell reported `proposition expression … cannot be matched with` — and
+   where it did match it captured (`exbidv`, `∃ xq4 ⟨ xq4 , xq4 ⟩`).
+ * A NAME THAT ALSO OCCURS FREE KEEPS ITS SPELLING. An open proposition (what
+   a `let` leaves) states the article's own free variables, and the citing step
+   must state them too. Only ∀-closed statements are renamed.
+
+MEASURED, full gate, every article Russell-verified and then checked by the
+ORIGINAL Metamath checker (all 7 databases success=true, proved == closed):
+
+    tarski 2/3 · xboole_0 3/8 · xboole_1 87/116 · enumset1 66/87
+    zfmisc_1 45/140 · subset_1 9/53 · xtuple_0 7/46 · relat_1 25/179
+    TOTAL 244 (was 240)
+
+The closed LISTS were diffed, not the counts: +8 (xtuple_0 t10 t11 t31 t35 t39
+t43, enumset1 t41, subset_1 t41) and −4 (relat_1 t70 t87 t89 t186).
+
+★ THE LOSS IS THE FACT BUDGET AGAIN, and it is worth stating plainly: the
+declined instances were never free. With them relat_1's steps over the tree cap
+go 100 → 233, its closed steps 50 → 45, and its emit time 3m05 → 5m02. Every
+new fact is offered to every step that can index it, so unblocking an
+instantiation is also an enlargement of the search. The four relat_1 theorems
+are the price of the eight elsewhere; recovering them is a SELECTION question,
+not a renaming one.
+
+Also in this unit: the failing-step diagnostic now prints the step's
+hypotheses and prior steps, the recorded witnesses, the kill pairing and the
+closing code, so a failing step can be read against what the proof had in hand.
