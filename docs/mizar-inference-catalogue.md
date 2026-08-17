@@ -585,3 +585,55 @@ refutation instead of offering its parts to a search. Per single-disjunct step:
 introduce the witnesses the record names (the ∃-facts are now derivable), build
 the instance at the recorded terms (done), then discharge the kill pairing in
 the recorded order. Every input exists; what is missing is the walk.
+
+## The replay walks: the checker's refutation becomes a Russell proof (2026-08-17)
+
+The assembly the last entry specified now runs end to end, and t4_subset_1 —
+the theorem whose record was read to design it — closes by it.
+
+WHAT THE WALK DOES, in Mizar's own order:
+ 1. the thesis is a denied conjunction, so the body is ASSUMED and a
+    contradiction derived (pm2.65i, and its deduction twin through imnani when
+    the denial stands under an assumption — most of them do);
+ 2. the checker's fresh constant is introduced: the non-emptiness the step
+    already carries gives an existential (miz_aux nempex, from n0) and the
+    ∃-elimination NAMES a witness;
+ 3. ★ the recorded clause is RESTATED about that witness — a free variable of
+    the recorded instance that is not a variable of the step IS the checker's
+    constant, so substituting our binder for it turns the record into facts
+    about a term we have;
+ 4. the instance is rebuilt at those terms by the ordinary join (here a
+    foundation row, eltmem), so nothing is asserted that is not proved;
+ 5. the step's own typed hypothesis is instantiated at the witness, the witness
+    gets its type from its membership (elti), and the propositional endgame is
+    three formulas.
+
+FOUR DEFECTS THE WALK EXPOSED, each general and each fixed here:
+ * ★ mizEmitProjTo descended only into the LEFT conjunct, so a conjunct nested
+   to the right — the shape Mizar's own conjunctions have, `A ∧ ( B ∧ C )` —
+   could not be projected out of an assumption at all. Every channel that asks
+   for one failed on it, the ∃-elimination's antecedent among them;
+ * the denied-goal rule applied to its own contradiction marker, assuming ⊤ and
+   denying it again: the assumption grew by `∧ ⊤` at every depth until the cap
+   (162 attempts on one step);
+ * the constants were computed from the clause's whole literal list, which also
+   carries the universal premise — whose binders are no one's constants;
+ * ★ TWO CASE TRAPS in one walk: `folFormVars` lowercases while
+   `mizFormFreeVars` does not (so the step's own variables looked foreign), and
+   the substitution must use the variable's RAW spelling (so the restatement
+   silently did nothing). Both were invisible — the machinery ran and produced
+   the unsubstituted formula.
+
+MEASURED: FULL GATE GREEN at 248, all 7 Metamath databases verified, proved ==
+closed. +2 against the previous round with nothing lost: t4_subset_1 and
+t7_xboole_0 (the latter free, from the same machinery).
+
+★ WHAT IS AND IS NOT DONE. The mechanism is done: a recorded refutation is
+walked into a verified proof, and the two theorems are the proof of it. The
+YIELD is not: the walk fires only where an ∃-elimination introduces a witness
+and the clause has exactly one checker constant. The 125 one-step-short
+theorems whose step carries a refutation (subset_1 30, relat_1 63, zfmisc_1 32)
+are reachable by firing the same walk in the shapes it does not yet cover —
+steps with no existential at all (the constant comes from elsewhere in the
+normalization), and clauses with more than one constant, where the pairing
+between the record's names and ours has to be decided rather than read off.

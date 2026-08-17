@@ -653,8 +653,21 @@ mizEmitExElim(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 						|| exists(vs, \v -> mizEmitFreeIn(v, goal))
 						|| exists(vs, \v -> exists(othersOf(cand), \f -> mizEmitFreeIn(v, f)))) acc
 					else {
+						// ★ THE WITNESS IS NAMED HERE, so here the recorded clause is
+						// restated about it: the checker's constant becomes this
+						// binder, its instance is rebuilt at those terms, and the
+						// binder gets the type its membership gives it.
+						ctxF = concat(map(ctx, \p9 -> p9.first), [goal]);
+						extra = concatA([
+							mizEmitClauseFactsAt(vs[0], ctxF),
+							mizEmitEltiAt(vs[0], arrayPush(ctxF, body)),
+							mizEmitEigenInsts(concat(hyps, prev), vs[0])]);
+						if (^mizEmitDbg && extra != [])
+							println("  EXREPLAY " + vs[0] + " facts=" + i2s(length(extra))
+								+ " :: " + strGlue(map(extra, \d9 ->
+									strGlue(folFormToks(d9.form), " ")), " ;; "));
 						sub = mizEmitReduceA(hyps, prev, body, goal, maxFacts, maxSize,
-							1, fresh, used, recDrv);
+							1, fresh, used, concat(recDrv, extra));
 						switch (sub.first) {
 							// a failed ∃-attempt keeps the step's ORIGINAL status: this
 							// is a last resort, and its budget overruns should not turn
@@ -715,11 +728,27 @@ mizEmitProjTo(steps : ref [FolPStep], asm : FolForm, tgt : FolForm) -> Maybe<int
 			else if (r == tgt) Some(emit(FolBin("imp", asm, r), "simpr", []))
 			else if (l == tgt) Some(emit(FolBin("imp", asm, l), "simpl", []))
 			else {
+				// BOTH branches: the walk descended only into the LEFT conjunct, so
+				// a conjunct nested to the right — which is the shape Mizar's own
+				// conjunctions have (`A ∧ ( B ∧ C )`) — could not be projected at
+				// all, and every channel that asks for one (the ∃-elimination's
+				// antecedent among them) failed on it.
 				s1 = emit(FolBin("imp", asm, l), "simpl", []);
-				switch (mizEmitProjTo(steps, l, tgt)) {
+				byL = switch (mizEmitProjTo(steps, l, tgt)) {
 					None(): None();
 					Some(s2): Some(emit(FolBin("imp", asm, tgt), "syl",
 						[FolPRefStep(s1), FolPRefStep(s2)]));
+				};
+				switch (byL) {
+					Some(__): byL;
+					None(): {
+						s3 = emit(FolBin("imp", asm, r), "simpr", []);
+						switch (mizEmitProjTo(steps, r, tgt)) {
+							None(): None();
+							Some(s4): Some(emit(FolBin("imp", asm, tgt), "syl",
+								[FolPRefStep(s3), FolPRefStep(s4)]));
+						}
+					}
 				}
 			}
 		default: None();
@@ -1042,7 +1071,9 @@ mizEmitExElimA(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolForm
 			+ " ctx-ex=" + i2s(length(ctxCands)) + " drv-ex=" + i2s(length(drvCands))
 			+ " insts=" + i2s(length(insts))
 			+ " asm= " + strGlue(folFormToks(asm), " ")
-			+ " goal= " + strGlue(folFormToks(goal), " "));
+			+ " goal= " + strGlue(folFormToks(goal), " ")
+			+ "\n    insts:: " + strGlue(map(insts, \d9 ->
+				strGlue(folFormToks(d9.form), " ")), " ;; "));
 	r1 = fold(concat(ctxCands, drvCands), failed, \acc : Pair<Maybe<FolStepProof>, bool>, cand -> switch (acc.first) {
 		Some(__): acc;
 		None(): {
@@ -1062,7 +1093,24 @@ mizEmitExElimA(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolForm
 						// inner witness) — produce on the ENRICHED assumption
 						asmE = FolBin("and", asm, body);
 						pmxE = mizEmitPairMatrixDrvs(asmE, recDrv, ^mizEmitShOfRef);
-						poolE = concat(recDrv, pmxE);
+						// ★ THE REPLAY'S LAST LINK. The witness has just been named,
+						// so the checker's own clause is restated about it: its
+						// constant becomes this binder, the recorded instance is
+						// rebuilt at those terms, and the binder gets the type its
+						// membership gives it. Mizar's endgame then has its premises.
+						ctxF9 = concat(map(ctx, \p9 -> p9.first), [asm, goal]);
+						cfE = mizEmitClauseFactsAt(vs[0], ctxF9);
+						repE = concatA([
+							cfE,
+							mizEmitEltiAt(vs[0], concat(arrayPush(ctxF9, body),
+								map(cfE, \d9 -> d9.form))),
+							mizEmitEigenInsts(concatA([[asm], mizEmitConjuncts(asm, []),
+								hyps, prev]), vs[0])]);
+						if (^mizEmitDbg && repE != [])
+							println("  EXREPLAY-A " + vs[0] + " facts=" + i2s(length(repE))
+								+ " :: " + strGlue(map(repE, \d9 ->
+									strGlue(folFormToks(d9.form), " ")), " ;; "));
+						poolE = concatA([recDrv, pmxE, repE]);
 						eqbE = mizEmitEqBridgeDrvs(asmE, goal, poolE);
 						sub = mizEmitReduceA0(hyps, prev, asmE, goal,
 							maxFacts, maxSize, depth + 2, fresh, used, concat(poolE, eqbE));
@@ -1952,7 +2000,7 @@ mizEmitReduce(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 			// to the ladder whole — so the step's own premises were never in hand.
 			// The deduction reduction already proves `asm → X`; with X the false
 			// constant, pm2.65i turns `body → ¬ ⊤` and `body → ⊤` into `¬ body`.
-			FolNeg(body): {
+			FolNeg(body): if (body == FolPred("$true", [])) direct else {
 				sub = mizEmitReduceA(hyps, prev, body, FolNeg(FolPred("$true", [])),
 					maxFacts, maxSize, depth + 1, fresh, used, recDrv);
 				switch (sub.first) {
@@ -2283,6 +2331,36 @@ mizEmitReduceA0(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolFor
 				FolPred(name, args): if (name != "⊆" || length(args) != 2) direct
 					else mizEmitCharGoalA(hyps, prev, asm, goal, args[0], args[1], "imp", "df-ss",
 						maxFacts, maxSize, depth, fresh, used, direct, recDrv);
+				// ★ THE DENIED GOAL'S DEDUCTION TWIN. Mizar's theses are denied
+				// conjunctions and most of them stand UNDER an assumption, so the
+				// rule that assumes the body has to exist here too: prove
+				// `( asm ∧ body ) → ¬ ⊤`, deny the conjunction with pm2.65i, and
+				// imnani re-curries it into `asm → ¬ body`.
+				// ...but never on the contradiction marker itself: assuming ⊤ and
+				// denying it again is an infinite regress (it grew the assumption
+				// by `∧ ⊤` at every depth until the cap, 162 attempts on one step)
+				FolNeg(nbody): if (nbody == FolPred("$true", [])) direct else {
+					both9 = FolBin("and", asm, nbody);
+					// the assumption now HAS the non-emptiness the witness comes from
+					sub9 = mizEmitReduceA(hyps, prev, both9, FolNeg(FolPred("$true", [])),
+						maxFacts, maxSize, depth + 1, fresh, used,
+						concat(recDrv, mizEmitNempEx([both9])));
+					switch (sub9.first) {
+						None(): Pair(None(), direct.second || sub9.second);
+						Some(pr9): {
+							n9 = length(pr9.steps);
+							tr9 = FolPStep(FolPred("$true", []), "tru", []);
+							a19 = FolPStep(FolBin("imp", both9, FolPred("$true", [])), "a1i",
+								[FolPRefStep(n9)]);
+							dn9 = FolPStep(FolNeg(both9), "pm2.65i",
+								[FolPRefStep(n9 + 1), FolPRefStep(n9 - 1)]);
+							im9 = FolPStep(FolBin("imp", asm, goal), "imnani",
+								[FolPRefStep(n9 + 2)]);
+							Pair(Some(FolStepProof(concat(pr9.steps, [tr9, a19, dn9, im9]),
+								pr9.factRefs, pr9.disjs)), false);
+						}
+					}
+				}
 				FolEq(l, r): mizEmitCharGoalA(hyps, prev, asm, goal, l, r, "iff", "dfcleq",
 					maxFacts, maxSize, depth, fresh, used, direct, recDrv);
 				FolBin(op, l, r): {
@@ -2325,7 +2403,6 @@ mizEmitReduceA0(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolFor
 						}
 					} else direct;
 				}
-				default: direct;
 			}
 		}
 	}
@@ -2842,6 +2919,109 @@ mizEmitEigenInsts(fs : [FolForm], v : string) -> [MizEmitDrv] {
 	insts;
 }
 
+// ---- THE RECORDED REFUTATION, RESTATED ABOUT OUR WITNESS ----
+// The checker names the witness of an existential and then states its whole
+// clause about that name. Our proof names its own witness — the binder the
+// ∃-elimination introduces — so the record is unusable until the two names are
+// identified. That is the last link of the replay: a free variable of the
+// recorded instance that is NOT a variable of the step is the checker's
+// constant, and substituting our binder for it turns the record into facts
+// about a term we have.
+//
+// The instance is then rebuilt at those terms by the ordinary join (a
+// foundation row, or a statement the skeleton index finds), so nothing is
+// asserted that is not proved, and the step's endgame becomes what Mizar's is:
+// the premise instance against the clause, over three or four formulas.
+// the names the INSTANCE speaks of that the step does not: the checker's
+// constants. Only the instance — the clause's literal list also carries the
+// universal premise, whose own binders are no one's constants — and the
+// comparison is case-insensitive, since the two variable readers disagree on
+// case (the standing trap).
+// variable names AS THE FORMULA CARRIES THEM (folFormVars lowercases)
+mizEmitRawVars(f : FolForm, acc : [string]) -> [string] {
+	switch (f) {
+		FolPred(__, args): fold(args, acc, \a, t -> mizEmitRawVarsT(t, a));
+		FolEq(l, r): mizEmitRawVarsT(r, mizEmitRawVarsT(l, acc));
+		FolNeg(g): mizEmitRawVars(g, acc);
+		FolBin(__, l, r): mizEmitRawVars(r, mizEmitRawVars(l, acc));
+		FolQuant(__, __, b): mizEmitRawVars(b, acc);
+	}
+}
+
+mizEmitRawVarsT(t : FolTerm, acc : [string]) -> [string] {
+	switch (t) {
+		FolVar(n): arrayPush(acc, n);
+		FolApp(__, args): fold(args, acc, \a, t2 -> mizEmitRawVarsT(t2, a));
+		FolAbs(__, b): mizEmitRawVars(b, acc);
+	}
+}
+
+mizEmitClauseConsts(c : MizDerivClause, ctxVars : Set<string>) -> [string] {
+	filter(uniq(folFormVars(c.instance)),
+		\v -> !containsSet(ctxVars, toLowerCase(v)));
+}
+
+mizEmitProveFact(f : FolForm) -> Maybe<MizEmitDrv> {
+	switch (mizEmitFoundFact(f)) {
+		Some(d): Some(d);
+		None(): mizEmitRecFromCites((^mizEmitBySkelRef)(mizEmitSkeleton(f)), f,
+			^mizEmitStmtOfRef, ^mizEmitIsAxiomRef, ^mizEmitShOfRef);
+	}
+}
+
+mizEmitClauseFactsAt(v : string, ctxForms : [FolForm]) -> [MizEmitDrv] {
+	// FREE variables: folFormVars counts binders too, and the assumption's own
+	// `∀ x7 …` then made x7 look like a variable of the step — which is exactly
+	// the name the checker uses for its constant, so nothing was ever restated
+	ctxVars = buildSet(map(concatA(map(ctxForms, mizFormFreeVars)), toLowerCase));
+	vt = FolVar(v);
+	concatA(map(^mizEmitStepClausesRef, \c -> {
+		consts = mizEmitClauseConsts(c, ctxVars);
+		// exactly one name to identify: with none there is nothing to restate,
+		// with several the pairing is a choice and this walk makes none
+		if (^mizEmitDbg && getUrlParameterDef("dbg-exelim", "") == "1")
+			println("    CLAUSEFACT consts=" + strGlue(consts, ",")
+				+ " inst=" + strGlue(folFormToks(c.instance), " "));
+		if (length(consts) != 1) []
+		else {
+			// the substitution must use the variable's RAW spelling: folFormVars
+			// lowercases and mizEmitSubF looks up what the term actually carries
+			sub = fold(mizEmitRawVars(c.instance, []), makeTree(), \ac, rv ->
+				if (toLowerCase(rv) == toLowerCase(consts[0])) setTree(ac, rv, vt) else ac);
+			inst2 = mizEmitSubF(c.instance, sub);
+			// the literals the record states about the constant become facts
+			// about our binder as well, when they can be proved on their own
+			lits2 = filtermap(c.lits, \pl -> {
+				l2 = mizEmitSubF(pl.second, sub);
+				if (!mizEmitFreeIn(v, l2)) None() else mizEmitProveFact(l2);
+			});
+			pf = mizEmitProveFact(inst2);
+			if (^mizEmitDbg && getUrlParameterDef("dbg-exelim", "") == "1")
+				println("    CLAUSEFACT-AT " + strGlue(folFormToks(inst2), " ")
+					+ " proved=" + b2s(isSome(pf)));
+			concat(switch (pf) {
+				None(): [];
+				Some(d): [d];
+			}, subrange(lits2, 0, 2));
+		}
+	}));
+}
+
+// `x ∈ T` makes x an Element of T (miz_aux elti) — the type the checker gives
+// its witness for free, and the form the step's own typed hypothesis needs.
+mizEmitEltiAt(v : string, forms : [FolForm]) -> [MizEmitDrv] {
+	vt = FolVar(v);
+	sets = uniq(filtermap(concatA(map(forms, \f -> mizEmitAtomsOf(f, []))), \a -> switch (a) {
+		FolPred(nm, args): if (nm != "∈" || length(args) != 2) None()
+			else if (args[0] != vt) None() else Some(args[1]);
+		default: None();
+	}));
+	map(subrange(sets, 0, 2), \t -> {
+		form = FolBin("imp", FolPred("∈", [vt, t]), FolPred("element", [vt, t]));
+		MizEmitDrv(form, [FolPStep(form, "elti", [])], [], []);
+	});
+}
+
 // ---- WHERE THE CHECKER'S FRESH CONSTANT COMES FROM ----
 // Negating a Mizar `for x holds …` leaves an existential and the checker names
 // its witness; the clause then speaks about that name. Our proof cannot use the
@@ -2851,15 +3031,26 @@ mizEmitEigenInsts(fs : [FolForm], v : string) -> [MizEmitDrv] {
 // empty has a member (miz_aux nempex, from n0). Offered as a fact, the existing
 // elimination introduces the eigenvariable and the recorded premise applies to
 // it.
+// every `¬ ( t = ∅ )` occurring in a formula, at any depth
+mizEmitNonEmptyOf(f : FolForm, depth : int) -> [FolTerm] {
+	empty = FolApp("∅", []);
+	if (depth > 6) [] else switch (f) {
+		FolNeg(g): switch (g) {
+			FolEq(l, r): if (r == empty) [l] else if (l == empty) [r] else [];
+			default: mizEmitNonEmptyOf(g, depth + 1);
+		}
+		FolBin(__, l, r): concat(mizEmitNonEmptyOf(l, depth + 1), mizEmitNonEmptyOf(r, depth + 1));
+		FolQuant(__, __, b): mizEmitNonEmptyOf(b, depth + 1);
+		default: [];
+	}
+}
+
 mizEmitNempEx(ctx : [FolForm]) -> [MizEmitDrv] {
 	empty = FolApp("∅", []);
-	nonEmpty = filtermap(uniq(ctx), \f -> switch (f) {
-		FolNeg(g): switch (g) {
-			FolEq(l, r): if (r == empty) Some(l) else if (l == empty) Some(r) else None();
-			default: None();
-		}
-		default: None();
-	});
+	// the non-emptiness may sit ANYWHERE — after the denied-goal rule it is a
+	// conjunct of the assumption, and in the thesis it was nested two levels in
+	nonEmpty = uniqBy(concatA(map(uniq(ctx), \f -> mizEmitNonEmptyOf(f, 0))),
+		\a9, b9 -> mizEmitTKey(a9) == mizEmitTKey(b9));
 	map(subrange(nonEmpty, 0, 2), \t -> {
 		v = "Xn1";
 		form = FolBin("imp", FolNeg(FolEq(t, empty)),
