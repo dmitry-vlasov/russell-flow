@@ -637,3 +637,47 @@ are reachable by firing the same walk in the shapes it does not yet cover —
 steps with no existential at all (the constant comes from elsewhere in the
 normalization), and clauses with more than one constant, where the pairing
 between the record's names and ours has to be decided rather than read off.
+
+## The walk, made general: the record decides, the foundation proves (2026-08-17)
+
+The first working walk fired only where an ∃-elimination happened to name a
+witness, and the witness itself came from a channel that PATTERN-MATCHED
+`¬ ( t = ∅ )` in the step. That is the ad-hoc shape this project keeps being
+burned by: one formula recognised in the emitter, and a thousand more waiting.
+
+★ THE GENERAL RULE, and there is only one: THE EXISTENTIAL TO PROVE IS READ OFF
+THE RECORD. A free variable of the recorded instance that is not a variable of
+the step IS one of the checker's constants; the clause's positive literals about
+it say what it satisfies; so the formula to prove is `∃v (that literal, at v)`.
+Proving it is the ordinary job of the fact machinery — a foundation row, a
+definition, a citation. The emitter names no formula: `¬ ( A = ∅ ) → ∃x ( x ∈ A )`
+is a lemma in miz_aux and a row in the foundation index, and the walk finds it by
+matching the row's CONCLUSION against what the record asked for.
+
+ONE RULE, TWO READINGS, because "not a variable of the step" depends on where
+the walk stands: at a LEAF the goal has been peeled, so the step's variables are
+the free ones; ABOVE the peeling they are still bound by the goal's prefix, and
+the honest test is that the name occurs nowhere in the step at all. Both
+readings call the same function with a different variable set — not two
+channels.
+
+WHAT THE GENERALIZATION COST AND BOUGHT. Gate GREEN at 247 (was 248): t4_subset_1
+still closes — by the record, now, rather than by a pattern — and t7_xboole_0 no
+longer does. That theorem was closing because the pattern channel sprayed a
+non-emptiness existential at every step that mentioned one, and it happened to
+help; the record never asked for it. One theorem is the honest price of removing
+a guess, and the mechanism that remains is the one that can scale.
+
+THE CASE TRAP, THIRD AND FOURTH SIGHTING, now fixed at the root: `folFormVars`
+lowercases and `mizFormFreeVars` does not, and `mizEmitSubF` looks up the RAW
+spelling. Every comparison in the walk now goes through `mizEmitRawVars`, which
+reads what the formula actually carries. Both times the machinery ran without
+error and silently produced the unsubstituted formula — nothing failed, nothing
+was logged, and the only symptom was a theorem that did not close.
+
+WHAT REMAINS FOR THE 125. The walk is general in what it reads and what it
+proves; it is still bounded in WHERE it can name a witness — the ∃-elimination
+must be reachable at that point in the reduction — and it identifies one
+constant per clause. Both are properties of the assembly, not of the record, and
+both are the next unit: name every constant the clause has, at the point the
+record says they exist.

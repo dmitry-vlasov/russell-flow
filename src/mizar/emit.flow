@@ -410,9 +410,12 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 		});
 		defDrvs1 = filter(defDrvs, \d8 -> !exists(mizEmitEqAtoms(d8.form, []),
 			\e8 -> containsSet(goalEqKeys, mizEmitKey(e8))));
-		// the existential a non-empty premise gives — the checker's fresh constant
-		// has to exist here before the recorded clause can be used
-		nempDrvs = mizEmitNempEx(concat(t.hyps, arrayPush(subrange(t.steps, 0, i), goal)));
+		// The record's existentials are NOT computed here: at this level the
+		// step's own variables are still bound by the goal's prefix, so every
+		// name looks foreign and the walk cannot tell the checker's constants
+		// from ours. It runs where the goal has been peeled — at the leaf.
+		nempDrvs = mizEmitClauseExAll(concat(t.hyps,
+			arrayPush(subrange(t.steps, 0, i), goal)));
 		// nempDrvs stays OUT of the normalizer: it turns `¬(A = ∅) → ∃x (x ∈ A)`
 		// into the ∀-contrapositive, which is the one form the ∃-elimination
 		// cannot use — and an eigenvariable is the whole point of the fact.
@@ -2341,10 +2344,10 @@ mizEmitReduceA0(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolFor
 				// by `∧ ⊤` at every depth until the cap, 162 attempts on one step)
 				FolNeg(nbody): if (nbody == FolPred("$true", [])) direct else {
 					both9 = FolBin("and", asm, nbody);
-					// the assumption now HAS the non-emptiness the witness comes from
+					// the assumption now carries what the record's witnesses come from
 					sub9 = mizEmitReduceA(hyps, prev, both9, FolNeg(FolPred("$true", [])),
 						maxFacts, maxSize, depth + 1, fresh, used,
-						concat(recDrv, mizEmitNempEx([both9])));
+						concat(recDrv, mizEmitClauseEx(concat(concat(hyps, prev), [both9]))));
 					switch (sub9.first) {
 						None(): Pair(None(), direct.second || sub9.second);
 						Some(pr9): {
@@ -2620,7 +2623,7 @@ mizEmitCharGoalA(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolFo
 			concatA([
 				mizEmitEigenInsts(concatA([[asm], mizEmitConjuncts(asm, []), hyps, prev]), v),
 				mizEmitElemTypeFacts(concatA([mizEmitConjuncts(asm, []), hyps, prev]), v),
-				mizEmitNempEx(concatA([mizEmitConjuncts(asm, []), hyps, prev]))])));
+				mizEmitClauseEx(concatA([[asm, goal], hyps, prev]))])));
 	switch (sub.first) {
 		None(): Pair(None(), direct.second || sub.second);
 		Some(pr): {
@@ -3022,40 +3025,93 @@ mizEmitEltiAt(v : string, forms : [FolForm]) -> [MizEmitDrv] {
 	});
 }
 
-// ---- WHERE THE CHECKER'S FRESH CONSTANT COMES FROM ----
-// Negating a Mizar `for x holds …` leaves an existential and the checker names
-// its witness; the clause then speaks about that name. Our proof cannot use the
-// clause until the same witness exists here, and the ∃-elimination that names
-// one needs the EXISTENTIAL first. In the shape the record shows (t4_subset_1's
-// family) it comes from a non-emptiness the step already has: a set that is not
-// empty has a member (miz_aux nempex, from n0). Offered as a fact, the existing
-// elimination introduces the eigenvariable and the recorded premise applies to
-// it.
-// every `¬ ( t = ∅ )` occurring in a formula, at any depth
-mizEmitNonEmptyOf(f : FolForm, depth : int) -> [FolTerm] {
-	empty = FolApp("∅", []);
-	if (depth > 6) [] else switch (f) {
-		FolNeg(g): switch (g) {
-			FolEq(l, r): if (r == empty) [l] else if (l == empty) [r] else [];
-			default: mizEmitNonEmptyOf(g, depth + 1);
-		}
-		FolBin(__, l, r): concat(mizEmitNonEmptyOf(l, depth + 1), mizEmitNonEmptyOf(r, depth + 1));
-		FolQuant(__, __, b): mizEmitNonEmptyOf(b, depth + 1);
-		default: [];
-	}
+// ---- WHERE THE CHECKER'S FRESH CONSTANTS COME FROM, GENERALLY ----
+// The checker normalizes what it assumes, and every existential it meets is
+// replaced by a fresh constant; the clause then speaks about those names. A
+// proof of ours can use the clause only after the same witnesses exist here,
+// and the record says exactly which ones it needs: a free variable of the
+// recorded instance that is not a variable of the step IS such a constant, and
+// the literals mentioning it say what it satisfies.
+//
+// So the existential to prove is READ OFF THE RECORD — `∃v (the clause's
+// literals about the constant, at v)` — and proving it is the ordinary job of
+// the fact machinery: a foundation lemma, a definition, a citation. Nothing
+// here knows any particular formula; `¬ ( A = ∅ ) → ∃x ( x ∈ A )` is a lemma in
+// miz_aux, not a case in the emitter.
+// A name is the checker's constant when it is not the step's. What "the step's"
+// means depends on where the walk stands: at a LEAF the goal has been peeled, so
+// its own variables are free and the free ones are ours; ABOVE the peeling they
+// are still bound by the goal's prefix, and there the honest test is that the
+// name occurs nowhere in the step at all. One walk, two readings of the same
+// rule — not two channels.
+mizEmitClauseExAt(ctxVars : Set<string>) -> [MizEmitDrv] {
+	concatA(map(^mizEmitStepClausesRef, \c -> {
+		consts = mizEmitClauseConsts(c, ctxVars);
+		concatA(map(subrange(consts, 0, 2), \k -> {
+			// what the record says this name satisfies (positive literals only:
+			// a negative one states what does NOT hold of it)
+			// case-insensitively: the record's forms carry the raw spelling and
+			// the name came through the lowercasing reader (the standing trap,
+			// met three times in this walk — every comparison here goes through
+			// mizEmitRawVars, which reads what the formula actually carries)
+			mentions = \f9 : FolForm -> exists(mizEmitRawVars(f9, []),
+				\rv -> toLowerCase(rv) == toLowerCase(k));
+			about = filtermap(c.lits, \pl -> switch (pl.second) {
+				FolNeg(__): None();
+				default: if (mentions(pl.second)) Some(pl.second) else None();
+			});
+			if (about == []) [] else {
+				v = "Xw" + i2s(sizeSet(ctxVars));
+				sub = fold(mizEmitRawVars(about[0], []), makeTree(), \ac, rv ->
+					if (toLowerCase(rv) == toLowerCase(k)) setTree(ac, rv, FolVar(v)) else ac);
+				body = mizEmitSubF(about[0], sub);
+				exForm = FolQuant("exists", [v], body);
+				if (^mizEmitDbg && getUrlParameterDef("dbg-exelim", "") == "1")
+					println("    CLAUSE-EX " + k + " :: " + strGlue(folFormToks(exForm), " "));
+				// proved outright, or under a guard the step can discharge — the
+				// guarded form is what the elimination's own candidate list takes
+				concat(switch (mizEmitProveFact(exForm)) {
+					None(): [];
+					Some(d): [d];
+				}, mizEmitFoundConcl(exForm));
+			}
+		}));
+	}));
 }
 
-mizEmitNempEx(ctx : [FolForm]) -> [MizEmitDrv] {
-	empty = FolApp("∅", []);
-	// the non-emptiness may sit ANYWHERE — after the denied-goal rule it is a
-	// conjunct of the assumption, and in the thesis it was nested two levels in
-	nonEmpty = uniqBy(concatA(map(uniq(ctx), \f -> mizEmitNonEmptyOf(f, 0))),
-		\a9, b9 -> mizEmitTKey(a9) == mizEmitTKey(b9));
-	map(subrange(nonEmpty, 0, 2), \t -> {
-		v = "Xn1";
-		form = FolBin("imp", FolNeg(FolEq(t, empty)),
-			FolQuant("exists", [v], FolPred("∈", [FolVar(v), t])));
-		MizEmitDrv(form, [FolPStep(form, "nempex", [])], [], []);
+// at a leaf: the step's variables are the FREE ones
+mizEmitClauseEx(ctxForms : [FolForm]) -> [MizEmitDrv] {
+	mizEmitClauseExAt(buildSet(map(concatA(map(ctxForms, mizFormFreeVars)), toLowerCase)));
+}
+
+// above the peeling: every name the step mentions, bound or free, is ours
+mizEmitClauseExAll(ctxForms : [FolForm]) -> [MizEmitDrv] {
+	mizEmitClauseExAt(buildSet(map(concatA(map(ctxForms, folFormVars)), toLowerCase)));
+}
+
+// a foundation row whose CONCLUSION is `f`, as the implication it is: the row
+// is stated `guard → f`, and the elimination discharges the guard from the
+// step's own assumption. Matching rows by their conclusion is what makes the
+// existential above provable without naming any lemma here.
+mizEmitFoundConcl(f : FolForm) -> [MizEmitDrv] {
+	metas = buildSet(["A", "B", "C", "D"]);
+	filtermap(mizEmitFoundIffTable(), \row -> switch (row.second) {
+		FolBin(op, l, r): if (op != "imp") None()
+			else switch (mizEmitMatchF(r, f, metas, Some(makeTree()))) {
+				None(): None();
+				Some(sub): {
+					inst = mizEmitSubF(row.second, sub);
+					switch (inst) {
+						// up to the names of the binders, like every other
+						// comparison in this walk
+						FolBin(__, __, r2): if (isNone(mizEmitMatchF(r2, f, makeSet(),
+							Some(makeTree())))) None()
+							else Some(MizEmitDrv(inst, [FolPStep(inst, row.first, [])], [], []));
+						default: None();
+					}
+				}
+			}
+		default: None();
 	});
 }
 
@@ -7156,6 +7212,10 @@ mizEmitFoundIffTable() -> [Pair<string, FolForm>] {
 			FolBin("iff", FolPred("element", [va, vb]), FolEq(va, FolApp("∅", []))))),
 		//   elti      ( A ∈ B ) → ( element A B )
 		Pair("elti", FolBin("imp", FolPred("∈", [va, vb]), FolPred("element", [va, vb]))),
+		//   nempex    ¬ ( A = ∅ ) → ∃x ( x ∈ A )   — a set that is not empty HAS a
+		//   member: the existential Mizar's own normalization names a constant for
+		Pair("nempex", FolBin("imp", FolNeg(FolEq(va, FolApp("∅", []))),
+			FolQuant("exists", ["Xe1"], FolPred("∈", [FolVar("Xe1"), va])))),
 		//   elt0pw    ( element ∅ 𝒫 B )
 		Pair("elt0pw", FolPred("element", [FolApp("∅", []), FolApp("𝒫", [vb])])),
 		//   eltpwi    ( element A 𝒫 B ) → ( A ⊆ B )
