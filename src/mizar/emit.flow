@@ -91,6 +91,8 @@ export {
 	// [one-step-short theorems, of them with the checker's refutation recorded,
 	// theorems whose every failing step has one]
 	mizEmitReplayCoverage() -> [int];
+	// covered failing steps by checker-constant count: [0, 1, 2, >2]
+	mizEmitConstBucketCounts() -> [int];
 	// the binder names those declines were on, most frequent first
 	mizEmitInstDeclNamesTop() -> string;
 	// (definitions the record named at emitted steps, instances built from them)
@@ -134,6 +136,13 @@ mizEmitStepCodesRef : ref [int] = ref [];
 // the RECORDED REFUTATION of this step, when the checker closed it with a
 // single disjunct: clause, premise instance, and the kill pairing
 mizEmitStepClausesRef : ref [MizDerivClause] = ref [];
+// THE PAIRING the replay accumulates: the checker's constant -> the witness our
+// proof named for it. Extended at each ∃-elimination whose body matches a
+// recorded literal, restored when a candidate fails, reset per step. This is
+// what lets a MULTI-constant clause be replayed by NESTED eliminations: at each
+// depth the record is read with the pairings made so far applied, and only the
+// still-unmapped names count as constants.
+mizEmitConstMapRef : ref Tree<string, FolTerm> = ref makeTree();
 mizEmitTypeCodes() -> [int] { [1, 2, 6, 8, 9, 10, 11, 21, 40, 41, 43]; }
 mizEmitStepIsTyped() -> bool {
 	exists(^mizEmitStepCodesRef, \c -> exists(mizEmitTypeCodes(), \t -> t == c));
@@ -185,6 +194,9 @@ mizEmitOneShort : ref int = ref 0;
 mizEmitOneShortRec : ref int = ref 0;
 // theorems whose EVERY failing step is covered (the replay's ceiling)
 mizEmitAllCovered : ref int = ref 0;
+// covered failing steps bucketed by how many checker constants their clause
+// carries: [0 consts, 1, 2, more]
+mizEmitConstBuckets : ref [int] = ref [0, 0, 0, 0];
 mizEmitNoInstVerum : ref int = ref 0;
 mizEmitNoInstNoCand : ref int = ref 0;
 mizEmitNoInstNoMatch : ref int = ref 0;
@@ -210,6 +222,7 @@ mizEmitClauseNoInstCount() -> int { ^mizEmitClauseNoInst; }
 mizEmitReplayCoverage() -> [int] {
 	[^mizEmitOneShort, ^mizEmitOneShortRec, ^mizEmitAllCovered];
 }
+mizEmitConstBucketCounts() -> [int] { ^mizEmitConstBuckets; }
 mizEmitNoInstKinds() -> [int] { [^mizEmitNoInstVerum, ^mizEmitNoInstNoCand,
 	^mizEmitNoInstNoMatch, ^mizEmitNoInstOther]; }
 mizEmitInstDeclNamesTop() -> string {
@@ -256,6 +269,7 @@ mizEmitRecReset() -> void {
 	mizEmitInstDeclBinder := 0; mizEmitInstDeclNames := makeTree();
 	mizEmitInstDeclWalk := 0; mizEmitInstDeclSeth := 0; mizEmitClauseNoInst := 0;
 	mizEmitOneShort := 0; mizEmitOneShortRec := 0; mizEmitAllCovered := 0;
+	mizEmitConstBuckets := [0, 0, 0, 0];
 	mizEmitNoInstVerum := 0; mizEmitNoInstNoCand := 0;
 	mizEmitNoInstNoMatch := 0; mizEmitNoInstOther := 0;
 	mizEmitDischarged := 0; mizEmitCleaned := 0;
@@ -313,6 +327,7 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 		// the rules the checker closed THIS step with (record dispatch)
 		mizEmitStepCodesRef := codesOf(pos);
 		mizEmitStepClausesRef := clausesOf(pos);
+		mizEmitConstMapRef := makeTree();
 		mizEmitShOfRef := shOf;
 		mizEmitStmtOfRef := stmtOf;
 		mizEmitBySkelRef := bySkeleton;
@@ -457,6 +472,16 @@ mizEmitThmProofs(t : MizThm, maxFacts : int, maxSize : int,
 			mizEmitFailSteps2 := ^mizEmitFailSteps2 + 1;
 			if (^mizEmitStepClausesRef != []) {
 				mizEmitFailWithClause := ^mizEmitFailWithClause + 1;
+				// the frame's design measurement: how many checker constants do
+				// the covered steps actually carry?
+				stepVars = buildSet(map(concatA(map(
+					concat(t.hyps, arrayPush(subrange(t.steps, 0, i), goal)),
+					folFormVars)), toLowerCase));
+				nc = fold(^mizEmitStepClausesRef, 0, \mx, c5 ->
+					max(mx, length(mizEmitClauseConsts(c5, stepVars))));
+				bi = if (nc <= 2) nc else 3;
+				mizEmitConstBuckets := mapi(^mizEmitConstBuckets, \i5, v5 ->
+					if (i5 == bi) v5 + 1 else v5);
 				// the two normal forms, side by side — is the gap EXPANSION or
 				// merely spelling? (the caveat the measurement left open)
 				if (^mizEmitDbg) {
@@ -661,6 +686,7 @@ mizEmitExElim(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 						// binder, its instance is rebuilt at those terms, and the
 						// binder gets the type its membership gives it.
 						ctxF = concat(map(ctx, \p9 -> p9.first), [goal]);
+						savedE = mizEmitPairConst(vs[0], body, ctxF);
 						extra = concatA([
 							mizEmitClauseFactsAt(vs[0], ctxF),
 							mizEmitEltiAt(vs[0], arrayPush(ctxF, body)),
@@ -675,7 +701,10 @@ mizEmitExElim(hyps : [FolForm], prev : [FolForm], goal : FolForm,
 							// a failed ∃-attempt keeps the step's ORIGINAL status: this
 							// is a last resort, and its budget overruns should not turn
 							// an attempted step into a "skipped" one
-							None(): acc;
+							None(): {
+								mizEmitConstMapRef := savedE;
+								acc;
+							}
 							Some(pr): {
 								dj = concatA(map(vs, \v -> {
 									vr = toLowerCase(v);
@@ -1102,6 +1131,7 @@ mizEmitExElimA(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolForm
 						// rebuilt at those terms, and the binder gets the type its
 						// membership gives it. Mizar's endgame then has its premises.
 						ctxF9 = concat(map(ctx, \p9 -> p9.first), [asm, goal]);
+						saved9 = mizEmitPairConst(vs[0], body, ctxF9);
 						cfE = mizEmitClauseFactsAt(vs[0], ctxF9);
 						repE = concatA([
 							cfE,
@@ -1118,7 +1148,11 @@ mizEmitExElimA(hyps : [FolForm], prev : [FolForm], asm : FolForm, goal : FolForm
 						sub = mizEmitReduceA0(hyps, prev, asmE, goal,
 							maxFacts, maxSize, depth + 2, fresh, used, concat(poolE, eqbE));
 						switch (sub.first) {
-							None(): acc;
+							None(): {
+								// a failed candidate must not keep its pairing
+								mizEmitConstMapRef := saved9;
+								acc;
+							}
 							Some(pr): {
 								steps : ref [FolPStep] = ref pr.steps;
 								refs : ref [RuParseRef] = ref pr.factRefs;
@@ -2959,55 +2993,98 @@ mizEmitRawVarsT(t : FolTerm, acc : [string]) -> [string] {
 	}
 }
 
+// substitution by RAW spelling, case-insensitively on the key
+mizEmitSubRaw(f : FolForm, key : string, t : FolTerm) -> FolForm {
+	sub = fold(mizEmitRawVars(f, []), makeTree(), \ac, rv ->
+		if (toLowerCase(rv) == toLowerCase(key)) setTree(ac, rv, t) else ac);
+	mizEmitSubF(f, sub);
+}
+
+// a record formula with every pairing made so far applied
+mizEmitApplyConstMap(f : FolForm) -> FolForm {
+	foldTree(^mizEmitConstMapRef, f, \k, t, ac -> mizEmitSubRaw(ac, k, t));
+}
+
 mizEmitClauseConsts(c : MizDerivClause, ctxVars : Set<string>) -> [string] {
-	filter(uniq(folFormVars(c.instance)),
-		\v -> !containsSet(ctxVars, toLowerCase(v)));
+	// the map's VALUES are our own witnesses: a name the pairing already
+	// introduced is not a constant, however foreign it is to the step's
+	// context (the binder just named is free only in the eliminated body,
+	// which the caller's context does not carry)
+	ours = fold(getTreeValues(^mizEmitConstMapRef), ctxVars, \ac, t -> switch (t) {
+		FolVar(n): insertSet(ac, toLowerCase(n));
+		default: ac;
+	});
+	filter(uniq(folFormVars(mizEmitApplyConstMap(c.instance))),
+		\v -> !containsSet(ours, toLowerCase(v))
+			&& !containsKeyTree(^mizEmitConstMapRef, v));
 }
 
 mizEmitProveFact(f : FolForm) -> Maybe<MizEmitDrv> {
-	switch (mizEmitFoundFact(f)) {
+	r = switch (mizEmitFoundFact(f)) {
 		Some(d): Some(d);
 		None(): mizEmitRecFromCites((^mizEmitBySkelRef)(mizEmitSkeleton(f)), f,
 			^mizEmitStmtOfRef, ^mizEmitIsAxiomRef, ^mizEmitShOfRef);
-	}
+	};
+	if (isNone(r) && ^mizEmitDbg && getUrlParameterDef("dbg-exelim", "") == "1")
+		println("      PROVEFACT-FAIL found=no skel-cands="
+			+ i2s(length((^mizEmitBySkelRef)(mizEmitSkeleton(f))))
+			+ " :: " + strGlue(folFormToks(f), " "));
+	r;
 }
 
 mizEmitClauseFactsAt(v : string, ctxForms : [FolForm]) -> [MizEmitDrv] {
-	// FREE variables: folFormVars counts binders too, and the assumption's own
-	// `∀ x7 …` then made x7 look like a variable of the step — which is exactly
-	// the name the checker uses for its constant, so nothing was ever restated
+	// FREE variables of the step are ours; the record's remaining names are the
+	// checker's constants. The formulas are read THROUGH the accumulated
+	// pairing (mizEmitConstMapRef), and the binder just named is expected to be
+	// in it already — mizEmitPairConst put it there when its candidate matched.
 	ctxVars = buildSet(map(concatA(map(ctxForms, mizFormFreeVars)), toLowerCase));
-	vt = FolVar(v);
 	concatA(map(^mizEmitStepClausesRef, \c -> {
 		consts = mizEmitClauseConsts(c, ctxVars);
-		// exactly one name to identify: with none there is nothing to restate,
-		// with several the pairing is a choice and this walk makes none
 		if (^mizEmitDbg && getUrlParameterDef("dbg-exelim", "") == "1")
 			println("    CLAUSEFACT consts=" + strGlue(consts, ",")
-				+ " inst=" + strGlue(folFormToks(c.instance), " "));
-		if (length(consts) != 1) []
-		else {
-			// the substitution must use the variable's RAW spelling: folFormVars
-			// lowercases and mizEmitSubF looks up what the term actually carries
-			sub = fold(mizEmitRawVars(c.instance, []), makeTree(), \ac, rv ->
-				if (toLowerCase(rv) == toLowerCase(consts[0])) setTree(ac, rv, vt) else ac);
-			inst2 = mizEmitSubF(c.instance, sub);
-			// the literals the record states about the constant become facts
-			// about our binder as well, when they can be proved on their own
-			lits2 = filtermap(c.lits, \pl -> {
-				l2 = mizEmitSubF(pl.second, sub);
-				if (!mizEmitFreeIn(v, l2)) None() else mizEmitProveFact(l2);
-			});
-			pf = mizEmitProveFact(inst2);
-			if (^mizEmitDbg && getUrlParameterDef("dbg-exelim", "") == "1")
-				println("    CLAUSEFACT-AT " + strGlue(folFormToks(inst2), " ")
-					+ " proved=" + b2s(isSome(pf)));
-			concat(switch (pf) {
-				None(): [];
-				Some(d): [d];
-			}, subrange(lits2, 0, 2));
-		}
+				+ " inst=" + strGlue(folFormToks(mizEmitApplyConstMap(c.instance)), " "));
+		// a fact still carrying an unmapped constant is NOT emitted: an
+		// undeclared variable in a proof step is exactly what the honesty gate
+		// catches. It becomes expressible one elimination deeper, when that
+		// constant is named too.
+		resolved = \f9 : FolForm -> !exists(map(mizEmitRawVars(f9, []), toLowerCase),
+			\rv -> exists(consts, \k2 -> rv == toLowerCase(k2)));
+		inst2 = mizEmitApplyConstMap(c.instance);
+		lits2 = filtermap(c.lits, \pl -> {
+			l2 = mizEmitApplyConstMap(pl.second);
+			if (!mizEmitFreeIn(v, l2) || !resolved(l2)) None() else mizEmitProveFact(l2);
+		});
+		pf = if (!mizEmitFreeIn(v, inst2) || !resolved(inst2)) None()
+			else mizEmitProveFact(inst2);
+		if (^mizEmitDbg && getUrlParameterDef("dbg-exelim", "") == "1")
+			println("    CLAUSEFACT-AT " + strGlue(folFormToks(inst2), " ")
+				+ " proved=" + b2s(isSome(pf)));
+		concat(switch (pf) {
+			None(): [];
+			Some(d): [d];
+		}, subrange(lits2, 0, 2));
 	}));
+}
+
+// ---- EXTENDING THE PAIRING at an elimination ----
+// The witness `v` was just named for an existential whose body is `body`. If a
+// clause's positive literal, read through the pairing so far and with one
+// still-unmapped constant `k` set to v, IS that body — then v is the checker's
+// k, and the pairing is extended. Returns the map to RESTORE on failure: the
+// fold over candidates must not keep a pairing whose sub-proof failed.
+mizEmitPairConst(v : string, body : FolForm, ctxForms : [FolForm]) -> Tree<string, FolTerm> {
+	saved = ^mizEmitConstMapRef;
+	ctxVars = buildSet(map(concatA(map(ctxForms, mizFormFreeVars)), toLowerCase));
+	iter(^mizEmitStepClausesRef, \c ->
+		iter(mizEmitClauseConsts(c, ctxVars), \k ->
+			if (!containsKeyTree(^mizEmitConstMapRef, k))
+				iter(c.lits, \pl -> {
+					l2 = mizEmitSubRaw(mizEmitApplyConstMap(pl.second), k, FolVar(v));
+					if (isSome(mizEmitMatchF(l2, body, makeSet(), Some(makeTree())))
+						&& mizEmitFreeIn(v, l2))
+						mizEmitConstMapRef := setTree(^mizEmitConstMapRef, k, FolVar(v));
+				})));
+	saved;
 }
 
 // `x ∈ T` makes x an Element of T (miz_aux elti) — the type the checker gives
@@ -3047,24 +3124,24 @@ mizEmitEltiAt(v : string, forms : [FolForm]) -> [MizEmitDrv] {
 mizEmitClauseExAt(ctxVars : Set<string>) -> [MizEmitDrv] {
 	concatA(map(^mizEmitStepClausesRef, \c -> {
 		consts = mizEmitClauseConsts(c, ctxVars);
-		concatA(map(subrange(consts, 0, 2), \k -> {
-			// what the record says this name satisfies (positive literals only:
-			// a negative one states what does NOT hold of it)
-			// case-insensitively: the record's forms carry the raw spelling and
-			// the name came through the lowercasing reader (the standing trap,
-			// met three times in this walk — every comparison here goes through
-			// mizEmitRawVars, which reads what the formula actually carries)
-			mentions = \f9 : FolForm -> exists(mizEmitRawVars(f9, []),
-				\rv -> toLowerCase(rv) == toLowerCase(k));
-			about = filtermap(c.lits, \pl -> switch (pl.second) {
-				FolNeg(__): None();
-				default: if (mentions(pl.second)) Some(pl.second) else None();
+		concatA(map(subrange(consts, 0, 3), \k -> {
+			// what the record says this name satisfies: positive literals about
+			// it, read THROUGH the accumulated pairing, and carrying no OTHER
+			// unmapped constant — a literal linking two constants belongs to a
+			// deeper elimination. All name comparisons go through
+			// mizEmitRawVars (the case trap).
+			others = filter(consts, \k2 -> k2 != k);
+			about = filtermap(c.lits, \pl -> {
+				lm = mizEmitApplyConstMap(pl.second);
+				vs9 = map(mizEmitRawVars(lm, []), toLowerCase);
+				ok = switch (lm) { FolNeg(__): false; default: true; };
+				if (ok && exists(vs9, \rv -> rv == toLowerCase(k))
+					&& !exists(others, \k2 -> exists(vs9, \rv -> rv == toLowerCase(k2))))
+					Some(lm) else None();
 			});
 			if (about == []) [] else {
 				v = "Xw" + i2s(sizeSet(ctxVars));
-				sub = fold(mizEmitRawVars(about[0], []), makeTree(), \ac, rv ->
-					if (toLowerCase(rv) == toLowerCase(k)) setTree(ac, rv, FolVar(v)) else ac);
-				body = mizEmitSubF(about[0], sub);
+				body = mizEmitSubRaw(about[0], k, FolVar(v));
 				exForm = FolQuant("exists", [v], body);
 				if (^mizEmitDbg && getUrlParameterDef("dbg-exelim", "") == "1")
 					println("    CLAUSE-EX " + k + " :: " + strGlue(folFormToks(exForm), " "));

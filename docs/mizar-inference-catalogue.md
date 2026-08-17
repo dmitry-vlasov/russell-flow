@@ -681,3 +681,49 @@ must be reachable at that point in the reduction — and it identifies one
 constant per clause. Both are properties of the assembly, not of the record, and
 both are the next unit: name every constant the clause has, at the point the
 record says they exist.
+
+## The measurement, and the pairing across depths (2026-08-17, later)
+
+★ THE MEASUREMENT the frame was to be designed by, per covered failing step,
+how many checker constants its clause carries:
+
+    subset_1    29 covered:  9 none · 10 one · 10 two ·  0 more
+    relat_1     63 covered:  4 none ·  2 one ·  5 two · 52 more
+    zfmisc_1    33 covered: 12 none · 10 one · 10 two ·  8 more
+
+Three findings, each of which changes the plan:
+ 1. MULTI-CONSTANT IS THE DOMINANT CLASS — 85 of 125, and nearly all of
+    relat_1. The single-constant walk covers 22 steps at best.
+ 2. 25 covered steps have NO constants at all: their clause is in the step's
+    own vocabulary, every fact is present, and the failure is the
+    propositional endgame itself. A separate question, unmeasured until now.
+ 3. subset_1 has no >2 class — which is why its numbers kept looking better
+    than the design deserved.
+
+BUILT HERE: THE PAIRING ACROSS DEPTHS (mizEmitConstMapRef). The replay keeps a
+map from the checker's constant to the witness our proof named for it:
+extended at each ∃-elimination whose body matches a recorded literal, restored
+when a candidate's sub-proof fails, reset per step. Every reading of the record
+goes through the map, so at each depth only the still-unmapped names count as
+constants and a literal linking two constants becomes expressible exactly one
+elimination deeper — nested elimination with no per-case code.
+
+TWO DEFECTS THE BUILD MET, both of the same family as before:
+ * the freshly named witness itself was counted as a CONSTANT (it is free only
+   in the eliminated body, which the caller's context does not carry), so the
+   restated instance looked unresolved and was withheld — t4_subset_1 briefly
+   regressed. The map's VALUES are ours by construction;
+ * the first version of this change was applied in a script whose earlier
+   edits silently did not land (an assert aborted before the write), and the
+   half-state compiled. Process, not logic — but it cost a round.
+
+MEASURED: gate GREEN at 247, closed list IDENTICAL. t4_subset_1 closes through
+the pairing now (one mapped constant), so the mechanism is exercised on the
+gate; no multi-constant step converts yet.
+
+★ WHERE THE 125 STAND: for the multi-constant class the pairing exists but the
+DEEPER eliminations do not fire — the existentials the record asks for at
+depth 2+ (relat_1's are `∃v ⟨a,v⟩ ∈ X` from the proj1/proj2 expansions) are
+not yet provable by the join at the point they are asked. That, and the
+25 no-constant endgames, are the two remaining questions, and both are now
+NAMED by a number rather than guessed.
