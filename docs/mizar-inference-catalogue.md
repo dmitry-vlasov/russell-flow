@@ -727,3 +727,40 @@ depth 2+ (relat_1's are `∃v ⟨a,v⟩ ∈ X` from the proj1/proj2 expansions) 
 not yet provable by the join at the point they are asked. That, and the
 25 no-constant endgames, are the two remaining questions, and both are now
 NAMED by a number rather than guessed.
+
+## The two classes, read (2026-08-17, evening)
+
+One step from each class the census named, read end to end.
+
+★ THE NO-CONSTANT CLASS IS THE EXPANSION BRIDGE (t12_subset_1). The recorded
+instance `( x28 ⊆ x29 ) → ( ( x4 ∖ x29 ) ⊆ ( x4 ∖ x28 ) )` is fully in the
+step's vocabulary and IS offered — but the goal says `` ` x4 x29 `` (the
+complement functor) where the clause says `x4 ∖ x29`: the checker expanded the
+complement's `equals` definition before reasoning, and the endgame would have
+to rewrite ⊆-atoms through that equation. The definitional expansion is in the
+record (<Expand>); what is missing is the REWRITE of the goal's atoms through
+it at the endgame — the "expand the goal by the recorded definitions" stage of
+the original pipeline, which exists for membership atoms but not for ⊆/= atoms
+over expanded functors. Also seen: a literal carrying
+`unhandled_term_UnmappedConst` — a deriv.flow reading gap, recorded here so it
+is not rediscovered.
+
+★ THE MULTI-CONSTANT CLASS IS EXTENSIONALITY PLUS INNER WITNESSES
+(t10_relat_1, consts=3). The theorem is an equation; the checker refutes it by
+introducing `x19` — THE ELEMENT THAT WOULD DISTINGUISH THE SIDES — and our
+⊆/= characterization introduces exactly that element as its fresh variable. So
+the pairing point is not only an ∃-elimination: it is EVERY place our proof
+names a fresh variable. Landed: mizEmitCharGoal/A now pair the record's
+constant whose literal is `k ∈ lhs`/`k ∈ rhs` with the eigenvariable, through
+the same map (gate GREEN at 247, closed list identical — infrastructure
+exercised, paying nothing yet). The remaining constants (xf4/xf5 in the kill
+pairing) are the components of the pair the definition's inner ∃ names — they
+appear at the kill stage, inside the endgame, which is where the walk must
+next learn to eliminate.
+
+THE HONEST STATE OF THE REPLAY CAMPAIGN, in one place: mechanism proved
+(t4_subset_1 closes through the full chain), pairing general (∃-elimination +
+extensionality, one map), yield still 2 theorems. The three named obstacles,
+by class size: the endgame's expansion rewrite for ⊆/= atoms (25 steps), the
+kill-stage inner witnesses (85 steps, with extensionality now in place), and
+the deriv UnmappedConst reading gap (size unknown, measure first).
