@@ -16,7 +16,9 @@
 - Verify one article: `bin/mizarj article=xboole_1`
 - Verify the whole MML in one process: `bin/mizarj mem=16g article-list=$RUSSELL_MATH/MML-test/mml.lar jobs=8 ref=~/mizar_oracle/m4ref`
 - Component suites: `bin/mizarj test=all` (or `test=<suite>`, `test=list`)
+- Fast CI check (suites + full-chain 8-article fixture vs reference): `bin/mizar-ci.sh`
 - Intermediates stay in MEMORY; `dump-xml=` / `dump-par=` are the only writers
+- MML→Russell gate (emit + tactic + Metamath): `scripts/translate/mizar/gate.sh tac=def-close` — see docs/mml-port-plan.md §9 (campaign closed at 275)
 
 ## Commands
 - Build: `./build_java.sh`
