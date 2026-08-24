@@ -41,8 +41,8 @@ from `$RUSSELL_MATH`, so you never pass `math=`.
 - `verify.rus` — read + verify one article.
 - `regen_foundation.rus` — rebuild `mizar/miz_set.ru` from the set.mm library
   (run from `$RUSSELL_MATH/set/`).
-- `install_foundation.sh` — install the hand-authored `foundation/miz_aux.ru`
-  into the math tree (see `foundation/README.md`).
+- `install_foundation.sh` — install the hand-authored `src/mizar/foundation/miz_aux.ru`
+  into the math tree (see `src/mizar/foundation/README.md`).
 - `translate_flat.rus` — legacy: translate against the FLAT `miz_logic`
   foundation (pre-A-map). Kept for comparison.
 

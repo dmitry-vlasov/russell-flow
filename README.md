@@ -17,6 +17,7 @@ The implementation is written in [Flow9](https://github.com/area9innovation/flow
 | [Tactics Language](docs/tactics-language.md) | The tactic DSL (atoms + combinators) and file-based derived tactics (`.tac`) that drive proof search |
 | [Unification Algorithms](docs/unification-algorithms.md) | Trie-indexed matching, multi-index unification, substitution composition |
 | [Unilambda](docs/unilambda.md) | Bidirectional, non-deterministic language on the Russell kernel: `eval` (verify) and `uneval` (narrowing/proof search) |
+| [Mizar](docs/mizar.md) | The Mizar verifier port and the MML→Russell translation pipeline — start here for anything Mizar |
 | [MML Port Plan](docs/mml-port-plan.md) | The Mizar→Russell translation campaign: plan, measured findings log, closing state |
 | [Mizar Decision Tactic](docs/mizar-decision-tactic.md) | The Mizar checker's decision procedure as Russell tactics (`def-close`, `checker-mizar`) and the composed pipeline |
 | [Mizar Checker Mapping](docs/mizar-checker-mapping.md) | How the Mizar checker's phases map onto Russell prover machinery |
@@ -113,34 +114,12 @@ The extension starts `russell_lsp` automatically when you open a `.ru` file. It 
 
 ---
 
-## The Mizar verifier port
+## Mizar
 
-`src/mizar/original/` is a 1:1 transcription of the original Mizar verifier
-(parser, MSM, analyzer, checker, accommodator) into Flow9 — one jar, exact on
-the whole MML: 1497/1497 articles, 1.4M inferences, analyzer output
-byte-identical to the original, ~21 min end to end at `jobs=8`.
-
-```bash
-# Build (from src/): one jar, nothing else
-cd src && flowc1 jar=1 mizar/original/mizar.flow
-
-# Component test suites (seconds; suites needing MML data skip when absent)
-bin/mizarj test=all
-
-# Verify one article (reads $RUSSELL_MATH/MML-test by default; override with mml=)
-bin/mizarj article=xboole_1
-
-# The whole MML in one process, byte-compared against reference reports
-bin/mizarj mem=16g article-list=$RUSSELL_MATH/MML-test/mml.lar jobs=8 ref=<refdir>
-```
-
-On top of the verifier sits the Mizar→Russell translation pipeline
-(`scripts/translate/mizar/`, entry point `gate.sh`): articles are translated
-into the set.mm-derived foundation, proofs are emitted from the checker's
-recorded derivations and completed by the decision-procedure tactics, and
-everything is finally checked by the original Metamath checker. See
-[docs/mml-port-plan.md](docs/mml-port-plan.md) for the state and
-[docs/mizar-decision-tactic.md](docs/mizar-decision-tactic.md) for the tactics.
+Russell carries a complete Flow9 port of the original Mizar verifier
+(`bin/mizarj` — exact on the whole MML, byte-identical reports) and a
+pipeline translating MML articles into Russell, gated by the original
+Metamath checker. See [docs/mizar.md](docs/mizar.md).
 
 ---
 
@@ -204,7 +183,6 @@ bin/mizar-ci.sh            # builds mizar.jar, then tests (~15 s after the build
 ```
 bin/            Executable scripts (russellj, mizarj, russell_lsp, etc.)
 docs/           Documentation
-foundation/     Hand-authored foundation lemmas (miz_aux.ru) for the Mizar import
 resources/      VSCode extension
 scripts/        .rus automation scripts (mm2ru, optimize, reprove, translate/mizar, etc.)
 tactics/        .tac derived tactics — named, documented compositions of prover
@@ -213,7 +191,7 @@ src/            Flow9 source code
   ru/           Russell language implementation
   mm/           Metamath parser and translator
   mizar/        Mizar→Russell translator + emitter; original/ = the verifier port;
-                analysis/ = Python census harnesses
+                foundation/ = hand-authored lemmas; analysis/ = census harnesses
   fol/          Flat FOL intermediate representation (the translator's back-end)
   uni/          Unilambda interpreter
   script/       Scripting language implementation

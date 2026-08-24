@@ -18,7 +18,7 @@ step needs a fresh construction instead of an application of a known rule,
 and proofs are enormous because a two-atom step expands into thousands of
 lines.
 
-`foundation/miz_aux.ru` is the shape of the right answer — a named lemma
+`src/mizar/foundation/miz_aux.ru` is the shape of the right answer — a named lemma
 cited instead of a re-derivation — arrived at by the wrong method: its
 contents were discovered one failure at a time, so it records where we got
 stuck, not what Mizar does.
@@ -482,7 +482,7 @@ from a registration's non-emptiness, `Subset of A` composed with ⊆, and the
 The previous unit derived Mizar's Element-of propagation inside the emitter, as
 a nine-step construction written out at every site that needed it. That is
 backwards, and this project already has the rule: a general lemma belongs in the
-foundation. The type layer now lives in `foundation/miz_aux.ru`.
+foundation. The type layer now lives in `src/mizar/foundation/miz_aux.ru`.
 
 WHAT THE FOUNDATION NOW OWNS. The mode `Element of B` is a foundation predicate,
 defined as SUBSET_1:def 1 defines it — for a non-empty B the elements are the
