@@ -6,10 +6,13 @@ import mizar/miz2ru;
 // the translated proof skeleton lives in. The completer consumes the pair.
 //
 // Two record-only obstacles are made explicit rather than papered over:
-//   * <Const nr vid="0"> — the checker's fixed variables lost their identifiers;
-//     the vid is recovered from the theorem's OWN analyzed-XML subtree (the same
-//     nr there carries its vid). An nr that is ambiguous inside the theorem
-//     (nested blocks reuse numbers) stays unmapped — honest, not guessed.
+//   * <Const nr vid> — the writer stamps each constant with its identifier
+//     (FixedVar[VarNr].nIdent, Out_VarTerm iocorrel.pas 1940), which the prep
+//     loads from the analyzed XML's <Typ vid> (Out_TypeWithId, iocorrel.pas
+//     1624). A record vid > 0 is authoritative. vid=0 (a constant the CHECKER
+//     itself introduced, or an old record) falls back to recovery from the
+//     theorem's OWN analyzed-XML subtree; an nr that is absent or ambiguous
+//     there stays unmapped — honest, not guessed.
 //   * <EqClass nr> / <It> — checker-only sorts (equalizer class references in a
 //     witness representative). They translate to unhandled markers; resolving a
 //     class to a surface term is its own future slice.
@@ -500,7 +503,11 @@ mizDerivResolveEq(x : MizXml, reps : Tree<int, MizXml>, fuel : int) -> MizXml {
 // straight from the record; this function chooses nothing.
 mizDerivPosClauses(derivXml : string, sig : MizSig,
 	posScope : Tree<string, Tree<int, int>>) -> Tree<string, [MizDerivClause]> {
-	switch (mizParseXml(derivXml)) {
+	// the UnmappedConst census: how many positions the scope-recovery gap
+	// touches (an nr absent or ambiguous in the theorem's own subtree)
+	unmPos : ref [string] = ref [];
+	totPos : ref int = ref 0;
+	ret = switch (mizParseXml(derivXml)) {
 		None(): makeTree();
 		Some(root): fold(mizKidsTagged(root, "Inference"), makeTree(), \acc, inf -> {
 			pos = mizAttr(inf, "line") + ":" + mizAttr(inf, "col");
@@ -509,6 +516,12 @@ mizDerivPosClauses(derivXml : string, sig : MizSig,
 			if (mizAttr(inf, "accepted") != "true" || length(ds) != 1) acc
 			else {
 				d = ds[0];
+				totPos := ^totPos + 1;
+				unm = mizCollectAll([mizDerivPatch(scope, d)], "UnmappedConst");
+				if (unm != []) {
+					whys = uniq(map(unm, \u -> mizAttr(u, "why")));
+					unmPos := arrayPush(^unmPos, pos + "(" + strGlue(whys, "+") + ")");
+				}
 				// every class reference resolved to a surface term first
 				reps = mizDerivClassReps(d);
 				rf = \x9 : MizXml -> mizDerivForm(sig, scope, mizDerivResolveEq(x9, reps, 8));
@@ -543,7 +556,13 @@ mizDerivPosClauses(derivXml : string, sig : MizSig,
 				}
 			}
 		});
+	};
+	if (^totPos > 0) {
+		println("deriv census: UnmappedConst at " + i2s(length(uniq(^unmPos)))
+			+ " of " + i2s(^totPos) + " single-disjunct positions"
+			+ (if (^unmPos == []) "" else ": " + strGlue(uniq(^unmPos), " ")));
 	}
+	ret;
 }
 
 mizDerivPosFacts(derivXml : string, sig : MizSig,
@@ -715,8 +734,16 @@ mizDerivSubstTerm(t : FolTerm, s : Tree<string, FolTerm>) -> FolTerm {
 // unhandled branch.
 mizDerivPatch(scope : Tree<int, int>, x : MizXml) -> MizXml {
 	if (x.tag == "Const") {
-		vid = lookupTreeDef(scope, s2i(mizAttr(x, "nr")), -1);
-		if (vid <= 0) MizXml("UnmappedConst", x.attrs, [])
+		// The record's own vid (FixedVar[VarNr].nIdent at write time,
+		// Out_VarTerm iocorrel.pas 1940) is authoritative; the subtree
+		// recovery is the fallback for a record written without idents.
+		// 0 = the nr is absent from the theorem's subtree; -1 = seen there
+		// with two different vids (the ambiguity collapse)
+		own = s2i(mizAttr(x, "vid"));
+		vid = if (own > 0) own
+			else lookupTreeDef(scope, s2i(mizAttr(x, "nr")), 0);
+		if (vid <= 0) MizXml("UnmappedConst",
+			setTree(x.attrs, "why", if (vid == 0) "missing" else "ambiguous"), [])
 		else MizXml("Const", setTree(x.attrs, "vid", i2s(vid)), x.kids);
 	} else if (x.kids == []) x
 	else MizXml(x.tag, x.attrs, map(x.kids, \k -> mizDerivPatch(scope, k)));
