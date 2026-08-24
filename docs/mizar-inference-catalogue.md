@@ -764,3 +764,35 @@ extensionality, one map), yield still 2 theorems. The three named obstacles,
 by class size: the endgame's expansion rewrite for ⊆/= atoms (25 steps), the
 kill-stage inner witnesses (85 steps, with extensionality now in place), and
 the deriv UnmappedConst reading gap (size unknown, measure first).
+
+## The UnmappedConst census, and the identifier transport (2026-08-24)
+
+The "measure first" instruction paid immediately. The census (now a standing
+line in mizDerivPosClauses): UnmappedConst touched 142/273 single-disjunct
+positions on subset_1, 205/576 on relat_1, 207/440 on zfmisc_1 — not a corner
+case but 36-52% of the record. Two findings located the cause:
+
+ * ZERO flagged positions inside subset_1's theorems came from ambiguity — the
+   per-theorem scope was complete and unambiguous. The loss was positional:
+   every inference OUTSIDE a JustifiedTheorem (registrations, definition
+   correctness blocks, nested considers) got an EMPTY scope, because posScope
+   is built from JustifiedTheorem subtrees only.
+ * The record itself wrote vid="0" on all 11,582 Const nodes of subset_1: the
+   prep never loaded the variable identifiers into FixedVar, so Out_VarTerm
+   (iocorrel.pas:1940) had nothing to write. In the original, the analyzer
+   sets FixedVar[i].nIdent (analyzer.pas:406) and the checker shares the
+   table; the analyzed XML transports the ident as the <Typ> vid attribute
+   (Out_TypeWithId, iocorrel.pas:1624) — the half-ported-field class again.
+
+Fix @574ccc63: mizPushFixed stores the <Typ> vid at all five fixed-variable
+sites; mizDerivPatch trusts a record vid > 0, subtree recovery is fallback
+only. This also removes a silent hazard: a checker-fresh constant whose nr
+collided with a real theorem constant was silently MIS-mapped before; now the
+record's own vid decides.
+
+After: subset_1 0 flagged, relat_1 4 (all "missing" = the checker's own fresh
+constants, the pairing's job), zfmisc_1 0. Recorded refutations grew
+subset_1 90->146, relat_1 211->276, zfmisc_1 171->251 positions. Closed counts
+unchanged (12/53, 25/179, 45/140 standalone) — the new records are fuel for
+the two remaining obstacles, not theorems yet. mizarj suites 2293/0.
+GATE GREEN at 247, closed list identical.
