@@ -1,7 +1,7 @@
 #!/bin/bash
 # S-A gate: translate MML articles in dependency order and record what happens.
 #
-#   scripts/analysis/mml_translate/run_translate.sh 60 [outdir]
+#   src/mizar/analysis/mml_translate/run_translate.sh 60 [outdir]
 #
 # Runs `translate/mizar/translate` on the first N articles of the dependency
 # order (dep_order.py) and writes:
@@ -21,7 +21,7 @@ MEM=${MEM:-8g}
 mkdir -p "$OUT/log"
 : > "$OUT/result.tsv"
 
-python3 scripts/analysis/mml_translate/dep_order.py "$N" > "$OUT/order.txt"
+python3 src/mizar/analysis/mml_translate/dep_order.py "$N" > "$OUT/order.txt"
 
 while read -r a; do
 	log="$OUT/log/$a.log"

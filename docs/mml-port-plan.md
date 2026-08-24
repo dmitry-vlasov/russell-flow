@@ -75,7 +75,7 @@ Every MML theorem statement was classified by the machinery needed to write it
 down, read from Mizar's own analyzed XML with constructor kinds resolved
 through each article's accommodated constructor list. 75,152 real statements
 (15,956 placeholder statements from articles analyzed with blocks skipped are
-excluded). Scripts: `scripts/analysis/mml_layers/` (see §7).
+excluded). Scripts: `src/mizar/analysis/mml_layers/` (see §7).
 
 | support set | theorems | share |
 |---|---|---|
@@ -139,7 +139,7 @@ the figure predates the in-memory pipeline and must be re-measured.
 *Artifact*: a naming rule that is total and collision-free by construction.
 *Gate*: percentage of MML articles that translate and parse, measured over a
 few hundred articles in dependency order.
-*Harness*: `scripts/analysis/mml_translate/` — `dep_order.py` (the topological
+*Harness*: `src/mizar/analysis/mml_translate/` — `dep_order.py` (the topological
 order the articles must be translated in), `run_translate.sh N` (translate the
 first N and record status + diagnostic per article), `report.py` (status
 counts and failure buckets), `name_stability.py` (is a constructor's name a
