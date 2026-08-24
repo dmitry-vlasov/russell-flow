@@ -1660,3 +1660,47 @@ should yield, not yet a pipeline result.)
     denied conjunction) stay as they are — they consume rows, whatever
     the source. That deletes the hand list and reaches all ~9,300
     statements instead of the 40 I typed.
+
+## 9. Closing state (2026-08-24) — the campaign stops here
+
+The project winds down at this milestone by the user's decision: three months
+in, the remaining stages (S-C soft types onward) have hypotheses but no proved
+design, and the honest estimate to >50% of the MML was months more.
+
+**What stands, all of it on master:**
+
+* **The verifier port is complete.** The whole Mizar verifier (checker,
+  accommodator, parser/MSM, analyzer) transcribed to Flow9, one jar
+  (`mizarj`), exact on the whole MML: 1497/1497 articles, 1.4M inferences at
+  100%, analyzer output byte-identical, ~21 min end to end. This is the
+  project's largest standalone asset.
+* **The translator (S-A).** 300 articles translate and parse with stable,
+  constructor-identity naming; loss inside articles is measured and
+  attributed (numerals, choice, flexary — later stages' constructs).
+* **The record-driven emitter (S-B).** The checker's recorded refutations
+  emitted as Russell proofs: 247 theorems on the 8-article gate set, every
+  one verified by Russell and by the original Metamath checker. The
+  identifier transport (2026-08-24) left the record essentially fully
+  readable (unmapped constants ~0).
+* **The decision-procedure tactic + THE COMPOSITION.** `def-close` /
+  `checker-mizar` are standalone tactics (docs/mizar-decision-tactic.md).
+  The final gate round composed them with the emitter
+  (`gate.sh tac=def-close`): **275 theorems, gate green, proved == closed on
+  all 8 Metamath databases** — more than the emitter alone (247), the tactic
+  alone (149), or their paper union (272). This is the by_mizar-as-one-
+  tactic design realized on the gate set.
+
+**Where the frontier stopped**, for whoever resumes:
+
+* S-C (soft types) has one landed rule (Element-of propagation, +2) and a
+  reframing finding: what typed steps lack is rules Mizar never records —
+  the type system carries them silently. No proved general design.
+* The replay walk closes single-constant steps; the census says
+  multi-constant steps dominate (85 of the 125 one-refutation-away
+  theorems), and 25 steps fail in the propositional endgame with every fact
+  present — unexplained.
+* The library-row index (reading foundation rows from the loaded math
+  instead of the hand table) is specified in the 08-14 entry and unbuilt.
+
+The findings log above is the project's real yield besides the code: every
+measured law, trap, and dead end is recorded with its commit.

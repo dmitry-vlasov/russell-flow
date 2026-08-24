@@ -5,9 +5,16 @@
 # proved until Metamath says so — see the gate law in the project memory.
 #
 # Usage:
-#   scripts/translate/mizar/gate.sh                 both phases
+#   scripts/translate/mizar/gate.sh                 all phases
 #   scripts/translate/mizar/gate.sh phase=emit      only the emit half
+#   scripts/translate/mizar/gate.sh phase=tac       only the tactic half (see tac=)
 #   scripts/translate/mizar/gate.sh phase=mm        only the Metamath half
+#   scripts/translate/mizar/gate.sh tac=def-close   THE COMPOSITION: after emit,
+#                                                   run this tactic over each
+#                                                   article's remaining `?` gaps
+#                                                   (translate/mizar/prove) and
+#                                                   write the closures back.
+#                                                   Empty (default) = skip.
 #   scripts/translate/mizar/gate.sh width=4         proofs in parallel, N at a time
 #   scripts/translate/mizar/gate.sh out=<dir>       where the logs go
 #
@@ -42,11 +49,18 @@ MATH="${RUSSELL_MATH:-$HOME/dev/math}"
 BASELINE="$MATH/mizar-honest-baseline-20260810.tar.gz"
 # the emit chain, in dependency order — pass 1 MUST follow it
 ARTS="tarski xboole_0 xboole_1 enumset1 zfmisc_1 subset_1 xtuple_0 relat_1"
-# the articles with closed theorems to check; xtuple_0 has none yet
-MM_ARTS="tarski xboole_0 xboole_1 enumset1 zfmisc_1 subset_1 relat_1"
+# every emitted article goes to the Metamath check — the gate law compares
+# proved against closed per article, and an article outside this list would
+# carry closures no checker ever saw (xtuple_0 did, from 2026-08-14 on)
+MM_ARTS="$ARTS"
 PHASE=all
 WIDTH=4
 MM_WIDTH=2
+# the composition tactic (empty = no tac phase). The tac phase is SEQUENTIAL
+# on purpose: def-close loses borderline steps under concurrency on this
+# power-capped machine, and the milestone numbers must be exact.
+TAC=""
+TAC_TL=5s
 # NOT under /tmp: that is a 31 GB tmpfs, i.e. RAM. A round writes ~4 GB of
 # working copies, and putting them in RAM competes with the exports that
 # already peak at 17 GB — one more reason the OOM killer fired.
@@ -61,6 +75,8 @@ case $i in
 	phase=*) PHASE="${i#*=}" ;;
 	width=*) WIDTH="${i#*=}" ;;
 	mm-width=*) MM_WIDTH="${i#*=}" ;;
+	tac=*)   TAC="${i#*=}" ;;
+	tac-tl=*) TAC_TL="${i#*=}" ;;
 	out=*)   OUT="${i#*=}" ;;
 	*) echo "unknown argument: $i" >&2; exit 1 ;;
 esac
@@ -147,6 +163,36 @@ if [ "$PHASE" = all ] || [ "$PHASE" = emit ]; then
 	# claim (the 2026-08-13 parse-failure round: total 200, list 195)
 	lc=$( wc -l < "$OUT/closed.txt" )
 	[ "$lc" -eq "$total" ] || { echo "EMIT COUNT $total != LIST $lc — RED" >&2; exit 1; }
+fi
+
+if { [ "$PHASE" = all ] && [ -n "$TAC" ]; } || [ "$PHASE" = tac ]; then
+	[ -n "$TAC" ] || { echo "phase=tac needs tac=<tactic>" >&2; exit 1; }
+	TT=$(date +%s)
+	# THE COMPOSITION PHASE: the tactic proves each article's remaining `?`
+	# gaps and translate/mizar/prove writes the closures back. Sequential and
+	# in place: each run rewrites only its own article, and the readers of
+	# the shared math dir are the same process.
+	for a in $ARTS; do
+		env RUSSELL_MATH="$MATH" bin/russellj no-server=1 mem=12g \
+			translate/mizar/prove module=$a tac="$TAC" tl=$TAC_TL mm=0 v=1 \
+			> "$OUT/tac_$a.log" 2>&1 \
+			|| { echo "TAC ABORT at $a" >&2; exit 1; }
+		# a tactic round that breaks a proof must stop the gate here, not
+		# surface as a Metamath mismatch an hour later
+		grep -q "all proofs valid): true" "$OUT/tac_$a.log" \
+			|| { echo "TAC VERIFY FAIL at $a" >&2; exit 1; }
+		printf "  %-10s %s\n" "$a" "$(grep -o "prove: .*" "$OUT/tac_$a.log" | tail -1)"
+	done
+	# recompute the closed list from the written articles: the tac closures
+	# replace the emit-phase list, and the Metamath law below checks proved
+	# against THIS list
+	for a in $ARTS; do
+		awk -v art="$a" '/^theorem/ { name=$2 } /= \?/ { open[name]=1 }
+			/^theorem/ { seen[name]=1 }
+			END { for (t in seen) if (!(t in open)) print art, t }' \
+			"$MATH/mizar/$a.ru"
+	done | sort > "$OUT/closed.txt"
+	echo "TAC DONE ($TAC, tl=$TAC_TL) in $(( $(date +%s) - TT ))s — closed list now $(wc -l < "$OUT/closed.txt") theorems"
 fi
 
 if [ "$PHASE" = all ] || [ "$PHASE" = mm ]; then
