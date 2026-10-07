@@ -97,6 +97,7 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 			finished_count  = ref 0;
 			reproved_count  = ref 0;
 			started_ids     : ref [int] = ref [];
+			finished_ids    : ref [int] = ref [];   // ruBuildAndProve returned (did not run out of its time slice)
 			reproved_ids    : ref [int] = ref [];
 			total_steps     : ref int = ref 0;
 			covered_steps   : ref int = ref 0;
@@ -110,15 +111,24 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 			inc_processed   = ruAtomicIntInc(processed_count);
 			inc_finished    = ruAtomicIntInc(finished_count);
 			push_started    = ruAtomicRefArrayPush(started_ids);
+			push_finished   = ruAtomicRefArrayPush(finished_ids);
 			push_reproved   = ruAtomicRefArrayPush(reproved_ids);
 			add_total       = ruAtomicIntInc(total_steps);
 			add_covered     = ruAtomicIntInc(covered_steps);
 			inc_full_cov    = ruAtomicIntInc(full_cov_count);
 			inc_gap         = ruAtomicIntInc(gap_count);
 
+			// The job budget (job-time-limit): a theorem is not STARTED once it has run out. It is
+			// deliberately not folded into the mapper's budget — ruMapDeclsSequentially splits that
+			// evenly over all theorems, so a 30m job cap would shrink every first-pass slice to
+			// 30m / n (2 s on a 913-theorem run), kill every big proof, and rerun it in the retry
+			// cycles while the killed attempt kept burning CPU in the background.
+			job_limit_str = ruTaskStringArg(task, "job-time-limit", "");
+			job_ms        = if (job_limit_str != "" && job_limit_str != "no") ruParseTime(job_limit_str) else doubleMax;
+			job_timer     = ruMakeTimer();
 			reprove_fn = \decl, time_limit, env1 -> {
 				th = cast(decl : RuDecl -> RuTheorem);
-				if (ruTheoremIsProved(th)) {
+				if (ruTheoremIsProved(th) && ruTimePassed(job_timer) < job_ms) {
 					inc_processed(1);
 					push_started(th.info.id);
 					th_timer = ruMakeTimer();
@@ -127,6 +137,7 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 					capped_limit = min(time_limit, per_th_ms);
 					penv = ruBuildAndProve(th, task, index, builder, capped_limit, frag_pair, math, env1);
 					inc_finished(1);
+					push_finished(th.info.id);
 					// A proof reached the goal AND respects the original theorem's
 					// disjoint-variable budget (no strengthening). Both are required
 					// for a genuine reproval of THIS theorem.
@@ -158,29 +169,26 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 				RuMappedDecl(true, false, decl);
 			};
 
-			// parallel=1: lightweight tactics (oracle, replay) that do not use the
-			// internal concurrent prover can safely run theorems in parallel — just
-			// pass the task through unchanged.
-			//
-			// parallel=0 (default): ruProve uses ruConcurrent internally; running
-			// multiple theorems concurrently causes nested thread-pool contention.
-			// Force sequential outer traversal via -seq and scale the total budget
-			// so each theorem gets per_th_ms * min(n, nProc) / n ≈ per_th_ms at
-			// full parallelism — the same throughput without OOM.
+			// parallel=1: lightweight tactics that do not use the internal concurrent prover can
+			// safely run theorems in parallel — pass the target through unchanged.
+			// parallel=0 (default): ruProve uses ruConcurrent internally; running multiple
+			// theorems concurrently causes nested thread-pool contention, so force a sequential
+			// outer traversal via -seq.
+			// Either way the mapper's budget is per_th * n: ruMapDeclsSequentially hands each
+			// theorem total/n, so every theorem gets its full time-limit on the first pass (the
+			// flood mode's slice is per_th * nproc, which capped_limit above trims to per_th).
+			// Passed as a plain number of seconds, which ruParseTime reads back exactly.
 			run_parallel  = ruTaskIntArg(task, "parallel", 0) > 0;
-			dispatch_task = if (run_parallel) task else {
-				n_theorems     = length(filter(ruTargetDecls(target, math, env), ruDeclIsTheorem));
-				n_par          = availableProcessors();
-				computed_total = per_th_ms * i2d(min(max(1, n_theorems), n_par));
-				job_limit_str  = ruTaskStringArg(task, "job-time-limit", "");
-				total_ms       = if (job_limit_str != "" && job_limit_str != "no") min(computed_total, ruParseTime(job_limit_str)) else computed_total;
-				RuTask(task with args =
-					setTree(
-						setTree(task.args, "target", ruTaskStringArg(task, "target", "all") + "-seq"),
-						"time-limit", ruTime2s(total_ms)
-					)
+			n_theorems    = length(filter(ruTargetDecls(target, math, env), \d ->
+				ruDeclIsTheorem(d) && ruTheoremIsProved(cast(d : RuDecl -> RuTheorem))
+			));
+			map_total_s   = per_th_ms * i2d(max(1, n_theorems)) / 1000.0;
+			dispatch_task = RuTask(task with args =
+				setTree(
+					if (run_parallel) task.args else setTree(task.args, "target", ruTaskStringArg(task, "target", "all") + "-seq"),
+					"time-limit", d2s(map_total_s)
 				)
-			};
+			);
 			new_state = ruMapFnComm(
 				RuUnit(dispatch_task, state, env.out),
 				RuMapFn(
@@ -200,8 +208,22 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 			not_reproved   = set2array(fold(^started_ids, makeSet(), \acc, id ->
 				if (containsSet(reproved_set, id)) acc else insertSet(acc, id)
 			));
-												if (ruTaskIntArg(task, "strict-fail", 0) > 0 && not_reproved != []) {
-				ruCrash("reprove: strict-fail: " + i2s(length(not_reproved)) + " theorem(s) failed to reprove");
+			// A started theorem that never finished ran out of its time slice (the per-theorem
+			// time-limit, or the job budget) — a different story from a search that ended
+			// without a proof, so the strict-fail message names both groups.
+			finished_set = buildSet(^finished_ids);
+			timed_out    = filter(not_reproved, \id -> !containsSet(finished_set, id));
+			// Theorems the job budget ran out BEFORE: never started, so neither reproved
+			// nor failed — a silent pass with a short count unless strict-fail counts them.
+			not_started  = n_theorems - sizeSet(buildSet(^started_ids));
+			if (ruTaskIntArg(task, "strict-fail", 0) > 0 && (not_reproved != [] || not_started > 0)) {
+				show_ids = \ids -> strGlue(map(take(ids, 32), id2s), ", ") + (if (length(ids) > 32) ", ..." else "");
+				ruCrash("reprove: strict-fail: " + i2s(length(not_reproved)) + " theorem(s) failed to reprove" +
+					(if (not_reproved == []) "" else ": " + show_ids(not_reproved)) +
+					(if (timed_out == []) "" else
+						"\n  of them " + i2s(length(timed_out)) + " ran out of the time limit (time-limit per theorem / the job budget): " + show_ids(timed_out)) +
+					(if (not_started <= 0) "" else
+						"\n  " + i2s(not_started) + " theorem(s) were never started: the job budget (job-time-limit) ran out"));
 			}
 
 			cov_vars = if (do_coverage) {
@@ -224,9 +246,14 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 			}
 			Some(RuState(new_state with
 				vars = setTree(new_state.vars, "reprove", mergeTree(map_vars, pairs2tree(concat([
-					Pair("reproved-count",  flow(^reproved_count)),
+					// Distinct theorems: a retried theorem can be counted per ATTEMPT otherwise (an
+					// attempt that ran out of its slice keeps running in the background and may
+					// still finish and report).
+					Pair("reproved-count",  flow(sizeSet(reproved_set))),
 					Pair("failed-count",    flow(length(not_reproved))),
-					Pair("failed-theorems", flow(map(not_reproved, id2s)))
+					Pair("failed-theorems", flow(map(not_reproved, id2s))),
+					Pair("timed-out-count", flow(length(timed_out))),
+					Pair("not-started-count", flow(max(0, not_started)))
 				], cov_vars))))
 			))
 		}
