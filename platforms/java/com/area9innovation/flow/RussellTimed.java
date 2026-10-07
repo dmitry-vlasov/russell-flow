@@ -203,6 +203,10 @@ public class RussellTimed extends NativeHost {
 						FlowRuntime.eventLoop();
 						return result;
 					} catch (OutOfMemoryError e) {
+						// Say so: a bare exit(255) looked like a silent crash (the full
+						// set-100000 oracle reprove died at theorem 9124 with no text).
+						System.err.println("Runtime failure: OutOfMemoryError in a worker thread (JVM heap exhausted; raise the heap with mem=16g)");
+						System.err.flush();
 						System.exit(255);
 						return null;
 					}
