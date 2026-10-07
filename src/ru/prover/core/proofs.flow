@@ -3,6 +3,7 @@ import ru/prover/core/env;
 import ru/prover/core/fragment;
 import ru/unify/prod;
 import ru/verify/math;
+import ru/util/src2s;
 
 export {
 	ruAddProof(prop : RuProverProp, hypProof : RuProverProofHyp, prover_env : RuProverEnv) -> void;
@@ -26,6 +27,14 @@ ruProofSubKey(s : RuSubst) -> string {
 	)), "|")
 }
 
+// Product size from which ruAddProof switches from exhaustive row enumeration to the
+// matrix unifier (ruUnifySubsProd). Config `unify-prod-threshold` overrides the default
+// 64 — a diagnostic knob: raising it very high disables the matrix path.
+ruUnifyProdThreshold(prover_env : RuProverEnv) -> int {
+	v = ruOptsString(prover_env.env.conf.opts, "unify-prod-threshold", "");
+	if (v == "") 64 else s2i(v);
+}
+
 ruAddProof(prop : RuProverProp, hypProof : RuProverProofHyp, prover_env : RuProverEnv) -> void {
 	if (sizeVector(prop.children) == ruArity(prop.assertion)) {
 		prod = CartProd(map(vector2array(prop.children), \hyp ->
@@ -45,7 +54,7 @@ ruAddProof(prop : RuProverProp, hypProof : RuProverProofHyp, prover_env : RuProv
 				\s -> [RuSubData(s, map(row, \hp -> hp.data))], 
 				[]
 			);
-		} else if (size < 64) {
+		} else if (size < ruUnifyProdThreshold(prover_env)) {
 			filtermapCartProd(prod, \row -> 
 				maybeMap(
 					ruUnifySubs(map(row, \hp -> hp.sub), prover_env.math, prover_env.env),
@@ -53,10 +62,35 @@ ruAddProof(prop : RuProverProp, hypProof : RuProverProofHyp, prover_env : RuProv
 				)
 			);
 		} else {
-			ruUnifySubsProd(
+			matrix_res = ruUnifySubsProd(
 				prod, prover_env.fns.admitExp,
 				prover_env.math, prover_env.env
 			);
+			// Diagnostic: `unify-prod-check=1` runs the exhaustive enumeration too and reports a
+			// matrix result that is SMALLER (the matrix unifier dropping a solution). Costly on
+			// big products — for small failing theorems only.
+			if (ruOptsString(prover_env.env.conf.opts, "unify-prod-check", "") == "1") {
+				exhaustive = filtermapCartProd(prod, \row ->
+					maybeMap(
+						ruUnifySubs(map(row, \hp -> hp.sub), prover_env.math, prover_env.env),
+						\s -> RuSubData(s, map(row, \hp -> hp.data))
+					)
+				);
+				ex_keys = buildSet(map(exhaustive, \r -> ruProofSubKey(r.sub)));
+				mx_keys = buildSet(map(matrix_res, \r -> ruProofSubKey(r.sub)));
+				prover_env.env.out.println("prod-check at " + id2s(prop.assertion.info.id) + ": size " + i2s(size) +
+					" exhaustive " + i2s(length(exhaustive)) + "/" + i2s(sizeSet(ex_keys)) + " distinct, matrix " + i2s(length(matrix_res)) + "/" + i2s(sizeSet(mx_keys)) + " distinct" +
+					(if (ex_keys == mx_keys) "" else "  <-- DIFFERENT SOLUTION SETS"));
+				if (ex_keys != mx_keys) {
+					prover_env.env.out.println("UNIFY-PROD MISMATCH at " + id2s(prop.assertion.info.id) + ": product size " + i2s(size) +
+						", exhaustive solutions " + i2s(length(exhaustive)) + ", matrix solutions " + i2s(length(matrix_res)) + "\n" +
+						strIndent(ruUnifyProdSubs2s(prod, prover_env.math)) + "\n  exhaustive unifiers:\n" +
+						strGlue(map(exhaustive, \r -> strIndent(strIndent(ruSubst2s(r.sub, prover_env.math)))), "\n  ----\n") +
+						"\n  matrix unifiers:\n" +
+						strGlue(map(matrix_res, \r -> strIndent(strIndent(ruSubst2s(r.sub, prover_env.math)))), "\n  ----\n"));
+				} else {};
+			} else {};
+			matrix_res;
 
 			/*new_proofs1 = ruAddProofDirect(prod, prop, prover_env);
 			direct_time = ruTimePassed(t_direct);
@@ -122,27 +156,99 @@ ruAddProof(prop : RuProverProp, hypProof : RuProverProofHyp, prover_env : RuProv
 		};
 		new_proofs = filtermap(unified,
 			\unif -> maybeBind(ruCompose(prop.sub, unif.sub), \theta ->
-				if (!ruCheckDisjs(theta, prop.assertion.infer.vars.disjs)) None() else
+				// The assertion's $d are over ITS variables, which live in prop.outer (bound
+				// ones to expressions, unbound ones to fresh vars) — theta's domain is the
+				// goal's variables. Checking theta alone never found a binding and never
+				// fired, so $d-violating variants propagated to the root and failed only at
+				// reconstruction (nfcvf via nfnaew). Compose as ruMakeProofTree does.
+				if (ruVariantStepDisjs(ruUnsafeCompose(prop.outer, theta), prop.assertion.infer.vars.disjs, prover_env.fns.unconst) == None()) None() else
 				if (check_consistent(theta, unif.data) == None()) None() else {
 					Some(RuProverProofProp(prop, theta, unif.data));
 				}
 			)
 		);
-		// Deduplicate by resulting substitution. Distinct child proof-subtree
-		// selections that compose to the SAME theta are interchangeable for
-		// everything upstream (ruBuildPropProofs builds the parent stmt purely
-		// from proof.sub), so keeping more than one per theta only multiplies
-		// combinatorially up the proof tree without adding provability. Seed the
-		// seen-set with the props already stored so re-entrant calls stay deduped.
-		seen = ref buildSet(map(vector2array(prop.proofs), \p -> ruProofSubKey(p.sub)));
-		iter(new_proofs, \p -> {
+		// Deduplicate by resulting substitution AND disjoint-variable requirements.
+		// Distinct child proof-subtree selections that compose to the SAME theta give the
+		// same parent statement (ruBuildPropProofs builds it purely from proof.sub), so
+		// keeping more than one per theta only multiplies combinatorially up the tree —
+		// EXCEPT that two such variants can differ in the $d conditions their steps need
+		// (equcoms: the stored proof's equcomi vs the alternative equcomiv, same theta;
+		// dedup kept equcomiv, the single root proof then failed the theorem's $d check —
+		// a completeness loss found by the oracle test with others=-1). So variants with
+		// equal theta are merged only when their $d requirements are equal too; the $d
+		// set is computed only on a theta collision. Seed with the props already stored
+		// so re-entrant calls stay deduped.
+		seen : ref Tree<string, [RuProverProofProp]> = ref makeTree();
+		iterVector(prop.proofs, \p : RuProverProofProp -> {
+			seen := treePushToArrayValue(^seen, ruProofSubKey(p.sub), p);
+		});
+		iter(new_proofs, \p : RuProverProofProp -> {
 			k = ruProofSubKey(p.sub);
-			if (!containsSet(^seen, k)) {
-				seen := insertSet(^seen, k);
-				pushVector(prop.proofs, p)
+			same : [RuProverProofProp] = lookupTreeDef(^seen, k, []);
+			dup : bool = if (same == []) false else {
+				switch (ruProofVariantDisjs(p, prover_env)) {
+					None(): false;
+					Some(dn): exists(same, \q : RuProverProofProp -> switch (ruProofVariantDisjs(q, prover_env)) {
+						Some(dq): ruEqualDisjs(dn, dq);
+						None():   false;
+					});
+				}
 			}
+			if (!dup) {
+				seen := treePushToArrayValue(^seen, k, p);
+				pushVector(prop.proofs, p);
+			} else if (prover_env.env.conf.verbose >= 4) {
+				prover_env.env.out.println("  dedup: merged a variant of " + id2s(prop.assertion.info.id) + " (same theta and $d), children: " +
+					strGlue(map(p.children, \ch -> switch (ch) {
+						RuProverProofStmt(__,__,__, c): id2s(c.node.assertion.info.id);
+						RuProverProofTop(__,__,__,__): "premise";
+						RuProverProofForward(__,__,__,__): "forward";
+					}), ", ") + "; $d new={" + eitherMap(ruProofVariantDisjs(p, prover_env), ruDisjs2s, "?") + "} kept={" +
+					strGlue(map(same, \q -> eitherMap(ruProofVariantDisjs(q, prover_env), ruDisjs2s, "?")), " / ") + "}" +
+					"; outer of child0: " + switch (p.children[0]) {
+						RuProverProofStmt(__,__,__, c): ruSubst2s(c.node.outer, prover_env.math) + " theta: " + ruSubst2s(c.sub, prover_env.math);
+						default: "-";
+					});
+			} else {};
 		});
 	}
+}
+
+// The disjoint-variable conditions a proof variant needs: each applied assertion's $d
+// instantiated by that step's substitution, over the whole variant subtree. None when the
+// variant contains a forward splice (its $d are not derived here) — such variants are
+// never merged with others. Only computed on a theta collision in ruAddProof.
+ruProofVariantDisjs(p : RuProverProof, prover_env : RuProverEnv) -> Maybe<Set<RuDisj>> {
+	switch (p) {
+		RuProverProofTop(__,__,__,__): Some(makeSet());
+		RuProverProofStmt(__,__,__, child): ruProofVariantDisjs(child, prover_env);
+		RuProverProofForward(__,__,__,__): None();
+		RuProverProofProp(node, theta, children): {
+			own = ruVariantStepDisjs(ruUnsafeCompose(node.outer, theta), node.assertion.infer.vars.disjs, prover_env.fns.unconst);
+			fold(children, own, \acc, ch -> maybeBind(acc, \a ->
+				maybeMap(ruProofVariantDisjs(ch, prover_env), \d -> mergeSets(a, d))
+			));
+		}
+	}
+}
+
+// One step's $d under its full substitution (outer composed with theta): None on a
+// violation (the two sides share a variable), else the inherent $d pairs the step
+// imposes on the variables of the goal. The theorem's variables are CONSTIFIED inside
+// the engine, so they must be un-constified first — ruComputeDisjs on the raw
+// expressions sees no variables at all and reports nothing (equcomiv's $d x y under
+// x:=_y, y:=_x came out EMPTY, and so did nfcd's violated $d A y under A:=y).
+ruVariantStepDisjs(composed : RuSubst, disjs : Set<RuDisj>, unconst : (RuExp) -> RuExp) -> Maybe<Set<RuDisj>> {
+	foldSet(disjs, Some(makeSet()), \acc, disj -> maybeBind(acc, \a -> {
+		e1_vars = ruExp2Vars(unconst(ruLookupSubstDef(composed, disj.v1)));
+		e2_vars = ruExp2Vars(unconst(ruLookupSubstDef(composed, disj.v2)));
+		if (!isEmptySet(intersectSets(e1_vars, e2_vars))) None() else {
+			Some(foldSet(e1_vars, a, \a1, v1 -> foldSet(e2_vars, a1, \a2, v2 ->
+				if (v1.id < v2.id) insertSet(a2, RuDisj(v1, v2)) else
+				if (v2.id < v1.id) insertSet(a2, RuDisj(v2, v1)) else a2
+			)));
+		}
+	}));
 }
 
 ruBuildPropProofs(prop : RuProverProp, proofs : Vector<RuProverProofProp>, prover_env : RuProverEnv) -> void {

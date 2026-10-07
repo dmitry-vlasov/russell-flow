@@ -11,6 +11,7 @@ import ru/prover/core/fragment;
 import ru/prover/ml/premise_selector;
 import ru/map_decls;
 import comm;
+import ru/util/src2s;
 
 export {
 	ruCommReprove : RuComm;
@@ -98,6 +99,7 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 			reproved_count  = ref 0;
 			started_ids     : ref [int] = ref [];
 			finished_ids    : ref [int] = ref [];   // ruBuildAndProve returned (did not run out of its time slice)
+			gaveup_ids      : ref [int] = ref [];   // returned WITHOUT a proof with its wall timer over (the engine gave up)
 			reproved_ids    : ref [int] = ref [];
 			total_steps     : ref int = ref 0;
 			covered_steps   : ref int = ref 0;
@@ -112,6 +114,7 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 			inc_finished    = ruAtomicIntInc(finished_count);
 			push_started    = ruAtomicRefArrayPush(started_ids);
 			push_finished   = ruAtomicRefArrayPush(finished_ids);
+			push_gaveup     = ruAtomicRefArrayPush(gaveup_ids);
 			push_reproved   = ruAtomicRefArrayPush(reproved_ids);
 			add_total       = ruAtomicIntInc(total_steps);
 			add_covered     = ruAtomicIntInc(covered_steps);
@@ -142,11 +145,23 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 					// disjoint-variable budget (no strengthening). Both are required
 					// for a genuine reproval of THIS theorem.
 					reproved = length(^(penv.tree.proofs)) > 0 && ruReprovedWithinDisjs(th, penv, math, env1);
+					if (!reproved && ruTimeIsOver(penv.conf.timer)) {
+						push_gaveup(th.info.id);
+					}
 					if (reproved) {
 						inc_reproved(1);
 						push_reproved(th.info.id);
-											} else {
-											}
+					} else if (length(^(penv.tree.proofs)) > 0 && env1.conf.verbose >= 3) {
+						// The engine found proofs, but each needs MORE disjoint-variable conditions than the
+						// theorem declares — a proof of a stronger-hypothesis statement, not of this theorem.
+						env1.out.println("  " + id2s(th.info.id) + ": " + i2s(length(^(penv.tree.proofs))) +
+							" root proof(s) found, ALL rejected by the $d check; theorem $d: {" + ruDisjs2s(th.infer.vars.disjs) + "}");
+						iter(^(penv.tree.proofs), \p -> {
+							normalized = ruNormalizeTheoremVarsDisjs(RuTheorem(th with proof = p));
+							env1.out.println("    proof needs $d: {" + ruDisjs2s(normalized.infer.vars.disjs) + "}\n" +
+								strIndent(strIndent(ru2s(p, math))));
+						});
+					}
 					// Coverage extracted while the tree is still live, before GC.
 					// Only count on first attempt per theorem to avoid retry inflation.
 					if (do_coverage && !containsSet(^covered_th_ids, th.info.id)) {
@@ -233,8 +248,11 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 			// A started theorem that never finished ran out of its time slice (the per-theorem
 			// time-limit, or the job budget) — a different story from a search that ended
 			// without a proof, so the strict-fail message names both groups.
+			// Two ways to run out of time: killed by the slice (never finished), or the engine's own
+			// wall timer expired and it returned without a proof (gave up).
 			finished_set = buildSet(^finished_ids);
-			timed_out    = filter(not_reproved, \id -> !containsSet(finished_set, id));
+			gaveup_set   = buildSet(^gaveup_ids);
+			timed_out    = filter(not_reproved, \id -> !containsSet(finished_set, id) || containsSet(gaveup_set, id));
 			// Theorems the job budget ran out BEFORE: never started, so neither reproved
 			// nor failed — a silent pass with a short count unless strict-fail counts them.
 			not_started  = n_theorems - sizeSet(buildSet(^started_ids));
