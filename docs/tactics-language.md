@@ -71,7 +71,7 @@ Components are grouped into categories (the same grouping `tactic` prints). Belo
 | `linear-guided(attempts)` | Replay corpus goal→premise spines (`attempts` chains). Only replays the spine; off-spine goals fall to the next stage (so it needs a BFS fallback, e.g. `seq(linear-guided(3), limited(bfs,…))`). Needs the step index. |
 | `ml` | Expand the frontier in ML-ranked (best-first) order — the ML analogue of `bfs`. Needs an ML selector (`load-ml=1`). Bound/beam via `limited(ml, batch=k, size=, depth=)`. |
 | `ap(a, child, …)` | Replay a positional proof **tree**: assertion `a` applied at the goal, each child proving a premise (a nested `ap(…)` or the leaf `prem`). Deterministic; the structure-carrying atom. |
-| `oracle(max-true-props, max-false-props, max-variants, max-proofs)` | Drive the search by the theorem's own stored proof tree (oracle stubs map proof nodes onto prover props). Used by the round-trip reprovability test. |
+| `oracle(others=0, hyps=1)` | The oracle TEST: the theorem's own stored proof tree selects which props to expand; everything else is the unhooked engine (whole assertion index, real premise matching, propagation). `others` = alternative props expanded once per subgoal (-1 = all); `hyps=0` lets the engine admit every unifiable hypothesis instead of the one the stored proof uses. The reprovability regression test (`reprove/oracle`). |
 | `follow-proof(theorem)` | Replay a named theorem's stored proof tree (diagnostic). |
 | `kalmar-closer` | Propositional closer: unfold membership atoms + a Kalmár certificate. `[PRUNE-CANDIDATE]` — no active workflow invokes it. |
 

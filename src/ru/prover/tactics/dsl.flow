@@ -498,7 +498,7 @@ ruTacticDocs() -> [RuTacticDoc] {
 		dp("atoms", "checker(closer=<tactic>)",     "Mizar-style refutation-closer PRESET = hilbert + an optional fallback finisher; checker(closer=X) == or-else(hilbert, X)", [p("closer", "fallback tactic when the emitter cannot certify (e.g. limited(bfs,...)); omit for a no-op")]),
 		dp("atoms", "linear-guided(attempts)", "guide search by linear goal->premise chains from the corpus (unbounded; wrap in limited)", [p("attempts", "how many goal->premise chains to try")]),
 		dp("atoms", "follow-proof(theorem)",        "replay a named theorem's stored proof tree (diagnostic)", [p("theorem", "name of the theorem whose stored proof tree to replay")]),
-		dp("atoms", "oracle(max-true-props, ...)",  "drive search by the theorem's own proof tree (oracle stubs map proof nodes onto prover props)", [p("max-true-props", "oracle-mapped props expanded per iteration (negative = unlimited)"), p("max-false-props", "non-oracle-mapped leaves expanded per iteration (negative = unlimited)"), p("max-variants", "assertion-unification variants offered: the oracle's + N fallbacks (negative = oracle only)"), p("max-proofs", "premise-proof variants offered: the oracle's + N fallbacks (negative = oracle only)")]),
+		dp("atoms", "oracle(others=0, hyps=1)",    "THE ORACLE TEST: the theorem's own stored proof tree selects the props to expand; the rest is the unhooked engine (whole assertion index, real premise matching, propagation)", [p("others", "alternatives (props NOT on the stored proof) expanded once per subgoal; -1 = all of them"), p("hyps", "1 = the oracle also picks the hypothesis at a premise leaf (a filter over the engine's premise unifications); 0 = every unifiable hypothesis is admitted")]),
 		// refiners — goal reducers composed inside refine(...); not runnable standalone
 		d ("refiners", "strip-forall",              "strip the leading ∀-chain; the matrix proof is re-quantified with ax-gen"),
 		d ("refiners", "conj-split",                "split a conjunction goal (B ∧ C ∧ …) into its conjuncts; recombined with pm3.2i"),
@@ -1352,39 +1352,26 @@ ruDslBuildLinearGuided(ast : RuTacticAst, ctx : RuTacticContext) -> Maybe<RuTact
 }
 
 ruDslBuildOracle(ast : RuTacticAst) -> Maybe<RuTacticBuilder> {
-	// oracle(max-true-props, max-false-props, max-variants, max-proofs):
-	// drives the search by the original proof tree of the theorem being
-	// proved.  Needs the per-theorem env: looks up the current theorem from
-	// penv.conf.task and overrides penv.fns.unifyAssertion / unifyPremise
-	// with oracle-aware variants that share a per-theorem mapping ref.
-	max_true     = ruDslGetInt(ast, "max-true-props",  0, 1);
-	max_false    = ruDslGetInt(ast, "max-false-props", 1, 0);
-	max_variants = ruDslGetInt(ast, "max-variants",    2, -1);
-	max_proofs   = ruDslGetInt(ast, "max-proofs",      3, -1);
+	// oracle(others=0, hyps=1): THE ORACLE TEST. The theorem's own stored proof tree
+	// chooses which props to expand; everything else is the unhooked engine (whole
+	// assertion index, no whitelist, real premise matching, propagation). ruOracleTactic.
+	//   others: alternatives (props NOT on the stored proof) expanded once per subgoal;
+	//           -1 = all of them (every node of the frontier expanded once, only the
+	//           oracle's path keeps going)
+	//   hyps:   1 = the oracle also picks the hypothesis at a premise leaf — a FILTER over
+	//           the engine's own premise unifications; 0 = every unifiable hypothesis
+	others = ruDslGetInt(ast, "others", 0, 0);
+	hyps   = ruDslGetInt(ast, "hyps",   1, 1) != 0;
 	Some(RuTacticBuilder(\penv -> {
 		th_id = penv.conf.task.info.id;
 		switch (lookupTree(penv.math.decls.assertions, th_id)) {
 			Some(ass): switch (ass) {
-				RuTheorem(__,__,__,proof): {
-					th = ass;
-					mapping : ref Tree<RuProverProp, RuProofStep> = ref makeTree();
-					root_ass = lookupTreeDef(penv.math.decls.assertions, ruProofQedStep(proof).assertion, ruNoAxiom);
-					// Relabel with ALL four params (the underlying tactic only carries max_true/max_false;
-					// max_variants/max_proofs live in the unify-fn overrides, so its own toString omits them).
-					tactic = ruLabeledTactic(
-						"oracle(" + i2s(max_true) + ", " + i2s(max_false) + ", " + i2s(max_variants) + ", " + i2s(max_proofs) + ")",
-						ruReproveOracleTactic(th, penv.math, mapping, max_true, max_false, penv.env)
-					);
-					new_penv = RuProverEnv(penv with
+				RuTheorem(__,__,__,__): {
+					mapping : ref Tree<int, RuProofStep> = ref makeTree();
+					tactic = ruOracleTactic(ass, penv.math, mapping, others, hyps, penv.env);
+					new_penv = if (!hyps) penv else RuProverEnv(penv with
 						fns = RuProverFuncs(penv.fns with
-							unifyAssertion = ruReproveOracleUnifyAssertion(
-								th, penv.fns.unifyAssertion, mapping, root_ass, penv.math, penv.env,
-								max_variants, max_true, max_false
-							),
-							unifyPremise = ruReproveOracleUnifyPremise(
-								th, penv.fns.unifyPremise, mapping, penv.math, penv.env,
-								max_proofs, max_true, max_false
-							)
+							unifyPremise = ruOracleFilterPremises(penv.fns.unifyPremise, mapping)
 						)
 					);
 					Pair(new_penv, tactic)
