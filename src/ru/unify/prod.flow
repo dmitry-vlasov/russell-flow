@@ -40,9 +40,16 @@ ruSubsMatrix2s(matrix : RuSubsMatrix, math : RuMath) -> string {
 }
 
 ruMakeSubsMatrix(prod : CartProd<RuSubData<?>>) -> RuSubsMatrix {
+	ruMakeSubsMatrixOf(prod, \__ -> true);
+}
+
+// Columns only for the variables `keep` admits (ruUnifySubsProd keeps the SHARED ones:
+// bound in two or more variant substitutions; a variable bound in a single variant has
+// a column that never filters any row combination).
+ruMakeSubsMatrixOf(prod : CartProd<RuSubData<?>>, keep : (int) -> bool) -> RuSubsMatrix {
 	vars = set2array(fold(prod.sets, makeSet(), \acc, ss ->
 		fold(ss, acc, \ac, s ->
-			mergeSets(ac, buildSet(map(hashMapValues(s.sub.map), \se -> se.var)))
+			mergeSets(ac, buildSet(filtermap(hashMapValues(s.sub.map), \se -> if (keep(se.var.id)) Some(se.var) else None())))
 		)
 	));
 	make_cell = \v, ss -> {
@@ -123,15 +130,52 @@ ruUnifySubsProd(prod : CartProd<RuSubData<?>>, admitExp : (RuExp) -> bool, math 
 	subs = prod.sets;
 	if (subs == [] || exists(subs, \s -> s == [])) [] else 
 	if (length(subs) == 1) map(subs[0], \d -> RuSubData(d.sub, [d.data])) else {
-		matrix = ruMakeSubsMatrix(prod);
+		stats_on = ruOptsString(env.conf.opts, "reprove-stats", "") == "1";
+		t_mx = ruMakeTimer();
+		// How many variant substitutions bind each variable, over all hyps. A variable bound
+		// in ONE variant only gets no column (it cannot filter: every other row reads it as
+		// free); its binding is restored per row combination in `finalize` below. On dffi3
+		// in hard mode this cut the matrices from ~900 columns to the few shared ones.
+		// Counted per HYP (not per variant): a variable bound only by variants of one hyp
+		// cannot filter across hyps either — its column just groups that hyp's variants.
+		bind_count : Tree<int, int> = fold(subs, makeTree(), \acc, ss -> {
+			hyp_vars = fold(ss, makeSet(), \ac, s -> foldHashMap(s.sub.map, ac, \v, __, a -> insertSet(a, v)));
+			foldSet(hyp_vars, acc, \a, v -> setTree(a, v, lookupTreeDef(a, v, 0) + 1));
+		});
+		shared = \vid -> lookupTreeDef(bind_count, vid, 0) >= 2;
+		uniques : [[RuSubst]] = map(subs, \ss -> map(ss, \s -> ruFilterSub(s.sub, \v, __ -> !shared(v.id))));
+		// A row combination's unifier: the group's shared-variable unifier plus the chosen
+		// variants' private bindings, unified together (private right-hand sides may mention
+		// shared variables and vice versa).
+		finalize = \group_sub : RuSubst, vect : [int] -> {
+			parts = filter(mapi(vect, \i, n -> uniques[i][n]), \u -> sizeHashMap(u.map) > 0);
+			maybeBind(
+				if (parts == []) Some(group_sub) else ruUnifySubs(concat([group_sub], parts), math, env),
+				\s3 -> if (ruSubSatisfies(s3, admitExp)) Some(s3) else None()
+			);
+		};
+		matrix = ruMakeSubsMatrixOf(prod, shared);
+		if (stats_on) {
+			ruAddStats("prod-matrix", RuStatsRow("", pairs2tree([Pair("time", ruTimePassed(t_mx)), Pair("count", 1.0),
+				Pair("cols", i2d(length(matrix.cols))), Pair("rows", i2d(length(subs)))])));
+		}
 		if (matrix.cols == []) {
-			mapCartProd(prod, \vect -> RuSubData(ruEmptySubst, map(vect, \sd -> sd.data)));
+			// No shared variable: every row combination stands on its own.
+			idx_prod = CartProd(map(subs, \ss -> enumFromTo(0, length(ss) - 1)));
+			filtermapCartProd(idx_prod, \vect ->
+				maybeMap(finalize(ruEmptySubst, vect), \s -> RuSubData(s, mapi(vect, \i, n -> subs[i][n].data)))
+			);
 		} else {
 			empty = ref false;
 			unified = mapi(matrix.cols, 
 				\i, col -> {
 					size = fold(col.rows, 1, \acc, ind -> acc * ruIndexDataCount(ind));
+					t_col = ruMakeTimer();
 					uns = ruUnifyIndexes(col.rows, ruEmptySubst, math, env);
+					if (stats_on) {
+						ruAddStats("prod-column", RuStatsRow("", pairs2tree([Pair("time", ruTimePassed(t_col)), Pair("count", 1.0),
+							Pair("size", i2d(size)), Pair("rets", i2d(length(uns)))])));
+					}
 					unif_col = filtermap(uns, \unif -> {
 						switch (ruLookupSubst(unif.sub, col.var)) {
 							None(): 
@@ -167,41 +211,43 @@ ruUnifySubsProd(prod : CartProd<RuSubData<?>>, admitExp : (RuExp) -> bool, math 
 					"\n" + strIndent(ruUnifiedCols2s1(unified, matrix, math)));
 			}
 			if (^empty) [] else {
+				t_int = ruMakeTimer();
 				inter_cols = fold(
 					tail(unified), 
 					map(unified[0], \unif -> RuSubArrData([unif.sub], unif.data)), 
 					\acc, col -> ruIntersectCols(acc, col, math)
 				);
-				intersected = filtermap(inter_cols, \ss -> 
+				if (stats_on) {
+					ruAddStats("prod-intersect", RuStatsRow("", pairs2tree([Pair("time", ruTimePassed(t_int)), Pair("count", 1.0),
+						Pair("rets", i2d(length(inter_cols))), Pair("size", i2d(fold(unified, 0, \a, c -> a + length(c))))])));
+				}
+				t_fold = ruMakeTimer();
+				// One n-ary unification per row group. The former PAIRWISE fold threaded up to
+				// ~900 one-binding column unifiers through ruUnifySubs one at a time, re-resolving
+				// the growing accumulator at every step: 158 of 180 summed seconds on dffi3 in
+				// hard mode (a single group of 128 rows x 922 columns took 29 s). ruUnifySubs
+				// splits an array of substitutions in one linear pass.
+				intersected = filtermap(inter_cols, \ss -> {
+					r = ruUnifySubs(ss.subs, math, env);
+					if (dbg) {
+						env.out.println("PROD-TRACE unify-group of " + i2s(length(ss.subs)) + " column unifiers => " +
+							switch (r) { Some(s3): "\n" + strIndent(strIndent(ruSubst2s(s3, math))); None(): "FAIL"; });
+					}
 					maybeMap(
-						fold(ss.subs, Some(ruEmptySubst), \acc, s2 -> 
-							maybeBind(acc, \s1 -> {
-								r = ruUnifySubs([s1, s2], math, env);
-								if (dbg) {
-									env.out.println("PROD-TRACE unify-step\n  s1:\n" + strIndent(strIndent(ruSubst2s(s1, math))) + "\n  s2:\n" + strIndent(strIndent(ruSubst2s(s2, math))) +
-										"\n  => " + switch (r) { Some(s3): "\n" + strIndent(strIndent(ruSubst2s(s3, math))); None(): "FAIL"; });
-								}
-								maybeBind(r, \s3 ->
-									if (ruSubSatisfies(s3, admitExp)) {
-										Some(s3);
-									} else {
-										None();
-									}
-								)
-							})
-						),
+						maybeBind(r, \s3 -> if (ruSubSatisfies(s3, admitExp)) Some(s3) else None()),
 						\s -> RuSubData(s, ss.data)
 					)
-				);
+				});
+				if (stats_on) {
+					ruAddStats("prod-fold", RuStatsRow("", pairs2tree([Pair("time", ruTimePassed(t_fold)), Pair("count", 1.0),
+						Pair("rets", i2d(length(intersected))), Pair("size", i2d(fold(inter_cols, 0, \a, ss -> a + length(ss.subs))))])));
+				}
 				fold(intersected, [],
 					\acc, unif -> {
 						ret_prod = CartProd(map(unif.data, \d -> set2array(d)));
-						// The pairwise-assembled unifier can be TRIANGULAR (z => x_1, x_1 => _y): the
-						// rest of the engine applies a substitution once (ruAdd2Subst keeps them
-						// idempotent), so a triangular one leaves variables unresolved in the built
-						// statements and the proof is lost. Close it (see ruResolveSubst).
-						resolved = ruResolveSubst(unif.sub);
-						concat(acc, mapCartProd(ret_prod, \v -> RuSubData(resolved, mapi(v, \i, n -> subs[i][n].data))))
+						concat(acc, filtermapCartProd(ret_prod, \v ->
+							maybeMap(finalize(unif.sub, v), \s -> RuSubData(s, mapi(v, \i, n -> subs[i][n].data)))
+						))
 					}
 				);
 			}
