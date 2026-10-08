@@ -55,8 +55,12 @@ ruProofPropKey(p : RuProverProofProp) -> string {
 
 ruAddProof(prop : RuProverProp, hypProof : RuProverProofHyp, prover_env : RuProverEnv) -> void {
 	if (sizeVector(prop.children) == ruArity(prop.assertion)) {
+		// The hyp the new proof belongs to is identified by its index under `prop`: a
+		// structural `hyp == hypProof.node` deep-compared whole prover nodes (vectors of
+		// proofs and all) per child per call — 10% of a hard-mode profile.
+		proof_ind = switch (hypProof.node) { RuProverExp(ind,__,__,__,__): ind; RuProverRoot(__,__,__): -1; };
 		prod = CartProd(map(vector2array(prop.children), \hyp ->
-			if (hyp == hypProof.node) [RuSubData(hypProof.sub, hypProof)] else
+			if (hyp.ind == proof_ind) [RuSubData(hypProof.sub, hypProof)] else
 			// hyp.proofs is written under synchronizedUnaryFn(hyp.proofs, …) in
 			// ruBuildPropProofs; read under the same lock to avoid a data race that
 			// causes null entries in the snapshot and a subsequent NPE in map.
@@ -242,43 +246,47 @@ ruAddProof(prop : RuProverProp, hypProof : RuProverProofHyp, prover_env : RuProv
 		// The $d key is touched ONLY on a theta collision: the common path (a new theta) costs
 		// one set lookup. On the first collision of a theta the stored variants with that
 		// theta get their $d keys computed (memoized in the records) and cached per theta.
-		// Buckets by theta hash; within a bucket, equal theta is confirmed structurally.
-		buckets : ref Tree<string, [RuProverProofProp]> = ref makeTree();
+		// The prop's PERSISTENT dedup table: theta hash -> distinct thetas (one representative
+		// each). A new variant is compared with representatives only, never with every
+		// member (under an explosion hundreds of variants share one theta: comparing with
+		// all of them was quadratic, 160 summed seconds on dffi3), and nothing is rebuilt
+		// per call. The $d keys of a theta's members are computed on its first collision.
 		unique_n   = ref 0;
 		full_key = \p : RuProverProofProp -> switch (ruProofVariantDisjs(p, prover_env)) {
 			Some(d): strGlue(sort(map(set2array(d), \dj -> i2s(dj.v1.id) + "-" + i2s(dj.v2.id))), ",");
 			None(): { unique_n := ^unique_n + 1; "?" + i2s(^unique_n); }
 		};
-		iterVector(prop.proofs, \p : RuProverProofProp -> {
-			buckets := treePushToArrayValue(^buckets, ruProofPropKey(p), p);
-		});
 		iter(new_proofs, \p : RuProverProofProp -> {
 			k = ruProofPropKey(p);
-			bucket : [RuProverProofProp] = lookupTreeDef(^buckets, k, []);
-			same_theta = filter(bucket, \q -> ruSubstEquals(q.sub, p.sub));
-			if (same_theta == []) {
-				buckets := setTree(^buckets, k, arrayPush(bucket, p));
-				pushVector(prop.proofs, p);
-			} else {
-				fk = full_key(p);
-				if (!exists(same_theta, \q -> full_key(q) == fk)) {
-					buckets := setTree(^buckets, k, arrayPush(bucket, p));
+			groups : [RuThetaGroup] = lookupTreeDef(^(prop.dedup), k, []);
+			switch (find(groups, \g -> ruSubstEquals(g.rep.sub, p.sub))) {
+				None(): {
+					prop.dedup := setTree(^(prop.dedup), k, arrayPush(groups, RuThetaGroup(p, ref [p], ref None())));
 					pushVector(prop.proofs, p);
-				} else {
-					if (prover_env.env.conf.verbose >= 4) {
-						same : [RuProverProofProp] = same_theta;
-				prover_env.env.out.println("  dedup: merged a variant of " + id2s(prop.assertion.info.id) + " (same theta and $d), children: " +
-					strGlue(map(p.children, \ch -> switch (ch) {
-						RuProverProofStmt(__,__,__, c): id2s(c.node.assertion.info.id);
-						RuProverProofTop(__,__,__,__): "premise";
-						RuProverProofForward(__,__,__,__): "forward";
-					}), ", ") + "; $d new={" + eitherMap(ruProofVariantDisjs(p, prover_env), ruDisjs2s, "?") + "} kept={" +
-					strGlue(map(same, \q -> eitherMap(ruProofVariantDisjs(q, prover_env), ruDisjs2s, "?")), " / ") + "}" +
-					"; outer of child0: " + switch (p.children[0]) {
-						RuProverProofStmt(__,__,__, c): ruSubst2s(c.node.outer, prover_env.math) + " theta: " + ruSubst2s(c.sub, prover_env.math);
-						default: "-";
-					});
-					} else {};
+				}
+				Some(g): {
+					dkeys : Set<string> = switch (^(g.dkeys)) {
+						Some(ks): ks;
+						None(): buildSet(map(^(g.members), full_key));
+					};
+					fk = full_key(p);
+					if (!containsSet(dkeys, fk)) {
+						g.dkeys := Some(insertSet(dkeys, fk));
+						refArrayPush(g.members, p);
+						pushVector(prop.proofs, p);
+					} else {
+						g.dkeys := Some(dkeys);
+						if (prover_env.env.conf.verbose >= 4) {
+							same : [RuProverProofProp] = ^(g.members);
+							prover_env.env.out.println("  dedup: merged a variant of " + id2s(prop.assertion.info.id) + " (same theta and $d), children: " +
+								strGlue(map(p.children, \ch -> switch (ch) {
+									RuProverProofStmt(__,__,__, c): id2s(c.node.assertion.info.id);
+									RuProverProofTop(__,__,__,__): "premise";
+									RuProverProofForward(__,__,__,__): "forward";
+								}), ", ") + "; $d new={" + eitherMap(ruProofVariantDisjs(p, prover_env), ruDisjs2s, "?") + "} kept={" +
+								strGlue(map(same, \q -> eitherMap(ruProofVariantDisjs(q, prover_env), ruDisjs2s, "?")), " / ") + "}");
+						} else {};
+					}
 				}
 			}
 		});
