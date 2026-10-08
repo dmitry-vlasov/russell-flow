@@ -35,6 +35,15 @@ ruUnifyProdThreshold(prover_env : RuProverEnv) -> int {
 	if (v == "") 64 else s2i(v);
 }
 
+// The variant's theta key, computed once (memo in the record).
+ruProofPropKey(p : RuProverProofProp) -> string {
+	if (^(p.key) != "") ^(p.key) else {
+		k = ruProofSubKey(p.sub);
+		p.key := if (k == "") "#" else k;
+		^(p.key);
+	}
+}
+
 ruAddProof(prop : RuProverProp, hypProof : RuProverProofHyp, prover_env : RuProverEnv) -> void {
 	if (sizeVector(prop.children) == ruArity(prop.assertion)) {
 		prod = CartProd(map(vector2array(prop.children), \hyp ->
@@ -45,6 +54,7 @@ ruAddProof(prop : RuProverProp, hypProof : RuProverProofHyp, prover_env : RuProv
 			map(synchronizedUnaryFn(hyp.proofs, vector2array)(hyp.proofs), \p -> RuSubData(p.sub, p))
 		));
 		size = sizeCartProd(prod);
+		t_add = ruMakeTimer();
 		unified = if (size == 0) {
 			[];
 		} else if (size == 1) {
@@ -163,6 +173,12 @@ ruAddProof(prop : RuProverProp, hypProof : RuProverProofHyp, prover_env : RuProv
 		// candidates, causing the imbi1d-class OOM. Filter here using the
 		// same primitives (ruMatchExp + ruMergeSubst) the verifier uses, so
 		// only candidates the verifier will actually accept survive.
+		if (ruOptsString(prover_env.env.conf.opts, "reprove-stats", "") == "1") {
+			ruAddStats("ruAddProof-" + (if (size < ruUnifyProdThreshold(prover_env)) "exhaustive" else "matrix"),
+				RuStatsRow("join at " + id2s(prop.assertion.info.id), pairs2tree([
+					Pair("size", i2d(size)), Pair("time", ruTimePassed(t_add)), Pair("rets", i2d(length(unified))), Pair("count", 1.0)
+				])));
+		}
 		check_consistent = \theta : RuSubst, children_data : [RuProverProofHyp] -> {
 			n_hyps = length(prop.assertion.infer.hyps);
 			n_kids = length(children_data);
@@ -195,7 +211,7 @@ ruAddProof(prop : RuProverProp, hypProof : RuProverProofHyp, prover_env : RuProv
 				// reconstruction (nfcvf via nfnaew). Compose as ruMakeProofTree does.
 				if (ruVariantStepDisjs(ruUnsafeCompose(prop.outer, theta), prop.assertion.infer.vars.disjs, prover_env.fns.unconst) == None()) None() else
 				if (check_consistent(theta, unif.data) == None()) None() else {
-					Some(RuProverProofProp(prop, theta, unif.data));
+					Some(RuProverProofProp(prop, theta, unif.data, ref None(), ref ""));
 				}
 			)
 		);
@@ -210,26 +226,41 @@ ruAddProof(prop : RuProverProp, hypProof : RuProverProofHyp, prover_env : RuProv
 		// equal theta are merged only when their $d requirements are equal too; the $d
 		// set is computed only on a theta collision. Seed with the props already stored
 		// so re-entrant calls stay deduped.
-		seen : ref Tree<string, [RuProverProofProp]> = ref makeTree();
+		t_dedup = ruMakeTimer();
+		// One lookup per variant: key = theta key + the variant's $d key (computed once per
+		// variant on a theta collision and memoized in the record). A variant whose $d are
+		// not derivable (forward splice inside) gets a unique key and is never merged.
+		// The $d key is touched ONLY on a theta collision: the common path (a new theta) costs
+		// one set lookup. On the first collision of a theta the stored variants with that
+		// theta get their $d keys computed (memoized in the records) and cached per theta.
+		theta_keys : ref Set<string> = ref makeSet();
+		full_by_theta : ref Tree<string, Set<string>> = ref makeTree();
+		unique_n   = ref 0;
+		full_key = \p : RuProverProofProp -> switch (ruProofVariantDisjs(p, prover_env)) {
+			Some(d): strGlue(sort(map(set2array(d), \dj -> i2s(dj.v1.id) + "-" + i2s(dj.v2.id))), ",");
+			None(): { unique_n := ^unique_n + 1; "?" + i2s(^unique_n); }
+		};
 		iterVector(prop.proofs, \p : RuProverProofProp -> {
-			seen := treePushToArrayValue(^seen, ruProofSubKey(p.sub), p);
+			theta_keys := insertSet(^theta_keys, ruProofPropKey(p));
 		});
 		iter(new_proofs, \p : RuProverProofProp -> {
-			k = ruProofSubKey(p.sub);
-			same : [RuProverProofProp] = lookupTreeDef(^seen, k, []);
-			dup : bool = if (same == []) false else {
-				switch (ruProofVariantDisjs(p, prover_env)) {
-					None(): false;
-					Some(dn): exists(same, \q : RuProverProofProp -> switch (ruProofVariantDisjs(q, prover_env)) {
-						Some(dq): ruEqualDisjs(dn, dq);
-						None():   false;
-					});
-				}
-			}
-			if (!dup) {
-				seen := treePushToArrayValue(^seen, k, p);
+			k = ruProofPropKey(p);
+			if (!containsSet(^theta_keys, k)) {
+				theta_keys := insertSet(^theta_keys, k);
 				pushVector(prop.proofs, p);
-			} else if (prover_env.env.conf.verbose >= 4) {
+			} else {
+				stored : Set<string> = switch (lookupTree(^full_by_theta, k)) {
+					Some(fs): fs;
+					None(): buildSet(map(filter(vector2array(prop.proofs), \q -> ruProofPropKey(q) == k), full_key));
+				};
+				fk = full_key(p);
+				if (!containsSet(stored, fk)) {
+					full_by_theta := setTree(^full_by_theta, k, insertSet(stored, fk));
+					pushVector(prop.proofs, p);
+				} else {
+					full_by_theta := setTree(^full_by_theta, k, stored);
+					if (prover_env.env.conf.verbose >= 4) {
+						same : [RuProverProofProp] = filter(vector2array(prop.proofs), \q -> ruProofPropKey(q) == k);
 				prover_env.env.out.println("  dedup: merged a variant of " + id2s(prop.assertion.info.id) + " (same theta and $d), children: " +
 					strGlue(map(p.children, \ch -> switch (ch) {
 						RuProverProofStmt(__,__,__, c): id2s(c.node.assertion.info.id);
@@ -241,8 +272,15 @@ ruAddProof(prop : RuProverProp, hypProof : RuProverProofHyp, prover_env : RuProv
 						RuProverProofStmt(__,__,__, c): ruSubst2s(c.node.outer, prover_env.math) + " theta: " + ruSubst2s(c.sub, prover_env.math);
 						default: "-";
 					});
-			} else {};
+					} else {};
+				}
+			}
 		});
+		if (ruOptsString(prover_env.env.conf.opts, "reprove-stats", "") == "1") {
+			ruAddStats("ruAddProof-dedup", RuStatsRow("dedup at " + id2s(prop.assertion.info.id), pairs2tree([
+				Pair("time", ruTimePassed(t_dedup)), Pair("count", 1.0), Pair("rets", i2d(length(new_proofs)))
+			])));
+		}
 	}
 }
 
@@ -255,11 +293,18 @@ ruProofVariantDisjs(p : RuProverProof, prover_env : RuProverEnv) -> Maybe<Set<Ru
 		RuProverProofTop(__,__,__,__): Some(makeSet());
 		RuProverProofStmt(__,__,__, child): ruProofVariantDisjs(child, prover_env);
 		RuProverProofForward(__,__,__,__): None();
-		RuProverProofProp(node, theta, children): {
-			own = ruVariantStepDisjs(ruUnsafeCompose(node.outer, theta), node.assertion.infer.vars.disjs, prover_env.fns.unconst);
-			fold(children, own, \acc, ch -> maybeBind(acc, \a ->
-				maybeMap(ruProofVariantDisjs(ch, prover_env), \d -> mergeSets(a, d))
-			));
+		RuProverProofProp(node, theta, children, memo, __): {
+			switch (^memo) {
+				Some(d): d;
+				None(): {
+					own = ruVariantStepDisjs(ruUnsafeCompose(node.outer, theta), node.assertion.infer.vars.disjs, prover_env.fns.unconst);
+					d = fold(children, own, \acc, ch -> maybeBind(acc, \a ->
+						maybeMap(ruProofVariantDisjs(ch, prover_env), \dd -> mergeSets(a, dd))
+					));
+					memo := Some(d);
+					d;
+				}
+			}
 		}
 	}
 }
