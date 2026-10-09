@@ -51,8 +51,15 @@ export {
 			id        : int,
 			assertion : RuAssertion,
 			proofs    : Vector<RuProverProofProp>,
-			sub       : RuSubst,
-			outer     : RuSubst,
+			// The raw unifier of the goal against the assertion's conclusion (from the index).
+			// A CANDIDATE prop keeps only this: the split into `sub` (goal variables ->
+			// expressions) and `outer` (assertion variables -> expressions / fresh variables)
+			// is computed ONCE, when the prop is expanded (ruPropSubs) — a goal matches
+			// ~1,800 assertions on set.mm and only the selected ones are ever expanded, so
+			// splitting and renaming every candidate eagerly cost 4 substitutions and fresh
+			// variables per candidate: millions per big theorem, out of heap on set.mm.
+			unif      : RuSubst,
+			split     : ref Maybe<Pair<RuSubst, RuSubst>>,
 			children  : Vector<RuProverExp>,
 			parent    : RuProverHyp,
 			// "" until expanded; once expanded, the tag of the DSL atom that
@@ -115,7 +122,14 @@ export {
 	ruProverTreeDiff(snap : RuProverTreeSnapshot, tree : RuProverTree) -> RuProverTreeDiff;
 
 	ruNoProverHyp = RuProverRoot(makeVector(0), ruNoStmt, makeVector(0));
-	ruNoProverProp = RuProverProp(-1, ruNoAxiom, makeVector(0), ruEmptySubst, ruEmptySubst, makeVector(0), ruNoProverHyp, ref "", ref makeTree());
+	ruNoProverProp = RuProverProp(-1, ruNoAxiom, makeVector(0), ruEmptySubst, ref Some(Pair(ruEmptySubst, ruEmptySubst)), makeVector(0), ruNoProverHyp, ref "", ref makeTree());
+
+	// The (sub, outer) split of a prop, computed on first use with the env's fresher.
+	ruPropSubs(prop : RuProverProp, fresher : (RuVar) -> RuVar) -> Pair<RuSubst, RuSubst>;
+	ruPropSub(prop : RuProverProp, fresher : (RuVar) -> RuVar) -> RuSubst;
+	ruPropOuter(prop : RuProverProp, fresher : (RuVar) -> RuVar) -> RuSubst;
+	// The split of an EXPANDED prop (already computed); crashes on a candidate.
+	ruPropSubsForced(prop : RuProverProp) -> Pair<RuSubst, RuSubst>;
 
 	ruProverTreeDepth(tree : RuProverTree) -> int;
 	ruProverTreeSize(tree : RuProverTree) -> int;
@@ -171,7 +185,7 @@ ruMakeProofTree(proof : RuProverProof) -> RuProofTree {
 					RuStmt(s1 with exps = map(s1.exps, \ex -> ruApplySubst(ruExp(ex), sub)));
 				}
 				RuProverExp(__,__,__,__,__): {
-					composed_sub = ruUnsafeCompose(node.outer, sub);
+					composed_sub = ruUnsafeCompose(ruPropSubsForced(node).second, sub);
 					RuStmt(node.assertion.infer.prop with
 						exps = map(node.assertion.infer.prop.exps, \ex -> ruApplySubst(ruExp(ex), composed_sub))
 					);
@@ -188,7 +202,7 @@ ruMakeProofTree(proof : RuProverProof) -> RuProofTree {
 
 ruProverNode2s(node : RuProverNode, math : RuMath) -> string {
 	switch (node) {
-		RuProverProp(id, ass, proofs, sub, outer, children, parent, expanded, __):
+		RuProverProp(id, ass, proofs, unif, spl, children, parent, expanded, __):
 			"Prop<" + 
 				"id=" + i2s(id) + ", " +
 				"ass=" + id2s(ass.info.id) + ", " + 
@@ -214,14 +228,14 @@ ruProverNode2s(node : RuProverNode, math : RuMath) -> string {
 
 ruProverTree2s(node : RuProverNode, math : RuMath, small : bool) -> string {
 	get_proofs = \n -> switch (n) {
-		RuProverProp(id, ass, proofs, sub, outer, children, parent, expanded, __): proofs;
+		RuProverProp(id, ass, proofs, unif, spl, children, parent, expanded, __): proofs;
 		RuProverExp(ind, proofs, expr, children, parent): proofs;
 		RuProverRoot(proofs, expr, children): proofs;
 	}
 	ruProverNode2s(node, math) + 
 	(if (sizeVector(node.children) == 0) "" else {
 		all_children : [RuProverNode] = switch (node) {
-			RuProverProp(id, ass, proofs, sub, outer, children, parent, expanded, __): vector2array(children);
+			RuProverProp(id, ass, proofs, unif, spl, children, parent, expanded, __): vector2array(children);
 			RuProverExp(ind, proofs, expr, children, parent): vector2array(children);
 			RuProverRoot(proofs, expr, children): vector2array(children);
 		}
@@ -242,7 +256,9 @@ ruProverTree2s(node : RuProverNode, math : RuMath, small : bool) -> string {
 ruProverNode2json(node : RuProverNode, math : RuMath, conf : RuConf) -> Json {
 	maxlen = s2i(ruOptsString(conf.opts, "maxlen-expr", "32"));
 	switch (node) {
-		RuProverProp(ind, ass, proofs, sub, outer, children, parent, expanded, __): {
+		RuProverProp(ind, ass, proofs, unif, spl, children, parent, expanded, __): {
+			// an expanded prop shows its goal-side substitution; a candidate its raw unifier
+			sub = switch (^spl) { Some(p): p.first; None(): unif; };
 			expr = ruApplySubst(ruExp(parent.stmt.exps[0]), sub);
 			tooltip = ru2s(ass, math);
 			JsonObject([
@@ -419,5 +435,44 @@ ruProverEnvProof(tree : RuProverTree) -> Maybe<RuProof> {
 		Some(fold(tail(proofs), proofs[0], \acc, proof -> 
 			if (length(proof.steps) < length(acc.steps)) proof else acc
 		));
+	}
+}
+
+
+ruPropSubs(prop : RuProverProp, fresher : (RuVar) -> RuVar) -> Pair<RuSubst, RuSubst> {
+	switch (^(prop.split)) {
+		Some(p): p;
+		None(): {
+			a_vars = ruAssertion2Vars(prop.assertion);
+			fresh = ruMakeFresherSubst(
+				foldSet(a_vars, [], \ac, v -> if (ruSubstMapsVar(prop.unif, v.id)) ac else concat(ac, [v])),
+				fresher
+			);
+			s_all = ruUnsafeCompose(prop.unif, fresh);
+			p = Pair(
+				ruFilterSub(s_all, \v,__ -> !containsSet(a_vars, v)),
+				ruFilterSub(s_all, \v,__ -> containsSet(a_vars, v))
+			);
+			prop.split := Some(p);
+			p;
+		}
+	}
+}
+
+ruPropSub(prop : RuProverProp, fresher : (RuVar) -> RuVar) -> RuSubst {
+	ruPropSubs(prop, fresher).first;
+}
+
+ruPropOuter(prop : RuProverProp, fresher : (RuVar) -> RuVar) -> RuSubst {
+	ruPropSubs(prop, fresher).second;
+}
+
+ruPropSubsForced(prop : RuProverProp) -> Pair<RuSubst, RuSubst> {
+	switch (^(prop.split)) {
+		Some(p): p;
+		None(): {
+			ruCrash("ruPropSubsForced: the prop " + i2s(prop.id) + " (" + id2s(prop.assertion.info.id) + ") was not expanded");
+			Pair(ruEmptySubst, ruEmptySubst);
+		}
 	}
 }
