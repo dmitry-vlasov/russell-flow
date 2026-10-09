@@ -178,13 +178,16 @@ mmCompressAssertion(ass : MmAssertion, sources : Tree<int, MmSource>, structs : 
 	}
 }
 
-MmProofCompressionAcc(
-	stack : List<MmExp>,
-	compressed : Vector<MmStepLen>,
-	steps : Tree<MmExp, int>,
-	count : int
-);
-
+// Compression as a TREE emission. The proof RPN is executed once to get every step's
+// expression; the subtree spans follow from the arities; then the tree is emitted in
+// post-order: a repeated expression is saved (Z) at its first emission and REFERENCED
+// afterwards — a referenced subtree is never re-emitted, so nothing inside it is ever
+// saved or cut. (The former linear algorithm executed the whole RPN and TRUNCATED the
+// output when it met a repeated expression, which deleted the Z markers of steps saved
+// inside the truncated part while their indices stayed in the table: a later reference
+// pointed past the saved steps — "compressed label reference is outside the range of
+// the label list", found by the reproving gate on rblem5.) A second emission drops the
+// saves nothing references.
 mmCompressProof(labels : [int], ass : MmAssertion, sources : Tree<int, MmSource>, structs : MmStructs, env : RuEnv, arities : Tree<int, int>) -> MmCompressedProof {
 	level = s2i(ruOptsString(env.conf.opts, "mm-compress-level", "1"));
 	labs = concat(
@@ -194,62 +197,61 @@ mmCompressProof(labels : [int], ass : MmAssertion, sources : Tree<int, MmSource>
 	hyps_map = foldi(concat(ass.hyps, ass.inner), makeTree(), \i, acc, hyp -> setTree(acc, hyp.label, i));
 	labs_map = foldi(labs, makeTree(), \i, acc, lab -> setTree(acc, lab, length(ass.hyps) + i));
 	Z = length(ass.hyps) + sizeTree(labs_map);
-
-	exps_counts = if (level == 0) makeTree() else mmCompressCountExprsInProof(labels, ass, sources, structs, env);
-
-	calc_acc = \bad_steps -> 
-		foldi(labels, MmProofCompressionAcc(makeList(), makeVector(128), makeTree(), 0), \i, acc, label -> {
-			stack = mmCompressExecuteRPNstep(label, acc.stack, structs.labeled, ass, env);
-			ex = headList(stack, MmExp([]));
-			acc1 = MmProofCompressionAcc(acc with stack = stack);
-			switch (lookupTree(hyps_map, label)) {
-				Some(k): {
-					pushVector(acc.compressed, MmStepLen(k, 1));
-					acc1;
-				}
+	n = length(labels);
+	label_ind = \label -> switch (lookupTree(hyps_map, label)) {
+		Some(k): k;
+		None(): switch (lookupTree(labs_map, label)) {
+			Some(k): k;
+			None(): { ruCrash("MUST NOT HAPPEN, unknown label: " + id2s(label)); -1 }
+		}
+	};
+	arity_of = \label -> if (containsKeyTree(hyps_map, label)) 0 else lookupTreeDef(arities, label, 0);
+	// 1. the expression of every step (one execution of the RPN)
+	exps : [MmExp] = fold(labels, Pair(makeList(), []), \acc, label -> {
+		stack = mmCompressExecuteRPNstep(label, acc.first, structs.labeled, ass, env);
+		Pair(stack, arrayPush(acc.second, headList(stack, MmExp([]))));
+	}).second;
+	exps_counts = if (level == 0) makeTree() else fold(exps, makeTree(), \acc, ex -> setTree(acc, ex, lookupTreeDef(acc, ex, 0) + 1));
+	// 2. subtree spans: starts[i] = index of the first step of the subtree rooted at i
+	starts : [int] = foldi(labels, Pair(makeList(), []), \i, acc, label -> {
+		a = arity_of(label);
+		popped = fold(enumFromTo(1, a), Pair(acc.first, i), \ac, __ -> Pair(tailList(ac.first), headList(ac.first, i)));
+		start = popped.second;
+		Pair(Cons(start, popped.first), arrayPush(acc.second, start));
+	}).second;
+	// 3. post-order emission with saves and references
+	emit_all = \bad : Set<MmExp> -> {
+		out : Vector<int> = makeVector(n);
+		saved : ref Tree<MmExp, int> = ref makeTree();
+		count = ref 0;
+		emit = ref \__ : int -> {};
+		emit := \i : int -> {
+			ex = exps[i];
+			switch (lookupTree(^saved, ex)) {
+				Some(k): pushVector(out, k);
 				None(): {
-					switch (lookupTree(labs_map, label)) {
-						Some(k): {
-							len = mmCalcSubproofLen(
-								sizeVector(acc.compressed) - 1,
-								lookupTreeDef(arities, label, -1), 
-								0, acc.compressed
-							);
-							switch (lookupTree(acc.steps, ex)) {
-								Some(n): {
-									resizeVector(acc.compressed, sizeVector(acc.compressed) - len);
-									pushVector(acc.compressed, MmStepLen(n, 1));
-									acc1
-								}
-								None(): {
-									if (lookupTreeDef(exps_counts, ex, 0) <= 1 || containsSet(bad_steps, ex)) {
-										pushVector(acc.compressed, MmStepLen(k, len + 1));
-										acc1
-									} else {
-										pushVector(acc.compressed, MmStepLen(k, len + 1));
-										pushVector(acc.compressed, MmStepLen(-1, len + 2));
-										MmProofCompressionAcc(acc1 with
-											steps = setTree(acc.steps, ex, Z + acc.count),
-											count = acc.count + 1
-										);
-									}
-								}
-							}
-						}
-						None(): { 
-							ruCrash("MUST NOT HAPPEN, unknown label: " + id2s(label)); 
-							acc; 
-						}
+					a = arity_of(labels[i]);
+					// the children end at i-1, starts[i-1]-1, ... (right to left); emit left to right
+					ends = fold(enumFromTo(1, a), Pair([], i - 1), \ac, __ ->
+						Pair(concat([ac.second], ac.first), starts[ac.second] - 1)
+					).first;
+					iter(ends, \e -> (^emit)(e));
+					pushVector(out, label_ind(labels[i]));
+					// only an assertion step may be saved (Z): Metamath forbids local labels on hypotheses
+					if (level > 0 && !containsKeyTree(hyps_map, labels[i]) && lookupTreeDef(exps_counts, ex, 0) > 1 && !containsSet(bad, ex)) {
+						pushVector(out, -1);
+						saved := setTree(^saved, ex, Z + ^count);
+						count := ^count + 1;
 					}
 				}
 			}
-		});
-	acc1 = calc_acc(makeSet());
-	steps_inds = buildSet(getTreeValues(acc1.steps));
-	unused_inds = differenceSets(steps_inds, buildSet(map(vector2array(acc1.compressed), \s -> s.step)));
-	unused_exps = foldTree(acc1.steps, makeSet(), \ex, i, acc ->
-		if (containsSet(unused_inds, i)) insertSet(acc, ex) else acc
-	);
-	acc2 = calc_acc(unused_exps);
-	MmCompressedProof(labs, map(vector2array(acc2.compressed), \s -> s.step));
+		};
+		(^emit)(n - 1);
+		Pair(vector2array(out), ^saved);
+	};
+	first = emit_all(makeSet());
+	referenced = buildSet(filter(first.first, \k -> k >= Z));
+	unused = foldTree(first.second, makeSet(), \ex, k, acc -> if (containsSet(referenced, k)) acc else insertSet(acc, ex));
+	steps = if (isEmptySet(unused)) first.first else emit_all(unused).first;
+	MmCompressedProof(labs, steps);
 }
