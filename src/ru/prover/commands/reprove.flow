@@ -36,6 +36,8 @@ ruCommReprove = RuComm(
 			RuCommArg("load-ml",        true, "set to 1 to load the ML selector (required by the `ml` atom)",                  "0"),
 			RuCommArg("tactic",         true, "tactic DSL expression or .tac derived-tactic ref; if empty, a strict bounded BFS (limited(bfs, size=max-size, depth=max-depth, batch=16)) is used", ""),
 			RuCommArg("strict-fail",    true, "set to 1 to crash if any theorem could not be reproved (CI / regression mode)", "0"),
+			RuCommArg("max-props",      true, "candidate budget per theorem: props created before the prover gives up on it (0 = unlimited); a give-up is a resource limit, reported with the timeouts", "0"),
+			RuCommArg("allow-giveup",   true, "set to 1 so strict-fail tolerates theorems that gave up under a limit (time, candidate budget, job budget) — they are listed and counted; a search that ends WITHOUT a proof within its limits still fails", "0"),
 			RuCommArg("replace",        true, "set to 1 to INSTALL the found proof into the theorem (the one accepted by the $d check); `changed-count` then counts installed proofs that differ from the stored ones — for an end-to-end check: verify, write-ru, export, Metamath", "0"),
 			RuCommArg("coverage",       true, "set to 1 to measure proof-step coverage from the search tree inline",           "0"),
 			RuCommArg("parallel",             true, "0 = one theorem at a time; 1 = all theorems at once (flood); N > 1 = at most N theorems in flight (bounded width — the heavy oracle modes need this: a flood exhausts the heap)", "0"),
@@ -101,6 +103,7 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 			started_ids     : ref [int] = ref [];
 			finished_ids    : ref [int] = ref [];   // ruBuildAndProve returned (did not run out of its time slice)
 			gaveup_ids      : ref [int] = ref [];   // returned WITHOUT a proof with its wall timer over (the engine gave up)
+			budget_ids      : ref [int] = ref [];   // gave up on the candidate budget (max-props)
 			reproved_ids    : ref [int] = ref [];
 			total_steps     : ref int = ref 0;
 			covered_steps   : ref int = ref 0;
@@ -116,6 +119,7 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 			push_started    = ruAtomicRefArrayPush(started_ids);
 			push_finished   = ruAtomicRefArrayPush(finished_ids);
 			push_gaveup     = ruAtomicRefArrayPush(gaveup_ids);
+			push_budget     = ruAtomicRefArrayPush(budget_ids);
 			push_reproved   = ruAtomicRefArrayPush(reproved_ids);
 			add_total       = ruAtomicIntInc(total_steps);
 			add_covered     = ruAtomicIntInc(covered_steps);
@@ -150,7 +154,9 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 					// disjoint-variable budget (no strengthening). Both are required
 					// for a genuine reproval of THIS theorem.
 					reproved = length(^(penv.tree.proofs)) > 0 && ruReprovedWithinDisjs(th, penv, math, env1);
-					if (!reproved && ruTimeIsOver(penv.conf.timer)) {
+					if (!reproved && ^(penv.budgetOver)) {
+						push_budget(th.info.id);
+					} else if (!reproved && ruTimeIsOver(penv.conf.timer)) {
 						push_gaveup(th.info.id);
 					}
 					if (reproved) {
@@ -285,16 +291,31 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 			// wall timer expired and it returned without a proof (gave up).
 			finished_set = buildSet(^finished_ids);
 			gaveup_set   = buildSet(^gaveup_ids);
-			timed_out    = filter(not_reproved, \id -> !containsSet(finished_set, id) || containsSet(gaveup_set, id));
+			budget_set   = buildSet(^budget_ids);
+			timed_out    = filter(not_reproved, \id -> (!containsSet(finished_set, id) || containsSet(gaveup_set, id)) && !containsSet(budget_set, id));
+			over_budget  = filter(not_reproved, \id -> containsSet(budget_set, id));
+			gave_up_set  = buildSet(concat(timed_out, over_budget));
+			real_failed  = filter(not_reproved, \id -> !containsSet(gave_up_set, id));
+			allow_giveup = ruTaskIntArg(task, "allow-giveup", 0) > 0;
 			// Theorems the job budget ran out BEFORE: never started, so neither reproved
 			// nor failed — a silent pass with a short count unless strict-fail counts them.
 			not_started  = n_theorems - sizeSet(buildSet(^started_ids));
-			if (ruTaskIntArg(task, "strict-fail", 0) > 0 && (not_reproved != [] || not_started > 0)) {
-				show_ids = \ids -> strGlue(map(take(ids, 32), id2s), ", ") + (if (length(ids) > 32) ", ..." else "");
+			show_ids = \ids -> strGlue(map(take(ids, 32), id2s), ", ") + (if (length(ids) > 32) ", ..." else "");
+			if (allow_giveup && (gave_up_set != makeSet() || not_started > 0)) {
+				env.out.println("reprove: gave up under a limit (allowed): " + i2s(length(timed_out)) + " on time" +
+					(if (timed_out == []) "" else " (" + show_ids(timed_out) + ")") +
+					", " + i2s(length(over_budget)) + " on the candidate budget" +
+					(if (over_budget == []) "" else " (" + show_ids(over_budget) + ")") +
+					", " + i2s(max(0, not_started)) + " never started (job budget)");
+			}
+			strict_fails = if (allow_giveup) real_failed != [] else (not_reproved != [] || not_started > 0);
+			if (ruTaskIntArg(task, "strict-fail", 0) > 0 && strict_fails) {
 				ruCrash("reprove: strict-fail: " + i2s(length(not_reproved)) + " theorem(s) failed to reprove" +
 					(if (not_reproved == []) "" else ": " + show_ids(not_reproved)) +
 					(if (timed_out == []) "" else
 						"\n  of them " + i2s(length(timed_out)) + " ran out of the time limit (time-limit per theorem / the job budget): " + show_ids(timed_out)) +
+					(if (over_budget == []) "" else
+						"\n  of them " + i2s(length(over_budget)) + " ran out of the candidate budget (max-props): " + show_ids(over_budget)) +
 					(if (not_started <= 0) "" else
 						"\n  " + i2s(not_started) + " theorem(s) were never started: the job budget (job-time-limit) ran out"));
 			}
@@ -326,6 +347,7 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 					Pair("failed-count",    flow(length(not_reproved))),
 					Pair("failed-theorems", flow(map(not_reproved, id2s))),
 					Pair("timed-out-count", flow(length(timed_out))),
+					Pair("budget-count",    flow(length(over_budget))),
 					Pair("changed-count",   flow(^changed_count)),
 					Pair("not-started-count", flow(max(0, not_started)))
 				], cov_vars))))
