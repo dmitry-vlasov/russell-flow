@@ -36,6 +36,7 @@ ruCommReprove = RuComm(
 			RuCommArg("load-ml",        true, "set to 1 to load the ML selector (required by the `ml` atom)",                  "0"),
 			RuCommArg("tactic",         true, "tactic DSL expression or .tac derived-tactic ref; if empty, a strict bounded BFS (limited(bfs, size=max-size, depth=max-depth, batch=16)) is used", ""),
 			RuCommArg("strict-fail",    true, "set to 1 to crash if any theorem could not be reproved (CI / regression mode)", "0"),
+			RuCommArg("replace",        true, "set to 1 to INSTALL the found proof into the theorem (the one accepted by the $d check); `changed-count` then counts installed proofs that differ from the stored ones — for an end-to-end check: verify, write-ru, export, Metamath", "0"),
 			RuCommArg("coverage",       true, "set to 1 to measure proof-step coverage from the search tree inline",           "0"),
 			RuCommArg("parallel",             true, "0 = one theorem at a time; 1 = all theorems at once (flood); N > 1 = at most N theorems in flight (bounded width — the heavy oracle modes need this: a flood exhausts the heap)", "0"),
 			RuCommArg("min-index-rule-nodes", true, "min rule-node count for step index entries (1 = index all steps; only used when tactic contains spr or linear-guided)", "1"),
@@ -120,6 +121,9 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 			add_covered     = ruAtomicIntInc(covered_steps);
 			inc_full_cov    = ruAtomicIntInc(full_cov_count);
 			inc_gap         = ruAtomicIntInc(gap_count);
+			do_replace      = ruTaskIntArg(task, "replace", 0) > 0;
+			changed_count   = ref 0;
+			inc_changed     = ruAtomicIntInc(changed_count);
 
 			// The job budget (job-time-limit): a theorem is not STARTED once it has run out. It is
 			// deliberately not folded into the mapper's budget — ruMapDeclsSequentially splits that
@@ -131,6 +135,7 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 			job_timer     = ruMakeTimer();
 			reprove_fn = \decl, time_limit, env1 -> {
 				th = cast(decl : RuDecl -> RuTheorem);
+				replaced : ref Maybe<RuDecl> = ref None();
 				if (ruTheoremIsProved(th) && ruTimePassed(job_timer) < job_ms) {
 					inc_processed(1);
 					push_started(th.info.id);
@@ -151,6 +156,18 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 					if (reproved) {
 						inc_reproved(1);
 						push_reproved(th.info.id);
+						if (do_replace) {
+							// Install the first found proof within the theorem's $d budget.
+							accepted = find(^(penv.tree.proofs), \p -> {
+								normalized = ruNormalizeTheoremVarsDisjs(RuTheorem(th with proof = p));
+								ruSubsetDisjs(normalized.infer.vars.disjs, th.infer.vars.disjs);
+							});
+							maybeApply(accepted, \p -> {
+								new_th = ruNormalizeTheoremVarsDisjs(RuTheorem(th with proof = p));
+								if (ru2s(new_th.proof, math) != ru2s(th.proof, math)) inc_changed(1);
+								replaced := Some(new_th);
+							});
+						}
 					} else if (length(^(penv.tree.proofs)) > 0 && env1.conf.verbose >= 3) {
 						// The engine found proofs, but each needs MORE disjoint-variable conditions than the
 						// theorem declares — a proof of a stronger-hypothesis statement, not of this theorem.
@@ -181,7 +198,10 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 						if (full_covered && !reproved) inc_gap(1);
 					}
 				}
-				RuMappedDecl(true, false, decl);
+				switch (^replaced) {
+					Some(d): RuMappedDecl(true, true, d);
+					None():  RuMappedDecl(true, false, decl);
+				}
 			};
 
 			// parallel=1: lightweight tactics that do not use the internal concurrent prover can
@@ -306,6 +326,7 @@ ruRunReprove(unit : RuUnit) -> Maybe<RuState> {
 					Pair("failed-count",    flow(length(not_reproved))),
 					Pair("failed-theorems", flow(map(not_reproved, id2s))),
 					Pair("timed-out-count", flow(length(timed_out))),
+					Pair("changed-count",   flow(^changed_count)),
 					Pair("not-started-count", flow(max(0, not_started)))
 				], cov_vars))))
 			))
