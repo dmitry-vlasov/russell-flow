@@ -1,4 +1,6 @@
 import ru/prover/core/expand;
+import sys/system;
+import ds/concur_hashmap;
 
 export {
 	ruInitProver(
@@ -63,17 +65,52 @@ ruProveProp(prop : RuProverProp, prover_env : RuProverEnv) -> RuProverEnv {
 // signal); Expand / ExpandForward pass through. Returns Pair(updated env, step)
 // where step is always RuTacticExpand(leafs) (backward) or RuTacticExpandForward()
 // (advance the forward front one wave). An empty Expand([]) means stop.
-ruRunTacticStep(prover_env : RuProverEnv) -> Pair<RuProverEnv, RuProverTacticStep> {
-	// a task argument (reprove max-props=N) first, then the conf option
+// THE HEAP-AWARE CANDIDATE BUDGET. Every prove run registers its prop counter here while it
+// runs (ruProve / ruProveSequential), so the budget sees ALL theorems in flight. The global
+// budget follows the JVM's real maximum heap: maxMemory * 0.8 / ruBytesPerProp. When the props
+// of all live provers exceed it, the LARGEST prover gives up; the others go on. A giant alone
+// may use the whole budget. (A fixed
+// per-theorem count cannot fit every heap: 2M fit 16 GB with 8 theorems in flight, and the
+// launcher's default is 10 GB.) Explicit max-props stays a hard per-theorem cap.
+ruLiveProvers : ConcurHashMap<int, ref int> = makeConcurHashMap(idfn);
+ruLiveProverSerial = ref 0;
+ruBytesPerProp = 6144.0;   // live heap per candidate prop with its share of the tree, measured ~4 KB on set.mm giants; margin
+
+ruRegisterProver(prover_env : RuProverEnv) -> int {
+	key = atomicRefIntAddition(ruLiveProverSerial, 1);
+	setConcurHashMap(ruLiveProvers, key, prover_env.propCount);
+	key;
+}
+
+ruCandidateBudgetOver(prover_env : RuProverEnv) -> Pair<bool, string> {
+	// a task argument (reprove max-props=N) first, then the conf option; 0 = no hard cap
 	max_props_s = switch (lookupTree(prover_env.conf.task.args, "max-props")) {
 		Some(v): ruScValue2s(v);
 		None(): ruOptsString(prover_env.env.conf.opts, "max-props", "");
 	};
 	max_props = if (max_props_s == "") 0 else s2i(max_props_s);
-	if (max_props > 0 && ^(prover_env.propCount) > max_props) {
+	own = ^(prover_env.propCount);
+	if (max_props > 0 && own > max_props) Pair(true, i2s(own) + " props > max-props=" + i2s(max_props))
+	else {
+		global = round(maxMemory() * 0.8 / ruBytesPerProp);
+		counters = valuesConcurHashMap(ruLiveProvers);
+		live = fold(counters, 0, \acc, r -> acc + ^r);
+		// Over budget: only the LARGEST prover in flight gives up — the hog; its heap frees the
+		// rest. (Stopping every prover above a fair share stopped 74 of 946 set.mm theorems at
+		// 10 GB instead of the dozen real giants.)
+		largest = fold(counters, 0, \acc, r -> max(acc, ^r));
+		if (live > global && own >= largest)
+			Pair(true, i2s(own) + " props, the largest of " + i2s(length(counters)) + " provers in flight (" + i2s(live) + " live > heap budget " + i2s(global) + ")")
+		else Pair(false, "");
+	}
+}
+
+ruRunTacticStep(prover_env : RuProverEnv) -> Pair<RuProverEnv, RuProverTacticStep> {
+	over = ruCandidateBudgetOver(prover_env);
+	if (over.first) {
 		// The candidate budget is exhausted: give up (a resource limit, reported by reprove).
 		if (!^(prover_env.budgetOver) && prover_env.env.conf.verbose >= 3) {
-			prover_env.env.out.println("  candidate budget exhausted: " + i2s(^(prover_env.propCount)) + " props > max-props=" + i2s(max_props) + " — giving up");
+			prover_env.env.out.println("  candidate budget exhausted: " + over.second + " — giving up");
 		} else {};
 		prover_env.budgetOver := true;
 		Pair(prover_env, RuTacticExpand([]));
@@ -150,6 +187,13 @@ ruExpandLeafsInto(env_after_step : RuProverEnv, to_expand : [RuProverProp], para
 }
 
 ruProve(prover_env : RuProverEnv) -> RuProverEnv {
+	key = ruRegisterProver(prover_env);
+	ret = ruProveUnregistered(prover_env);
+	removeConcurHashMap(ruLiveProvers, key);
+	ret;
+}
+
+ruProveUnregistered(prover_env : RuProverEnv) -> RuProverEnv {
 	ruProveRec(prover_env, false);
 }
 
@@ -234,7 +278,10 @@ ruProveOneRoundRec(prover_env0 : RuProverEnv, dry : bool) -> Pair<RuProverEnv, b
 }
 
 ruProveSequential(prover_env : RuProverEnv) -> RuProverEnv {
-	ruProveSequentialRec(prover_env, false);
+	key = ruRegisterProver(prover_env);
+	ret = ruProveSequentialRec(prover_env, false);
+	removeConcurHashMap(ruLiveProvers, key);
+	ret;
 }
 
 ruProveSequentialRec(prover_env0 : RuProverEnv, dry : bool) -> RuProverEnv {
