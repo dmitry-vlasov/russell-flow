@@ -16,6 +16,33 @@ import java.util.concurrent.ThreadFactory;
 
 
 public class RussellTimed extends NativeHost {
+	// Heap in use right after the JVM's MOST RECENT garbage collection (bytes) — close to the
+	// live data, with no forced collection. The prover's heap-aware candidate budget judges
+	// memory pressure by it: plain used memory includes uncollected garbage and passes any
+	// threshold routinely, and forcing collections stops every thread. -1 before the first GC.
+	public static final double heapUsedAfterLastGc() {
+		java.util.Set<String> heapPools = new java.util.HashSet<String>();
+		for (java.lang.management.MemoryPoolMXBean p : java.lang.management.ManagementFactory.getMemoryPoolMXBeans()) {
+			if (p.getType() == java.lang.management.MemoryType.HEAP) heapPools.add(p.getName());
+		}
+		long bestEnd = -1;
+		long bestUsed = -1;
+		for (java.lang.management.GarbageCollectorMXBean gc : java.lang.management.ManagementFactory.getGarbageCollectorMXBeans()) {
+			if (gc instanceof com.sun.management.GarbageCollectorMXBean) {
+				com.sun.management.GcInfo info = ((com.sun.management.GarbageCollectorMXBean) gc).getLastGcInfo();
+				if (info != null && info.getEndTime() > bestEnd) {
+					long sum = 0;
+					for (java.util.Map.Entry<String, java.lang.management.MemoryUsage> e : info.getMemoryUsageAfterGc().entrySet()) {
+						if (heapPools.contains(e.getKey())) sum += e.getValue().getUsed();
+					}
+					bestEnd = info.getEndTime();
+					bestUsed = sum;
+				}
+			}
+		}
+		return (double) bestUsed;
+	}
+
 	static private class TaskTimer implements Runnable {
 		private long time_limit;
 		private Thread controlled;
