@@ -700,7 +700,8 @@ ruCommTestForwardCombined = RuComm(
 			RuCommArg("limit", true, "per-node proof-variant limit (1 = strict unique; N = N variants incl. target; 0 = off)", "1"),
 			RuCommArg("threads", true, "worker threads (0 = all cores)", "0"),
 			RuCommArg("nojoin", true, "DBG: 1 = disable the universal join (pure backward oracle)", "0"),
-			RuCommArg("strict-fail", true, "1 = crash if any combined reconstruction fails", "0")
+			RuCommArg("strict-fail", true, "1 = crash if any combined reconstruction fails", "0"),
+			RuCommArg("allow-giveup", true, "1 = strict-fail tolerates theorems that gave up under a limit (candidate budget, time); they are listed", "0")
 		], []
 	),
 	ruRunTestForwardCombined
@@ -758,7 +759,11 @@ ruRunTestForwardCombined(unit : RuUnit) -> Maybe<RuState> {
 		// The backward oracle drives the structure; max_variants=max_proofs=limit bounds
 		// its per-node branching. The loop interleaves a forward reveal with each round.
 		ctx = RuTacticContext(math, e, None(), None(), None(), Some(ruMakeTacticBoard()));
-		ostr = if (limit <= 0) "oracle(-1, -1)" else "oracle(-1, -1, " + i2s(limit) + ", " + i2s(limit) + ")";
+		// The backward side is the plain oracle (others=0, hyps=1). The old positional form
+		// oracle(-1, -1, limit, limit) — the stub's max-true/max-false/max-variants/max-proofs —
+		// reads as others=-1 under the rewritten oracle: EVERY alternative expanded, which ran
+		// out of a 32 GB heap in test/all step 10. `limit` still drives the variant gate.
+		ostr = "oracle";
 		result = switch (ruParseAndBuildTactic(ostr, ctx)) {
 			None(): "ORACLE-BUILD-FAILED";
 			Some(builder): {
@@ -766,8 +771,13 @@ ruRunTestForwardCombined(unit : RuUnit) -> Maybe<RuState> {
 				penv0 = built.first;
 				penv0.tactic := Some(built.second);
 				penv1 = ruExpandHyp(penv0.tree.root, penv0);
+				key   = ruRegisterProver(penv1);
 				penv  = ruCombinedLoop(penv1, rest_levels, length(facts) + 5000);
-				if (length(^(penv.tree.proofs)) > 0) "RECONSTRUCTED+VERIFIED" else "NOT-RECONSTRUCTED";
+				ruUnregisterProver(key);
+				if (length(^(penv.tree.proofs)) > 0) "RECONSTRUCTED+VERIFIED"
+				else if (^(penv.budgetOver)) "GAVE-UP (candidate budget)"
+				else if (ruTimeIsOver(penv.conf.timer)) "GAVE-UP (time limit)"
+				else "NOT-RECONSTRUCTED";
 			}
 		};
 		Pair(th.info.id, result);
@@ -779,12 +789,16 @@ ruRunTestForwardCombined(unit : RuUnit) -> Maybe<RuState> {
 		env
 	);
 	ok  = filter(results, \r -> r.second == "RECONSTRUCTED+VERIFIED");
-	bad = filter(results, \r -> r.second != "RECONSTRUCTED+VERIFIED");
+	gave_up = filter(results, \r -> startsWith(r.second, "GAVE-UP"));
+	failed  = filter(results, \r -> r.second != "RECONSTRUCTED+VERIFIED" && !startsWith(r.second, "GAVE-UP"));
+	bad = if (ruTaskIntArg(task, "allow-giveup", 0) > 0) failed else concat(failed, gave_up);
 	if (length(theorems) == 1) {
 		env.out.println("test/forward-combined: theorem=" + id2s(results[0].first) + "  => " + results[0].second);
 	} else {
-		env.out.println("test/forward-combined: " + i2s(length(ok)) + "/" + i2s(length(results)) + " reconstructed+verified");
-		iter(take(bad, 12), \r -> env.out.println("  NOT-RECONSTRUCTED: " + id2s(r.first) + " => " + r.second));
+		env.out.println("test/forward-combined: " + i2s(length(ok)) + "/" + i2s(length(results)) + " reconstructed+verified, " +
+			i2s(length(gave_up)) + " gave up under a limit, " + i2s(length(failed)) + " not reconstructed");
+		iter(take(failed, 12), \r -> env.out.println("  NOT-RECONSTRUCTED: " + id2s(r.first) + " => " + r.second));
+		if (gave_up != []) env.out.println("  gave up: " + strGlue(map(take(gave_up, 32), \r -> id2s(r.first)), ", ") + (if (length(gave_up) > 32) ", ..." else ""));
 	};
 	if (ruTaskIntArg(task, "strict-fail", 0) > 0 && bad != []) {
 		ruCrash("test/forward-combined: failed for " + i2s(length(bad)) + " theorem(s)");

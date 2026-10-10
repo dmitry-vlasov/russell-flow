@@ -207,7 +207,7 @@ reprove tactic="linear-bfs(attempts=3)"
 reprove load-ml=1 tactic="limited(ml, batch=5, size=10000, depth=7)"
 
 # drive the search by each theorem's own proof (round-trip test)
-reprove strict-fail=1 tactic="oracle(-1, -1)"
+reprove strict-fail=1 tactic="oracle"
 
 # definitional closure (the Mizar-import workhorse; a derived tactic)
 prove target=all steps=1 tactic="def-close"

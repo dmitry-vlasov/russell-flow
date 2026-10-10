@@ -142,7 +142,7 @@ The `oracle` tactic uses the existing proof tree as a guide:
 2. The prover tries the oracle's suggestion; if it succeeds, it proceeds to the next step.
 3. If the oracle's suggestion fails (e.g. because an assertion was renamed or its statement changed), the prover falls back to general search.
 
-This is used to re-verify proofs after refactoring, or after translating from Metamath. The roundtrip test invokes `reprove strict-fail=1 tactic="oracle(-1, -1)"`.
+This is used to re-verify proofs after refactoring, or after translating from Metamath. The roundtrip test invokes `reprove strict-fail=1 tactic="oracle"`.
 
 ---
 
